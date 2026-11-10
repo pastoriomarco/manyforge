@@ -13,14 +13,16 @@
 
 namespace manyforge::core {
 
+/// v20: operation intents use direct component references; older journals are
+/// refused, never converted.
 /// v19: the motion takeover decision carries its planning cap.
 /// v18: lean Stop record without fault latch or surveillance. `stop_projections`
 /// is an index of journal_records sequences; each Stop payload is stored once,
 /// in journal_records. Earlier journals are refused
-/// (operation_journal_format_unsupported), not converted.
+/// (operation_journal_version_unsupported), not converted.
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v19";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 19;
+    "manyforge.internal.execution.operation-journal.o1.5.v20";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 20;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;

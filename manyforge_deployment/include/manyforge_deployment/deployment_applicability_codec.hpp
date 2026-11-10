@@ -37,7 +37,7 @@ class RevisionVerifiedDeploymentApplicabilityInputs;
 /// Immutable-store readback proof for one deployment-authored commissioning
 /// row.
 ///
-/// The private constructor deliberately prevents C0.2n or an ordinary caller
+/// The private constructor deliberately prevents the applicability qualifier or an ordinary caller
 /// from promoting an authored digest into evidence.  The sole producer below
 /// requires the exact resolved CAS key and stored bytes and independently
 /// checks the complete artifact reference before constructing this value.
@@ -217,7 +217,7 @@ class TypedDeploymentApplicabilityInputsCandidate final {
 /// This boundary proves only closed shape, strict scalar syntax, canonical
 /// collection order, and binding semantic identity. Graph occurrence,
 /// catalog, provider, runtime-profile, topology, and site-overlay
-/// applicability remain the later C0.2n qualifier's responsibility.
+/// applicability remain the later applicability qualifier's responsibility.
 class RevisionVerifiedDeploymentApplicabilityInputs final {
  public:
   RevisionVerifiedDeploymentApplicabilityInputs(
@@ -291,7 +291,7 @@ class RevisionVerifiedDeploymentApplicabilityInputs final {
       const TypedDeploymentApplicabilityInputsCandidate&);
 };
 
-/// Decodes only the C0.2n-owned tables from one strictly parsed deployment
+/// Decodes only the applicability-owned tables from one strictly parsed deployment
 /// root.
 ///
 /// `api_version`, `desired_control_configurations`, and
@@ -331,14 +331,14 @@ verify_capability_provider_binding_revisions(
 /// This is the only producer of QualifiedCommissioningEvidenceRef.  It
 /// verifies the fixed role/media type, exact safe CAS key, byte count and
 /// SHA-256 digest against the bytes returned by the outer deployment
-/// resolver.  C0.2n receives only the resulting prefiltered proof closure.
+/// resolver.  The applicability qualifier receives only the resulting prefiltered proof closure.
 [[nodiscard]] QualifiedCommissioningEvidenceRef
 resolve_and_verify_commissioning_evidence_ref(
     const core::CommissionedStopInterfaceDTO& commissioned_interface,
     const core::ContentAddressedStoreKey& resolved_store_key,
     std::string_view stored_bytes);
 
-/// CP9 Deployment overrides of component stream parameters
+/// Deployment overrides of component stream parameters
 /// (`policies.component_streams`). Closed rows of `controllable_component_id`,
 /// `stream_id` and `budget_ns` (> 0); unique per
 /// `(controllable_component_id, stream_id)` and returned in that order.

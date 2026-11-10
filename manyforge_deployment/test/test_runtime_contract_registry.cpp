@@ -132,14 +132,6 @@ TEST(RuntimeContractRegistry,
       });
   ASSERT_NE(ros2_control, registry.contracts().end());
   check_offer(ros2_control->offer(), 39U);
-  const auto has_operation_scale = [](const auto &offer) {
-    return std::any_of(offer.provided_capabilities.begin(),
-                       offer.provided_capabilities.end(), [](const auto &ref) {
-                         return ref.capability_id.value() ==
-                                "execution.runtime_scale.operation_scoped";
-                       });
-  };
-  EXPECT_FALSE(has_operation_scale(ros2_control->offer()));
 }
 
 TEST(RuntimeContractRegistry,

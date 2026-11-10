@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_scene VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_scene VERSION 0.2.1 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -298,7 +298,7 @@ if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
     ERROR_VARIABLE _MANYFORGE_SCENE_LITE6_PREPARATION_ERROR)
   if(NOT _MANYFORGE_SCENE_LITE6_PREPARATION_RESULT EQUAL 0)
     message(FATAL_ERROR
-      "N5c scene native-fixture preparation failed:\n"
+      "scene native-fixture preparation failed:\n"
       "${_MANYFORGE_SCENE_LITE6_PREPARATION_OUTPUT}"
       "${_MANYFORGE_SCENE_LITE6_PREPARATION_ERROR}")
   endif()

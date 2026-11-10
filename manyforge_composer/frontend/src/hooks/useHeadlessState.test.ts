@@ -1433,7 +1433,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
   });
 
   it('sends a refused motion command once: no re-arm loop, no Recover', async () => {
-    // M6 ADAPTERM: the robot's own adapter re-engages it inside the admitted
+    // The robot's own adapter re-engages it inside the admitted
     // motion; Composer neither re-arms nor re-sends a refused command.
     vi.useFakeTimers();
     class FakeWebSocket {
@@ -1513,7 +1513,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(() => parseExecutionObservationFrame(crossed)).toThrow(
       /joint vectors/,
     );
-    // H1a-IF.2: a cell may have no observable coordinate (for example only
+    // A cell may have no observable coordinate (for example only
     // an unsupported capability); each target names its capability.
     const empty = wireObservation(4);
     empty.targets = [];

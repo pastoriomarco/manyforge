@@ -7,11 +7,9 @@
 namespace manyforge::roboplan_backend {
 
 core::ComponentState SimulatorComponentState(const std::optional<SimulationState> &observed,
-                                             const bool request_unknown,
                                              const std::int64_t now_ns) {
   core::ComponentState state;
-  state.activity =
-      request_unknown ? core::ComponentActivity::kUnknown : core::ComponentActivity::kIdle;
+  state.activity = core::ComponentActivity::kIdle;
   state.observed_at_ns = now_ns;
   if (!observed) {
     state.lifecycle = core::ComponentLifecycle::kOffline;
@@ -44,28 +42,12 @@ SimulatorComponentAdapter::SimulatorComponentAdapter(std::shared_ptr<ISimulation
 
 core::ComponentState SimulatorComponentAdapter::State(const std::int64_t now_ns) const {
   const auto observed = control_->Observed();
-  const std::lock_guard lock(mutex_);
-  if (unknown_target_ && observed == unknown_target_) unknown_target_.reset();
-  return SimulatorComponentState(observed, unknown_target_.has_value() || reset_unknown_, now_ns);
-}
-
-void SimulatorComponentAdapter::Settle(const SimulationCall &call) {
-  if (call.outcome == core::ActionOutcome::kUnknown) return;
-  // The simulator answered: what it reports from now on is its state.
-  const std::lock_guard lock(mutex_);
-  unknown_target_.reset();
-  reset_unknown_ = false;
+  return SimulatorComponentState(observed, now_ns);
 }
 
 SimulationCall SimulatorComponentAdapter::Set(const SimulationState state,
                                               const std::stop_token &stop) {
   auto call = control_->Set(state, stop);
-  if (call.outcome == core::ActionOutcome::kUnknown) {
-    const std::lock_guard lock(mutex_);
-    unknown_target_ = state;
-  } else {
-    Settle(call);
-  }
   return call;
 }
 
@@ -76,7 +58,6 @@ core::ActionResult SimulatorComponentAdapter::Run(const core::ComponentAction ac
     case core::ComponentAction::kPrepare:
     case core::ComponentAction::kRecover:
       call = control_->Read(stop);
-      Settle(call);
       break;
     case core::ComponentAction::kEnable:
       call = Set(SimulationState::kPlaying, stop);
@@ -86,12 +67,6 @@ core::ActionResult SimulatorComponentAdapter::Run(const core::ComponentAction ac
       break;
     case core::ComponentAction::kSimReset:
       call = control_->Reset(stop);
-      if (call.outcome == core::ActionOutcome::kUnknown) {
-        const std::lock_guard lock(mutex_);
-        reset_unknown_ = true;
-      } else {
-        Settle(call);
-      }
       break;
     default:
       call = SimulationCall{core::ActionOutcome::kFailed,

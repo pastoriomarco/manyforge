@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue } from '../types/api';
+import { DraftTextInput } from './common/DraftInputs';
 import {
   IO_DRIVER_FRESHNESS_NOTE,
   IO_LIVENESS_UNPROVEN_WARNING,
@@ -11,7 +12,10 @@ import {
   ioSignalRows,
   ioSignalRowsValue,
   ioSignalsConfiguration,
+  msTextToNs,
   newIoSignalInput,
+  rosNameProblem,
+  rosServiceNameProblem,
   validateIoSignalRows,
   withIoDirection,
   type IoOutputProfile,
@@ -39,10 +43,12 @@ export interface GeometricContactRobotOption {
   componentId: string;
 }
 
+type NewIoSignalRow = Extract<IoSignalRow, { kind: 'input' | 'output' }>;
+
 /**
  * Declare the boolean input and output signals of one runtime unit. The whole
  * `io_signals` array commits through the ordinary Deployment Draft mutation.
- * New signals are added only to I/O devices (contract 84): ROS-connected I/O,
+ * New signals are added only to I/O devices: ROS-connected I/O,
  * including I/O physically on a robot, is its own I/O device component, so an
  * arm's runtime only lists (and may remove) rows it already declares.
  */
@@ -50,11 +56,13 @@ export function IoSignalConfigurationSection({
   controller,
   runtimes,
   geometricContactRobots = [],
+  sceneResourceIds = [],
 }: {
   controller: DeploymentWorkspaceController;
   runtimes: IoSignalRuntimeConfiguration[];
   /** Motion robots used to select a dynamic geometric-contact source. */
   geometricContactRobots?: readonly GeometricContactRobotOption[];
+  sceneResourceIds?: readonly string[];
 }) {
   const [selected, setSelected] = useState(0);
   // Arms are listed only while they still declare rows (to review/remove them).
@@ -71,45 +79,109 @@ export function IoSignalConfigurationSection({
   const source = useMemo(() => ioSignalRows(location?.configuration ?? null), [location]);
   const [rows, setRows] = useState<IoSignalRow[]>(source);
   const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState<NewIoSignalRow | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
+  const sourceFingerprint = JSON.stringify(source);
+  const previousSource = useRef(sourceFingerprint);
   useEffect(() => {
+    if (sourceFingerprint === previousSource.current) return;
+    previousSource.current = sourceFingerprint;
     setRows(source);
     setError(null);
-  }, [source]);
+    setAdding(null);
+    setAddError(null);
+  }, [source, sourceFingerprint]);
+  const targetsFor = (componentId: string) => [...new Set(source.flatMap((row) => {
+    const owner = row.kind === 'preserved' ? row.raw.controllable_component_id : row.draft.componentId;
+    const target = row.kind === 'preserved' ? row.raw.command_target_id : row.draft.targetId;
+    return owner === componentId && typeof target === 'string' && target !== '' ? [target] : [];
+  }))].sort();
+  const targets = targetsFor(runtime?.runtimeUnitId ?? '');
+  const outputsFor = (componentId: string) => rows.flatMap((row) => row.kind === 'output'
+    && row.draft.profile === 'mock_output' && row.draft.componentId === componentId
+    && row.draft.signalName !== '' ? [row.draft.signalName] : []);
   const disabled = !controller.mutationAvailable || controller.busy;
+  const removeDisabledReason = runtime?.ioProvider === true && rows.length === 1
+    ? 'An I/O device needs at least one signal; remove the device instead.' : null;
   const declared = location !== null && Array.isArray(location.configuration.io_signals);
-  const sameValue = (left: IoSignalRow[], right: IoSignalRow[]) => (
-    validateIoSignalRows(left) === null && validateIoSignalRows(right) === null
-      ? JSON.stringify(ioSignalRowsValue(left)) === JSON.stringify(ioSignalRowsValue(right))
-      : left === right
-  );
-  const changed = !sameValue(rows, source);
+  const commitRows = async (nextRows: IoSignalRow[], declaredBefore = declared) => {
+    if (location === null) return false;
+    const problem = validateIoSignalRows(nextRows, runtime?.ioProvider ? runtime.runtimeUnitId : undefined);
+    if (problem !== null) { setError(problem); return false; }
+    setError(null);
+    if (nextRows.length === 0) {
+      if (declaredBefore && await controller.mutate(location.path, 'remove') === null) {
+        setRows(source);
+        return false;
+      }
+      return true;
+    }
+    if (JSON.stringify(ioSignalRowsValue(nextRows)) !== JSON.stringify(ioSignalRowsValue(source))) {
+      if (await controller.mutate(location.path, 'set', ioSignalRowsValue(nextRows)) === null) {
+        setRows(source);
+        return false;
+      }
+    }
+    return true;
+  };
+  const editRows = (nextRows: IoSignalRow[]) => {
+    setRows(nextRows);
+    const problem = validateIoSignalRows(nextRows, runtime?.ioProvider ? runtime.runtimeUnitId : undefined);
+    setError(problem);
+    if (problem === null) void commitRows(nextRows);
+  };
   const updateRow = (index: number, patch: Partial<IoSignalInputDraft>) => {
-    setRows(rows.map((row, rowIndex) => (
+    editRows(rows.map((row, rowIndex) => (
       rowIndex === index && row.kind === 'input' ? { kind: 'input', draft: { ...row.draft, ...patch } } : row
     )));
   };
   const updateOutput = (index: number, patch: Partial<IoSignalOutputDraft>) => {
-    setRows(rows.map((row, rowIndex) => (
+    editRows(rows.map((row, rowIndex) => (
       rowIndex === index && row.kind === 'output' ? { kind: 'output', draft: { ...row.draft, ...patch } } : row
     )));
   };
   const setDirection = (index: number, direction: 'input' | 'output') => {
-    setRows(rows.map((row, rowIndex) => (
+    editRows(rows.map((row, rowIndex) => (
       rowIndex === index && row.kind !== 'preserved' ? withIoDirection(row, direction) : row
     )));
   };
-  const commit = async () => {
-    if (location === null) return;
-    const problem = validateIoSignalRows(rows, runtime?.ioProvider ? runtime.runtimeUnitId : undefined);
-    if (problem !== null) {
-      setError(problem);
-      return;
+  const removeRow = (index: number) => {
+    const next = rows.filter((_row, rowIndex) => rowIndex !== index);
+    const problem = validateIoSignalRows(next, runtime?.ioProvider ? runtime.runtimeUnitId : undefined);
+    if (problem !== null) { setError(problem); return; }
+    setRows(next);
+    void commitRows(next);
+  };
+  const beginAdd = (direction: 'input' | 'output') => {
+    const input = {
+      kind: 'input' as const,
+      draft: { ...newIoSignalInput(runtime?.runtimeUnitId ?? ''),
+        targetId: targets.length === 1 ? targets[0] : '' },
+    };
+    setAdding((direction === 'input' ? input : withIoDirection(input, 'output')) as NewIoSignalRow);
+    setAddError(null);
+  };
+  const updateAdding = (patch: Partial<IoSignalInputDraft | IoSignalOutputDraft>) => {
+    if (adding === null) return;
+    setAdding(adding.kind === 'input'
+      ? { kind: 'input', draft: { ...adding.draft, ...patch } as IoSignalInputDraft }
+      : { kind: 'output', draft: { ...adding.draft, ...patch } as IoSignalOutputDraft });
+    setAddError(null);
+  };
+  const changeAddingDirection = (direction: 'input' | 'output') => {
+    if (adding !== null) setAdding(withIoDirection(adding, direction) as NewIoSignalRow);
+    setAddError(null);
+  };
+  const addRow = async () => {
+    if (adding === null) return;
+    const next = [...rows, adding];
+    const problem = validateIoSignalRows(next, runtime?.ioProvider ? runtime.runtimeUnitId : undefined);
+    if (problem !== null) { setAddError(problem); return; }
+    if (await commitRows(next)) {
+      setRows(next);
+      setAdding(null);
+      setAddError(null);
     }
-    if (rows.length === 0 && !declared) return;
-    setError(null);
-    // A refusal shows once, in the yellow Deployment notice row.
-    if (rows.length === 0) await controller.mutate(location.path, 'remove');
-    else await controller.mutate(location.path, 'set', ioSignalRowsValue(rows));
   };
 
   return (
@@ -129,15 +201,16 @@ export function IoSignalConfigurationSection({
                 </select>
               </label>
             )}
-            {rows.length === 0 && <p className="muted">No I/O signals are declared for {runtime.runtimeUnitId}.</p>}
+            {rows.length === 0 && adding === null && <p className="muted">No I/O signals are declared for {runtime.runtimeUnitId}.</p>}
             {rows.map((row, index) => (
               row.kind === 'preserved' ? (
                 <fieldset className="deployment-gripper-editor" key={`preserved-${index}`}>
                   <legend>{String(row.raw.signal_name ?? `Signal ${index + 1}`)} · {String(row.raw.direction ?? 'unknown')}</legend>
                   <p className="field-help">{row.reason}</p>
                   <div className="button-row">
-                    <button type="button" disabled={disabled}
-                      onClick={() => setRows(rows.filter((_row, rowIndex) => rowIndex !== index))}>Remove signal</button>
+                    <button type="button" disabled={disabled || removeDisabledReason !== null}
+                      title={removeDisabledReason ?? undefined}
+                      onClick={() => removeRow(index)}>Remove signal</button>
                   </div>
                 </fieldset>
               ) : row.kind === 'output' ? (
@@ -147,9 +220,11 @@ export function IoSignalConfigurationSection({
                   draft={row.draft}
                   disabled={disabled}
                   ioProvider={runtime.ioProvider === true}
+                  removeDisabledReason={removeDisabledReason}
+                  targetOptions={targetsFor(row.draft.componentId)}
                   onChange={(patch) => updateOutput(index, patch)}
                   onDirection={(direction) => setDirection(index, direction)}
-                  onRemove={() => setRows(rows.filter((_row, rowIndex) => rowIndex !== index))}
+                  onRemove={() => removeRow(index)}
                 />
               ) : (
                 <IoSignalInputFields
@@ -158,32 +233,46 @@ export function IoSignalConfigurationSection({
                   draft={row.draft}
                   disabled={disabled}
                   ioProvider={runtime.ioProvider === true}
+                  removeDisabledReason={removeDisabledReason}
                   geometricContactRobots={geometricContactRobots}
+                  targetOptions={targetsFor(row.draft.componentId)}
+                  sceneResourceIds={sceneResourceIds} outputSignalNames={outputsFor(row.draft.componentId)}
                   onChange={(patch) => updateRow(index, patch)}
                   onDirection={(direction) => setDirection(index, direction)}
-                  onRemove={() => setRows(rows.filter((_row, rowIndex) => rowIndex !== index))}
+                  onRemove={() => removeRow(index)}
                 />
               )
             ))}
+            {adding !== null && (
+              adding.kind === 'output' ? (
+                <IoSignalOutputFields index={source.length} draft={adding.draft} disabled={disabled}
+                  ioProvider={runtime.ioProvider === true}
+                  targetOptions={targetsFor(adding.draft.componentId)} error={addError}
+                  onChange={updateAdding} onDirection={changeAddingDirection} />
+              ) : (
+                <IoSignalInputFields index={source.length} draft={adding.draft} disabled={disabled}
+                  ioProvider={runtime.ioProvider === true}
+                  geometricContactRobots={geometricContactRobots}
+                  targetOptions={targetsFor(adding.draft.componentId)} sceneResourceIds={sceneResourceIds}
+                  outputSignalNames={outputsFor(adding.draft.componentId)} error={addError}
+                  onChange={updateAdding} onDirection={changeAddingDirection} />
+              )
+            )}
             {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
             {!canAdd && (
               <p className="field-help">ROS-connected I/O (ROS Bool / SetBool, ros2_control GPIO) is its own I/O device: add it in I/O devices; a machine's own I/O banks are its I/O members. Signals listed here on {runtime.runtimeUnitId} can only be reviewed or removed.</p>
             )}
             <div className="button-row">
-              {canAdd && <button type="button" disabled={disabled}
-                onClick={() => setRows([...rows, {
-                  kind: 'input',
-                  draft: newIoSignalInput(runtime.intentComponent ? runtime.runtimeUnitId : ''),
-                }])}>Add input signal</button>}
-              {canAdd && <button type="button" disabled={disabled}
-                onClick={() => setRows([...rows, withIoDirection({
-                  kind: 'input',
-                  draft: newIoSignalInput(runtime.intentComponent ? runtime.runtimeUnitId : ''),
-                }, 'output')])}>Add output signal</button>}
-              <button type="button" className="primary-action" disabled={disabled || !changed}
-                onClick={() => { void commit(); }}>Update I/O Draft</button>
-              <button type="button" disabled={disabled || !changed}
-                onClick={() => { setRows(source); setError(null); }}>Discard I/O edits</button>
+              {canAdd && adding === null && <button type="button" disabled={disabled}
+                onClick={() => beginAdd('input')}>Add input signal</button>}
+              {canAdd && adding === null && <button type="button" disabled={disabled}
+                onClick={() => beginAdd('output')}>Add output signal</button>}
+              {adding !== null && <>
+                <button type="button" className="primary-action" disabled={disabled}
+                  onClick={() => { void addRow(); }}>Add signal</button>
+                <button type="button" disabled={disabled}
+                  onClick={() => { setAdding(null); setAddError(null); }}>Cancel</button>
+              </>}
             </div>
             <p className="field-help">Boolean signals. Mock inputs and outputs are simulated sources for offline tests; ROS Bool and ros2_control GPIO inputs read real topics. ROS SetBool writes complete when the service accepts them; ros2_control GPIO writes are submitted only; none is confirmed by a physical readback.</p>
           </>
@@ -216,11 +305,117 @@ function DirectionField({
   );
 }
 
+function ChoiceField({ label, name, value, options, disabled, onChange, readOnly = false }: {
+  label: string; name: string; value: string; options: readonly string[];
+  disabled: boolean; onChange: (value: string) => void; readOnly?: boolean;
+}) {
+  const values = [...new Set(options.filter(Boolean))].sort();
+  return <label className="deployment-focused-field">
+    <span>{name}</span>
+    <select aria-label={`${label} ${name}`} title={`Select the ${name.toLowerCase()} for this signal.`}
+      value={value} className={readOnly ? 'io-signal-readonly' : undefined} disabled={disabled || readOnly} onChange={(event) => onChange(event.target.value)}>
+      <option value="">Select {name.toLowerCase()}</option>
+      {value !== '' && !values.includes(value) && <option value={value}>{value} (not currently listed)</option>}
+      {values.map((item) => <option key={item} value={item}>{item}</option>)}
+    </select>
+  </label>;
+}
+
+const PORTABLE_SIGNAL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function signalIdProblem(value: string, name: string) {
+  return PORTABLE_SIGNAL_ID.test(value) ? null
+    : `The ${name} must be 1–128 letters, digits, '.', '_' or '-', starting with a letter or digit.`;
+}
+
+function inputFieldProblem(
+  draft: IoSignalInputDraft,
+  field: keyof IoSignalInputDraft,
+  value: string,
+): string | null {
+  if (field === 'componentId' || field === 'initialValue' || field === 'echoEnabled' || field === 'explicit') return null;
+  if (['targetId', 'resourceRoleId', 'signalName', 'sourceId', 'robotComponentId',
+    'targetSceneResourceId', 'echoOutputSignalName'].includes(field)) {
+    const names: Partial<Record<keyof IoSignalInputDraft, string>> = {
+      targetId: 'target', resourceRoleId: 'resource role', signalName: 'signal name', sourceId: 'source',
+      robotComponentId: 'robot', targetSceneResourceId: 'target Scene resource id',
+      echoOutputSignalName: 'Mock output signal name',
+    };
+    return signalIdProblem(value, names[field] ?? 'value');
+  }
+  if (field === 'maximumAgeMs') {
+    const ns = msTextToNs(value);
+    return ns !== null && ns >= 1 ? null : 'The maximum sample age must be above 0 ms, with at most 6 decimals.';
+  }
+  if (field === 'ingressDepth') {
+    const depth = /^\d+$/.test(value) ? Number(value) : NaN;
+    return Number.isSafeInteger(depth) && depth >= 1 ? null
+      : `Ingress depth must be a whole number of samples from 1 to ${Number.MAX_SAFE_INTEGER}.`;
+  }
+  if (field === 'echoDelayMs') {
+    const delay = /^\d+$/.test(value) ? Number(value) : NaN;
+    return Number.isSafeInteger(delay) && delay <= 9_007_199_254 ? null
+      : 'The Mock echo delay must be a whole number of milliseconds from 0 to 9007199254.';
+  }
+  if (field === 'topic') {
+    if (draft.profile === 'ros2_control_gpio') return rosNameProblem(value, 'GPIO topic');
+    return value.trim() === '' ? 'Enter the source topic.' : null;
+  }
+  if (field === 'group') return value !== '' && !value.includes('\0') ? null : 'Enter the GPIO group.';
+  if (field === 'interfaceName') return value !== '' && !value.includes('\0') ? null : 'Enter the GPIO interface name.';
+  return null;
+}
+
+function outputFieldProblem(
+  field: keyof IoSignalOutputDraft,
+  value: string,
+): string | null {
+  if (field === 'componentId') return null;
+  if (field === 'targetId' || field === 'resourceRoleId' || field === 'signalName' || field === 'sourceId') {
+    const names: Partial<Record<keyof IoSignalOutputDraft, string>> = {
+      targetId: 'target', resourceRoleId: 'resource role', signalName: 'signal name', sourceId: 'source',
+    };
+    return signalIdProblem(value, names[field] ?? 'value');
+  }
+  if (field === 'service') return rosServiceNameProblem(value);
+  if (field === 'channel') return signalIdProblem(value, 'Mock output channel');
+  if (field === 'topic') return rosNameProblem(value, 'GPIO topic');
+  if (field === 'group') return value !== '' && !value.includes('\0') ? null : 'Enter the GPIO group.';
+  if (field === 'interfaceName') return value !== '' && !value.includes('\0') ? null : 'Enter the GPIO interface name.';
+  return null;
+}
+
+function IoDraftTextField({ label, ariaLabel = label, value, disabled, validate, onCommit, help, readOnly = false, inputMode, unit }: {
+  label: string;
+  ariaLabel?: string;
+  value: string;
+  disabled: boolean;
+  validate: (value: string) => string | null;
+  onCommit: (value: string) => void;
+  help?: string;
+  readOnly?: boolean;
+  inputMode?: 'decimal';
+  unit?: string;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const input = <DraftTextInput aria-label={ariaLabel} value={value} title={help} disabled={disabled} readOnly={readOnly}
+    className={readOnly ? 'io-signal-readonly' : undefined}
+    inputMode={inputMode} validate={validate} onInvalidChange={setError} onCommit={onCommit} />;
+  return <label className="deployment-focused-field">
+    <span>{label}</span>
+    {unit === undefined ? input : <span className="deployment-number-with-unit">{input}<small>{unit}</small></span>}
+    {error !== null && <span className="deployment-field-error inline-message severity-error" role="alert">{error}</span>}
+  </label>;
+}
+
 export function IoSignalOutputFields({
   index,
   draft,
   disabled,
-  ioProvider = false,
+  targetOptions = [],
+  addDevice = false,
+  removeDisabledReason = null,
+  error = null,
   onChange,
   onDirection,
   onRemove,
@@ -230,26 +425,50 @@ export function IoSignalOutputFields({
   disabled: boolean;
   /** An I/O device row: its component is the device itself (read-only). */
   ioProvider?: boolean;
+  targetOptions?: readonly string[];
+  addDevice?: boolean;
+  removeDisabledReason?: string | null;
+  error?: string | null;
   onChange: (patch: Partial<IoSignalOutputDraft>) => void;
   onDirection: (direction: 'input' | 'output') => void;
   onRemove?: () => void;
 }) {
   const label = draft.signalName.trim() === '' ? `Signal ${index + 1}` : draft.signalName;
-  const text = (name: string, field: keyof IoSignalOutputDraft, help?: string) => (
-    <label className="deployment-focused-field" key={field}>
+  const patchForText = (field: keyof IoSignalOutputDraft, value: string): Partial<IoSignalOutputDraft> => ({
+    [field]: value,
+    ...(field === 'signalName' && !addDevice && value !== '' ? {
+      ...(draft.resourceRoleId === '' ? { resourceRoleId: value } : {}),
+      ...(draft.sourceId === '' && draft.componentId !== '' ? { sourceId: `${draft.componentId}.${value}` } : {}),
+    } : {}),
+  });
+  const text = (name: string, field: keyof IoSignalOutputDraft, help?: string) => {
+    const fieldLabel = `${label} ${name}`;
+    const patch = (value: string) => patchForText(field, value);
+    if (addDevice) return <label className="deployment-focused-field" key={field}>
       <span>{name}</span>
-      <input aria-label={`${label} ${name}`} value={draft[field]} title={help}
-        disabled={disabled} readOnly={ioProvider && field === 'componentId'}
-        onChange={(event) => onChange({ [field]: event.target.value })} />
-    </label>
-  );
+      <input aria-label={fieldLabel} value={draft[field]} title={help}
+        placeholder={addDevice && field === 'sourceId' ? `${draft.componentId}_source` : undefined}
+        disabled={disabled} readOnly={field === 'componentId'} aria-invalid={error !== null}
+        className={field === 'componentId' ? 'io-signal-readonly' : undefined}
+        onChange={(event) => onChange({ [field]: event.target.value })}
+        onBlur={field === 'signalName' && !addDevice ? () => {
+          if (draft.signalName === '') return;
+          onChange(patchForText('signalName', draft.signalName));
+        } : undefined} />
+    </label>;
+    return <IoDraftTextField key={field} label={name} ariaLabel={fieldLabel} value={draft[field] as string} help={help} disabled={disabled}
+      readOnly={field === 'componentId'} validate={(value) => outputFieldProblem(field, value)}
+      onCommit={(value) => onChange(patch(value))} />;
+  };
   return (
     <fieldset className="deployment-gripper-editor">
       <legend>{label} · bool output</legend>
       <div className="deployment-focused-form-grid">
         {text('Signal name', 'signalName')}
-        {text('Component', 'componentId')}
-        {text('Target', 'targetId')}
+        {text('Component', 'componentId', 'This signal belongs to this component.')}
+        {addDevice || targetOptions.length === 0 ? text('Target', 'targetId', 'The command target that carries this signal.') : <ChoiceField label={label} name="Target" value={draft.targetId}
+          options={targetOptions} disabled={disabled} readOnly={targetOptions.length === 1 && draft.targetId === targetOptions[0]}
+          onChange={(value) => onChange({ targetId: value })} />}
         {text('Resource role', 'resourceRoleId', 'The Program resource role this signal serves on the target.')}
         <DirectionField label={label} value="output" disabled={disabled} onDirection={onDirection} />
         <label className="deployment-focused-field">
@@ -279,9 +498,11 @@ export function IoSignalOutputFields({
           : `A write completes when the source accepts it (${draft.profile === 'mock_output' ? 'the Mock acknowledges it' : 'the SetBool response'}), not on the physical effect.`}
         {' '}To read the state back, declare a separate input signal.
       </p>
+      {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
       {onRemove !== undefined && (
         <div className="button-row">
-          <button type="button" disabled={disabled} onClick={onRemove}>Remove signal</button>
+          <button type="button" disabled={disabled || removeDisabledReason !== null}
+            title={removeDisabledReason ?? undefined} onClick={onRemove}>Remove signal</button>
         </div>
       )}
     </fieldset>
@@ -292,8 +513,13 @@ export function IoSignalInputFields({
   index,
   draft,
   disabled,
-  ioProvider = false,
   geometricContactRobots = [],
+  targetOptions = [],
+  sceneResourceIds = [],
+  outputSignalNames = [],
+  addDevice = false,
+  removeDisabledReason = null,
+  error = null,
   onChange,
   onDirection,
   onRemove,
@@ -305,6 +531,12 @@ export function IoSignalInputFields({
   ioProvider?: boolean;
   /** Motion robots used to select a dynamic geometric-contact source. */
   geometricContactRobots?: readonly GeometricContactRobotOption[];
+  targetOptions?: readonly string[];
+  sceneResourceIds?: readonly string[];
+  outputSignalNames?: readonly string[];
+  addDevice?: boolean;
+  removeDisabledReason?: string | null;
+  error?: string | null;
   onChange: (patch: Partial<IoSignalInputDraft>) => void;
   onDirection: (direction: 'input' | 'output') => void;
   onRemove?: () => void;
@@ -314,31 +546,55 @@ export function IoSignalInputFields({
   const liveness = inputLivenessMode(draft);
   const robotOptions = [...geometricContactRobots]
     .sort((left, right) => left.componentId.localeCompare(right.componentId));
-  const text = (name: string, field: keyof IoSignalInputDraft, help?: string) => (
-    <label className="deployment-focused-field" key={field}>
+  const patchForText = (field: keyof IoSignalInputDraft, value: string): Partial<IoSignalInputDraft> => ({
+    [field]: value,
+    ...(field === 'signalName' && !addDevice && value !== '' ? {
+      ...(draft.resourceRoleId === '' ? { resourceRoleId: value } : {}),
+      ...(draft.sourceId === '' && draft.componentId !== '' ? { sourceId: `${draft.componentId}.${value}` } : {}),
+    } : {}),
+  });
+  const text = (name: string, field: keyof IoSignalInputDraft, help?: string) => {
+    const fieldLabel = `${label} ${name}`;
+    const patch = (value: string) => patchForText(field, value);
+    if (addDevice) return <label className="deployment-focused-field" key={field}>
       <span>{name}</span>
-      <input aria-label={`${label} ${name}`} value={draft[field] as string} title={help}
-        disabled={disabled} readOnly={ioProvider && field === 'componentId'}
-        onChange={(event) => onChange({ [field]: event.target.value })} />
-    </label>
-  );
-  const number = (name: string, field: keyof IoSignalInputDraft, unit: string, help?: string) => (
-    <label className="deployment-focused-field" key={field}>
-      <span>{name}</span>
-      <span className="deployment-number-with-unit">
-        <input aria-label={`${label} ${name}`} inputMode="decimal" value={draft[field] as string}
+      <input aria-label={fieldLabel} value={draft[field] as string} title={help}
+        placeholder={addDevice && field === 'sourceId' ? `${draft.componentId}_source` : undefined}
+        disabled={disabled} readOnly={field === 'componentId'} aria-invalid={error !== null}
+        className={field === 'componentId' ? 'io-signal-readonly' : undefined}
+        onChange={(event) => onChange({ [field]: event.target.value })}
+        onBlur={field === 'signalName' && !addDevice ? () => {
+          if (draft.signalName === '') return;
+          onChange(patchForText('signalName', draft.signalName));
+        } : undefined} />
+    </label>;
+    return <IoDraftTextField key={field} label={name} ariaLabel={fieldLabel} value={draft[field] as string} help={help} disabled={disabled}
+      readOnly={field === 'componentId'} validate={(value) => inputFieldProblem({ ...draft, ...patch(value) }, field, value)}
+      onCommit={(value) => onChange(patch(value))} />;
+  };
+  const number = (name: string, field: keyof IoSignalInputDraft, unit: string, help?: string) => {
+    const fieldLabel = `${label} ${name}`;
+    if (addDevice) return <label className="deployment-focused-field" key={field}>
+      <span>{name}</span><span className="deployment-number-with-unit">
+        <input aria-label={fieldLabel} inputMode="decimal" value={draft[field] as string}
           disabled={disabled} title={help} onChange={(event) => onChange({ [field]: event.target.value })} />
         <small>{unit}</small>
       </span>
-    </label>
-  );
+    </label>;
+    return <IoDraftTextField key={field} label={name} ariaLabel={fieldLabel} value={draft[field] as string} help={help} disabled={disabled}
+      inputMode="decimal" unit={unit}
+      validate={(value) => inputFieldProblem({ ...draft, [field]: value }, field, value)}
+      onCommit={(value) => onChange({ [field]: value })} />;
+  };
   return (
     <fieldset className="deployment-gripper-editor">
       <legend>{label} · bool input</legend>
       <div className="deployment-focused-form-grid">
         {text('Signal name', 'signalName')}
-        {text('Component', 'componentId')}
-        {text('Target', 'targetId')}
+        {text('Component', 'componentId', 'This signal belongs to this component.')}
+        {addDevice || targetOptions.length === 0 ? text('Target', 'targetId', 'The command target that carries this signal.') : <ChoiceField label={label} name="Target" value={draft.targetId}
+          options={targetOptions} disabled={disabled} readOnly={targetOptions.length === 1 && draft.targetId === targetOptions[0]}
+          onChange={(value) => onChange({ targetId: value })} />}
         {text('Resource role', 'resourceRoleId', 'The Program resource role this signal serves on the target.')}
         <DirectionField label={label} value="input" disabled={disabled} onDirection={onDirection} />
         <label className="deployment-focused-field">
@@ -385,10 +641,12 @@ export function IoSignalInputFields({
                 </select>
               </label>
             ) : (
-              text('Robot component id', 'robotComponentId', 'The motion robot whose Active TCP is followed.')
+              text('Robot component id', 'robotComponentId', 'The motion robot used by this contact input.')
             )}
-            {text('Target Scene resource', 'targetSceneResourceId',
-              'Exact logical Scene resource id whose current collision shapes are queried.')}
+            {sceneResourceIds.length === 0
+              ? text('Target Scene resource', 'targetSceneResourceId', 'The object in the cell Scene that this input checks for contact.')
+              : <ChoiceField label={label} name="Target Scene resource" value={draft.targetSceneResourceId}
+                options={sceneResourceIds} disabled={disabled} onChange={(value) => onChange({ targetSceneResourceId: value })} />}
           </>
         )}
         {draft.profile === 'mock' ? (
@@ -406,8 +664,10 @@ export function IoSignalInputFields({
               <input type="checkbox" aria-label={`${label} Echo a Mock output`} checked={draft.echoEnabled}
                 disabled={disabled} onChange={(event) => onChange({ echoEnabled: event.target.checked })} />
             </label>
-            {draft.echoEnabled && text('Output signal name', 'echoOutputSignalName',
-              'Name of a Mock output on this I/O device.')}
+            {draft.echoEnabled && (outputSignalNames.length === 0
+              ? text('Output signal name', 'echoOutputSignalName', 'The Mock output that this input follows.')
+              : <ChoiceField label={label} name="Output signal name" value={draft.echoOutputSignalName}
+                options={outputSignalNames} disabled={disabled} onChange={(value) => onChange({ echoOutputSignalName: value })} />)}
             {draft.echoEnabled && number('Echo delay', 'echoDelayMs', 'ms',
               'The input follows the output after this delay.')}
           </>
@@ -423,16 +683,54 @@ export function IoSignalInputFields({
             : 'provider validity only; no sample age applies.'}
         {' '}Transitions are sampled only.
       </p>
+      {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
       {draft.profile === 'geometric_contact' && (
-        <p className="field-help" data-geometric-contact-note>
-          Derived read-only input. Runtime reads the selected robot&apos;s current Active TCP at each evaluation and
-          uses the contact bodies declared for that TCP&apos;s owner with the selected Scene resource; neither is copied
-          into the Program. No Active TCP, no contact bodies declared for its owner, an uncarried TCP tool, or
-          missing, stale, busy or inconclusive geometry makes the input unavailable, never false. A maximum age
-          below runtime production latency can make the input stale. Contact bodies must move with the robot;
-          bodies static relative to its motion group produce contact_bodies_static (unavailable, never false).
-          Manual and timed Mock writes do not apply.
-        </p>
+        <>
+          <p className="field-help" data-geometric-contact-note>
+            This input is true while the selected robot&apos;s contact bodies touch the selected Scene resource, checked
+            against live geometry. If ManyForge can&apos;t make the check, the input is unavailable, never false. Contact
+            bodies are the collision shapes on the robot, or on the mounted tool, that owns its Active TCP (the tool
+            center point currently selected for that robot); a Scene resource is a named object in the cell&apos;s Scene.
+          </p>
+          <details className="field-help">
+            <summary>How geometric contact works</summary>
+            <p>
+              At every sample, ManyForge reads the current Active TCP and collision geometry. A Program may read this
+              signal, but it does not store those live values or the contact result.
+            </p>
+            <p>A live unavailable sample uses <code>io_source_unavailable</code>; its <code>reason</code> says why:</p>
+            <ul>
+              <li><code>active_tcp_unavailable</code>: the robot has no current Active TCP.</li>
+              <li><code>active_tcp_unknown</code>: the current Active TCP is not in this robot&apos;s TCP list.</li>
+              <li><code>tcp_tool_not_mounted</code>: the TCP&apos;s tool is not mounted on this robot.</li>
+              <li><code>active_tcp_contact_bodies_unavailable</code>: no contact bodies are declared for
+                the Active TCP&apos;s component.</li>
+              <li>
+                <code>runtime_motion_endpoint_body_unresolved</code>, <code>runtime_motion_endpoint_invalid</code>,
+                <code>runtime_motion_endpoint_body_invalid</code>,
+                <code>runtime_collision_body_alias_table_invalid</code>, or
+                <code>runtime_collision_body_alias_unresolved</code>: the runtime cannot identify or
+                validate a contact body in the robot&apos;s model.
+              </li>
+              <li><code>observed_state_missing_or_stale</code>: current robot or tool positions needed
+                for the check are missing or past their freshness limit.</li>
+              <li><code>collision_geometry_missing_or_stale</code>: current collision geometry for
+                the robot or Scene resource is missing or stale.</li>
+              <li><code>collision_geometry_unresolved</code>: ManyForge cannot match or prepare the
+                contact bodies and Scene resource geometry for a complete check.</li>
+              <li><code>collision_query_busy</code>: the previous contact check is still running.</li>
+              <li><code>collision_query_inconclusive</code>: the geometry query cannot confirm
+                contact or no contact.</li>
+              <li><code>contact_bodies_static</code>: at least one contact body is static relative to
+                this robot&apos;s motion group, so it does not move with the robot.</li>
+            </ul>
+            <p>
+              Before the first sample the signal has no value. A valid sample becomes stale when it
+              is older than Maximum sample age; setting that age below normal sample-production time
+              can make it stale. This input is read-only: manual and timed Mock writes do not apply.
+            </p>
+          </details>
+        </>
       )}
       {liveness === 'change_only' && (
         <p className="inline-message severity-warning" data-io-liveness-warning>{IO_LIVENESS_UNPROVEN_WARNING}</p>
@@ -448,7 +746,8 @@ export function IoSignalInputFields({
       </details>
       {onRemove !== undefined && (
         <div className="button-row">
-          <button type="button" disabled={disabled} onClick={onRemove}>Remove signal</button>
+          <button type="button" disabled={disabled || removeDisabledReason !== null}
+            title={removeDisabledReason ?? undefined} onClick={onRemove}>Remove signal</button>
         </div>
       )}
     </fieldset>

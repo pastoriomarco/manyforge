@@ -30,20 +30,24 @@ static_assert(!std::is_aggregate_v<BuildQualifiedAssistantInstrumentRegistry>);
 [[nodiscard]] std::string
 mode(std::string_view mode_id = "inspect",
      std::string_view tools = "\"status_read\",\"scene_inspect\"",
-     std::string_view skills = "", std::string_view nodes = "",
+     std::string_view skills = "", std::string_view stuck_loop_recovery = "",
      std::string_view session_kind = "null",
      std::string_view approval_mode = "null",
      std::string_view review_policy = "not_required") {
   return "\"" + std::string(mode_id) + "\":{" + "\"enabled\":true," +
          "\"description\":\"Bounded mode\"," +
-         "\"provider_alias\":\"direct_local\"," +
-         "\"model_endpoint_alias\":\"primary_model\"," + "\"grant_policy\":{" +
+         "\"assistant_component_id\":\"@assistant@\"," +
+         "\"model_endpoint_alias\":\"primary_model\"," +
+         "\"runs_in\":[\"no_program_active\"]," + "\"grant_policy\":{" +
          "\"session_kind\":" + std::string(session_kind) + "," +
          "\"approval_mode\":" + std::string(approval_mode) + "," +
          "\"review_policy\":\"" + std::string(review_policy) + "\"}," +
          "\"catalog\":{" + "\"skills\":[" + std::string(skills) + "]," +
-         "\"tools\":[" + std::string(tools) + "]," + "\"nodes\":[" +
-         std::string(nodes) + "]}}";
+         "\"tools\":[" + std::string(tools) + "]}" +
+         (stuck_loop_recovery.empty()
+              ? std::string()
+              : ",\"stuck_loop_recovery\":" + std::string(stuck_loop_recovery)) +
+         "}";
 }
 
 [[nodiscard]] std::string
@@ -72,7 +76,7 @@ model_alias(std::string request_contract = model_request_contract()) {
 
 [[nodiscard]] std::string
 assistant_document(std::string modes = mode(),
-                   std::string_view provider_kind = "direct",
+                   std::string_view assistant_component_id = "assistant",
                    std::string_view assistant_extra = "",
                    std::string_view prompt_templates =
                        "\"choose_object_v1\":{"
@@ -89,11 +93,15 @@ assistant_document(std::string modes = mode(),
          "\"redact_argument_values\":true}," +
          "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
          "\"model_endpoint_aliases\":{" + model_alias() + "}," +
-         "\"provider_aliases\":{" + "\"direct_local\":{" +
-         "\"provider_kind\":\"" + std::string(provider_kind) + "\"," +
-         "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," +
-         "\"modes\":{" + std::move(modes) + "}" + std::string(assistant_extra) +
-         "}}";
+         "\"modes\":{" +
+         [&] {
+           // Each mode names the document's assistant component.
+           for (auto at = modes.find("@assistant@"); at != std::string::npos;
+                at = modes.find("@assistant@"))
+             modes.replace(at, 11, assistant_component_id);
+           return modes;
+         }() +
+         "}" + std::string(assistant_extra) + "}}";
 }
 
 [[nodiscard]] std::string
@@ -104,8 +112,7 @@ model_query_document(std::string_view prompt_templates =
                          "\"variables\":{\"object_id\":\"string\"},"
                          "\"response_contract\":{"
                          "\"response_mode\":\"json_object\"}}",
-                     std::string model_endpoint_aliases = model_alias(),
-                     std::string_view provider_aliases = "") {
+                     std::string model_endpoint_aliases = model_alias()) {
   return std::string(
              "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
          "\"audit_policy\":{"
@@ -114,7 +121,6 @@ model_query_document(std::string_view prompt_templates =
          "\"redact_argument_values\":true}," +
          "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
          "\"model_endpoint_aliases\":{" + std::string(model_endpoint_aliases) +
-         "}," + "\"provider_aliases\":{" + std::string(provider_aliases) +
          "}," + "\"modes\":{}}}";
 }
 
@@ -181,6 +187,27 @@ TEST(AssistantSettingsCodec,
                AssistantSettingsCodecError);
 }
 
+TEST(AssistantSettingsCodec, ModeRunStatesAreAClosedSortedNonEmptySet) {
+  const auto with_runs_in = [](std::string_view runs_in) {
+    auto modes = mode();
+    modes.replace(modes.find("[\"no_program_active\"]"), 21, runs_in);
+    return assistant_document(modes);
+  };
+  const auto qualified =
+      qualify_assistant_settings(decode(assistant_document()));
+  ASSERT_EQ(qualified.value().modes.size(), 1U);
+  EXPECT_EQ(qualified.value().modes.front().runs_in,
+            (std::vector<core::AssistantModeRunState>{
+                core::AssistantModeRunState::kNoProgramActive}));
+  EXPECT_EQ(qualified.value().modes.front().assistant_component_id, "assistant");
+  expect_decode_error(with_runs_in("[]"), "runs in at least one cell state");
+  expect_decode_error(with_runs_in("[\"during_execution\"]"),
+                      "outside the closed registry");
+  expect_decode_error(
+      with_runs_in("[\"no_program_active\",\"no_program_active\"]"),
+      "sorted and unique");
+}
+
 TEST(AssistantSettingsCodec,
      ReadOnlyModeProducesDeterministicRetainedProjection) {
   const auto left = qualify_assistant_settings(
@@ -189,7 +216,7 @@ TEST(AssistantSettingsCodec,
   const auto right = qualify_assistant_settings(
       decode(assistant_document(
           mode("inspect", "\"alarms_read\",\"scene_inspect\",\"status_read\""),
-          "nemoclaw")));
+          "other_assistant")));
 
   ASSERT_TRUE(left.enabled());
   ASSERT_EQ(left.value().prompt_templates.size(), 1U);
@@ -205,7 +232,7 @@ TEST(AssistantSettingsCodec,
   EXPECT_EQ(left.retained_projection().canonical_json,
             canonical_json(left.normalized_projection()));
   EXPECT_NE(left.projection_digest(), right.projection_digest())
-      << "provider kind is retained semantic configuration";
+      << "the serving assistant component is retained semantic configuration";
 
   const auto verified =
       verify_retained_assistant_projection(left.normalized_projection());
@@ -240,7 +267,6 @@ TEST(AssistantSettingsCodec,
   EXPECT_EQ(request_contract.supported_image_transports.size(), 2U);
   EXPECT_EQ(request_contract.tool_call_family,
             core::AssistantToolCallFamily::kOpenAiChatTools);
-  EXPECT_TRUE(qualified.value().provider_aliases.empty());
   EXPECT_TRUE(is_sha256_digest(qualified.projection_digest().value()));
 
   const auto verified =
@@ -286,16 +312,8 @@ TEST(AssistantSettingsCodec,
   std::vector<std::string> read_only;
   std::vector<std::string> proposals;
   std::vector<std::string> draft_mutations;
-  std::size_t total_canonical_schema_bytes = 0U;
   for (const auto &tool : registry.value().tools) {
     ids.push_back(tool.tool_id);
-    total_canonical_schema_bytes += tool.canonical_input_schema.size();
-    EXPECT_EQ(tool.input_schema_digest.value(),
-              sha256_digest(tool.canonical_input_schema));
-    EXPECT_EQ(
-        canonical_json(
-            parse_strict_json_model_yaml(tool.canonical_input_schema).root()),
-        tool.canonical_input_schema);
     switch (tool.effect) {
     case core::AssistantToolEffect::kReadOnly:
       read_only.push_back(tool.tool_id);
@@ -307,10 +325,9 @@ TEST(AssistantSettingsCodec,
       draft_mutations.push_back(tool.tool_id);
       break;
     case core::AssistantToolEffect::kRuntimeMutating:
-      FAIL() << "N6-b2 must not restore runtime-mutating assistant tools";
+      FAIL() << "the settings codec must not restore runtime-mutating assistant tools";
     }
   }
-  EXPECT_LT(total_canonical_schema_bytes, 512U * 1024U);
   EXPECT_EQ(ids, (std::vector<std::string>{"alarms_read",
                                            "blackboard_draft_remove_keys",
                                            "blackboard_draft_remove_namespaces",
@@ -320,7 +337,9 @@ TEST(AssistantSettingsCodec,
                                            "deployment_capabilities_read",
                                            "history_read",
                                            "inspect_isaac_scene",
+                                           "program_draft_remove_contact_policies",
                                            "program_draft_remove_parameters",
+                                           "program_draft_upsert_contact_policies",
                                            "program_draft_upsert_parameters",
                                            "program_read",
                                            "program_validate",
@@ -347,37 +366,16 @@ TEST(AssistantSettingsCodec,
           "program_validate", "scene_inspect", "skills_read", "status_read"}));
   // Assistant edits land in the Draft through the tool callback only.
   EXPECT_TRUE(proposals.empty());
-  EXPECT_EQ(draft_mutations.size(), 18U);
+  EXPECT_EQ(draft_mutations.size(), 20U);
 
-  std::vector<std::string> node_ids;
-  for (const auto &node : registry.value().nodes) {
-    node_ids.push_back(node.node_id);
-  }
-  EXPECT_EQ(
-      node_ids,
-      (std::vector<std::string>{
-          "fallback", "gripper.command_position", "inverter", "logic.set_value",
-          "logic.wait_for_value", "motion.follow_cartesian_path",
-          "motion.move_to_joint_target", "motion.move_to_pose", "parallel",
-          "repeat", "retry", "scene.add_object", "scene.attach_carried_object",
-          "scene.detach_carried_object", "scene.remove_object",
-          "scene.update_object_pose", "scene.upsert_object", "sequence",
-          "simulation.reset", "simulation.set_entity_pose",
-          "simulation.set_state", "simulation.step", "timer"}));
-
-  const auto catalog = std::find_if(
-      registry.value().tools.begin(), registry.value().tools.end(),
-      [](const auto &tool) { return tool.tool_id == "catalog_read"; });
-  ASSERT_NE(catalog, registry.value().tools.end());
-  EXPECT_NE(catalog->canonical_input_schema.find("\"entry_ids\""),
-            std::string::npos);
-  EXPECT_EQ(catalog->canonical_input_schema.find("entryIds"),
-            std::string::npos);
+  // Descriptions and input schemas are built from the node catalog where
+  // the mode projection is built; the registry is identity and effect only.
+  EXPECT_EQ(registry.normalized_root().find_object_member("nodes"), nullptr);
 }
 
 TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
   expect_decode_error(
-      assistant_document(mode(), "direct", ",\"unexpected\":true"),
+      assistant_document(mode(), "assistant", ",\"unexpected\":true"),
       "unknown field 'unexpected'");
   expect_decode_error(
       assistant_document(mode("inspect", "\"status_read\",\"status_read\"")),
@@ -390,20 +388,6 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
   expect_decode_error(
       model_query_document("", model_alias()),
       "require at least one prompt template and model endpoint");
-  expect_decode_error(
-      model_query_document("\"choose_object_v1\":{"
-                           "\"version\":\"1\","
-                           "\"template_text\":\"Choose\","
-                           "\"variables\":{},"
-                           "\"response_contract\":{"
-                           "\"response_mode\":\"json_object\"}}",
-                           model_alias(),
-                           "\"direct_local\":{"
-                           "\"provider_kind\":\"direct\","
-                           "\"bridge_external_resource_alias\":"
-                           "\"assistant_bridge\"}"),
-      "provider aliases require at least one interactive "
-      "assistant mode");
   expect_decode_error(
       model_query_document(
           "\"choose_object_v1\":{"
@@ -424,7 +408,7 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
           "\"response_contract\":{\"response_mode\":\"tool_call\"}}"),
       "missing required field 'tool_name'");
   expect_decode_error(
-      assistant_document(mode(), "direct", "",
+      assistant_document(mode(), "assistant", "",
                          "\"choose_object_v1\":{"
                          "\"version\":\"1\","
                          "\"template_text\":\"Choose\","
@@ -463,13 +447,23 @@ TEST(AssistantSettingsCodec, EnforcesExactReservedModePolicies) {
   const auto composer = qualify_assistant_settings(
       decode(assistant_document(
           mode("composer-assistant", "\"program_read\",\"catalog_read\"", "",
-               "\"scene.add_object\"", "null", "null", "required"))));
+               "", "null", "null", "required"))));
   EXPECT_TRUE(composer.enabled());
-  expect_qualification_error(
+  EXPECT_TRUE(composer.value().modes.front().stuck_loop_recovery);
+  const auto without_recovery = qualify_assistant_settings(
+      decode(assistant_document(
+          mode("composer-assistant", "\"program_read\"", "", "false", "null",
+               "null", "required"))));
+  EXPECT_FALSE(without_recovery.value().modes.front().stuck_loop_recovery);
+  EXPECT_FALSE(verify_retained_assistant_projection(
+                   without_recovery.normalized_projection())
+                   .value()
+                   .modes.front()
+                   .stuck_loop_recovery);
+  expect_decode_error(
       assistant_document(mode("composer-assistant", "\"program_read\"", "",
-                              "\"add_collision_object\"", "null", "null",
-                              "required")),
-      "unresolved node ID 'add_collision_object'");
+                              "\"on\"", "null", "null", "required")),
+      "stuck_loop_recovery");
 
   const auto recovery = qualify_assistant_settings(
       decode(assistant_document(mode(
@@ -493,6 +487,122 @@ TEST(AssistantSettingsCodec, RetainedProjectionRejectsAnyTampering) {
                      CanonicalValue(CanonicalValue::Object{}));
   EXPECT_THROW((void)verify_retained_assistant_projection(bad_registry),
                AssistantSettingsCodecError);
+}
+
+TEST(AssistantSettingsCodec, ExperimentalReasoningSwitchIsOptionalAndRetained) {
+  const auto with = [](std::string_view value) {
+    std::string contract = model_request_contract();
+    contract.insert(1, "\"reasoning\":" + std::string(value) + ",");
+    return model_query_document(
+        "\"choose_object_v1\":{\"version\":\"1\","
+        "\"template_text\":\"Choose {{object_id}}\","
+        "\"variables\":{\"object_id\":\"string\"},"
+        "\"response_contract\":{\"response_mode\":\"json_object\"}}",
+        model_alias(contract));
+  };
+  const auto absent = qualify_assistant_settings(decode(model_query_document()));
+  EXPECT_FALSE(absent.value().model_endpoint_aliases.front().request_contract.reasoning);
+  const auto off = qualify_assistant_settings(decode(with("\"off\"")));
+  ASSERT_TRUE(off.value().model_endpoint_aliases.front().request_contract.reasoning);
+  EXPECT_FALSE(*off.value().model_endpoint_aliases.front().request_contract.reasoning);
+  EXPECT_EQ(verify_retained_assistant_projection(off.normalized_projection())
+                .projection_digest(),
+            off.projection_digest());
+  expect_decode_error(with("\"maybe\""), "reasoning must be on or off");
+}
+
+TEST(AssistantSettingsCodec, SamplingIsOptionalBoundedAndRetained) {
+  const auto with = [](std::string_view value) {
+    std::string contract = model_request_contract();
+    contract.insert(1, "\"sampling\":" + std::string(value) + ",");
+    return model_query_document(
+        "\"choose_object_v1\":{\"version\":\"1\","
+        "\"template_text\":\"Choose {{object_id}}\","
+        "\"variables\":{\"object_id\":\"string\"},"
+        "\"response_contract\":{\"response_mode\":\"json_object\"}}",
+        model_alias(contract));
+  };
+  const auto absent = qualify_assistant_settings(decode(model_query_document()));
+  EXPECT_FALSE(absent.value().model_endpoint_aliases.front().request_contract.sampling);
+  const auto set = qualify_assistant_settings(
+      decode(with("{\"temperature\":0.7,\"top_k\":20}")));
+  const auto& sampling =
+      set.value().model_endpoint_aliases.front().request_contract.sampling;
+  ASSERT_TRUE(sampling);
+  EXPECT_EQ(sampling->temperature, std::optional<double>(0.7));
+  EXPECT_FALSE(sampling->top_p);
+  EXPECT_EQ(sampling->top_k, std::optional<std::uint32_t>(20U));
+  EXPECT_EQ(verify_retained_assistant_projection(set.normalized_projection())
+                .projection_digest(),
+            set.projection_digest());
+  EXPECT_NO_THROW((void)decode(with("{\"temperature\":0}")));
+  expect_decode_error(with("{}"), "sampling must set at least one field");
+  expect_decode_error(with("{\"min_p\":0.1}"), "unknown field 'min_p'");
+  expect_decode_error(with("{\"temperature\":2.5}"), "from 0 to 2");
+  expect_decode_error(with("{\"temperature\":-0.1}"), "from 0 to 2");
+  expect_decode_error(with("{\"top_p\":0}"), "within its fixed bound");
+  expect_decode_error(with("{\"top_p\":1.5}"), "within its fixed bound");
+  expect_decode_error(with("{\"top_k\":0}"), "within its fixed bound");
+  expect_decode_error(with("{\"top_k\":1.5}"), "expected an integer");
+}
+
+TEST(AssistantSettingsCodec, ExperimentalCompactHistoryIsOptionalAndRetained) {
+  const auto with = [](std::string_view value) {
+    std::string composer = mode("composer-assistant", "\"program_read\"", "",
+                                "", "null", "null", "required");
+    composer.insert(composer.size() - 1,
+                    ",\"compact_history\":" + std::string(value));
+    return assistant_document(composer);
+  };
+  const auto absent = qualify_assistant_settings(decode(assistant_document(
+      mode("composer-assistant", "\"program_read\"", "", "", "null", "null",
+           "required"))));
+  EXPECT_FALSE(absent.value().modes.front().compact_history);
+  // Off is not encoded, so settings without the switch keep their identity.
+  EXPECT_EQ(canonical_json(absent.normalized_projection()).find("compact_history"),
+            std::string::npos);
+  const auto off = qualify_assistant_settings(decode(with("false")));
+  EXPECT_EQ(off.projection_digest(), absent.projection_digest());
+  const auto on = qualify_assistant_settings(decode(with("true")));
+  EXPECT_TRUE(on.value().modes.front().compact_history);
+  EXPECT_NE(on.projection_digest(), absent.projection_digest());
+  const auto retained =
+      verify_retained_assistant_projection(on.normalized_projection());
+  EXPECT_TRUE(retained.value().modes.front().compact_history);
+  EXPECT_EQ(retained.projection_digest(), on.projection_digest());
+  expect_decode_error(with("\"on\""), "compact_history");
+}
+
+TEST(AssistantSettingsCodec, ExperimentalConstrainedRegenerationIsOptionalAndRetained) {
+  const auto with = [](std::string_view fields) {
+    std::string composer = mode("composer-assistant", "\"program_read\"", "",
+                                "", "null", "null", "required");
+    composer.insert(composer.size() - 1, std::string(fields));
+    return assistant_document(composer);
+  };
+  const auto absent = qualify_assistant_settings(decode(with("")));
+  EXPECT_FALSE(absent.value().modes.front().constrained_regeneration);
+  // Off is not encoded, so settings without the switch keep their identity.
+  EXPECT_EQ(canonical_json(absent.normalized_projection())
+                .find("constrained_regeneration"),
+            std::string::npos);
+  const auto off = qualify_assistant_settings(
+      decode(with(",\"constrained_regeneration\":false")));
+  EXPECT_EQ(off.projection_digest(), absent.projection_digest());
+  // Alone and next to compact_history (both encoded in sorted order).
+  for (const std::string_view fields :
+       {",\"constrained_regeneration\":true",
+        ",\"compact_history\":true,\"constrained_regeneration\":true"}) {
+    const auto on = qualify_assistant_settings(decode(with(fields)));
+    EXPECT_TRUE(on.value().modes.front().constrained_regeneration);
+    EXPECT_NE(on.projection_digest(), absent.projection_digest());
+    const auto retained =
+        verify_retained_assistant_projection(on.normalized_projection());
+    EXPECT_TRUE(retained.value().modes.front().constrained_regeneration);
+    EXPECT_EQ(retained.projection_digest(), on.projection_digest());
+  }
+  expect_decode_error(with(",\"constrained_regeneration\":\"on\""),
+                      "constrained_regeneration");
 }
 
 } // namespace

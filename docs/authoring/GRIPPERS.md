@@ -184,7 +184,7 @@ the dwell (for example to 3000) and Apply.
 ## When a gripper command completes
 
 A controlled gripper (a position gripper on a controller: the Mock lane's
-gripper controller, Isaac's GripperCommand transport, or the Real driver) is
+gripper controller, Isaac's ParallelGripperCommand transport, or the Real driver) is
 done when its controller reports the command done. `command_duration_s` with
 **Wait for command duration** (`wait_for_duration: true`) makes the node wait
 **longer** than that: until the duration has also passed since the command
@@ -202,15 +202,15 @@ with a position gripper set it. In a Pick or Place template,
 `tool_wait_for_duration` sets it on the template's gripper node, like
 `tool_command_duration_s`.
 
-If the controller's report doesn't come, the command fails after its result
-timeout (`gripper_result_timeout`):
+The node owns the command's deadline: `completion_timeout_s` (default 5 s;
+`tool_completion_timeout_s` in a Pick or Place template). If the gripper has
+not reported done (goal result or confirming signal) by then, the command
+fails with `gripper_result_timeout`:
 
-- controlled grippers: `gripper_result_timeout_s` in the component model's
-  lane row (5 s in the component template; the Robotiq examples use 15 s),
-  counted after `command_duration_s`;
-- pneumatic grippers: `delivery_result_timeout_s` on the gripper's row of the
-  Deployment's Current gripper configuration, default 1 s, for the output
-  write's delivery result.
+- controlled grippers: `command_duration_s` plus `completion_timeout_s`
+  (the Robotiq example Programs set 15 s);
+- pneumatic grippers: `completion_timeout_s` alone bounds the output write's
+  delivery result; the `command_duration_s` dwell follows it.
 
 **Stop.** A Stop sends no cancel when a controlled gripper's command is
 already done: the controller reported it reached the goal, the fingers are
@@ -246,7 +246,7 @@ tool has no controller manager of its own. Its launch
 (`isaac_gripper.launch.py`) publishes the tool's description. The tool's
 `lanes.isaac` row picks the transport (`gripper_transport`):
 
-- `ros_gripper_command` (Robotiq 2F-140): a GripperCommand action
+- `ros_gripper_command` (Robotiq 2F-140): a ParallelGripperCommand action
   `<controller>/gripper_cmd`, served by a bridge that the tool's launch also
   runs; its parameters are the lane's `gripper_bridges/<model>.yaml`, named
   by the row's `gripper_bridge`. The row also has

@@ -44,7 +44,7 @@ for _path in (ROOT / "manyforge_deployment/tools", ROOT, ROOT / "manyforge_behav
 BEHAVIOR = "manyforge_behavior"
 MAINTAINED = "manyforge_deployment/resources/maintained"
 DESCRIPTION = f"{MAINTAINED}/maintained_deployment_sources.v1.json"
-ASSISTANT_PROFILES = f"{MAINTAINED}/maintained_assistant_profiles.v1.json"
+ASSISTANT_PROFILES = f"{MAINTAINED}/maintained_assistant_profiles.v2.json"
 CATALOG_PY = f"{BEHAVIOR}/manyforge_behavior/catalog.py"
 NODE_CATALOG = f"{BEHAVIOR}/resources/node_catalog.yaml"
 SCHEMA_ROOT = "manyforge_deployment/resources/closed_schema"
@@ -276,15 +276,6 @@ def step_program_binding_transport(ctx: Context) -> None:
            *(["--check"] if not ctx.update else []), ctx=ctx)
 
 
-def step_assistant_registry(ctx: Context) -> None:
-    python("manyforge_deployment/tools/generate_assistant_instrument_registry.py",
-           *(["--check"] if not ctx.update else []),
-           "--catalog", ROOT / NODE_CATALOG,
-           "--assistant-profiles", ROOT / ASSISTANT_PROFILES,
-           "--output", ROOT / "manyforge_deployment/resources/assistant/"
-                              "assistant_instrument_registry_source.v1.json", ctx=ctx)
-
-
 def step_node_environment(ctx: Context) -> None:
     python(f"{BEHAVIOR}/scripts/generate_node_environment_manifest.py",
            *(["--check"] if not ctx.update else []), ctx=ctx)
@@ -293,7 +284,7 @@ def step_node_environment(ctx: Context) -> None:
 def step_program_revisions(ctx: Context) -> None:
     tool = ctx.tool("manyforge_program_revision")
     for path in sorted((ROOT / "examples").glob("*.program.yaml")):
-        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v2":
+        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v3":
             continue
         try:
             run(tool, "--check", "--input", path)
@@ -333,6 +324,9 @@ def step_scenario_pins(ctx: Context) -> None:
         manifest_path = project / sa.SCENARIO_MANIFEST
         manifest = load_strict_json_yaml_bytes(manifest_path.read_bytes(),
                                                source=rel(manifest_path))
+        if (manifest.get("api_version") != sa.SCENARIO_PROJECT_API_VERSION
+                or (project / "assignment.yaml").exists()):
+            raise Stale(f"Scenario {project.name} uses an unsupported project format; re-author it with direct references")
         values, digests = {}, {}
         for member, filename in sa.SCENARIO_PROJECT_MEMBERS.items():
             raw = (project / filename).read_bytes()
@@ -344,12 +338,14 @@ def step_scenario_pins(ctx: Context) -> None:
         pinned["content"] = {
             "deployment_present": values["deployment_draft"] is not None,
             "program_present": values["program_draft"] is not None,
-            "assignment_present": values["program_role_assignment"] is not None,
         }
+        content_digest = sa.scenario_content_digest(
+            values["program_draft"], values["deployment_draft"])
         pinned["saved_status"] = {**manifest["saved_status"],
-                                  "checked_content_digest": sa.scenario_content_digest(
-                                      values["program_draft"], values["deployment_draft"],
-                                      values["program_role_assignment"])}
+                                  "checked_content_digest": content_digest}
+        if (content_digest != manifest["saved_status"]["checked_content_digest"]
+                and pinned["saved_status"]["last_known_status"] == "ready"):
+            pinned["saved_status"]["last_known_status"] = "unknown"
         pinned["source_snapshot"], _ = sa._source_snapshot(values["deployment_draft"],
                                                            project_root=project)
         if pinned != manifest:
@@ -392,8 +388,6 @@ STEPS = (
          ("manyforge_headless_api/program_binding_transport.py",
           "manyforge_composer/frontend/src/types/programBindingTransport.generated.ts",
           "manyforge_composer/frontend/src/api/programBindingTransport.generated.ts")),
-    Step("assistant-registry", step_assistant_registry,
-         ("manyforge_deployment/resources/assistant/*.json",)),
     Step("node-environment", step_node_environment,
          (f"{BEHAVIOR}/resources/node_environment_manifest.yaml",)),
     Step("program-revisions", step_program_revisions, ("examples/*.program.yaml",),

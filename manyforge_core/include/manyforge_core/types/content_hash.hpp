@@ -9,8 +9,7 @@
 
 namespace manyforge::core {
 
-/// FNV-1a 64-bit content-hash primitives (spec §3.8.1, added by the
-/// kernel-architecture sprint P-2-impl-snapshot chunk).
+/// FNV-1a 64-bit content-hash primitives.
 ///
 /// This is NOT a cryptographic hash. It is retained only as a
 /// process-independent diagnostic fingerprint for legacy/local callers.

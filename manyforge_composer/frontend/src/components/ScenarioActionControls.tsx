@@ -14,6 +14,7 @@ import {
   type ScenarioAction,
 } from '../state/documentStates';
 import { ApplyImpact } from './ApplyImpact';
+import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { OverlayPanel } from './OverlayPanel';
 
 function actionTitle(action: ScenarioAction): string {
@@ -31,7 +32,7 @@ function actionTitle(action: ScenarioAction): string {
  * shown: whenever the Deployment differs it carries the action, together with
  * the Program, as one activation; otherwise the Program-only path does, which
  * never changes components or the Scene. Discard is Draft-only. A Deployment
- * Apply is the server's one Apply path (CONTRACTS §11): Preview, confirm the
+ * Apply is the server's one Apply path: Preview, confirm the
  * per-component impact, Apply; the server disables, applies and prepares.
  */
 export function ScenarioActionControls({
@@ -40,6 +41,7 @@ export function ScenarioActionControls({
   runtime,
   resetApply = null,
   localInvalidEdit = false,
+  authoringAdmissionAllowed = null,
 }: {
   program: ProgramWorkspaceController;
   deployment: DeploymentWorkspaceController;
@@ -47,12 +49,17 @@ export function ScenarioActionControls({
   /** Apply while a Program run exists Resets it first (one confirmation). */
   resetApply?: ResetApplyController | null;
   localInvalidEdit?: boolean;
+  /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
+  authoringAdmissionAllowed?: boolean | null;
 }) {
+  const authoringAdmissionTooltip = useAuthoringAdmissionTooltip();
   const [action, setAction] = useState<ScenarioAction | null>(null);
   const [applyRefusal, setApplyRefusal] = useState<string | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
   const programWorkspace = program.state.workspace;
   const deploymentWorkspace = deployment.workspace;
+  const authoringAdmissionBlock = authoringAdmissionAllowed === false
+    ? authoringAdmissionTooltip : null;
   const resetsRun = resetApply?.runExists === true;
 
   // Program reasons: the same order the Program controls always used.
@@ -68,9 +75,11 @@ export function ScenarioActionControls({
   const currentScenarioUnavailable = programApplyScenarioReason(runtime.state.currentScenario);
   const invalidEditReason = localInvalidEdit ? 'Review or discard the invalid local field edit first.' : null;
   const programReasons = {
-    apply: programActionUnavailableReason(programWorkspace, 'apply', programApplyCommon)
+    apply: authoringAdmissionBlock
+      ?? programActionUnavailableReason(programWorkspace, 'apply', programApplyCommon)
       ?? invalidEditReason ?? currentScenarioUnavailable,
-    revert: programActionUnavailableReason(programWorkspace, 'revert', programBusyReason ?? program.documentUnavailableReason),
+    revert: authoringAdmissionBlock
+      ?? programActionUnavailableReason(programWorkspace, 'revert', programBusyReason ?? program.documentUnavailableReason),
     discard: programActionUnavailableReason(programWorkspace, 'discard', programBusyReason ?? program.mutationUnavailableReason),
   };
   const programSavedDiffers = programWorkspace?.saved.available === true
@@ -84,8 +93,8 @@ export function ScenarioActionControls({
   // Deployment reasons: the same order the Deployment controls always used.
   const deploymentBusyReason = deployment.busy ? operationReason ?? 'Another Deployment operation is in progress.' : null;
   // While a run exists the Deployment Apply Resets a stopped or held run first
-  // (AUD-4, one shared Reset and Apply); a finished run awaiting Reset is
-  // reset by the server's Apply itself (R3).
+  // (one shared Reset and Apply); a finished run awaiting Reset is
+  // reset by the server's Apply itself.
   const deploymentResetsRun = resetApply?.deploymentRunReset === true;
   const deploymentApplyCommon = deploymentBusyReason ?? (resetApply === null || !resetApply.runExists
     ? deployment.documentUnavailableReason
@@ -95,9 +104,10 @@ export function ScenarioActionControls({
     ? programWorkspace.draft.diagnostics[0]?.message ?? 'Complete the Program Draft before Apply.'
     : null;
   const deploymentReasons = {
-    apply: deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deploymentApplyCommon)
+    apply: authoringAdmissionBlock
+      ?? deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deploymentApplyCommon)
       ?? invalidEditReason ?? programIncomplete,
-    revert: deploymentActionUnavailableReason(
+    revert: authoringAdmissionBlock ?? deploymentActionUnavailableReason(
       deploymentWorkspace, 'revert', deploymentBusyReason ?? deployment.documentUnavailableReason,
     ),
     discard: deploymentActionUnavailableReason(
@@ -242,7 +252,8 @@ export function ScenarioActionControls({
           <div className="dialog-copy compact-confirmation">
             <p>Replace the Draft and Applied with the Saved Scenario: {covers(routes.revert.target)}.</p>
             <div className="dialog-actions">
-              <button type="button" className="primary-action" disabled={routes.revert.target === null} onClick={confirm}>Revert to saved</button>
+              <button type="button" className="primary-action" disabled={routes.revert.target === null}
+                title={authoringAdmissionBlock ?? undefined} onClick={confirm}>Revert to saved</button>
             </div>
           </div>
         )}
@@ -271,7 +282,8 @@ export function ScenarioActionControls({
             {resetsRun && <ResetsRunWarning />}
             {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
-              <button type="button" className="primary-action" disabled={routes.apply.target === null} onClick={confirm}>
+              <button type="button" className="primary-action" disabled={routes.apply.target === null}
+                title={authoringAdmissionBlock ?? undefined} onClick={confirm}>
                 {resetsRun ? 'Reset run and Apply' : 'Apply'}
               </button>
             </div>
@@ -302,8 +314,8 @@ export function ScenarioActionControls({
                 type="button"
                 className="primary-action"
                 disabled={preview === null || confirmationReason !== null}
-                title={preview === null ? 'Previewing impact…' : deploymentApplyCommon
-                  ?? 'Apply the Deployment: affected components are disabled, applied and prepared again.'}
+                title={authoringAdmissionBlock ?? (preview === null ? 'Previewing impact…' : deploymentApplyCommon
+                  ?? 'Apply the Deployment: affected components are disabled, applied and prepared again.')}
                 onClick={confirmPreview}
               >{deployment.applying ? 'Applying Deployment' : reverting ? 'Confirm revert'
                 : previewResetsRun ? 'Reset run and Apply' : 'Confirm apply'}</button>

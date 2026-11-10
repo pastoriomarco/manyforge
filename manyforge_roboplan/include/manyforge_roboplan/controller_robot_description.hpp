@@ -14,8 +14,7 @@
 namespace manyforge::roboplan_backend {
 
 /// Controller `robot_description` generation for the ros2_control components
-/// ManyForge starts itself (design Q69; ROBOT_DESCRIPTION_GENERATION.md
-/// §1-§2). ROS-free and vendor-free: the input is the model bundle's ManyForge
+/// ManyForge starts itself. ROS-free and vendor-free: the input is the model bundle's ManyForge
 /// URDF text, retained binding facts and the adapter's hardware section, the
 /// output is URDF text. No vendor xacro is used.
 ///
@@ -46,7 +45,7 @@ struct MockGripperBinding final {
 
 /// The one generated `<ros2_control type="system">` element of a ros2_control
 /// component, on every lane (Mock, Isaac, Real): the adapter's hardware
-/// section (CONTRACTS §12) with the instance's joints.
+/// section with the instance's joints.
 struct Ros2ControlLane final {
   /// The generated element's `name` attribute.
   std::string hardware_component_name;
@@ -65,7 +64,7 @@ struct Ros2ControlLane final {
   std::optional<MockGripperBinding> gripper;
 };
 
-/// The GripperCommand bridge an Isaac tool (gripper-only) component runs in
+/// The ParallelGripperCommand bridge an Isaac tool (gripper-only) component runs in
 /// its own namespace when its profile's gripper transport is the action
 /// (`ros_gripper_command`). A direct-effort transport has none.
 struct IsaacGripperBridgeLane final {

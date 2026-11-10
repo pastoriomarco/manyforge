@@ -93,10 +93,17 @@ class ProcessContainedRoboPlanCandidateClient final : public IRoboPlanCandidateC
   [[nodiscard]] const RoboPlanCandidateBindingDTO& binding() const noexcept override;
   [[nodiscard]] core::Result<core::TrajectoryDTO> compute(
       const RoboPlanCandidateRequestDTO& request) override;
+  [[nodiscard]] core::Result<core::TrajectoryDTO> compute_with_target(
+      const RoboPlanCandidateRequestDTO& request,
+      std::optional<core::ControlledStateDTO>* target) override;
   [[nodiscard]] core::Result<std::vector<double>> solve_ik(
       const core::Pose3DTO& goal, const core::ResolvedFrameDTO& base_frame,
       const core::ResolvedFrameDTO& tcp_frame, const core::ControlledStateDTO& seed_state,
       double timeout_s) override;
+  [[nodiscard]] core::Result<std::vector<double>> solve_ik_diagnostic(
+      const core::Pose3DTO& goal, const core::ResolvedFrameDTO& base_frame,
+      const core::ResolvedFrameDTO& tcp_frame, const core::ControlledStateDTO& seed_state,
+      double timeout_s, const std::optional<core::TolerancesDTO>& tolerances) override;
   [[nodiscard]] bool requires_retained_projection() const noexcept override;
   [[nodiscard]] core::Result<void> select_retained_projection(
       const RoboPlanCandidateProjectionDTO& projection) override;

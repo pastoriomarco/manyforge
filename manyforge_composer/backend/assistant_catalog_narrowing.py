@@ -88,7 +88,7 @@ def _framed_digest(domain: str, version: str, value: Any) -> str:
     return raw_sha256_digest(preimage)
 
 
-def _narrow_schema(schema: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+def narrow_schema(schema: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
     disallowed = set(ORIENTATION_FIELDS) - allowed
     if not ({"xyzw", "rpy_deg"} & allowed):
         disallowed.add("orientation")
@@ -145,7 +145,7 @@ def resolve_assistant_catalog(
             continue
         tool = deepcopy(source)
         if policy:
-            tool["input_schema"] = _narrow_schema(tool["input_schema"], allowed)
+            tool["input_schema"] = narrow_schema(tool["input_schema"], allowed)
             tool["input_schema_hash"] = raw_sha256_digest(
                 canonical_json_bytes(tool["input_schema"])
             )
@@ -171,6 +171,7 @@ def resolve_assistant_catalog(
 __all__ = [
     "AssistantCatalogNarrowingError",
     "ORIENTATION_FIELDS",
+    "narrow_schema",
     "normalize_field_policy",
     "normalize_requested_tools",
     "resolve_assistant_catalog",

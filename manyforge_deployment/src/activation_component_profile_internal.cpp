@@ -27,10 +27,10 @@ constexpr std::string_view kDescriptionRelativePath =
     "manyforge_deployment/resources/maintained/"
     "maintained_deployment_sources.v1.json";
 constexpr std::string_view kAssistantProfilesApiVersion =
-    "manyforge.maintained_assistant_profiles.v1";
+    "manyforge.maintained_assistant_profiles.v2";
 constexpr std::string_view kAssistantProfilesRelativePath =
     "manyforge_deployment/resources/maintained/"
-    "maintained_assistant_profiles.v1.json";
+    "maintained_assistant_profiles.v2.json";
 constexpr std::size_t kMaximumModelFamilies = 128U;
 
 [[noreturn]] void fail(std::string message) {
@@ -141,6 +141,8 @@ parse_runtime_kind(const CanonicalValue &configuration,
     return ActivationRuntimeKind::kAiModel;
   if (value == "sensor")
     return ActivationRuntimeKind::kSensor;
+  if (value == "assistant")
+    return ActivationRuntimeKind::kAssistant;
   fail(std::string(label) + ".runtime_kind is unsupported: " + value);
 }
 
@@ -157,6 +159,8 @@ runtime_kind_text(ActivationRuntimeKind kind) noexcept {
     return "machine";
   case ActivationRuntimeKind::kSensor:
     return "sensor";
+  case ActivationRuntimeKind::kAssistant:
+    return "assistant";
   case ActivationRuntimeKind::kRos2Control:
     break;
   }
@@ -202,7 +206,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       parse_strict_json_model_yaml(read_description(capability_root));
   const auto &root = parsed.root();
   // `component_models`: the descriptors of models without a model family
-  // (machines and model-form I/O devices, CONTRACTS §16; sensors).
+  // (machines and model-form I/O devices; sensors).
   if (root.find_object_member("component_models") != nullptr)
     require_fields(root, {"api_version", "component_models", "model_families"},
                    "description");
@@ -286,11 +290,12 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
                                   "component model id");
       const auto &kind = text(member(descriptor.root(), "kind", "component model"),
                               "component model kind");
-      if (kind != "machine" && kind != "io_device" && kind != "sensor")
+      if (kind != "machine" && kind != "io_device" && kind != "sensor" &&
+          kind != "assistant")
         fail("component model " + model_id +
-             " must be a machine, an I/O device or a sensor");
-      // A sensor has no lanes (PC-1): one adapter row on every lane.
-      if (kind != "sensor")
+             " must be a machine, an I/O device, a sensor or an assistant");
+      // A sensor or an assistant has no lanes: one adapter row on every lane.
+      if (kind != "sensor" && kind != "assistant")
         static_cast<void>(object(member(descriptor.root(), "lanes", "component model"),
                                  "component model lanes"));
       if (!models.emplace(model_id, Model{std::string{}, descriptor.root()}).second)
@@ -318,7 +323,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
         return &row;
     return nullptr;
   };
-  // CONTRACTS §16 slot checks per owner, over its active and inactive members.
+  // Slot checks per owner, over its active and inactive members.
   {
     std::map<std::string, std::set<std::string, std::less<>>, std::less<>> roles;
     const auto check_member = [&](std::string_view component_id,
@@ -352,7 +357,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     for (const auto &inactive : intent.inactive_members)
       check_member(inactive.component_id, inactive.component_profile_id,
                    inactive.owner, inactive.role);
-    // AUD-5b revised: a machine's members come from its model and are
+    // A machine's members come from its model and are
     // always all present; a member is only deactivated, never removed.
     for (const auto &component : intent.components) {
       const auto machine = models.find(component.component_profile_id);
@@ -373,7 +378,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       }
     }
   }
-  // AUD-5: a machine's member model (its arm, an I/O bank) is placed only as
+  // A machine's member model (its arm, an I/O bank) is placed only as
   // a member of that machine, on every lane.
   for (const auto &[machine_id, machine] : models) {
     if (model_kind(machine.descriptor) != "machine") continue;
@@ -398,23 +403,25 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     const auto kind = found_model == models.end()
                           ? std::string{}
                           : model_kind(found_model->second.descriptor);
-    if (kind == "sensor") {
-      // A sensor: no owner, no model asset, no lane; one adapter row (the
-      // model's `adapter_row`).
+    if (kind == "sensor" || kind == "assistant") {
+      // A sensor or the assistant: no owner, no model asset, no lane; one
+      // adapter row (the model's `adapter_row`).
+      const auto lane_free = kind == "sensor" ? ActivationRuntimeKind::kSensor
+                                              : ActivationRuntimeKind::kAssistant;
       if (component.owner)
-        fail("component " + component.component_id + " selects sensor model " +
+        fail("component " + component.component_id + " selects " + kind + " model " +
              component.component_profile_id + " but is a member");
       const auto authored_kind = parse_runtime_kind(
           component.configuration,
           "component " + component.component_id + ".configuration");
-      if (authored_kind != ActivationRuntimeKind::kSensor)
+      if (authored_kind != lane_free)
         fail("component " + component.component_id + " selects " +
              std::string(runtime_kind_text(authored_kind)) +
-             " runtime configuration for sensor model " +
+             " runtime configuration for " + kind + " model " +
              component.component_profile_id);
       result.push_back(ActivationComponentProfile{
           component.component_id, component.component_profile_id, {}, {}, {},
-          ActivationRuntimeKind::kSensor, CanonicalValue(nullptr),
+          lane_free, CanonicalValue(nullptr),
           found_model->second.descriptor, std::nullopt, std::nullopt});
       continue;
     }
@@ -448,7 +455,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       if (const auto *ref = owner_row->configuration.find_object_member(
               "device_address_ref"))
         profile.owner_device_address_ref = *ref;
-      // CONTRACTS §16: on a lane where the machine has a process, a
+      // On a lane where the machine has a process, a
       // deactivated arm (the member with a description) still gives it its
       // lane row, description and joints.
       for (const auto &inactive : intent.inactive_members) {
@@ -527,7 +534,7 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     }
     // The authored lane picks one of the model's `lanes` rows; only a
     // pneumatic tool may name none (lane-free). A member runs on its
-    // owner's lane (CONTRACTS §16).
+    // owner's lane.
     const auto &descriptor = model->second.descriptor;
     const auto &lanes = member(descriptor, "lanes", "component model");
     const auto *owner_row =
@@ -631,7 +638,7 @@ void expand_activation_machine_members(
         row.emplace_back("transition_capability", CanonicalValue("sampled_only"));
         // Real: the bank reports its inputs once per stream period, so they
         // carry the model's sample-age budget; a stale input leaves a rule
-        // unable to watch it (CONTRACTS §7, §8).
+        // unable to watch it.
         Object freshness{{"mode", CanonicalValue("provider_validity")}};
         if (adapter)
           freshness = {
@@ -662,11 +669,27 @@ void expand_activation_machine_members(
   }
 }
 
-std::optional<ActivationAssistantProfile> resolve_activation_assistant_profile(
+ActivationAssistantProfiles resolve_activation_assistant_profiles(
     const std::filesystem::path &capability_root,
-    const ActivationDeploymentIntent &intent) {
-  if (!intent.assistant_profile_id.has_value())
-    return std::nullopt;
+    const ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &profiles) {
+  if (intent.components.size() != profiles.size())
+    throw std::invalid_argument("assistant component profile join differs");
+  std::optional<std::size_t> assistant;
+  for (std::size_t index = 0; index != profiles.size(); ++index) {
+    if (profiles[index].runtime_kind != ActivationRuntimeKind::kAssistant)
+      continue;
+    // One chat per cell (the AI tab has one).
+    if (assistant)
+      throw core::TypedError(
+          "assistant_component_duplicate",
+          "Activation component profiles: assistant_component_duplicate: " +
+              intent.components[index].component_id + " is a second assistant component (" +
+              intent.components[*assistant].component_id + " is the first)",
+          {{"component_id", intent.components[index].component_id}});
+    assistant = index;
+  }
+  if (!intent.assistant_profile_id && !assistant) return {};
   const auto parsed = parse_strict_json_model_yaml(
       read_description(capability_root, kAssistantProfilesRelativePath));
   const auto &root = parsed.root();
@@ -675,21 +698,49 @@ std::optional<ActivationAssistantProfile> resolve_activation_assistant_profile(
   if (text(member(root, "api_version", "assistant profiles"),
            "assistant profiles.api_version") != kAssistantProfilesApiVersion)
     fail("assistant profiles have an unsupported api_version");
-  for (const auto &row : array(member(root, "profiles", "assistant profiles"),
-                               "assistant profiles.profiles")) {
-    if (text(member(row, "profile_id", "assistant profile"),
-             "assistant profile.profile_id") != *intent.assistant_profile_id)
-      continue;
-    const auto &mode_profile_id =
-        member(row, "mode_profile_id", "assistant profile");
-    if (mode_profile_id.is_null())
-      return ActivationAssistantProfile{row, CanonicalValue(Object{})};
-    return ActivationAssistantProfile{
-        row, member(member(root, "mode_profiles", "assistant profiles"),
-                    text(mode_profile_id, "assistant profile.mode_profile_id"),
-                    "assistant profiles.mode_profiles")};
+  const auto find = [&](const std::string &profile_id) {
+    for (const auto &row : array(member(root, "profiles", "assistant profiles"),
+                                 "assistant profiles.profiles")) {
+      if (text(member(row, "profile_id", "assistant profile"),
+               "assistant profile.profile_id") != profile_id)
+        continue;
+      const auto &mode_profile_id =
+          member(row, "mode_profile_id", "assistant profile");
+      if (mode_profile_id.is_null())
+        return ActivationAssistantProfile{row, CanonicalValue(Object{})};
+      return ActivationAssistantProfile{
+          row, member(member(root, "mode_profiles", "assistant profiles"),
+                      text(mode_profile_id, "assistant profile.mode_profile_id"),
+                      "assistant profiles.mode_profiles")};
+    }
+    fail("assistant profile is unknown: " + profile_id);
+  };
+  ActivationAssistantProfiles result;
+  if (intent.assistant_profile_id)
+    result.runtime = find(*intent.assistant_profile_id);
+  if (assistant) {
+    const auto &component = intent.components[*assistant];
+    const auto label = "component " + component.component_id;
+    const auto &settings = member(component.configuration, "runtime_configuration",
+                                  label + ".configuration");
+    require_fields(settings, {"assistant_profile_id", "model_component_id"},
+                   label + ".runtime_configuration");
+    auto chat = find(text(member(settings, "assistant_profile_id", label),
+                          label + ".assistant_profile_id"));
+    if (object(chat.modes, "assistant modes").empty())
+      throw core::TypedError(
+          "assistant_profile_has_no_chat_mode",
+          "Activation component profiles: assistant_profile_has_no_chat_mode: " +
+              component.component_id + " selects assistant profile " +
+              text(member(settings, "assistant_profile_id", label), "assistant_profile_id") +
+              ", which has no chat mode",
+          {{"component_id", component.component_id}});
+    result.chat = ActivationAssistantChat{
+        component.component_id,
+        text(member(settings, "model_component_id", label), label + ".model_component_id"),
+        std::move(chat)};
   }
-  fail("assistant profile is unknown: " + *intent.assistant_profile_id);
+  return result;
 }
 
 } // namespace manyforge::deployment::detail

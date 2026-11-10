@@ -47,4 +47,10 @@ struct RoboPlanSceneInput final {
 [[nodiscard]] std::shared_ptr<roboplan::Scene> make_roboplan_scene(
     RoboPlanSceneInput input);
 
+/// Request-local diagnostic scene with retained kinematics and no collision pairs.
+[[nodiscard]] std::shared_ptr<roboplan::Scene> make_collision_disabled_scene(
+    const roboplan::Scene &source, const std::string &scene_name,
+    const std::vector<RoboPlanJointLimitInput> &joint_limits,
+    const std::string &srdf_xml);
+
 }  // namespace manyforge::roboplan_backend

@@ -15,8 +15,8 @@
 
 namespace manyforge::roboplan_backend {
 
-/// The generic launch generator of every ros2_control component (CONTRACTS
-/// §12; plan "Vendor driver configuration", startup step 3). ROS-free and
+/// The generic launch generator of every ros2_control component.
+/// ROS-free and
 /// vendor-free: the adapter's `LaunchContribution` (from the model row and its
 /// vendor or lane folder) plus the instance values (namespace, the address
 /// from the site settings, joints, initial pose, the operator Stop's
@@ -31,7 +31,7 @@ public:
   using std::invalid_argument::invalid_argument;
 };
 
-/// Q66: the host's fixed controller manager of one controllable component.
+/// The host's fixed controller manager of one controllable component.
 [[nodiscard]] std::string
 controller_runtime_namespace(std::string_view controllable_component_id);
 inline constexpr std::string_view kControllerManagerNodeName =
@@ -52,6 +52,18 @@ struct ControllerLaneRates final {
 /// The cadence of a controllers file; absent when it has no arm controller.
 [[nodiscard]] std::optional<ControllerLaneRates>
 controller_lane_rates(std::string_view controllers_yaml);
+
+/// The command interfaces the controllers file's one controller claims
+/// (`command_interfaces`, flow or block list); empty when none is claimed.
+[[nodiscard]] std::vector<std::string>
+controller_command_interfaces(std::string_view controllers_yaml);
+
+/// Stock JTC subscribes to `~/speed_scaling_input` only when it claims a
+/// position command interface and no velocity, acceleration or effort one
+/// (ros2_controllers 6.10 `JointTrajectoryController::on_configure`). A lane
+/// whose controller claims anything else cannot apply a runtime scale.
+[[nodiscard]] bool
+jtc_accepts_speed_scaling(const std::vector<std::string> &command_interfaces);
 
 /// One configuration-scoped stock writer (`__reset_writer__`) serving
 /// `reset_position` (Mock, Isaac). Its topic is never reused for a different
@@ -98,7 +110,7 @@ struct LaunchInstance final {
   /// Ordered arm joints (its controller profile's `joint_names`); empty for
   /// a tool.
   std::vector<std::string> arm_joint_names;
-  /// CONTRACTS §16: the machine's process with its arm deactivated. The arm's
+  /// The machine's process with its arm deactivated. The arm's
   /// joints stay in the description (the hardware needs them) but no arm
   /// controller is configured or loaded (the contribution's controllers have
   /// none); the hardware is left as the contribution starts it. Its frames
@@ -111,13 +123,13 @@ struct LaunchInstance final {
   /// they seed the hardware state. Empty for hardware that reports measured
   /// state.
   std::vector<double> initial_joint_positions_rad;
-  /// Q48: the Deployment's operator Stop per-joint maximum deceleration, by
+  /// The Deployment's operator Stop per-joint maximum deceleration, by
   /// model source joint. Required for every arm joint.
   std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2;
   /// The device address from the site settings (`${address}`); empty when
   /// the contribution names none.
   std::string address;
-  /// Q82: the retained deployment frame prefix, passed literally.
+  /// The retained deployment frame prefix, passed literally.
   std::string frame_prefix;
   /// Exact deployment::derive_component_runtime_identity of this component;
   /// required by a `__reset_writer__`.
@@ -128,7 +140,7 @@ struct LaunchInstance final {
 /// kIsaac: the Isaac adapter's own launches. kSimulatedPlc, kPoseSource,
 /// kAiModel: their own processes; none of these is produced here.
 /// kComponent: a component's own process, started by its adapter family
-/// through the host's component process launcher (CONTRACTS §6).
+/// through the host's component process launcher.
 enum class ControllerLaunchLane {
   kRos2Control,
   kIsaac,
@@ -159,6 +171,8 @@ struct ControllerLaunchArtifacts final {
   /// A tool's gripper controller.
   std::optional<std::string> gripper_controller_name;
   std::optional<ControllerLaneRates> rates;
+  /// The arm controller's claimed command interfaces, as written.
+  std::vector<std::string> arm_command_interfaces;
   std::string frame_prefix;
   std::optional<MockResetPositionTarget> mock_reset_position;
   /// With driver parameters: its path and the `sha256:<hex>` of its bytes.

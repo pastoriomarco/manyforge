@@ -12,7 +12,7 @@ using namespace manyforge::core;
 [[nodiscard]] OperationIntentDTO valid_motion_operation() {
   MotionParticipantIntentDTO motion{
       MoveId("move.pick"),
-      FrameRoleId("base"),
+      {ControllableComponentId("robot"), FrameRoleId("base")},
       CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
@@ -36,7 +36,7 @@ using namespace manyforge::core;
       GraphRevision("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
       RetainedBundleId("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
       std::nullopt,
-      {OperationParticipantIntentDTO{ComponentRoleId("robot"), TargetRoleId("arm"),
+      {OperationParticipantIntentDTO{{ControllableComponentId("robot"), CommandTargetId("arm")},
                                      CapabilityId("planning.motion.joint_goal"),
                                      ActionSpanDTO{ActionSource::kProgramNode, "attempt.1", "run.1",
                                                    "root/move", "attempt.1", ""},
@@ -72,7 +72,7 @@ TEST(OperationIntentTest, RejectsDuplicateSourceJointNames) {
 }
 
 TEST(OperationIntentTest, MotionClearanceIsOptionalAndBounded) {
-  // M6 decision 16: a move's own collision clearance, in [0, 0.05] m.
+  // A move's own collision clearance, in [0, 0.05] m.
   for (const double admitted : {0.0, 0.0005, 0.05}) {
     auto operation = valid_motion_operation();
     std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).clearance_m =
@@ -93,7 +93,7 @@ TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {
   auto operation = valid_motion_operation();
   operation.request_context.request_id = RequestId("request.command.1");
   operation.participants.front() = OperationParticipantIntentDTO{
-      ComponentRoleId("robot"), TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
+      {ControllableComponentId("robot"), CommandTargetId("gripper")}, CapabilityId("tool.gripper.command"),
       std::nullopt,
       CapabilityCommandIntentDTO{
           CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -137,7 +137,7 @@ TEST(OperationIntentTest, RejectsUnknownAdapterAttributionEnum) {
 TEST(OperationIntentTest, RejectsAbsoluteMotionWithRelativeReference) {
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
-  motion.target_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+  motion.target_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot"), FrameRoleId("fixture")});
 
   const auto result = validate_operation_intent(operation);
   ASSERT_FALSE(result.ok());
@@ -150,10 +150,9 @@ TEST(OperationIntentTest, AcceptsAbsolutePoseInNamedGoalFrameOnly) {
   Pose3DTO goal;
   goal.orientation.w = 1.0;
   motion.motion = PoseGoalDTO{goal};
-  const ReferenceTargetDTO peer{TargetRoleId("peer_arm"), ControllableComponentId("peer"),
-                                CommandTargetId("arm")};
+  const ProgramFrameReferenceDTO peer{ControllableComponentId("peer"), FrameRoleId("tcp")};
   for (const auto& frame :
-       {ReferenceDTO(ReferenceDTO::Type::kCellFrame, ""), ReferenceDTO(FrameRoleId("tcp"), peer),
+       {ReferenceDTO(ReferenceDTO::Type::kCellFrame, ""), ReferenceDTO(peer),
         ReferenceDTO(ReferenceDTO::Type::kSceneResource, "fixture")}) {
     motion.goal_frame_reference = frame;
     const auto accepted = validate_operation_intent(operation);
@@ -169,7 +168,7 @@ TEST(OperationIntentTest, AcceptsAbsolutePoseInNamedGoalFrameOnly) {
   rejected("goal_frame_inline_pose_unsupported");
   motion.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
   motion.target_mode = MotionTargetModeDTO::kRelative;
-  motion.target_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+  motion.target_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot"), FrameRoleId("fixture")});
   rejected("goal_frame_requires_absolute_target");
   motion.target_mode = MotionTargetModeDTO::kAbsolute;
   motion.target_reference.reset();
@@ -177,8 +176,8 @@ TEST(OperationIntentTest, AcceptsAbsolutePoseInNamedGoalFrameOnly) {
   rejected("goal_frame_motion_type_unsupported");
   motion.motion = PoseGoalDTO{goal};
   auto incomplete = peer;
-  incomplete.controllable_component_id = ControllableComponentId("");
-  motion.goal_frame_reference = ReferenceDTO(FrameRoleId("tcp"), incomplete);
+  incomplete.component_id = ControllableComponentId("");
+  motion.goal_frame_reference = ReferenceDTO(incomplete);
   rejected("motion_reference_invalid");
 }
 
@@ -200,20 +199,21 @@ TEST(OperationIntentTest, TcpEndpointTakesTheThreeSelectorFormsWithCompleteIdent
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
   EXPECT_TRUE(validate_operation_intent(operation).ok());
-  motion.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("gripper")};
+  motion.tcp_endpoint = DefaultTcpOfTargetDTO{{ControllableComponentId("lite_gripper"), CommandTargetId("gripper")}};
   EXPECT_TRUE(validate_operation_intent(operation).ok());
-  motion.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("")};
+  motion.tcp_endpoint = DefaultTcpOfTargetDTO{{ControllableComponentId(""), CommandTargetId("gripper")}};
   EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),
             "motion_tcp_endpoint_invalid");
-  const TcpEntryDTO entry{ControllableComponentId("lite_gripper"), CommandTargetId("gripper"),
-                          FrameRoleId("finger_tip")};
+  const TcpEntryReferenceDTO entry{{ControllableComponentId("robot"), CommandTargetId("arm")},
+                                   {ControllableComponentId("lite_gripper"), FrameRoleId("finger_tip")}};
   motion.tcp_endpoint = entry;
   EXPECT_TRUE(validate_operation_intent(operation).ok());
-  for (int missing = 0; missing < 3; ++missing) {
+  for (int missing = 0; missing < 4; ++missing) {
     auto incomplete = entry;
-    if (missing == 0) incomplete.component_id = ControllableComponentId("");
-    if (missing == 1) incomplete.target_id = CommandTargetId("");
-    if (missing == 2) incomplete.frame_role_id = FrameRoleId("");
+    if (missing == 0) incomplete.target.component_id = ControllableComponentId("");
+    if (missing == 1) incomplete.target.command_target_id = CommandTargetId("");
+    if (missing == 2) incomplete.frame.component_id = ControllableComponentId("");
+    if (missing == 3) incomplete.frame.frame_id = FrameRoleId("");
     motion.tcp_endpoint = incomplete;
     EXPECT_FALSE(validate_operation_intent(operation).ok()) << missing;
   }
@@ -221,17 +221,18 @@ TEST(OperationIntentTest, TcpEndpointTakesTheThreeSelectorFormsWithCompleteIdent
 
 TEST(OperationIntentTest, SetTcpNamesOneRobotAndNeverCurrent) {
   auto operation = valid_motion_operation();
-  operation.participants.front().payload = SetTcpParticipantIntentDTO{TcpEntryDTO{
-      ControllableComponentId("lite_gripper"), CommandTargetId("gripper"), FrameRoleId("tcp")}};
+  operation.participants.front().payload = SetTcpParticipantIntentDTO{TcpEntryReferenceDTO{
+      {ControllableComponentId("robot"), CommandTargetId("arm")},
+      {ControllableComponentId("lite_gripper"), FrameRoleId("tcp")}}};
   EXPECT_TRUE(validate_operation_intent(operation).ok());
   operation.participants.front().payload =
-      SetTcpParticipantIntentDTO{DefaultTcpOfRoleDTO{TargetRoleId("gripper")}};
+      SetTcpParticipantIntentDTO{DefaultTcpOfTargetDTO{{ControllableComponentId("lite_gripper"), CommandTargetId("gripper")}}};
   EXPECT_TRUE(validate_operation_intent(operation).ok());
   operation.participants.front().payload = SetTcpParticipantIntentDTO{CurrentTcpDTO{}};
   EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),
             "set_tcp_current_invalid");
   operation.participants.front().payload =
-      SetTcpParticipantIntentDTO{DefaultTcpOfRoleDTO{TargetRoleId("gripper")}};
+      SetTcpParticipantIntentDTO{DefaultTcpOfTargetDTO{{ControllableComponentId("lite_gripper"), CommandTargetId("gripper")}}};
   operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
   operation.participants.push_back(operation.participants.front());
   EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),

@@ -306,12 +306,10 @@ TEST(TrajectoryCacheIntentTest,
 TEST(TrajectoryCacheIntentTest, GoalFrameAndReferenceRobotChangeIdentity) {
   const auto baseline = make_cartesian_request();
   auto own_frame = baseline;
-  own_frame.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "tcp");
+  own_frame.goal_frame_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot"), FrameRoleId("tcp")});
   auto peer_frame = baseline;
   peer_frame.goal_frame_reference =
-      ReferenceDTO(FrameRoleId("tcp"),
-                   ReferenceTargetDTO{TargetRoleId("peer_arm"),
-                                      ControllableComponentId("peer"), CommandTargetId("arm")});
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("peer"), FrameRoleId("tcp")});
   auto cell_frame = baseline;
   cell_frame.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
 
@@ -370,7 +368,7 @@ TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndPlannerChangeIdentity) {
   auto relative = baseline;
   relative.target_mode = MotionTargetModeDTO::kRelative;
   relative.target_reference =
-      ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("robot"), FrameRoleId("fixture")});
   auto best_of_n = baseline;
   best_of_n.planner.optimize = PlannerOptimizeDTO::kBestOfN;
   auto coarse = baseline;

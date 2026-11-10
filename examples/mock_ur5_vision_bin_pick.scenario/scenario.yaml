@@ -1,20 +1,18 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock UR5 vision-guided bin pick. Needs one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot. Load and Execute the Program.",
   "members": {
-    "assignment.yaml": "sha256:3efa8a6729b59a3e9625812198609af1fdacb880319c79d84a7d86e55277de43",
     "deployment.yaml": "sha256:98d755acf47c3991d97c24fdfb56f8a3f6c6e2a6364e1b130a6edc3c7c1172b6",
-    "program.yaml": "sha256:cbc49435d4bf740c6374efd9b5e30cab794c53cfe408d2f5750d302ef22d5773"
+    "program.yaml": "sha256:154b815cf6dd9f6c891a6dca224107062e0559ad8c093647b1cb6a7f46a7dfe2"
   },
   "name": "mock_ur5_vision_bin_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:437764e170db449d3237cfb60bbefc97c12542bc624e45924e0998cae27297c3",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:bcbea58e844b4119a11ce2f28522ea559439107cfff997c7f9072ad7804a8a49",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "mock_ur5_vision_bin_pick",

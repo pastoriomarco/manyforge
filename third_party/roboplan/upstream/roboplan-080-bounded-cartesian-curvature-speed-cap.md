@@ -22,7 +22,7 @@ speed the lateral acceleration v²/r would be 2.25 m/s².
 
 ## Impact
 
-ManyForge rounds corners before RoboPlan (RP-2 blend radius), so that
+ManyForge rounds corners before RoboPlan (blend radius), so that
 constant_speed Cartesian moves run through corners without stopping. Our
 frame-dynamics check sees the arc's lateral acceleration (11.3 times the
 limit on the benchmark U path with 10 mm corners) and stretches the whole
@@ -55,7 +55,7 @@ with the patch.
 
 ## Sanitizer evidence
 
-See the M9 image row `manyforge-ros-lyrical-full:m9-rp08c` in the external
+See the image row `manyforge-ros-lyrical-full:m9-rp08c` in the external
 delta ledger.
 
 ## Compatibility risk

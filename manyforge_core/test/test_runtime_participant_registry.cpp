@@ -11,7 +11,7 @@ namespace {
 using namespace manyforge::core;
 
 [[nodiscard]] RuntimeParticipantBinding binding_for(
-    std::string target_role, std::string command_target, std::string capability,
+    std::string command_target, std::string capability,
     CoordinateKind kind, std::optional<ProgramCommandSchemaRefDTO> command_schema = std::nullopt) {
   RuntimeParticipantBindingDTO value{
       ProgramId("program.pick"),
@@ -19,8 +19,6 @@ using namespace manyforge::core;
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
       GraphRevision("graph"),
-      ComponentRoleId("robot"),
-      TargetRoleId(std::move(target_role)),
       ControllableComponentId("robot.1"),
       ComponentTypeId("aggregate.robot"),
       ComponentTypeRevision("aggregate-revision"),
@@ -35,9 +33,9 @@ using namespace manyforge::core;
           ModelInstanceId("robot.model"),
           "mf2_robot_group",
           {kind == CoordinateKind::kAngular ? "mf2_robot_joint" : "mf2_gripper_joint"}}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "mf2_robot_base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+       ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "mf2_robot_tcp"}},
       {RuntimeResourceBindingDTO{
           ResourceRoleId(kind == CoordinateKind::kAngular ? "joint" : "finger"),
@@ -74,7 +72,7 @@ using namespace manyforge::core;
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
                                   RuntimeEpoch("runtime-epoch.1")}}};
   value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-      value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+      {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);
@@ -85,7 +83,7 @@ using namespace manyforge::core;
 [[nodiscard]] MotionParticipantIntentDTO motion_payload() {
   return MotionParticipantIntentDTO{
       MoveId("move.1"),
-      FrameRoleId("base"),
+      {ControllableComponentId("robot.1"), FrameRoleId("base")},
       CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
@@ -113,7 +111,7 @@ using namespace manyforge::core;
       GraphRevision("graph"),
       RetainedBundleId("bundle"),
       std::nullopt,
-      {OperationParticipantIntentDTO{ComponentRoleId("robot"), TargetRoleId(std::move(target_role)),
+      {OperationParticipantIntentDTO{{ControllableComponentId("robot.1"), CommandTargetId(std::move(target_role))},
                                      CapabilityId(std::move(capability)), std::nullopt,
                                      std::move(payload)}},
       OperationCoordinationPolicy::kIndependent};
@@ -121,7 +119,7 @@ using namespace manyforge::core;
 
 TEST(RuntimeParticipantRegistryTest, ResolvesExactAddressWithoutRobotOrGroupFallback) {
   RuntimeParticipantRegistry registry(
-      {binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
+      {binding_for("arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
   const auto operation = operation_for("arm", "planning.motion.joint_goal", motion_payload());
 
   auto resolved = registry.resolve(operation, 0U);
@@ -133,7 +131,7 @@ TEST(RuntimeParticipantRegistryTest, ResolvesExactAddressWithoutRobotOrGroupFall
 
 TEST(RuntimeParticipantRegistryTest, RejectsWrongProgramBindingContext) {
   RuntimeParticipantRegistry registry(
-      {binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
+      {binding_for("arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
   auto operation = operation_for("arm", "planning.motion.joint_goal", motion_payload());
   operation.program_binding_id = ProgramBindingId("other-binding");
 
@@ -144,7 +142,7 @@ TEST(RuntimeParticipantRegistryTest, RejectsWrongProgramBindingContext) {
 
 TEST(RuntimeParticipantRegistryTest, RejectsTrajectoryMotionAgainstPrismaticCommandTarget) {
   RuntimeParticipantRegistry registry(
-      {binding_for("gripper", "gripper", "planning.motion.joint_goal", CoordinateKind::kLinear)});
+      {binding_for("gripper", "planning.motion.joint_goal", CoordinateKind::kLinear)});
   const auto operation =
       operation_for("gripper", "planning.motion.joint_goal", motion_payload());
 
@@ -158,7 +156,7 @@ TEST(RuntimeParticipantRegistryTest, RejectsCommandCoordinateUnitMismatch) {
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   RuntimeParticipantRegistry registry(
-      {binding_for("gripper", "gripper", "tool.gripper.command", CoordinateKind::kLinear, schema)});
+      {binding_for("gripper", "tool.gripper.command", CoordinateKind::kLinear, schema)});
   CapabilityCommandIntentDTO command{
       schema.command_schema_id,
       schema.command_schema_revision,
@@ -173,7 +171,7 @@ TEST(RuntimeParticipantRegistryTest, RejectsCommandCoordinateUnitMismatch) {
 }
 
 TEST(RuntimeParticipantRegistryTest, RejectsAmbiguousRegistrationAtStartup) {
-  auto first = binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular);
+  auto first = binding_for("arm", "planning.motion.joint_goal", CoordinateKind::kAngular);
   auto duplicate = first;
   EXPECT_THROW(RuntimeParticipantRegistry({std::move(first), std::move(duplicate)}),
                std::invalid_argument);
@@ -182,18 +180,17 @@ TEST(RuntimeParticipantRegistryTest, RejectsAmbiguousRegistrationAtStartup) {
 TEST(RuntimeParticipantRegistryTest,
      QualifiedTcpMustMatchTheSelectedCaptureWithoutChangingArmOwnership) {
   auto value =
-      binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular).value();
+      binding_for("arm", "planning.motion.joint_goal", CoordinateKind::kAngular).value();
   value.motion_endpoint =
-      RuntimeMotionEndpointBindingDTO{TargetRoleId("tool"),
-                                      CommandTargetId("gripper"),
-                                      {FrameRoleId("fingertip"), ModelInstanceId("robot.model"),
+      RuntimeMotionEndpointBindingDTO{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                                      {{ControllableComponentId("tool.1"), FrameRoleId("fingertip")}, ModelInstanceId("robot.model"),
                                        ModelRevision("model-revision"), "mf2_fingertip"},
                                       {}};
   auto selected = verify_runtime_participant_binding(value);
   ASSERT_TRUE(selected.ok()) << selected.error().message;
   RuntimeParticipantRegistry registry({selected.value()});
-  const TcpEntryDTO fingertip{ControllableComponentId("tool.1"), CommandTargetId("gripper"),
-                              FrameRoleId("fingertip")};
+  const TcpEntryReferenceDTO fingertip{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                                      {ControllableComponentId("tool.1"), FrameRoleId("fingertip")}};
   auto motion = motion_payload();
   motion.tcp_endpoint = fingertip;
   auto operation = operation_for("arm", "planning.motion.joint_goal", motion);
@@ -205,25 +202,25 @@ TEST(RuntimeParticipantRegistryTest,
   // A different target or frame cannot consume this captured TCP. The owner
   // is not in the sealed binding (B7); the Kernel checks it.
   auto other = fingertip;
-  other.target_id = CommandTargetId("other_gripper");
+  other.target.command_target_id = CommandTargetId("other_gripper");
   requested.tcp_endpoint = other;
   EXPECT_FALSE(registry.resolve(operation, 0U).ok());
   other = fingertip;
-  other.frame_role_id = FrameRoleId("other_tip");
+  other.frame.frame_id = FrameRoleId("other_tip");
   requested.tcp_endpoint = other;
   EXPECT_FALSE(registry.resolve(operation, 0U).ok());
   // Current and form 2 were resolved by the owner's resolver into this capture.
   requested.tcp_endpoint = CurrentTcpDTO{};
   EXPECT_TRUE(registry.resolve(operation, 0U).ok());
-  requested.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("tool")};
+  requested.tcp_endpoint = DefaultTcpOfTargetDTO{{ControllableComponentId("robot.1"), CommandTargetId("arm")}};
   EXPECT_TRUE(registry.resolve(operation, 0U).ok());
 }
 
 TEST(RuntimeParticipantRegistryTest, SetTcpResolvesToTheRobotMotionTargetLikeAMove) {
   RuntimeParticipantRegistry registry(
-      {binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
-  const TcpEntryDTO own{ControllableComponentId("robot.1"), CommandTargetId("arm"),
-                        FrameRoleId("tcp")};
+      {binding_for("arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
+  const TcpEntryReferenceDTO own{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                                {ControllableComponentId("robot.1"), FrameRoleId("tcp")}};
   auto operation = operation_for("arm", "planning.motion.joint_goal", motion_payload());
   operation.participants.front().payload = SetTcpParticipantIntentDTO{own};
   const auto resolved = registry.resolve(operation, 0U);
@@ -232,7 +229,7 @@ TEST(RuntimeParticipantRegistryTest, SetTcpResolvesToTheRobotMotionTargetLikeAMo
                          resolved.value().value().controllable_component_id),
             own);
   auto other = own;
-  other.frame_role_id = FrameRoleId("base");
+  other.frame.frame_id = FrameRoleId("base");
   operation.participants.front().payload = SetTcpParticipantIntentDTO{other};
   const auto refused = registry.resolve(operation, 0U);
   ASSERT_FALSE(refused.ok());

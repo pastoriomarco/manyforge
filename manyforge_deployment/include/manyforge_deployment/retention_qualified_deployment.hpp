@@ -13,10 +13,10 @@ class RetentionQualificationError final : public std::invalid_argument {
   using std::invalid_argument::invalid_argument;
 };
 
-/// One immutable proof that a complete source deployment and the final I2
+/// One immutable proof that a complete source deployment and the final
 /// compiler result describe exactly the same semantic cell.
 ///
-/// This proof is the sole legal deployment/compiler input to I3 product
+/// This proof is the sole legal deployment/compiler input to retained product
 /// materialization. It performs no retrieval, storage, product construction,
 /// publication, process, or runtime effect.
 class RetentionQualifiedDeployment final {
@@ -57,7 +57,7 @@ class RetentionQualifiedDeployment final {
       const CompilerQualifiedCellIr&);
 };
 
-/// Proves complete field-for-field agreement before I3 can perform an effect.
+/// Proves complete field-for-field agreement before retention can perform an effect.
 ///
 /// The comparison covers cell identity, the complete graph and GraphRevision,
 /// every applicability table, optional source-presence spelling, selected

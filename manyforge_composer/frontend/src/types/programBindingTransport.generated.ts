@@ -1,18 +1,21 @@
-/* GENERATED FILE -- program_binding_transport.v1.json; DO NOT EDIT. */
+/* GENERATED FILE -- program_binding_transport.v3.json; DO NOT EDIT. */
 
 export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy';
 export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
 export type ProgramInterventionStopScope = 'all' | 'own_groups';
 export interface ProgramBindingDocument {
-  api_version: 'manyforge.program_binding.v2';
+  api_version: 'manyforge.program_binding.v3';
   program_binding_id: string;
   program_id: string;
   program_revision: string;
   retained_bundle_id: string;
   graph_revision: string;
   node_environment: ProgramBindingNodeEnvironment;
-  component_role_bindings: ProgramComponentRoleBinding[];
-  target_role_bindings: ProgramTargetRoleBinding[];
+  component_bindings: ProgramComponentBinding[];
+  target_bindings: ProgramTargetBinding[];
+  frame_bindings: ProgramFrameBinding[];
+  collision_body_bindings: ProgramCollisionBodyBinding[];
+  signal_bindings: ProgramSignalBinding[];
   node_policies: ProgramNodePolicy[];
   contact_grasp_bindings: ProgramContactGraspBinding[];
   provenance: ProgramBindingProvenance;
@@ -23,47 +26,43 @@ export interface ProgramBindingNodeEnvironment {
   catalog_digest: string;
   environment_digest: string;
 }
-export interface ProgramComponentRoleBinding {
-  component_role_id: string;
-  controllable_component_id: string;
+export interface ProgramComponentBinding {
+  component_id: string;
   component_type_id: string;
   component_type_revision: string;
-  model_role_bindings: ProgramModelRoleBinding[];
+  model_bindings: ProgramModelRoleBinding[];
 }
 export interface ProgramModelRoleBinding {
   model_role_id: string;
   model_instance_id: string;
   model_revision: string;
 }
-export interface ProgramTargetRoleBinding {
-  target_role_id: string;
-  component_role_id: string;
-  controllable_component_id: string;
-  command_target_id: string;
-  frame_role_bindings: ProgramFrameRoleBinding[];
+export interface ProgramTargetBinding {
+  target: ProgramTargetReference;
+  frame_references: ProgramFrameReference[];
+  frame_associations: ProgramFrameAssociation[];
+  collision_body_references: ProgramBodyReference[];
+  signal_references: ProgramSignalReference[];
   resource_role_bindings: ProgramResourceRoleBinding[];
-  collision_body_role_bindings: ProgramCollisionBodyRoleBinding[];
   capability_bindings: ProgramCapabilityBinding[];
-  signal_role_bindings?: ProgramSignalRoleBinding[];
   pneumatic_io?: ProgramPneumaticIoBinding;
   robot_tcps?: ProgramRobotTcpBinding[];
   default_tcp?: ProgramTcpEntry;
 }
-export interface ProgramFrameRoleBinding {
-  frame_role_id: string;
+export interface ProgramFrameBinding {
+  reference: ProgramFrameReference;
   model_instance_id: string;
   model_revision: string;
   compiled_frame_name: string;
-  contact_body_role_ids?: string[];
 }
 export interface ProgramTcpEntry {
-  component_id: string;
-  target_id: string;
-  frame_role_id: string;
+  target: ProgramTargetReference;
+  frame: ProgramFrameReference;
 }
 export interface ProgramRobotTcpBinding {
   entry: ProgramTcpEntry;
-  frame: ProgramFrameRoleBinding;
+  frame: ProgramFrameBinding;
+  contact_body_role_ids: string[];
   end_effector: boolean;
   component_default: boolean;
 }
@@ -72,8 +71,8 @@ export interface ProgramResourceRoleBinding {
   resource_ids: string[];
   compiled_resource_names: string[];
 }
-export interface ProgramCollisionBodyRoleBinding {
-  collision_body_role_id: string;
+export interface ProgramCollisionBodyBinding {
+  reference: ProgramBodyReference;
   model_instance_id: string;
   model_revision: string;
   compiled_collision_body_names: string[];
@@ -117,19 +116,14 @@ export interface ProgramContactGraspEnvelopeBinding {
   bodies_from_motion_endpoint?: true;
 }
 export interface ProgramContactGraspBodyBinding {
-  component_role_id: string;
-  target_role_id: string;
-  controllable_component_id: string;
-  command_target_id: string;
+  body: ProgramBodyReference;
   model_role_id: string | null;
-  collision_body_role_id: string;
   model_instance_id: string;
   model_revision: string;
   collision_body_ids: string[];
 }
 export interface ProgramBindingProvenance {
   binding_compiler_contract_digest: string;
-  role_assignment_digest: string;
   source_records: ProgramBindingProvenanceRecord[];
   resolved_output_records: ProgramBindingProvenanceRecord[];
 }
@@ -138,9 +132,10 @@ export interface ProgramBindingProvenanceRecord {
   record_id: string;
   revision: string;
 }
-export interface ProgramSignalRoleBinding {
-  resource_role_id: string;
-  signal_name: string;
+export interface ProgramSignalBinding {
+  reference: ProgramSignalReference;
+  target: ProgramTargetReference;
+  runtime_unit_id: string;
   value_type: 'bool';
   direction: 'input' | 'output';
   transition_capability: 'sampled_only' | 'captured';
@@ -151,15 +146,13 @@ export interface ProgramPneumaticIoBinding {
   inputs: ProgramPneumaticInputBinding[];
 }
 export interface ProgramPneumaticOutputBinding {
-  target_role_id: string;
-  resource_role_id: string;
+  signal: ProgramSignalReference;
   open_value: boolean;
   close_value: boolean;
 }
 export interface ProgramPneumaticInputBinding {
   input: 'open' | 'closed' | 'pressure' | 'workpiece_grasped';
-  target_role_id: string;
-  resource_role_id: string;
+  signal: ProgramSignalReference;
 }
 export interface ProgramContactReleaseBinding {
   contact_policy_id: string;
@@ -176,5 +169,25 @@ export interface ProgramContactReleaseBinding {
   require_separation_by_end: boolean;
   allow_recontact: boolean;
   bodies_from_motion_endpoint?: true;
+}
+export interface ProgramTargetReference {
+  component_id: string;
+  command_target_id: string;
+}
+export interface ProgramFrameReference {
+  component_id: string;
+  frame_id: string;
+}
+export interface ProgramBodyReference {
+  component_id: string;
+  collision_body_id: string;
+}
+export interface ProgramSignalReference {
+  component_id: string;
+  signal_name: string;
+}
+export interface ProgramFrameAssociation {
+  frame: ProgramFrameReference;
+  contact_body_role_ids: string[];
 }
 export type ProgramContactGraspBinding = ProgramContactGraspEnvelopeBinding | ProgramContactReleaseBinding;

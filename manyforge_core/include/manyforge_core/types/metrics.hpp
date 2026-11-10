@@ -103,7 +103,7 @@ struct MetricsSnapshot {
   // Total events dispatched (== the dispatch-order sequence high-water mark)
   // and total records absorbed by the flight ring. Populated at
   // get_metrics() time from their owning counters — no additional hot-path
-  // work (observability plan OW6).
+  // work.
   uint64_t events_emitted = 0;
   uint64_t flight_recorder_records = 0;
 };

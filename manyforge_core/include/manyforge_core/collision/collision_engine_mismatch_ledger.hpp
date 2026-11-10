@@ -9,9 +9,7 @@
 
 namespace manyforge::core {
 
-/// Bounded ring buffer of CollisionEngineMismatchRecord values
-/// (spec COLLISION_CHECKING_OWNERSHIP_PLAN §"Engine Capability And Mismatch
-/// Policy", added in Chunk 8 groundwork).
+/// Bounded ring buffer of CollisionEngineMismatchRecord values.
 ///
 /// The ledger lets compare-mode emitters (for example a RoboPlan diagnostic
 /// comparator) deposit canonical mismatch records that

@@ -1,7 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { useRobotControl } from '../hooks/useRobotControl';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { MotionPreviewDots } from './MotionPreviewDots';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import {
@@ -17,6 +18,9 @@ import {
   robotControlHasLocalDraft,
   robotControlPreviewApprovable,
   rpyDegreesFromQuaternion,
+  moveToFreeAvailable,
+  moveToLinearAvailable,
+  ROBOT_CONTROL_MODE_LABELS,
 } from '../state/robotControl';
 import type {
   ManualMotionSettings,
@@ -25,13 +29,16 @@ import type {
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
 import { tcpEntryIdentityKey } from '../types/robotControl';
-import type { LogicalSceneProjection, ProgramTreeNode } from '../types/api';
+import type { LogicalSceneObject, LogicalSceneProjection, ProgramTreeNode, SourceModelProjection } from '../types/api';
+import { previewBodyIdentity } from '../state/runtimeScenePresentation';
 import {
-  boundProgramTargetRoleIds,
   DEFAULT_MOVE_TO_OPTIONS,
+  hasBoundProgramTarget,
+  programFrameKey,
   resolveStoredProgramPose,
+  storedMoveToProvenance,
 } from '../utils/moveTo';
-import type { CartesianMoveDraftOptions } from '../utils/moveTo';
+import type { CartesianMoveDraftOptions, MoveToReferenceProvenance } from '../utils/moveTo';
 import { relativePose, type PoseTuple } from '../utils/poseTransforms';
 import { flattenProgramForest } from '../utils/programAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
@@ -57,6 +64,13 @@ function formatDegrees(radiansValue: number): string {
   return degrees(radiansValue).toFixed(2);
 }
 
+export function formatClearanceDistanceMm(distanceMm: number): string {
+  const rounded = Math.abs(distanceMm) < 10
+    ? distanceMm.toFixed(2).replace(/\.?0+$/, '')
+    : distanceMm.toFixed(1);
+  return `${rounded} mm`;
+}
+
 function phaseLabel(phase: RobotControlPhase): string {
   switch (phase) {
     case 'loading': return 'Connecting';
@@ -77,13 +91,7 @@ function phaseLabel(phase: RobotControlPhase): string {
   }
 }
 
-const MODE_LABELS: Array<[RobotControlMode, string]> = [
-  ['joint', 'Joint'],
-  ['pose_goal', 'Pose plan'],
-  ['cartesian_path', 'Cartesian'],
-  ['move_to', 'Move To'],
-  ['gripper', 'Gripper'],
-];
+const MODE_LABELS = Object.entries(ROBOT_CONTROL_MODE_LABELS) as Array<[RobotControlMode, string]>;
 
 const MOVE_SOURCE_GROUPS: Array<[MoveToSource['group'], string]> = [
   ['current', 'Current state'],
@@ -100,6 +108,7 @@ interface MoveToSource {
   pose?: PoseTuple;
   positionsRad?: number[];
   node?: ProgramTreeNode;
+  provenance?: MoveToReferenceProvenance;
 }
 
 
@@ -219,7 +228,9 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   // Rendered only for a selected motion target (never in Gripper mode).
   const descriptor = controller.selectedStatus!.directControl!.targetDescriptor;
   const settings = state.motionSettings;
-  const cartesian = state.mode === 'cartesian_path';
+  // A Linear Move To is the same straight-line request as the Cartesian tab.
+  const cartesian = state.mode === 'cartesian_path'
+    || (state.mode === 'move_to' && state.moveToKind === 'pose' && state.moveToPath === 'linear');
   type MotionSettingField = {
     key: Exclude<keyof ManualMotionSettings, 'jointLimits' | 'clearanceM'>;
     label: string; fullLabel: string; unit: string; factor: number; step: number;
@@ -311,6 +322,22 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   );
 }
 
+/** Use the retained viewer join for identity, but show its source name to people. */
+function previewBodyLabel(
+  identity: string,
+  resolved: ReturnType<typeof previewBodyIdentity>,
+  sourceModel: SourceModelProjection | null,
+): string {
+  if (resolved === null) return identity;
+  if (resolved.kind === 'object') return resolved.name;
+  const parts = identity.split('/');
+  const occurrences = sourceModel?.occurrences.filter((occurrence) => occurrence.component_id === parts[1]
+    && occurrence.model_instance_id === parts[3]) ?? [];
+  const links = occurrences.length === 1
+    ? occurrences[0].links.filter((link) => link.viewer_link_name === resolved.name) : [];
+  return links.length === 1 ? `${parts[1]} · ${links[0].source_link_name}` : identity;
+}
+
 export function RobotControlPanelView({
   enabled,
   controller,
@@ -319,6 +346,7 @@ export function RobotControlPanelView({
   sourceFrameNames = {},
   controlBasePoseInCell = null,
   runtimeScene = null,
+  previewSourceModel = null, previewSceneObjects = [],
 }: {
   enabled: boolean;
   controller: RobotControlController;
@@ -327,6 +355,8 @@ export function RobotControlPanelView({
   sourceFrameNames?: Readonly<Record<string, string>>;
   controlBasePoseInCell?: PoseTuple | null;
   runtimeScene?: LogicalSceneProjection | null;
+  previewSourceModel?: SourceModelProjection | null;
+  previewSceneObjects?: readonly LogicalSceneObject[];
 }) {
   const localGizmo = useGizmoSettings();
   const cardLayout = useCardPanelLayout();
@@ -337,13 +367,28 @@ export function RobotControlPanelView({
   const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
   const [moveSourceGroup, setMoveSourceGroup] = useState<MoveToSource['group'] | ''>('');
   const [previewInfoOpen, setPreviewInfoOpen] = useState(false);
+  const [playingPreview, setPlayingPreview] = useState(false);
+  const [previewReplay, setPreviewReplay] = useState(0);
+  const previewPath = controller.state.diagnosticPreview ?? (controller.state.preview?.schemaVersion
+    === 'manyforge.direct_control_motion_preview.v4' ? controller.state.preview.pathPreview : undefined);
+  const previewIndex = controller.state.previewSampleIndex;
+  useEffect(() => { setPlayingPreview(false); }, [previewPath]);
+  useEffect(() => {
+    if (!playingPreview || previewPath == null) return;
+    if (previewIndex >= previewPath.samples.length - 1) { setPlayingPreview(false); return; }
+    const delay = (previewPath.samples[previewIndex + 1].timeFromStartS
+      - previewPath.samples[previewIndex].timeFromStartS) * 1000;
+    const timer = window.setTimeout(() => controller.selectPreviewSample?.(previewIndex + 1), delay);
+    return () => window.clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- the timer reads the controller method when it fires.
+  }, [playingPreview, previewReplay, previewPath, previewIndex, controller.selectPreviewSample]);
   const [dismissedPreviewNotice, setDismissedPreviewNotice] = useState<string | null>(null);
   const previewInfoButton = useRef<HTMLButtonElement>(null);
   const previewInfoId = useId();
   const [inputRebase, setInputRebase] = useState(0);
   const [pendingInputs, setPendingInputs] = useState<ReadonlySet<string>>(new Set());
   const setManualPanelVisible = controller.setManualPanelVisible;
-  useEffect(() => {
+  useLayoutEffect(() => {
     setManualPanelVisible(true);
     return () => setManualPanelVisible(false);
   }, [setManualPanelVisible]);
@@ -379,23 +424,26 @@ export function RobotControlPanelView({
   const status = controller.selectedStatus;
   // Null for an arm-only component; gripper controls then never render.
   const gripper = status?.directControlGripper ?? null;
-  // Null for a component without motion (gripper-only, H1a-IF.2).
+  // Null for a component without motion (gripper-only).
   const motion = status?.directControl ?? null;
   const selectedTcp = motion === null ? null : selectedTcpOf(motion);
-  // B1: no end-effector TCP and no TCP picked.
+  // No end-effector TCP and no TCP picked.
   const noTcp = motion !== null && motion.tcpFrameRoleId === null;
   const observedMotion = status?.observedMotion ?? null;
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
   const inputResetKey = [status?.ownerEpoch, motion?.programBindingId,
-    motion?.tcpTargetRoleId, motion?.tcpFrameRoleId, motion?.selectedTcpEntryKey,
+    motion?.tcpFrameRoleId, motion?.selectedTcpEntryKey,
     gripper?.programBindingId,
     status?.retainedBundleId, status?.graphRevision, programActive,
     state.selectedControllableComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
     state.mode, inputRebase].join('\u0000');
   const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
   const operationActive = robotControlHasActiveOperation(state);
+  // Move To with Path: Linear plans exactly like the Cartesian tab.
+  const straightLine = state.mode === 'cartesian_path'
+    || (state.mode === 'move_to' && state.moveToKind === 'pose' && state.moveToPath === 'linear');
   const tcpBlocksCartesian = controller.tcpApplying && (state.mode === 'pose_goal' || state.mode === 'cartesian_path'
     || (state.mode === 'move_to' && state.moveToKind === 'pose'));
   const active = operationActive || !controller.manualControlAllowed || tcpBlocksCartesian;
@@ -443,27 +491,35 @@ export function RobotControlPanelView({
     && applied?.retainedBundleId === status?.retainedBundleId ? applied?.program : null;
   const moveSources = useMemo<MoveToSource[]>(() => {
     if (status === null || motion === null || observedMotion === null) return [];
-    // Move To is unavailable without a TCP (B1).
+    // Move To is unavailable without a TCP.
     const tcpFrameRoleId = motion.tcpFrameRoleId;
     const currentTcpPose = observedMotion.currentTcpPose;
     if (tcpFrameRoleId === null) return [];
     const planningCapabilities = motion.targetDescriptor.contracts
       .supportingProviders.map((provider) => provider.capabilityId);
+    // A pose source needs a Free (pose goal) or Linear (Cartesian path) planner.
     const poseAvailable = currentTcpPose !== null
-      && planningCapabilities.includes('planning.motion.pose_goal');
+      && (planningCapabilities.includes('planning.motion.pose_goal')
+        || planningCapabilities.includes('planning.motion.cartesian_path'));
     const jointAvailable = planningCapabilities.includes('planning.motion.joint_goal');
     const sources: MoveToSource[] = [];
-    const boundTargetRoles = new Set(boundProgramTargetRoleIds(
+    // Stored poses come only from nodes that move this exact, Applied-bound target.
+    const targetBound = hasBoundProgramTarget(
       appliedBinding,
       motion.controllableComponentId,
       motion.commandTargetId,
-    ));
-    const frameRolePoses = new Map<string, PoseTuple>([
-      [motion.baseFrameRoleId, {
+    );
+    const baseFrame = { component_id: motion.controllableComponentId, frame_id: motion.baseFrameRoleId };
+    const activeTcpEntry = motion.activeTcp?.entry ?? null;
+    const framePoses = new Map<string, PoseTuple>([
+      [programFrameKey(baseFrame), {
         position: [0, 0, 0],
         quaternion: [0, 0, 0, 1],
       }],
-      ...(currentTcpPose === null ? [] : [[tcpFrameRoleId, observedPose(currentTcpPose)] as [string, PoseTuple]]),
+      ...(currentTcpPose === null || activeTcpEntry === null ? [] : [[
+        programFrameKey({ component_id: activeTcpEntry.frameComponentId, frame_id: activeTcpEntry.frameRoleId }),
+        observedPose(currentTcpPose),
+      ] as [string, PoseTuple]]),
     ]);
     const sceneResourcePoses = new Map<string, PoseTuple>();
     if (controlBasePoseInCell !== null) {
@@ -491,6 +547,7 @@ export function RobotControlPanelView({
         kind: 'pose',
         group: 'current',
         pose: observedPose(currentTcpPose),
+        provenance: { kind: 'absolute' },
       });
       for (const frame of motion.targetDescriptor.frames) {
         const pose = frame.frameRoleId === motion.baseFrameRoleId
@@ -505,7 +562,7 @@ export function RobotControlPanelView({
             // TCP-C: every other robot TCP's observed pose too.
             : (() => {
               const tcp = motion.targetDescriptor.tcps.find((row) => (
-                row.targetRoleId === motion.targetRoleId && row.frameRoleId === frame.frameRoleId));
+                row.entry.frameComponentId === frame.frameComponentId && row.frameRoleId === frame.frameRoleId));
               const tcpPose = tcp === undefined
                 ? undefined : observedMotion.tcpPoses[tcpEntryIdentityKey(tcp.entry)];
               return tcpPose === undefined ? null : observedPose(tcpPose);
@@ -518,6 +575,12 @@ export function RobotControlPanelView({
           kind: 'pose',
           group: 'frame',
           pose,
+          provenance: {
+            kind: 'relative',
+            targetReference: { type: 'component_frame', frame: { component_id: frame.frameComponentId, frame_id: frame.frameRoleId } },
+            targetPose: pose,
+            offsetPose: pose,
+          },
         });
       }
       for (const [sceneResourceId, pose] of sceneResourcePoses) {
@@ -527,27 +590,36 @@ export function RobotControlPanelView({
           kind: 'pose',
           group: 'object',
           pose,
+          provenance: {
+            kind: 'relative',
+            targetReference: { type: 'scene_resource', scene_resource_id: sceneResourceId },
+            targetPose: pose,
+            offsetPose: pose,
+          },
         });
       }
     }
     for (const { node } of flattenProgramForest(appliedProgram ? [appliedProgram.tree] : [])) {
-      const programTargetRole = node.parameters.target_role;
-      if (typeof programTargetRole !== 'string'
-        || !boundTargetRoles.has(programTargetRole)) continue;
+      const nodeTarget = node.parameters.target;
+      if (!targetBound || nodeTarget === null || typeof nodeTarget !== 'object' || Array.isArray(nodeTarget)
+        || (nodeTarget as Record<string, unknown>).component_id !== motion.controllableComponentId
+        || (nodeTarget as Record<string, unknown>).command_target_id !== motion.commandTargetId) continue;
       if (poseAvailable && node.node_id === 'motion.move_to_pose') {
-        const pose = resolveStoredProgramPose(node.parameters, {
-          programTargetRoleId: programTargetRole,
-          baseFrameRoleId: motion.baseFrameRoleId,
+        const context = {
+          baseFrame,
           sceneResourcePoses,
-          frameRolePoses,
-        });
-        if (pose !== null) sources.push({
+          framePoses,
+        };
+        const pose = resolveStoredProgramPose(node.parameters, context);
+        const provenance = storedMoveToProvenance(node.parameters, context);
+        if (pose !== null && provenance !== null) sources.push({
             id: `node:${node.instance_id}`,
             label: `Stored pose · ${node.instance_id}`,
             kind: 'pose',
             group: 'stored',
             pose,
             node,
+            provenance,
         });
       } else if (jointAvailable && node.node_id === 'motion.move_to_joint_target') {
         const goal = node.parameters.goal;
@@ -616,7 +688,7 @@ export function RobotControlPanelView({
       return;
     }
     if (source?.pose === undefined || status === null) return;
-    controller.selectMoveToSource({ id: source.id, kind: 'pose', pose: source.pose });
+    controller.selectMoveToSource({ id: source.id, kind: 'pose', pose: source.pose, provenance: source.provenance });
   };
   const availableSourceGroups = MOVE_SOURCE_GROUPS.filter(([group]) => (
     moveSources.some((source) => source.group === group)
@@ -647,12 +719,13 @@ export function RobotControlPanelView({
     if (mode === 'gripper') return gripper !== null;
     // Motion modes need a selected motion target (none for gripper-only).
     if (motion === null) return false;
-    // Without a TCP, joint jog only (B1, C-P2).
+    // Without a TCP, joint jog only.
     if (mode !== 'joint' && noTcp) return false;
     if (mode === 'move_to') {
       return motion.targetDescriptor.contracts.supportingProviders.some((provider) => (
         provider.capabilityId === 'planning.motion.pose_goal'
         || provider.capabilityId === 'planning.motion.joint_goal'
+        || provider.capabilityId === 'planning.motion.cartesian_path'
       ));
     }
     const capability = mode === 'joint'
@@ -1111,6 +1184,29 @@ export function RobotControlPanelView({
                             ))}
                         </select>
                       </label>
+                      {selectedMoveSource?.kind === 'pose' && moveToLinearAvailable(controller.selectedStatus) && (
+                        <div className="robot-control-move-path">
+                          <span>Path</span>
+                          <span className="robot-control-segment" role="group" aria-label="Move To path">
+                            <button
+                              type="button"
+                              aria-pressed={state.moveToPath === 'free'}
+                              disabled={authoringBlocked || !moveToFreeAvailable(controller.selectedStatus)}
+                              title={moveToFreeAvailable(controller.selectedStatus)
+                                ? 'Plan any collision-free path to the target'
+                                : 'This robot target plans straight lines only'}
+                              onClick={() => controller.setMoveToPath('free')}
+                            >Free</button>
+                            <button
+                              type="button"
+                              aria-pressed={state.moveToPath === 'linear'}
+                              disabled={authoringBlocked}
+                              title="Move the TCP along a straight line to the target, as in the Cartesian tab"
+                              onClick={() => controller.setMoveToPath('linear')}
+                            >Linear</button>
+                          </span>
+                        </div>
+                      )}
                       {selectedMoveSource?.kind === 'pose' && (
                         <>
                           <label>
@@ -1237,7 +1333,7 @@ export function RobotControlPanelView({
                             sourceFrameNames[base.compiledFrameName] ?? 'source name unavailable'
                           }`;
                     })()}</code>.{' '}
-                    {state.mode === 'cartesian_path'
+                    {straightLine
                       ? observedMotion?.currentTcpPose == null
                         ? 'The current TCP pose is unavailable. Select a TCP with a reported pose to preview a Cartesian path.'
                         : 'The current owner-issued TCP pose is the explicit first waypoint.'
@@ -1388,6 +1484,64 @@ export function RobotControlPanelView({
                 </p>
               )}
 
+              {previewPath != null && !state.poseDragging && <div className="robot-control-path" title="Play or drag along the planned path to see where parts touch.">
+                {previewPath.kind === 'collision_disabled_path' && <p>Planning failed: showing the path planned without collision avoidance{previewPath.samples[previewIndex].contacts.some((c) => c.disposition === 'refused') ? '; it collides here.' : '; see the planner’s reason.'} ({previewPath.reason})</p>}
+                {(previewPath.kind === 'collision_disabled_ik_pose' || previewPath.kind === 'collision_disabled_ik_path') && <p>No collision-free pose: showing {previewPath.kind === 'collision_disabled_ik_path' ? 'a path to the pose planned with collisions ignored' : 'a pose that reaches the target if collisions are ignored'}{previewPath.samples[previewIndex].contacts.some((c) => c.disposition === 'refused') ? '; it collides here' : '; collision evidence is shown below'}. ({previewPath.reason})</p>}
+                <button type="button" onClick={() => {
+                  controller.selectPreviewSample?.(0);
+                  setPreviewReplay((value) => value + 1);
+                  setPlayingPreview(true);
+                }}>Play</button>
+                <div className="robot-control-path-track">
+                  <input aria-label="Preview sample" type="range" min={0} max={previewPath.samples.length - 1}
+                    value={previewIndex} onChange={(event) => { setPlayingPreview(false); controller.selectPreviewSample?.(Number(event.target.value)); }} />
+                  <MotionPreviewDots samples={previewPath.samples} selectedIndex={previewIndex} onSelect={(index) => {
+                    setPlayingPreview(false); controller.selectPreviewSample?.(index);
+                  }} />
+                </div>
+                <span>{previewPath.samples[previewIndex].timeFromStartS.toFixed(2)} s · {previewPath.samples[previewIndex].status}</span>
+                <p title="Blue: checked, no contact. Yellow: contact your settings allow. Orange: closer than clearance. Red: contact not allowed, or still touching at the end. Grey: unknown.">Blue: clear · Yellow: allowed · Orange: too close · Red: collision · Grey: unknown</p>
+                {robotControlPreviewApprovable(state) && <p>Ready to approve</p>}
+                {state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+                  && runtimeScene?.snapshot?.revision != null
+                  && (state.preview.sceneRevision.scene_id !== runtimeScene.snapshot.revision.scene_id
+                    || state.preview.sceneRevision.revision_id !== runtimeScene.snapshot.revision.revision_id
+                    || state.preview.sceneRevision.content_hash !== runtimeScene.snapshot.revision.content_hash)
+                  && <p>The Scene changed after this preview.</p>}
+                {previewPath.samples[previewIndex].status === 'unknown' && <p>Not checked</p>}
+                {previewPath.samples[previewIndex].status === 'checked' && previewPath.samples[previewIndex].contacts.length === 0 && (previewPath.samples[previewIndex].clearanceViolations?.length ?? 0) === 0 && <p>{previewPath.kind === 'collision_disabled_path' ? `Planning failed: the path planned without collision avoidance shows no contacts; see the planner’s reason (${previewPath.reason})` : 'No contacts'}</p>}
+                <ul>{[...previewPath.samples[previewIndex].contacts]
+                  .sort((a, b) => Number(b.disposition === 'refused') - Number(a.disposition === 'refused'))
+                  .slice(0, 4).map((contact) => {
+                  const pair = previewPath.pairs[contact.pairIndex];
+                  if (pair === undefined) return <li key={contact.pairIndex}>Contact identity unavailable: unknown</li>;
+                  const a = previewBodyIdentity(pair.bodyA, previewSourceModel, previewSceneObjects);
+                  const b = previewBodyIdentity(pair.bodyB, previewSourceModel, previewSceneObjects);
+                  const disposition = a === null || b === null || (previewPath.schemaVersion !== 'manyforge.motion_preview_diagnostic.v2' && previewPath.samples[previewIndex].status === 'unknown')
+                    ? 'unknown' : contact.disposition;
+                  const reason = disposition === 'allowed' ? 'allowed contact'
+                    : disposition === 'refused' ? 'collision (not allowed)' : 'not checked or identity unavailable';
+                  return <li key={contact.pairIndex} title={[a?.kind === 'link' ? a.name : null, b?.kind === 'link' ? b.name : null].filter(Boolean).join(' ↔ ') || undefined}>{previewBodyLabel(pair.bodyA, a, previewSourceModel)} ↔ {previewBodyLabel(pair.bodyB, b, previewSourceModel)}: {reason}</li>;
+                })}
+                  {previewPath.samples[previewIndex].contacts.length > 4 && <li>and {previewPath.samples[previewIndex].contacts.length - 4} more</li>}
+                {(previewPath.samples[previewIndex].clearanceViolations ?? []).map((violation) => {
+                  const pair = previewPath.pairs[violation.pairIndex];
+                  if (!pair) return null;
+                  const a = previewBodyIdentity(pair.bodyA, previewSourceModel, previewSceneObjects);
+                  const b = previewBodyIdentity(pair.bodyB, previewSourceModel, previewSceneObjects);
+                  const exactDistanceMm = violation.distanceM * 1000;
+                  const exactRequiredClearanceMm = violation.requiredClearanceM * 1000;
+                  const linkNames = [a?.kind === 'link' ? a.name : null, b?.kind === 'link' ? b.name : null]
+                    .filter(Boolean).join(' ↔ ');
+                  const title = [linkNames || null,
+                    `Exact distances: ${exactDistanceMm} mm < ${exactRequiredClearanceMm} mm`]
+                    .filter(Boolean).join(' · ');
+                  return <li key={`clearance-${violation.pairIndex}`} title={title}>{previewBodyLabel(pair.bodyA, a, previewSourceModel)} ↔ {previewBodyLabel(pair.bodyB, b, previewSourceModel)}: closer than clearance ({formatClearanceDistanceMm(exactDistanceMm)} &lt; {formatClearanceDistanceMm(exactRequiredClearanceMm)})</li>;
+                })}
+                </ul>
+                {(previewPath.samples[previewIndex].clearanceViolations?.length ?? 0) > 0 && <p>Lower the manual Clearance in Speed &amp; acceleration → Advanced, or use an offset.</p>}
+              </div>}
+
               {state.poseDragging && <p className="robot-control-tcp">Unvalidated target. Release to validate.</p>}
               {!state.poseDragging && state.phase === 'blocked' && (
                 <p className="robot-control-tcp">Approve is disabled. Check the preview details.</p>
@@ -1467,7 +1621,7 @@ export function RobotControlPanelView({
             <p>Target coordinates are relative to <code>{motion?.baseFrameRoleId}</code>. Local/World selects gizmo axes, not the target reference frame.</p>
             <p>A red tool marks an unvalidated TCP target, not a solved robot configuration or proof of collision. Preview rejection does not mean the Program or robot has faulted.</p>
             <p>Joint velocity/acceleration caps and the TCP speed ceiling are configured in Deployment → Robot model and target limits. The runtime Velocity slider is separate from those limits.</p>
-            {state.mode === 'cartesian_path' && <p>Cartesian preview currently requests 0.1 m/s linear speed, 0.5 m/s² linear acceleration, 0.5 rad/s angular speed and 2.5 rad/s² angular acceleration, subject to the backend limits. Per-move editing of these values is not yet available.</p>}
+            {straightLine && <p>Cartesian preview currently requests 0.1 m/s linear speed, 0.5 m/s² linear acceleration, 0.5 rad/s angular speed and 2.5 rad/s² angular acceleration, subject to the backend limits. Per-move editing of these values is not yet available.</p>}
             {state.error !== null && <p className="robot-control-error notice severity-error">{state.error}</p>}
             {state.previewIssue != null && <p>{state.previewIssue}</p>}
             {state.ghost !== null && <>

@@ -35,6 +35,7 @@ class BinaryGroup:
     registered_count: int = 0
     disabled_count: int = 0
     timeout_seconds: float = 300.0
+    isolate_filters: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class OrdinaryCTest:
     name: str
     disabled: bool
     timeout_seconds: float
+    fixture_setup: bool = False
 
 
 def properties(test: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-regex")
     parser.add_argument("--exclude-test-regex")
     parser.add_argument("--summary-prefix", default="GROUPED_GTEST")
+    parser.add_argument("--isolate-filter", action="append", default=[],
+                        help="Exact GTest filter to run in its own process; repeatable.")
     parser.add_argument(
         "--timeout-seconds",
         type=float,
@@ -94,7 +98,8 @@ def load_registry(
 
 
 def group_registry(
-    tests: list[dict[str, Any]], timeout_ceiling: float
+    tests: list[dict[str, Any]], timeout_ceiling: float,
+    isolate_filters: frozenset[str] = frozenset(),
 ) -> tuple[
     collections.OrderedDict[str, BinaryGroup],
     list[OrdinaryCTest],
@@ -131,6 +136,7 @@ def group_registry(
                     name=test_name,
                     disabled=props.get("DISABLED") is True,
                     timeout_seconds=min(timeout_ceiling, timeout_seconds),
+                    fixture_setup=bool(props.get("FIXTURES_SETUP")),
                 )
             )
             continue
@@ -147,6 +153,7 @@ def group_registry(
             group = BinaryGroup(
                 binary=binary,
                 working_directory=working_directory,
+                isolate_filters=isolate_filters,
                 timeout_seconds=min(timeout_ceiling, timeout_seconds),
             )
             groups[binary] = group
@@ -273,6 +280,33 @@ def run_isolated_fallback(
 
 
 def run_group(index: int, group: BinaryGroup) -> tuple[int, int, int, bool]:
+    isolated = [f for f in group.enabled_filters if f in group.isolate_filters]
+    if isolated:
+        grouped = [f for f in group.enabled_filters if f not in group.isolate_filters]
+        common = dict(binary=group.binary, working_directory=group.working_directory,
+                      timeout_seconds=group.timeout_seconds)
+        totals = [0, 0, 0]
+        failures: list[str] = []
+        used_fallback = False
+        if grouped:
+            try:
+                ran, passed, skipped, used_fallback = run_group(
+                    index, BinaryGroup(**common, enabled_filters=grouped,
+                                       registered_count=group.registered_count,
+                                       disabled_count=group.disabled_count))
+                totals = [ran, passed, skipped]
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                failures.append(str(error))
+        try:
+            ran, passed, skipped = run_isolated_fallback(
+                index, BinaryGroup(**common, enabled_filters=isolated,
+                                   registered_count=len(isolated)))
+            totals = [a + b for a, b in zip(totals, (ran, passed, skipped))]
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            failures.append(str(error))
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        return *totals, used_fallback
     expected = len(group.enabled_filters)
     if expected == 0:
         print(
@@ -364,7 +398,7 @@ def main() -> int:
     tests = load_registry(
         build_dir, args.test_regex, args.exclude_test_regex
     )
-    groups, ordinary_tests = group_registry(tests, args.timeout_seconds)
+    groups, ordinary_tests = group_registry(tests, args.timeout_seconds, frozenset(args.isolate_filter))
     disabled = (
         sum(group.disabled_count for group in groups.values())
         + sum(test.disabled for test in ordinary_tests)
@@ -386,6 +420,26 @@ def main() -> int:
     executed_binaries = 0
     fallback_binaries = 0
     failures: list[tuple[str, str, str]] = []
+
+    def run_ordinary_tests(selected: list[OrdinaryCTest], first_index: int) -> None:
+        nonlocal executed_binaries, total_ran, total_passed, total_skipped
+        for index, test in enumerate(selected, start=first_index):
+            if not test.disabled:
+                executed_binaries += 1
+            try:
+                ran, passed, skipped = run_ordinary_test(index, test, build_dir)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                failures.append(("ordinary_ctest", test.name, str(error)))
+                continue
+            total_ran += ran
+            total_passed += passed
+            total_skipped += skipped
+
+    # CTest runs a FIXTURES_SETUP test before every test that requires its
+    # fixture. The grouped GTest processes bypass CTest's scheduling, so the
+    # ordinary fixture setups run first and everything else keeps its order.
+    setup_tests = [test for test in ordinary_tests if test.fixture_setup]
+    run_ordinary_tests(setup_tests, 1)
     for index, group in enumerate(groups.values(), start=1):
         if group.enabled_filters:
             executed_binaries += 1
@@ -400,17 +454,10 @@ def main() -> int:
         total_passed += passed
         total_skipped += skipped
 
-    for index, test in enumerate(ordinary_tests, start=1):
-        if not test.disabled:
-            executed_binaries += 1
-        try:
-            ran, passed, skipped = run_ordinary_test(index, test, build_dir)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            failures.append(("ordinary_ctest", test.name, str(error)))
-            continue
-        total_ran += ran
-        total_passed += passed
-        total_skipped += skipped
+    run_ordinary_tests(
+        [test for test in ordinary_tests if not test.fixture_setup],
+        len(setup_tests) + 1,
+    )
 
     print(
         f"{args.summary_prefix}_GROUP_SUMMARY binaries={executed_binaries} "

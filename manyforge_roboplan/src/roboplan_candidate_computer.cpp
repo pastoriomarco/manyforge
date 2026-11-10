@@ -971,7 +971,7 @@ prepare_candidate_time_law(
     roboplan::JointTrajectory &trajectory,
     const Eigen::VectorXd &model_velocity_limits,
     const Eigen::VectorXd &model_acceleration_limits,
-    const CartesianPlanningControl &control, bool tcp_held_by_toppra,
+    const CartesianPlanningControl &control,
     std::vector<double>* cartesian_waypoint_times_s = nullptr,
     bool retain_moving_evidence = false) {
   const auto incomplete = [] {
@@ -1051,34 +1051,63 @@ prepare_candidate_time_law(
       limits.push_back({angular_velocity, angular_acceleration, std::nullopt});
     }
     tcp_time_multiplier = std::max(1.0, frame_velocity_ratio);
-  } else if (contract.speed_profile.max_tcp_linear_speed_mps) {
-    // Check the active TCP at the samples only (linear; time_optimal
-    // Cartesian moves also angular). Exceedances between samples are
-    // accepted. RP-3 (motion timing fast, time_optimal Cartesian moves):
-    // TOPP-RA held the TCP at 0.98 of its limit on its grid, so only a sample
-    // above the limit stretches the whole trajectory back to the 0.98 target.
-    // Motion timing smooth (M8): TOPP-RA ignored the TCP, so the stretch
-    // brings the sample peak down to the 0.98 target.
-    const auto ratio =
-        detail::measure_tcp_sample_speed_ratio(contract, path, scene,
-                                               trajectory);
-    if (!ratio)
-      return incomplete();
-    frame_velocity_ratio = *ratio;
-    if (*ratio > (tcp_held_by_toppra ? 1.0 : detail::kTcpSpeedTargetFraction))
-      tcp_time_multiplier = *ratio / detail::kTcpSpeedTargetFraction;
+  }
+  if (contract.speed_profile.max_tcp_linear_speed_mps) {
+    // Retain the original Cartesian sample/envelope time law until the
+    // independent validator's chord threshold would actually be exceeded.
+    if (!path || path->speed_mode == core::CartesianSpeedModeDTO::kTimeOptimal) {
+      const auto sample = detail::measure_tcp_sample_speed_ratio(
+          contract, path, scene, trajectory);
+      if (!sample) return incomplete();
+      frame_velocity_ratio = *sample;
+      if (!path || *sample > 1.0)
+        tcp_time_multiplier = std::max(
+            tcp_time_multiplier, *sample / detail::kTcpSpeedTargetFraction);
+    }
+    if (!path) {
+      const auto chord = detail::measure_tcp_chord_speed_ratio(
+          contract, scene, trajectory, control);
+      if (!chord.ok())
+        return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(chord.error());
+      frame_velocity_ratio = std::max(frame_velocity_ratio, chord.value());
+      tcp_time_multiplier = std::max(
+          tcp_time_multiplier, chord.value() / detail::kTcpSpeedTargetFraction);
+    }
   }
   // One implementation constant, not an extra operator setting. Reserving 20%
   // avoids spending the complete acceleration/jerk budget on nominal timing.
   // 4/s retains the prior rate ceiling; 16/s² removes its rate discontinuity.
   if (!std::isfinite(frame_velocity_ratio))
     return incomplete();
-  const std::array envelopes{core::detail::TrajectoryDynamicsEnvelope{
-      derivatives, limits, tcp_time_multiplier}};
-  const auto prepared = core::detail::prepare_runtime_scaling(
-      envelopes, kNominalScalingHeadroom, {4.0, 16.0});
+  const auto prepare = [&](double minimum_multiplier) {
+    const std::array envelopes{core::detail::TrajectoryDynamicsEnvelope{
+        derivatives, limits, minimum_multiplier}};
+    return core::detail::prepare_runtime_scaling(
+        envelopes, kNominalScalingHeadroom, {4.0, 16.0});
+  };
+  auto prepared = prepare(tcp_time_multiplier);
   if (!prepared)
     return incomplete();
+  if (path && contract.speed_profile.max_tcp_linear_speed_mps) {
+    const auto baseline_speed = detail::measure_tcp_chord_speed_mps(
+        contract, scene, trajectory, control, prepared->trajectory_time_multiplier);
+    if (!baseline_speed.ok())
+      return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(baseline_speed.error());
+    // Match final validation's unscaled limit and tolerance exactly.
+    constexpr double kValidatorLimitTolerance = 1e-8;
+    if (baseline_speed.value() > *contract.speed_profile.max_tcp_linear_speed_mps +
+                                     kValidatorLimitTolerance) {
+      const auto chord = detail::measure_tcp_chord_speed_ratio(
+          contract, scene, trajectory, control);
+      if (!chord.ok())
+        return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(chord.error());
+      frame_velocity_ratio = std::max(frame_velocity_ratio, chord.value());
+      tcp_time_multiplier = std::max(
+          tcp_time_multiplier, chord.value() / detail::kTcpSpeedTargetFraction);
+      prepared = prepare(tcp_time_multiplier);
+      if (!prepared) return incomplete();
+    }
+  }
   // Retain velocity authority from the exact clipped/scaled limits and the
   // continuous curve envelopes. R/B describe live scaling, not Stop headroom.
   double velocity_ratio = frame_velocity_ratio;
@@ -1118,6 +1147,7 @@ struct FixedPieceMeasurement final {
   double velocity_ratio{};
   double correction_ratio{1.0};
   double duration_ratio{1.0};
+  bool chord_correction{};
 };
 
 // Diagnostic-only worker-local counters. No curve, qualification or deadline
@@ -1261,7 +1291,8 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
                     const roboplan::JointTrajectory &trajectory,
                     double position_tolerance,
                     const CartesianPlanningControl &control,
-                    MovingFinalizationMeasurements &measurements) {
+                    MovingFinalizationMeasurements &measurements,
+                    bool preserve_cartesian_timing) {
   if (!measurements.source)
     measurements.future_v_ratio = measurements.future_a_ratio =
         measurements.future_j_ratio = measurements.future_tcp_ratio = 0.0;
@@ -1305,6 +1336,8 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
   if (!joint.value().complete)
     return invalid();
   FixedPieceMeasurement result;
+  std::optional<double> deferred_cartesian_chord_ratio;
+  double sampled_tcp_ratio = 0.0;
   result.derivatives = std::move(joint.value().joint_derivatives);
   result.limits = resolved_runtime_joint_limits(
       contract, trajectory.joint_names, model_velocity->second,
@@ -1313,13 +1346,36 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
     MovingEnvelopeMeasurement timer(measurements, 1U,
                                     measurements.source ? "source_tcp_begin"
                                                         : "future_tcp_begin");
-    // RP-3: the same sample check as ordinary joint moves.
+    // The retained source remains as delivered. The new connector also needs
+    // the final-waypoint chord check used for ordinary candidates.
     const auto ratio =
         detail::measure_tcp_sample_speed_ratio(contract, nullptr, scene,
                                                trajectory);
     if (!ratio)
       return invalid();
     result.velocity_ratio = *ratio;
+    sampled_tcp_ratio = *ratio;
+    if (!measurements.source) {
+      const auto speed = detail::measure_tcp_chord_speed_mps(
+          contract, scene, trajectory, control, 1.0);
+      if (!speed.ok()) return core::Result<FixedPieceMeasurement>::Err(speed.error());
+      constexpr double kValidatorLimitTolerance = 1e-8;
+      const double limit = *contract.speed_profile.max_tcp_linear_speed_mps;
+      if (!preserve_cartesian_timing ||
+          speed.value() > limit + kValidatorLimitTolerance) {
+        const double scaled_limit = limit * contract.speed_profile.velocity_scale;
+        if (!finite_positive(scaled_limit)) return invalid();
+        const double chord_ratio = speed.value() / scaled_limit;
+        if (preserve_cartesian_timing) {
+          deferred_cartesian_chord_ratio = chord_ratio;
+        } else {
+          result.velocity_ratio = std::max(result.velocity_ratio, chord_ratio);
+          const double target_ratio = result.velocity_ratio / detail::kTcpSpeedTargetFraction;
+          result.correction_ratio = std::max(result.correction_ratio, target_ratio);
+          result.duration_ratio = std::max(result.duration_ratio, target_ratio);
+        }
+      }
+    }
     if (!measurements.source)
       measurements.future_tcp_ratio = result.velocity_ratio;
   }
@@ -1368,6 +1424,18 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
       std::max(result.correction_ratio, result.velocity_ratio);
   result.duration_ratio =
       std::max(result.duration_ratio, result.velocity_ratio);
+  // Let the existing connector search reach its original accepted candidate
+  // before adding the chord correction, preserving every previously passing
+  // Cartesian connector and its exact time law.
+  if (deferred_cartesian_chord_ratio && result.correction_ratio <= 1.0) {
+    result.chord_correction = true;
+    const double tcp_ratio = std::max(sampled_tcp_ratio, *deferred_cartesian_chord_ratio);
+    result.velocity_ratio = std::max(result.velocity_ratio, tcp_ratio);
+    const double target_ratio = tcp_ratio / detail::kTcpSpeedTargetFraction;
+    result.correction_ratio = std::max(result.correction_ratio, target_ratio);
+    result.duration_ratio = std::max(result.duration_ratio, target_ratio);
+    measurements.future_tcp_ratio = result.velocity_ratio;
+  }
   if (!finite(result.correction_ratio) || !finite(result.velocity_ratio))
     return invalid();
   MovingEnvelopeMeasurement timer(
@@ -1453,7 +1521,7 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
 
   const auto contract = cartesian_contract_input(binding, request, caps);
   const auto contract_control = cartesian_control(control);
-  // CT-1: the Deployment's `cartesian_timing` applies when the move sets none.
+  // The Deployment's `cartesian_timing` applies when the move sets none.
   core::CartesianPathDTO timed = path;
   timed.speed_mode = path.speed_mode.value_or(config.cartesian_timing);
   const bool time_optimal =
@@ -1472,7 +1540,7 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   }
   options.position_tolerance = request.tolerances.translation_tol_m;
   options.orientation_tolerance = request.tolerances.rotation_tol_rad;
-  // N18: Bounded times the resolved samples themselves, so a rounded corner
+  // Bounded times the resolved samples themselves, so a rounded corner
   // is resolved at most every r/20 (the whole path takes the finer step; the
   // fidelity check below still holds the node's own tolerances). TimeOptimal
   // reduces the samples to its tolerance budget and keeps the node's values.
@@ -1502,9 +1570,9 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
       path.max_linear_acceleration_mps2 * options.acceleration_scale;
   options.max_angular_acceleration =
       path.max_angular_acceleration_rad_s2 * options.acceleration_scale;
-  // Corners are rounded by densify_cartesian_path (RP-2). TimeOptimal keeps
+  // Corners are rounded by densify_cartesian_path. TimeOptimal keeps
   // RoboPlan's own small joint-space blend between the waypoints it keeps;
-  // RP-3 holds the active TCP at 0.98 of its linear and angular speed limits
+  // The TCP bound holds the active TCP at 0.98 of its linear and angular speed limits
   // on TOPP-RA's grid (patches 0016, 0018).
   if (time_optimal) {
     auto bound =
@@ -1650,11 +1718,10 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
     waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
   }
   // Cartesian moves follow `cartesian_timing`, never `motion_timing`:
-  // time_optimal carries the RP-3 bound; constant_speed is certified above.
+  // time_optimal carries the TCP bound; constant_speed is certified above.
   auto prepared = prepare_candidate_time_law(
       contract, &timed, scene, trajectory, model_velocity_limits->second,
-      model_acceleration_limits->second, contract_control,
-      /*tcp_held_by_toppra=*/true, &waypoint_times_s);
+      model_acceleration_limits->second, contract_control, &waypoint_times_s);
   if (!prepared.ok())
     return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
   scale_bounds = prepared.value();
@@ -1690,18 +1757,18 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   options.dt = config.trajectory_sample_period_s;
   options.mode = roboplan::SplineFittingMode::Hermite;
   options.velocity_scale = request.speed_profile.velocity_scale;
-  // N12 / RP-3b: the robot's Deployment `motion_timing`.
+  // The robot's Deployment `motion_timing`.
   const bool fast = config.motion_timing == core::MotionTimingDTO::kFast;
   // Fast: time within the nominal acceleration share directly, so the
   // live-scaling headroom needs no uniform stretch that would also slow the
   // stretches held at the TCP target; the final stretch covers only what is
-  // still exceeded. Smooth (M8): the full acceleration scale; the final
+  // still exceeded. Smooth: the full acceleration scale; the final
   // uniform stretch adds the TCP target, the headroom and jerk limits.
   options.acceleration_scale =
       request.speed_profile.acceleration_scale *
       (fast ? 1.0 - kNominalScalingHeadroom : 1.0);
   options.max_output_samples = config.maximum_trajectory_samples;
-  // Fast (RP-3): hold the active TCP at 0.98 of its speed limit on TOPP-RA's
+  // Fast: hold the active TCP at 0.98 of its speed limit on TOPP-RA's
   // grid.
   if (fast && contract.speed_profile.max_tcp_linear_speed_mps) {
     auto bound =
@@ -2017,7 +2084,8 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
   measurements.Record("source_begin");
   auto source = measure_fixed_piece(
       source_contract, scene, native_trajectory(source_piece),
-      input.tolerances.joint_position_tol_rad, contract_control, measurements);
+      input.tolerances.joint_position_tol_rad, contract_control, measurements,
+      false);
   measurements.Record("source_return");
   measurements.source = false;
   if (!source.ok())
@@ -2132,6 +2200,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
     double duration = std::max(entry, lower_bound);
     measurements.endpoint_lower_bound_s = lower_bound;
     double previous_ratio = std::numeric_limits<double>::infinity();
+    bool chord_search_started = false;
     for (;;) {
       if (auto error = control_error(control, "moving_duration_search"))
         return core::Result<core::TrajectoryDTO>::Err(*error);
@@ -2167,13 +2236,16 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
           future.waypoints.push_back(point);
       // Check the connector and its adjacent restricted suffix interval only.
       // Later knots retain the already-qualified suffix PVA/time law.
+      // Timestamp translation can move a boundary chord over limit + epsilon;
+      // independent final validation then refuses the candidate without motion.
       if (future.waypoints.size() > 3U) future.waypoints.resize(3U);
       measurements.future_points = future.waypoints.size();
       measurements.future_points_total += future.waypoints.size();
       auto changed =
           measure_fixed_piece(future_contract, scene, native_trajectory(future),
                               input.tolerances.joint_position_tol_rad,
-                              contract_control, measurements);
+                              contract_control, measurements,
+                              std::holds_alternative<core::CartesianPathDTO>(input.motion));
       if (measurements.trace_stages)
         measurements.Record("future_return");
       if (!changed.ok()) {
@@ -2184,6 +2256,10 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       measurements.ratio = ratio;
       measurements.next_duration_ratio = changed.value().duration_ratio;
       if (ratio > 1.0) {
+        if (changed.value().chord_correction && !chord_search_started) {
+          previous_ratio = std::numeric_limits<double>::infinity();
+          chord_search_started = true;
+        }
         if (!(ratio < previous_ratio))
           break;
         const double next = std::nextafter(
@@ -2257,14 +2333,44 @@ core::Result<std::vector<double>> RoboPlanCandidateComputer::solve_ik(
     const core::Pose3DTO &goal, const core::ResolvedFrameDTO &base_frame,
     const core::ResolvedFrameDTO &tcp_frame,
     const core::ControlledStateDTO &seed_state, double timeout_s,
-    const RoboPlanCandidateControl &control) {
+    const RoboPlanCandidateControl &control,
+    const core::TolerancesDTO *tolerances) {
   std::lock_guard lock(computation_mutex_);
   try {
     if (config_.rng_seed.has_value()) {
       scene_->setRngSeed(*config_.rng_seed);
     }
-    return solve_ik_locked(scene_, binding_, goal, base_frame, tcp_frame,
-                           seed_state, timeout_s, control);
+    auto result = solve_ik_locked(scene_, binding_, goal, base_frame, tcp_frame,
+                                  seed_state, timeout_s, control, tolerances);
+    if (!result.ok() || tolerances == nullptr) return result;
+    const Eigen::VectorXd q = eigen_vector(result.value());
+    const auto limits = scene_->getPositionLimitVectors(binding_.compiled_group_name, false);
+    if (!limits || limits->first.size() != q.size() || limits->second.size() != q.size())
+      return fail<std::vector<double>>(ErrorCode::kIkFailed,
+          "Diagnostic IK limits unavailable", "native_diagnostic_ik_unqualified");
+    for (Eigen::Index i = 0; i < q.size(); ++i) {
+      if (std::isnan(limits->first[i]) || std::isnan(limits->second[i]) ||
+          q[i] < limits->first[i] || q[i] > limits->second[i])
+        return fail<std::vector<double>>(ErrorCode::kIkFailed,
+            "Diagnostic IK violates model limits", "native_diagnostic_ik_unqualified");
+    }
+    const auto full = scene_->toFullJointPositions(binding_.compiled_group_name, q);
+    const auto actual = scene_->forwardKinematics(full, core::compiled_frame_name(tcp_frame),
+                                                   core::compiled_frame_name(base_frame));
+    const auto expected = native_pose(goal);
+    auto options = production_planning_ik_options(binding_.compiled_group_name);
+    if (finite_positive(tolerances->translation_tol_m))
+      options.max_linear_error_norm = std::min(options.max_linear_error_norm, tolerances->translation_tol_m);
+    if (finite_positive(tolerances->rotation_tol_rad))
+      options.max_angular_error_norm = std::min(options.max_angular_error_norm, tolerances->rotation_tol_rad);
+    if (!actual.allFinite() ||
+        (actual.block<3, 1>(0, 3) - expected.block<3, 1>(0, 3)).norm() > options.max_linear_error_norm ||
+        rotation_distance(actual.block<3, 3>(0, 0), expected.block<3, 3>(0, 0)) > options.max_angular_error_norm)
+      return fail<std::vector<double>>(ErrorCode::kIkFailed,
+          "Diagnostic IK does not reach its target", "native_diagnostic_ik_unqualified");
+    if (auto expired = control_error(control, "diagnostic_ik_qualification"))
+      return core::Result<std::vector<double>>::Err(std::move(*expired));
+    return result;
   } catch (const std::exception &error) {
     return fail<std::vector<double>>(ErrorCode::kPlanningFailed,
                                      "RoboPlan IK adapter failed: " +
@@ -2275,7 +2381,9 @@ core::Result<std::vector<double>> RoboPlanCandidateComputer::solve_ik(
 
 core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     const RoboPlanCandidateRequestDTO &input,
-    const RoboPlanCandidateControl &caller_control) {
+    const RoboPlanCandidateControl &caller_control,
+    std::optional<core::ControlledStateDTO> *qualified_target) {
+  if (qualified_target) qualified_target->reset();
   const auto whole_started = input.moving_replacement
                                  ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
@@ -2439,7 +2547,23 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     roboplan::JointConfiguration native_goal;
     native_goal.joint_names = binding_.compiled_joint_names;
     bool resolved_from_pose = false;
-    if (const auto *joint =
+    if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+      if (!request.diagnostic_qualified_target) {
+        return fail<core::TrajectoryDTO>(ErrorCode::kInvalidRequest,
+            "Diagnostic planning requires a qualified target", "native_diagnostic_target_missing");
+      }
+      auto expected = request.start_state;
+      expected.positions = request.diagnostic_qualified_target->positions;
+      expected.velocities = request.diagnostic_qualified_target->velocities;
+      auto projected = core::angular_position_projection(*request.diagnostic_qualified_target);
+      if (expected != *request.diagnostic_qualified_target || !projected.ok() ||
+          request.diagnostic_qualified_target->velocities.has_value()) {
+        return fail<core::TrajectoryDTO>(ErrorCode::kInvalidRequest,
+            "Diagnostic target differs from the retained binding", "native_diagnostic_target_invalid");
+      }
+      native_goal.positions = eigen_vector(projected.value());
+      resolved_from_pose = std::holds_alternative<core::PoseGoalDTO>(request.motion);
+    } else if (const auto *joint =
             std::get_if<core::ResolvedJointGoalDTO>(&request.motion)) {
       if (joint->resources.empty() ||
           joint->resources.size() != joint->joint_names.size() ||
@@ -2513,6 +2637,32 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
           ErrorCode::kInvalidRequest,
           "Resolved goal configuration has an invalid shape",
           "native_goal_shape_invalid");
+    }
+    // This evidence does not change ordinary planning or its errors. Only a
+    // finite target within the retained limits may qualify for preview replan.
+    const auto limits = planning_scene->getPositionLimitVectors(binding_.compiled_group_name, false);
+    bool within_limits = limits && limits->first.size() == native_goal.positions.size() &&
+                         limits->second.size() == native_goal.positions.size();
+    if (within_limits) {
+      for (Eigen::Index i = 0; i < native_goal.positions.size(); ++i) {
+        if (std::isnan(limits->first[i]) || std::isnan(limits->second[i]) ||
+            native_goal.positions[i] < limits->first[i] ||
+            native_goal.positions[i] > limits->second[i]) {
+          within_limits = false;
+          break;
+        }
+      }
+    }
+    if (!within_limits && request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled)
+      return fail<core::TrajectoryDTO>(ErrorCode::kInvalidRequest,
+          "Diagnostic target is outside retained model limits", "native_diagnostic_target_invalid");
+    if (within_limits && qualified_target) {
+      auto target = request.start_state;
+      target.positions.clear();
+      for (Eigen::Index i = 0; i < native_goal.positions.size(); ++i)
+        target.positions.emplace_back(core::AngularPositionDTO{native_goal.positions[i]});
+      target.velocities.reset();
+      *qualified_target = std::move(target);
     }
     const Eigen::VectorXd full_goal = planning_scene->toFullJointPositions(
         binding_.compiled_group_name, native_goal.positions);
@@ -2634,7 +2784,6 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
         contract, nullptr,
         planning_scene, trajectory.value(), model_velocity->second,
         model_acceleration->second, cartesian_control(control),
-        /*tcp_held_by_toppra=*/config_.motion_timing == core::MotionTimingDTO::kFast,
         nullptr, input.moving_replacement.has_value());
     if (!prepared.ok())
       return core::Result<core::TrajectoryDTO>::Err(prepared.error());

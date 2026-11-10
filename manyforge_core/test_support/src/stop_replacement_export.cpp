@@ -1,6 +1,6 @@
 // stop_replacement_export: test-support exporter of Core's exact Stop
-// replacement trajectories for Track 2's pinned-JTC characterization (design
-// §9, Q20/Q26/Q42). Built with the Core tests; never installed or shipped. It
+// replacement trajectories for pinned-JTC characterization. Built with the
+// Core tests; never installed or shipped. It
 // calls the real Core functions (`compute_stop_join_elapsed_s`,
 // `plan_controlled_hard_stop_brake`, `convert_stop_trajectory_to_path_time`,
 // `build_stop_replacement_join`); it has no second implementation.
@@ -38,14 +38,14 @@
 //
 // OUTPUT (canonical JSON):
 //
-//   elapsed_path_s  number   Q26 elapsed: cursor + factor * (wall + allowance)
+//   elapsed_path_s  number   elapsed: cursor + factor * (wall + allowance)
 //                            (`elapsed_error` {"error": ...} instead on refusal)
-//   brake           object   Q42 level 3: {"limiting_joint", "stop_path_time_s",
+//   brake           object   level 3: {"limiting_joint", "stop_path_time_s",
 //                            "stop_time_s", "trajectory" (brake alone, path time,
-//                            time 0 = the sample), "replace" (the Q20 join sent
+//                            time 0 = the sample), "replace" (the join sent
 //                            with Replace)} or {"error": {"message", "reason"}}
 //   ramp            object   present with `ramp`: {"path_time" (the ramp in path
-//                            time at the factor), "replace" (the Q20 join: the
+//                            time at the factor), "replace" (the join: the
 //                            active points before the trip point, the trip
 //                            point, then the ramp after it), "trip_path_s"
 //                            (origin_path_s + factor * lead_in_s)} or

@@ -1,7 +1,6 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
   "assistant_model_components": {
-    "assistant_model": "chat_model",
     "selection_model": "selection_model"
   },
   "assistant_profile_id": "semantic_shape_selection",

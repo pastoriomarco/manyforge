@@ -19,13 +19,13 @@ namespace {
 }  // namespace
 
 RetainedExecutionStateSink::RetainedExecutionStateSink(
-    core::IClock& clock,
+    std::shared_ptr<core::IClock> clock,
     std::vector<RetainedExecutionStateSinkBinding> bindings)
-    : clock_(&clock), bindings_(std::move(bindings)) {
+    : clock_(std::move(clock)), bindings_(std::move(bindings)) {
   std::set<std::string> group_names;
-  if (bindings_.empty()) {
+  if (!clock_ || bindings_.empty()) {
     throw std::invalid_argument(
-        "retained execution-state sink requires at least one binding");
+        "retained execution-state sink requires a clock and at least one binding");
   }
   for (const auto& binding : bindings_) {
     if (binding.compiled_group_name.empty() || !binding.state_channel ||

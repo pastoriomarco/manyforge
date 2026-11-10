@@ -11,9 +11,5 @@ Deployment. The execution host supervises the processes of its components
 (drivers, bridges, `ros2_control.launch.py`). Component health is each
 component's `ComponentState`, served by the Headless API (`GET /api/components`).
 
-`verification/composable_cell_i4/` and `tests/composable_cell_i4/` keep
-test-only reference fixtures of the runtime-observation rules; production code
-never imports them.
-
 The deleted Python sources are in the repository history (commit
 `08222188293df8e12f90dc72e204c21f22f92ea1`).

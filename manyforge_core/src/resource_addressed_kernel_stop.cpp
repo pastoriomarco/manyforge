@@ -321,10 +321,6 @@ bool ResourceAddressedExecutionKernel::ordinary_request_id_retained_locked(
                      [&](const auto& row) {
                        return row.request.request_context.request_id == request_id;
                      }) ||
-         std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                     [&](const auto& row) {
-                       return row.request.request_context.request_id == request_id;
-                     }) ||
          std::any_of(runtime_scale_control_replay_ledger_.begin(),
                      runtime_scale_control_replay_ledger_.end(), [&](const auto& row) {
                        return row.request.request_context.request_id == request_id;
@@ -471,7 +467,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         // a normal rejection or unwinding would lose its already-linearized
         // containment authority. Restated facts refuse in the reserve's
         // precommit and a fence failure is accepted-degraded, so what remains
-        // here is an owner bug or allocation failure (D5): it terminates
+        // here is an owner bug or allocation failure: it terminates
         // fail-closed rather than pretending the Stop was rejected.
         std::terminate();
       }
@@ -586,7 +582,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       }
     }
     // Every per-robot Stop-time deadline is measured from this acceptance and
-    // must stay representable on the Kernel clock (Q51: there is no shared
+    // must stay representable on the Kernel clock (there is no shared
     // outer budget; this is only the representability bound).
     if (checked_deadline(accepted_at_ns, kMaximumStopDurationNs) < 0) {
       return reject<StopAcceptedDTO>("Stop deadline cannot be represented monotonically",
@@ -1838,7 +1834,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       projection_state = std::move(affected_state);
       work_token = outcome.work_token;
       handoff_work = true;
-      // Q51: no shared Stop deadline is armed; the handed-off work starts at
+      // No shared Stop deadline is armed; the handed-off work starts at
       // once and every later wakeup is a robot's own stage deadline or a
       // stage completion.
       next_stop_id_ = proposed_number + 1U;
@@ -1939,7 +1935,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                    ErrorCode::kInvariantViolation);
   }
   post_reserve_guard.armed = false;
-  // CONTRACTS §5: an accepted Stop arms the cell latch condition; §2: it
+  // An accepted Stop arms the cell latch condition; it
   // interrupts every component action in progress (after the lock).
   if (accepted->replay_status != RequestReplayStatusDTO::kReplayedExact) {
     refresh_cell_latch_locked(true);
@@ -2144,13 +2140,33 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
   }
 }
 
+bool ResourceAddressedExecutionKernel::stop_stage_attempts_owned_locked() const noexcept {
+  return std::any_of(
+      stop_transactions_.begin(), stop_transactions_.end(), [](const auto& transaction) {
+        return transaction != nullptr && transaction->active && !transaction->terminal &&
+               std::any_of(transaction->participants.begin(), transaction->participants.end(),
+                           [](const auto& participant) {
+                             return std::any_of(
+                                 participant.attempts.begin(), participant.attempts.end(),
+                                 [](const auto& attempt) {
+                                   return attempt.handle.has_value() && !attempt.result_consumed;
+                                 });
+                           });
+      });
+}
+
 void ResourceAddressedExecutionKernel::StageAttemptCompleted(
-    const StopStageAttemptHandle handle) noexcept {
+    BoundedStopStageAttemptExecutor& source, const StopStageAttemptHandle handle) noexcept {
   std::optional<StopControlWorkToken> owner_token;
   try {
     {
       std::lock_guard state_lock(state_mutex_);
+      // Only the current pool's attempts can belong to a live transaction:
+      // a pool is swapped out only while no live transaction owns an attempt
+      // of it. A retired pool's completion is a late result settled below.
+      const bool current_pool = &source == stop_stage_attempt_executor_.get();
       for (const auto& transaction : stop_transactions_) {
+        if (!current_pool) break;
         if (transaction == nullptr || !transaction->active || transaction->terminal) {
           continue;
         }
@@ -2182,11 +2198,11 @@ void ResourceAddressedExecutionKernel::StageAttemptCompleted(
     }
     // A terminal transaction may already have handed off its immutable
     // certificate. Consume and release a late isolated result so one hung
-    // predecessor can never exhaust future Stop-stage capacity. Later P5d
+    // predecessor can never exhaust future Stop-stage capacity. A later
     // projection owns the bounded late-audit sink.
-    const auto late = stop_stage_attempt_executor_->TryTake(handle);
+    const auto late = source.TryTake(handle);
     if (late.status != StopStageAttemptTakeStatus::kPending) {
-      static_cast<void>(stop_stage_attempt_executor_->Release(handle));
+      static_cast<void>(source.Release(handle));
     }
   } catch (...) {
   }
@@ -2612,7 +2628,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       catch (...) {
       }
     });
-    // Q60: late cancellation replies of never-dispatched participants whose
+    // Late cancellation replies of never-dispatched participants whose
     // Stop already closed are tidied up on this lane, before any Stop work.
     settle_deferred_pre_dispatch_cancellations();
     struct PreparedCancellation final {
@@ -2866,7 +2882,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           item.collision_escalation_error.reset();
           if (!item.terminal && !item.cancelled_pre_dispatch && collision_error.has_value()) {
             if (!item.stop_path_collision.has_value()) item.stop_path_collision = collision_error;
-            // Q29: the participant ends InterventionRequired with the
+            // The participant ends InterventionRequired with the
             // collision (as `main`).
             const auto strongest = item.plan.stage_commands.empty()
                                        ? std::size_t{0}
@@ -2920,7 +2936,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           }
           // The bounded, local Prepare/read borrow and the synchronous
           // cancellation call still finish inside this Stop lane (this pass
-          // issues the call below and re-enters directly). Q60: the
+          // issues the call below and re-enters directly). The
           // cancellation's own asynchronous terminal is not awaited.
           const bool waiting =
               preparation_in_flight || (needs_cancellation && !item.prepared_cancel_complete);
@@ -2930,11 +2946,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               !item.prepared_cancel_terminal_observed &&
               !item.unclassified_prepared_terminal.has_value();
           if (waiting) {
-            // Q51: no shared Stop deadline; the never-dispatched participant's
+            // No shared Stop deadline; the never-dispatched participant's
             // own owner settles it (its completion wakes this Stop).
             continue;
           } else if (cancel_terminal_outstanding) {
-            // Q60: nothing was dispatched and the dispatch barrier stays
+            // Nothing was dispatched and the dispatch barrier stays
             // closed, so the Stop closes now. The participant's settlement is
             // deferred to its cancellation terminal (below).
             item.cancel_terminal_deferred = true;
@@ -3035,7 +3051,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   item.terminal = true;
                   if (retained.request.stage_index > 0U && item.terminal_error.has_value()) {
                     item.escalation_cause = std::move(item.terminal_error);
-                    // Q33: a hard stop the Stop planner chose is the intended
+                    // A hard stop the Stop planner chose is the intended
                     // Stop, so its certificate is nominal, not escalated.
                     if (planner_selected_hard_stop(*item.escalation_cause)) {
                       item.lane_hard_stop_requested = true;
@@ -3044,7 +3060,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   item.terminal_error.reset();
                 } else if (retained.request.stage_index == 0U &&
                            controlled_stop_unsettled_result(retained)) {
-                  // Q18: the controller finished the Stop ramp outside its
+                  // The controller finished the Stop ramp outside its
                   // goal tolerance. As `main`'s confirmed-but-not-settled
                   // case: InterventionRequired, no second Stop command.
                   item.controlled_stop_unsettled = true;
@@ -3060,12 +3076,12 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                                                   "false");
                   }
                 } else {
-                  // No cell-wide latch for an escalation (items 25, Q29).
+                  // No cell-wide latch for an escalation.
                   advance_after_failed_stage();
                 }
               }
             } else if (!attempt.superseded) {
-              // Q29: an invalid provider result escalates; the participant's
+              // An invalid provider result escalates; the participant's
               // outcome carries it, no cell-wide latch or admission closure.
               retain_first_error(valid.error());
               advance_after_failed_stage();
@@ -3080,7 +3096,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
 
         while (!item.terminal) {
           if (item.current_stage_index >= item.plan.stage_commands.size()) {
-            // Q29: an exhausted cascade ends the participant
+            // An exhausted cascade ends the participant
             // InterventionRequired without a cell-wide latch (as `main`).
             item.terminal = true;
             item.contained = false;
@@ -3185,7 +3201,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const bool participant_settlement_required = !item.settlement_not_required();
         if (item.contained && participant_settlement_required &&
             !item.participant_settlement_complete) {
-          // Q58 (as `main`): the gripper's cancel is fire-and-forget and the
+          // The gripper's cancel is fire-and-forget and the
           // Stop does not wait for the still-returning command; a stuck
           // gripper cannot hold up the Stop. Its exact local settlement is
           // handed to the dispatch return (local cleanup needs the returned
@@ -3256,7 +3272,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   active_participant->deferred_stop_settlement = std::move(settlement_request);
                   item.participant_settlement_complete = true;
                 } else if (item.cancel_terminal_deferred) {
-                  // Q60: as Q58, the exact settlement waits for the
+                  // As for a gripper cancel, the exact settlement waits for the
                   // cancellation's own terminal; the Stop does not.
                   active_participant->deferred_cancel_settlement =
                       ActiveOperationParticipant::DeferredPreDispatchCancelSettlement{
@@ -3290,7 +3306,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                                   !item.participant_settlement_error.has_value()));
         // A runtime collision outside an operator Stop ends the colliding
         // participant InterventionRequired once contained, through the
-        // ordinary outcome path (item 19); its siblings end Stopped.
+        // ordinary outcome path; its siblings end Stopped.
         const bool runtime_collision_participant =
             runtime_collision_containment &&
             active_participant->runtime_collision_error.has_value();
@@ -3324,7 +3340,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                    !internal_control_stop && !planner_selected_hard_stop(*item.escalation_cause) &&
                    !participant_state->terminal_error.has_value()) {
           // A successful fallback hard stop ends Stopped with `main`'s
-          // degraded-Stop error (item 25).
+          // degraded-Stop error.
           const auto containing = std::find_if(
               item.retained_results.rbegin(), item.retained_results.rend(),
               [](const auto& candidate) {

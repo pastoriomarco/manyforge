@@ -587,7 +587,7 @@ TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndIntrinsicallyValid) {
             "articulated_arm");
 }
 
-// TCP-A: an owned occurrence carries its Deployment custom TCPs (sorted,
+// An owned occurrence carries its Deployment custom TCPs (sorted,
 // emitted only when present).
 TEST(CellGraphCodec, OwnedOccurrenceCarriesSortedCustomTcps) {
   const std::string custom =
@@ -640,7 +640,7 @@ TEST(CellGraphCodec, OwnedOccurrenceCarriesSortedCustomTcps) {
                CellGraphCodecError);
 }
 
-// B5: a component's compiled `default_tcp` pair and a mount's authored
+// A component's compiled `default_tcp` pair and a mount's authored
 // `primary` round-trip; each is emitted only when present (true).
 TEST(CellGraphCodec, CarriesDefaultTcpAndPrimaryOnlyWhenPresent) {
   const std::string tcp_anchor = "  - controllable_component_id: robot_1\n";
@@ -697,7 +697,8 @@ TEST(CellGraphCodec, CarriesSortedCollisionExclusionsOnlyWhenPresent) {
       "      - {child_link: right_finger, parent_link: link5}\n"
       "      - {child_link: left_finger, parent_link: link5}\n"
       "      - {child_link: left_finger, parent_link: link4}\n");
-  const auto& edge = validate(pairs).graph().component_attachments.front();
+  const auto validated = validate(pairs);
+  const auto& edge = validated.graph().component_attachments.front();
   using Pair = core::ComponentAttachmentCollisionExclusionDTO;
   EXPECT_EQ(edge.collision_exclusions,
             (std::vector<Pair>{{"left_finger", "link4"},

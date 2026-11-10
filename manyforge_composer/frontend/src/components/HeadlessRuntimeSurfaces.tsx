@@ -39,7 +39,7 @@ import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
 
 
-/** The state label (plan, "Presentation of problems"): Active or Resolved. */
+/** The state label: Active or Resolved. */
 function lifecycleLabel(alarm: OperatorAlarmRecord): string {
   switch (alarm.lifecycleState) {
     case 'active_unacknowledged':

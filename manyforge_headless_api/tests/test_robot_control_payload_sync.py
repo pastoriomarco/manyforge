@@ -110,7 +110,9 @@ def test_set_tcp_does_not_sync_even_with_direct_motion_program_id():
     from manyforge_headless_api.tests.test_models import _planning_operation
 
     body = _planning_operation("set-tcp", {
-        "kind": "set_tcp", "tcp": {"kind": "default_of_role", "role": "tool"},
+        "kind": "set_tcp",
+        "tcp": {"kind": "default_of_target",
+                "target": {"component_id": "robot", "command_target_id": "arm"}},
     })
     body["program_id"] = "manyforge.direct_control.motion"
     calls = []

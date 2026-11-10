@@ -137,13 +137,11 @@ def main() -> None:
         "--startup-scenario-document",
         help="open and activate one exact complete v2 Scenario document",
     )
-    parser.add_argument("--assistant-bridge-url")
     parser.add_argument(
         "--mcp-http",
         action="store_true",
         help="enable the optional stateless MCP adapter at /mcp/ (requires the mcp extra)",
     )
-    parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--settings-dir",
         help=(
@@ -161,24 +159,13 @@ def main() -> None:
     setup_logging(args.log_level)
     security = SecurityConfig.from_env()
     headless_client = None
-    assistant_client = None
+    state = None
     if args.headless_api_url is not None:
         from manyforge_headless_api.client import HeadlessHttpClient
 
         headless_client = HeadlessHttpClient(
             args.headless_api_url,
             timeout_seconds=args.headless_api_timeout_s,
-        )
-    if args.assistant_bridge_url is not None:
-        if headless_client is None:
-            parser.error("--assistant-bridge-url requires --headless-api-url")
-        from manyforge_composer.backend.assistant_provider_client import (
-            AssistantProviderHttpClient,
-        )
-
-        assistant_client = AssistantProviderHttpClient(
-            args.assistant_bridge_url,
-            timeout_seconds=args.assistant_request_timeout_s,
         )
     try:
         state = ComposerState.from_paths(
@@ -187,7 +174,6 @@ def main() -> None:
             allowed_program_write_roots=security.allowed_program_write_roots,
             allowed_deployment_write_roots=security.allowed_deployment_write_roots,
             headless_client=headless_client,
-            assistant_client=assistant_client,
         )
         state_dir = os.environ.get("MANYFORGE_STATE_DIR", "").strip()
         settings_dir = (
@@ -221,8 +207,8 @@ def main() -> None:
             ws_per_message_deflate=False,
         )
     finally:
-        if assistant_client is not None:
-            assistant_client.close()
+        if state is not None and state.assistant_client is not None:
+            state.assistant_client.close()
         if headless_client is not None:
             headless_client.close()
 

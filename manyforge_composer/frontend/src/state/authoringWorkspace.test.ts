@@ -36,7 +36,7 @@ function workspaceSnapshot(
   deploymentDraftRevision: number,
 ): AuthoringWorkspaceSnapshot {
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision,
     program: {
@@ -47,7 +47,7 @@ function workspaceSnapshot(
         authoring: { forest: [] } as unknown as ProgramAuthoringDocument,
         candidateAvailable: true,
         programRevision: `sha256:${'b'.repeat(64)}`,
-        program: { api_version: 'manyforge.program.v2' } as unknown as ProgramDocument,
+        program: { api_version: 'manyforge.program.v3' } as unknown as ProgramDocument,
         diagnostics: [],
         formulaReferences: { computedKeys: {}, nodes: {} },
       },
@@ -76,7 +76,6 @@ function workspaceSnapshot(
         { code: 'scenario_source_changed', sourceId: 'mesh.1', message: 'changed' },
       ] satisfies ScenarioSourceDiagnostic[],
       sourceDocumentDigest: `sha256:${'c'.repeat(64)}`,
-      programRoleAssignment: { arm: 'role.arm' },
       sourceProgramDigest: null,
       sourceDeploymentDigest: null,
     },
@@ -230,7 +229,7 @@ describe('authoringWorkspace', () => {
     )).toContain('editing requires Idle or all Program motion stopped');
   });
 
-  it('leaves a finished or stopped run to the server for New and Load (R3)', () => {
+  it('leaves a finished or stopped run to the server for New and Load', () => {
     const installed = published(workspaceSnapshot(5, 3, 4));
     const finished = headlessState(5, {}, {
       programCycle: { state: 'terminal_awaiting_reset' } as never,
@@ -246,7 +245,7 @@ describe('authoringWorkspace', () => {
     );
   });
 
-  it('never disables New or Load for a held authoring claim (R3)', () => {
+  it('never disables New or Load for a held authoring claim', () => {
     const installed = published(workspaceSnapshot(5, 3, 4));
     // A claim left held (e.g. after a refused Apply) closes Kernel admission.
     const locked = headlessState(5, {}, {
@@ -328,7 +327,7 @@ describe('authoringWorkspace', () => {
     })]);
   });
 
-  it('keeps a Controlled Stop row with its own cause beside an open latch (ERRUI, SX-643)', () => {
+  it('keeps a Controlled Stop row with its own cause beside an open latch', () => {
     // No overview reason is the latch or the incident itself, so a missing
     // stop binding stays its own item; the latch has its own Recover cell item.
     const state = headlessState(5);

@@ -134,13 +134,13 @@ struct SceneRuntimeCarriedObjectLoss final {
   manyforge::core::GraphRevision graph_revision;
   /// Unique per observation; the Stop request id.
   std::string request_id;
-  /// Contract §10: the loss `event_id` and the attachment's stored
+  /// The loss `event_id` and the attachment's stored
   /// `on_grasp_lost.set_key`, carried into the host's loss row.
   std::string loss_event_id{};
   std::optional<std::string> set_key{};
 };
 
-/// C-P4 (G1): the components a carried-object-lost Stop names: the holder and
+/// The components a carried-object-lost Stop names: the holder and
 /// every component it is mounted on (the cell kinematic index's
 /// `ancestors_of`), in id order as the Stop component selector requires.
 [[nodiscard]] std::vector<manyforge::core::ControllableComponentId>
@@ -202,7 +202,7 @@ struct SceneRuntimePoseApplicationResult final {
 /// row's full text; details carry the four flags; `raise_alarm` is the
 /// Headless alarm's selector). The baseline is forgotten only after a
 /// successful detach, so a refused detach is detected and retried on the next
-/// sample (DX-2562); without `detach` the attachment is marked lost and fires
+/// sample; without `detach` the attachment is marked lost and fires
 /// once.
 class SceneRuntimePoseProjector final {
 public:

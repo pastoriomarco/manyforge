@@ -109,7 +109,7 @@ ProgramStartSettlementJson(std::string_view claim_json,
          std::string(prepared_scene) + ",\"program_run_id\":\"" +
          std::string(program_run_id) +
          "\",\"schema_version\":"
-         "\"manyforge.program_cycle_start_settlement.v1\"}";
+         "\"manyforge.program_cycle_start_settlement.v2\"}";
 }
 
 TEST(OwnerSettlementReaders,
@@ -164,7 +164,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
@@ -212,20 +212,20 @@ TEST(OwnerSettlementReaders,
         "\",\"program_run_id\":\"run.7\",\"retained_bundle_id\":\"" +
         std::string(kDigestB) +
         "\"},\"details\":null,\"origin\":null,"
-        "\"schema_version\":\"manyforge.program_run_status.v3\","
+        "\"schema_version\":\"manyforge.program_run_status.v4\","
         "\"state\":\"running\"}',0)");
     fixture.Close();
     return ReadActiveProgramRunProductForReconciliation(fixture.path());
   };
 
-  const auto current = journal(8);
+  const auto current = journal(9);
   ASSERT_TRUE(current.ok());
   ASSERT_TRUE(current.value().has_value());
   EXPECT_EQ(current.value()->program_run_id, core::ProgramRunId("run.7"));
   EXPECT_FALSE(journal(6).ok());
   EXPECT_FALSE(journal(3).ok());
   EXPECT_FALSE(journal(7).ok());
-  EXPECT_FALSE(journal(9).ok());
+  EXPECT_FALSE(journal(8).ok());
 }
 
 TEST(OwnerSettlementReaders, AbsentProgramJournalHasNoRecoveryProduct) {
@@ -245,7 +245,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase current;
   current.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "INSERT INTO program_cycle VALUES(1,'running','run.7',0)");
@@ -258,7 +258,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "INSERT INTO program_cycle "
@@ -274,7 +274,7 @@ TEST(OwnerSettlementReaders, ActiveProgramRunRecoveryRejectsACrossRunCapture) {
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
@@ -318,7 +318,7 @@ TEST(OwnerSettlementReaders,
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY "
         "KEY,schema_version INTEGER);"
-        "INSERT INTO program_cycle_metadata VALUES(1,8);"
+        "INSERT INTO program_cycle_metadata VALUES(1,9);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state "
         "TEXT,program_run_id TEXT,reconciliation_required INTEGER);"
         "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY "
@@ -373,7 +373,7 @@ TEST(OwnerSettlementReaders,
     TemporaryDatabase fixture;
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-        "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+        "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
         "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
         "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -410,7 +410,7 @@ TEST(OwnerSettlementReaders,
       ",\"kind\":\"proven_no_effect\",\"prepared_scene\":{"
       "\"schema_version\":\"manyforge.prepared_program_scene.v1\"},"
       "\"program_run_id\":\"cycle.1\",\"schema_version\":"
-      "\"manyforge.program_cycle_start_settlement.v1\"}";
+      "\"manyforge.program_cycle_start_settlement.v2\"}";
   const auto evidence = content_identity::sha256_digest(start_settlement);
   const auto release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
                                         "start.1", "explicit_reset", evidence);
@@ -419,7 +419,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -434,10 +434,32 @@ TEST(OwnerSettlementReaders,
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
           .ok());
 
+  auto retired_settlement = start_settlement;
+  const auto version_pos = retired_settlement.find("manyforge.program_cycle_start_settlement.v2");
+  ASSERT_NE(version_pos, std::string::npos);
+  retired_settlement.replace(version_pos, std::string("manyforge.program_cycle_start_settlement.v2").size(),
+                             "manyforge.program_cycle_start_settlement.v1");
+  const auto retired_evidence = content_identity::sha256_digest(retired_settlement);
+  const auto retired_release_json = ReleaseJson("program_runner", "runner.1", "cycle.1",
+                                                "start.1", "explicit_reset", retired_evidence);
+  const auto retired_release = DecodeCellAdmissionClaimRelease(retired_release_json);
+  TemporaryDatabase retired;
+  retired.Exec(
+      "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,schema_version INTEGER);"
+      "INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,owner_epoch TEXT,"
+      "program_run_id TEXT,claim_json TEXT,terminal_reference TEXT,start_settlement_json TEXT,"
+      "release_intent_json TEXT,reconciliation_required INTEGER,acquisition_pending_json TEXT,reset_phase TEXT);");
+  retired.Exec("INSERT INTO program_cycle VALUES(1,'resetting','runner.1','cycle.1','" +
+               claim_json + "','" + retired_evidence + "','" + retired_settlement +
+               "','" + retired_release_json + "',0,NULL,'releasing')");
+  retired.Close();
+  EXPECT_FALSE(ValidateProgramCycleSettlementReadOnly(retired.path(), claim, retired_release).ok());
+
   TemporaryDatabase missing_intent;
   missing_intent.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -468,7 +490,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -504,7 +526,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -525,7 +547,7 @@ TEST(OwnerSettlementReaders,
   EXPECT_FALSE(
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
           .ok());
-  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=8");
+  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=9");
 
   fixture.Exec("UPDATE program_cycle SET reset_phase='stopping'");
   fixture.Close();
@@ -550,7 +572,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -582,7 +604,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -628,7 +650,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -704,7 +726,7 @@ TEST(OwnerSettlementReaders,
           ",\"program_run_id\":\"" +
           (which == "foreign_run" ? "foreign.cycle" : "cycle.1") +
           "\",\"schema_version\":\"manyforge.program_cycle_start_settlement."
-          "v1\"" +
+          "v2\"" +
           (state == "terminal_effects_settled"
                ? ",\"terminal_run\":{\"capture\":{\"program_run_id\":\"" +
                      std::string(which == "foreign_terminal" ? "foreign.cycle"
@@ -719,7 +741,7 @@ TEST(OwnerSettlementReaders,
       fixture.Exec(
           "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
           "schema_version INTEGER); INSERT INTO program_cycle_metadata "
-          "VALUES(1,8);"
+          "VALUES(1,9);"
           "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
           "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
           "release_intent_json TEXT,terminal_reference TEXT,"
@@ -777,7 +799,7 @@ TEST(OwnerSettlementReaders,
         (which == "malformed_scene" ? "{\"unexpected\":true}" : "{}") +
         ",\"program_run_id\":\"" +
         (which == "foreign_run" ? "foreign.cycle" : "cycle.1") +
-        "\",\"schema_version\":\"manyforge.program_cycle_start_settlement.v1\","
+        "\",\"schema_version\":\"manyforge.program_cycle_start_settlement.v2\","
         "\"terminal_run\":" +
         terminal + "}";
     const auto reference = content_identity::sha256_digest(settlement);
@@ -789,7 +811,7 @@ TEST(OwnerSettlementReaders,
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
         "schema_version INTEGER); INSERT INTO program_cycle_metadata "
-        "VALUES(1,8);"
+        "VALUES(1,9);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
         "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
         "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -816,7 +838,7 @@ TEST(OwnerSettlementReaders, IdleResetReleaseRequiresItsExactAcceptedJournalOccu
   const auto request_json = content_identity::canonical_json(original);
   const auto request_digest = content_identity::sha256_digest(request_json);
   const auto start_settlement = content_identity::canonical_json(Value(Value::Object{
-      {"schema_version", Value("manyforge.program_cycle_start_settlement.v1")},
+      {"schema_version", Value("manyforge.program_cycle_start_settlement.v2")},
       {"kind", Value("proven_no_effect")}, {"claim", Value(nullptr)},
       {"program_run_id", Value("failed-start.1")}, {"prepared_scene", Value(Value::Object{})}}));
   const auto terminal_reference = content_identity::sha256_digest(start_settlement);
@@ -851,7 +873,7 @@ TEST(OwnerSettlementReaders, IdleResetReleaseRequiresItsExactAcceptedJournalOccu
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,schema_version INTEGER);"
-      "INSERT INTO program_cycle_metadata VALUES(1,8);"
+      "INSERT INTO program_cycle_metadata VALUES(1,9);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,owner_epoch TEXT,"
       "cycle_generation INTEGER,program_run_id TEXT,claim_json TEXT,terminal_reference TEXT,"
       "reconciliation_required INTEGER,acquisition_pending_json TEXT,reset_phase TEXT,reset_effect_claim_json TEXT,"
@@ -877,7 +899,7 @@ TEST(OwnerSettlementReaders, IdleResetReleaseRequiresItsExactAcceptedJournalOccu
   }
   fixture.Exec("UPDATE program_cycle SET reset_phase='releasing'; UPDATE program_cycle_metadata SET schema_version=7");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());
-  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=8; UPDATE program_cycle SET reconciliation_required=1");
+  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=9; UPDATE program_cycle SET reconciliation_required=1");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());
   fixture.Exec("UPDATE program_cycle SET reconciliation_required=0; UPDATE program_cycle_inflight_commands SET request_id='foreign'");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());

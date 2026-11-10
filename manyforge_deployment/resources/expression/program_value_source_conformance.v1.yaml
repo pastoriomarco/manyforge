@@ -61,9 +61,12 @@ nodes:
     node_id: motion.move_to_joint_target
     instance_id: move
     parameters:
-      target_role: arm
-      base_frame_role: base
-      tcp_endpoint: {target_role: arm, frame_role: tcp}
+      target: {component_id: lite6_robot, command_target_id: arm}
+      base_frame: {component_id: lite6_robot, frame_id: base}
+      tcp_endpoint:
+        kind: entry
+        target: {component_id: lite6_robot, command_target_id: arm}
+        frame: {component_id: lite6_robot, frame_id: tcp}
       goal: [{joint_name: joint1, position_rad: 0.0}]
   probe:
     node_id: motion.probe_search
@@ -174,25 +177,35 @@ refused:
     value_sources:
       pose.frame_ref.kind: {kind: program_parameter, reference: label}
     reason: nested text, choice and identifier fields stay literal
-  - name: nested target role selector
+  - name: nested frame component selector
     node: offset
     parameters:
       pose:
-        frame_ref: {kind: target_frame, target_role: arm, frame_role: tcp}
+        frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
         position_m: [0.1, 0.2, 0.3]
         orientation: {rpy_deg: [0.0, 0.0, 90.0]}
     value_sources:
-      pose.frame_ref.target_role: {kind: program_parameter, reference: label}
-    reason: cannot dynamically select runtime/binding semantics
-  - name: nested frame role selector
+      pose.frame_ref.frame.component_id: {kind: program_parameter, reference: label}
+    reason: nested text, choice and identifier fields stay literal
+  - name: nested direct frame selector
     node: offset
     parameters:
       pose:
-        frame_ref: {kind: target_frame, target_role: arm, frame_role: tcp}
+        frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
         position_m: [0.1, 0.2, 0.3]
         orientation: {rpy_deg: [0.0, 0.0, 90.0]}
     value_sources:
-      pose.frame_ref.frame_role: {kind: blackboard_key, reference: ratio}
+      pose.frame_ref.frame.frame_id: {kind: blackboard_key, reference: ratio}
+    reason: nested text, choice and identifier fields stay literal
+  - name: nested whole direct frame selector
+    node: offset
+    parameters:
+      pose:
+        frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
+        position_m: [0.1, 0.2, 0.3]
+        orientation: {rpy_deg: [0.0, 0.0, 90.0]}
+    value_sources:
+      pose.frame_ref.frame: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
   - name: blackboard key selector
     node: offset
@@ -202,7 +215,7 @@ refused:
   - name: effect target selector
     node: move
     value_sources:
-      target_role: {kind: program_parameter, reference: label}
+      target: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
   - name: effect condition selector
     node: check

@@ -89,7 +89,7 @@ describe('Deployment I/O devices', () => {
       await mounted.click('Add I/O device');
       expect(mounted.control('I/O device component id').value).toBe('io_device_1');
       expect(mounted.control('I/O device lifecycle command time limit').value).toBe('10');
-      // The first signal belongs to the device; every R5 source incl. ros2_control GPIO is offered (contract 84); no UR profiles.
+      // The first signal belongs to the device; every source incl. ros2_control GPIO is offered; no UR profiles.
       expect(mounted.control('Signal 1 Component').readOnly).toBe(true);
       const profiles = (mounted.control('Signal 1 Source profile').children as Array<{ props: { value: string } }>)
         .map((option) => option.props.value);
@@ -149,27 +149,20 @@ describe('Deployment I/O devices', () => {
   it('keeps at least one signal on an I/O device', async () => {
     const mounted = await mount([device]);
     try {
-      await mounted.click('Remove signal');
-      await mounted.click('Update I/O Draft');
+      const remove = mounted.all((props) => props.type === 'button' && props.children === 'Remove signal')[0];
+      expect(remove.disabled).toBe(true);
+      expect(remove.title).toBe('An I/O device needs at least one signal; remove the device instead.');
       expect(mounted.controller.mutate).not.toHaveBeenCalled();
-      expect(alerts(mounted.all).join()).toContain('at least one signal');
-      await mounted.click('Discard I/O edits');
-      await mounted.click('Add output signal');
-      await mounted.type('Signal 2 Signal name', 'lamp');
-      await mounted.type('lamp Resource role', 'lamp');
-      await mounted.type('lamp Target', 'io');
-      await mounted.type('lamp Source', 'lamp_mock');
-      await mounted.type('lamp Output profile', 'mock_output');
-      await mounted.type('lamp Channel', 'lamp');
-      await mounted.click('Update I/O Draft');
-      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['components', 0, 'configuration', 'runtime_configuration', 'io_signals'], 'set',
-        [signal, {
-          controllable_component_id: 'station_io', command_target_id: 'io', resource_role_id: 'lamp',
-          signal_name: 'lamp', source_id: 'lamp_mock', value_type: 'bool', direction: 'output',
-          provider: { profile: 'mock_output', channel: 'lamp' },
-        }],
-      );
+      expect(alerts(mounted.all)).toEqual([]);
+      expect(mounted.has('part_present Source')).toBe(true);
+      const buttons = mounted.all((props) => props.type === 'button').map((props) => props.children);
+      expect(buttons).not.toContain('Update I/O Draft');
+      expect(buttons).not.toContain('Discard I/O edits');
+      const add = mounted.all((props) => props.type === 'button' && props.children === 'Add input signal')[0];
+      expect(add.disabled).toBe(false);
+      await mounted.click('Add input signal');
+      expect(mounted.has('Signal 2 Signal name')).toBe(true);
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
     } finally { await mounted.unmount(); }
   });
 });

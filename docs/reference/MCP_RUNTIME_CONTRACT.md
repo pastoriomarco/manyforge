@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-11-02 10:29:59 CET
+  Last regenerated: 2026-11-09 11:41:15 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -2369,14 +2369,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Arguments",
             "type": "object"
           },
-          "component_roles": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "maxProperties": 32,
-            "title": "Component Roles",
-            "type": "object"
-          },
           "expected_environment_digest": {
             "pattern": "^sha256:[0-9a-f]{64}$",
             "title": "Expected Environment Digest",
@@ -2394,7 +2386,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "object"
           },
           "schema_version": {
-            "const": "manyforge.skill_expansion_request.v1",
+            "const": "manyforge.skill_expansion_request.v2",
             "title": "Schema Version",
             "type": "string"
           },
@@ -2402,14 +2394,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
             "title": "Skill Id",
             "type": "string"
-          },
-          "target_roles": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "maxProperties": 32,
-            "title": "Target Roles",
-            "type": "object"
           }
         },
         "required": [
@@ -2418,8 +2402,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "skill_id",
           "instance_prefix",
           "arguments",
-          "component_roles",
-          "target_roles",
           "program_context"
         ],
         "title": "SkillExpansionRequest",
@@ -5295,7 +5277,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ServerApplyRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711: Preview takes an empty body.",
+        "description": "Preview takes an empty body.",
         "properties": {},
         "title": "ServerApplyRequest",
         "type": "object"
@@ -5864,7 +5846,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "ScenarioEmptyRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711 `POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
+        "description": "`POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
         "properties": {
           "discard_unsaved": {
             "default": false,
@@ -5877,7 +5859,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ScenarioLoadRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a711 `POST /api/scenario/load` body. With an unsaved Draft the\nLoad is refused unless the caller confirms `discard_unsaved`.",
+        "description": "`POST /api/scenario/load` body. With an unsaved Draft the\nLoad is refused unless the caller confirms `discard_unsaved`.",
         "properties": {
           "discard_unsaved": {
             "default": false,
@@ -5959,7 +5941,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "ComponentActionRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a72 `POST /api/components/{component_id}/actions`.",
+        "description": "`POST /api/components/{component_id}/actions` body.",
         "properties": {
           "action": {
             "enum": [
@@ -5984,7 +5966,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ComponentGroupActionRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a72 `POST /api/components/actions` (Enable all and groups):\nthe caller names the components (Enable all = every `prepared` member and\nowner-less component; owners have no Enable, \u00a716).",
+        "description": "`POST /api/components/actions` body (Enable all and groups):\nthe caller names the components (Enable all = every `prepared` member and\nowner-less component; owners have no Enable).",
         "properties": {
           "action": {
             "enum": [
@@ -6138,7 +6120,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "$defs": {
       "SetOutputRequest": {
         "additionalProperties": false,
-        "description": "CONTRACTS \u00a77 `POST /api/io/{signal_id}/set` body.",
+        "description": "`POST /api/io/{signal_id}/set` body.",
         "properties": {
           "value": {
             "anyOf": [
@@ -6573,24 +6555,42 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "CommandFlagOptionRequest",
         "type": "object"
       },
-      "ComponentBodyRoleReferenceRequest": {
+      "ComponentBodyReferenceRequest": {
         "additionalProperties": false,
         "properties": {
-          "collision_body_role_id": {
-            "title": "Collision Body Role Id",
-            "type": "string"
+          "body": {
+            "$ref": "#/$defs/ProgramCollisionBodyReferenceRequest"
           },
           "type": {
-            "const": "component_body_role",
+            "const": "component_body",
             "title": "Type",
             "type": "string"
           }
         },
         "required": [
           "type",
-          "collision_body_role_id"
+          "body"
         ],
-        "title": "ComponentBodyRoleReferenceRequest",
+        "title": "ComponentBodyReferenceRequest",
+        "type": "object"
+      },
+      "ComponentFrameReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "frame": {
+            "$ref": "#/$defs/ProgramFrameReferenceRequest"
+          },
+          "type": {
+            "const": "component_frame",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "frame"
+        ],
+        "title": "ComponentFrameReferenceRequest",
         "type": "object"
       },
       "CurrentTcpSelectorRequest": {
@@ -6608,55 +6608,23 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "CurrentTcpSelectorRequest",
         "type": "object"
       },
-      "DefaultTcpOfRoleSelectorRequest": {
+      "DefaultTcpOfTargetSelectorRequest": {
         "additionalProperties": false,
         "properties": {
           "kind": {
-            "const": "default_of_role",
+            "const": "default_of_target",
             "title": "Kind",
             "type": "string"
           },
-          "role": {
-            "title": "Role",
-            "type": "string"
+          "target": {
+            "$ref": "#/$defs/ProgramTargetReferenceRequest"
           }
         },
         "required": [
           "kind",
-          "role"
+          "target"
         ],
-        "title": "DefaultTcpOfRoleSelectorRequest",
-        "type": "object"
-      },
-      "FrameRoleReferenceRequest": {
-        "additionalProperties": false,
-        "description": "A frame role of the moving robot, or of `target` when it is named.",
-        "properties": {
-          "frame_role_id": {
-            "title": "Frame Role Id",
-            "type": "string"
-          },
-          "target": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ReferenceTargetRequest"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "type": {
-            "const": "frame_role",
-            "title": "Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "type",
-          "frame_role_id"
-        ],
-        "title": "FrameRoleReferenceRequest",
+        "title": "DefaultTcpOfTargetSelectorRequest",
         "type": "object"
       },
       "FullStopIntentRequest": {
@@ -6914,9 +6882,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "MotionParticipantRequest": {
         "additionalProperties": false,
         "properties": {
-          "base_frame_role_id": {
-            "title": "Base Frame Role Id",
-            "type": "string"
+          "base_frame": {
+            "$ref": "#/$defs/ProgramFrameReferenceRequest"
           },
           "cache_mode": {
             "enum": [
@@ -6956,7 +6923,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "discriminator": {
                   "mapping": {
                     "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
-                    "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
+                    "component_frame": "#/components/schemas/ComponentFrameReferenceRequest",
                     "scene_resource": "#/components/schemas/SceneResourceReferenceRequest"
                   },
                   "propertyName": "type"
@@ -6966,7 +6933,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "$ref": "#/$defs/CellFrameReferenceRequest"
                   },
                   {
-                    "$ref": "#/$defs/FrameRoleReferenceRequest"
+                    "$ref": "#/$defs/ComponentFrameReferenceRequest"
                   },
                   {
                     "$ref": "#/$defs/SceneResourceReferenceRequest"
@@ -7024,8 +6991,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "discriminator": {
                   "mapping": {
                     "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
-                    "component_body_role": "#/components/schemas/ComponentBodyRoleReferenceRequest",
-                    "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
+                    "component_body": "#/components/schemas/ComponentBodyReferenceRequest",
+                    "component_frame": "#/components/schemas/ComponentFrameReferenceRequest",
                     "pose": "#/components/schemas/InlinePoseReferenceRequest",
                     "runtime_object": "#/components/schemas/RuntimeObjectReferenceRequest",
                     "scene_resource": "#/components/schemas/SceneResourceReferenceRequest"
@@ -7037,10 +7004,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "$ref": "#/$defs/CellFrameReferenceRequest"
                   },
                   {
-                    "$ref": "#/$defs/FrameRoleReferenceRequest"
+                    "$ref": "#/$defs/ComponentFrameReferenceRequest"
                   },
                   {
-                    "$ref": "#/$defs/ComponentBodyRoleReferenceRequest"
+                    "$ref": "#/$defs/ComponentBodyReferenceRequest"
                   },
                   {
                     "$ref": "#/$defs/SceneResourceReferenceRequest"
@@ -7101,8 +7068,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "discriminator": {
                   "mapping": {
                     "cell_frame": "#/components/schemas/CellFrameReferenceRequest",
-                    "component_body_role": "#/components/schemas/ComponentBodyRoleReferenceRequest",
-                    "frame_role": "#/components/schemas/FrameRoleReferenceRequest",
+                    "component_body": "#/components/schemas/ComponentBodyReferenceRequest",
+                    "component_frame": "#/components/schemas/ComponentFrameReferenceRequest",
                     "pose": "#/components/schemas/InlinePoseReferenceRequest",
                     "runtime_object": "#/components/schemas/RuntimeObjectReferenceRequest",
                     "scene_resource": "#/components/schemas/SceneResourceReferenceRequest"
@@ -7114,10 +7081,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "$ref": "#/$defs/CellFrameReferenceRequest"
                   },
                   {
-                    "$ref": "#/$defs/FrameRoleReferenceRequest"
+                    "$ref": "#/$defs/ComponentFrameReferenceRequest"
                   },
                   {
-                    "$ref": "#/$defs/ComponentBodyRoleReferenceRequest"
+                    "$ref": "#/$defs/ComponentBodyReferenceRequest"
                   },
                   {
                     "$ref": "#/$defs/SceneResourceReferenceRequest"
@@ -7140,7 +7107,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "discriminator": {
               "mapping": {
                 "current": "#/components/schemas/CurrentTcpSelectorRequest",
-                "default_of_role": "#/components/schemas/DefaultTcpOfRoleSelectorRequest",
+                "default_of_target": "#/components/schemas/DefaultTcpOfTargetSelectorRequest",
                 "entry": "#/components/schemas/TcpEntrySelectorRequest"
               },
               "propertyName": "kind"
@@ -7150,7 +7117,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "$ref": "#/$defs/CurrentTcpSelectorRequest"
               },
               {
-                "$ref": "#/$defs/DefaultTcpOfRoleSelectorRequest"
+                "$ref": "#/$defs/DefaultTcpOfTargetSelectorRequest"
               },
               {
                 "$ref": "#/$defs/TcpEntrySelectorRequest"
@@ -7168,7 +7135,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "kind",
           "move_id",
-          "base_frame_role_id",
+          "base_frame",
           "tcp_endpoint",
           "tolerances",
           "speed_profile",
@@ -7439,10 +7406,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               }
             ]
           },
-          "component_role_id": {
-            "title": "Component Role Id",
-            "type": "string"
-          },
           "payload": {
             "discriminator": {
               "mapping": {
@@ -7469,14 +7432,12 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Required Capability Id",
             "type": "string"
           },
-          "target_role_id": {
-            "title": "Target Role Id",
-            "type": "string"
+          "target": {
+            "$ref": "#/$defs/ProgramTargetReferenceRequest"
           }
         },
         "required": [
-          "component_role_id",
-          "target_role_id",
+          "target",
           "required_capability_id",
           "action_span",
           "payload"
@@ -7486,7 +7447,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "OperationResetRequest": {
         "additionalProperties": false,
-        "description": "Targeted operation Reset (contract 66).",
+        "description": "Targeted operation Reset.",
         "properties": {
           "expected_operation_revision": {
             "maximum": 9007199254740991.0,
@@ -7557,6 +7518,63 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "PoseGoalRequest",
         "type": "object"
       },
+      "ProgramCollisionBodyReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "collision_body_id": {
+            "title": "Collision Body Id",
+            "type": "string"
+          },
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "component_id",
+          "collision_body_id"
+        ],
+        "title": "ProgramCollisionBodyReferenceRequest",
+        "type": "object"
+      },
+      "ProgramFrameReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "frame_id": {
+            "title": "Frame Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "component_id",
+          "frame_id"
+        ],
+        "title": "ProgramFrameReferenceRequest",
+        "type": "object"
+      },
+      "ProgramTargetReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_target_id": {
+            "title": "Command Target Id",
+            "type": "string"
+          },
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "component_id",
+          "command_target_id"
+        ],
+        "title": "ProgramTargetReferenceRequest",
+        "type": "object"
+      },
       "QuaternionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -7584,31 +7602,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "w"
         ],
         "title": "QuaternionRequest",
-        "type": "object"
-      },
-      "ReferenceTargetRequest": {
-        "additionalProperties": false,
-        "description": "The robot owning a robot-qualified frame, from the exact Program Binding.",
-        "properties": {
-          "command_target_id": {
-            "title": "Command Target Id",
-            "type": "string"
-          },
-          "controllable_component_id": {
-            "title": "Controllable Component Id",
-            "type": "string"
-          },
-          "target_role_id": {
-            "title": "Target Role Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "target_role_id",
-          "controllable_component_id",
-          "command_target_id"
-        ],
-        "title": "ReferenceTargetRequest",
         "type": "object"
       },
       "RuntimeObjectReferenceBindingRequest": {
@@ -7684,7 +7677,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RuntimeScaleControlSelectorRequest": {
         "additionalProperties": false,
         "properties": {
-          "component_role_id": {
+          "command_target_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -7693,7 +7686,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Component Role Id"
+            "title": "Command Target Id"
+          },
+          "component_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Component Id"
           },
           "group_targets": {
             "anyOf": [
@@ -7714,17 +7718,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "program_binding_id": {
             "title": "Program Binding Id",
             "type": "string"
-          },
-          "target_role_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Target Role Id"
           }
         },
         "required": [
@@ -7736,18 +7729,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RuntimeScaleControlTargetRequest": {
         "additionalProperties": false,
         "properties": {
-          "component_role_id": {
-            "title": "Component Role Id",
+          "command_target_id": {
+            "title": "Command Target Id",
             "type": "string"
           },
-          "target_role_id": {
-            "title": "Target Role Id",
+          "component_id": {
+            "title": "Component Id",
             "type": "string"
           }
         },
         "required": [
-          "component_role_id",
-          "target_role_id"
+          "component_id",
+          "command_target_id"
         ],
         "title": "RuntimeScaleControlTargetRequest",
         "type": "object"
@@ -7812,7 +7805,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "discriminator": {
               "mapping": {
                 "current": "#/components/schemas/CurrentTcpSelectorRequest",
-                "default_of_role": "#/components/schemas/DefaultTcpOfRoleSelectorRequest",
+                "default_of_target": "#/components/schemas/DefaultTcpOfTargetSelectorRequest",
                 "entry": "#/components/schemas/TcpEntrySelectorRequest"
               },
               "propertyName": "kind"
@@ -7822,7 +7815,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "$ref": "#/$defs/CurrentTcpSelectorRequest"
               },
               {
-                "$ref": "#/$defs/DefaultTcpOfRoleSelectorRequest"
+                "$ref": "#/$defs/DefaultTcpOfTargetSelectorRequest"
               },
               {
                 "$ref": "#/$defs/TcpEntrySelectorRequest"
@@ -7997,46 +7990,25 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "StopResourceTargetRequest",
         "type": "object"
       },
-      "TcpEntryRequest": {
-        "additionalProperties": false,
-        "description": "One owner-qualified TCP in the retained Deployment.",
-        "properties": {
-          "component_id": {
-            "title": "Component Id",
-            "type": "string"
-          },
-          "frame_role_id": {
-            "title": "Frame Role Id",
-            "type": "string"
-          },
-          "target_id": {
-            "title": "Target Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "component_id",
-          "target_id",
-          "frame_role_id"
-        ],
-        "title": "TcpEntryRequest",
-        "type": "object"
-      },
       "TcpEntrySelectorRequest": {
         "additionalProperties": false,
         "properties": {
-          "entry": {
-            "$ref": "#/$defs/TcpEntryRequest"
+          "frame": {
+            "$ref": "#/$defs/ProgramFrameReferenceRequest"
           },
           "kind": {
             "const": "entry",
             "title": "Kind",
             "type": "string"
+          },
+          "target": {
+            "$ref": "#/$defs/ProgramTargetReferenceRequest"
           }
         },
         "required": [
           "kind",
-          "entry"
+          "target",
+          "frame"
         ],
         "title": "TcpEntrySelectorRequest",
         "type": "object"
@@ -8304,7 +8276,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "query": {
             "additionalProperties": false,
             "properties": {
-              "component_role_id": {
+              "command_target_id": {
                 "anyOf": [
                   {
                     "maxLength": 256,
@@ -8315,7 +8287,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "type": "null"
                   }
                 ],
-                "title": "Component Role Id"
+                "title": "Command Target Id"
+              },
+              "component_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Component Id"
               },
               "group_targets": {
                 "anyOf": [
@@ -8334,19 +8319,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "minLength": 1,
                 "title": "Program Binding Id",
                 "type": "string"
-              },
-              "target_role_id": {
-                "anyOf": [
-                  {
-                    "maxLength": 256,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Target Role Id"
               }
             },
             "required": [

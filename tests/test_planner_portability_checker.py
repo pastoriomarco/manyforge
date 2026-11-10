@@ -307,7 +307,7 @@ def test_evidence_reference_symlinks_and_traversal_fail_closed(
 
 def test_run_check_rejects_a_symlinked_mapping(tmp_path: Path) -> None:
     root = tmp_path / "repo"
-    mapping_parent = root / "verification/planner_portability"
+    mapping_parent = root / "scripts/ci"
     mapping_parent.mkdir(parents=True)
     outside = tmp_path / "mapping.json"
     outside.write_text("{}", encoding="utf-8")
@@ -362,7 +362,7 @@ def test_main_fails_cleanly_on_a_non_object_mapping(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     root = tmp_path / "repo"
-    mapping = root / "verification/planner_portability/mapping.json"
+    mapping = root / "scripts/ci/planner-portability-mapping.json"
     mapping.parent.mkdir(parents=True)
     mapping.write_text("[]", encoding="utf-8")
     monkeypatch.setattr(CHECKER, "ROOT", root)

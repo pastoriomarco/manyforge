@@ -239,7 +239,7 @@ ResolveRetainedIoSignalCatalog(
           throw InvalidConfiguration("io_signal_owner_mismatch");
         if (text(row, "value_type") != "bool")
           throw InvalidConfiguration("io_signal_type_mismatch");
-        // `<output>.changed_outside` names the core-held signal (CONTRACTS §7).
+        // `<output>.changed_outside` names the core-held signal.
         if (text(row, "signal_name").ends_with(core::kChangedOutsideSignalSuffix))
           throw InvalidConfiguration("io_system_signal_conflict");
         if (output) {
@@ -269,7 +269,7 @@ ResolveRetainedIoSignalCatalog(
           } else {
             throw InvalidConfiguration("io_signal_provider_unsupported");
           }
-          // A machine's I/O bank output (CONTRACTS §16): one channel per
+          // A machine's I/O bank output: one channel per
           // signal of its component.
           const bool component_adapter =
               address.profile == kComponentAdapterIoProfile;
@@ -287,9 +287,9 @@ ResolveRetainedIoSignalCatalog(
                (!IsGenericIoProviderProfile(address.profile) && !component_adapter))
                   ? typed_output_resource(address)
                   : output_resource(address.profile, channel)};
-          // CONTRACTS §7: `controller_owned` authored, default false.
+          // `controller_owned` is authored, default false.
           // Read-back: a machine's I/O bank reports its outputs, and Mock
-          // outputs report the written value back (D2); ros_set_bool and
+          // outputs report the written value back; ros_set_bool and
           // ros2_control_gpio outputs have none.
           descriptor.readback =
               component_adapter || address.profile == "mock_output";
@@ -510,6 +510,22 @@ const RetainedIoSignalConfiguration *FindChangedOutsideOutput(
   return found == signals.end() ? nullptr : &*found;
 }
 
+std::vector<ProgramSignalMatch> FindProgramSignalMatches(
+    std::span<const RetainedIoSignalConfiguration> catalog,
+    const core::ProgramSignalReferenceDTO &reference) {
+  std::vector<ProgramSignalMatch> result;
+  for (const auto &row : catalog) {
+    if (row.descriptor.signal_id.controllable_component_id != reference.component_id)
+      continue;
+    if (row.descriptor.signal_id.name == reference.signal_name)
+      result.push_back({&row, row.descriptor, false});
+    if (core::HoldsChangedOutside(row.descriptor) &&
+        core::ChangedOutsideSignalId(row.descriptor.signal_id).name == reference.signal_name)
+      result.push_back({&row, core::ChangedOutsideDescriptor(row.descriptor), true});
+  }
+  return result;
+}
+
 core::Result<std::vector<RetainedIoSignalConfiguration>>
 ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph) {
   using Reply = core::Result<std::vector<RetainedIoSignalConfiguration>>;
@@ -518,7 +534,7 @@ ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph) {
     return authored;
   auto result = std::move(authored.value());
   // Only authored rows can collide with a system row; the generated rows
-  // share the reserved source by design (SX-205).
+  // share the reserved source by design.
   const auto authored_count = static_cast<std::ptrdiff_t>(result.size());
   std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
       grippers;
@@ -751,7 +767,7 @@ ResolveRetainedIoProviderDevices(
                 "io_provider_device_output_budget_invalid");
           output_budget_ns = static_cast<core::Duration>(output_ns);
         }
-        // CONTRACTS §16: a machine member's owner and role.
+        // A machine member's owner and role.
         const auto optional_text = [&](std::string_view key) {
           return row.contains(key) ? std::optional(text(row, key)) : std::nullopt;
         };

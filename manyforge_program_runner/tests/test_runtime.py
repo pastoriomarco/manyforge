@@ -173,7 +173,7 @@ class _Headless:
     def __init__(self) -> None:
         self.applied_reads = 0
         self.registered_captures: list[dict[str, Any]] = []
-        # CONTRACTS §10 RunReadiness and §5 CellLatch, as served by the API.
+        # RunReadiness and CellLatch, as served by the API.
         self.readiness: dict[str, Any] = {
             "can_execute": True, "can_resume": True, "motion_clear": True, "blocked_reasons": []}
         self.latch: dict[str, Any] = {"latched": False, "causes": []}
@@ -278,7 +278,7 @@ class _Headless:
 
 
 def test_run_readiness_refuses_with_its_first_reason() -> None:
-    """CONTRACTS §10: the Runner reads RunReadiness and computes nothing."""
+    """The Runner reads RunReadiness and computes nothing."""
 
     headless = _Headless()
     runtime = ProgramRuntime.__new__(ProgramRuntime)
@@ -395,7 +395,7 @@ class _Snapshot:
             to_dict=lambda: deepcopy(capture),
         )
         self._value = {
-            "schema_version": "manyforge.program_run_status.v3",
+            "schema_version": "manyforge.program_run_status.v4",
             "owner_id": owner_id,
             "owner_epoch": owner_epoch,
             "run_revision": revision,
@@ -945,7 +945,7 @@ def _program_cycle_claim(owner_epoch: str) -> dict[str, Any]:
 
 def _retain_terminal_cycle(journal: ProgramCycleJournal, claim: dict[str, Any]) -> str:
     settlement = {
-        "schema_version": "manyforge.program_cycle_start_settlement.v1",
+        "schema_version": "manyforge.program_cycle_start_settlement.v2",
         "kind": "proven_no_effect",
         "claim": claim,
         "program_run_id": "program-cycle.1",
@@ -1654,7 +1654,7 @@ def _retain_no_effect_terminal(
     retained = journal.read()
     assert retained.claim is not None
     settlement = {
-        "schema_version": "manyforge.program_cycle_start_settlement.v1",
+        "schema_version": "manyforge.program_cycle_start_settlement.v2",
         "kind": "proven_no_effect",
         "claim": retained.claim,
         "program_run_id": program_run_id,
@@ -2315,7 +2315,7 @@ def _real_persistent_loss_program() -> Program:
         deepcopy(document),
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -2468,7 +2468,7 @@ def test_start_stages_pre_cas_loss_until_admission_request_completes(
         if kwargs.get("state") == "running":
             assert journal.read().state == "starting"
             assert runtime._carried_object_lost_run_id == "program-cycle.1"  # noqa: SLF001
-            assert runtime._interrupt_state_run_id is None  # noqa: SLF001  (SX-261: not exposed before admission)
+            assert runtime._interrupt_state_run_id is None  # noqa: SLF001  (not exposed before admission)
             assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
             state["last_losses"] = (loss,)
             runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
@@ -2480,7 +2480,7 @@ def test_start_stages_pre_cas_loss_until_admission_request_completes(
     completed: list[bool] = []
 
     def complete_request(**kwargs: Any) -> Any:
-        # SX-263: the staged loss is still unwritten when admission completes.
+        # The staged loss is still unwritten when admission completes.
         assert store.writes == []
         assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
         completed.append(True)
@@ -2507,7 +2507,7 @@ def test_start_stages_pre_cas_loss_until_admission_request_completes(
 def test_start_complete_request_failure_never_writes_the_key_and_retires_binding(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """SX-263: a raising admission completion leaves the staged loss unwritten."""
+    """A raising admission completion leaves the staged loss unwritten."""
 
     runtime, journal, _admission, owner, _host = _terminal_cycle_reset_runtime(
         monkeypatch,
@@ -2633,7 +2633,7 @@ def test_run_start_is_refused_before_claim_while_a_robot_has_no_end_effector_tcp
         "command_target_id": "arm",
         "operation_capability_id": "execution.trajectory.execute",
         "presentation": "motion",
-        "command": {"tcp_frame_role_id": None},
+        "command": {"tcp_frame": None},
     }
     runtime._kernel._transport.target_components = [  # noqa: SLF001
         {"controllable_component_id": "lite6_robot", "targets": [motion]},
@@ -2648,7 +2648,7 @@ def test_run_start_is_refused_before_claim_while_a_robot_has_no_end_effector_tcp
         assert journal.read().state == "idle_after_reset"
 
         # With an End-effector TCP the same Run starts.
-        motion["command"]["tcp_frame_role_id"] = "tcp"
+        motion["command"]["tcp_frame"] = {"component_id": "lite_gripper", "frame_id": "tcp"}
         runtime._kernel._transport.target_components = [  # noqa: SLF001
             {"controllable_component_id": "lite6_robot", "targets": [motion]},
         ]
@@ -3314,7 +3314,7 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
         "no_effect": True,
         "needs_reset": True,
         "cause_code": "program_run_superseded_by_stop",
-        # M6 ERR: the cause's typed producer travels with it.
+        # The cause's typed producer travels with it.
         "cause_producer": "program_runner",
         "cause_message": "Program Stop was accepted before Run admission completed",
     }
@@ -3794,7 +3794,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert host.motion_start_calls == []
     headless.readiness = ready
 
-    # N8: Run is fenced on run id, owner epoch and selection revision only.
+    # Run is fenced on run id, owner epoch and selection revision only.
     for request_id, run_id, changes, code in (
         ("stale-epoch", "program-cycle.1", {"expected_owner_epoch": "old"},
          "program_run_owner_stale"),
@@ -3944,7 +3944,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "reason": "operator Run after Full Stop",
         }
     )
-    # Resume after Halt checks readiness like Resume (CONTRACTS §10).
+    # Resume after Halt checks readiness like Resume.
     ready = headless.readiness
     headless.readiness = {
         "can_execute": False,
@@ -4243,8 +4243,7 @@ def test_manual_handover_requeries_kernel_and_retains_cleanup_outcome(
                 "manual_handover": context,
                 "participants": [
                     {
-                        "component_role_id": "gripper",
-                        "target_role_id": "gripper",
+                        "target": {"component_id": "gripper", "command_target_id": "gripper"},
                         "required_capability_id": "tool.gripper.command",
                         "action_span": None,
                         "payload": {
@@ -4374,7 +4373,7 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
 
     def selected(*_args, **_kwargs):
         calls.append("selected")
-        # N8: Resume is fenced on the selection revision, not the run revision.
+        # Resume is fenced on the selection revision, not the run revision.
         assert "expected_run_revision" not in _kwargs
         assert _kwargs["expected_selection_revision"] == 4
         error = (
@@ -4626,7 +4625,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
         ("program-cycle.1", "operator requested Program cycle Reset")
     ]
     assert host.reset_calls == ["program-cycle.1"]
-    # Reset returns every global rule to its `active_at_start` (CONTRACTS §8).
+    # Reset returns every global rule to its `active_at_start`.
     assert transport.rule_resets >= 1
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
@@ -6714,7 +6713,7 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
     try:
         if case == "alarm":
             # The Kernel's operator-alarm attention refuses the motion this
-            # Retry would release, before any owner effect (spec 450 §5.2).
+            # Retry would release, before any owner effect.
             refusal = ProgramRunOwnerError(
                 "an active operator-alarm condition interlock gates this motion"
             )
@@ -7020,7 +7019,7 @@ def test_unknown_host_start_keeps_claim_and_unresolved_request_without_resending
         runtime.shutdown()
 
 
-# DX891: dependency follows used targets/nodes, not declared roles or site names.
+# Dependency follows used targets/nodes, not declared roles or site names.
 class _SimulationLaneHeadless(_Headless):
     def __init__(self, graph: dict[str, Any]) -> None:
         super().__init__()
@@ -7064,19 +7063,19 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
     binding = json.loads((root / "manyforge_deployment/resources/"
                          "program_binding_lite6_native.fixture.json").read_text())
     binding["retained_bundle_id"], binding["graph_revision"] = _DIGEST_A, _DIGEST_B
-    component = deepcopy(binding["component_role_bindings"][0])
-    component.update(component_role_id="other_robot", controllable_component_id="robot.other")
-    binding["component_role_bindings"].append(component)
-    target = deepcopy(next(row for row in binding["target_role_bindings"] if row["target_role_id"] == "arm"))
-    target.update(target_role_id="other_arm", component_role_id="other_robot",
-                  controllable_component_id="robot.other")
-    binding["target_role_bindings"].append(target)
-    # A model-free Mock I/O device sharing the ROS runtime unit, as Applied.
-    binding["component_role_bindings"].append({**deepcopy(component), "component_role_id": "station_device",
-                                               "controllable_component_id": "station_io", "model_role_bindings": []})
-    binding["target_role_bindings"].append({**deepcopy(target), "target_role_id": "station",
-        "component_role_id": "station_device", "controllable_component_id": "station_io",
-        "command_target_id": "io"})
+    component = deepcopy(next(row for row in binding["component_bindings"]
+                              if row["component_id"] == "lite6_robot"))
+    component["component_id"] = "robot.other"
+    binding["component_bindings"].append(component)
+    target_row = deepcopy(next(row for row in binding["target_bindings"]
+                               if row["target"] == {"component_id": "lite6_robot", "command_target_id": "arm"}))
+    target_row["target"] = {"component_id": "robot.other", "command_target_id": "arm"}
+    binding["target_bindings"].append(target_row)
+    binding["component_bindings"].append({**deepcopy(component), "component_id": "station_io", "model_bindings": []})
+    binding["target_bindings"].append({**deepcopy(target_row),
+        "target": {"component_id": "station_io", "command_target_id": "io"}})
+    binding["signal_bindings"].append({"reference": {"component_id": "station_io", "signal_name": "clamp"},
+        "target": {"component_id": "station_io", "command_target_id": "io"}})
     graph = {
         "schema_version": "manyforge.manager_graph_projection.v1",
         "source": {"available": True, "freshness": "fresh", "known_gaps": [],
@@ -7084,7 +7083,8 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
         "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B,
         "cell_graph": {"graph_revision": _DIGEST_B,
             "controllable_components": [
-                {"controllable_component_id": "lite6_arm", "runtime_unit_ids": ["cell.ros"]},
+                {"controllable_component_id": "lite6_robot", "runtime_unit_ids": ["cell.ros"]},
+                {"controllable_component_id": "lite_gripper", "runtime_unit_ids": ["cell.ros"]},
                 {"controllable_component_id": "robot.other", "runtime_unit_ids": ["cell.ros"]},
                 {"controllable_component_id": "station_io", "runtime_unit_ids": ["cell.ros"]}],
             "control_domains": [{"control_domain_id": "io.provider.station", "kind": "provider",
@@ -7096,11 +7096,11 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
                 "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
                 "configuration": {"controller_profiles": [
                     {"controllable_component_id": name, **_SIMULATION_LANE_PROFILES[lane]}
-                    for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)]}}]},
+                    for name, lane in (("lite6_robot", lanes[0]), ("lite_gripper", lanes[0]), ("robot.other", lanes[1]))]}}]},
         # Deployment-derived and sorted by component; Mock and Real need none.
         "component_simulator_dependencies": [
             {"controllable_component_id": name, "simulator": "isaac" if lane == "isaac" else "none"}
-            for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)],
+            for name, lane in (("lite6_robot", lanes[0]), ("lite_gripper", lanes[0]), ("robot.other", lanes[1]))],
     }
     headless = _SimulationLaneHeadless(graph)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="program-runner.test"),
@@ -7110,14 +7110,15 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
 
 
 def _simulation_lane_program(*roles: str, node_id="motion.move_to_joint_target", **parameters):
+    identities = {"arm": ("lite6_robot", "arm"), "other_arm": ("robot.other", "arm"),
+                  "gripper": ("lite_gripper", "gripper")}
     children = [{"node_id": "gripper.command_position" if role == "gripper" else node_id,
                  "instance_id": f"step.{index}",
-                 "parameters": {**parameters, "target_role": role}, "children": []}
-                for index, role in enumerate(roles)]
-    return {"tree": {"node_id": "sequence", "instance_id": "root",
-                     "parameters": {}, "children": children},
-            # Declared, unused roles must not become simulator dependencies.
-            "target_roles": {"arm": {}, "other_arm": {}, "gripper": {}}}
+                 "parameters": {**parameters, "target": {"component_id": identities[role][0],
+                                                            "command_target_id": identities[role][1]}},
+                 "children": []} for index, role in enumerate(roles)]
+    return {"tree": {"node_id": "sequence", "instance_id": "root", "parameters": {}, "children": children}}
+
 
 
 def _simulation_node_program(node_id):
@@ -7233,7 +7234,7 @@ def test_actual_cell_global_simulator_capability_has_typed_cell_eligibility(node
 
 @pytest.mark.parametrize("case", ["stale", "unavailable", "gap", "bundle", "graph", "nested_graph",
                                   "duplicate_profile", "foreign_profile",
-                                  "foreign_component_role", "duplicate_component_role", "duplicate_target_role",
+                                  "missing_bound_component", "duplicate_component", "duplicate_target",
                                   "duplicate_graph_component", "foreign_graph_component", "duplicate_runtime",
                                   "foreign_runtime", "missing_runtime_profile", "duplicate_runtime_owner"])
 def test_simulation_dependency_refuses_inexact_source_or_used_component_join(case):
@@ -7257,12 +7258,12 @@ def test_simulation_dependency_refuses_inexact_source_or_used_component_join(cas
             rows.append(deepcopy(rows[0]))
         else:
             rows[0]["controllable_component_id"] = "foreign.component"
-    elif case == "foreign_component_role":
-        binding["target_role_bindings"][0]["component_role_id"] = "foreign.role"
-    elif case == "duplicate_component_role":
-        binding["component_role_bindings"].append(deepcopy(binding["component_role_bindings"][0]))
-    elif case == "duplicate_target_role":
-        binding["target_role_bindings"].append(deepcopy(binding["target_role_bindings"][0]))
+    elif case == "missing_bound_component":
+        binding["component_bindings"] = [row for row in binding["component_bindings"] if row["component_id"] != "lite6_robot"]
+    elif case == "duplicate_component":
+        binding["component_bindings"].append(deepcopy(binding["component_bindings"][0]))
+    elif case == "duplicate_target":
+        binding["target_bindings"].append(deepcopy(binding["target_bindings"][0]))
     elif case == "duplicate_graph_component":
         graph["cell_graph"]["controllable_components"].append(
             deepcopy(graph["cell_graph"]["controllable_components"][0]))
@@ -7286,8 +7287,8 @@ def test_simulation_dependency_refuses_inexact_source_or_used_component_join(cas
 @pytest.mark.parametrize(("parameters", "required", "reads"), [
     ({}, True, 1),  # default state selects the condition; default target is Isaac
     ({"expected_state": "idle"}, False, 0),  # inactive target requirement
-    ({"expected_state": "moving", "target_role": "arm"}, False, 1),
-    ({"expected_state": "moving", "target_role": "other_arm"}, True, 1),
+    ({"expected_state": "moving", "target": {"component_id": "lite6_robot", "command_target_id": "arm"}}, False, 1),
+    ({"expected_state": "moving", "target": {"component_id": "robot.other", "command_target_id": "arm"}}, True, 1),
 ])
 def test_simulation_dependency_respects_conditional_and_defaulted_target_requirements(
     monkeypatch, parameters, required, reads
@@ -7304,7 +7305,7 @@ def test_simulation_dependency_respects_conditional_and_defaulted_target_require
             required_capabilities=(next(row for row in entry.required_capabilities
                                         if row.when_equals == "moving"),),
             parameters=tuple(replace(row, required=False, has_default=True,
-                                     default="other_arm" if row.id == "target_role" else "moving")
+                                     default={"component_id": "robot.other", "command_target_id": "arm"} if row.id == "target" else "moving")
                              for row in entry.parameters))
         monkeypatch.setattr(catalog, "get", lambda node_id:
                             entry if node_id == "gripper.check_status" else original_get(node_id))
@@ -7376,13 +7377,13 @@ def test_one_runtime_rechecks_used_lane_after_each_current_graph_change():
         assert runtime._simulation_context_requirement(program=applied["program"],
             program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
                 False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
-        _set_simulation_lane(headless.graph, "lite6_arm", "isaac")
+        _set_simulation_lane(headless.graph, "lite6_robot", "isaac")
         applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "c" * 64
         headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
         assert runtime._simulation_context_requirement(program=applied["program"],
             program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
                 True, AvailabilityFact(True))
-        _set_simulation_lane(headless.graph, "lite6_arm", "real")
+        _set_simulation_lane(headless.graph, "lite6_robot", "real")
         applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "d" * 64
         headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
         assert runtime._simulation_context_requirement(program=applied["program"],
@@ -7406,13 +7407,12 @@ def test_used_isaac_target_requires_but_cannot_supply_an_unconfigured_simulator_
 def _io_station_program(*motion_roles: str) -> dict[str, Any]:
     """Mock station_io I/O nodes (trial d) plus optional motion on robot roles."""
     io = [{"node_id": node_id, "instance_id": f"io.{index}",
-           "parameters": {"target_role": "station", "resource_role": "clamp", **extra}, "children": []}
+           "parameters": {"signal": {"component_id": "station_io", "signal_name": "clamp"}, **extra}, "children": []}
           for index, (node_id, extra) in enumerate((("io.set_output", {"value": True}),
                                                     ("io.get_input", {}), ("io.check_input", {}),
                                                     ("io.wait_for_input", {})))]
     program = _simulation_lane_program(*motion_roles)
     program["tree"]["children"] = io + program["tree"]["children"]
-    program["target_roles"]["station"] = {}
     return program
 
 
@@ -7440,7 +7440,7 @@ def test_mixed_motion_and_io_program_selects_only_the_controller_target(lanes, m
         assert _simulation_lane_required(runtime, binding, _io_station_program(motion_role)) is required
         # The controller target keeps its exact unique-profile requirement.
         rows = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
-        component = {"arm": "lite6_arm", "other_arm": "robot.other"}[motion_role]
+        component = {"arm": "lite6_robot", "other_arm": "robot.other"}[motion_role]
         rows[:] = [row for row in rows if row["controllable_component_id"] != component]
         with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
             _simulation_lane_required(runtime, binding, _io_station_program(motion_role))
@@ -7526,7 +7526,7 @@ def test_motion_target_without_profile_still_refused_with_controller_profile_rea
     {"output_mode": "commanded", "pneumatic_io": {"inputs": {}, "outputs": []}},
 ])
 def test_simulation_dependency_skips_a_lane_free_pneumatic_tool(no_output):
-    # mock_lite6_pneumatic_pick_and_place (merge 6 D4): the mounted no-output pneumatic tool
+    # mock_lite6_pneumatic_pick_and_place: the mounted no-output pneumatic tool
     # has no controller profile; Run was refused before this fix.
     runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"))
     graph = headless.graph
@@ -7652,13 +7652,13 @@ def test_simulator_dependency_uses_exact_catalog_scope_capability_and_configured
         # proves the approved predicate without introducing a product node.
         requirement = replace(original.required_capabilities[0], scope=scope,
                               capability_id=capability,
-                              target_parameter="target_role" if scope == "target_binding" else None)
+                              target_parameter="target" if scope == "target_binding" else None)
         entry = replace(original, required_capabilities=(requirement,),
                         execution=replace(original.execution, owner_api=owner))
         monkeypatch.setattr(catalog, "get", lambda node_id:
                             entry if node_id == "simulation.reset" else original_get(node_id))
         program = {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
-                            "parameters": {"target_role": "arm"}, "children": []}}
+                            "parameters": {"target": {"component_id": "lite6_robot", "command_target_id": "arm"}}, "children": []}}
         if required is None:
             # The owner/scope is authoritative; the known capability set is a
             # consistency assertion, never permission to skip a future node.
@@ -7757,7 +7757,7 @@ def test_public_node_availability_projects_real_simulator_eligibility_without_ta
 
 @pytest.mark.parametrize("program_kind", ["target", "simulator"])
 def test_real_ros_configuration_is_admitted_without_simulator_dependency(program_kind):
-    # CP8 step 1: a unit hosting only real robots has no `mode`; the Manager
+    # A unit hosting only real robots has no `mode`; the Manager
     # row, not the lane selector, decides that no simulator is needed.
     runtime, headless, binding = _simulation_lane_fixture(lanes=("real", "real"),
                                                          simulation=_SimulationControl())
@@ -7786,9 +7786,9 @@ def test_component_simulator_dependency_rows_must_match_ros_controller_profiles(
     if case == "absent":
         del headless.graph["component_simulator_dependencies"]
     elif case == "not_rows":
-        headless.graph["component_simulator_dependencies"] = {"lite6_arm": "isaac"}
+        headless.graph["component_simulator_dependencies"] = {"lite6_robot": "isaac"}
     elif case == "not_row":
-        dependencies[0] = "lite6_arm"
+        dependencies[0] = "lite6_robot"
     elif case == "missing_row":
         del dependencies[1]
     elif case == "extra_row":
@@ -8380,7 +8380,7 @@ def test_selected_reload_after_proven_never_started_run_uses_reset_claim(monkeyp
         def get(self):
             return {"admission_generation": 1, "authoring_allowed": True}
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
-    settlement = {"schema_version": "manyforge.program_cycle_start_settlement.v1", "kind": "proven_no_effect",
+    settlement = {"schema_version": "manyforge.program_cycle_start_settlement.v2", "kind": "proven_no_effect",
                   "claim": None, "program_run_id": "never-started.1", "prepared_scene": {}}
     if invalid == "kind": settlement["kind"] = "assumed"
     if invalid == "claim": settlement["claim"] = {"claim_generation": 1}
@@ -8545,7 +8545,7 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         }
     )
     try:
-        # Continue lets held motion continue: it needs motion_clear (§10),
+        # Continue lets held motion continue: it needs motion_clear,
         # refused with the readiness reason before any owner effect.
         headless = runtime._headless
         headless.readiness = {
@@ -8579,7 +8579,7 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         assert lookups == ["attempt.2"]
         assert calls == [
             ("continue_failure_pause", "attempt.2", "continue.2"),
-            # Continue's marker (item 11: the Acknowledge of an unconfirmed Stop).
+            # Continue's marker (the Acknowledge of an unconfirmed Stop).
             ("resume_recovery", "attempt.2", "manual_failure", "continue_with_failure"),
         ]
         assert result["cycle_resumed"] is True
@@ -8605,7 +8605,7 @@ def _run_end_runtime(headless: _Headless) -> ProgramRuntime:
 
 
 def test_a_run_that_ends_while_the_cell_is_latched_ends_by_a_cell_fault() -> None:
-    """CONTRACTS §9: the latch is the error; the run end names its component.
+    """The latch is the error; the run end names its component.
     Every rule returns to `active_at_start` once at the end of the run."""
 
     headless = _Headless()
@@ -8638,7 +8638,7 @@ def test_a_run_end_without_a_latch_keeps_its_own_reason(state, run_end) -> None:
 
 
 def test_start_refuses_a_set_rule_active_naming_an_unknown_rule(monkeypatch, tmp_path) -> None:
-    """CONTRACTS §9: a node naming a rule the Deployment lacks blocks Execute."""
+    """A node naming a rule the Deployment lacks blocks Execute."""
 
     admitted = _PreparedRunAdmission()
     admitted.program.rule_activation_rule_ids = ("missing",)

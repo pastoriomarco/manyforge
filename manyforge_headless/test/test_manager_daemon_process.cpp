@@ -1,4 +1,5 @@
 #include "../src/program_runner_publisher_fault_internal.hpp"
+#include "../src/manager_reference_diagnostics_internal.hpp"
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <signal.h>
@@ -26,10 +27,13 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
+#include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/program_reference_facts.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -50,6 +54,35 @@ namespace component_manager = manyforge::component_manager;
 namespace content_identity = manyforge::content_identity;
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
+
+TEST(ManagerReferenceDiagnostics, RetainsTypedRowsAndBoundsTheResponse) {
+  using V = content_identity::CanonicalValue;
+  const V response(V::Object{{"api_version", V("manyforge.manager_command_response.v2")},
+      {"ok", V(false)}, {"error", V(V::Object{{"code", V("program_reference_validation_failed")},
+          {"message", V("invalid reference")}, {"details", V(V::Object{})}, {"producer", V("manager")}})}});
+  const deployment::ProgramReferenceDiagnostic row{
+      "signal_missing", {"/tree/parameters/signal", std::string("read"), std::string("signal")},
+      V(V::Object{{"component_id", V("device")}, {"signal_name", V("ready")}})};
+  const auto result = manyforge::headless::detail::AttachReferenceDiagnostics(response, {row});
+  const auto *error = result.find_object_member("error");
+  ASSERT_NE(error, nullptr);
+  const auto *detail = error->find_object_member("reference_validation");
+  ASSERT_NE(detail, nullptr);
+  EXPECT_EQ(detail->find_object_member("diagnostics")->as_array().front(),
+            deployment::program_reference_diagnostic_value(row));
+  EXPECT_EQ(detail->find_object_member("total_count")->as_number(), 1.0);
+  EXPECT_FALSE(detail->find_object_member("truncated")->as_bool());
+
+  auto large = row;
+  large.payload = V(V::Object{{"value", V(std::string(1024U, 'x'))}});
+  const std::vector<deployment::ProgramReferenceDiagnostic> many(100U, large);
+  const auto bounded = manyforge::headless::detail::AttachReferenceDiagnostics(response, many);
+  const auto *bounded_detail = bounded.find_object_member("error")->find_object_member("reference_validation");
+  ASSERT_NE(bounded_detail, nullptr);
+  EXPECT_TRUE(bounded_detail->find_object_member("truncated")->as_bool());
+  EXPECT_EQ(bounded_detail->find_object_member("total_count")->as_number(), 100.0);
+  EXPECT_LT(content_identity::canonical_json(bounded).size(), 64U * 1024U);
+}
 
 core::ProgramCycleStatusDTO IdleCycleStatus() {
   return {core::RequestOwnerEpoch("runner-owner"),
@@ -484,7 +517,6 @@ struct ManagerApplyFixtureMetadata final {
   std::string program_binding_id;
   std::string program_id;
   std::string program_revision;
-  content_identity::CanonicalValue program_role_assignment;
 };
 
 ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
@@ -497,7 +529,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 16U ||
+  if (!root.is_object() || root.as_object().size() != 15U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
@@ -519,7 +551,6 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
       RequiredText(root, "program_binding_id"),
       RequiredText(root, "program_id"),
       RequiredText(root, "program_revision"),
-      RequiredMember(root, "program_role_assignment"),
   };
 }
 
@@ -1023,7 +1054,7 @@ ExecutionReadyObservation WaitForExecutionReady(
     try {
       observation.response = SendCommand(
           directory.execution_socket_path(),
-          R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+          R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
       if (observation.response.find("\"code\":\"execution_owner_not_ready\"") !=
           std::string::npos) {
         observation.observed_closed = true;
@@ -1209,7 +1240,7 @@ AuthoringAdmissionProjection
 ReadAuthoringAdmissionProjection(const DaemonDirectory &directory) {
   const auto response = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v1","command":"cell_admission_get"})");
+      R"({"api_version":"manyforge.execution_command.v3","command":"cell_admission_get"})");
   const auto root = deployment::parse_strict_json_model_yaml(response).root();
   const auto *ok = std::get_if<bool>(&RequiredMember(root, "ok").storage());
   const auto &admission = RequiredMember(root, "authoring_admission");
@@ -1250,10 +1281,61 @@ ReadAuthoringAdmissionProjection(const DaemonDirectory &directory) {
 }
 
 #if defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
+/// Publish one prepared activation with its complete captured closure into
+/// the daemon's trusted activation store, as the native preparer does.
+void PublishPreparedActivationClosure(const DaemonDirectory &directory,
+                                      const deployment::PreparedActivationInput &prepared) {
+  // Publish the complete captured closure under the same writer lock used by
+  // the native preparer. The Manager's collector may run concurrently.
+  const deployment::ActivationContentWriterLock writing(directory.activation_root());
+  const auto &closure = prepared.closure();
+  std::vector<std::string_view> raw_values;
+  for (const auto &artifact : closure.raw_artifacts)
+    raw_values.emplace_back(artifact.bytes);
+  deployment::FilesystemRawArtifactStore activation_raw(directory.activation_root());
+  const auto raw_stored = activation_raw.put_all_if_absent(raw_values);
+  for (std::size_t index = 0; index < raw_stored.size(); ++index) {
+    const auto &expected = closure.raw_artifacts[index];
+    if (raw_stored[index].content_addressed_store_key != expected.content_addressed_store_key ||
+        raw_stored[index].content_digest != expected.content_digest ||
+        raw_stored[index].byte_size != expected.bytes.size())
+      throw std::runtime_error("prepared fixture raw artifact identity mismatch");
+  }
+  std::vector<deployment::CatalogArtifactPublication> catalog_values;
+  for (const auto &artifact : closure.catalog_artifacts)
+    catalog_values.push_back({artifact.content_addressed_store_key,
+                              artifact.content_digest, artifact.bytes});
+  deployment::FilesystemCatalogArtifactStore activation_catalogs(directory.activation_root());
+  const auto catalog_stored = activation_catalogs.put_all_if_absent(catalog_values);
+  for (std::size_t index = 0; index < catalog_stored.size(); ++index) {
+    const auto &expected = closure.catalog_artifacts[index];
+    if (catalog_stored[index].content_addressed_store_key != expected.content_addressed_store_key ||
+        catalog_stored[index].content_digest != expected.content_digest ||
+        catalog_stored[index].byte_size != expected.bytes.size())
+      throw std::runtime_error("prepared fixture catalog artifact identity mismatch");
+  }
+  deployment::FilesystemRetainedBundleRepository activation_bundles(directory.activation_root());
+  static_cast<void>(activation_bundles.put_if_absent(closure.retained_bundle));
+  if (closure.program) {
+    deployment::FilesystemProgramRepository programs(directory.activation_root());
+    static_cast<void>(programs.put_if_absent(closure.program, *closure.retained_bundle));
+  }
+  if (closure.program_binding) {
+    if (!closure.retained_model_map)
+      throw std::logic_error("prepared fixture Binding has no retained model map");
+    deployment::FilesystemProgramBindingRepository bindings(directory.activation_root());
+    static_cast<void>(bindings.put_if_absent(closure.program_binding,
+        *closure.retained_bundle, *closure.retained_model_map, activation_catalogs));
+  }
+  static_cast<void>(
+      deployment::FilesystemPreparedActivationRepository(directory.activation_root())
+          .put_if_absent(prepared));
+}
+
 /// Assemble and publish one real prepared activation for the exact candidate
 /// this test applies, and return its Apply summary. The fixture Program is
 /// re-verified against that candidate; if its roles do not resolve there the
-/// value is honestly non-executable (H1a).
+/// value is honestly non-executable.
 content_identity::CanonicalValue PublishTestPreparedActivation(
     const DaemonDirectory &directory,
     const deployment::RetainedBundle &candidate,
@@ -1272,8 +1354,6 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
   if (authored == nullptr) {
     throw std::runtime_error("Manager Apply fixture Program is unavailable");
   }
-  const auto program = deployment::verify_program_binding_contract(
-      authored->canonical_program_bytes(), candidate);
   const auto &map_products =
       candidate.value().compiled_products.symbol_role_maps;
   if (map_products.size() > 1U) {
@@ -1291,10 +1371,12 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
     throw std::runtime_error(
         "Manager Apply fixture candidate omits required model data");
   }
+  deployment::FilesystemCatalogArtifactStore catalogs(package_root);
+  const auto program = deployment::verify_program_binding_contract(
+      authored->canonical_program_bytes(), candidate, model_map, catalogs);
   if (program == nullptr) {
     throw std::runtime_error("Manager Apply fixture Program is unavailable");
   }
-  deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   deployment::FilesystemRawArtifactStore raw_artifacts(package_root);
   const auto prepared = deployment::assemble_prepared_activation(
       {deployment::PreparedScenarioOrigin{
@@ -1307,16 +1389,51 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
            "sha256:2020202020202020202020202020202020202020202020"
            "202020202020202020"),
        "optional"},
-      candidate, model_map, *program, fixture.program_role_assignment, catalogs,
+      candidate, model_map, *program, catalogs,
       raw_artifacts);
-  static_cast<void>(
-      deployment::FilesystemPreparedActivationRepository(directory.activation_root())
-          .put_if_absent(prepared));
+  PublishPreparedActivationClosure(directory, prepared);
   content_identity::CanonicalValue::Object summary;
   for (const auto &[name, value] : prepared.normalized_root().as_object()) {
     if (name != "activation_payload") summary.emplace_back(name, value);
   }
   return content_identity::CanonicalValue(std::move(summary));
+}
+
+/// Assemble and publish the prepared activation of the fixture's Close (the
+/// Apply of the empty intent) applied without a Program, and return its id.
+std::string PublishTestCloseWithoutProgram(
+    const DaemonDirectory &directory,
+    const ManagerApplyFixtureMetadata &fixture) {
+  const auto package_root = directory.apply_package_root();
+  const auto close =
+      deployment::FilesystemVerifiedRetainedBundleSource(package_root)
+          .get_verified(core::RetainedBundleId(fixture.close_retained_bundle_id));
+  if (close == nullptr) {
+    throw std::runtime_error("Manager Apply fixture lost its Close bundle");
+  }
+  const auto &map_products = close->value().compiled_products.symbol_role_maps;
+  std::optional<deployment::VerifiedRetainedModelMap> model_map;
+  if (!map_products.empty()) {
+    model_map =
+        deployment::FilesystemVerifiedRetainedModelMapSource(package_root)
+            .get_verified({close->retained_bundle_id(),
+                           map_products.front().product_id});
+  }
+  deployment::FilesystemRawArtifactStore raw_artifacts(package_root);
+  const auto prepared = deployment::assemble_prepared_activation_without_program(
+      {deployment::PreparedScenarioOrigin{
+           "scenario.close",
+           core::ContentDigest(
+               "sha256:1515151515151515151515151515151515151515151515"
+               "151515151515151515"),
+           "/fixtures/scenario.close.scenario"},
+       core::ContentDigest(
+           "sha256:2121212121212121212121212121212121212121212121"
+           "212121212121212121"),
+       "optional"},
+      *close, model_map, raw_artifacts);
+  PublishPreparedActivationClosure(directory, prepared);
+  return prepared.prepared_activation_id().value();
 }
 #endif
 
@@ -1918,7 +2035,7 @@ TEST(ManagerDaemonProcess, ProcessStopOfferReturnsKnownEmptyInventoryAndIsPassiv
       R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":"component.1"})");
   const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
   ASSERT_EQ(response.as_object().size(), 4U);
-  EXPECT_EQ(RequiredMember(response, "api_version"), CanonicalValue("manyforge.manager_command_response.v1"));
+  EXPECT_EQ(RequiredMember(response, "api_version"), CanonicalValue("manyforge.manager_command_response.v2"));
   EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(true)) << bytes;
   EXPECT_EQ(RequiredMember(response, "error"), CanonicalValue(nullptr));
   const auto &offer = RequiredMember(response, "result");
@@ -1971,7 +2088,7 @@ TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
   }
 }
 
-// N7: New's release finds no failed Apply holding a fresh cell; the command
+// New's release finds no failed Apply holding a fresh cell; the command
 // takes only its request context.
 TEST(ManagerDaemonProcess, ApplyReleaseForNewReleasesNothingOnAFreshCell) {
   using content_identity::CanonicalValue;
@@ -2885,9 +3002,7 @@ TEST(ManagerDaemonProcess,
   const auto prepared = package_activations.get_verified(
       core::ContentDigest(fixture.prepared_activation_id));
   ASSERT_NE(prepared, nullptr);
-  const deployment::FilesystemPreparedActivationRepository daemon_activations(
-      directory.activation_root());
-  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared));
+  PublishPreparedActivationClosure(directory, *prepared);
   const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
   ProgramRunnerProcess program_runner(directory, fixture.cell_id);
   ManagerProcess manager(directory, directory.apply_package_root().string(),
@@ -2933,7 +3048,7 @@ TEST(ManagerDaemonProcess,
   EXPECT_FALSE(ready.owner_epoch.empty());
   const auto status = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
   ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
   EXPECT_NE(status.find("tool.gripper.command"), std::string::npos)
       << status;
@@ -3005,9 +3120,7 @@ TEST(
   const auto prepared = package_activations.get_verified(
       core::ContentDigest(fixture.prepared_activation_id));
   ASSERT_NE(prepared, nullptr);
-  const deployment::FilesystemPreparedActivationRepository daemon_activations(
-      directory.activation_root());
-  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared));
+  PublishPreparedActivationClosure(directory, *prepared);
   const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
   ProgramRunnerProcess program_runner(directory, fixture.cell_id);
   ManagerProcess manager(directory, directory.apply_package_root().string(),
@@ -3063,7 +3176,7 @@ TEST(
             fixture.physical_candidate_retained_bundle_id);
   const auto status = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
   ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
   EXPECT_NE(status.find("tool.gripper.command"), std::string::npos) << status;
   EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
@@ -3124,7 +3237,7 @@ TEST(ManagerDaemonProcess,
                                       fixture_a.physical_deployment_revision,
                                       fixture_a.predecessor_graph_revision,
                                       fixture_a.predecessor_retained_bundle_id,
-                                      "manager-o1-4g-replacement-a.1");
+                                      "manager-replacement-a.1");
     const auto submitted = SendCommand(directory_a.socket_path(), request);
     ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
     const auto status_request = ApplyStatusRequest(submitted);
@@ -3212,7 +3325,7 @@ TEST(ManagerDaemonProcess,
                                       fixture_b.physical_deployment_revision,
                                       fixture_b.predecessor_graph_revision,
                                       fixture_b.predecessor_retained_bundle_id,
-                                      "manager-o1-4g-replacement-b.1");
+                                      "manager-replacement-b.1");
     const auto submitted = SendCommand(directory_b.socket_path(), request);
     ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
     const auto status_request = ApplyStatusRequest(submitted);
@@ -3262,10 +3375,42 @@ TEST(ManagerDaemonProcess,
                                              "manager-source.json");
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
+  // First Apply the physical fixture cell with its Program.
+  const auto physical_submitted = SendCommand(
+      directory.socket_path(),
+      ApplyRequest(directory, before->source_owner_epoch,
+                   WaitForAuthoringAdmission(directory).admission_generation,
+                   fixture.physical_deployment_artifact_id,
+                   fixture.physical_deployment_revision,
+                   fixture.predecessor_graph_revision,
+                   fixture.predecessor_retained_bundle_id,
+                   "impact-physical-apply.1"));
+  const auto physical_status_request = ApplyStatusRequest(physical_submitted);
+  auto physical_applied = physical_submitted;
+  const auto physical_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (physical_applied.find("\"state\":\"succeeded\"") == std::string::npos &&
+         std::chrono::steady_clock::now() < physical_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    physical_applied = SendCommand(directory.socket_path(), physical_status_request);
+  }
+  ASSERT_NE(physical_applied.find("\"state\":\"succeeded\""), std::string::npos)
+      << physical_applied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
+  const auto physical =
+      deployment::FilesystemVerifiedRetainedBundleSource(
+          directory.apply_package_root())
+          .get_verified(core::RetainedBundleId(
+              fixture.physical_candidate_retained_bundle_id));
+  ASSERT_NE(physical, nullptr);
+  const auto physical_graph_revision =
+      physical->value().cell_graph.graph_revision.value();
+
+  // Then Close (the Apply of the empty intent) without a Program: the active
+  // physical cell's components are removed, a destructive impact.
+  const auto close_prepared_activation_id =
+      PublishTestCloseWithoutProgram(directory, fixture);
   const auto admission =
       WaitForAuthoringAdmission(directory).admission_generation;
-  // Close (the Apply of the empty intent) has none of the fixture Program's
-  // components: the Program becomes non-executable, a destructive impact (H1a).
   std::string last_request;
   const auto submit = [&](const std::string_view request_id,
                           const std::string_view accepted) {
@@ -3273,9 +3418,9 @@ TEST(ManagerDaemonProcess,
         ApplyRequest(directory, before->source_owner_epoch, admission,
                      fixture.close_deployment_artifact_id,
                      fixture.close_deployment_revision,
-                     fixture.predecessor_graph_revision,
-                     fixture.predecessor_retained_bundle_id, request_id, {},
-                     false, accepted);
+                     physical_graph_revision,
+                     fixture.physical_candidate_retained_bundle_id, request_id,
+                     {}, false, accepted, close_prepared_activation_id);
     const auto response = SendCommand(directory.socket_path(), last_request);
     return response;
   };
@@ -3337,7 +3482,7 @@ TEST(ManagerDaemonProcess,
 TEST(ManagerDaemonProcess,
      NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
-  DaemonDirectory directory;
+  DaemonDirectory directory(true);
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
                         directory.apply_package_root(),
                         std::filesystem::copy_options::recursive);
@@ -3352,7 +3497,7 @@ TEST(ManagerDaemonProcess,
       try {
         status = SendCommand(
             directory.execution_socket_path(),
-            R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+            R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
         if (status.find("\"ok\":true") != std::string::npos ||
             status.find("\"code\":\"execution_owner_not_ready\"") !=
                 std::string::npos) {
@@ -3499,6 +3644,73 @@ TEST(ManagerDaemonProcess,
                   .terminal_outcome->terminal_outcome
                   .candidate_projection_revision->retained_bundle_id.value(),
               fixture.physical_candidate_retained_bundle_id);
+
+    // Optional export is reached only after this test's real Manager Apply
+    // and its durable journal report the same successful candidate.
+    if (const char* export_path = std::getenv("MANYFORGE_REAL_APPLY_FIXTURE_EXPORT")) {
+      const auto& intent = inventory.front().intent;
+      ASSERT_TRUE(inventory.front().terminal_outcome->terminal_outcome.succeeded());
+      ASSERT_NE(applied.find(R"("terminal_state":"succeeded")"), std::string::npos);
+      ASSERT_NE(applied.find(intent.intent_digest.value()), std::string::npos);
+      ASSERT_TRUE(intent.intent.prepared_activation.program_binding_id.has_value());
+      ASSERT_EQ(intent.intent.prepared_activation.program_binding_id->value(), fixture.program_binding_id);
+      ASSERT_EQ(intent.intent.candidate_retained_bundle_id.value(), fixture.physical_candidate_retained_bundle_id);
+      const auto package = directory.apply_package_root();
+      const auto bundle = deployment::FilesystemVerifiedRetainedBundleSource(package)
+          .get_verified(intent.intent.candidate_retained_bundle_id);
+      ASSERT_NE(bundle, nullptr);
+      ASSERT_EQ(bundle->value().cell_graph.graph_revision, intent.intent.candidate_graph_revision);
+      ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
+      const auto map = deployment::FilesystemVerifiedRetainedModelMapSource(package)
+          .get_verified({bundle->retained_bundle_id(), bundle->value().compiled_products.symbol_role_maps.front().product_id});
+      ASSERT_TRUE(map.has_value());
+      deployment::FilesystemCatalogArtifactStore catalogs(package);
+      const auto program = deployment::FilesystemVerifiedProgramSource(package).get_verified(
+          core::ProgramId(fixture.program_id), core::ProgramRevision(fixture.program_revision), *bundle);
+      ASSERT_NE(program, nullptr);
+      const auto contract = deployment::verify_program_binding_contract(
+          program->canonical_program_bytes(), *bundle, map, catalogs);
+      const auto binding = deployment::FilesystemVerifiedProgramBindingSource(package).get_verified(
+          *intent.intent.prepared_activation.program_binding_id, *bundle, *map, catalogs);
+      ASSERT_NE(binding, nullptr);
+      ASSERT_EQ(binding->value().program_revision.value(), fixture.program_revision);
+      const auto facts = deployment::CaptureProgramFrameFacts(
+          contract->value(), *map, intent.intent_digest.value(), binding->value().program_binding_id.value(),
+          fixture.program_revision, bundle->retained_bundle_id().value(),
+          bundle->value().cell_graph.graph_revision.value());
+      const char* source_root = std::getenv("MANYFORGE_REAL_APPLY_FIXTURE_SOURCE_ROOT");
+      ASSERT_NE(source_root, nullptr);
+      const auto source_hash = [&](const char* name) {
+        std::ifstream in(std::filesystem::path(source_root) / name, std::ios::binary);
+        if (!in) throw std::runtime_error("fixture provenance source is unavailable");
+        const std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        return content_identity::sha256_digest(bytes);
+      };
+      const auto fact_bytes = content_identity::canonical_json(facts);
+      using V = content_identity::CanonicalValue;
+      const auto provenance = V(V::Object{
+          {"producer_test_source_sha256", V(source_hash("manyforge_headless/test/test_manager_daemon_process.cpp"))},
+          {"package_generator_source_sha256", V(source_hash("manyforge_headless/test/generate_manager_apply_package.cpp"))},
+          {"frame_capture_source_sha256", V(source_hash("manyforge_deployment/src/program_reference_facts.cpp"))},
+          {"captured_input_digest", V(intent.intent.prepared_activation.captured_input_digest.value())},
+          {"prepared_activation_id", V(intent.intent.prepared_activation.prepared_activation_id.value())},
+          {"program_sha256", V(content_identity::sha256_digest(program->canonical_program_bytes()))},
+          {"binding_sha256", V(content_identity::sha256_digest(binding->canonical_bytes()))},
+          {"frame_facts_sha256", V(content_identity::sha256_digest(fact_bytes))},
+          {"manager_snapshot_sha256", V(content_identity::sha256_digest(applied))},
+      });
+      const auto destination = std::filesystem::path(export_path);
+      std::filesystem::create_directories(destination);
+      const auto emit = [&](const char* name, std::string_view bytes) {
+        std::ofstream out(destination / name, std::ios::binary | std::ios::trunc);
+        if (!out || !(out << bytes)) throw std::runtime_error("could not export committed Apply fixture");
+      };
+      emit("program.json", program->canonical_program_bytes());
+      emit("program_binding.json", binding->canonical_bytes());
+      emit("program_frame_facts.json", fact_bytes);
+      emit("committed_manager_snapshot.json", applied);
+      emit("provenance.json", content_identity::canonical_json(provenance));
+    }
 
     const auto manager_after = manager_source.Read();
     const auto scene_after = scene_source.Read();
@@ -3739,13 +3951,13 @@ TEST(ManagerDaemonProcess,
   // silently rebuild the old physical product or reopen control admission.
   const auto execution_status = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
   EXPECT_NE(execution_status.find("\"code\":\"execution_owner_not_ready\""),
             std::string::npos)
       << execution_status;
   EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed)
       << SendCommand(directory.execution_socket_path(),
-                     R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+                     R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
   const auto replay = SendCommand(directory.socket_path(), apply_request);
   EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
       << replay;
@@ -3817,15 +4029,15 @@ TEST(ManagerDaemonProcess,
                         directory.apply_package_root(),
                         std::filesystem::copy_options::recursive);
   // The package and daemon activation repositories are distinct capabilities.
-  // Reuse the genuine stored product exactly as the gripper-only fixture does.
+  // Publish the genuine stored product with its whole closure, as the
+  // preparer does: the host reads the selected Program, its Binding and their
+  // catalog bytes from the activation root.
   const deployment::FilesystemPreparedActivationRepository package_activations(
       directory.apply_package_root());
   const auto prepared_activation = package_activations.get_verified(
       core::ContentDigest(RequiredText(metadata, "prepared_activation_id")));
   ASSERT_NE(prepared_activation, nullptr);
-  const deployment::FilesystemPreparedActivationRepository daemon_activations(
-      directory.activation_root());
-  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared_activation));
+  PublishPreparedActivationClosure(directory, *prepared_activation);
   // Reuse the real installed-target loader and Program runner with only the
   // selected ROS executable and its actual shared candidate worker.
   const auto installed_manager = PrepareManagerApplyInstalledTargets(
@@ -3841,11 +4053,17 @@ TEST(ManagerDaemonProcess,
   ASSERT_NE(predecessor, nullptr);
   ASSERT_NE(candidate, nullptr);
   ASSERT_TRUE(predecessor->value().cell_graph.controllable_components.empty());
-  ASSERT_EQ(candidate->value().cell_graph.controllable_components.size(), 1U);
-  EXPECT_EQ(candidate->value()
-                .cell_graph.controllable_components.front()
-                .controllable_component_id.value(),
-            component);
+  // The Mock Lite 6 is a machine (ARCHITECTURE.md "Machines: owners and
+  // members"): owner, arm member and the
+  // gripper mounted on the arm are three components; `component` is the arm.
+  ASSERT_EQ(candidate->value().cell_graph.controllable_components.size(), 3U);
+  EXPECT_EQ(std::count_if(
+                candidate->value().cell_graph.controllable_components.begin(),
+                candidate->value().cell_graph.controllable_components.end(),
+                [&](const auto &row) {
+                  return row.controllable_component_id.value() == component;
+                }),
+            1);
   for (const auto *bundle : {predecessor.get(), candidate.get()}) {
     ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
     EXPECT_EQ(bundle->value()
@@ -3874,11 +4092,11 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(RequiredText(RequiredMember(before->payload, "active"),
                          "retained_bundle_id"),
             predecessor_id);
-  // CONTRACTS §1/§2: the component model and component actions are served
+  // The component model and component actions are served
   // on the execution host's Stop control socket.
   const auto control_command = [&](CanonicalValue::Object request) {
     request.emplace_back("api_version",
-                         CanonicalValue("manyforge.execution_command.v1"));
+                         CanonicalValue("manyforge.execution_command.v3"));
     const auto bytes = SendCommand(
         directory.execution_run_root() / "execution-control.sock",
         content_identity::canonical_json(CanonicalValue(std::move(request))));
@@ -3891,7 +4109,7 @@ TEST(ManagerDaemonProcess,
   // Events use the stable owner/journal even before a physical product exists.
   const auto idle_identity = deployment::parse_strict_json_model_yaml(SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})")).root();
+      R"({"api_version":"manyforge.execution_command.v3","command":"identity"})")).root();
   ASSERT_EQ(RequiredMember(idle_identity, "ok"), CanonicalValue(false));
   const auto event_owner_epoch = RequiredText(
       RequiredMember(RequiredMember(idle_identity, "error"), "details"), "owner_epoch");
@@ -3899,7 +4117,7 @@ TEST(ManagerDaemonProcess,
     const auto response = deployment::parse_strict_json_model_yaml(SendCommand(
         directory.execution_socket_path(), content_identity::canonical_json(
             CanonicalValue(CanonicalValue::Object{
-                {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+                {"api_version", CanonicalValue("manyforge.execution_command.v3")},
                 {"command", CanonicalValue("events")},
                 {"owner_epoch", CanonicalValue(stale_cursor ? "unregistered-event-owner" : event_owner_epoch)},
                 {"after_sequence", CanonicalValue(0.0)}, {"limit", CanonicalValue(1.0)}})))).root();
@@ -4049,17 +4267,35 @@ TEST(ManagerDaemonProcess,
   ASSERT_TRUE(status.fence_released.has_value());
   ASSERT_TRUE(status.publication_receipt.has_value());
 
-  const auto read_component = [&] {
+  const auto read_component = [&](const std::string &component_id) {
     const auto model = control_command(
         {{"command", CanonicalValue("read_component_model")}});
     for (const auto &state :
          RequiredMember(model, "component_states").as_array())
-      if (RequiredText(state, "component_id") == component) return state;
+      if (RequiredText(state, "component_id") == component_id) return state;
     throw std::runtime_error("Actual component state is absent: " +
                              content_identity::canonical_json(model));
   };
-  // An added component starts not prepared; the operator prepares it.
-  EXPECT_EQ(RequiredText(read_component(), "lifecycle"), "not_prepared");
+  // An added component starts not prepared; the operator prepares it
+  // (ARCHITECTURE.md "Component model"). The arm is a machine member: offline with
+  // `owner_unavailable` until its owner is prepared. The gripper
+  // mounted on it is its own component ("Tools as components").
+  const auto arm_state = read_component(component);
+  EXPECT_EQ(RequiredText(arm_state, "lifecycle"), "offline");
+  const auto owner = RequiredText(arm_state, "owner_id");
+  std::string gripper_component;
+  for (const auto &row : candidate->value().cell_graph.controllable_components) {
+    const auto id = row.controllable_component_id.value();
+    if (id != component && id != owner) gripper_component = id;
+  }
+  ASSERT_FALSE(gripper_component.empty());
+  EXPECT_EQ(RequiredText(read_component(owner), "lifecycle"), "not_prepared");
+  // An added component starts not_prepared, or offline until its process
+  // reports.
+  const auto gripper_state = read_component(gripper_component);
+  EXPECT_TRUE(RequiredText(gripper_state, "lifecycle") == "not_prepared" ||
+              RequiredText(gripper_state, "lifecycle") == "offline")
+      << content_identity::canonical_json(gripper_state);
 
   const auto observe_ros = [&](const std::string &state, const std::string &label) {
     const auto output = directory.execution_run_root() / (label + ".ros-observation.json");
@@ -4075,7 +4311,8 @@ TEST(ManagerDaemonProcess,
       ::close(fd);
       ::execl(MANYFORGE_HEADLESS_TEST_PYTHON, MANYFORGE_HEADLESS_TEST_PYTHON,
               helper.c_str(), "--observe-manager-ros", "--execution-root", execution_root.c_str(),
-              "--component", component.c_str(), "--state", state.c_str(), "--label", label.c_str(),
+              "--component", component.c_str(), "--gripper-component", gripper_component.c_str(),
+              "--state", state.c_str(), "--label", label.c_str(),
               "--output", output.c_str(), static_cast<char *>(nullptr));
       _exit(127);
     }
@@ -4097,7 +4334,6 @@ TEST(ManagerDaemonProcess,
     while (::waitpid(child, &result, 0) < 0 && errno == EINTR) {}
     throw std::runtime_error("Actual ROS observation timed out: " + read_file(log));
   };
-  observe_ros("inactive", "after-apply");
 
   // This is the installed Kernel's actual per-component command gate, not
   // Manager convergence or process presence. Reading it never dispatches
@@ -4105,7 +4341,7 @@ TEST(ManagerDaemonProcess,
   const auto read_command_gate = [&] {
     const auto bytes = SendCommand(
         directory.execution_socket_path(),
-        R"({"api_version":"manyforge.execution_command.v1","command":"targets"})");
+        R"({"api_version":"manyforge.execution_command.v3","command":"targets"})");
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
@@ -4114,12 +4350,13 @@ TEST(ManagerDaemonProcess,
     const auto &components =
         RequiredMember(RequiredMember(response, "targets"), "components")
             .as_array();
-    if (components.size() != 1U ||
-        RequiredText(components.front(), "controllable_component_id") !=
-            component)
+    const auto row = std::find_if(components.begin(), components.end(), [&](const auto &entry) {
+      return RequiredText(entry, "controllable_component_id") == component;
+    });
+    if (row == components.end())
       throw std::runtime_error("Actual execution target membership mismatch: " +
                                bytes);
-    return RequiredMember(components.front(), "availability");
+    return RequiredMember(*row, "availability");
   };
   EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"),
             CanonicalValue(false));
@@ -4135,7 +4372,7 @@ TEST(ManagerDaemonProcess,
                                                  false) {
     const auto bytes = SendCommand(
         directory.execution_socket_path(),
-        R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+        R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
@@ -4143,9 +4380,12 @@ TEST(ManagerDaemonProcess,
     const auto &actual = RequiredMember(response, "status");
     const auto &identity = RequiredMember(actual, "identity");
     const auto &components = RequiredMember(RequiredMember(actual, "targets"), "components").as_array();
-    if (components.size() != 1U || RequiredText(components.front(), "controllable_component_id") != component)
+    const auto arm_row = std::find_if(components.begin(), components.end(), [&](const auto &entry) {
+      return RequiredText(entry, "controllable_component_id") == component;
+    });
+    if (arm_row == components.end())
       throw std::runtime_error("Actual motion producer component closure differs");
-    const auto &targets = RequiredMember(components.front(), "targets").as_array();
+    const auto &targets = RequiredMember(*arm_row, "targets").as_array();
     const auto target = std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
       return RequiredText(row, "presentation") == "motion";
     });
@@ -4173,8 +4413,8 @@ TEST(ManagerDaemonProcess,
       throw std::runtime_error("Actual motion axes differ from the compiled direct target");
     CanonicalValue payload(CanonicalValue::Object{
         {"kind", CanonicalValue("motion")}, {"move_id", CanonicalValue(request_id + ".hold")},
-        {"base_frame_role_id", RequiredMember(command, "base_frame_role_id")},
-        // Active TCP (M7): Robot control moves at the robot's Active TCP.
+        {"base_frame", RequiredMember(command, "base_frame")},
+        // Active TCP: Robot control moves at the robot's Active TCP.
         {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
             {"kind", CanonicalValue("current")}})},
         {"tolerances", CanonicalValue(CanonicalValue::Object{
@@ -4196,8 +4436,7 @@ TEST(ManagerDaemonProcess,
         {"motion_interrupt_scopes", CanonicalValue(CanonicalValue::Array{})},
         {"runtime_object_bindings", CanonicalValue(CanonicalValue::Array{})}});
     CanonicalValue::Object participant{
-        {"component_role_id", RequiredMember(command, "component_role_id")},
-        {"target_role_id", RequiredMember(command, "target_role_id")},
+        {"target", RequiredMember(command, "target")},
         {"required_capability_id",
          non_motion_capability
              ? CanonicalValue("tool.gripper.command")
@@ -4228,7 +4467,7 @@ TEST(ManagerDaemonProcess,
     const auto submitted_motion = SendCommand(
         directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+            {"api_version", CanonicalValue("manyforge.execution_command.v3")},
             {"command", CanonicalValue("submit")},
             {"operation", std::move(operation)},
             {"attribution", CanonicalValue(CanonicalValue::Object{
@@ -4239,19 +4478,20 @@ TEST(ManagerDaemonProcess,
   };
 
   // Runs one component action and waits for its result in the component's
-  // state (CONTRACTS §2: `202`-style acceptance, then `last_action`).
-  const auto run_action = [&](const std::string &action) {
+  // state (`202`-style acceptance, then `last_action`).
+  const auto run_action = [&](const std::string &action,
+                              const std::string &component_id) {
     const auto accepted = control_command(
         {{"command", CanonicalValue("component_action")},
          {"request", CanonicalValue(CanonicalValue::Object{
                          {"action", CanonicalValue(action)},
-                         {"component_id", CanonicalValue(component)}})}});
+                         {"component_id", CanonicalValue(component_id)}})}});
     const auto started =
         RequiredMember(RequiredMember(accepted, "accepted"), "started_at_ns");
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
-      const auto state = read_component();
+      const auto state = read_component(component_id);
       const auto *last = state.find_object_member("last_action");
       if (state.find_object_member("action") == nullptr && last != nullptr &&
           RequiredText(*last, "action") == action &&
@@ -4265,7 +4505,11 @@ TEST(ManagerDaemonProcess,
     }
     throw std::runtime_error("Component action did not finish: " + action);
   };
-  EXPECT_EQ(RequiredText(run_action("prepare"), "lifecycle"), "prepared");
+  EXPECT_EQ(RequiredText(run_action("prepare", owner), "lifecycle"), "prepared");
+  EXPECT_EQ(RequiredText(run_action("prepare", component), "lifecycle"), "prepared");
+  EXPECT_EQ(RequiredText(run_action("prepare", gripper_component), "lifecycle"), "prepared");
+  // Prepared: both controllers configured and inactive.
+  observe_ros("inactive", "after-prepare");
   EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"),
             CanonicalValue(false));
 
@@ -4274,7 +4518,8 @@ TEST(ManagerDaemonProcess,
   ASSERT_EQ(RequiredMember(refused_motion, "ok"), CanonicalValue(false))
       << content_identity::canonical_json(refused_motion);
 
-  EXPECT_EQ(RequiredText(run_action("enable"), "lifecycle"), "enabled");
+  EXPECT_EQ(RequiredText(run_action("enable", component), "lifecycle"), "enabled");
+  EXPECT_EQ(RequiredText(run_action("enable", gripper_component), "lifecycle"), "enabled");
   observe_ros("active", "after-enable");
   const auto ready_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -4296,12 +4541,12 @@ TEST(ManagerDaemonProcess,
     return deployment::parse_strict_json_model_yaml(bytes).root();
   };
   const CanonicalValue::Object capability_request{
-      {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+      {"api_version", CanonicalValue("manyforge.execution_command.v3")},
       {"command", CanonicalValue("reset_robot_position_capability")}};
   const auto capability = execution_command(capability_request);
   ASSERT_EQ(capability.as_object().size(), 5U);
   ASSERT_EQ(RequiredMember(capability, "ok"), CanonicalValue(true));
-  EXPECT_EQ(RequiredText(capability, "api_version"), "manyforge.execution_command_response.v1");
+  EXPECT_EQ(RequiredText(capability, "api_version"), "manyforge.execution_command_response.v4");
   EXPECT_EQ(RequiredText(capability, "command"), "reset_robot_position_capability");
   const auto &position_capability = RequiredMember(capability, "reset_robot_position");
   ASSERT_EQ(position_capability.as_object().size(), 2U);
@@ -4324,7 +4569,7 @@ TEST(ManagerDaemonProcess,
     expected_deployment.emplace_back(key, RequiredMember(position_identity, key));
   const auto reset_command = [](CanonicalValue::Object authorization, CanonicalValue::Object expected) {
     return CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
         {"command", CanonicalValue("reset_robot_position")},
         {"authorization", CanonicalValue(std::move(authorization))},
         {"expected_deployment_identity", CanonicalValue(std::move(expected))}};
@@ -4415,7 +4660,7 @@ TEST(ManagerDaemonProcess,
   while (std::chrono::steady_clock::now() < motion_deadline) {
     const auto bytes = SendCommand(directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+            {"api_version", CanonicalValue("manyforge.execution_command.v3")},
             {"command", CanonicalValue("read")}, {"operation_id", CanonicalValue(operation_id)}})));
     const auto actual = deployment::parse_strict_json_model_yaml(bytes).root();
     ASSERT_EQ(RequiredMember(actual, "ok"), CanonicalValue(true)) << bytes;
@@ -4452,6 +4697,8 @@ TEST(ManagerDaemonProcess,
   // These commands reach the actual private decoder and stable Kernel. This
   // product has no sealed signals, so valid shapes refuse without registration
   // or effects; malformed counter/condition shapes must stop at the decoder.
+  // The applied Program's blackboard installs the I/O signal service, so a
+  // forged watch token is refused as not current (io_watch_generation_stale).
   const CanonicalValue io_attribution(CanonicalValue::Object{
       {"transport", CanonicalValue("internal")},
       {"assurance", CanonicalValue("unverified")},
@@ -4464,7 +4711,7 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v1")},
+                            CanonicalValue("manyforge.execution_command.v3")},
                            {"command", CanonicalValue(name)},
                            {"attribution", io_attribution},
                            {field, std::move(payload)}}))))
@@ -4507,7 +4754,7 @@ TEST(ManagerDaemonProcess,
     EXPECT_EQ(
         RequiredText(RequiredMember(RequiredMember(refused, "error"), "details"),
                      "reason"),
-        "io_signal_service_unavailable")
+        "io_watch_generation_stale")
         << content_identity::canonical_json(refused);
     for (const auto &bad :
          {CanonicalValue(1.0), CanonicalValue("01"),
@@ -4523,7 +4770,7 @@ TEST(ManagerDaemonProcess,
     }
   }
   CanonicalValue::Object io_request{
-      {"schema_version", CanonicalValue("manyforge.io_watch_request.v1")},
+      {"schema_version", CanonicalValue("manyforge.io_watch_request.v2")},
       {"owner_epoch", CanonicalValue(event_owner_epoch)},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
       {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
@@ -4531,8 +4778,9 @@ TEST(ManagerDaemonProcess,
       {"program_run_id", CanonicalValue("run.io-wire")},
       {"node_instance_id", CanonicalValue("io_wait")},
       {"node_attempt_id", CanonicalValue("attempt.io-wire")},
-      {"target_role_id", CanonicalValue("io_target")},
-      {"resource_role_id", CanonicalValue("ready_input")},
+      {"signal", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue("io_target")},
+          {"signal_name", CanonicalValue("ready_input")}})},
       {"condition", CanonicalValue(CanonicalValue::Object{
                         {"kind", CanonicalValue("level")},
                         {"expected_value", CanonicalValue(false)}})}};
@@ -4602,8 +4850,9 @@ TEST(ManagerDaemonProcess,
             {"participants",
              CanonicalValue(
                  CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                     {"component_role_id", CanonicalValue("io_device")},
-                     {"target_role_id", CanonicalValue("outputs")},
+                     {"target", CanonicalValue(CanonicalValue::Object{
+                         {"component_id", CanonicalValue("io_device")},
+                         {"command_target_id", CanonicalValue("outputs")}})},
                      {"required_capability_id",
                       CanonicalValue("io.output.command")},
                      {"action_span", CanonicalValue(nullptr)},
@@ -4616,14 +4865,13 @@ TEST(ManagerDaemonProcess,
             {"kind", CanonicalValue("io_signal_write")},
             {"resource_role_id", CanonicalValue("valve_enable")},
             {"value", CanonicalValue(value)}}));
+    // Output writes are no longer operations (one write path through
+    // `POST /api/io/{signal_id}/set`): the `io_signal_write` command value is
+    // refused at the decoder.
     ASSERT_EQ(RequiredMember(stale_output, "ok"), CanonicalValue(false));
     EXPECT_EQ(RequiredText(RequiredMember(stale_output, "error"), "code"),
-              "invalid_request")
+              "execution_command_invalid")
         << content_identity::canonical_json(stale_output);
-    EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(stale_output, "error"),
-                                         "details"),
-                           "reason"),
-              "program_execution_scope_missing");
   }
   for (const auto &value : {CanonicalValue(nullptr), CanonicalValue(0.0),
                             CanonicalValue("false")}) {
@@ -4681,12 +4929,13 @@ TEST(ManagerDaemonProcess,
             "execution_command_invalid");
 
   CanonicalValue::Object io_query{
-      {"schema_version", CanonicalValue("manyforge.target_observation_query.v1")},
+      {"schema_version", CanonicalValue("manyforge.target_observation_query.v2")},
       {"owner_epoch", CanonicalValue(event_owner_epoch)},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
-      {"target_role_id", CanonicalValue("io_target")},
       {"kind", CanonicalValue("io_signal")},
-      {"resource_role_id", CanonicalValue("ready_input")}};
+      {"signal", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue("io_target")},
+          {"signal_name", CanonicalValue("ready_input")}})}};
   const auto query_io = [&](CanonicalValue query) {
     return deployment::parse_strict_json_model_yaml(
                SendCommand(
@@ -4694,26 +4943,29 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v1")},
+                            CanonicalValue("manyforge.execution_command.v3")},
                            {"command", CanonicalValue("query_target")},
                            {"query", std::move(query)}}))))
         .root();
   };
+  // The service is installed (the applied Program's blackboard); this
+  // invented signal is bound to nothing in it.
   const auto missing_service = query_io(CanonicalValue(io_query));
   EXPECT_EQ(RequiredText(RequiredMember(missing_service, "error"), "code"),
-            "io_signal_service_unavailable");
+            "io_signal_unbound");
   CanonicalValue::Object mock_set{
-      {"schema_version", CanonicalValue("manyforge.mock_io_input_request.v1")},
+      {"schema_version", CanonicalValue("manyforge.mock_io_input_request.v2")},
       {"owner_epoch", CanonicalValue(event_owner_epoch)},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
-      {"target_role_id", CanonicalValue("io_target")},
-      {"resource_role_id", CanonicalValue("ready_input")},
+      {"signal", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue("io_target")},
+          {"signal_name", CanonicalValue("ready_input")}})},
       {"expected_source_epoch", CanonicalValue("installation.io-wire")},
       {"value", CanonicalValue(false)}};
   const auto missing_mock =
       io_command("set_mock_io_input", "request", CanonicalValue(mock_set));
   EXPECT_EQ(RequiredText(RequiredMember(missing_mock, "error"), "code"),
-            "io_signal_service_unavailable");
+            "io_signal_unbound");
   for (auto &[key, value] : mock_set)
     if (key == "value")
       value = CanonicalValue("false");
@@ -4733,7 +4985,7 @@ TEST(ManagerDaemonProcess,
   CanonicalValue retired_motion(nullptr);
   do {
     retired_motion = execution_command(CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
         {"command", CanonicalValue("read")},
         {"operation_id", CanonicalValue(operation_id)}});
     ASSERT_EQ(RequiredMember(retired_motion, "ok"), CanonicalValue(true));
@@ -4751,7 +5003,7 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v1")},
+                            CanonicalValue("manyforge.execution_command.v3")},
                            {"command",
                             CanonicalValue("get_operation_recovery")},
                            {"operation_id", CanonicalValue(operation_id)}}))))
@@ -4785,7 +5037,7 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v1")},
+                            CanonicalValue("manyforge.execution_command.v3")},
                            {"command",
                             CanonicalValue("apply_operation_recovery")},
                            {"expected_operation_revision", operation_revision},
@@ -4888,7 +5140,8 @@ TEST(ManagerDaemonProcess,
                                "active_projection"),
                 "retained_bundle_id"),
             candidate_id);
-  EXPECT_EQ(RequiredText(run_action("disable"), "lifecycle"), "prepared");
+  EXPECT_EQ(RequiredText(run_action("disable", component), "lifecycle"), "prepared");
+  EXPECT_EQ(RequiredText(run_action("disable", gripper_component), "lifecycle"), "prepared");
   observe_ros("inactive", "after-disable");
   EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"), CanonicalValue(false));
 

@@ -1,4 +1,4 @@
-"""Q116: a repeated SIGINT must not abort ``ros2 launch``'s own shutdown.
+"""A repeated SIGINT must not abort ``ros2 launch``'s own shutdown.
 
 LaunchService handles SIGINT through ``signal.set_wakeup_fd`` and an asyncio
 callback: the first SIGINT starts its shutdown, later ones are logged and

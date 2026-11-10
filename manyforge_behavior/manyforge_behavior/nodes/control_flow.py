@@ -5,8 +5,8 @@ In update(), read self.decorated.status — do NOT call self.decorated.tick() ag
 Each cycle/attempt advances once per tree tick.
 
 A Program node's parameters, its count or policy included, are resolved once
-per attempt from that attempt's input snapshot, like every other node's
-(spec 420 §9): a value source is honoured and the result is checked against
+per attempt from that attempt's input snapshot, like every other node's:
+a value source is honoured and the result is checked against
 the catalog schema then. An attempt whose parameters cannot be resolved
 fails with a named reason before any child is ticked; it never falls back
 to another value.

@@ -112,6 +112,14 @@ template <typename Writer>
   return bindings;
 }
 
+/// The participant mechanism's current runtime-scale availability; a
+/// registration without an engine keeps the qualification-only default.
+[[nodiscard]] inline RuntimeScaleMechanismAvailability runtime_scale_availability_of(
+    const IResolvedParticipantExecutionEngine* engine) noexcept {
+  return engine == nullptr ? RuntimeScaleMechanismAvailability::kAvailable
+                           : engine->runtime_scale_availability();
+}
+
 [[nodiscard]] inline std::size_t qualified_execution_engine_count(
     const std::vector<RuntimeParticipantExecutionRegistration>& registrations) {
   std::set<const IResolvedParticipantExecutionEngine*> engines;
@@ -376,9 +384,9 @@ derive_route_readiness_projection(
   auto candidate_controller_binding = b;
   // A retained controller may receive a fresh product seal and fresh authored
   // Program metadata during Apply. Everything that identifies its physical
-  // control/runtime context remains exact. The role IDs are Program aliases;
-  // their resolved target, model, frame, resource and provider facts below
-  // still have to match. Contact/grasp templates are likewise authored
+  // control/runtime context remains exact. Resolved target, model, frame,
+  // resource and provider facts below still have to match. Contact/grasp
+  // templates are authored
   // Program inputs consumed by later admitted operations, not controller state.
   // The moving-takeover budgets are cell context: a retained controller takes
   // the candidate's, so they are not compared.
@@ -387,9 +395,10 @@ derive_route_readiness_projection(
   candidate_controller_binding.program_binding_id = a.program_binding_id;
   candidate_controller_binding.retained_bundle_id = a.retained_bundle_id;
   candidate_controller_binding.graph_revision = a.graph_revision;
-  candidate_controller_binding.component_role_id = a.component_role_id;
-  candidate_controller_binding.target_role_id = a.target_role_id;
   candidate_controller_binding.contact_grasp_bindings = a.contact_grasp_bindings;
+  candidate_controller_binding.program_frame_bindings = a.program_frame_bindings;
+  candidate_controller_binding.program_collision_body_bindings = a.program_collision_body_bindings;
+  candidate_controller_binding.frame_associations = a.frame_associations;
   candidate_controller_binding.motion_endpoint = a.motion_endpoint;
   if (a != candidate_controller_binding || left.engine != right.engine ||
       left.stop_execution_port != right.stop_execution_port ||
@@ -556,11 +565,11 @@ struct StopStaticFacts final {
   return facts;
 }
 
-[[nodiscard]] inline const ProgramFrameRoleBindingDTO* find_frame(
-    const RuntimeParticipantBindingDTO& binding, const FrameRoleId& role) noexcept {
+[[nodiscard]] inline const ProgramFrameBindingDTO* find_frame(
+    const RuntimeParticipantBindingDTO& binding, const ProgramFrameReferenceDTO& reference) noexcept {
   const auto found = std::find_if(
       binding.frame_bindings.begin(), binding.frame_bindings.end(),
-      [&](const ProgramFrameRoleBindingDTO& candidate) { return candidate.frame_role_id == role; });
+      [&](const ProgramFrameBindingDTO& candidate) { return candidate.reference == reference; });
   return found == binding.frame_bindings.end() ? nullptr : &*found;
 }
 
@@ -640,7 +649,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   if (object == motion.runtime_object_bindings.end() ||
       object->runtime_object_id != policy->runtime_object_id) {
     // Name the one runtime object the policy requires and the motion does not
-    // select (spec 210 §4.4, §5.3).
+    // select.
     auto unresolved = reject<std::optional<ResolvedContactGraspBindingDTO>>(
                           "contact-grasp policy has no selected runtime object",
                           "contact_grasp_runtime_object_unresolved", ErrorCode::kMissingReference)
@@ -674,10 +683,10 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
           object->scene_resource_id, std::move(body_ids), policy->envelope}});
 }
 
-// B7: a frame's component is always its owner, never the moving arm.
+// A frame's component is always its owner, never the moving arm.
 [[nodiscard]] inline ResolvedFrameDTO resolved_component_frame(const ControllableComponentId& owner,
-                                                        const ProgramFrameRoleBindingDTO& frame) {
-  return ResolvedComponentModelFrameDTO{owner, frame.model_instance_id, frame.frame_role_id,
+                                                        const ProgramFrameBindingDTO& frame) {
+  return ResolvedComponentModelFrameDTO{owner, frame.model_instance_id, frame.reference.frame_id,
                                         frame.compiled_frame_name, frame.model_revision};
 }
 
@@ -688,13 +697,13 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     const OperationParticipantId& participant_id, const ControllerGoalId& controller_goal_id,
     ControllerGoalGeneration controller_goal_generation,
     const RuntimeParticipantExecutionRegistration& registration,
-    const double initial_runtime_scale) {
+    const double initial_runtime_scale, const std::uint64_t initial_runtime_scale_sequence = 0U) {
   const auto& participant_policy = *registration.participant_policy;
   if (binding.model_groups.size() != 1U) {
-    return reject<ExecuteRequestDTO>("I6 motion requires exactly one retained model group",
+    return reject<ExecuteRequestDTO>("motion requires exactly one retained model group",
                                      "i6_motion_model_group_cardinality_invalid");
   }
-  const auto* base = find_frame(binding, motion.base_frame_role_id);
+  const auto* base = find_frame(binding, motion.base_frame);
   const auto* tcp =
       binding.motion_endpoint &&
               tcp_selector_admits(
@@ -812,7 +821,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       std::move(bound_resources),
       // The base is the motion component's own frame; the TCP entry belongs to
       // the motion component or a tool mounted on it.
-      resolved_component_frame(binding.controllable_component_id, *base),
+      resolved_component_frame(base->reference.component_id, *base),
       resolved_component_frame(
           registration.motion_endpoint_owner.value_or(binding.controllable_component_id), *tcp),
       {},
@@ -820,9 +829,11 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       control.runtime_scale_qualification,
       binding.retained_bundle_id,
       binding.graph_revision,
-      binding.target_role_id,
+      ProgramTargetReferenceDTO{binding.controllable_component_id, binding.command_target_id},
       binding.frame_bindings,
-      binding.collision_body_bindings};
+      binding.collision_body_bindings,
+      binding.program_frame_bindings,
+      binding.program_collision_body_bindings};
 
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();
@@ -871,7 +882,11 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     return Result<ExecuteRequestDTO>::Err(contact_grasp.error());
   }
   request.resolved_contact_grasp = std::move(contact_grasp.value());
-  if (control.runtime_scale_qualification.has_value()) {
+  // A lane that cannot scale is treated as an unqualified route: the motion
+  // runs without a runtime-scale contract.
+  if (control.runtime_scale_qualification.has_value() &&
+      runtime_scale_availability_of(registration.engine) !=
+          RuntimeScaleMechanismAvailability::kLaneUnsupported) {
     const auto& qualification = *control.runtime_scale_qualification;
     request.initial_runtime_scale =
         ResolvedRuntimeScaleCommandDTO{operation_id,
@@ -896,7 +911,8 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
                                        control.active_control_configuration_generation,
                                        RuntimeScaleGeneration(0U),
                                        RuntimeScaleGeneration(0U),
-                                       initial_runtime_scale};
+                                       initial_runtime_scale,
+                                       initial_runtime_scale_sequence};
   }
 
   if (const auto* goal = std::get_if<JointGoalDTO>(&motion.motion)) {
@@ -987,7 +1003,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     GripperOutputMode output = GripperOutputMode::kCommanded) {
   if (binding.model_groups.size() > 1U || binding.resources.size() != 1U) {
     return reject<GripperCommandRequestDTO>(
-        "the retained I6 gripper mechanism requires one exact command resource",
+        "the retained gripper mechanism requires one exact command resource",
         "i6_gripper_command_scope_unsupported");
   }
   const auto& resource = binding.resources.front();
@@ -1005,7 +1021,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   }
   if (command.command_schema_id.value() != kGripperPositionCommandSchemaId ||
       command.command_schema_revision.value() != kGripperPositionCommandSchemaRevision) {
-    return reject<GripperCommandRequestDTO>("the command is not the qualified I6 gripper schema",
+    return reject<GripperCommandRequestDTO>("the command is not the qualified gripper schema",
                                             "i6_command_schema_unsupported",
                                             ErrorCode::kUnsupportedCapability);
   }
@@ -1487,11 +1503,6 @@ struct ResourceAddressedExecutionKernel::StopReplayEntry final {
   }
 };
 
-struct ResourceAddressedExecutionKernel::RuntimeScaleReplayEntry final {
-  RuntimeScaleRequestDTO request;
-  RuntimeScaleAcceptedDTO accepted;
-};
-
 struct ResourceAddressedExecutionKernel::RuntimeScaleControlResolution final {
   RuntimeScaleControlSelectorDTO selector;
   ControlDomainId control_domain_id;
@@ -1675,12 +1686,12 @@ struct ActiveOperationParticipant final {
   std::shared_ptr<const detail::MotionResumeIntent> continuation{};
   std::size_t continuation_node_index{};
   /// Runtime collision observed outside an active Stop; its containment Stop
-  /// ends this participant InterventionRequired with this cause (item 19).
+  /// ends this participant InterventionRequired with this cause.
   std::optional<ErrorDTO> runtime_collision_error{};
-  /// Q58: a Stop that did not wait for this command's still-returning dispatch
+  /// A Stop that did not wait for this command's still-returning dispatch
   /// leaves its exact local settlement here; the dispatch return performs it.
   std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_stop_settlement{};
-  /// Q60: a Stop that closed without waiting for this never-dispatched
+  /// A Stop that closed without waiting for this never-dispatched
   /// participant's prepared cancellation to return leaves its exact local
   /// settlement here. The cancellation's own terminal hands it to the Stop
   /// lane, which performs it; until then the participant stays borrowed, so
@@ -1709,6 +1720,7 @@ struct ActiveOperationParticipant final {
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> takeover_preparation{};
   std::optional<std::int64_t> takeover_preparation_budget_ns{};
   std::optional<std::int64_t> takeover_planning_budget_ns{};
+  std::uint64_t engine_subscription_id{};
 
   [[nodiscard]] bool non_motion_transaction() const noexcept {
     return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
@@ -1737,7 +1749,7 @@ struct ActiveOperationParticipant final {
   }
 
   /// A Prepare call, prepared read or deferred pre-dispatch cancellation
-  /// (Q60) still borrows this participant's engine.
+  /// still borrows this participant's engine.
   [[nodiscard]] bool preparation_borrow_in_flight() const noexcept {
     return prepare_in_flight || prepared_advance_in_flight ||
            deferred_cancel_settlement.has_value();
@@ -1748,7 +1760,7 @@ struct ActiveOperationParticipant final {
 };
 
 /// Exact reserved resource set of one operation: the union over its
-/// participants (spec 450 §5.2 coordinated rule).
+/// participants.
 [[nodiscard]] inline std::vector<ResourceId> operation_resources(
     const std::vector<ActiveOperationParticipant>& participants) {
   std::set<ResourceId> resources;
@@ -1758,7 +1770,7 @@ struct ActiveOperationParticipant final {
   return {resources.begin(), resources.end()};
 }
 
-// Strict M1 authority shared by already resolved admission/manual checks.
+// Strict authority shared by already resolved admission/manual checks.
 // An authored payload/capability alone never grants the Stop-only exception.
 [[nodiscard]] inline bool non_motion_registration(
     const RuntimeParticipantExecutionRegistration& registration) {
@@ -1770,8 +1782,8 @@ struct ActiveOperationParticipant final {
           registration.binding.value().command_target_id.value()) == GripperActuationKind::kPneumatic;
 }
 
-/// The motion-producing recovery actions gated by operator-alarm attention
-/// (spec 450 §5.2); acknowledge_and_continue moves nothing and stays open.
+/// The motion-producing recovery actions gated by operator-alarm attention;
+/// acknowledge_and_continue moves nothing and stays open.
 [[nodiscard]] inline bool motion_producing_recovery(const RecoveryAction action) noexcept {
   return action == RecoveryAction::kRetryMotionFromCurrentState ||
          action == RecoveryAction::kRetryAfterSceneRepair ||
@@ -1807,7 +1819,6 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::vector<ActiveOperationParticipant> participants;
   OperationStateDTO state;
   std::optional<PendingOperationControl> pending_control;
-  bool runtime_scale_effect_in_flight{};
   bool stop_effect_in_flight{};
   bool ordinary_acceptance_pending{};
   bool ordinary_acceptance_durable{};
@@ -1832,14 +1843,14 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::optional<SettledStop> settled_stop{};
   std::shared_ptr<const ResolvedManualProgramHandover> manual_handover{};
   // Manual Robot Control identity, fixed at admission from the binding's
-  // intrinsic direct control. Spec 450 §5.2 / spec 530 §11 gate ordinary
+  // intrinsic direct control. Attention and fencing gate ordinary
   // Run/Resume and motion-producing recovery; they never gate a manual
   // operation, whether or not a manual cell-admission claim still names it.
   bool manual{};
   // The current Stop (`state.active_stop_id`) was requested by the Program's
   // own configuration (`is_program_requested_stop`) and no other requester
   // joined it. Its settled first-stage outcome is the Program's ordinary
-  // failure, not an operator hold (spec 260 §2.8.4).
+  // failure, not an operator hold.
   bool program_requested_stop{};
   bool retry_run_ended{false};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
@@ -1863,7 +1874,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   }
 
   /// The Program's ordinary failure from its own Stop: that Stop alone,
-  /// settled at its first stage, left the operation Stopped (spec 260 §2.8.4).
+  /// settled at its first stage, left the operation Stopped.
   [[nodiscard]] bool ordinary_program_stop() const noexcept {
     return program_requested_stop && state.state == OperationStateKind::kStopped &&
            terminal_stop_result() == StopCertificateResultDTO::kSucceededNominal;
@@ -1881,7 +1892,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   }
   [[nodiscard]] bool permanent_preparation_no_effect() const noexcept {
     if (!cancelled_pneumatic_preparation_shape() || pending_control || recovery_effect_in_flight ||
-        coordinated_cancellation_in_flight || stop_effect_in_flight || runtime_scale_effect_in_flight)
+        coordinated_cancellation_in_flight || stop_effect_in_flight)
       return false;
     return std::all_of(participants.begin(), participants.end(), [](const auto& row) {
       return row.permanent_preparation_no_effect();
@@ -1895,7 +1906,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
         });
   }
 
-  /// DX778: only exact typed pneumatic Failures may be consumed without Reset.
+  /// Only exact typed pneumatic Failures may be consumed without Reset.
   [[nodiscard]] bool pneumatic_final_failure() const noexcept {
     if (state.state != OperationStateKind::kFailed || state.participants.empty() ||
         state.participants.size() != participants.size()) return false;
@@ -2011,6 +2022,7 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
       claimed_ = true;
     }
   }
+  [[nodiscard]] bool claimed() const noexcept { return claimed_; }
   ~OperationCommitGuard() { release(); }
   void release() noexcept {
     if (!lock_.owns_lock()) return;
@@ -2177,9 +2189,9 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
 
 /// Internal Stops with their own Stop choice: Reset while busy runs the
 /// deployment's operator Stop profile and issues the lane's hard stop only
-/// on its timeout or when no profile is configured (Q27, as `main`
-/// EK:8082-8221); the zero-speed hold timeout issues the lane's hard stop
-/// directly (Q31). Neither is a degraded Stop.
+/// on its timeout or when no profile is configured (as `main`); the
+/// zero-speed hold timeout issues the lane's hard stop
+/// directly. Neither is a degraded Stop.
 [[nodiscard]] inline InternalStopKind internal_stop_kind(const StopIntentDTO* intent) noexcept {
   if (intent == nullptr || !intent->reason.has_value()) return InternalStopKind::kNone;
   const auto& source = intent->request_context.source_label;
@@ -2191,7 +2203,7 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
 }
 
 /// `main`'s degraded-Stop error: the controlled Stop did not contain the
-/// motion and the fallback hard stop did (item 25). The operation still ends
+/// motion and the fallback hard stop did. The operation still ends
 /// Stopped; this error explains the downgrade.
 [[nodiscard]] inline ErrorDTO degraded_stop_error(const ErrorDTO& cause,
                                            const PreparedParticipantStopPlanDTO& plan,
@@ -2225,8 +2237,8 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
   return degraded;
 }
 
-/// The controlled stage reports the hard stop as the right Stop: Q33, the
-/// Stop planner chose it (`main`'s ros2_control operator path); Q45, the
+/// The controlled stage reports the hard stop as the right Stop: the
+/// Stop planner chose it (`main`'s ros2_control operator path), or the
 /// controller reports an applied speed factor of exactly 0, so the Stop is
 /// the plain cancel. That hard stop ends Stopped with no error; a hard stop
 /// used as a fallback after a failed soft Stop or spring-back keeps the
@@ -2238,7 +2250,7 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
           disposition->second == "applied_factor_zero_hard_stop");
 }
 
-/// Q18: a Stop ramp that ended with the robot outside the controller's goal
+/// A Stop ramp that ended with the robot outside the controller's goal
 /// tolerance is `main`'s confirmed-but-not-settled case.
 [[nodiscard]] inline bool controlled_stop_unsettled_result(const ParticipantStopStageResultDTO& result) {
   if (result.attempt_disposition == StopStageAttemptDispositionDTO::kNotDispatched ||
@@ -2304,8 +2316,8 @@ struct StopParticipantAttempt final {
   std::optional<StopStageAttemptHandle> handle;
   std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
   std::shared_ptr<const RemainingStopBudgetDTO> budget;
-  /// The Kernel's own watchdog: only a controlled stage's own deadline (Q51);
-  /// absent for a hard stage (Q57) and a gripper cancel (Q58).
+  /// The Kernel's own watchdog: only a controlled stage's own deadline;
+  /// absent for a hard stage and a gripper cancel.
   std::optional<std::int64_t> stage_deadline_ns;
 };
 
@@ -2361,23 +2373,23 @@ struct StopParticipantWork final {
   std::optional<ErrorDTO> stop_path_collision;
   /// Why a weaker stage did not contain this participant before a stronger
   /// (fallback hard) stage did. A contained participant with this cause ends
-  /// Stopped with a degraded-Stop error (item 25, as `main`).
+  /// Stopped with a degraded-Stop error (as `main`).
   std::optional<ErrorDTO> escalation_cause{};
   /// The Stop ramp ended but the controller reported the robot outside its
-  /// goal tolerance (Q18, `main`'s confirmed-but-not-settled case): the
+  /// goal tolerance (`main`'s confirmed-but-not-settled case): the
   /// participant ends InterventionRequired and no further Stop command is
   /// issued.
   bool controlled_stop_unsettled{};
   /// The hard stop is this participant's intended Stop: requested directly
-  /// (Q27, Q31; it then starts at the strongest stage) or chosen by the Stop
-  /// planner (Q33). Its strongest stage is then not an escalation.
+  /// (it then starts at the strongest stage) or chosen by the Stop
+  /// planner. Its strongest stage is then not an escalation.
   bool lane_hard_stop_requested{};
-  /// Q60: the never-dispatched participant was closed after its prepared
+  /// The never-dispatched participant was closed after its prepared
   /// cancellation was accepted but before that cancellation's terminal
   /// returned. Its exact settlement is deferred to that terminal.
   bool cancel_terminal_deferred{};
   GripperActuationKind gripper_actuation{GripperActuationKind::kPositionCommanded};
-  /// Contract77: an interrupt-selected response follows its qualified suffix
+  /// An interrupt-selected response follows its qualified suffix
   /// sequentially. Ordinary/operator and collision strongest jumps stay intact.
   bool selected_interrupt_suffix{};
   bool participant_failure_preserved{};
@@ -2592,12 +2604,12 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return now + duration;
 }
 
-/// Q28/Q51: this robot's own controlled-Stop deadline, measured from the Stop
+/// This robot's own controlled-Stop deadline, measured from the Stop
 /// acceptance and computed at Stop time from the stage's exact prepared
 /// controlled-Stop parameters (`max_stop_time_s`, else deceleration time +
 /// 0.5 s). Absent for every other stage: a hard stage is bounded by its
-/// participant with the lane's stop-completion timeout (Q57) and a gripper
-/// cancel is fire-and-forget (Q58).
+/// participant with the lane's stop-completion timeout and a gripper
+/// cancel is fire-and-forget.
 [[nodiscard]] inline std::optional<Duration> controlled_stage_deadline_ns(
     const PreparedStopStageCommandDTO& command) {
   if (command.resolved_stage.containment_command.command_kind !=
@@ -2608,7 +2620,7 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return controlled_stop_deadline_from_contract_parameters(*command.validated_contract_parameters);
 }
 
-/// The per-robot Stop-time values handed with one stage (Q51): no shared
+/// The per-robot Stop-time values handed with one stage: no shared
 /// cell-wide budget.
 [[nodiscard]] inline RemainingStopBudgetDTO remaining_stop_budget(
     const PreparedStopStageCommandDTO& command, const StopId& stop_id,
@@ -2625,10 +2637,10 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 /// The Kernel's own watchdog for one stage: only a controlled stage's, from
 /// the Stop request its controlled deadline plus a normal motion's no-report
-/// bound for a Stop trajectory as long as that deadline (maintainer M6: a
+/// bound for a Stop trajectory as long as that deadline (a
 /// dispatched Stop trajectory finishes like a normal motion,
 /// `controlled_stage_watchdog_ns`). The Kernel arms no watchdog of its own for
-/// a hard stage (Q57) or a gripper cancel (Q58).
+/// a hard stage or a gripper cancel.
 [[nodiscard]] inline std::optional<std::int64_t> stage_watchdog_deadline(
     const RemainingStopBudgetDTO& budget, const std::int64_t now) noexcept {
   if (!budget.remaining_controlled_deadline_ns.has_value()) {
@@ -2849,7 +2861,7 @@ inline bool global_rule_registration_matches(const IoRuleRegistrationDTO& token,
 }
 }  // namespace resource_addressed_kernel_detail
 
-// One installed global rule (CONTRACTS §8). An inactive rule holds no
+// One installed global rule. An inactive rule holds no
 // registration. An active rule watches through its registration; without one
 // (`qualification_error`) it can't watch and gates its scope until a fresh
 // rearm succeeds. A trip is consumed once; the registration is renewed when
@@ -2861,7 +2873,7 @@ struct ResourceAddressedExecutionKernel::GlobalIoRuleRuntime final {
   std::optional<ErrorDTO> qualification_error;
   bool active{};
   bool trip_consumed{};
-  // AUD-6: a `stop`/`hold` trip holds the Program run like the operator's
+  // A `stop`/`hold` trip holds the Program run like the operator's
   // Stop; set at the trip, cleared once the run's hold is issued.
   bool hold_run{};
   // Watched at least once since Load or activation: a missing Program key
@@ -3032,6 +3044,9 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
 struct ResourceAddressedExecutionKernel::EngineSubscription final {
   IResolvedParticipantExecutionEngine* engine{};
   SubscriptionHandle handle{};
+  std::uint64_t sequence_id{};
+  // First registered component for this possibly shared engine.
+  std::string component_id{};
 };
 
 struct ResourceAddressedExecutionKernel::EngineEventIngress final
@@ -3099,10 +3114,10 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
       : owner_(owner), admission_lock_(*owner.admission_mutex_) {}
 
   [[nodiscard]] Result<void> ValidatePrerequisites() const override {
-    // DX583/Q121: inspect actual Kernel facts under the existing admission
+    // Inspect actual Kernel facts under the existing admission
     // lease and a brief state lock. Neither state nor submission spans SQL;
     // Stop remains recognizable, and callers recheck immediately precommit.
-    // The cell latch never blocks Close (R3).
+    // The cell latch never blocks Close.
     std::lock_guard state_lock(owner_.state_mutex_);
     for (const auto& [id, operation] : owner_.active_operations_) {
       if (operation->containment_effect_uncertain())
@@ -3169,7 +3184,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     if (intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
       return reject<RuntimeParticipantExecutionRegistration>(
-          "I6 preview admits one independent participant", "i6_preview_single_participant_only");
+          "preview admits one independent participant", "i6_preview_single_participant_only");
     }
     auto resolved = owner_.resolve_registration(intent, 0U);
     if (!resolved.ok()) {
@@ -3195,6 +3210,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
  public:
   [[nodiscard]] Result<ExecuteRequestDTO> prepare_motion(
       const OperationIntentDTO& intent) override {
+    preview_tcp_capture_.reset();
     auto resolved = resolve_registration(intent);
     if (!resolved.ok()) {
       return Result<ExecuteRequestDTO>::Err(resolved.error());
@@ -3220,6 +3236,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     const OperationId operation_id(prefix);
     const OperationParticipantId participant_id(prefix + ":participant:1");
     const ControllerGoalId controller_goal_id(prefix + ":controller-goal:1");
+    preview_tcp_capture_ = resolved.value().preview_tcp_capture;
     return build_motion_request(
         intent, intent.participants.front(),
         std::get<MotionParticipantIntentDTO>(intent.participants.front().payload),
@@ -3247,7 +3264,9 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
   [[nodiscard]] Result<MotionPreviewResultDTO> preview_motion(
       OperationIntentDTO intent, CollisionWorldLeaseInventory projection_inventory,
       RobotStateDTO start_state, const std::uint32_t planning_attempt_index,
-      const std::stop_token stop_token) override {
+      const std::stop_token stop_token,
+      std::optional<MotionPathPreview>* path_preview) override {
+    if (path_preview != nullptr) path_preview->reset();
     if (!intent.expected_scene_revision.has_value() ||
         *intent.expected_scene_revision !=
             projection_inventory.projection_binding.projection_revision.scene_revision) {
@@ -3259,8 +3278,11 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     if (!prepared.ok()) {
       return Result<MotionPreviewResultDTO>::Err(prepared.error());
     }
-    return motion_.preview_motion(std::move(prepared.value()), std::move(projection_inventory),
-                                  std::move(start_state), planning_attempt_index, stop_token);
+    auto result = motion_.preview_motion(std::move(prepared.value()), std::move(projection_inventory),
+                                         std::move(start_state), planning_attempt_index, stop_token,
+                                         path_preview);
+    if (result.ok()) result.value().resolved_tcp = preview_tcp_capture_;
+    return result;
   }
 
  private:
@@ -3269,6 +3291,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
   RuntimeParticipantPolicySelection primary_participant_policy_;
   IResolvedParticipantExecutionEngine& primary_engine_;
   IMotionPreview& motion_;
+  std::optional<PreviewTcpCapture> preview_tcp_capture_{};
   // This is intentionally retained for the complete multi-leg candidate
   // transaction. The independent control path never takes this mutex.
   std::unique_lock<std::mutex> submission_lock_;

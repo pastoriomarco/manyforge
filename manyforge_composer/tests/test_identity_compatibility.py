@@ -30,6 +30,8 @@ _EXAMPLE = Path(__file__).resolve().parents[2] / "examples/pick_and_place_minima
 
 def _older_minor(version: str) -> str:
     major, minor, _patch = version.split(".")
+    if int(minor) == 0:
+        pytest.skip("the active catalog is the first minor of its major: no older compatible minor exists")
     return f"{major}.{int(minor) - 1}.0"
 
 
@@ -50,19 +52,19 @@ def test_hand_edited_scenario_member_loads_with_edited_outside_warning(
     )
     assert clean == []
 
-    edited = {"component_roles": [], "target_roles": [
-        {"command_target_id": "arm", "target_role_id": "picker"}
-    ]}
-    (target / "assignment.yaml").write_text(json.dumps(edited) + "\n", encoding="utf-8")
+    program_path = target / "program.yaml"
+    edited = json.loads(program_path.read_text(encoding="utf-8"))
+    edited["description"] = "Hand-edited description"
+    program_path.write_text(json.dumps(edited) + "\n", encoding="utf-8")
     document, _, _, diagnostics = capture_scenario_artifact_with_diagnostics(
         str(target), allowed_roots=[str(tmp_path)]
     )
 
-    assert document["program_role_assignment"] == edited
+    assert document["program_draft"]["description"] == "Hand-edited description"
     assert diagnostics == [
         {
             "code": "edited_outside_manyforge",
-            "source_id": "member:assignment.yaml",
+            "source_id": "member:program.yaml",
             "message": "Edited outside ManyForge since the last Save",
         }
     ]

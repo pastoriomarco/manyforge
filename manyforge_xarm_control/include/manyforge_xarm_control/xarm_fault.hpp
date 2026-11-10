@@ -33,7 +33,7 @@ namespace manyforge::xarm_control {
 /// Servo errors C10-C17 need a power cycle; their error is not cleared.
 [[nodiscard]] bool xarm_drive_error(int code) noexcept;
 
-/// The plan's fault catalogue for a controller error code (CONTRACTS §4), as
+/// The plan's fault catalogue for a controller error code, as
 /// the machine owner's fault (its operator action is the owner's Recover):
 /// C1-C3 `fault_estop`, C31 `fault_protective_stop`, C23/C24/C35/C60
 /// `fault_limit_violation`, C22 `fault_self_collision`, C21/C25
@@ -42,7 +42,7 @@ namespace manyforge::xarm_control {
 /// vendor code and text. None for code 0 (no error) or a negative code.
 [[nodiscard]] std::optional<core::Fault> xarm_fault(int code, std::int64_t since_ns);
 
-/// Which part of the machine a controller error concerns (CONTRACTS §4, §16):
+/// Which part of the machine a controller error concerns:
 /// C19 the tool I/O, C33 the controller I/O, the arm's own errors (C10-C17
 /// servo, C21/C25 motion, C22 self-collision, C23/C24/C35/C60 limits, C31
 /// collision) the arm, anything else (e-stops C1-C3 included) every member.
@@ -51,7 +51,7 @@ enum class XArmFaultScope : std::uint8_t { kMachine, kArm, kControllerIo, kToolI
 
 /// A mode or state change from outside ManyForge (UFactory Studio, the
 /// pendant) while ManyForge has the arm armed: the machine owner's
-/// `fault_external_control` (CONTRACTS §16, operator action `recover`); the
+/// `fault_external_control` (operator action `recover`); the
 /// owner's Recover releases the arm and its Enable takes control back.
 [[nodiscard]] core::Fault xarm_external_control_fault(int mode, int state,
                                                       std::int64_t since_ns);

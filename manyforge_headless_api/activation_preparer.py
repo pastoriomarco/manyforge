@@ -27,8 +27,9 @@ from manyforge_behavior.model_source_preparation import (
     prepare_captured_model_source,
 )
 from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import Program, ProgramFormatUnsupported, ProgramValidationError, require_program_format
 
+from manyforge_behavior.reference_validation import validate_reference_refusal
 from .native import (
     HeadlessApiError,
     MAX_ACTIVATION_PREPARATION_REQUEST_BYTES,
@@ -73,8 +74,9 @@ _MODEL_FREE_PROFILES = {
     "pose_source_v0": "pose_source",
     "ai_model_v0": "ai_model",
 }
-# A machine (owner) or a model-form I/O member model (the description's
-# `component_models`): its rows carry no model source and no runtime_kind.
+# A machine (owner), a model-form I/O member model or a lane-free adapter
+# component model (a sensor, the assistant) (the description's
+# `component_models`): its rows carry no model source.
 _COMPONENT_MODEL = object()
 
 
@@ -230,6 +232,62 @@ def _preparer_cause(output: bytes) -> dict[str, str]:
     if isinstance(code, str) and code:
         return {"cause_code": code}
     return {}
+
+
+def _reference_refusal(output: bytes, *, allow_empty: bool = False) -> dict[str, Any] | None:
+    """Accept the native validator's bounded structured refusal only."""
+
+    try:
+        value = json.loads(output.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "code", "diagnostics", "total_count", "truncated"
+    } or value["code"] != "program_reference_validation_failed":
+        return None
+    return validate_reference_refusal(
+        {key: value[key] for key in ("diagnostics", "total_count", "truncated")},
+        allow_empty=allow_empty,
+    )
+
+
+def _format_refusal(output: bytes) -> dict[str, str] | None:
+    try:
+        value = json.loads(output.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"code", "details"}
+            or value["code"] != "program_format_unsupported"):
+        return None
+    details = value["details"]
+    if (not isinstance(details, dict)
+            or set(details) != {"actual_api_version", "supported_api_version"}
+            or any(not isinstance(v, str) for v in details.values())):
+        return None
+    return details
+
+
+def _validate_raw_reference_program(program: Mapping[str, Any], draft: bool) -> None:
+    if draft:
+        from manyforge_behavior.authoring_forest import AuthoringForestError, derive_candidate
+
+        try:
+            require_program_format(program, supported_api_version="manyforge.program.v3")
+            derive_candidate(dict(program), _program_catalog())
+        except ProgramFormatUnsupported as error:
+            raise HeadlessApiError(error.code, str(error), details=error.details) from error
+        except AuthoringForestError as error:
+            raise HeadlessApiError(
+                "activation_preparation_failed", "Draft Program validation failed",
+                details={"preparer_detail": str(error)[:4096]},
+            ) from error
+        return
+    try:
+        Program.from_dict(dict(program), _program_catalog(), path="<reference-validation-program>")
+    except ProgramFormatUnsupported as error:
+        raise HeadlessApiError(error.code, str(error), details=error.details) from error
+    except (ProgramValidationError, TypeError, ValueError) as error:
+        raise HeadlessApiError("activation_preparation_failed", "Program validation failed", details={"preparer_detail": str(error)[:4096]}) from error
 
 
 def _read_stored_prepared_activation(
@@ -394,7 +452,8 @@ def _prepare_model_closure(
                 )
             seen_components.add(component_id)
             if profile is _COMPONENT_MODEL:
-                # A machine owner or a model-form I/O member: no model.
+                # A machine owner, a model-form I/O member, a sensor or the
+                # assistant: no model.
                 if "model_source" in component or source is not None:
                     raise HeadlessApiError(
                         "activation_model_profile_invalid",
@@ -475,6 +534,95 @@ class ActivationPreparer:
         self._publish_canonical_empty = publish_canonical_empty
         self._lock = threading.Lock()
         self._prepared: dict[str, dict[str, Any]] = {}
+        # Reference validation's prepared candidate, capacity one, keyed on the
+        # Deployment and model-source digests: a Draft edit changes only the
+        # Program, so the candidate is reused. Leaf lock: guards the slot only.
+        self._candidate_lock = threading.Lock()
+        self._candidate: tuple[tuple[str, str], Any] | None = None
+
+    def validate_program_references(
+        self, *, deployment: Mapping[str, Any], model_source_closure: Mapping[str, Any] | None = None,
+        model_source_closure_digest: str | None = None,
+        program: Mapping[str, Any], program_content_digest: str, draft: bool,
+    ) -> dict[str, Any]:
+        """Build and validate one detached candidate without publication or admission.
+
+        Exactly one of ``model_source_closure`` and ``model_source_closure_digest``
+        is given. A digest names the closure of the held candidate; a digest the
+        candidate slot does not hold is refused with ``model_sources_unknown``.
+        """
+        try:
+            require_program_format(program, supported_api_version="manyforge.program.v3")
+        except ProgramFormatUnsupported as error:
+            raise HeadlessApiError(error.code, str(error), details=error.details) from error
+        try:
+            program_bytes = rfc8785.dumps(dict(program))
+            deployment_bytes = rfc8785.dumps(dict(deployment))
+            source_bytes = b"" if model_source_closure is None else rfc8785.dumps(dict(model_source_closure))
+        except (TypeError, ValueError) as error:
+            raise HeadlessApiError("activation_preparation_failed", "Candidate input is invalid") from error
+        if (len(program_bytes) + len(deployment_bytes) + len(source_bytes)
+                > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES):
+            raise HeadlessApiError("activation_preparation_request_oversized", "Candidate input exceeds its bound")
+        if "sha256:" + hashlib.sha256(program_bytes).hexdigest() != program_content_digest:
+            raise HeadlessApiError("activation_preparation_failed", "Program content digest does not match")
+        # Apply admits a strict Program after canonical transport. Draft forest
+        # preflight instead uses its existing incomplete-authoring input form.
+        _validate_raw_reference_program(program if draft else json.loads(program_bytes), draft)
+        try:
+            import manyforge_core_py  # type: ignore[import-not-found]
+        except ImportError as error:
+            raise HeadlessApiError("activation_preparer_unavailable", "Reference validation is unavailable") from error
+        source_digest = (model_source_closure_digest if model_source_closure is None
+                         else "sha256:" + hashlib.sha256(source_bytes).hexdigest())
+        key = ("sha256:" + hashlib.sha256(deployment_bytes).hexdigest(), source_digest)
+        with self._candidate_lock:
+            candidate = self._candidate[1] if self._candidate and self._candidate[0] == key else None
+        if candidate is None and model_source_closure is None:
+            raise HeadlessApiError("model_sources_unknown", "The model-source closure digest names no prepared candidate")
+        try:
+            if candidate is None:
+                prepared = _prepare_model_closure(
+                    deployment=deployment, model_source_closure=model_source_closure,
+                    profiles=self._profiles,
+                )
+                prepared_bytes = rfc8785.dumps(prepared)
+                if (len(program_bytes) + len(deployment_bytes) + len(source_bytes) + len(prepared_bytes)
+                        > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES):
+                    raise HeadlessApiError("activation_preparation_request_oversized", "Candidate input exceeds its bound")
+                candidate = manyforge_core_py.prepare_activation_candidate(
+                    str(self._capability_root), deployment_bytes.decode(), source_bytes.decode(),
+                    prepared_bytes.decode(), self._runtime_cell_id,
+                )
+                with self._candidate_lock:
+                    self._candidate = (key, candidate)
+            encoded = candidate.validate_program_references(program_bytes.decode(), draft)
+            selector_encoded = candidate.selector_facts_json()
+        except manyforge_core_py.PreparedActivationCandidateError as error:
+            raise HeadlessApiError("activation_preparation_failed", "Candidate materialization failed", details={"preparer_detail": str(error)[:4096]}) from error
+        except manyforge_core_py.ProgramContractError as error:
+            code = getattr(error, "code", None)
+            details = getattr(error, "details", None)
+            if code == "program_format_unsupported" and isinstance(details, dict):
+                raise HeadlessApiError(code, "Program validation failed", details=details) from error
+            raise HeadlessApiError("activation_preparation_failed", "Program validation failed", details={"preparer_detail": str(error)[:4096]}) from error
+        except manyforge_core_py.ProgramReferenceValidationIncomplete as error:
+            raise HeadlessApiError("activation_preparer_unavailable", "Reference validation is unavailable") from error
+        if not isinstance(encoded, str) or len(encoded.encode("utf-8")) > _MAXIMUM_COMPILER_OUTPUT_BYTES:
+            raise HeadlessApiError("activation_preparer_response_invalid", "Reference validation returned an invalid response")
+        result = _reference_refusal(encoded.encode("utf-8"), allow_empty=True)
+        if result is None:
+            raise HeadlessApiError("activation_preparer_response_invalid", "Reference validation returned an invalid response")
+        if not isinstance(selector_encoded, str):
+            raise HeadlessApiError("activation_preparer_response_invalid", "Candidate selectors are invalid")
+        try:
+            selector = json.loads(selector_encoded)
+        except (TypeError, ValueError) as error:
+            raise HeadlessApiError("activation_preparer_response_invalid", "Candidate selectors are invalid") from error
+        if not isinstance(selector, dict) or set(selector) != {"components", "targets", "signals", "frames", "bodies", "rules"} or any(not isinstance(value, list) for value in selector.values()):
+            raise HeadlessApiError("activation_preparer_response_invalid", "Candidate selectors are invalid")
+        result["selector_facts"] = selector
+        return result
 
     def prepared_value(self, prepared_activation_id: str) -> dict[str, Any] | None:
         """Return the capacity-one immutable activation receipt."""
@@ -499,7 +647,6 @@ class ActivationPreparer:
         deployment: Mapping[str, Any],
         model_source_closure: Mapping[str, Any],
         program: Mapping[str, Any] | None,
-        program_role_assignment: Mapping[str, Any],
     ) -> dict[str, Any]:
         origin = {"kind": "scenario", "scenario_id": scenario_id,
                   "source_document_digest": source_document_digest,
@@ -511,7 +658,7 @@ class ActivationPreparer:
                 profiles=self._profiles,
             )
             return {
-                "schema_version": "manyforge.activation_preparation_request.v3",
+                "schema_version": "manyforge.activation_preparation_request.v4",
                 "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
                 "scenario_id": scenario_id,
@@ -521,7 +668,6 @@ class ActivationPreparer:
                 "model_source_closure": dict(model_source_closure),
                 "prepared_model_closure": prepared_model_closure,
                 "program": dict(program) if program is not None else None,
-                "program_role_assignment": dict(program_role_assignment),
             }
 
         return self._prepare(request_value, origin, captured_input_digest)
@@ -538,6 +684,17 @@ class ActivationPreparer:
         input_path: Path | None = None
         try:
             request = request_value()
+            captured_program = request["program"]
+            if captured_program is not None:
+                try:
+                    require_program_format(captured_program, supported_api_version="manyforge.program.v3")
+                except ProgramFormatUnsupported as error:
+                    raise HeadlessApiError(error.code, str(error), details=error.details) from error
+            _require_admitted_program({
+                "program_id": captured_program.get("program_id") if captured_program is not None else None,
+                "program_revision": captured_program.get("program_revision") if captured_program is not None else None,
+                "activation_payload": {"program": captured_program},
+            })
             encoded = rfc8785.dumps(request)
             if len(encoded) > MAX_ACTIVATION_PREPARATION_REQUEST_BYTES:
                 raise HeadlessApiError(
@@ -595,6 +752,19 @@ class ActivationPreparer:
                 output = stdout.read()
                 detail = stderr.read().decode("utf-8", errors="replace").strip()
             if completed.returncode != 0:
+                format_refusal = _format_refusal(output)
+                if format_refusal is not None:
+                    raise HeadlessApiError(
+                        "program_format_unsupported", "Program format is unsupported",
+                        details=format_refusal,
+                    )
+                reference_refusal = _reference_refusal(output)
+                if reference_refusal is not None:
+                    raise HeadlessApiError(
+                        "program_reference_validation_failed",
+                        "Program references are invalid for the candidate Deployment",
+                        details=reference_refusal,
+                    )
                 logging.getLogger(__name__).error(
                     "Activation preparation failed: runtime=%s origin_kind=%s origin_id=%s input=%s detail=%s",
                     self._runtime_cell_id,
@@ -622,7 +792,7 @@ class ActivationPreparer:
                 not isinstance(receipt, dict)
                 or set(receipt) != _RECEIPT_FIELDS
                 or receipt.get("schema_version")
-                != "manyforge.prepared_activation_input.v6"
+                != "manyforge.prepared_activation_input.v7"
                 or receipt.get("origin") != origin
                 or receipt.get("captured_input_digest") != captured_input_digest
                 or not isinstance(receipt.get("prepared_activation_id"), str)
@@ -637,7 +807,11 @@ class ActivationPreparer:
                     self._activation_root, receipt["prepared_activation_id"]
                 ),
             )
-            _require_admitted_program(value)
+            if value["activation_payload"].get("program") != captured_program:
+                raise HeadlessApiError(
+                    "activation_preparer_response_invalid",
+                    "Activation preparer returned a divergent Program",
+                )
             self._prepared = {receipt["prepared_activation_id"]: receipt}
             return deepcopy(receipt)
         finally:

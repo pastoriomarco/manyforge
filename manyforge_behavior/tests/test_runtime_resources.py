@@ -2,8 +2,8 @@
 
 The historical factory lookup, partial-open rollback, duplicate-handle close,
 alias fallback, and post-close rejection cases at commit
-``08222188293df8e12f90dc72e204c21f22f92ea1`` map to I5/H0 implementation
-availability and I6/N resource-addressed native binding.  Exact lifecycle and
+``08222188293df8e12f90dc72e204c21f22f92ea1`` map to headless implementation
+availability and resource-addressed native binding.  Exact lifecycle and
 partial-failure behavior is requalified at the component Manager/Kernel owner;
 the deployment-owned Python registry never returns.
 """
@@ -15,7 +15,6 @@ from collections.abc import Callable
 import pytest
 
 from manyforge_behavior.runtime_resources import (
-    RUNTIME_RESOURCE_BINDING_RESTORATION_GATES,
     RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE,
     RuntimeResourceBindingUnavailableError,
     RuntimeResourceFactoryRegistry,
@@ -57,12 +56,5 @@ def test_runtime_resource_entrypoints_gate_before_input_or_effects(
 
     message = str(raised.value)
     assert RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE in message
-    assert "H0 provides read-only implementation availability" in message
-    assert "I6/N" in message
-
-
-def test_runtime_resource_gate_names_exact_restoration_order() -> None:
-    assert RUNTIME_RESOURCE_BINDING_RESTORATION_GATES == (
-        "I6",
-        "N",
-    )
+    assert "the headless owner provides read-only implementation availability" in message
+    assert "not available" in message

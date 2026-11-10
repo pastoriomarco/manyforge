@@ -93,7 +93,7 @@ struct RouteEndpointProjectionDTO {
                          const RouteEndpointProjectionDTO&) = default;
 };
 
-/// Route-specific retained qualification for ADR-0018 runtime scaling.
+/// Route-specific retained qualification for runtime scaling.
 /// Absence means unsupported. Endpoint roles must belong to the named route's
 /// exact command/state projections; no runtime adapter may infer support from
 /// provider brand or implementation type.

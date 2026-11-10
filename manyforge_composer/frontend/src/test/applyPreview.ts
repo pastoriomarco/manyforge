@@ -1,6 +1,6 @@
 import type { ApplyPreview } from '../types/components';
 
-/** A Preview (CONTRACTS §11) with these component rows and nothing else changing. */
+/** A Preview with these component rows and nothing else changing. */
 export function applyPreviewFixture(
   components: ApplyPreview['components'],
   extra: Partial<Omit<ApplyPreview, 'components'>> = {},

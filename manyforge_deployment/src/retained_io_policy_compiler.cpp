@@ -64,10 +64,10 @@ group_subjects(const std::vector<std::string> &groups,
       if (!effect.effectful ||
           effect.capability_id.value() != "execution.trajectory.execute")
         continue;
-      const auto &targets = binding.value().target_role_bindings;
+      const auto &targets = binding.value().target_bindings;
       const auto target =
           std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
-            return row.target_role_id == effect.target_role_id;
+            return row.target == effect.target;
           });
       if (target == targets.end())
         throw std::invalid_argument("global_interrupt_group_unbound");
@@ -90,8 +90,8 @@ group_subjects(const std::vector<std::string> &groups,
           });
       if (control == controls.end() ||
           control->controllable_component_id !=
-              target->controllable_component_id ||
-          control->command_target_id != target->command_target_id)
+              target->target.component_id ||
+          control->command_target_id != target->target.command_target_id)
         throw std::invalid_argument("global_interrupt_group_unbound");
       subjects.insert({control->controllable_component_id,
                        control->command_target_id, control->control_domain_id,
@@ -197,7 +197,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
             binding->program_binding_id(), groups,
             group_subjects(groups, *program, *binding, retained_bundle, rule_id)};
       }
-      // CONTRACTS §8, sealed by the retained codec: on_trip and
+      // Sealed by the retained codec: on_trip and
       // active_at_start are always present, after_stop exactly with stop.
       const bool stop = member(rule, "on_trip").as_string() == "stop";
       const auto *after_stop = rule.find_object_member("after_stop");

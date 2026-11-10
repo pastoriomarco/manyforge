@@ -1,6 +1,6 @@
 """Single transport-neutral execution-control semantic adapter.
 
-This module translates the generated UI6-F envelope into the existing strict
+This module translates the generated control envelope into the existing strict
 owner requests. It contains no lifecycle state machine: Program-scoped
 eligibility comes from Program Runner's current ``allowed_commands``
 projection, standalone operation eligibility remains with the native owner,
@@ -101,8 +101,8 @@ class HeadlessExecutionControlDispatch:
             or identity.get("owner_epoch")
             != request.payload.get(_EXPECTED_EXECUTION_OWNER_FIELD)
             or not isinstance(state, Mapping)
-            # H1a-IF.2: one component-based version, no legacy fallback.
-            or state.get("schema_version") != "manyforge.execution_control_state.v6"
+            # One component-based version, no legacy fallback.
+            or state.get("schema_version") != "manyforge.execution_control_state.v7"
             or request.payload.get("execution_scope") is not None
         ):
             return "manual_operation_scope_stale"

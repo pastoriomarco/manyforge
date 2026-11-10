@@ -956,9 +956,11 @@ TEST(ComponentManagerPortContracts, FenceScopeAndActiveConfigurationsAreCanonica
       ControlDomainId{"domain.other"};
   EXPECT_FALSE(intent.valid());
 
+  // A controller-predecessor domain with no reconciled active configuration
+  // (never Enabled, or Disabled) pins no row; a foreign row still refuses.
   intent = FenceIntent();
   intent.expected_active_control_configurations.clear();
-  EXPECT_FALSE(intent.valid());
+  EXPECT_TRUE(intent.valid());
 
   intent = FenceIntent();
   intent.scope.domains = {
@@ -1004,8 +1006,9 @@ TEST(ComponentManagerPortContracts,
   EXPECT_TRUE(snapshot.presence_valid());
   EXPECT_TRUE(snapshot.matches(query));
 
+  // No reconciled configuration for the domain: no row, still valid.
   snapshot.active_control_configurations.clear();
-  EXPECT_FALSE(snapshot.presence_valid());
+  EXPECT_TRUE(snapshot.presence_valid());
 
   snapshot = FenceAdmissionSnapshot();
   snapshot.active_control_configurations.front().control_domain_id =

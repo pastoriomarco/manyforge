@@ -1,5 +1,5 @@
-// Qualification micro-benchmark for the kernel event emit-path additions
-// (observability plan OW1/OW3): the dispatch-order sequence assignment plus
+// Qualification micro-benchmark for the kernel event emit-path additions:
+// the dispatch-order sequence assignment plus
 // the flight-recorder ring copy must stay within budget on the emit path.
 //
 // Emits one MANYFORGE_QUALIFICATION_EVIDENCE JSON line. Budgets via env:

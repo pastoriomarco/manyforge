@@ -84,6 +84,8 @@ class MockPlanner : public IPlannerBackend {
   PlanResultDTO next_result;
   std::vector<PlanResultDTO> result_sequence;
   std::function<void(int)> on_plan;
+  std::optional<IkResultDTO> next_ik_result;
+  std::optional<IkRequestDTO> last_ik_request;
   int plan_count = 0;
   int cancel_count = 0;
   PlanRequestDTO last_request = testing::make_test_plan_request(
@@ -122,6 +124,10 @@ class MockPlanner : public IPlannerBackend {
   }
 
   void request_cancel() override { ++cancel_count; }
+  IkResultDTO solve_ik(const IkRequestDTO& request) override {
+    last_ik_request = request;
+    return next_ik_result.value_or(IkResultDTO{});
+  }
 };
 
 class SlowMockPlanner : public IPlannerBackend {
@@ -521,9 +527,6 @@ class MockFocusedPorts final : public IObservedRobotStateProvider,
     gripper_admission_blocked.store(false, std::memory_order_release);
   }
 
-  operator ExecutionKernelPorts() {
-    return ExecutionKernelPorts{*this, *this, *this, *this, *this, this};
-  }
 };
 
 class MockPlanningSceneSynchronizer final : public IPlanningSceneSynchronizer {
@@ -693,22 +696,84 @@ class FakeCollisionApplyFenceAdmissionGate final : public IResourceOperationAdmi
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
 };
 
+class BlockingCollisionApplyFenceAdmissionGate final : public IResourceOperationAdmissionGate {
+ public:
+  BlockingCollisionApplyFenceAdmissionGate(ConfigurationFenceId fence_id,
+                                           ConfigurationFenceScopeDTO scope)
+      : fence_id_(std::move(fence_id)),
+        scope_(std::move(scope)),
+        verification_entered_future_(verification_entered_.get_future()),
+        release_verification_future_(release_verification_.get_future().share()) {}
+
+  std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override {
+    return admission_mutex_;
+  }
+
+  Result<void> reserve(ResourceSlotTable&, const ResourceSlotOwnerDTO&,
+                       const std::vector<ResourceId>&) override {
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "test gate does not admit operations",
+                                      {}});
+  }
+
+  Result<void> reserve_batch(ResourceSlotTable&,
+                             const std::vector<ResourceSlotReservationOwnerDTO>&) override {
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "test gate does not admit operations",
+                                      {}});
+  }
+
+  std::vector<ResourceId> current_fenced_resources(const std::vector<ResourceId>&) const override {
+    return {};
+  }
+
+  bool exact_fence_covers(const ConfigurationFenceId&,
+                          const std::vector<ResourceId>&) const override {
+    return false;
+  }
+
+  bool exact_fence_is_held(const ConfigurationFenceId& fence_id,
+                           const ConfigurationFenceScopeDTO& scope) const override {
+    verification_entered_.set_value();
+    release_verification_future_.wait();
+    return fence_id == fence_id_ && scope == scope_;
+  }
+
+  bool wait_until_verification_entered(std::chrono::milliseconds timeout) {
+    return verification_entered_future_.wait_for(timeout) == std::future_status::ready;
+  }
+
+  void release_verification() { release_verification_.set_value(); }
+
+ private:
+  ConfigurationFenceId fence_id_;
+  ConfigurationFenceScopeDTO scope_;
+  std::shared_ptr<std::recursive_mutex> admission_mutex_ = std::make_shared<std::recursive_mutex>();
+  mutable std::promise<void> verification_entered_;
+  std::future<void> verification_entered_future_;
+  std::promise<void> release_verification_;
+  std::shared_future<void> release_verification_future_;
+};
+
 ConfigurationFenceScopeDTO make_collision_apply_fence_scope(
     std::string resource_id = "resource:collision-apply") {
   ConfigurationFenceScopeDTO scope;
   scope.controllable_component_ids = {ControllableComponentId{"component:collision-apply"}};
-  scope.domains = {ConfigurationFenceDomainScopeDTO{
-      ControlDomainId{"domain:collision-apply"}, std::nullopt,
-      ControlDomainRevision{"revision:candidate"}}};
-  scope.bindings = {ConfigurationFenceBindingScopeDTO{
-      ControlBindingId{"binding:collision-apply"}, std::nullopt,
-      ControlBindingRevision{"revision:candidate"}}};
+  scope.domains = {ConfigurationFenceDomainScopeDTO{ControlDomainId{"domain:collision-apply"},
+                                                    std::nullopt,
+                                                    ControlDomainRevision{"revision:candidate"}}};
+  scope.bindings = {
+      ConfigurationFenceBindingScopeDTO{ControlBindingId{"binding:collision-apply"}, std::nullopt,
+                                        ControlBindingRevision{"revision:candidate"}}};
   scope.resources = {ResourceId{std::move(resource_id)}};
   return scope;
 }
 
 class MockCollisionEngine final : public ICollisionQueryEngine {
  public:
+  void set_diagnostic_enumeration_complete(bool value) {
+    capability_.diagnostic_reports_all_collision_pairs = value;
+  }
   CollisionResult default_result;
   std::map<std::int64_t, CollisionResult> result_by_waypoint;
   std::vector<CollisionResult> result_sequence;
@@ -744,6 +809,7 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
         CollisionDistanceRequestMode::kAllCollidingPairs,
         CollisionDistanceRequestMode::kAllActivePairs};
     capability_.supports_penetration_depth = true;
+    capability_.diagnostic_reports_all_collision_pairs = true;
     capability_.thread_safety = CollisionEngineThreadSafetyClass::kSingleContextExclusive;
     capability_.mutable_context_id =
         "mock_collision_engine:" + std::to_string(reinterpret_cast<std::uintptr_t>(this));
@@ -978,6 +1044,12 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
  private:
   CollisionEngineCapabilityDescriptor capability_;
 };
+
+ExecutionKernelPorts test_execution_kernel_ports(
+    const std::shared_ptr<MockFocusedPorts>& ports,
+    std::shared_ptr<IPlanningSceneSynchronizer> scene_synchronizer = {}) {
+  return {ports, ports, ports, ports, ports, ports, std::move(scene_synchronizer)};
+}
 
 ParticipantStopStageResultDTO unsupported_stop_stage(const ResolvedParticipantStopStageDTO& stage) {
   const ErrorDTO error{
@@ -1227,7 +1299,7 @@ class ControlledExecution : public IExecutionBackend {
   }
 
   std::atomic<int> retire_count{0};
-  // Number of retirements to refuse as still winding down (item 12).
+  // Number of retirements to refuse as still winding down.
   std::atomic<int> retire_not_quiescent_refusals{0};
   Result<void> RetirePreparedExecution(std::uint64_t) override {
     ++retire_count;
@@ -1754,6 +1826,7 @@ class ThreadSafeManualScheduler final : public IScheduler {
     ScheduleHandle handle = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
+      ++schedule_calls_;
       handle = next_handle_++;
       pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
     }
@@ -1763,6 +1836,12 @@ class ThreadSafeManualScheduler final : public IScheduler {
 
   void cancel(ScheduleHandle handle) override {
     std::lock_guard<std::mutex> lock(mu_);
+    if (fail_next_cancel_) {
+      fail_next_cancel_ = false;
+      failed_cancel_handle_ = handle;
+      throw std::runtime_error("injected scheduler cancel failure");
+    }
+    last_cancelled_handle_ = handle;
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
       if (it->second.first == handle) {
         pending_.erase(it);
@@ -1790,9 +1869,23 @@ class ThreadSafeManualScheduler final : public IScheduler {
     }
   }
 
+  void fail_next_cancel() {
+    std::lock_guard<std::mutex> lock(mu_);
+    fail_next_cancel_ = true;
+  }
+  std::pair<ScheduleHandle, ScheduleHandle> cancel_test_handles() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return {failed_cancel_handle_, last_cancelled_handle_};
+  }
+
   size_t pending_count() const {
     std::lock_guard<std::mutex> lock(mu_);
     return pending_.size();
+  }
+
+  size_t schedule_call_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return schedule_calls_;
   }
 
   bool wait_for_pending_deadline(TimePoint deadline,
@@ -1806,6 +1899,10 @@ class ThreadSafeManualScheduler final : public IScheduler {
   std::condition_variable pending_changed_;
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
   uint64_t next_handle_ = 1;
+  std::size_t schedule_calls_ = 0;
+  bool fail_next_cancel_{false};
+  ScheduleHandle failed_cancel_handle_{0U};
+  ScheduleHandle last_cancelled_handle_{0U};
 };
 
 class ThreadSafeFakeClock final : public IClock {
@@ -2111,7 +2208,7 @@ CollisionResult make_authoritative_collision_result() {
   return result;
 }
 
-// M6 clearance fixtures: one robot link plus scene obstacles, and a mock
+// Clearance fixtures: one robot link plus scene obstacles, and a mock
 // engine answer for one pair at a signed distance that honours the query's
 // clearance margin like ManyForgeCollisionEngine.
 const CollisionBodyId kClearanceTestLink = "component/arm/model/arm_model/body/link1/collision/0";
@@ -2419,19 +2516,118 @@ class ValidationOutcomeRecorder {
 [[nodiscard]] Result<std::uint64_t> prepare_and_dispatch(ExecutionKernel& kernel,
                                                          ExecuteRequestDTO request);
 
+TEST(ExecutionKernelDetachTest, RetainedEngineOutlivesSchedulerAndRefusesSchedulerUse) {
+  auto clock_owner = std::make_shared<FakeClock>();
+  auto scheduler = std::make_unique<ManualScheduler>();
+  auto planner_owner = std::make_shared<MockPlanner>();
+  auto context_owner = std::make_shared<MockFocusedPorts>();
+  auto execution_owner = std::make_shared<MockExecution>();
+  auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto kernel =
+      std::make_shared<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
+                                        execution_owner, clock_owner, *scheduler, cache_owner);
+  ASSERT_TRUE(kernel->detach(std::chrono::steady_clock::now() + std::chrono::seconds(1)).ok());
+  scheduler.reset();
+  const auto refused = kernel->CancelPreparedMotion(1U);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "scheduler_not_ready");
+  kernel->NotifyOwnerRebuilt();
+  EXPECT_TRUE(kernel->detach(std::chrono::steady_clock::now() + std::chrono::seconds(1)).ok());
+  kernel.reset();
+}
+
+TEST(ExecutionKernelDetachTest,
+     WeakUpgradedDetachedEngineRetainsClockAndDoesNotRescheduleOnRebuild) {
+  auto clock_owner = std::make_shared<FakeClock>();
+  std::weak_ptr<IClock> clock_lifetime = clock_owner;
+  ThreadSafeManualScheduler scheduler;
+  auto planner_owner = std::make_shared<MockPlanner>();
+  auto context_owner = std::make_shared<MockFocusedPorts>();
+  auto execution_owner = std::make_shared<MockExecution>();
+  auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto engine =
+      std::make_shared<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
+                                        execution_owner, clock_owner, scheduler, cache_owner);
+  ASSERT_TRUE(engine->detach(std::chrono::steady_clock::now() + std::chrono::seconds(1)).ok());
+
+  std::weak_ptr<ExecutionKernel> weak_engine = engine;
+  auto upgraded_engine = weak_engine.lock();
+  ASSERT_NE(upgraded_engine, nullptr);
+  engine.reset();
+  clock_owner.reset();
+  EXPECT_FALSE(clock_lifetime.expired());
+
+  const auto scheduled_before_rebuild = scheduler.schedule_call_count();
+  upgraded_engine->NotifyOwnerRebuilt();
+  EXPECT_EQ(scheduler.schedule_call_count(), scheduled_before_rebuild);
+
+  upgraded_engine.reset();
+  EXPECT_TRUE(weak_engine.expired());
+  EXPECT_TRUE(clock_lifetime.expired());
+}
+
+TEST(ExecutionKernelDetachTest, AdmissionDeadlineKeepsInFlightSchedulerCallAlive) {
+  class BlockingScheduler final : public IScheduler {
+   public:
+    ManualScheduler inner;
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> release_future{release.get_future().share()};
+    ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                            SchedulerPriority priority) override {
+      entered.set_value();
+      release_future.wait();
+      return inner.schedule(deadline, std::move(callback), priority);
+    }
+    void cancel(ScheduleHandle handle) override { inner.cancel(handle); }
+  } scheduler;
+  auto clock_owner = std::make_shared<FakeClock>();
+  auto planner_owner = std::make_shared<MockPlanner>();
+  auto context_owner = std::make_shared<MockFocusedPorts>();
+  auto execution_owner = std::make_shared<MockExecution>();
+  auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto kernel =
+      std::make_shared<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
+                                        execution_owner, clock_owner, scheduler, cache_owner);
+  auto entered = scheduler.entered.get_future();
+  std::thread caller([&] { kernel->NotifyOwnerRebuilt(); });
+  const auto entered_status = entered.wait_for(std::chrono::seconds(1));
+  if (entered_status != std::future_status::ready) {
+    scheduler.release.set_value();
+    caller.join();
+    FAIL() << "scheduler call was not entered";
+  }
+  const auto timed_out = kernel->detach(std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+  EXPECT_FALSE(timed_out.ok());
+  EXPECT_EQ(timed_out.error().details.at("reason"), "scheduler_detach_timeout");
+  scheduler.release.set_value();
+  caller.join();
+  EXPECT_TRUE(kernel->detach(std::chrono::steady_clock::now() + std::chrono::seconds(1)).ok());
+}
+
 class ExecutionKernelTest : public ::testing::Test {
  protected:
-  FakeClock clock;
+  std::shared_ptr<FakeClock> clock_owner = std::make_shared<FakeClock>();
+  FakeClock& clock = *clock_owner;
   ManualScheduler scheduler;
-  MockPlanner planner;
-  MockFocusedPorts context;
-  MockExecution execution;
-  TrajectoryCache cache{CacheConfig{10}};
-  MockCollisionWorldPublisher collision_world_publisher;
+  std::shared_ptr<MockPlanner> planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& planner = *planner_owner;
+  std::shared_ptr<MockFocusedPorts> context_owner = std::make_shared<MockFocusedPorts>();
+  MockFocusedPorts& context = *context_owner;
+  std::shared_ptr<MockExecution> execution_owner = std::make_shared<MockExecution>();
+  MockExecution& execution = *execution_owner;
+  std::shared_ptr<TrajectoryCache> cache_owner =
+      std::make_shared<TrajectoryCache>(CacheConfig{10});
+  TrajectoryCache& cache = *cache_owner;
+  std::shared_ptr<MockCollisionWorldPublisher> collision_world_publisher_owner =
+      std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& collision_world_publisher = *collision_world_publisher_owner;
   std::shared_ptr<MockCollisionEngine> collision_runtime_engine =
       std::make_shared<MockCollisionEngine>();
   std::shared_ptr<MockCollisionEngine> collision_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel kernel{planner, context, execution, clock, scheduler, cache};
+  ExecutionKernel kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                         execution_owner, clock_owner,
+                         scheduler,       cache_owner};
 
   void SetUp() override {
     PlanResultDTO plan_ok;
@@ -2451,7 +2647,7 @@ class ExecutionKernelTest : public ::testing::Test {
     collision_runtime_engine = std::make_shared<MockCollisionEngine>();
     collision_engine = std::make_shared<MockCollisionEngine>();
     kernel.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-    kernel.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+    kernel.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                    {collision_engine});
   }
 
@@ -2542,24 +2738,24 @@ class ExecutionKernelTest : public ::testing::Test {
   }
 
   void configure_authoritative_collision_validation(
-      ExecutionKernel& target_kernel, MockCollisionWorldPublisher& publisher,
+      ExecutionKernel& target_kernel, const std::shared_ptr<MockCollisionWorldPublisher>& publisher,
       const std::shared_ptr<MockCollisionEngine>& engine) {
-    publisher.current_snapshot =
+    publisher->current_snapshot =
         std::make_shared<const CollisionWorldSnapshot>(make_test_collision_world_snapshot());
-    publisher.current_policy = make_test_collision_policy_snapshot();
+    publisher->current_policy = make_test_collision_policy_snapshot();
     target_kernel.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
     target_kernel.set_collision_resources(publisher, std::make_shared<MockCollisionEngine>(),
                                           {engine});
   }
 
   void configure_runtime_collision_monitoring(
-      ExecutionKernel& target_kernel, MockCollisionWorldPublisher& publisher,
+      ExecutionKernel& target_kernel, const std::shared_ptr<MockCollisionWorldPublisher>& publisher,
       const std::shared_ptr<MockCollisionEngine>& validation_engine,
       const std::shared_ptr<MockCollisionEngine>& runtime_engine,
       std::vector<std::shared_ptr<ICollisionQueryEngine>> lookahead_engines = {}) {
-    publisher.current_snapshot =
+    publisher->current_snapshot =
         std::make_shared<const CollisionWorldSnapshot>(make_test_collision_world_snapshot());
-    publisher.current_policy = make_test_collision_policy_snapshot();
+    publisher->current_policy = make_test_collision_policy_snapshot();
     target_kernel.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
     target_kernel.set_collision_resources(publisher, runtime_engine, {validation_engine},
                                           std::move(lookahead_engines));
@@ -2624,11 +2820,56 @@ TEST_F(ExecutionKernelTest, CollisionResourcesReplaceOnlyUnderExactApplyFenceAnd
   EXPECT_EQ(kernel.collision_resource_set_readback().value(), installed.value());
 }
 
-TEST_F(ExecutionKernelTest, CollisionResourcesReadbackRequiresKernelOwnedPublisher) {
+TEST_F(ExecutionKernelTest, CollisionResourceReplacementParkedAtFenceRechecksAfterDetach) {
+  const ConfigurationFenceId apply_fence_id{"apply:collision-resource-parked-replacement"};
+  const auto apply_scope = make_collision_apply_fence_scope("resource:parked-replacement");
+  ASSERT_TRUE(apply_scope.valid());
+  const auto before = kernel.collision_resource_set_readback();
+  ASSERT_TRUE(before.ok()) << before.error().message;
+  ASSERT_EQ(before.value().generation, 1U);
+
+  BlockingCollisionApplyFenceAdmissionGate admission_gate{apply_fence_id, apply_scope};
+  auto candidate = make_owned_collision_pipeline_resources();
+  std::optional<Result<CollisionPipelineResourceReadbackDTO>> replacement;
+  std::promise<void> replacement_finished;
+  auto replacement_finished_future = replacement_finished.get_future();
+  std::thread replacement_thread([&] {
+    replacement.emplace(kernel.replace_collision_resources_under_apply_fence(
+        apply_fence_id, apply_scope, admission_gate, std::move(candidate)));
+    replacement_finished.set_value();
+  });
+
+  const bool reached_pre_lock_fence_gate =
+      admission_gate.wait_until_verification_entered(std::chrono::seconds(2));
+  if (!reached_pre_lock_fence_gate) {
+    admission_gate.release_verification();
+    replacement_thread.join();
+    FAIL() << "replacement did not reach the exact-fence check before the lifecycle lock";
+  }
+  EXPECT_EQ(replacement_finished_future.wait_for(std::chrono::milliseconds(20)),
+            std::future_status::timeout);
+
+  const auto detached = kernel.detach(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+  admission_gate.release_verification();
+  const auto replacement_status = replacement_finished_future.wait_for(std::chrono::seconds(2));
+  replacement_thread.join();
+
+  ASSERT_TRUE(detached.ok()) << detached.error().message;
+  ASSERT_EQ(replacement_status, std::future_status::ready);
+  ASSERT_TRUE(replacement.has_value());
+  ASSERT_FALSE(replacement->ok());
+  EXPECT_EQ(replacement->error().details.at("reason"), "scheduler_not_ready");
+
+  const auto after = kernel.collision_resource_set_readback();
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_EQ(after.value(), before.value());
+}
+
+TEST_F(ExecutionKernelTest, CollisionResourcesReadbackIncludesSharedPublisherOwner) {
   const auto readback = kernel.collision_resource_set_readback();
-  ASSERT_FALSE(readback.ok());
-  EXPECT_EQ(readback.error().details.at("reason"),
-            "collision_resource_publisher_owner_missing");
+  ASSERT_TRUE(readback.ok()) << readback.error().message;
+  EXPECT_EQ(readback.value().generation, 1U);
+  EXPECT_EQ(readback.value().resources.snapshot_publisher, collision_world_publisher_owner);
 }
 
 TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrWorkers) {
@@ -2639,8 +2880,10 @@ TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrW
   const auto observed = gripper.get_gripper_status(request.gripper_id);
   const auto invalidations = context.gripper_invalidation_count.load();
   {
-    ExecutionKernel arm(planner, context, execution, clock, scheduler, cache);
-    configure_authoritative_collision_validation(arm, collision_world_publisher, collision_engine);
+    ExecutionKernel arm(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                        clock_owner, scheduler, cache_owner);
+    configure_authoritative_collision_validation(arm, collision_world_publisher_owner,
+                                                 collision_engine);
     EXPECT_FALSE(arm.command_gripper(request).accepted);
     const auto motion = prepare_and_dispatch(arm, make_test_request("independent_arm"));
     ASSERT_TRUE(motion.ok());
@@ -2721,6 +2964,346 @@ TEST_F(ExecutionKernelTest, MotionPreviewUsesExplicitStartAndDoesNotDispatchOrMu
   EXPECT_EQ(cache.size(), 0U);
 }
 
+TEST_F(ExecutionKernelTest, MotionPreviewReplansQualifiedTargetWithoutDispatch) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorPlanningFailed, "no path", {{"reason", "no_path"}}};
+  failed.target_qualified = true;
+  PlanResultDTO fallback;
+  fallback.trajectory = make_test_trajectory();
+  planner.result_sequence = {failed, fallback};
+  planner.on_plan = [this](int count) {
+    if (count == 1) {
+      auto target = planner.last_request.start_state;
+      target.positions = {AngularPositionDTO{1.0}, AngularPositionDTO{1.0}};
+      target.velocities.reset();
+      planner.result_sequence.front().qualified_target = std::move(target);
+      clock.advance(100'000'000);
+    }
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  auto request = make_test_request("preview_fallback");
+  request.timeouts.planning_timeout_s = 1.0;
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorPlanningFailed);
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->diagnostic_kind, "collision_disabled_path");
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(planner.last_request.collision_mode, PlannerCollisionMode::kDiagnosticDisabled);
+  ASSERT_TRUE(planner.last_request.diagnostic_qualified_target);
+  EXPECT_DOUBLE_EQ(planner.last_request.planning_timeout_s, 0.9);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, CartesianPreviewReplansSameLineWithoutCollisionAvoidance) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+  PlanResultDTO fallback;
+  fallback.trajectory = make_test_trajectory();
+  planner.result_sequence = {failed, fallback};
+  planner.on_plan = [this](int count) { if (count == 1) clock.advance(100'000'000); };
+  auto request = make_test_request("cartesian_diagnostic");
+  CartesianPathDTO line;
+  line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+  line.max_translation_step_m = 0.005;
+  line.max_rotation_step_rad = 0.05;
+  request.motion = line;
+  request.timeouts.planning_timeout_s = 1.0;
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorCartesianIncomplete);
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->diagnostic_kind, "collision_disabled_path");
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(planner.last_request.motion, request.motion);
+  EXPECT_EQ(planner.last_request.collision_mode, PlannerCollisionMode::kDiagnosticDisabled);
+  EXPECT_FALSE(planner.last_request.diagnostic_qualified_target);
+  EXPECT_DOUBLE_EQ(planner.last_request.planning_timeout_s, 0.9);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, CartesianPreviewReportsDiagnosticFailureWithoutPath) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+  PlanResultDTO fallback;
+  fallback.error = ErrorDTO{kErrorValidationLimitsViolation, "joint limit",
+                            {{"reason", "cartesian_joint_limit_violation"},
+                             {"planner_error", "Joint position limit"}}};
+  planner.result_sequence = {failed, fallback};
+  auto request = make_test_request("cartesian_diagnostic_infeasible");
+  CartesianPathDTO line;
+  line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+  line.max_translation_step_m = 0.005;
+  line.max_rotation_step_rad = 0.05;
+  request.motion = line;
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorValidationLimitsViolation);
+  EXPECT_EQ(result.error().details.at("reason"), "cartesian_joint_limit_violation");
+  EXPECT_EQ(result.error().details.at("cartesian_collision_disabled_diagnostic"), "failed");
+  EXPECT_EQ(result.error().details.at("original_error_message"), "line blocked");
+  EXPECT_FALSE(path);
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, CartesianPreviewDoesNotPublishDiagnosticAfterDeadlineOrStop) {
+  for (const bool cancelled : {false, true}) {
+    PlanResultDTO failed;
+    failed.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+    PlanResultDTO fallback;
+    fallback.trajectory = make_test_trajectory();
+    planner.plan_count = 0;
+    planner.result_sequence = {failed, fallback};
+    std::stop_source stop;
+    planner.on_plan = [&](int count) {
+      if (count == 2) {
+        if (cancelled) stop.request_stop();
+        else clock.advance(2'000'000'000);
+      }
+    };
+    auto request = make_test_request("cartesian_diagnostic_cancel");
+    CartesianPathDTO line;
+    line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+    line.max_translation_step_m = 0.005;
+    line.max_rotation_step_rad = 0.05;
+    request.motion = line;
+    request.timeouts.planning_timeout_s = 1.0;
+    auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+    ASSERT_TRUE(inventory);
+    std::optional<MotionPathPreview> path;
+    const auto result = kernel.preview_motion(request, std::move(*inventory),
+        RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, stop.get_token(), &path);
+    ASSERT_FALSE(result.ok());
+    EXPECT_FALSE(path);
+    EXPECT_EQ(planner.plan_count, 2);
+    EXPECT_EQ(execution.execute_count, 0);
+    EXPECT_EQ(cache.size(), 0U);
+  }
+}
+
+TEST_F(ExecutionKernelTest, CartesianDiagnosticTimeoutIsNotMarkedInfeasible) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+  PlanResultDTO fallback;
+  fallback.error = ErrorDTO{kErrorPlanningTimeout, "diagnostic timed out", {{"reason", "planning_timeout"}}};
+  planner.result_sequence = {failed, fallback};
+  auto request = make_test_request("cartesian_diagnostic_timeout");
+  CartesianPathDTO line;
+  line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+  line.max_translation_step_m = 0.005;
+  line.max_rotation_step_rad = 0.05;
+  request.motion = line;
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorPlanningTimeout);
+  EXPECT_EQ(result.error().details.count("cartesian_collision_disabled_diagnostic"), 0U);
+  EXPECT_FALSE(path);
+}
+
+TEST_F(ExecutionKernelTest, CartesianDiagnosticSolverFailuresAreMarked) {
+  for (const auto& diagnostic : std::vector<ErrorDTO>{
+           {kErrorCartesianIncomplete, "solver failed", {{"reason", "cartesian_ik_failure"},
+                                                        {"planner_error", "Oink solve failed"}}},
+           {kErrorValidationLimitsViolation, "velocity limit", {{"reason", "cartesian_joint_limit_violation"},
+                                                                {"planner_error", "Joint velocity limit"}}},
+           {kErrorCartesianIncomplete, "singularity", {{"reason", "cartesian_tracking_stalled"},
+                                                        {"planner_error", "stalled near a singularity"}}}}) {
+    PlanResultDTO failed;
+    failed.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+    PlanResultDTO fallback;
+    fallback.error = diagnostic;
+    planner.result_sequence = {failed, fallback};
+    auto request = make_test_request("cartesian_diagnostic_ambiguous");
+    CartesianPathDTO line;
+    line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+    request.motion = line;
+    auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+    ASSERT_TRUE(inventory);
+    std::optional<MotionPathPreview> path;
+    const auto result = kernel.preview_motion(request, std::move(*inventory),
+        RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, diagnostic.code);
+    EXPECT_EQ(result.error().details.at("cartesian_collision_disabled_diagnostic"), "failed");
+    EXPECT_FALSE(path);
+  }
+}
+
+TEST_F(ExecutionKernelTest, CartesianPreviewWithoutDiagnosticOutputDoesNotReplan) {
+  planner.next_result = {};
+  planner.next_result.error = ErrorDTO{kErrorCartesianIncomplete, "line blocked", {{"reason", "cartesian_tracking_failed"}}};
+  auto request = make_test_request("cartesian_no_diagnostic_output");
+  CartesianPathDTO line;
+  line.waypoints = {make_pose(0.1, 0.2, 0.3), make_pose(0.4, 0.5, 0.6)};
+  line.max_translation_step_m = 0.005;
+  line.max_rotation_step_rad = 0.05;
+  request.motion = line;
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewIkFallbackReportsOnlyObservedPose) {
+  planner.next_result = {};
+  planner.next_result.error = ErrorDTO{kErrorIkFailed, "no collision-free IK", {{"reason", "native_ik_no_solution"}}};
+  planner.next_ik_result = IkResultDTO{true, {ResourceId("joint.1"), ResourceId("joint.2")},
+                                     {"j1", "j2"}, {0.4, 0.5}, std::nullopt};
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  auto request = make_test_request("preview_ik_fallback");
+  request.motion = PoseGoalDTO{make_pose(0.3, 0.1, 0.2)};
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorIkFailed);
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->diagnostic_kind, "collision_disabled_ik_pose");
+  ASSERT_EQ(path->samples.size(), 1U);
+  EXPECT_EQ(path->samples[0].positions_rad, (std::vector<double>{0.4, 0.5}));
+  ASSERT_TRUE(planner.last_ik_request);
+  EXPECT_EQ(planner.last_ik_request->collision_mode, PlannerCollisionMode::kDiagnosticDisabled);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewIkFallbackPlansPathToExactSolvedPose) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorIkFailed, "no collision-free IK", {{"reason", "native_ik_no_solution"}}};
+  PlanResultDTO fallback;
+  fallback.trajectory = make_test_trajectory_from({0.0, 0.0}, {0.4, 0.5});
+  planner.result_sequence = {failed, fallback};
+  planner.next_ik_result = IkResultDTO{true, {ResourceId("joint.1"), ResourceId("joint.2")},
+                                     {"j1", "j2"}, {0.4, 0.5}, std::nullopt};
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  auto request = make_test_request("preview_ik_path");
+  request.motion = PoseGoalDTO{make_pose(0.3, 0.1, 0.2)};
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorIkFailed);
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->diagnostic_kind, "collision_disabled_ik_path");
+  ASSERT_GE(path->samples.size(), 2U);
+  EXPECT_EQ(path->samples.back().positions_rad, (std::vector<double>{0.4, 0.5}));
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(planner.last_request.collision_mode, PlannerCollisionMode::kDiagnosticDisabled);
+  ASSERT_TRUE(planner.last_request.diagnostic_qualified_target);
+  EXPECT_EQ(angular_position_projection(*planner.last_request.diagnostic_qualified_target).value(),
+            (std::vector<double>{0.4, 0.5}));
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewIkPathFailureKeepsAlreadyCheckedPose) {
+  for (int mode = 0; mode < 3; ++mode) {
+    planner.plan_count = 0;
+    PlanResultDTO failed;
+    failed.error = ErrorDTO{kErrorIkFailed, "no collision-free IK", {{"reason", "native_ik_no_solution"}}};
+    PlanResultDTO fallback;
+    if (mode == 0) {
+      fallback.error = ErrorDTO{kErrorPlanningFailed, "no diagnostic path", {}};
+    } else {
+      fallback.trajectory = make_test_trajectory_from({0.0, 0.0}, mode == 1
+          ? std::vector<double>{0.4, 0.5} : std::vector<double>{0.4, 0.6});
+    }
+    planner.result_sequence = {failed, fallback};
+    planner.next_ik_result = IkResultDTO{true, {ResourceId("joint.1"), ResourceId("joint.2")},
+                                       {"j1", "j2"}, {0.4, 0.5}, std::nullopt};
+    planner.on_plan = [this, mode](int count) {
+      if (mode == 1 && count == 2) clock.advance(1'000'000'000);
+    };
+    auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+    ASSERT_TRUE(inventory);
+    auto request = make_test_request("preview_ik_pose_fallback_" + std::to_string(mode));
+    request.motion = PoseGoalDTO{make_pose(0.3, 0.1, 0.2)};
+    request.timeouts.planning_timeout_s = 1.0;
+    std::optional<MotionPathPreview> path;
+    const auto result = kernel.preview_motion(request, std::move(*inventory),
+        RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, kErrorIkFailed);
+    ASSERT_TRUE(path);
+    EXPECT_EQ(path->diagnostic_kind, "collision_disabled_ik_pose");
+    ASSERT_EQ(path->samples.size(), 1U);
+    EXPECT_EQ(path->samples[0].positions_rad, (std::vector<double>{0.4, 0.5}));
+    EXPECT_EQ(execution.execute_count, 0);
+    EXPECT_EQ(cache.size(), 0U);
+  }
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDoesNotReplanWithoutQualifiedTarget) {
+  planner.next_result = {};
+  planner.next_result.error = ErrorDTO{kErrorPlanningFailed, "failure before goal", {{"reason", "unqualified"}}};
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("preview_unqualified"),
+      std::move(*inventory), RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "unqualified");
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_FALSE(path);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiscardsFallbackAfterOriginalDeadline) {
+  PlanResultDTO failed;
+  failed.error = ErrorDTO{kErrorPlanningFailed, "original", {{"reason", "no_path"}}};
+  failed.target_qualified = true;
+  PlanResultDTO fallback;
+  fallback.trajectory = make_test_trajectory();
+  planner.result_sequence = {failed, fallback};
+  planner.on_plan = [this](int count) {
+    if (count == 1) {
+      auto target = planner.last_request.start_state;
+      target.positions = {AngularPositionDTO{1.0}, AngularPositionDTO{1.0}};
+      target.velocities.reset();
+      planner.result_sequence.front().qualified_target = std::move(target);
+    } else {
+      clock.advance(1'000'000'000);
+    }
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  auto request = make_test_request("preview_fallback_expired");
+  request.timeouts.planning_timeout_s = 1.0;
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "no_path");
+  EXPECT_FALSE(path);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
 TEST_F(ExecutionKernelTest, MotionPreviewTimeoutRetainsUnderlyingFailureDiagnostics) {
   for (const bool already_wrapped : {false, true}) {
     auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
@@ -2763,6 +3346,418 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutRetainsUnderlyingFailureDiagnost
   }
 }
 
+TEST_F(ExecutionKernelTest, MotionPreviewPathIsBoundedAndNoDiagnosticQueryWithoutOutput) {
+  std::atomic<int> diagnostics{0};
+  collision_engine->on_check = [&](const CollisionQuery& query) {
+    if (query.query_id.starts_with("motion_preview_geometry_")) {
+      EXPECT_FALSE(query.clearance_margins);
+      EXPECT_EQ(query.required_capabilities, std::vector<std::string>({"body_pair_only"}));
+      ++diagnostics;
+    }
+  };
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints.clear();
+  for (int i = 0; i < 40; ++i)
+    trajectory.waypoints.push_back({static_cast<double>(i), {i / 39.0, i / 39.0}, {}, {}});
+  planner.next_result.trajectory = trajectory;
+  auto first = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(first);
+  auto ordinary = kernel.preview_motion(make_test_request("path_without_output"), std::move(*first),
+                                        RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U);
+  ASSERT_TRUE(ordinary.ok());
+  EXPECT_EQ(diagnostics.load(), 0);
+  auto second = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(second);
+  std::optional<MotionPathPreview> path;
+  auto preview = kernel.preview_motion(make_test_request("path_with_output"), std::move(*second),
+                                       RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_TRUE(preview.ok());
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->joint_names, std::vector<std::string>({"j1", "j2"}));
+  ASSERT_EQ(path->samples.size(), 32U);
+  EXPECT_EQ(path->samples.front().time_from_start_s, 0.0);
+  EXPECT_EQ(path->samples.back().time_from_start_s, 39.0);
+  EXPECT_EQ(diagnostics.load(), 32);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewFailedCollisionPreservesErrorAndHasNoAuthority) {
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.query_id.starts_with("motion_preview_geometry_") ||
+        (query.waypoint_index && *query.waypoint_index == 1))
+      return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_collision"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorValidationCollision);
+  ASSERT_TRUE(path);
+  ASSERT_EQ(path->samples.size(), 2U);
+  ASSERT_EQ(path->samples.back().contacts.size(), 1U);
+  EXPECT_EQ(path->samples.back().contacts.front().disposition, MotionPreviewContactDisposition::kRefused);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewSuppressesDiagnosticWhenFinalFailureIsNotCollisionValidation) {
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  context.throw_fk = true;
+  std::optional<MotionPathPreview> path = MotionPathPreview{};
+  const auto result = kernel.preview_motion(make_test_request("path_fk_failure"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_FALSE(path);
+  EXPECT_EQ(result.error().details.at("reason"), "fk_failed");
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewUnrepresentableTimesDoNotChangeUnderlyingValidation) {
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints.back().time_from_start_s = 0.0;
+  planner.next_result.trajectory = trajectory;
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path = MotionPathPreview{};
+  const auto result = kernel.preview_motion(make_test_request("path_invalid_wire_time"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  EXPECT_TRUE(result.ok()); // The test validator, unlike RoboPlan, admits it.
+  EXPECT_FALSE(path); // The serializer must report preview unavailable.
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, NormalExecutionDoesNotRunPreviewGeometryQueries) {
+  std::atomic<int> diagnostics{0};
+  collision_engine->on_check = [&](const CollisionQuery& query) {
+    if (query.query_id.starts_with("motion_preview_geometry_")) ++diagnostics;
+  };
+  const auto result = execute_sync(make_test_request("ordinary_no_preview_query"));
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(diagnostics.load(), 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewSortsPairDictionaryAndDeduplicatesContacts) {
+  const auto later = clearance_test_pair("z");
+  const auto earlier = clearance_test_pair("a");
+  auto policy = make_test_collision_policy_snapshot();
+  policy.allowed_touch_link_pairs = {earlier, later};
+  kernel.set_collision_validation_policy_snapshot(policy);
+  collision_engine->result_for_query = [later, earlier](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    CollisionResult result = make_authoritative_collision_result();
+    const auto pair = query.waypoint_index.value_or(0) == 0 ? later : earlier;
+    result.normalized_pairs = query.query_id.starts_with("motion_preview_geometry_")
+                                  ? std::vector<CollisionPairId>{pair, pair}
+                                  : std::vector<CollisionPairId>{pair};
+    return result;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  inventory->bundle.policy = policy;
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_pair_order"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(path);
+  ASSERT_EQ(path->pairs.size(), 2U);
+  EXPECT_EQ(path->pairs[0].body_b, earlier.body_b);
+  EXPECT_EQ(path->pairs[1].body_b, later.body_b);
+  ASSERT_EQ(path->samples[0].contacts.size(), 1U);
+  ASSERT_EQ(path->samples[1].contacts.size(), 1U);
+  EXPECT_EQ(path->samples[0].contacts[0].pair_index, 1U);
+  EXPECT_EQ(path->samples[1].contacts[0].pair_index, 0U);
+  EXPECT_EQ(path->samples[0].contacts[0].disposition, MotionPreviewContactDisposition::kAllowed);
+  EXPECT_EQ(path->samples[1].contacts[0].disposition, MotionPreviewContactDisposition::kAllowed);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewTooManyPairsOmitsEvidenceWithoutChangingCoreResult) {
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (!query.query_id.starts_with("motion_preview_geometry_")) return std::nullopt;
+    auto result = make_authoritative_collision_result();
+    result.normalized_pairs.clear();
+    for (int i = 0; i < 65; ++i)
+      result.normalized_pairs.push_back(clearance_test_pair("obstacle_" + std::to_string(i)));
+    return result;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_pair_overflow"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  EXPECT_TRUE(result.ok());
+  EXPECT_FALSE(path); // Host returns preview-unavailable for an unrepresentable success.
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDoesNotPresentMarginOnlyProximityAsContact) {
+  const auto pair = clearance_test_pair("box");
+  collision_engine->result_for_query = [pair](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.query_id.starts_with("motion_preview_geometry_")) return std::nullopt;
+    auto result = make_authoritative_collision_result();
+    result.normalized_pairs = {pair};
+    result.clearance_violations = {CollisionPairClearance{pair, 0.0005}};
+    return result;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_margin_only"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  EXPECT_TRUE(path->pairs.empty());
+  for (const auto& sample : path->samples) {
+    EXPECT_TRUE(sample.contacts.empty());
+    EXPECT_TRUE(sample.clearance_violations.empty());
+    EXPECT_EQ(sample.status, MotionPreviewSampleStatus::kUnknown);
+  }
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticRetainsMeasuredClearanceAndEffectiveMargin) {
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(*collision_world_publisher.current_snapshot, {"box"}));
+  const auto pair = clearance_test_pair("box");
+  collision_engine->result_for_query = [pair](const CollisionQuery& query) {
+    return clearance_test_result(query, pair,
+                                 0.004 - 0.003 * clearance_test_joint(query, "j1"));
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  auto request = make_test_request("preview_measured_clearance");
+  request.clearance_m = 0.003;
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(request, std::move(*inventory),
+      RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  ASSERT_EQ(path->samples.back().clearance_violations.size(), 1U);
+  const auto& violation = path->samples.back().clearance_violations.front();
+  EXPECT_NEAR(violation.distance_m, 0.001, 1e-12);
+  EXPECT_DOUBLE_EQ(violation.required_clearance_m, 0.003);
+  EXPECT_TRUE(path->samples.back().contacts.empty());
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewRetainsFailingSampleWhenDownsampling) {
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints.clear();
+  for (int i = 0; i < 40; ++i)
+    trajectory.waypoints.push_back({static_cast<double>(i), {i / 39.0, i / 39.0}, {}, {}});
+  planner.next_result.trajectory = trajectory;
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index == 19)
+      return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_retains_failure"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  ASSERT_LE(path->samples.size(), 32U);
+  EXPECT_EQ(path->samples.front().time_from_start_s, 0.0);
+  EXPECT_EQ(path->samples.back().time_from_start_s, 39.0);
+  const auto failure = std::find_if(path->samples.begin(), path->samples.end(),
+                                    [](const auto& sample) { return sample.time_from_start_s == 19.0; });
+  ASSERT_NE(failure, path->samples.end());
+  ASSERT_EQ(failure->contacts.size(), 1U);
+  EXPECT_EQ(failure->contacts.front().disposition, MotionPreviewContactDisposition::kRefused);
+  EXPECT_EQ(cache.size(), 0U);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticKeepsQualifiedClearSamplesAfterFailure) {
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints = {{0.0, {0.0, 0.0}, {}, {}},
+                          {1.0, {0.5, 0.5}, {}, {}},
+                          {2.0, {1.0, 1.0}, {}, {}}};
+  planner.next_result.trajectory = trajectory;
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index == 1)
+      return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("preview_after_collision"),
+      std::move(*inventory), RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  ASSERT_EQ(path->samples.size(), 3U);
+  EXPECT_EQ(path->samples.back().status, MotionPreviewSampleStatus::kChecked);
+  EXPECT_TRUE(path->samples.back().contacts.empty());
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticKeepsProvedContactWhenGeometryIsIncomplete) {
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index == 1) {
+      auto result = make_authoritative_collision_result();
+      if (query.query_id.starts_with("motion_preview_geometry_"))
+        result.decision = CollisionDecisionResult::kInconclusiveFail;
+      return result;
+    }
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("preview_incomplete_geometry"),
+      std::move(*inventory), RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->samples.back().status, MotionPreviewSampleStatus::kUnknown);
+  ASSERT_EQ(path->samples.back().contacts.size(), 1U);
+  EXPECT_EQ(path->samples.back().contacts.front().disposition, MotionPreviewContactDisposition::kRefused);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticDoesNotClaimClearWithoutEnumerationCapability) {
+  collision_engine->set_diagnostic_enumeration_complete(false);
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index == 1)
+      return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("preview_unqualified_enumeration"),
+      std::move(*inventory), RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->samples.front().status, MotionPreviewSampleStatus::kUnknown);
+  EXPECT_TRUE(path->samples.front().contacts.empty());
+  EXPECT_EQ(path->samples.back().status, MotionPreviewSampleStatus::kUnknown);
+  ASSERT_EQ(path->samples.back().contacts.size(), 1U);
+  EXPECT_EQ(path->samples.back().contacts.front().disposition, MotionPreviewContactDisposition::kRefused);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticKeepsStatefulContactLocalAfterFailure) {
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints = {{0.0, {0.0, 0.0}, {}, {}},
+                          {1.0, {0.5, 0.5}, {}, {}},
+                          {2.0, {1.0, 1.0}, {}, {}}};
+  planner.next_result.trajectory = trajectory;
+  auto policy = make_support_contact_test_policy();
+  const auto support_pair = policy.support_contacts.front().pair;
+  collision_engine->result_for_query = [support_pair](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index == 1)
+      return make_authoritative_collision_result();
+    if (query.waypoint_index && *query.waypoint_index == 2)
+      return make_support_contact_collision_result(support_pair, -0.001);
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  inventory->bundle.policy = policy;
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("preview_stateful_contact"),
+      std::move(*inventory), RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(path);
+  ASSERT_EQ(path->samples.size(), 3U);
+  EXPECT_EQ(path->samples.back().status, MotionPreviewSampleStatus::kChecked);
+  ASSERT_EQ(path->samples.back().contacts.size(), 1U);
+  EXPECT_EQ(path->samples.back().contacts.front().disposition, MotionPreviewContactDisposition::kUnknown);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewCancellationDuringDiagnosticDoesNotExposePath) {
+  std::stop_source stop;
+  collision_engine->on_check = [&](const CollisionQuery& query) {
+    if (query.query_id.starts_with("motion_preview_geometry_")) stop.request_stop();
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path = MotionPathPreview{};
+  const auto result = kernel.preview_motion(make_test_request("path_diagnostic_cancel"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U,
+                                            stop.get_token(), &path);
+  ASSERT_FALSE(result.ok());
+  EXPECT_FALSE(path);
+  EXPECT_EQ(result.error().details.at("reason"), "motion_preview_cancelled");
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewMapsCandidateJointsByBindingName) {
+  auto trajectory = make_test_trajectory();
+  trajectory.waypoints.back().positions_rad = {0.2, 0.8};
+  planner.next_result.trajectory = trajectory;
+  auto expanded = trajectory;
+  expanded.joint_names = {"other", "j2", "j1"};
+  expanded.waypoints.front().positions_rad = {7.0, 0.0, 0.0};
+  expanded.waypoints.back().positions_rad = {7.0, 0.8, 0.2};
+  context.next_expand_result = Result<TrajectoryDTO>::Ok(std::move(expanded));
+  std::vector<std::string> diagnostic_names;
+  std::vector<double> diagnostic_positions;
+  collision_engine->on_check = [&](const CollisionQuery& query) {
+    if (query.query_id.starts_with("motion_preview_geometry_") && query.waypoint_index == 1) {
+      diagnostic_names = query.robot_state.joint_names;
+      diagnostic_positions = query.robot_state.positions_rad;
+    }
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_joint_order"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(path);
+  EXPECT_EQ(path->joint_names, std::vector<std::string>({"j1", "j2"}));
+  EXPECT_EQ(path->samples.back().positions_rad, std::vector<double>({0.2, 0.8}));
+  EXPECT_EQ(diagnostic_names, std::vector<std::string>({"other", "j2", "j1"}));
+  EXPECT_EQ(diagnostic_positions, std::vector<double>({7.0, 0.8, 0.2}));
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewMarksIncompleteGeometryAsUnknown) {
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (!query.query_id.starts_with("motion_preview_geometry_")) return std::nullopt;
+    CollisionResult result;
+    result.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
+    result.decision = CollisionDecisionResult::kInconclusiveFail;
+    return result;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_geometry_unknown"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(path);
+  for (const auto& sample : path->samples) {
+    EXPECT_EQ(sample.status, MotionPreviewSampleStatus::kUnknown);
+    EXPECT_TRUE(sample.contacts.empty());
+  }
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, MotionPreviewDoesNotInferUnclassifiedContactIsAllowed) {
+  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.query_id.starts_with("motion_preview_geometry_"))
+      return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(inventory);
+  std::optional<MotionPathPreview> path;
+  const auto result = kernel.preview_motion(make_test_request("path_unclassified_contact"), std::move(*inventory),
+                                            RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(path);
+  for (const auto& sample : path->samples) {
+    EXPECT_EQ(sample.status, MotionPreviewSampleStatus::kUnknown);
+    ASSERT_EQ(sample.contacts.size(), 1U);
+    EXPECT_EQ(sample.contacts[0].disposition, MotionPreviewContactDisposition::kUnknown);
+  }
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
 TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailureStage) {
   auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(inventory.has_value());
@@ -2792,7 +3787,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
 
 [[nodiscard]] ResolvedStopBasePlanDTO prepared_motion_stop_base_plan() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
   if (bytes.ends_with('\n')) bytes.pop_back();
@@ -2853,8 +3848,6 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
       ProgramBindingId(kTestDigestB),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -2868,9 +3861,9 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
                                    ModelInstanceId("robot.model"),
                                    "arm_group",
                                    {"joint_1", "joint_2"}}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+       ProgramFrameBindingDTO{{ControllableComponentId("robot1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_tcp"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
@@ -3414,9 +4407,10 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
         ::alarm(10U);
         const auto verify = [&] {
           // Destroy and join this child-owned Kernel before the death-test exit.
-          ExecutionKernel owner(planner, context, execution, clock, scheduler, cache);
+          ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+                                execution_owner, clock_owner, scheduler, cache_owner);
           owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-          owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+          owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                         {collision_engine});
           PlanResultDTO failed;
           failed.error = ErrorDTO{kErrorIkFailed, "no path", {}};
@@ -3701,7 +4695,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_PoseReference_ResolvesToPoseGoa
 
 TEST_F(ExecutionKernelTest, Execute_AbsolutePoseInGoalFrame_ResolvesFromAdmissionContext) {
   ExecuteRequestDTO req = make_test_request("framed_absolute_pose");
-  req.goal_frame_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
+  req.goal_frame_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("fixture")});
   PoseGoalDTO framed_goal;
   framed_goal.goal.position_m = {0.0, 0.0, 0.1};
   framed_goal.goal.orientation = {0.0, 0.0, 0.0, 1.0};
@@ -3727,7 +4721,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_OffsetReference_UsesIndependent
   ExecuteRequestDTO req = make_relative_object_request("relative_pose", "graspable");
 
   ReferenceDTO offset_reference;
-  offset_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "frame-role:base");
+  offset_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:base")});
   req.offset_reference = offset_reference;
 
   auto& relative_offset = std::get<PoseGoalDTO>(req.motion);
@@ -3763,35 +4757,40 @@ TEST_F(ExecutionKernelTest, Config_SingleShotIkTimeout_RejectsNonPositiveOrNonFi
                      std::numeric_limits<double>::infinity()}) {
     ExecutionKernelConfig config;
     config.single_shot_ik_timeout_s = bad;
-    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+    EXPECT_THROW((ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                  execution_owner, clock_owner, scheduler, cache_owner, config}),
                  std::invalid_argument);
   }
 
   ExecutionKernelConfig ok_config;
   ok_config.single_shot_ik_timeout_s = 0.05;
   EXPECT_NO_THROW(
-      (ExecutionKernel{planner, context, execution, clock, scheduler, cache, ok_config}));
+      (ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                       clock_owner, scheduler, cache_owner, ok_config}));
 }
 
 TEST_F(ExecutionKernelTest, Config_ValidationCollisionWallTimeoutRejectsNonPositive) {
   for (Duration bad : {Duration{0}, Duration{-1}}) {
     ExecutionKernelConfig config;
     config.validation_collision_wall_timeout_ns = bad;
-    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+    EXPECT_THROW((ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                  execution_owner, clock_owner, scheduler, cache_owner, config}),
                  std::invalid_argument);
   }
 
   ExecutionKernelConfig ok_config;
   ok_config.validation_collision_wall_timeout_ns = 5'000'000'000;
   EXPECT_NO_THROW(
-      (ExecutionKernel{planner, context, execution, clock, scheduler, cache, ok_config}));
+      (ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                       clock_owner, scheduler, cache_owner, ok_config}));
 }
 
 TEST_F(ExecutionKernelTest, Config_ValidationCollisionWorkersRejectsOutOfRangeWithoutClamping) {
   for (const int bad : {0, 65}) {
     ExecutionKernelConfig config;
     config.validation_collision_workers = bad;
-    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+    EXPECT_THROW((ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                  execution_owner, clock_owner, scheduler, cache_owner, config}),
                  std::invalid_argument);
   }
 
@@ -3799,7 +4798,8 @@ TEST_F(ExecutionKernelTest, Config_ValidationCollisionWorkersRejectsOutOfRangeWi
     ExecutionKernelConfig config;
     config.validation_collision_workers = admitted;
     EXPECT_NO_THROW(
-        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
+        (ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                         clock_owner, scheduler, cache_owner, config}));
   }
 }
 
@@ -3807,9 +4807,12 @@ TEST_F(ExecutionKernelTest, DeclaredValidationWorkerCapacityRejectsInsufficientR
   ExecutionKernelConfig config;
   config.validation_collision_workers = 2;
   config.validation_collision_workers_declared = true;
-  ExecutionKernel declared_kernel{planner, context, execution, clock, scheduler, cache, config};
+  ExecutionKernel declared_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                                  execution_owner, clock_owner,
+                                  scheduler,       cache_owner,
+                                  config};
 
-  EXPECT_THROW(declared_kernel.set_collision_resources(collision_world_publisher,
+  EXPECT_THROW(declared_kernel.set_collision_resources(collision_world_publisher_owner,
                                                        std::make_shared<MockCollisionEngine>(),
                                                        {std::make_shared<MockCollisionEngine>()}),
                std::invalid_argument);
@@ -4619,11 +5622,13 @@ TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanningFailure_Block
 }
 
 TEST_F(ExecutionKernelTest, Execute_SynchronizesExternalSceneBeforeRetainingPlanningProjection) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result =
@@ -4638,15 +5643,17 @@ TEST_F(ExecutionKernelTest, Execute_SynchronizesExternalSceneBeforeRetainingPlan
 
 TEST_F(ExecutionKernelTest,
        Execute_AcceptsRetainedProjectionForwardOfSceneSynchronizationFloor) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   auto retained_revision = test_projection_revision();
   retained_revision.scene_revision.revision_id = 2U;
   retained_revision.scene_revision.content_hash = ContentDigest{kTestDigestA};
   collision_world_publisher.lease_projection_revision = retained_revision;
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result = prepare_and_dispatch(
@@ -4662,13 +5669,15 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, Execute_SceneSynchronizationFailureBlocksPlanningAndDispatch) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Err(ErrorDTO{
       "scene_runtime_pose_observation_stale", "before-planning pose observation is stale", {}});
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result =
@@ -4682,14 +5691,16 @@ TEST_F(ExecutionKernelTest, Execute_SceneSynchronizationFailureBlocksPlanningAnd
 }
 
 TEST_F(ExecutionKernelTest, Execute_RejectsProjectionChangeAfterSceneSynchronization) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   auto successor = test_projection_revision();
   successor.scene_revision.revision_id = 2U;
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(successor);
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result =
@@ -4704,14 +5715,16 @@ TEST_F(ExecutionKernelTest, Execute_RejectsProjectionChangeAfterSceneSynchroniza
 
 TEST_F(ExecutionKernelTest,
        Execute_RejectsSynchronizedFloorWithEqualRevisionAndDifferentHash) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   auto floor = test_projection_revision();
   floor.scene_revision.content_hash = ContentDigest{kTestDigestA};
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result = prepare_and_dispatch(
@@ -4726,14 +5739,16 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_RejectsSynchronizedFloorFromDifferentSceneLineage) {
-  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto scene_synchronizer_owner = std::make_shared<MockPlanningSceneSynchronizer>();
+  MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   auto floor = test_projection_revision();
   floor.scene_revision.scene_id = SceneId{kTestDigestD};
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
-  auto ports = static_cast<ExecutionKernelPorts>(context);
-  ports.planning_scene_synchronizer = &scene_synchronizer;
-  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+  auto ports = test_execution_kernel_ports(context_owner);
+  ports.planning_scene_synchronizer = scene_synchronizer_owner;
+  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   const auto result = prepare_and_dispatch(
@@ -4854,8 +5869,11 @@ TEST_F(ExecutionKernelTest, Execute_CollisionRejectionOmitsDiagnosticCompareByDe
 TEST_F(ExecutionKernelTest, Execute_CollisionRejectionAppendsDiagnosticCompareWhenEnabled) {
   ExecutionKernelConfig config;
   config.enable_collision_diagnostic_compare = true;
-  ExecutionKernel gated_kernel{planner, context, execution, clock, scheduler, cache, config};
-  configure_authoritative_collision_validation(gated_kernel, collision_world_publisher,
+  ExecutionKernel gated_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                               execution_owner, clock_owner,
+                               scheduler,       cache_owner,
+                               config};
+  configure_authoritative_collision_validation(gated_kernel, collision_world_publisher_owner,
                                                collision_engine);
   store_cache("diagnostic_compare_on", make_test_trajectory());
   collision_engine->default_result = make_authoritative_collision_result();
@@ -4899,13 +5917,14 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_RefusesACollidingCachedTra
   EXPECT_FALSE(context.last_validation_options.run_collision_checks);
 }
 
-// --- M6 collision clearance (security margin)
+// --- Collision clearance (security margin)
 
 TEST_F(ExecutionKernelTest, Config_CollisionClearanceRejectsOutOfRange) {
   for (const double bad : {-0.001, 0.0501}) {
     ExecutionKernelConfig config;
     config.collision_clearance_m = bad;
-    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+    EXPECT_THROW((ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                  execution_owner, clock_owner, scheduler, cache_owner, config}),
                  std::invalid_argument);
   }
   // 0.1 mm by default; 0 turns the clearance off; no lower floor otherwise.
@@ -4914,7 +5933,8 @@ TEST_F(ExecutionKernelTest, Config_CollisionClearanceRejectsOutOfRange) {
     ExecutionKernelConfig config;
     config.collision_clearance_m = admitted;
     EXPECT_NO_THROW(
-        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
+        (ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                         clock_owner, scheduler, cache_owner, config}));
   }
 }
 
@@ -4973,7 +5993,7 @@ TEST_F(ExecutionKernelTest, Execute_DefaultClearanceAppliesWithoutAConfiguredOne
 }
 
 TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAContactPolicy) {
-  // M6 decision 17: the move's target object is not exempt by itself. With a
+  // The move's target object is not exempt by itself. With a
   // 3 mm clearance and no contact-grasp policy, the planner keeps 3 mm from
   // the target and from the table (a planner keeping it refuses an approach
   // within 1 mm). The mock planner does not, so the pre-dispatch check refuses
@@ -5009,13 +6029,16 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAConta
 }
 
 TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearance) {
-  // M6 decision 16: with a 3 mm Deployment clearance, the same pick with the
+  // With a 3 mm Deployment clearance, the same pick with the
   // move's own clearance_m of 0.5 mm is accepted, and the planner and the
   // pre-dispatch check carry 0.5 mm; 0 turns the clearance off for the move.
   ExecutionKernelConfig config;
   config.collision_clearance_m = 0.003;
-  ExecutionKernel cell_kernel{planner, context, execution, clock, scheduler, cache, config};
-  configure_authoritative_collision_validation(cell_kernel, collision_world_publisher,
+  ExecutionKernel cell_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                              execution_owner, clock_owner,
+                              scheduler,       cache_owner,
+                              config};
+  configure_authoritative_collision_validation(cell_kernel, collision_world_publisher_owner,
                                                collision_engine);
   Pose3DTO reference;
   reference.position_m = {0.3, -0.2, 0.15};
@@ -5143,13 +6166,13 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionPipelineRejectsCollisi
 }
 
 TEST_F(ExecutionKernelTest, Config_FreshPlanCheckIsOnByDefault) {
-  // N6 / CLR-2: the default comes from robot_defaults.tsv.
+  // The default comes from robot_defaults.tsv.
   EXPECT_TRUE(kDefaultCollisionCheckFreshPlans);
   EXPECT_EQ(ExecutionKernelConfig{}.collision_check_fresh_plans, kDefaultCollisionCheckFreshPlans);
 }
 
 TEST_F(ExecutionKernelTest, Execute_FreshPlanIsCollisionValidatedByDefault) {
-  // N6 / CLR-2: a trajectory planned for this request, with no active contact
+  // A trajectory planned for this request, with no active contact
   // policy, gets the same pre-dispatch waypoint check as a cached one.
   ValidationOutcomeRecorder outcome(kernel);
 
@@ -5411,12 +6434,15 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesNonzeroDefaultQuer
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesConfiguredValidationQueryTimeout) {
-  MockCollisionWorldPublisher local_publisher;
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernelConfig config;
   config.validation_collision_query_timeout_ns = 125'000'000;
-  ExecutionKernel local_kernel{planner, context, execution, clock, scheduler, cache, config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  ExecutionKernel local_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                               execution_owner, clock_owner,
+                               scheduler,       cache_owner,
+                               config};
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   store_cache("validation_timeout", make_test_trajectory());
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request("validation_timeout"));
@@ -5448,7 +6474,9 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesPublisherPolicySna
 }
 
 TEST_F(ExecutionKernelTest, Execute_MissingAuthoritativeCollisionPipelineFailsClosed) {
-  ExecutionKernel unconfigured_kernel{planner, context, execution, clock, scheduler, cache};
+  ExecutionKernel unconfigured_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                                      execution_owner, clock_owner,
+                                      scheduler,       cache_owner};
 
   auto result = prepare_and_dispatch(unconfigured_kernel, make_test_request("missing_pipeline"));
   ASSERT_FALSE(result.ok());
@@ -5459,13 +6487,16 @@ TEST_F(ExecutionKernelTest, Execute_MissingAuthoritativeCollisionPipelineFailsCl
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSecondCandidate) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  TrajectoryCache& local_cache = *local_cache_owner;
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 1;
-  MockPlanner local_planner;
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO first_plan;
   first_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   PlanResultDTO second_plan;
@@ -5474,13 +6505,17 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   // returns the second, which passes the pre-dispatch check.
   local_planner.result_sequence = {second_plan};
   store_cache(local_cache, make_test_request("replan_collision"), *first_plan.trajectory);
-  MockFocusedPorts local_context = context;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner, local_context,   controlled_execution,
-                               local_clock,   local_scheduler, local_cache,
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
                                config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   local_engine->result_for_query =
       [](const CollisionQuery& query) -> std::optional<CollisionResult> {
     if (clearance_test_joint(query, "j1") == 1.0) return make_authoritative_collision_result();
@@ -5534,25 +6569,32 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedFailsClosed) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 1;
-  MockPlanner local_planner;
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO first_plan;
   first_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   PlanResultDTO second_plan;
   second_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockFocusedPorts local_context = context;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner, local_context,   controlled_execution,
-                               local_clock,   local_scheduler, local_cache,
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
                                config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   // An active support contact: each fresh plan is collision-validated.
   local_publisher.current_policy = make_support_contact_test_policy();
   local_kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
@@ -5572,25 +6614,32 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsReplanBehavior) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 1;
-  MockPlanner local_planner;
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO first_plan;
   first_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   PlanResultDTO second_plan;
   second_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
   local_planner.result_sequence = {first_plan, second_plan};
-  MockFocusedPorts local_context = context;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner, local_context,   controlled_execution,
-                               local_clock,   local_scheduler, local_cache,
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
                                config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   const CollisionPairId pair{"scene/insert/shape/0", "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
@@ -5620,23 +6669,31 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsRe
 
 TEST_F(ExecutionKernelTest,
        Execute_DiscoversOnlyActualCarriedObjectStartContactAndDispatchesAfterRelease) {
-  FakeClock local_clock;
+  auto local_clock_owner = std::make_shared<FakeClock>();
   ManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockPlanner local_planner;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory();
   local_planner.next_result = plan;
-  MockFocusedPorts local_context = context;
-  MockExecution local_execution;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_execution_owner = std::make_shared<MockExecution>();
+  MockExecution& local_execution = *local_execution_owner;
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 0;
   config.validation_collision_workers = 1;
-  ExecutionKernel local_kernel{local_planner,   local_context, local_execution, local_clock,
-                               local_scheduler, local_cache,   config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               local_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
+                               config};
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   auto world = make_test_collision_world_snapshot();
   auto carried = make_observed_box_body("carried", make_test_pose(), "carried-body-hash");
@@ -5700,23 +6757,31 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidingCarriedPair) {
-  FakeClock local_clock;
+  auto local_clock_owner = std::make_shared<FakeClock>();
   ManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockPlanner local_planner;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  TrajectoryCache& local_cache = *local_cache_owner;
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory();
   local_planner.next_result = plan;
-  MockFocusedPorts local_context = context;
-  MockExecution local_execution;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_execution_owner = std::make_shared<MockExecution>();
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 0;
   config.validation_collision_workers = 1;
-  ExecutionKernel local_kernel{local_planner,   local_context, local_execution, local_clock,
-                               local_scheduler, local_cache,   config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               local_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
+                               config};
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   auto world = make_test_collision_world_snapshot();
   auto carried = make_observed_box_body("carried", make_test_pose(), "carried-body-hash");
@@ -5763,26 +6828,33 @@ TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidin
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionReplansACachedTrajectory) {
   // An inconclusive (timed-out) result refuses a cached trajectory like a
   // collision does; the move is re-planned once and the fresh plan dispatched.
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  TrajectoryCache& local_cache = *local_cache_owner;
   ExecutionKernelConfig config;
   // The fresh plan stands on the planner's check.
   config.collision_check_fresh_plans = false;
   config.authoritative_validation_collision_replan_attempts = 2;
-  MockPlanner local_planner;
+  auto local_planner_owner = std::make_shared<MockPlanner>();
+  MockPlanner& local_planner = *local_planner_owner;
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   local_planner.result_sequence = {plan};
   store_cache(local_cache, make_test_request("replan_non_ok"), *plan.trajectory);
-  MockFocusedPorts local_context = context;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner, local_context,   controlled_execution,
-                               local_clock,   local_scheduler, local_cache,
+  ExecutionKernel local_kernel{local_planner_owner,
+                               test_execution_kernel_ports(local_context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
                                config};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   auto non_ok_collision = make_authoritative_collision_result();
   non_ok_collision.engine_status = CollisionEngineStatus::kTimeout;
   local_engine->default_result = non_ok_collision;
@@ -5891,19 +6963,26 @@ TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBacke
 
 TEST_F(ExecutionKernelTest,
        CollisionValidationAdmission_WithSharedRuntimeResourceDefersWithoutStoppingMonitor) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto shared_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(local_kernel, local_publisher, shared_engine,
+  ExecutionKernel local_kernel{planner_owner,
+                               test_execution_kernel_ports(context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
+                               config};
+  configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, shared_engine,
                                          shared_engine);
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request());
@@ -5930,22 +7009,30 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, RuntimeCollisionPublishedBundleFailureFailsClosedWithoutStaleFallback) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto validation_engine = std::make_shared<MockCollisionEngine>();
   auto runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel local_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(local_kernel, local_publisher, validation_engine,
+  ExecutionKernel local_kernel{planner_owner,
+                               test_execution_kernel_ports(context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
+                               config};
+  configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, validation_engine,
                                          runtime_engine);
 
   local_kernel.subscribe_events([&](const KernelEvent& e) {
@@ -6047,19 +7134,25 @@ TEST_F(ExecutionKernelTest, RuntimeMonitorPrepareFailureIsCriticalFaultWithoutDi
 }
 
 TEST_F(ExecutionKernelTest, RuntimeProtectionLeaseIsActiveBeforeBackendExecuteStarts) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
-  MockCollisionWorldPublisher local_publisher;
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto shared_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(local_kernel, local_publisher, shared_engine,
+  ExecutionKernel local_kernel{planner_owner,
+                               test_execution_kernel_ports(context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner,
+                               config};
+  configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, shared_engine,
                                          shared_engine);
 
   std::optional<ErrorDTO> admission_during_backend_execute;
@@ -6089,28 +7182,36 @@ TEST_F(ExecutionKernelTest, CollisionCheckTick_NotExecuting_NoOp) {
   EXPECT_EQ(context.collision_count.load(), 0);
 }
 
-// Step 3 regression: the participant reports a runtime collision as a fact
+// Regression: the participant reports a runtime collision as a fact
 // only. It keeps no local fault latch, commits no terminal and issues no
 // backend command; the addressed Kernel owns containment. Retirement after the
 // owner's certified containment is motion-free: it retires the prepared
 // membership and never resets the backend, so positions are preserved.
 TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotionFree) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mu;
   std::condition_variable events_cv;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
     {
@@ -6174,11 +7275,13 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotio
 }
 
 TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterruptedProjection) {
-  ControlledExecution controlled_execution;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
   controlled_execution.enable_execution_progress_publication();
-  ThreadSafeFakeClock local_clock;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
@@ -6189,7 +7292,7 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
   config.runtime_collision_lookahead_workers = 1;
   config.runtime_collision_lookahead_workers_declared = true;
   config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_validation_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
@@ -6198,9 +7301,14 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
   std::condition_variable events_changed;
   std::vector<KernelEvent> events;
   std::atomic<std::uint64_t> addressed_execution_id{0U};
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -6270,11 +7378,13 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
 }
 
 TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBeforeTelemetry) {
-  ControlledExecution controlled_execution;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
   controlled_execution.enable_execution_progress_publication();
-  ThreadSafeFakeClock local_clock;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
@@ -6285,7 +7395,7 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   config.runtime_collision_lookahead_workers = 1;
   config.runtime_collision_lookahead_workers_declared = true;
   config.runtime_collision_lookahead_min_waypoints_for_parallel = 2;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_validation_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
@@ -6293,9 +7403,14 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   std::mutex events_mu;
   std::condition_variable events_cv;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -6369,9 +7484,11 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   // backend handle itself completes.
   const auto* progress = controlled_execution.execution_progress_publication();
   ASSERT_NE(progress, nullptr);
+  EXPECT_TRUE(progress->acquire().valid);
   controlled_execution.complete();
+  // Once the backend completes, the kernel worker may already have retired
+  // the generation (invalid, non-terminal); either way no terminal marker.
   const auto after_late_completion = progress->acquire();
-  EXPECT_TRUE(after_late_completion.valid);
   EXPECT_FALSE(after_late_completion.terminal);
 
   for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -6400,11 +7517,13 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
 }
 
 TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffFencesRacingResult) {
-  ControlledExecution controlled_execution;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
   controlled_execution.enable_execution_progress_publication();
-  ThreadSafeFakeClock local_clock;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
@@ -6414,7 +7533,7 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
   config.runtime_collision_lookahead_max_samples = 8;
   config.runtime_collision_lookahead_workers = 1;
   config.runtime_collision_lookahead_workers_declared = true;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_validation_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   auto local_lookahead_engine = std::make_shared<MockCollisionEngine>();
@@ -6424,9 +7543,14 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
   };
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -6465,19 +7589,27 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ExpandsObservedStateBeforeEngineQuery) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   context.current_state_value.joint_names = {"j1", "j2"};
@@ -6535,18 +7667,24 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ExpandsObservedStateBeforeEngine
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesBackendObservedStateForRuntimeQuery) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
     std::lock_guard<std::mutex> lock(events_mutex);
@@ -6582,16 +7720,22 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesBackendObservedStateForRunti
 
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_RemapsEqualLengthObservedStateWhenJointOrderDiffers) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   TrajectoryDTO collision_trajectory;
@@ -6626,16 +7770,22 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_ObservedStateShapeMismatchFailsClosedBeforeEngineQuery) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -6660,18 +7810,25 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_StaleObservedStateFailsClosedBeforeEngineQuery) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.runtime_observed_state_max_age_ns = 10'000'000;  // 10 ms
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -6705,18 +7862,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SampleReceivedAfterTickBoundaryI
   // The monitor takes its boundary before it acquires the sample, so a sample
   // the publisher stamps in between is newer than the boundary: it is current
   // (received_sample_age.hpp), not an invalid timestamp.
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.runtime_observed_state_max_age_ns = 10'000'000;  // 10 ms
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -6741,18 +7905,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SampleReceivedAfterTickBoundaryI
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ReadsDedicatedPublicationWithoutLifecycleSnapshot) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.runtime_observed_state_max_age_ns = 10'000'000;  // 10 ms
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
@@ -6778,17 +7949,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ReadsDedicatedPublicationWithout
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldRevisionChange) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   auto initial_snapshot = make_test_collision_world_snapshot();
@@ -6833,16 +8012,23 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldR
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseAllowsBoundedOngoingReleaseContact) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   const CollisionPairId pair{"scene/part/shape/0", "scene/support/shape/0"};
@@ -6881,20 +8067,27 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseAllowsBoundedOngoi
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreaseFailsClosed) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   // Captured by the kernel's event callback, so this storage must outlive the
   // kernel.
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -6968,20 +8161,27 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLaterFirstContact) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   // Captured by the kernel's event callback, so this storage must outlive the
   // kernel.
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
     std::lock_guard<std::mutex> lock(events_mutex);
@@ -7044,18 +8244,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLater
 
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_BoundedPenetrationMissingClearanceDoesNotClaimOverCap) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
     std::lock_guard<std::mutex> lock(events_mutex);
@@ -7214,16 +8421,23 @@ TEST_F(ExecutionKernelTest, Execute_ResolvedContactReleaseInstallsOnlyExactDepar
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntimeContact) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   constexpr const char* kPolicyId = "contact_grasp/graspable";
@@ -7260,18 +8474,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntime
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededFailsClosed) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -7343,16 +8564,23 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
 
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_ContactGraspMixedAllowedAndViolationKeepsViolation) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -7406,18 +8634,25 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFailsClosed) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -7493,18 +8728,25 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsClosed) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -7561,19 +8803,26 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
             events.end());
 }
 
-// F-3: a move keeps its admitted operation-local contact policy for the whole
+// A move keeps its admitted operation-local contact policy for the whole
 // move; the published policy never carries it.
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -7619,16 +8868,23 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportContacts) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -7675,16 +8931,23 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportCon
 
 TEST_F(ExecutionKernelTest,
        CollisionMonitoring_ContactGraspFollowsNewWorldWithTheAdmittedPolicy) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -7759,16 +9022,23 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_NonContactMoveFollowsThePublishedPolicy) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
@@ -7820,23 +9090,30 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_NonContactMoveFollowsThePublishe
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 50'000'000;                  // 50 ms
   config.runtime_collision_immediate_query_budget_ns = 25'000'000;  // 25 ms
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::optional<std::int64_t> observed_timeout_budget_ns;
   local_runtime_engine->on_check = [&](const CollisionQuery& query) {
     observed_timeout_budget_ns = query.timeout_budget_ns;
   };
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
@@ -8000,15 +9277,20 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_DuringExecuting_ServesLiveBacke
   // kernel's published cache, so display consumers (visual-state publisher)
   // never see joints a publish-cycle stale. The kernel stays the lifecycle
   // authority: state and execution identity come from the state machine.
-  ControlledExecution controlled_execution;
-  FakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<FakeClock>();
   ManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_collision_world;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
-                                    local_clock, local_scheduler, local_cache};
-  configure_authoritative_collision_validation(controlled_kernel, local_collision_world,
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_authoritative_collision_validation(controlled_kernel, local_collision_world_owner,
                                                local_collision_engine);
 
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request("live_snapshot_move"));
@@ -8073,7 +9355,7 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
   execute_sync(make_test_request());
 
   std::lock_guard<std::mutex> lock(events_mutex);
-  // Spec 230 §6.1: state_transition -> cache_miss -> plan_started ->
+  // state_transition -> cache_miss -> plan_started ->
   //   plan_completed -> state_transition -> validation_started ->
   //   validation_passed -> participant_prepared -> state_transition ->
   //   execute_started -> execute_completed -> participant_settled (fact)
@@ -8226,7 +9508,7 @@ TEST_F(ExecutionKernelTest, Events_CacheHit) {
   execute_sync(make_test_request("cached_move"));
 
   std::lock_guard<std::mutex> lock(events_mutex);
-  // Spec 230 §6.1: admission first enters Planning even when the request
+  // Admission first enters Planning even when the request
   // later resolves to a cache hit.
   ASSERT_GE(events.size(), 10u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
@@ -8256,7 +9538,7 @@ TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
   execute_sync(make_test_request());
 
   std::lock_guard<std::mutex> lock(events_mutex);
-  // Spec 230 §6.1 (failure): state_transition -> cache_miss -> plan_started ->
+  // Failure: state_transition -> cache_miss -> plan_started ->
   //   error_raised -> participant_settled (local-failure fact)
   ASSERT_GE(events.size(), 5u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
@@ -8361,7 +9643,7 @@ TEST_F(ExecutionKernelTest, Events_ExecutionId_Matches) {
 }
 
 // ============================================================================
-// State transition event tests (spec 230 §6.1)
+// State transition event tests
 // ============================================================================
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_HappyPath) {
@@ -8517,7 +9799,7 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_ValidationFailure) {
 }
 
 // ============================================================================
-// Cancellation tests (spec 230 §6.2)
+// Cancellation tests
 // ============================================================================
 
 // ============================================================================
@@ -8686,12 +9968,17 @@ TEST_F(ExecutionKernelTest, Events_CollisionDetectedEvent) {
   // synchronous, we need a different approach We'll use a slow planner and
   // subscribe to events
 
-  SlowMockPlanner slow_planner;
-  FakeClock clock;
+  auto slow_planner_owner = std::make_shared<SlowMockPlanner>();
+
+  SlowMockPlanner& slow_planner = *slow_planner_owner;
+  auto clock_owner = std::make_shared<FakeClock>();
   ManualScheduler scheduler;
-  TrajectoryCache cache{CacheConfig{10}};
-  ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(kernel, collision_world_publisher, collision_engine);
+  auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+                         execution_owner,    clock_owner,
+                         scheduler,          cache_owner};
+  configure_authoritative_collision_validation(kernel, collision_world_publisher_owner,
+                                               collision_engine);
 
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
@@ -8803,12 +10090,17 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   // We need to be in Executing state to call collision_check_tick()
   // Since execution is synchronous, we'll need to use a slow planner
 
-  SlowMockPlanner slow_planner;
-  FakeClock clock;
+  auto slow_planner_owner = std::make_shared<SlowMockPlanner>();
+
+  SlowMockPlanner& slow_planner = *slow_planner_owner;
+  auto clock_owner = std::make_shared<FakeClock>();
   ManualScheduler scheduler;
-  TrajectoryCache cache{CacheConfig{10}};
-  ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
-  configure_authoritative_collision_validation(kernel, collision_world_publisher, collision_engine);
+  auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+                         execution_owner,    clock_owner,
+                         scheduler,          cache_owner};
+  configure_authoritative_collision_validation(kernel, collision_world_publisher_owner,
+                                               collision_engine);
 
   // Set up collision detection
   context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
@@ -8906,7 +10198,7 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
            Case{true, 10.0, 1.0, 21, 21, true},     // Zero-scale hold consumes no budget.
            Case{false, 10.0, 1.0, 10, 10, false},   // Completion at the deadline wins.
            Case{true, 50.0, 1.0, 100, 50, false},   // Preserve a larger requested budget.
-           // Item 40: timing feedback is never itself a failure (the branch's
+           // Timing feedback is never itself a failure (the branch's
            // `runtime_scale_timing_feedback_invalid` is removed). Without a
            // valid applied factor the accepted slider value (1.0 here) times
            // the motion, as `main` did, so the 32 s manual budget applies.
@@ -8916,13 +10208,17 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
            Case{true, 10.0, 1.0, 100, 32, false, FeedbackFailure::kLostSupport},
        }) {
     SCOPED_TRACE(test.expected_ticks);
-    TimedExecution timed;
+    auto timed_owner = std::make_shared<TimedExecution>();
+    TimedExecution& timed = *timed_owner;
     timed.failure = test.failure;
-    ThreadSafeFakeClock ts_clock;
+    auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+    ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
     ThreadSafeManualScheduler ts_scheduler;
-    TrajectoryCache local_cache{CacheConfig{10}};
-    ExecutionKernel timed_kernel{planner, context, timed, ts_clock, ts_scheduler, local_cache};
-    configure_authoritative_collision_validation(timed_kernel, collision_world_publisher,
+    auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+    ExecutionKernel timed_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                 timed_owner,   ts_clock_owner,
+                                 ts_scheduler,  local_cache_owner};
+    configure_authoritative_collision_validation(timed_kernel, collision_world_publisher_owner,
                                                  collision_engine);
     planner.next_result.trajectory = make_test_trajectory();
     planner.next_result.trajectory->waypoints.back().time_from_start_s = 20.0;
@@ -8970,7 +10266,8 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
                                          binding.active_control_configuration_generation,
                                          RuntimeScaleGeneration{0},
                                          RuntimeScaleGeneration{0},
-                                         1.0};
+                                         1.0,
+                                         0U};
     }
     const auto accepted = prepare_and_dispatch(timed_kernel, request);
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -8989,7 +10286,7 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
   }
 }
 
-// Item 40: an optional user-set zero-speed hold timeout. A hold at zero never
+// An optional user-set zero-speed hold timeout. A hold at zero never
 // trips the execution timeout (as `main`); when the hold lasts the user-set
 // time, the participant asks its addressed owner, once, to end the motion
 // Stopped like an operator Stop. Unset keeps `main`: nothing is requested.
@@ -9019,12 +10316,16 @@ TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStopOnce)
   };
   for (const auto hold_timeout_s : {std::optional<double>{}, std::optional<double>{3.0}}) {
     SCOPED_TRACE(hold_timeout_s.has_value() ? "hold timeout set" : "hold timeout unset");
-    HeldExecution held;
-    ThreadSafeFakeClock ts_clock;
+    auto held_owner = std::make_shared<HeldExecution>();
+    HeldExecution& held = *held_owner;
+    auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+    ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
     ThreadSafeManualScheduler ts_scheduler;
-    TrajectoryCache local_cache{CacheConfig{10}};
-    ExecutionKernel held_kernel{planner, context, held, ts_clock, ts_scheduler, local_cache};
-    configure_authoritative_collision_validation(held_kernel, collision_world_publisher,
+    auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+    ExecutionKernel held_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                held_owner,    ts_clock_owner,
+                                ts_scheduler,  local_cache_owner};
+    configure_authoritative_collision_validation(held_kernel, collision_world_publisher_owner,
                                                  collision_engine);
     std::mutex events_mu;
     std::vector<KernelEvent> stop_requests;
@@ -9068,7 +10369,7 @@ TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutMustBePositiveWhenSet) {
   EXPECT_EQ(result.error().details.at("reason_code"), "invalid_zero_speed_hold_timeout");
 }
 
-// Item 17: a worker exception after dispatch leaves the command's effect
+// A worker exception after dispatch leaves the command's effect
 // uncertain (InterventionRequired at the addressed owner) and the Kernel
 // issues the lane's hard stop, the primitive Reset uses.
 TEST_F(ExecutionKernelTest, WorkerExceptionAfterDispatchIssuesTheLaneHardStop) {
@@ -9085,12 +10386,15 @@ TEST_F(ExecutionKernelTest, WorkerExceptionAfterDispatchIssuesTheLaneHardStop) {
       return handle;
     }
   };
-  ThrowingExecution throwing;
-  ThreadSafeFakeClock ts_clock;
+  auto throwing_owner = std::make_shared<ThrowingExecution>();
+  ThrowingExecution& throwing = *throwing_owner;
+  auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel throwing_kernel{planner, context, throwing, ts_clock, ts_scheduler, local_cache};
-  configure_authoritative_collision_validation(throwing_kernel, collision_world_publisher,
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel throwing_kernel{planner_owner,  test_execution_kernel_ports(context_owner),
+                                  throwing_owner, ts_clock_owner,
+                                  ts_scheduler,   local_cache_owner};
+  configure_authoritative_collision_validation(throwing_kernel, collision_world_publisher_owner,
                                                collision_engine);
   ASSERT_TRUE(prepare_and_dispatch(throwing_kernel, make_test_request("worker_exception")).ok());
   ASSERT_TRUE(throwing.wait_until_execute_called());
@@ -9104,15 +10408,18 @@ TEST_F(ExecutionKernelTest, WorkerExceptionAfterDispatchIssuesTheLaneHardStop) {
   EXPECT_EQ(throwing.stop_count_value(), 1);
 }
 
-// Item 18: a backend that ends the motion Stopped without an addressed Stop
+// A backend that ends the motion Stopped without an addressed Stop
 // is a failure with its own reason, never a silent Stopped outcome.
 TEST_F(ExecutionKernelTest, BackendStoppedWithoutAddressedStopFails) {
-  ControlledExecution stopping;
-  ThreadSafeFakeClock ts_clock;
+  auto stopping_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& stopping = *stopping_owner;
+  auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel stopping_kernel{planner, context, stopping, ts_clock, ts_scheduler, local_cache};
-  configure_authoritative_collision_validation(stopping_kernel, collision_world_publisher,
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel stopping_kernel{planner_owner,  test_execution_kernel_ports(context_owner),
+                                  stopping_owner, ts_clock_owner,
+                                  ts_scheduler,   local_cache_owner};
+  configure_authoritative_collision_validation(stopping_kernel, collision_world_publisher_owner,
                                                collision_engine);
   ASSERT_TRUE(prepare_and_dispatch(stopping_kernel, make_test_request("backend_stopped")).ok());
   ASSERT_TRUE(stopping.wait_until_execute_called());
@@ -9126,16 +10433,19 @@ TEST_F(ExecutionKernelTest, BackendStoppedWithoutAddressedStopFails) {
   EXPECT_EQ(status.fact->error->details.at("reason"), "backend_stopped_without_addressed_stop");
 }
 
-// Item 12: Reset after certified containment issues the lane's hard stop
+// Reset after certified containment issues the lane's hard stop
 // when the backend is still winding down and then completes; it never
 // leaves an unresolved retirement behind.
 TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenCompletes) {
-  ControlledExecution winding;
-  ThreadSafeFakeClock ts_clock;
+  auto winding_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& winding = *winding_owner;
+  auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel winding_kernel{planner, context, winding, ts_clock, ts_scheduler, local_cache};
-  configure_authoritative_collision_validation(winding_kernel, collision_world_publisher,
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel winding_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+                                 winding_owner, ts_clock_owner,
+                                 ts_scheduler,  local_cache_owner};
+  configure_authoritative_collision_validation(winding_kernel, collision_world_publisher_owner,
                                                collision_engine);
   const auto result = prepare_and_dispatch(winding_kernel, make_test_request("reset_winding"));
   ASSERT_TRUE(result.ok()) << result.error().message;
@@ -9157,14 +10467,20 @@ TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenComple
 
 TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   // ControlledExecution never completes — timeout should trigger
-  ControlledExecution controlled_execution;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
   // Need a separate kernel with ThreadSafe clock/scheduler for concurrency
-  ThreadSafeFakeClock ts_clock;
+  auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
   ThreadSafeManualScheduler ts_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel timeout_kernel{planner,  context,      controlled_execution,
-                                 ts_clock, ts_scheduler, local_cache};
-  configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher,
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel timeout_kernel{planner_owner,
+                                 test_execution_kernel_ports(context_owner),
+                                 controlled_execution_owner,
+                                 ts_clock_owner,
+                                 ts_scheduler,
+                                 local_cache_owner};
+  configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   auto req = make_test_request();
@@ -9206,13 +10522,16 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
 }
 
 TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
-  SlowMockPlanner slow_planner;
-  ThreadSafeFakeClock ts_clock;
+  auto slow_planner_owner = std::make_shared<SlowMockPlanner>();
+  SlowMockPlanner& slow_planner = *slow_planner_owner;
+  auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
   ThreadSafeManualScheduler ts_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernel timeout_kernel{slow_planner, context,      execution,
-                                 ts_clock,     ts_scheduler, local_cache};
-  configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher,
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernel timeout_kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+                                 execution_owner,    ts_clock_owner,
+                                 ts_scheduler,       local_cache_owner};
+  configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
   auto req = make_test_request();
@@ -9235,7 +10554,7 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
   // Wait for kernel to settle
   timeout_kernel.wait_for_completion();
 
-  // P2: an expired planning deadline is the planning failure
+  // An expired planning deadline is the planning failure
   // `planning_timeout` with nothing dispatched, exactly as when the planner
   // backend reports the timeout; it is never a Stop and publishes no Stop
   // certificate.
@@ -9255,7 +10574,7 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
 }
 
 TEST_F(ExecutionKernelTest, PlanningTimeout_BackendReportedMatchesKernelDeadline) {
-  // P2: whichever timer notices the timeout first, the participant reports
+  // Whichever timer notices the timeout first, the participant reports
   // the same planning failure fact.
   PlanResultDTO plan_err;
   plan_err.error = ErrorDTO{kErrorPlanningTimeout, "Planning timed out", {}};
@@ -9273,7 +10592,7 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_BackendReportedMatchesKernelDeadline
 }
 
 TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcrossRuns) {
-  // spec/500 §2.2/§4.1: the program_run_id of a prepared motion must reach
+  // The program_run_id of a prepared motion must reach
   // every kernel event for that execution and never leak onto the events of
   // a later execution.
   std::mutex events_mutex;
@@ -9421,15 +10740,20 @@ TEST_F(ExecutionKernelTest, Execute_ContactPolicyStampsEventsAndFailedSnapshot) 
 // dispatch-order sequence. Downstream pipelines rely on gaps meaning LOSS,
 // never renumbering, so contiguity across a full lifecycle is the contract.
 TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  MockCollisionWorldPublisher local_publisher;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{planner,     context,         controlled_execution,
-                               local_clock, local_scheduler, local_cache};
-  configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  ExecutionKernel local_kernel{planner_owner,
+                               test_execution_kernel_ports(context_owner),
+                               controlled_execution_owner,
+                               local_clock_owner,
+                               local_scheduler,
+                               local_cache_owner};
+  configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   std::mutex sequences_mutex;
   std::vector<std::uint64_t> sequences;
@@ -9454,7 +10778,7 @@ TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
   }
 }
 
-// Track 1 step 3: the participant reports facts, never operation terminals.
+// The participant reports facts, never operation terminals.
 TEST_F(ExecutionKernelTest, ParticipantPublishesOnlyWorkingPhasesAndFacts) {
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
@@ -9491,7 +10815,7 @@ TEST_F(ExecutionKernelTest, ParticipantPublishesOnlyWorkingPhasesAndFacts) {
   EXPECT_EQ(facts, 2u);
 }
 
-// Track 1 step 3: an exact cancellation before dispatch is reported as the
+// An exact cancellation before dispatch is reported as the
 // cancelled-before-dispatch fact, with nothing dispatched; the addressed
 // Kernel owns the outcome.
 TEST_F(ExecutionKernelTest, CancelBeforeDispatchIsReportedAsItsOwnFact) {
@@ -9534,7 +10858,7 @@ TEST_F(ExecutionKernelTest, CancelBeforeDispatchIsReportedAsItsOwnFact) {
 
 // =============================================================================
 // Core robot participant over IExecutionPort, driven by the real participant
-// Kernel (shared execution design §4.1, §7.4). The fake port scripts every
+// Kernel. The fake port scripts every
 // controller fact; the participant's waiter is the tick that advances fake
 // time, so the Kernel worker's own timing runs deterministically.
 // =============================================================================
@@ -9615,7 +10939,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   }
 
   void Build(ExecutionPortParticipantConfig config) {
-    participant = std::make_unique<ExecutionPortParticipant>(
+    participant = std::make_shared<ExecutionPortParticipant>(
         prepared_motion_binding(prepared_motion_stop_base_plan()), port, pclock, pscheduler,
         [this](TimePoint, const std::stop_token&) {
           {
@@ -9632,9 +10956,10 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
                                                                   : Result<void>::Ok();
                                                }},
         std::move(config));
-    pkernel = std::make_unique<ExecutionKernel>(planner, context, *participant, pclock, pscheduler,
-                                                pcache);
-    configure_authoritative_collision_validation(*pkernel, collision_world_publisher,
+    pkernel =
+        std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
+                                          participant, pclock_owner, pscheduler, pcache_owner);
+    configure_authoritative_collision_validation(*pkernel, collision_world_publisher_owner,
                                                  collision_engine);
     planner.next_result.trajectory = PortTrajectory();
   }
@@ -9754,7 +11079,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
                                            ContentDigest("scope.digest")};
   }
 
-  /// Q51: the stage's own Stop-time values at the Stop request: a controlled
+  /// The stage's own Stop-time values at the Stop request: a controlled
   /// command carries its own profile deadline, nothing else is shared.
   static RemainingStopBudgetDTO BudgetFor(const ResolvedParticipantStopStageDTO& stage) {
     RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, 0, std::nullopt};
@@ -9895,9 +11220,12 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   }
 
   std::shared_ptr<testing::FakeExecutionPort> port = std::make_shared<testing::FakeExecutionPort>();
-  FakeClock pclock;
+  std::shared_ptr<FakeClock> pclock_owner = std::make_shared<FakeClock>();
+  FakeClock& pclock = *pclock_owner;
   ThreadSafeManualScheduler pscheduler;
-  TrajectoryCache pcache{CacheConfig{10}};
+  std::shared_ptr<TrajectoryCache> pcache_owner =
+      std::make_shared<TrajectoryCache>(CacheConfig{10});
+  TrajectoryCache& pcache = *pcache_owner;
   ObservedRobotStatePublication publication{
       {"joint_1", "joint_2"},
       {ObservedRobotStateSourceConfig{
@@ -9907,10 +11235,10 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   std::function<void()> tick;
   std::atomic<int> ticks{0};
   std::atomic<std::uint64_t> receipts{0U};
-  // M6 ADAPTERM: the lane's pre-planning sync (its re-engage), when set.
+  // The lane's pre-planning sync (its re-engage), when set.
   std::function<Result<void>()> sync_hook;
   std::atomic<int> syncs{0};
-  std::unique_ptr<ExecutionPortParticipant> participant;
+  std::shared_ptr<ExecutionPortParticipant> participant;
   std::unique_ptr<ExecutionKernel> pkernel;
 };
 
@@ -9925,7 +11253,7 @@ TEST_F(PortParticipantKernelTest, ExecutesWithCompletePathTimeTrajectoryCursorAn
     if (!key) return;
     ++step;
     if (step == 1) {
-      // Item 10: Executing is published at dispatch, before any controller fact.
+      // Executing is published at dispatch, before any controller fact.
       state_before_first_fact = participant->get_execution_snapshot().state;
       Executing(*key);
     }
@@ -9954,14 +11282,14 @@ TEST_F(PortParticipantKernelTest, ExecutesWithCompletePathTimeTrajectoryCursorAn
     EXPECT_EQ(sent.accelerations_rad_s2, planned.waypoints[index].accelerations_rad_s2);
   }
   EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
-  // Progress is the controller's own cursor (§3.3), no second clock.
+  // Progress is the controller's own cursor, no second clock.
   EXPECT_DOUBLE_EQ(progress_at_half, 2.0 / 4.0);
   EXPECT_EQ(cursor_at_half_ns, 2'000'000'000);
   // Natural completion retains the original path's end for continuation.
   const auto observed = pkernel->ObservePreparedMotion(accepted.value());
   ASSERT_TRUE(observed.ok());
   EXPECT_EQ(observed.value().stopped_trajectory_time_s, 4.0);
-  // Commanded authority (item 20): the commanded end state, no measured check.
+  // Commanded authority: the commanded end state, no measured check.
   EXPECT_EQ(participant->get_execution_snapshot().joint_positions_rad,
             (std::vector<double>{2.0, 2.0}));
 }
@@ -10007,14 +11335,14 @@ TEST_F(PortParticipantKernelTest, MeasuredDispatchChecksTheStartStateBeforeTheGo
       EXPECT_EQ(error->code, "start_state_mismatch");
       EXPECT_EQ(error->details.at("start_tolerance_rad"), "0.010000");
       EXPECT_EQ(error->details.at("max_joint_error_rad"), "0.050000");
-      // M6 ADAPTERM: e.g. a jog or Move-to target computed before a manual
+      // E.g. a jog or Move-to target computed before a manual
       // move; the typed refusal tells the operator what to do.
       EXPECT_NE(error->message.find("preview again"), std::string::npos) << error->message;
     }
   }
 }
 
-// M6 ADAPTERM: an admitted motion after an idle move from the robot's own
+// An admitted motion after an idle move from the robot's own
 // interface. The participant's pre-planning sync (the lane's re-engage) runs
 // before planning; the robot then reports its current pose and the goal is
 // sent from it.
@@ -10052,7 +11380,7 @@ TEST_F(PortParticipantKernelTest, AnIdleMoveIsReengagedBeforePlanningAndTheGoalS
             (std::vector<double>{0.0, 0.0}));
 }
 
-// M6 ADAPTERM: a re-engage that fails refuses the admitted motion typed,
+// A re-engage that fails refuses the admitted motion typed,
 // before planning; no goal is sent, the robot does not move.
 TEST_F(PortParticipantKernelTest, AReengageFailureRefusesTheMotionBeforeAnyGoal) {
   Build(Config(StateAuthorityClass::kMeasured));
@@ -10071,9 +11399,9 @@ TEST_F(PortParticipantKernelTest, AReengageFailureRefusesTheMotionBeforeAnyGoal)
   EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
 }
 
-// M6 (approval list 2, item 34): a jog/Move-to preview made while the arm
+// A jog/Move-to preview made while the arm
 // counted as moved planned from the vendor pose. Execute keeps the existing
-// flow: the pre-planning sync re-arms (ADAPTERM), then the participant checks
+// flow: the pre-planning sync re-arms, then the participant checks
 // the trajectory's start against the first fresh measured sample after the
 // rebind. The fixture planner's trajectory starts at 0 rad, the pose it was
 // planned from. Unchanged: the goal is sent from there. The fresh measured
@@ -10162,7 +11490,7 @@ TEST_F(PortParticipantKernelTest, DiagnosticContextCallbackPrecedesSendAndCannot
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
 }
 
-// M6 ADAPTERM TOOLCTX (live 2026-10-28): a TCP offset send leaves the
+// A TCP offset send leaves the
 // controller's ready state; the lane re-arms the robot and binds the
 // reactivated controller on a new port (a new epoch). The dispatch decision
 // then runs again on that port: a fresh sample at the start pose sends the
@@ -10221,7 +11549,7 @@ TEST_F(PortParticipantKernelTest, AToolContextRearmRevalidatesTheDispatchOnTheRe
 }
 
 TEST_F(PortParticipantKernelTest, ToolContextIsAppliedAtRestBeforeTheSendAndAFailureRefusesTheMotion) {
-  // TOOLCTX: the lane applies the robot's tool context once per new goal,
+  // The lane applies the robot's tool context once per new goal,
   // before Submit (nothing in flight), with the motion's own TCP. A context
   // the robot did not confirm sends no goal: the motion fails typed.
   for (const bool fails : {false, true}) {
@@ -10295,7 +11623,7 @@ TEST_F(PortParticipantKernelTest, StopDuringASlowToolContextApplyWinsAndNoGoalIs
   ExecutionHandle handle;
   Result<void> applied = Result<void>::Ok();
   std::thread dispatcher([&] {
-    // M6b: the tool-context action, then the dispatch (as the Kernel runs them).
+    // The tool-context action, then the dispatch (as the Kernel runs them).
     applied = participant->ApplyToolContext(product);
     handle = participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
   });
@@ -10330,7 +11658,7 @@ TEST_F(PortParticipantKernelTest, StopDuringASlowToolContextApplyWinsAndNoGoalIs
 }
 
 TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesThatGoal) {
-  // M6b (maintainer rule): a Stop stage naming a goal this participant never
+  // A Stop stage naming a goal this participant never
   // sent, with no goal live and no other Stop running, has nothing to stop. It
   // is contained without any controller sample or rest check (not a failed
   // uncontained Stop), and that goal is never sent afterwards.
@@ -10379,7 +11707,7 @@ TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesTh
 }
 
 TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
-  // TOOLCTX: the tool context is applied for a new goal only, never for a
+  // The tool context is applied for a new goal only, never for a
   // moving replacement (Replace, or ReplaceScheduled on a lane that supports
   // it): the robot is moving then.
   for (const bool scheduled : {false, true}) {
@@ -10427,7 +11755,7 @@ TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
   }
 }
 
-// M6b (maintainer 2026-10-29): the tool-context action is its own step before
+// The tool-context action is its own step before
 // the motion is sent, and the motion counts as running (Executing) only once
 // it was sent: during the action the execution is still Validating, nothing
 // was submitted and no execute-started event was published. A refused action
@@ -10710,7 +12038,7 @@ TEST_F(PortParticipantKernelTest, TrackingBreachCancelsTheGoalWithUncertainEffec
       EXPECT_FALSE(goal->cancel_ack_local_receipt_stamp);
       EXPECT_FALSE(goal->result);
     } else {
-      // Offline: no feedback, no check (item 13).
+      // Offline: no feedback, no check.
       ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
       EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
     }
@@ -10766,6 +12094,73 @@ TEST_F(PortParticipantKernelTest, ControllerResultsAndBindingLossMapAsMain) {
     EXPECT_EQ(Calls<testing::FakeExecutionPort::CancelCall>().size(),
               test.result.has_value() ? 0U : 1U);
   }
+}
+
+TEST_F(PortParticipantKernelTest, RebuiltOwnerRequiresLaterFreshStillObservations) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    if (++step == 1) Executing(*key);
+    if (step == 3)
+      port->FinishGoal(*key, ExecutionGoalResult::kEndedUnknown, std::nullopt, pclock.now());
+  };
+  ASSERT_TRUE(Start(PortRequest("owner_rebuild_unknown")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "failed_effect_uncertain")) << ended_as(*pkernel);
+  ASSERT_TRUE(pkernel->wait_for_completion(1'000'000'000));
+  const auto original = pkernel->get_status().fact;
+  ASSERT_TRUE(original);
+  EXPECT_EQ(original->effect, ParticipantEffectKnowledge::kEffectUncertain);
+  const std::vector<std::string> names{"joint_1", "joint_2"};
+  const std::vector<double> positions{0.0, 0.0};
+  const auto publish = [&](double velocity) {
+    const std::vector<double> velocities{velocity, velocity};
+    return publication.publish(ObservedRobotStateSourceKind::kJointState, names, positions,
+                               velocities, pclock.now(), pclock.now());
+  };
+  ASSERT_TRUE(publish(0.0).published);
+  const auto old_command_count = port->commands().size();
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  EXPECT_FALSE(pkernel->get_recovery_assessment().eligible_close);
+  auto staged = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(staged.ok());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
+  ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
+  EXPECT_TRUE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  participant->CommitLockedOwnerRebind(staged.value());
+  EXPECT_TRUE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  participant->UnlockOwnerRebind(staged.value());
+  pkernel->NotifyOwnerRebuilt();
+  pscheduler.advance_to(pclock.now());
+  EXPECT_FALSE(pkernel->get_recovery_assessment().eligible_close);
+  ASSERT_TRUE(publish(0.5).published);
+  pclock.advance(20'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_FALSE(pkernel->get_recovery_assessment().eligible_close);
+  ASSERT_TRUE(publish(0.0).published);
+  pclock.advance(20'000'000);
+  pscheduler.advance_to(pclock.now());
+  pclock.advance(210'000'000);
+  ASSERT_TRUE(publish(0.0).published);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_TRUE(pkernel->get_recovery_assessment().eligible_close);
+  EXPECT_EQ(pkernel->get_status().fact, original);
+  pclock.advance(1'100'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_TRUE(pkernel->get_recovery_assessment().eligible_close);
+  EXPECT_FALSE(pkernel->get_recovery_assessment().observed_state_fresh);
+  ASSERT_TRUE(publish(0.5).published);
+  pclock.advance(20'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_TRUE(pkernel->get_recovery_assessment().eligible_close);
+  EXPECT_FALSE(pkernel->get_recovery_assessment().observed_state_at_rest);
+  EXPECT_EQ(pkernel->get_status().fact, original);
+  EXPECT_EQ(port->commands().size(), old_command_count);
+  EXPECT_TRUE(next->commands().empty());
 }
 
 TEST_F(PortParticipantKernelTest, MissingGoalReportsUncertainEffectsWithoutAnotherCommand) {
@@ -10867,7 +12262,7 @@ TEST_F(PortParticipantKernelTest, ExecutionTimeoutRunsOnTheAppliedFactorFromSamp
     ++step;
     if (step == 1) Executing(*key);
     pclock.advance(1'000'000'000);
-    // Item 40: elapsed x applied factor (0.5) -> 2 s of budget per 4 s.
+    // Elapsed x applied factor (0.5) -> 2 s of budget per 4 s.
     Sample(0.5 * step, 0.25 * step, 0.5, 0.5);
     if (!Calls<testing::FakeExecutionPort::CancelCall>().empty()) {
       port->FinishGoal(*key, ExecutionGoalResult::kCanceled, std::nullopt, pclock.now());
@@ -10916,7 +12311,7 @@ TEST_F(PortParticipantKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToSto
 }
 
 TEST_F(PortParticipantKernelTest, SpeedRampSlewsLinearlyOneValuePerTickAndReadsTheAppliedFactorBack) {
-  // Item 28 / Q11: linear slew at the trajectory's max_rate_per_s (at most
+  // Linear slew at the trajectory's max_rate_per_s (at most
   // 4/s), one value per controller-rate tick; no rate-change limit applies.
   struct Case {
     double max_rate_per_s;
@@ -10987,17 +12382,17 @@ TEST_F(PortParticipantKernelTest, TimingObservationKeepsLatenessApartFromTelemet
   EXPECT_DOUBLE_EQ(metrics.max_period_s, 0.014);
   EXPECT_DOUBLE_EQ(metrics.max_state_stamp_gap_s, 0.3);
   EXPECT_GT(metrics.windows, 0U);
-  // Q50 "measure": the dispatched goal's recognition delay (dispatch to its
+  // The dispatched goal's recognition delay (dispatch to its
   // own first feedback, local clock).
   EXPECT_EQ(metrics.goals_recognized, 1U);
   EXPECT_GE(metrics.last_recognition_delay_ns, 0);
   EXPECT_EQ(metrics.max_recognition_delay_ns, metrics.last_recognition_delay_ns);
 }
 
-TEST_F(PortParticipantKernelTest, LateControlCycleBeyondTheMarginIsTheItem17Path) {
-  // Q52: a controller cycle later than the lane margin is handled like item
-  // 17: the Kernel issues the lane's hard stop (the goal cancel) and the
-  // motion ends InterventionRequired with `late_control_cycle`.
+TEST_F(PortParticipantKernelTest, LateControlCycleBeyondTheMarginHardStopsTheMotion) {
+  // A controller cycle later than the lane margin is handled like a worker
+  // exception after dispatch: the Kernel issues the lane's hard stop (the goal
+  // cancel) and the motion ends InterventionRequired with `late_control_cycle`.
   Build(Config(StateAuthorityClass::kCommanded));
   std::atomic<int> step{0};
   tick = [&] {
@@ -11023,7 +12418,7 @@ TEST_F(PortParticipantKernelTest, LateControlCycleBeyondTheMarginIsTheItem17Path
   EXPECT_EQ(participant->timing_metrics().windows_late_beyond_margin, 1U);
 }
 
-TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultIsTheItem17Path) {
+TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultHardStopsTheMotion) {
   // A host-reported mechanism fault ends in-flight motion through the Kernel's
   // hard stop, not as a controller-binding loss.
   Build(Config(StateAuthorityClass::kCommanded));
@@ -11107,7 +12502,7 @@ TEST_F(PortParticipantKernelTest, SoftStopUnderTheAddressedFenceEndsTheExecution
   ASSERT_EQ(Calls<testing::FakeExecutionPort::ReplaceCall>().size(), 1U);
   ASSERT_TRUE(wait_for_ended(*pkernel, "preempted_by_addressed_stop")) << ended_as(*pkernel);
   EXPECT_EQ(participant->get_execution_snapshot().state, ExecutionState::kStopped);
-  // §3.3: the soft Stop's end on the original path, mapped by the planner,
+  // The soft Stop's end on the original path, mapped by the planner,
   // is retained for continuation (ahead of the 1.0 s trip cursor).
   const auto observed = pkernel->ObservePreparedMotion(accepted.value());
   ASSERT_TRUE(observed.ok());
@@ -11166,26 +12561,30 @@ TEST_F(PortParticipantKernelTest, HardStopStageUnderTheFenceBrakesThroughTheHelp
 TEST_F(PortParticipantKernelTest, RebindingTakesANewPortForTheNewEpochOnlyWhenQuiescent) {
   Build(Config(StateAuthorityClass::kCommanded));
   std::atomic<int> step{0};
+  std::atomic<bool> allow_completion{false};
   tick = [&] {
     const auto key = SubmittedKey();
     if (!key) return;
     ++step;
     if (step == 1) Executing(*key);
-    if (step == 4) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    if (step >= 4 && allow_completion.load())
+      port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
   };
   const auto first = Start(PortRequest("port_epoch_1"));
   ASSERT_TRUE(first.ok());
   auto next_port = std::make_shared<testing::FakeExecutionPort>();
   next_port->SetLaneFacts(port->ReadLaneFacts());
   next_port->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
-  if (ended_as(*pkernel) != "completed") {
-    const auto busy = participant->RebindPort(next_port);
-    ASSERT_FALSE(busy.ok());
-    EXPECT_EQ(busy.error().details.at("reason"), "execution_port_rebind_busy");
-  }
+  const auto busy = participant->RebindPort(next_port);
+  ASSERT_FALSE(busy.ok());
+  EXPECT_EQ(busy.error().details.at("reason"), "execution_port_rebind_busy");
+  EXPECT_FALSE(participant->RebindPortAfterOwnerRebuild(next_port).ok());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  allow_completion.store(true);
   ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
   ASSERT_TRUE(pkernel->acknowledge_completed(first.value()).accepted);
   ASSERT_TRUE(participant->RebindPort(next_port).ok());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
 
   // The next motion runs on the new epoch's port; the old port sees nothing.
   const auto old_commands = port->commands().size();
@@ -11199,6 +12598,217 @@ TEST_F(PortParticipantKernelTest, RebindingTakesANewPortForTheNewEpochOnlyWhenQu
   ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
   EXPECT_EQ(old_port->commands().size(), old_commands);
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+}
+
+TEST_F(PortParticipantKernelTest, StagedOwnerTimerCancelFailureRetainsExactHandle) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (key) Executing(*key);
+  };
+  ASSERT_TRUE(Start(PortRequest("owner_timer_failure")).ok());
+  participant->set_runtime_velocity_scale(0.5);
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  auto staged = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(staged.ok());
+  pscheduler.fail_next_cancel();
+  EXPECT_THROW(participant->RetireOwnerRebindTimer(staged.value()), std::runtime_error);
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  const auto failed = pscheduler.cancel_test_handles().first;
+  ASSERT_NE(failed, 0U);
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
+  EXPECT_EQ(pscheduler.cancel_test_handles().second, failed);
+  // The timer was retired, but an active goal still refuses publication.
+  EXPECT_FALSE(participant->LockOwnerRebind(staged.value()).ok());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+}
+
+TEST_F(PortParticipantKernelTest, StagedOwnerRebindPublishesOnlyAfterLockedCommit) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  auto staged = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(staged.ok());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
+  ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
+  participant->UnlockOwnerRebind(staged.value());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
+  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  participant->CommitLockedOwnerRebind(staged.value());
+  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  participant->UnlockOwnerRebind(staged.value());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  EXPECT_TRUE(port->commands().empty());
+  EXPECT_TRUE(next->commands().empty());
+}
+
+TEST_F(PortParticipantKernelTest, StagedOwnerRebindClearsUnrelatedMarkerForCompletedMotion) {
+  const auto product = DirectBackendProduct();
+  ASSERT_TRUE(participant->RetirePreparedExecution(1U).ok());
+  auto first = std::make_shared<testing::FakeExecutionPort>();
+  first->SetLaneFacts(port->ReadLaneFacts());
+  first->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  ASSERT_TRUE(participant->RebindPortAfterOwnerRebuild(first).ok());
+  ASSERT_TRUE(participant->owner_rebuild_observation());
+  EXPECT_EQ(participant->owner_rebuild_observation()->first, 0U);
+  ASSERT_EQ(participant->Prepare(product, 2U).state, PrepareParticipantResultStateDTO::kPrepared);
+  port = first;
+  Sample(0.0, 0.0, 0.0);
+  const ExecutionGoalKey key{ControllerGoalId("rebuild.completed"), ControllerGoalGeneration(1U)};
+  const auto handle = participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+  Executing(key);
+  port->FinishGoal(key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+  ASSERT_TRUE(handle.wait_for_completion(0));
+  ASSERT_EQ(handle.get_snapshot().state, ExecutionState::kCompleted);
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(3U)});
+  auto staged = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(staged.ok());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
+  ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
+  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  participant->CommitLockedOwnerRebind(staged.value());
+  participant->UnlockOwnerRebind(staged.value());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+}
+
+TEST_F(PortParticipantKernelTest, StagedOwnerRebindRefusesChangedPortAndLaneWithoutPublication) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  auto stale = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(stale.ok());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(stale.value()).ok());
+  auto intervening = std::make_shared<testing::FakeExecutionPort>();
+  intervening->SetLaneFacts(port->ReadLaneFacts());
+  ASSERT_TRUE(participant->RebindPort(intervening).ok());
+  const auto rejected = participant->LockOwnerRebind(stale.value());
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "execution_port_rebind_busy");
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+
+  auto bad = std::make_shared<testing::FakeExecutionPort>();
+  auto lane = port->ReadLaneFacts();
+  lane.joint_names = {"foreign"};
+  bad->SetLaneFacts(lane);
+  auto invalid = participant->StageOwnerRebind(bad);
+  ASSERT_TRUE(invalid.ok());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(invalid.value()).ok());
+  const auto mismatch = participant->LockOwnerRebind(invalid.value());
+  ASSERT_FALSE(mismatch.ok());
+  EXPECT_EQ(mismatch.error().details.at("reason"), "execution_port_lane_facts_mismatch");
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+}
+
+TEST_F(PortParticipantKernelTest, OwnerRebuildWithoutRetainedGoalUsesOwnerOnlyMarker) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  EXPECT_TRUE(participant->RebindPortAfterOwnerRebuild(next).ok());
+  ASSERT_TRUE(participant->owner_rebuild_observation());
+  EXPECT_EQ(participant->owner_rebuild_observation()->first, 0U);
+  pkernel->NotifyOwnerRebuilt();
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(pkernel->get_recovery_assessment().reason_code, kOwnerRebuildObservationPending);
+  const std::vector<std::string> names{"joint_1", "joint_2"};
+  const std::vector<double> positions{0.0, 0.0};
+  const std::vector<double> still{0.0, 0.0};
+  ASSERT_TRUE(publication.publish(ObservedRobotStateSourceKind::kJointState, names, positions,
+                                  still, pclock.now(), pclock.now()).published);
+  pclock.advance(20'000'000);
+  pscheduler.advance_to(pclock.now());
+  pclock.advance(210'000'000);
+  ASSERT_TRUE(publication.publish(ObservedRobotStateSourceKind::kJointState, names, positions,
+                                  still, pclock.now(), pclock.now()).published);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(pkernel->get_recovery_assessment().reason_code, kOwnerRebuildObservedAtRest);
+  EXPECT_FALSE(pkernel->get_recovery_assessment().eligible_close);
+  EXPECT_TRUE(port->commands().empty());
+  EXPECT_TRUE(next->commands().empty());
+}
+
+TEST_F(PortParticipantKernelTest, OwnerRebuildKeepsPreparedSuccessorWithoutNewRefusal) {
+  const auto product = DirectBackendProduct();
+  Sample(0.0, 0.0, 0.0);
+  const ExecutionGoalKey old{ControllerGoalId("rebuild.old"), ControllerGoalGeneration(1U)};
+  const auto handle = participant->Dispatch(product, old.controller_goal_id,
+                                             old.controller_goal_generation);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  ASSERT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  const auto successor = DirectSuccessor(product, source.value());
+  ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  port->FinishGoal(old, ExecutionGoalResult::kEndedUnknown, std::nullopt, pclock.now());
+  ASSERT_TRUE(handle.wait_for_completion(0));
+  EXPECT_EQ(handle.get_snapshot().state, ExecutionState::kInterventionRequired);
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  const auto commands = port->commands().size();
+  ASSERT_TRUE(participant->RebindPortAfterOwnerRebuild(next).ok());
+  ASSERT_TRUE(participant->owner_rebuild_observation());
+  EXPECT_EQ(participant->owner_rebuild_observation()->first, 1U);
+  EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
+  EXPECT_EQ(port->ReadGoal(old)->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(port->commands().size(), commands);
+  EXPECT_TRUE(next->commands().empty());
+}
+
+TEST_F(PortParticipantKernelTest, OwnerRebuildRetainsUnknownDispatchedSuccessorUntilRest) {
+  const auto product = DirectBackendProduct();
+  Sample(0.0, 0.0, 0.0);
+  const ExecutionGoalKey old{ControllerGoalId("rebuild.unknown.old"), ControllerGoalGeneration(1U)};
+  const auto handle = participant->Dispatch(product, old.controller_goal_id,
+                                             old.controller_goal_generation);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  ASSERT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  const auto successor = DirectSuccessor(product, source.value());
+  ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  const ExecutionGoalKey next_key{ControllerGoalId("rebuild.unknown.next"),
+                                  ControllerGoalGeneration(2U)};
+  const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next_key,
+                                                      pclock.now() + 1'000'000'000);
+  ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+  port->FinishGoal(old, ExecutionGoalResult::kEndedUnknown, std::nullopt, pclock.now());
+  ASSERT_TRUE(handle.wait_for_completion(0));
+  ASSERT_EQ(handle.get_snapshot().state, ExecutionState::kInterventionRequired);
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  EXPECT_FALSE(participant->RebindPortAfterOwnerRebuild(next).ok());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  port->FinishGoal(next_key, ExecutionGoalResult::kEndedUnknown, std::nullopt, pclock.now());
+  EXPECT_FALSE(participant->RebindPort(next).ok());
+  const auto commands = port->commands().size();
+  ASSERT_TRUE(participant->RebindPortAfterOwnerRebuild(next).ok());
+  EXPECT_FALSE(participant->RetirePreparedExecution(2U).ok());
+  participant->record_owner_rebuild_rest(99U);
+  EXPECT_FALSE(participant->RetirePreparedExecution(2U).ok());
+  participant->record_owner_rebuild_rest(1U);
+  EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
+  ASSERT_TRUE(port->ReadGoal(old));
+  ASSERT_TRUE(port->ReadGoal(next_key));
+  EXPECT_EQ(port->ReadGoal(old)->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(port->ReadGoal(next_key)->result, ExecutionGoalResult::kEndedUnknown);
+  EXPECT_EQ(port->commands().size(), commands);
+  EXPECT_TRUE(next->commands().empty());
 }
 
 TEST_F(PortParticipantKernelTest, RebindKeepsTheOldPreparedMembershipUntilItsOwnerRetiresIt) {
@@ -11607,8 +13217,185 @@ TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopte
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
 }
 
+TEST_F(PortParticipantKernelTest, ReplacementSendRecheckCancelsTheSwapBeforeThePort) {
+  // OD-68: the Kernel's lock-free re-check runs once, unlocked, right before
+  // the send. An error cancels the swap before any Replace reaches the port,
+  // with that typed reason and no retained record; a clear re-check sends.
+  for (const bool revoke : {true, false}) {
+    SCOPED_TRACE(revoke);
+    const auto product = DirectBackendProduct();
+    Sample(0.0, 0.0, 0.0);
+    const ExecutionGoalKey old{ControllerGoalId("recheck.old"), ControllerGoalGeneration(1U)};
+    const auto handle =
+        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok());
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ExecutionGoalKey next{ControllerGoalId("recheck.next"), ControllerGoalGeneration(2U)};
+    int rechecks = 0;
+    const auto sent = participant->DispatchReplacement(
+        source.value(), 2U, successor, next, pclock.now() + 1'000'000'000,
+        [&]() -> std::optional<ErrorDTO> {
+          ++rechecks;
+          if (!revoke) return std::nullopt;
+          return ErrorDTO{kErrorExecutionRejected,
+                          "Source runtime protection changed before the replacement send",
+                          {{"reason", "motion_replacement_source_hazard_authority"}}};
+        });
+    EXPECT_EQ(rechecks, 1);
+    const auto replacements = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    if (revoke) {
+      EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kNotDispatched);
+      ASSERT_TRUE(sent.command.error);
+      EXPECT_EQ(sent.command.error->details.at("reason"),
+                "motion_replacement_source_hazard_authority");
+      EXPECT_FALSE(sent.submitted_at_ns);
+      EXPECT_TRUE(replacements.empty());
+      const auto observed = participant->ObserveReplacement(source.value(), 2U);
+      ASSERT_TRUE(observed.ok());
+      EXPECT_EQ(observed.value().phase, PreparedMotionReplacementPhaseDTO::kNoEffect);
+      ASSERT_TRUE(participant->RetirePreparedExecution(2U).ok());
+      // The successor recorded before the send was removed again: the source
+      // can supply a new replacement (no pending replacement remains).
+      EXPECT_TRUE(participant
+                      ->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                 product.prepared_contract_digest)
+                      .ok());
+    } else {
+      EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+      EXPECT_TRUE(sent.submitted_at_ns);
+      ASSERT_EQ(replacements.size(), 1U);
+      EXPECT_EQ(replacements.front().next_key, next);
+    }
+    Reset();
+  }
+}
+
+TEST_F(PortParticipantKernelTest, AStopDuringTheReplacementSendFencesItBeforeThePort) {
+  // The participant lock is not held across the send. A Stop that enters
+  // while the send is in flight (here: held inside the pre-send re-check,
+  // before the port admits it) fences the send's token: the port never sends
+  // it, the hard stop does not wait for the send, and a Stop stage waits only
+  // until the fenced sender has withdrawn its record.
+  enum class Stop { kHardStop, kStopStage };
+  for (const auto kind : {Stop::kHardStop, Stop::kStopStage}) {
+    SCOPED_TRACE(static_cast<int>(kind));
+    const auto product = DirectBackendProduct();
+    Sample(0.0, 0.0, 0.0);
+    const ExecutionGoalKey old{ControllerGoalId("inflight.old"), ControllerGoalGeneration(1U)};
+    const auto handle =
+        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok());
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ExecutionGoalKey next{ControllerGoalId("inflight.next"), ControllerGoalGeneration(2U)};
+    struct Gate {
+      std::mutex mutex;
+      std::condition_variable changed;
+      bool entered{};
+      bool released{};
+      void release() {
+        {
+          std::lock_guard lock(mutex);
+          released = true;
+        }
+        changed.notify_all();
+      }
+    } gate;
+    PreparedMotionReplacementDispatchDTO sent;
+    std::thread sender([&] {
+      sent = participant->DispatchReplacement(
+          source.value(), 2U, successor, next, pclock.now() + 1'000'000'000,
+          [&]() -> std::optional<ErrorDTO> {
+            std::unique_lock lock(gate.mutex);
+            gate.entered = true;
+            gate.changed.notify_all();
+            gate.changed.wait(lock, [&] { return gate.released; });
+            return std::nullopt;
+          });
+    });
+    struct JoinOnExit {
+      Gate& gate;
+      std::thread& thread;
+      ~JoinOnExit() {
+        gate.release();
+        if (thread.joinable()) thread.join();
+      }
+    } join_sender{gate, sender};
+    {
+      std::unique_lock lock(gate.mutex);
+      ASSERT_TRUE(gate.changed.wait_for(lock, std::chrono::seconds(2),
+                                        [&] { return gate.entered; }));
+    }
+    // In flight and unlocked: retirement sees a possibly sent replacement.
+    const auto in_flight = participant->RetirePreparedExecution(2U);
+    ASSERT_FALSE(in_flight.ok());
+    EXPECT_EQ(in_flight.error().message, "The replacement may still have effects");
+    std::optional<ParticipantStopStageResultDTO> stage_result;
+    std::thread stopper;
+    if (kind == Stop::kHardStop) {
+      // Returns while the send is still held: it never waits for the send.
+      const auto stopped = participant->stop();
+      EXPECT_TRUE(stopped.accepted) << (stopped.error ? stopped.error->message : "");
+    } else {
+      std::stop_source cancel;
+      cancel.request_stop();
+      const auto stage = StageForProduct(product, old, 0U);
+      stopper = std::thread([&, stage, token = cancel.get_token()] {
+        stage_result = participant->TranslateStopStage(stage, BudgetFor(stage), token);
+      });
+      // The stage fenced the token in its entry section (same lock section
+      // that counts it in flight).
+      const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      bool entered = false;
+      while (!entered && std::chrono::steady_clock::now() < until) {
+        const auto busy = participant->RetirePreparedExecution(2U);
+        entered = !busy.ok() && busy.error().message == "Replacement Stop work is in flight";
+        if (!entered) std::this_thread::yield();
+      }
+      EXPECT_TRUE(entered);
+    }
+    gate.release();
+    sender.join();
+    if (stopper.joinable()) stopper.join();
+    EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kNotDispatched);
+    ASSERT_TRUE(sent.command.error);
+    EXPECT_EQ(sent.command.error->details.at("reason"), "motion_replacement_stop_fenced");
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::ReplaceCall>().empty());
+    if (kind == Stop::kHardStop) {
+      // Fenced before admission: only the exact source goal is cancelled.
+      const auto cancels = Calls<testing::FakeExecutionPort::CancelCall>();
+      ASSERT_EQ(cancels.size(), 1U);
+      EXPECT_EQ(cancels.front().key, old);
+    } else {
+      ASSERT_TRUE(stage_result);
+      EXPECT_FALSE(stage_result->error &&
+                   stage_result->error->details.contains("reason") &&
+                   stage_result->error->details.at("reason") == "stop_evidence_phase_expired");
+    }
+    const auto observed = participant->ObserveReplacement(source.value(), 2U);
+    ASSERT_TRUE(observed.ok());
+    EXPECT_EQ(observed.value().phase, PreparedMotionReplacementPhaseDTO::kNoEffect);
+    Reset();
+  }
+}
+
 TEST_F(PortParticipantKernelTest, RestartedControllerCursorRefusesTheTakeoverWithoutASend) {
-  // D8: between the controller's end hold (cursor back near 0) and the terminal
+  // Between the controller's end hold (cursor back near 0) and the terminal
   // result, a takeover joined at that cursor would command a move back toward
   // the source start. It is refused before any send (the Kernel then runs the
   // configured Stop fallback).
@@ -11700,7 +13487,7 @@ TEST_F(PortParticipantKernelTest,
     EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
     if (factor == 0.0) {
       // Existing moving admission permits zero; pairing does not add a new
-      // refusal. Q45 controlled Stop remains separately cancel-only.
+      // refusal. A Stop at factor zero remains separately cancel-only.
       Reset();
       continue;
     }
@@ -11980,7 +13767,7 @@ TEST_F(PortParticipantKernelTest, ReleaseHoldNeverCrossesADeadlineAndRechecksRea
 }
 
 TEST_F(PortParticipantKernelTest, ReleaseHoldWaitsWithoutTheParticipantLockAndRerunsTheDecision) {
-  // SX-3475: the moving takeover waits for its release WITHOUT the participant
+  // The moving takeover waits for its release WITHOUT the participant
   // mutex, then reruns the existing dispatch decision. The waiter is paced 1:1
   // with real time (1 ms fake per 1 ms sleep) so lock delays are measurable.
   enum class Race { kStop, kRetired, kDuplicate, kOtherSuccessor, kOversleep };
@@ -12181,6 +13968,25 @@ TEST_F(PortParticipantKernelTest, ReplacementDeadlineAndInheritedRampBoundsRefus
     EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
     Reset();
   }
+}
+
+// OD-72: latest value wins at the participant's ramp target. An older value
+// that arrives after a newer one changes nothing; nothing is refused.
+TEST_F(PortParticipantKernelTest, AnOlderSpeedValueArrivingLaterIsSuperseded) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  const auto sent = [&] {
+    const auto calls = Calls<testing::FakeExecutionPort::SetScaleCall>();
+    return calls.empty() ? std::optional<double>{} : std::optional(calls.back().value);
+  };
+  participant->apply_runtime_velocity_scale(0.7, 5U);
+  EXPECT_EQ(sent(), std::optional(0.7));
+  const auto count = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
+  participant->apply_runtime_velocity_scale(0.3, 4U);
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  EXPECT_EQ(sent(), std::optional(0.7));
+  participant->apply_runtime_velocity_scale(0.4, 6U);
+  EXPECT_EQ(sent(), std::optional(0.4));
+  EXPECT_DOUBLE_EQ(participant->runtime_velocity_scale_status().commanded_scale, 0.4);
 }
 
 TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConnectorThenRebinds) {
@@ -12791,11 +14597,13 @@ TEST_F(ExecutionKernelTest,
     bool released{};
     bool candidate_completed{};
   } gate;
-  ReplacementObservationExecution backend;
+  auto backend_owner = std::make_shared<ReplacementObservationExecution>();
+  ReplacementObservationExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                        clock_owner, scheduler, cache_owner);
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
   auto incumbent = make_test_request("replacement.incumbent");
   incumbent.action_span = make_test_action_span();
@@ -12922,7 +14730,8 @@ TEST_F(ExecutionKernelTest, MovingReplacementPlansOneUnscaledPeriodAheadAcrossRa
           point.velocities_rad_s.assign(point.positions_rad.size(), 0.0);
           point.accelerations_rad_s2.assign(point.positions_rad.size(), 0.0);
         }
-        ReplacementObservationExecution backend;
+        auto backend_owner = std::make_shared<ReplacementObservationExecution>();
+        ReplacementObservationExecution& backend = *backend_owner;
         backend.replacement_factor = factor;
         backend.replacement_controller_period_ns = period_ns;
         backend.enable_execution_progress_publication();
@@ -12930,9 +14739,10 @@ TEST_F(ExecutionKernelTest, MovingReplacementPlansOneUnscaledPeriodAheadAcrossRa
         auto result = planned.get_future();
         std::promise<void> release;
         auto released = release.get_future().share();
-        ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+        ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+                              backend_owner, clock_owner, scheduler, cache_owner);
         owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-        owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+        owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                       {collision_engine});
         // Release before owner destruction even when an assertion fails.
         struct ReleasePlanner { std::promise<void> &gate; ~ReleasePlanner() { gate.set_value(); } } guard{release};
@@ -13027,7 +14837,8 @@ TEST_F(ExecutionKernelTest,
           point.velocities_rad_s.assign(point.positions_rad.size(), 0.0);
           point.accelerations_rad_s2.assign(point.positions_rad.size(), 0.0);
         }
-        ReplacementObservationExecution backend;
+        auto backend_owner = std::make_shared<ReplacementObservationExecution>();
+        ReplacementObservationExecution& backend = *backend_owner;
         backend.replacement_factor = factor;
         backend.replacement_controller_period_ns = rate.period_ns;
         backend.enable_execution_progress_publication();
@@ -13036,7 +14847,8 @@ TEST_F(ExecutionKernelTest,
         std::promise<void> release;
         auto released = release.get_future().share();
         bool release_needed = boundary_offset_ns < 0;
-        ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+        ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+                              backend_owner, clock_owner, scheduler, cache_owner);
         struct ReleasePlanner {
           std::promise<void>& release;
           bool& needed;
@@ -13045,7 +14857,7 @@ TEST_F(ExecutionKernelTest,
           }
         } release_planner{release, release_needed};
         owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-        owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+        owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                       {collision_engine});
         auto original = make_test_request("end.boundary.incumbent");
         original.cache_mode = CacheMode::kDisable;
@@ -13158,7 +14970,14 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t,
       const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
-      std::int64_t) override {
+      std::int64_t, const ReplacementSendRecheck& recheck_before_send) override {
+    // As the participant: the Kernel's lock-free re-check right before the send.
+    if (recheck_before_send) {
+      if (auto revoked = recheck_before_send())
+        return {{ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey,
+                 std::move(*revoked)},
+                std::nullopt};
+    }
     ++replacements;
     candidate_curve = std::get<PreparedMotionExecutionDTO>(product.payload).trajectory;
     auto handle = current_handle;
@@ -13209,12 +15028,14 @@ TEST_F(ExecutionKernelTest,
       point.accelerations_rad_s2.assign(point.positions_rad.size(), 0.0);
     }
     context.next_validation = ValidationResultDTO{true, std::nullopt};
-    KernelReplacementCommitExecution backend;
+    auto backend_owner = std::make_shared<KernelReplacementCommitExecution>();
+    KernelReplacementCommitExecution& backend = *backend_owner;
     backend.watchdog_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                          clock_owner, scheduler, cache_owner);
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-    owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+    owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});
     auto original = make_test_request("worker.original");
     original.cache_mode = CacheMode::kDisable;
@@ -13352,6 +15173,159 @@ TEST_F(ExecutionKernelTest,
 }
 
 
+// The replacement's release hold and send, blocked until released.
+class HeldReplacementCommitExecution final : public KernelReplacementCommitExecution {
+ public:
+  std::mutex hold_mutex;
+  std::condition_variable hold_changed;
+  bool hold_entered{};
+  bool hold_released{};
+
+  void release_hold() {
+    {
+      std::lock_guard lock(hold_mutex);
+      hold_released = true;
+    }
+    hold_changed.notify_all();
+  }
+
+  PreparedMotionReplacementDispatchDTO DispatchReplacement(
+      const PreparedMotionReplacementSourceDTO& source, std::uint64_t id,
+      const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
+      std::int64_t deadline_ns, const ReplacementSendRecheck& recheck_before_send) override {
+    {
+      std::unique_lock lock(hold_mutex);
+      hold_entered = true;
+      hold_changed.notify_all();
+      hold_changed.wait(lock, [&] { return hold_released; });
+    }
+    return KernelReplacementCommitExecution::DispatchReplacement(source, id, product, goal,
+                                                                 deadline_ns, recheck_before_send);
+  }
+};
+
+TEST_F(ExecutionKernelTest, MovingReplacementHoldHoldsNoKernelLockAndAStopDuringItRevokesTheSend) {
+  // OD-68: the Kernel commits the dispatch gate, releases its locks, and the
+  // backend holds/sends without them. A Stop during the hold neither waits
+  // for it nor lets the swap out: the backend's pre-send re-check sees the
+  // Stop's revocation and the replacement is not dispatched (typed reason).
+  planner.on_plan = {};
+  context.on_validate = {};
+  planner.next_result.trajectory = make_test_trajectory();
+  for (auto& point : planner.next_result.trajectory->waypoints) {
+    point.velocities_rad_s.assign(point.positions_rad.size(), 0.0);
+    point.accelerations_rad_s2.assign(point.positions_rad.size(), 0.0);
+  }
+  context.next_validation = ValidationResultDTO{true, std::nullopt};
+  auto backend_owner = std::make_shared<HeldReplacementCommitExecution>();
+  HeldReplacementCommitExecution& backend = *backend_owner;
+  backend.watchdog_clock = &clock;
+  backend.enable_execution_progress_publication();
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                        clock_owner, scheduler, cache_owner);
+  owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
+                                {collision_engine});
+  auto original = make_test_request("held.original");
+  original.cache_mode = CacheMode::kDisable;
+  original.action_span = make_test_action_span();
+  const auto started = prepare_and_dispatch(owner, prepared_motion_request(original));
+  ASSERT_TRUE(started.ok());
+  {
+    std::unique_lock lock(backend.observations_mutex);
+    ASSERT_TRUE(backend.observations_changed.wait_for(lock, std::chrono::seconds(2),
+                                                      [&]() { return backend.polls > 0; }));
+  }
+  const auto source = owner.CaptureMotionReplacementSource(started.value());
+  ASSERT_TRUE(source.ok());
+  planner.on_plan = [&](int) {
+    const auto& moving = *planner.last_request.moving_replacement;
+    auto curve = moving.source_prefix_trajectory;
+    const auto end = curve.waypoints.back().time_from_start_s + 1.0;
+    curve.waypoints.push_back({end, {1.0, 1.0}, {0.0, 0.0}, {0.0, 0.0}});
+    curve.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{1.0, 1.0, 1.0};
+    planner.next_result.trajectory = std::move(curve);
+  };
+  context.on_validate = [&]() {
+    const auto seam = context.last_validation_options.retained_prefix->end_time_s;
+    const auto end = planner.next_result.trajectory->waypoints.back().time_from_start_s;
+    const auto metrics = [](double duration) {
+      return TrajectoryValidationMetricsDTO{duration, {0.0, 0.0}, {0.0, 0.0}, 0.0};
+    };
+    context.next_validation = ValidationResultDTO{true, {}, metrics(end)};
+    context.next_validation.moving_replacement =
+        MovingReplacementValidationEvidenceDTO{metrics(seam), metrics(end - seam)};
+  };
+  std::mutex failure_mutex;
+  std::condition_variable failure_changed;
+  std::optional<ErrorDTO> failure;
+  const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
+    if (event.type != KernelEventType::kParticipantPrepared ||
+        event.execution_id == started.value())
+      return;
+    const auto observed = owner.ObservePreparedMotion(event.execution_id);
+    if (!observed.ok() ||
+        observed.value().state != ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed)
+      return;
+    {
+      std::lock_guard lock(failure_mutex);
+      failure = observed.value().error;
+    }
+    failure_changed.notify_all();
+  });
+  struct UnsubscribeBeforeLocals {
+    ExecutionKernel& owner;
+    SubscriptionHandle handle;
+    ~UnsubscribeBeforeLocals() { owner.unsubscribe_events(handle); }
+  } unsubscribe{owner, subscription};
+  auto newcomer_request = make_test_request("held.successor");
+  newcomer_request.action_span = make_test_action_span();
+  auto newcomer = prepared_motion_request(newcomer_request);
+  newcomer.execution_request.binding.controller_goal_id = ControllerGoalId("held.successor.goal");
+  newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000};
+  std::future<AddressedParticipantStopFenceDisposition> fenced;
+  std::future<Result<ResolvedPreparedMotionExecutionSnapshotDTO>> observed;
+  struct ReleaseHold {
+    HeldReplacementCommitExecution& backend;
+    ~ReleaseHold() { backend.release_hold(); }
+  } release{backend};
+  const auto candidate = prepare_and_dispatch(owner, std::move(newcomer));
+  ASSERT_TRUE(candidate.ok());
+  {
+    std::unique_lock lock(backend.hold_mutex);
+    ASSERT_TRUE(backend.hold_changed.wait_for(lock, std::chrono::seconds(2),
+                                              [&] { return backend.hold_entered; }));
+  }
+  // Both return while the hold is still in progress.
+  fenced = std::async(std::launch::async,
+                      [&] { return owner.fence_addressed_participant_stop(started.value()); });
+  ASSERT_EQ(fenced.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_EQ(fenced.get(), AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  observed = std::async(std::launch::async,
+                        [&] { return owner.ObservePreparedMotion(candidate.value()); });
+  ASSERT_EQ(observed.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  const auto during = observed.get();
+  ASSERT_TRUE(during.ok());
+  EXPECT_EQ(during.value().state, ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested);
+  ASSERT_TRUE(during.value().replacement);
+  EXPECT_EQ(during.value().replacement->phase, PreparedMotionReplacementPhaseDTO::kPossiblySent);
+  backend.release_hold();
+  {
+    std::unique_lock lock(failure_mutex);
+    ASSERT_TRUE(failure_changed.wait_for(lock, std::chrono::seconds(2),
+                                         [&] { return failure.has_value(); }));
+    EXPECT_EQ(failure->details.at("reason"), "motion_replacement_stop_revoked");
+  }
+  EXPECT_EQ(backend.replacements, 0);  // no send reached the backend's port
+  const auto after = owner.ObservePreparedMotion(candidate.value());
+  ASSERT_TRUE(after.ok());
+  ASSERT_TRUE(after.value().replacement);
+  EXPECT_EQ(after.value().replacement->phase, PreparedMotionReplacementPhaseDTO::kNoEffect);
+  (void)backend.stop();
+  ASSERT_TRUE(owner.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(backend.execute_count, 1);
+}
+
 class ScaleReplacementCommitExecution final : public KernelReplacementCommitExecution {
  public:
   mutable std::mutex scale_mutex;
@@ -13400,7 +15374,7 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
       binding.controller_topology_id, binding.topology_revision, binding.control_route_id,
       ScalingDomainId("scale.test"), {}, binding.resources, binding.active_control_configuration_id,
       binding.active_control_configuration_generation, RuntimeScaleGeneration(0U),
-      RuntimeScaleGeneration(0U), seed};
+      RuntimeScaleGeneration(0U), seed, 0U};
   const auto& old = *request.ordinary_stop_plan;
   auto stop = MakePreparedParticipantStopPlan(
       request.stop_readiness.value().resolved_stop_base_plan,
@@ -13418,8 +15392,8 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
 
 TEST_F(ExecutionKernelTest,
        MovingReplacementTransfersLatestScaleWithoutSetScaleAndFencesPriorCommands) {
-  // Same target, target changed during freeze, refused owner CAS, busy old
-  // submission. All ordering uses worker callbacks and explicit gates.
+  // Same target, target changed during freeze, refused owner CAS, old
+  // submission still in its backend call. All ordering uses worker callbacks and explicit gates.
   for (const int mode : {0, 1, 2, 3}) {
     SCOPED_TRACE(mode);
     planner.on_plan = {};
@@ -13430,12 +15404,14 @@ TEST_F(ExecutionKernelTest,
       point.accelerations_rad_s2.assign(point.positions_rad.size(), 0.0);
     }
     context.next_validation = ValidationResultDTO{true, {}};
-    ScaleReplacementCommitExecution backend;
+    auto backend_owner = std::make_shared<ScaleReplacementCommitExecution>();
+    ScaleReplacementCommitExecution& backend = *backend_owner;
     backend.watchdog_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                          clock_owner, scheduler, cache_owner);
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-    owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+    owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});
     auto original = scale_replacement_request("scale.original", 0.5);
     const auto original_command = *original.execution_request.initial_runtime_scale;
@@ -13477,6 +15453,9 @@ TEST_F(ExecutionKernelTest,
     const double latest = mode == 0 ? 0.5 : 0.8;
     const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
       if (event.type != KernelEventType::kParticipantPrepared || event.execution_id == started.value())
+        return;
+      const auto phase = event.details.find("phase");
+      if (phase == event.details.end() || phase->second != "replacement_commit_safe_point")
         return;
       {
         std::lock_guard lock(result_mutex);
@@ -13533,9 +15512,13 @@ TEST_F(ExecutionKernelTest,
           }};
       auto adopted = owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), callback);
       if (mode == 3) {
+        // The operator value is accepted (recorded as the latest) before its
+        // backend call, which runs outside the submission lock and is ordered
+        // at the participant (latest value wins, OD-72). Adoption therefore
+        // does not back off while that call is still in flight: it transfers
+        // the latest accepted value.
         EXPECT_TRUE(adopted.ok());
-        if (adopted.ok()) { EXPECT_FALSE(adopted.value()); }
-        EXPECT_EQ(backend.adoptions, 0);
+        if (adopted.ok()) { EXPECT_TRUE(adopted.value()); }
         {
           std::lock_guard lock(gate_mutex);
           released = true;
@@ -13543,7 +15526,6 @@ TEST_F(ExecutionKernelTest,
         gate_changed.notify_all();
         EXPECT_TRUE(in_flight.get().ok());
         backend.scale_hook = {};
-        adopted = owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), callback);
       }
       {
         std::lock_guard lock(result_mutex);
@@ -13805,9 +15787,10 @@ TEST_F(ExecutionKernelTest,
   execution.snapshot.error = ErrorDTO{kErrorExecutionAborted, "Controller aborted",
                                      {{"reason", "aborted_path_tolerance"}}};
   execution.execution_generation = 1U;
-  ExecutionKernel owner(planner, context, execution, clock, scheduler, cache);
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+                        clock_owner, scheduler, cache_owner);
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
 
   const auto authority = kernel_spring_authority("ack.settled-failure");
@@ -13893,7 +15876,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(execution.retire_count, 1);
 }
 
-// F-6a (W): the real engine after a nominal addressed Stop settles a moving
+// The real engine after a nominal addressed Stop settles a moving
 // motion (a first-stage gate or Program-requested Stop). The execute worker's
 // terminal cleanup is held after the backend ends: settlement is accepted, but
 // the assessment says waiting (terminal_cleanup_pending), not retry_ready
@@ -13934,16 +15917,18 @@ class HeldCleanupExecution final : public ReplacementObservationExecution {
 };
 
 TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsCloseEligible) {
-  HeldCleanupExecution backend;
+  auto backend_owner = std::make_shared<HeldCleanupExecution>();
+  HeldCleanupExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                        clock_owner, scheduler, cache_owner);
   // Release the held callback before owner destruction joins its worker.
   struct ReleaseOnExit {
     HeldCleanupExecution& backend;
     ~ReleaseOnExit() { backend.Release(); }
   } release_on_exit{backend};
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
   const auto authority = kernel_spring_authority("gate.moving");
   const auto started = prepare_and_dispatch(owner, authority);
@@ -14009,11 +15994,13 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
 }
 
 TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithoutReplanning) {
-  ColdPreparationExecution backend;
+  auto backend_owner = std::make_shared<ColdPreparationExecution>();
+  ColdPreparationExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                        clock_owner, scheduler, cache_owner);
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
   const auto authority = kernel_spring_authority("cold.incumbent");
   const auto started = prepare_and_dispatch(owner, authority);
@@ -14110,7 +16097,7 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
 
   // Computation completed before 250 ms. Physical spring return finishes
   // another 300 ms later, inside its independent Stop deadline; this must not expire the
-  // already sealed cold product or start another planner call (DX1179).
+  // already sealed cold product or start another planner call.
   clock.advance(300'000'000);
   backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
   ASSERT_TRUE(
@@ -14286,7 +16273,7 @@ class StrictSentSpringExecution final : public ReplacementObservationExecution {
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t id,
       const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
-      std::int64_t) override {
+      std::int64_t, const ReplacementSendRecheck&) override {
     remember_key(goal);
     sent_preparation_id.store(id);
     ++replacement_sends;
@@ -14350,12 +16337,14 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
       waypoint.accelerations_rad_s2.assign(2U, 0.0);
     }
     context.next_validation = ValidationResultDTO{true, std::nullopt};
-    StrictSentSpringExecution backend;
+    auto backend_owner = std::make_shared<StrictSentSpringExecution>();
+    StrictSentSpringExecution& backend = *backend_owner;
     backend.source_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                          clock_owner, scheduler, cache_owner);
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
-    owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+    owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});
     auto original = kernel_spring_authority("sent.spring.original");
     original.execution_request.cache_mode = CacheMode::kDisable;
@@ -14404,7 +16393,14 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
            std::chrono::steady_clock::now() < send_deadline)
       std::this_thread::yield();
     ASSERT_EQ(backend.replacement_sends.load(), 1);
-    const auto old = owner.ObservePreparedMotion(sent.value());
+    // The backend counts the send inside DispatchReplacement; the engine
+    // records its outcome only after that call returns. Wait for the record.
+    auto old = owner.ObservePreparedMotion(sent.value());
+    while (old.ok() && !old.value().last_dispatched_participant &&
+           std::chrono::steady_clock::now() < send_deadline) {
+      std::this_thread::yield();
+      old = owner.ObservePreparedMotion(sent.value());
+    }
     ASSERT_TRUE(old.ok());
     ASSERT_TRUE(old.value().backend_prepare_result);
     ASSERT_TRUE(old.value().last_dispatched_participant);

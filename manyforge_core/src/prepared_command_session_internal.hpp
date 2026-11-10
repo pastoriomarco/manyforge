@@ -83,26 +83,45 @@ struct PreparedCommandSessionLifecycle {
 /// The enclosing engine owns one bounded resident slot. The callback supplies
 /// only transport-specific evidence of a continuing effect; allocation,
 /// digest replay and publication retain the existing command-engine order.
-template <typename Session, typename Digest, typename ContinuingEffect>
+template <typename Session, typename Digest, typename CaptureEffect, typename ContinuingEffect>
 Result<std::uint64_t> AdmitPreparedCommandSession(std::shared_ptr<Session> candidate,
                                                   std::atomic<std::shared_ptr<Session>>& resident,
                                                   std::mutex& resident_mutex,
                                                   std::uint64_t& next_execution_id, Digest&& digest,
+                                                  CaptureEffect&& capture_effect,
                                                   ContinuingEffect&& continuing_effect) {
-  std::lock_guard active_lock(resident_mutex);
-  if (const auto active = resident.load()) {
-    std::lock_guard prior_lock(active->mutex);
+  std::unique_lock active_lock(resident_mutex);
+  bool settled = false;
+  for (unsigned attempt = 0; attempt < 3U; ++attempt) {
+    const auto active = resident.load();
+    if (!active) { settled = true; break; }
+    std::unique_lock prior_lock(active->mutex);
     if (digest(*active) != nullptr && digest(*candidate) != nullptr &&
         *digest(*active) == *digest(*candidate))
       return Result<std::uint64_t>::Ok(active->preparation_id);
-    const bool effect_active =
-        active->state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested ||
-        continuing_effect(*active);
+    const auto state = active->state.load();
+    const auto preparation_id = active->preparation_id;
+    const auto effect = capture_effect(*active);
+    prior_lock.unlock();
+    active_lock.unlock();
+    const bool continuing = effect && continuing_effect(*effect);
+    active_lock.lock();
+    if (resident.load() != active) continue;
+    prior_lock.lock();
+    if (active->preparation_id != preparation_id || active->state.load() != state ||
+        capture_effect(*active) != effect) continue;
+    const bool effect_active = state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchRequested || continuing;
     if (active->state == ResolvedPreparedCapabilityCommandStateDTO::kPrepared || effect_active)
       return Result<std::uint64_t>::Err({kErrorInvalidRequest,
                                          "Another prepared capability command is still resident",
                                          {{"reason", "prepared_command_session_busy"}}});
+    settled = true;
+    break;
   }
+  if (!settled)
+    return Result<std::uint64_t>::Err({kErrorInvalidRequest,
+                                       "Another prepared capability command is still resident",
+                                       {{"reason", "prepared_command_session_busy"}}});
   if (next_execution_id == std::numeric_limits<std::uint64_t>::max())
     return Result<std::uint64_t>::Err({kErrorInternalError,
                                        "Prepared command identity space is exhausted",

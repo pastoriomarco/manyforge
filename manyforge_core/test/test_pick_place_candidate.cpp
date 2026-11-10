@@ -96,13 +96,13 @@ constexpr char kDigest5[] =
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO arm_runtime_binding() {
-  std::vector<ProgramFrameRoleBindingDTO> frames{
-      ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:base"), ModelInstanceId("model:test"),
+  std::vector<ProgramFrameBindingDTO> frames{
+      ProgramFrameBindingDTO{{ControllableComponentId("component:test"), FrameRoleId("frame-role:base")}, ModelInstanceId("model:test"),
                                  ModelRevision("model-revision:test"), "base"},
-      ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:tcp"), ModelInstanceId("model:test"),
+      ProgramFrameBindingDTO{{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, ModelInstanceId("model:test"),
                                  ModelRevision("model-revision:test"), "tcp"}};
-  std::vector<ProgramCollisionBodyRoleBindingDTO> collision_bodies{
-      ProgramCollisionBodyRoleBindingDTO{CollisionBodyRoleId("collision-body-role:tool"),
+  std::vector<ProgramCollisionBodyBindingDTO> collision_bodies{
+      ProgramCollisionBodyBindingDTO{{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
                                          {"tcp"}}};
@@ -110,12 +110,8 @@ constexpr char kDigest5[] =
       ContactPolicyId("pick.contact"),
       ContactPolicyRevision("contact-policy-revision:1"),
       RuntimeObjectId("selected_object"),
-      {ProgramContactGraspBodyBindingDTO{ComponentRoleId("component-role:tool"),
-                                         TargetRoleId("target-role:tool"),
-                                         ControllableComponentId("component:test"),
-                                         CommandTargetId("target:test"),
+      {ProgramContactGraspBodyBindingDTO{{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
                                          ModelRoleId("tool"),
-                                         CollisionBodyRoleId("collision-body-role:tool"),
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
                                          {CollisionBodyId("body:tool")}}},
@@ -125,8 +121,6 @@ constexpr char kDigest5[] =
                                       ProgramBindingId("program-binding:test"),
                                       RetainedBundleId("bundle:test"),
                                       GraphRevision("graph:test"),
-                                      ComponentRoleId("component-role:arm"),
-                                      TargetRoleId("target-role:test"),
                                       ControllableComponentId("component:test"),
                                       ComponentTypeId("component-type:test"),
                                       ComponentTypeRevision("component-type-revision:test"),
@@ -145,14 +139,12 @@ constexpr char kDigest5[] =
                                       {},
                                       std::move(contact_grasps)};
   value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-      value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+      {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   return value;
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO carrier_runtime_binding() {
   auto value = arm_runtime_binding();
-  value.component_role_id = ComponentRoleId("component-role:tool");
-  value.target_role_id = TargetRoleId("target-role:tool");
   value.capability_id = CapabilityId("tool.gripper.command");
   value.motion_endpoint.reset();
   return value;
@@ -206,7 +198,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
             ErrorDTO{"invalid_request", "fixture endpoint capture differs from motion", {}});
       request.binding.tcp_frame = ResolvedComponentModelFrameDTO{
           binding.controllable_component_id, endpoint.frame.model_instance_id,
-          endpoint.frame.frame_role_id, endpoint.frame.compiled_frame_name,
+          endpoint.frame.reference.frame_id, endpoint.frame.compiled_frame_name,
           endpoint.frame.model_revision};
     }
     request.move_id = motion->move_id.value();
@@ -265,7 +257,10 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
                                                 CollisionWorldLeaseInventory projection_inventory,
                                                 RobotStateDTO start_state,
                                                 const std::uint32_t planning_attempt_index,
-                                                std::stop_token) override {
+                                                std::stop_token,
+                                                std::optional<MotionPathPreview>* path_preview) override {
+    EXPECT_EQ(path_preview, nullptr) << "pick/place must not request manual preview diagnostics";
+    if (path_preview != nullptr) path_preview->reset();
     if (!operation.expected_scene_revision.has_value() ||
         *operation.expected_scene_revision !=
             projection_inventory.projection_binding.projection_revision.scene_revision) {
@@ -349,11 +344,10 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
       GraphRevision("graph:test"),
       RetainedBundleId("bundle:test"),
       testing::make_test_projection_binding().projection_revision.scene_revision,
-      {OperationParticipantIntentDTO{ComponentRoleId("component-role:arm"),
-                                     TargetRoleId("target-role:test"),
+      {OperationParticipantIntentDTO{{ControllableComponentId("component:test"), CommandTargetId("target:test")},
                                      CapabilityId("execution.trajectory.execute"), std::nullopt,
                                      MotionParticipantIntentDTO{MoveId(std::move(move_id)),
-                                                                FrameRoleId("frame-role:base"),
+                                                                {ControllableComponentId("component:test"), FrameRoleId("frame-role:base")},
                                                                 CurrentTcpDTO{},
                                                                 TolerancesDTO{},
                                                                 SpeedProfileDTO{},
@@ -374,7 +368,7 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
 [[nodiscard]] OperationIntentDTO tool_operation(std::string request_id, double position_m) {
   auto operation = motion_operation(std::move(request_id), "unused", PoseGoalDTO{Pose3DTO{}});
   operation.participants.front() = OperationParticipantIntentDTO{
-      ComponentRoleId("component-role:tool"), TargetRoleId("target-role:tool"),
+      {ControllableComponentId("component:test"), CommandTargetId("target:test")},
       CapabilityId("tool.gripper.command"), std::nullopt,
       CapabilityCommandIntentDTO{
           CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
@@ -1034,7 +1028,7 @@ TEST(AddressedPickPlacePlanningOwner,
   const PickSequencePlanningIntentDTO request{"public-pick-1",
                                               SceneResourceId("workpiece"),
                                               RuntimeObjectId("selected_object"),
-                                              FrameRoleId("frame-role:tcp"),
+                                              ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
                                               synthesis,
                                               std::move(approach),
                                               std::move(descend),
@@ -1081,16 +1075,14 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
     motion.motion_binding = arm_runtime_binding();
     auto& arm = *motion.motion_binding;
     auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
-    endpoint_bodies.front().target_role_id = TargetRoleId("target-role:tool_tcp_alias");
     arm.motion_endpoint =
-        RuntimeMotionEndpointBindingDTO{TargetRoleId("target-role:tool_tcp_alias"),
-                                        CommandTargetId("target:test"),
-                                        {FrameRoleId("frame-role:fingertip"),
+        RuntimeMotionEndpointBindingDTO{{ControllableComponentId("component:test"), CommandTargetId("target:test")},
+                                        {{ControllableComponentId("component:test"), FrameRoleId("frame-role:fingertip")},
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
-                                         "fingertip",
-                                         {CollisionBodyRoleId("collision-body-role:tool")}},
-                                        std::move(endpoint_bodies)};
+                                         "fingertip"},
+                                        std::move(endpoint_bodies),
+                                        {CollisionBodyRoleId("collision-body-role:tool")}};
     arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
     arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
     motion.carrier_binding = carrier_runtime_binding();
@@ -1111,7 +1103,7 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
         "qualified-endpoint-pick",
         SceneResourceId("workpiece"),
         RuntimeObjectId("selected_object"),
-        FrameRoleId("frame-role:tcp"),
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
         PickCandidateSynthesisIntentDTO{},
         qualified(motion_operation("qualified.approach", "approach", PoseGoalDTO{Pose3DTO{}})),
         qualified(motion_operation(
@@ -1135,15 +1127,15 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
           std::get<AttachCarriedObjectRequestDTO>(scene.last_request->request.operation);
       EXPECT_EQ(attach.controllable_component_id, ControllableComponentId("component:test"));
       EXPECT_EQ(attach.command_target_id, CommandTargetId("target:test"));
-      EXPECT_EQ(attach.frame_role_id, request.carrier_frame_role_id);
-      EXPECT_NE(attach.frame_role_id, arm.motion_endpoint->frame.frame_role_id);
+      EXPECT_EQ(attach.frame_role_id, request.carrier_frame.frame_id);
+      EXPECT_NE(attach.frame_role_id, arm.motion_endpoint->frame.reference.frame_id);
       EXPECT_EQ(
           attach.touch_body_roles,
           (std::vector<CollisionBodyRoleId>{CollisionBodyRoleId("collision-body-role:tool")}));
       ASSERT_TRUE(scene.last_request->frame_resolution);
       const auto& frame = std::get<ResolvedComponentModelFrameDTO>(
           scene.last_request->frame_resolution->resolved_frame);
-      EXPECT_EQ(frame.frame_role_id, request.carrier_frame_role_id);
+      EXPECT_EQ(frame.frame_role_id, request.carrier_frame.frame_id);
       EXPECT_EQ(frame.compiled_frame_name, "tcp");
     }
     EXPECT_EQ(scene.commit_count, 0U);
@@ -1173,7 +1165,7 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCap
   const PickSequencePlanningIntentDTO request{"synchronized-pick-1",
                                               SceneResourceId("workpiece"),
                                               RuntimeObjectId("selected_object"),
-                                              FrameRoleId("frame-role:tcp"),
+                                              ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
                                               synthesis,
                                               std::move(approach),
                                               std::move(descend),
@@ -1212,10 +1204,10 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
   synthesis.approach_offset_envelope.position_max_m = {0.05, 0.0, 0.0};
   synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kSceneResource, "workpiece");
   synthesis.approach_offset_reference =
-      ReferenceDTO(ReferenceDTO::Type::kFrameRole, "frame-role:tcp");
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")});
   auto result = owner.PlanPick(PickSequencePlanningIntentDTO{
       "public-pick-reference", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
-      FrameRoleId("frame-role:tcp"), synthesis,
+      ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("reference.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("reference.descend", "descend", CartesianPathDTO{},
                        ContactPolicyId("pick.contact"),
@@ -1234,12 +1226,12 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
   EXPECT_NEAR(candidate.approach_pose.position_m.x_m, 0.05, 1.0e-9);
   EXPECT_NEAR(candidate.approach_pose.position_m.y_m, 0.02, 1.0e-9);
 
-  synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kFrameRole, "frame-role:tcp");
+  synthesis.pick_offset_reference = ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")});
   synthesis.approach_offset_reference =
-      ReferenceDTO(ReferenceDTO::Type::kComponentBodyRole, "body-role:wrist");
+      ReferenceDTO(ProgramCollisionBodyReferenceDTO{ControllableComponentId("component:test"), CollisionBodyRoleId("body-role:wrist")});
   auto inverse_result = owner.PlanPick(PickSequencePlanningIntentDTO{
       "public-pick-reference-inverse", SceneResourceId("workpiece"),
-      RuntimeObjectId("selected_object"), FrameRoleId("frame-role:tcp"), synthesis,
+      RuntimeObjectId("selected_object"), ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("reference.inverse.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("reference.inverse.descend", "descend", CartesianPathDTO{},
                        ContactPolicyId("pick.contact"),
@@ -1269,16 +1261,14 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
   motion.motion_binding = arm_runtime_binding();
   auto& arm = *motion.motion_binding;
   auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
-  endpoint_bodies.front().target_role_id = TargetRoleId("target-role:gripper");
   arm.motion_endpoint =
-      RuntimeMotionEndpointBindingDTO{TargetRoleId("target-role:gripper"),
-                                      CommandTargetId("target:test"),
-                                      {FrameRoleId("frame-role:fingertip"),
+      RuntimeMotionEndpointBindingDTO{{ControllableComponentId("component:test"), CommandTargetId("target:test")},
+                                      {{ControllableComponentId("component:test"), FrameRoleId("frame-role:fingertip")},
                                        ModelInstanceId("model:test"),
                                        ModelRevision("model-revision:test"),
-                                       "fingertip",
-                                       {CollisionBodyRoleId("collision-body-role:tool")}},
-                                      std::move(endpoint_bodies)};
+                                       "fingertip"},
+                                      std::move(endpoint_bodies),
+                                      {CollisionBodyRoleId("collision-body-role:tool")}};
   arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
   arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
   motion.carrier_binding = carrier_runtime_binding();
@@ -1295,7 +1285,7 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
         id,
         SceneResourceId("workpiece"),
         RuntimeObjectId("selected_object"),
-        FrameRoleId("frame-role:tcp"),
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
         std::move(synthesis),
         qualified(motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}})),
         qualified(motion_operation(
@@ -1304,19 +1294,17 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
         tool_operation(id + ".tool", 0.0),
         qualified(motion_operation(id + ".retreat", "retreat", CartesianPathDTO{}))};
   };
-  // The tool's entry, named by its own component (not the arm's).
-  const ReferenceTargetDTO tool_entry_owner{TargetRoleId("target-role:gripper"),
-                                            ControllableComponentId("component:gripper"),
-                                            CommandTargetId("target:test")};
-  ASSERT_NE(tool_entry_owner.controllable_component_id, arm.controllable_component_id);
+  // The exact endpoint frame uses candidate TCP orientation. Another frame
+  // on the same component is resolved independently.
   auto synthesis = PickCandidateSynthesisIntentDTO{};
-  synthesis.pick_offset_reference =
-      ReferenceDTO(FrameRoleId("frame-role:fingertip"), tool_entry_owner);
+  synthesis.pick_offset_reference = ReferenceDTO(ProgramFrameReferenceDTO{
+      ControllableComponentId("component:test"), FrameRoleId("frame-role:fingertip")});
   const auto candidate = owner.PlanPick(request("tool-entry-offset", synthesis));
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
   EXPECT_EQ(motion.reference_resolution_count, 0U);
 
-  synthesis.pick_offset_reference = ReferenceDTO(FrameRoleId("frame-role:base"), tool_entry_owner);
+  synthesis.pick_offset_reference = ReferenceDTO(ProgramFrameReferenceDTO{
+      ControllableComponentId("component:test"), FrameRoleId("frame-role:base")});
   const auto other_entry = owner.PlanPick(request("other-entry-offset", synthesis));
   ASSERT_TRUE(other_entry.ok()) << other_entry.error().message;
   EXPECT_EQ(motion.reference_resolution_count, 1U);
@@ -1331,7 +1319,7 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsAnyFrameOffsetReferenceAndNamesAnUn
   const auto request = [](const std::string& id, PickCandidateSynthesisIntentDTO synthesis) {
     return PickSequencePlanningIntentDTO{
         id, SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
-        FrameRoleId("frame-role:tcp"), std::move(synthesis),
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, std::move(synthesis),
         motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation(id + ".descend", "descend", CartesianPathDTO{},
                          ContactPolicyId("pick.contact"),
@@ -1346,10 +1334,8 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsAnyFrameOffsetReferenceAndNamesAnUn
   auto synthesis = PickCandidateSynthesisIntentDTO{};
   synthesis.pick_offset_reference = ReferenceDTO(ReferenceDTO::Type::kCellFrame, "");
   synthesis.approach_offset_reference =
-      ReferenceDTO(FrameRoleId("frame-role:tcp"),
-                   ReferenceTargetDTO{TargetRoleId("observer_arm"),
-                                      ControllableComponentId("observer.component"),
-                                      CommandTargetId("observer.command")});
+      ReferenceDTO(ProgramFrameReferenceDTO{ControllableComponentId("observer.component"),
+                                            FrameRoleId("frame-role:tcp")});
   const auto accepted = owner.PlanPick(request("any-frame-offsets", synthesis));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(motion.reference_resolution_count, 1U);
@@ -1373,7 +1359,8 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
     EXPECT_EQ(error.details.at("reason"), reason);
     EXPECT_EQ(error.details.at("reference_type"), "frame_role");
     EXPECT_EQ(error.details.at("reference_id"), "frame-role:absent");
-    EXPECT_EQ(error.details.at("target_role_id"), "target-role:tool");
+    EXPECT_EQ(error.details.at("component_id"), "component:test");
+    EXPECT_EQ(error.details.at("command_target_id"), "target:test");
   };
   {
     auto predecessor = predecessor_projection();
@@ -1383,7 +1370,7 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
     const auto pick = owner.PlanPick(PickSequencePlanningIntentDTO{
         "absent-carrier-pick", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
-        FrameRoleId("frame-role:absent"), PickCandidateSynthesisIntentDTO{},
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:absent")}, PickCandidateSynthesisIntentDTO{},
         motion_operation("absent-carrier-pick.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation("absent-carrier-pick.descend", "descend", CartesianPathDTO{},
                          ContactPolicyId("pick.contact"),
@@ -1401,7 +1388,7 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
     FakeSceneCandidateProjection projection(predecessor);
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
     const auto place = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
-        "absent-carrier-place", SceneResourceId("workpiece"), FrameRoleId("frame-role:absent"),
+        "absent-carrier-place", SceneResourceId("workpiece"), ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:absent")},
         motion_operation("absent-carrier-place.approach", "place.approach",
                          PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}}),
         motion_operation(
@@ -1430,7 +1417,7 @@ TEST(AddressedPickPlacePlanningOwner, NamesTheRuntimeObjectAndPolicyOfAnUnresolv
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
     return owner.PlanPick(PickSequencePlanningIntentDTO{
         id, SceneResourceId("workpiece"), RuntimeObjectId(runtime_object_id),
-        FrameRoleId("frame-role:tcp"), PickCandidateSynthesisIntentDTO{},
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, PickCandidateSynthesisIntentDTO{},
         motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation(id + ".descend", "descend", CartesianPathDTO{},
                          ContactPolicyId(contact_policy_id),
@@ -1480,7 +1467,7 @@ TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotio
   synthesis.approach_offset_envelope.position_max_m = {0.0, 0.0, 0.05};
   auto result = owner.PlanPick(PickSequencePlanningIntentDTO{
       "public-pick-failed", SceneResourceId("workpiece"), RuntimeObjectId("selected_object"),
-      FrameRoleId("frame-role:tcp"), synthesis,
+      ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("failed.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("failed.descend", "descend", CartesianPathDTO{},
                        ContactPolicyId("pick.contact"),
@@ -1516,7 +1503,7 @@ TEST(AddressedPickPlacePlanningOwner, RejectsInvalidOrCancelledPickBeforeRetaini
         "public-pick-2",
         SceneResourceId("workpiece"),
         RuntimeObjectId("selected_object"),
-        FrameRoleId("frame-role:tcp"),
+        ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
         {},
         motion_operation("public.pick2.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation("public.pick2.descend", "descend", CartesianPathDTO{},
@@ -1559,7 +1546,7 @@ TEST(AddressedPickPlacePlanningOwner, ResolvesThePublicInversePlaceWithoutCommit
       CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
 
   auto result = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
-      "public-place-1", SceneResourceId("workpiece"), FrameRoleId("frame-role:tcp"),
+      "public-place-1", SceneResourceId("workpiece"), ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
       std::move(approach), std::move(descend), tool_operation("public.place.tool", 0.04),
       std::move(retreat)});
 
@@ -1595,7 +1582,7 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCap
       CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
 
   const auto result = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
-      "floor-place-1", SceneResourceId("workpiece"), FrameRoleId("frame-role:tcp"),
+      "floor-place-1", SceneResourceId("workpiece"), ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")},
       std::move(approach), std::move(descend), tool_operation("floor.place.tool", 0.04),
       std::move(retreat)});
 

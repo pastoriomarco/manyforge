@@ -3,7 +3,7 @@ import { errorCatalogRow } from '../state/commandRefusal';
 /**
  * Live state of each Applied global (cell-level) interrupt rule, as the
  * Headless event pump projects it into the control-state shell
- * (`global_rules`, CONTRACTS §8). `null` is an unknown catalog (never "no
+ * (`global_rules`). `null` is an unknown catalog (never "no
  * rules"); an empty list proves that the Deployment has no global rule. A row
  * state of `unknown` means the rule can't watch its signals (its
  * `interrupt_state` key is withdrawn) and gates its scope until it can.

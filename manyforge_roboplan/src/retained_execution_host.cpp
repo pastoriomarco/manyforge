@@ -29,13 +29,13 @@ std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
     const deployment::VerifiedRetainedModelMap *model_map) {
   const auto &value = runtime.value();
   std::vector<core::ResolvedFrameDTO> frames;
-  // B7: every frame is stamped with its owner. A target's frames belong to its
-  // own component (no alias rows since B2), so the participant's frames carry
+  // Every frame is stamped with its owner. A target's frames belong to its
+  // own component (no alias rows), so the participant's frames carry
   // the motion component; mounted tools' frames carry the tool (below).
   for (const auto &frame : value.frame_bindings)
     frames.emplace_back(core::ResolvedComponentModelFrameDTO{
-        value.controllable_component_id, frame.model_instance_id,
-        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
+        frame.reference.component_id, frame.model_instance_id,
+        frame.reference.frame_id, frame.compiled_frame_name, frame.model_revision});
   if (!model_map)
     return frames;
   if (model_map->query().retained_bundle_id != value.retained_bundle_id ||
@@ -53,7 +53,7 @@ std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
         "planner frame inventory has no exact motion model");
   // A tool mounted on the motion component moves with it in the one composed
   // cell model, so its frames (its TCPs) are planner frames too, each once and
-  // owner-stamped (B4: the mounts and model owners come from the cell
+  // owner-stamped (the mounts and model owners come from the cell
   // kinematic index).
   const auto &index = model_map->kinematic_index();
   const auto mounted = index.self_and_mounted(value.controllable_component_id);
@@ -553,7 +553,7 @@ runtime_registration(
           "runtime operator Stop profile differs from retained Stop authority");
     }
     default_operator_stop_profile = retained_profiles->operator_profile;
-    // Q37: a Deployment-authored fault profile is the authority as given;
+    // A Deployment-authored fault profile is the authority as given;
     // only the native lane still derives it from the operator profile.
     if (!fault_stop_profile_from_deployment) {
       if (default_fault_stop_profile.has_value() &&
@@ -579,7 +579,7 @@ runtime_registration(
       deployment_maximum_tcp_linear_speed_mps};
 }
 
-// Active TCP (M7): Set TCP rides on the robot's motion-engine registrations.
+// Active TCP: Set TCP rides on the robot's motion-engine registrations.
 void attach_set_tcp(const RetainedExecutionHost &runtime,
                     core::RuntimeParticipantExecutionRegistration &registration) {
   if (runtime.set_tcp && registration.engine == runtime.participant_engine.get())
@@ -804,7 +804,8 @@ make_kernel_participant_resolver(
           binding.value().intrinsic_direct_control;
       registration.motion_endpoint_owner =
           binding.value().motion_endpoint_owner;
-      // Active TCP (M7): the robot's Set TCP, from its physical registration.
+      registration.preview_tcp_capture = binding.value().preview_tcp_capture;
+      // Active TCP: the robot's Set TCP, from its physical registration.
       registration.set_tcp = physical->set_tcp;
       registration.direct_control_joint_limits =
           physical->direct_control_joint_limits;
@@ -884,7 +885,7 @@ make_kernel_participant_resolver(
 void RetainedGripperRoutePublicationOwner::BindMotionRoot(
     const std::shared_ptr<RetainedExecutionHost>& root) {
   if (!root || root->cell_addressed_kernel != &kernel_ ||
-      root->clock.get() != &clock_ || !participant_peers_.empty() ||
+      root->clock.get() != clock_.get() || !participant_peers_.empty() ||
       transition_mutex_ != &mutex_)
     throw std::invalid_argument("scalar route owner requires its exact existing motion root");
   transition_owner_ = root;
@@ -1045,8 +1046,8 @@ create_retained_execution_host_participants(
     motion_operator_stop_profile = controlled_stop_profiles->operator_profile;
     motion_fault_stop_profile = controlled_stop_profiles->fault_profile;
   }
-  // Q37 (as main): the Deployment-authored fault profile is read directly,
-  // with its defaults resolved once at load (item 24); nothing is derived.
+  // The Deployment-authored fault profile is read directly,
+  // with its defaults resolved once at load; nothing is derived.
   if (input.fault_stop_profile_from_deployment) {
     motion_fault_stop_profile.reset();
     if (input.deployment_fault_stop_profile.has_value()) {
@@ -1247,7 +1248,7 @@ create_retained_execution_host_participants(
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->prepare_measured_sources = std::move(input.prepare_measured_sources);
-  // TCP-C: FK of every listed TCP, a mounted tool's included (planner frames).
+  // FK of every listed TCP, a mounted tool's included (planner frames).
   auto mounted_frame_names = retained_motion_planner_frame_names(
       runtime->motion_binding,
       input.planner_model_map ? &*input.planner_model_map : nullptr);
@@ -1265,7 +1266,7 @@ create_retained_execution_host_participants(
       shared_scheduler != nullptr
           ? std::move(shared_scheduler)
           : std::make_shared<SimpleScheduler>(std::move(config.scheduler));
-  runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
+  runtime->cache = std::make_shared<core::TrajectoryCache>(config.cache);
   runtime->planner = std::move(input.planner);
 
   auto motion_state_config = detail::select_retained_state_channel_config(
@@ -1276,12 +1277,12 @@ create_retained_execution_host_participants(
   runtime->motion_state_channel =
       std::make_shared<RetainedObservedStateChannel>(
           runtime->motion_binding, model_generation->state_projector,
-          std::move(motion_state_config), runtime->clock.get(),
+          std::move(motion_state_config), runtime->clock,
           observation_wake);
   const auto initial_timestamp_ns = runtime->clock->now();
   if (runtime->motion_state_channel->query_context().state_authority_class ==
       core::StateAuthorityClass::kMeasured) {
-    // CP8 step 1: measured arm state is never seeded from the model or an
+    // Measured arm state is never seeded from the model or an
     // initial pose; it stays unavailable until its measured source publishes.
     if (!config.initial_motion_positions_rad.empty()) {
       throw std::invalid_argument(
@@ -1306,9 +1307,16 @@ create_retained_execution_host_participants(
           "native motion state could not be seeded from the retained model");
     }
   }
+  struct OwnedAngularObservedState final {
+    std::shared_ptr<RetainedObservedStateChannel> channel;
+    core::AddressedAngularObservedRobotStateAdapter adapter;
+    explicit OwnedAngularObservedState(std::shared_ptr<RetainedObservedStateChannel> value)
+        : channel(std::move(value)), adapter(channel->publication()) {}
+  };
+  auto angular_owner = std::make_shared<OwnedAngularObservedState>(runtime->motion_state_channel);
   runtime->angular_observed_state =
-      std::make_unique<core::AddressedAngularObservedRobotStateAdapter>(
-          runtime->motion_state_channel->publication());
+      std::shared_ptr<core::AddressedAngularObservedRobotStateAdapter>(angular_owner,
+                                                                      &angular_owner->adapter);
   if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled) {
     auto limits = runtime->kinematic_model->joint_limits(
         motion_value.controllable_component_id.value(),
@@ -1345,7 +1353,7 @@ create_retained_execution_host_participants(
   if (input.backend_factory) {
     auto selected = input.backend_factory(
         runtime->motion_binding, runtime->motion_state_channel,
-        *runtime->clock, *runtime->scheduler);
+        runtime->clock, *runtime->scheduler);
     runtime->execution = std::move(selected.execution);
     runtime->rebind_motion_route = std::move(selected.rebind_motion_route);
     runtime->set_tcp = std::move(selected.set_tcp);
@@ -1416,18 +1424,18 @@ create_retained_execution_host_participants(
         std::make_shared<RetainedPlanningSceneSynchronizer>(
             std::move(input.planning_scene_synchronizer));
   }
-  core::ExecutionKernelPorts ports{*runtime->angular_observed_state,
-                                   *runtime->kinematic_model,
-                                   *runtime->reference_resolver_proxy,
-                                   *runtime->kinematic_model,
-                                   *runtime->kinematic_model,
+  core::ExecutionKernelPorts ports{runtime->angular_observed_state,
+                                   runtime->kinematic_model,
+                                   runtime->reference_resolver_proxy,
+                                   runtime->kinematic_model,
+                                   runtime->kinematic_model,
                                    nullptr,
-                                   runtime->planning_scene_synchronizer.get()};
+                                   runtime->planning_scene_synchronizer};
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
-      *runtime->planner, ports, *runtime->execution, *runtime->clock,
-      *runtime->scheduler, *runtime->cache, std::move(config.kernel));
+      runtime->planner, ports, runtime->execution, runtime->clock,
+      *runtime->scheduler, runtime->cache, std::move(config.kernel));
   runtime->participant_engine->set_collision_resources(
-      *runtime->collision_publisher, runtime->runtime_collision_engine,
+      runtime->collision_publisher, runtime->runtime_collision_engine,
       runtime->validation_collision_engines,
       runtime->lookahead_collision_engines);
   runtime->participant_engine->set_collision_validation_policy_snapshot(
@@ -2307,7 +2315,8 @@ RetainedExecutionHost::CurrentIndependentGripperRouteOwner(const core::ControlDo
     return CandidateResult::Ok({std::move(rows), std::move(resolver), std::move(adopt)});
   };
   auto route = std::make_shared<RetainedGripperRoutePublicationOwner>(
-      selected, *root->clock, *root->cell_addressed_kernel, std::move(candidate), root->cell_runtime_owner);
+      selected, root->clock, *root->cell_addressed_kernel,
+      std::move(candidate), root->cell_runtime_owner);
   route->BindMotionRoot(root);
   return Result::Ok(std::move(route));
 }
@@ -2596,6 +2605,30 @@ core::Result<void> ValidateRetainedPreparedMeasuredSources(
 
 
 
+std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+RetainedExecutionHost::SnapshotPreparedMeasuredSources() const {
+  const auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  return prepared_measured_sources_;
+}
+
+bool RetainedExecutionHost::MatchesPreparedMeasuredSources(
+    const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected) const {
+  const auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  return prepared_measured_sources_ == expected;
+}
+
+bool RetainedExecutionHost::WithExactPreparedMeasuredSources(
+    const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected,
+    void (*commit)(void *) noexcept, void *context) const {
+  const auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  if (!commit || prepared_measured_sources_ != expected) return false;
+  commit(context);
+  return true;
+}
+
 core::Result<core::RobotMeasuredStateSourceView>
 RetainedExecutionHost::PrepareCurrentMeasuredSources() {
   using Result = core::Result<core::RobotMeasuredStateSourceView>;
@@ -2646,6 +2679,9 @@ RetainedExecutionHost::PrepareCurrentMeasuredSources() {
       return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
           "measured_source_association_changed",
           "Measured route changed while preparing sources");
+    if (candidate && candidate->matches_transport_owner && !candidate->matches_transport_owner())
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_source_association_changed", "Measured transport changed while preparing sources");
     prepared_measured_sources_.swap(candidate);
     if (prepared_measured_sources_)
       enable_prepared_measured_sources(*prepared_measured_sources_);
@@ -2993,6 +3029,10 @@ RetainedExecutionHost::PublishAndReadBackRouteConfiguration(
             core::RuntimeRouteConfigurationReadbackDTO>(
             "measured_source_association_changed",
             "Measured route changed while staging a successor");
+      if (candidate_measured_sources && candidate_measured_sources->matches_transport_owner &&
+          !candidate_measured_sources->matches_transport_owner())
+        return measured_source_unavailable<core::RuntimeRouteConfigurationReadbackDTO>(
+            "measured_source_association_changed", "Measured transport changed while staging sources");
     }
     const auto transition_time_ns = clock->now();
     bool motion_rebound = false;

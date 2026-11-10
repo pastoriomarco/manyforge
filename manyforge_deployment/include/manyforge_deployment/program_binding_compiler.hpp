@@ -1,15 +1,19 @@
 #pragma once
 
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_core/types/component_type.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/program_reference_facts.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -29,24 +33,23 @@ inline constexpr std::string_view kDirectControlGripperProgramId =
     "manyforge.direct_control.gripper";
 inline constexpr std::string_view kDirectControlIoProgramId =
     "manyforge.direct_control.io";
-inline constexpr std::string_view kDirectControlComponentRoleId =
-    "controlled_component";
-inline constexpr std::string_view kDirectControlTargetRoleId = "command_target";
 inline constexpr std::string_view kDirectControlBaseFrameRoleId = "base";
-/// TCP-C: the frame-only role of the tool mounted on the robot's `flange`,
-/// whose TCPs Robot Control may move the robot at.
-inline constexpr std::string_view kDirectControlToolComponentRoleId =
-    "mounted_tool";
-inline constexpr std::string_view kDirectControlToolTargetRoleId =
-    "mounted_tool_target";
 
 /// A compiled robot TCP row projected into the Robot Control descriptor.
+struct DirectControlTcpFrameAssociation final {
+  core::ProgramTargetReferenceDTO target;
+  core::ProgramFrameReferenceDTO frame;
+  std::vector<core::CollisionBodyRoleId> contact_body_role_ids;
+};
+
 struct DirectControlTcp final {
   core::ProgramRobotTcpBindingDTO binding;
   std::string display;
-  /// Interim legacy manual-motion target role. A4 removes it after Set TCP
-  /// replaces the per-browser endpoint selector.
-  std::optional<core::TargetRoleId> target_role_id;
+  /// Exact retained target/frame associations for revalidating an existing
+  /// authored selector after a graph change; not command authorization.
+  std::vector<core::ProgramTargetReferenceDTO> associated_targets;
+  /// Exact per-target contact evidence from direct-control sealed bindings.
+  std::vector<DirectControlTcpFrameAssociation> frame_associations;
   bool mounted_here{};
   bool mounted_elsewhere{};
 };
@@ -63,26 +66,35 @@ using RobotTcp = core::ProgramRobotTcpBindingDTO;
     std::span<const QualifiedCapabilityDefinition> capabilities,
     const ICatalogArtifactSource& catalog_artifact_store);
 
+/// Candidate-side TCP inventory using the compiler's qualified catalog closure.
+[[nodiscard]] std::vector<RobotTcp> qualified_candidate_robot_tcps(
+    const core::ProgramTargetReferenceDTO& target,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
 /// Deterministic physical command-target inventory derived from one exact
 /// retained cell. Entries are build-owned direct-control Program Bindings;
 /// they select physical targets without selecting an authored Program.
+struct DirectControlProgramBindingEntry final {
+  core::ProgramTargetReferenceDTO target;
+  std::shared_ptr<const ProgramBinding> binding;
+};
 struct DirectControlProgramBindingInventory final {
-  std::vector<std::shared_ptr<const ProgramBinding>> motion;
-  std::vector<std::shared_ptr<const ProgramBinding>> gripper;
+  std::vector<DirectControlProgramBindingEntry> motion;
+  std::vector<DirectControlProgramBindingEntry> gripper;
   /// Logical input bindings only; these create no physical participant.
   std::vector<std::shared_ptr<const ProgramBinding>> io;
 };
 
-/// Resolve one complete authored role assignment against one exact retained
-/// cell and return the sealed, context-verified Program Binding.
+/// Resolve direct Program references against one exact retained cell and
+/// return the sealed, context-verified Program Binding.
 ///
-/// The Program contract, RetainedBundle, and model map are sealed inputs. The
-/// role assignment remains untrusted authored selection. Catalog bytes are
+/// The Program contract, RetainedBundle, and model map are sealed inputs. Catalog bytes are
 /// point-read only by exact key/digest from the retained closure; no path,
 /// active alias, runtime state, endpoint, or fallback selector is accepted.
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_program_binding(const ProgramBindingContract &program_contract,
-                        core::ProgramRoleAssignmentDTO role_assignment,
                         const RetainedBundle &retained_bundle,
                         const VerifiedRetainedModelMap &retained_model_map,
                         const ICatalogArtifactSource &catalog_artifact_store);
@@ -93,31 +105,77 @@ struct ProgramBindingOutcome final {
   std::shared_ptr<const ProgramBinding> binding;
   std::optional<ProgramNonExecutableOutcomeDTO> non_executable;
   /// Present exactly with `non_executable`.
-  std::optional<ProgramResolvedRolesDTO> resolved_roles;
+  std::optional<ProgramResolvedReferencesDTO> resolved_references;
 };
 
-/// Bind one preserved authored Program to one candidate cell (H1a).
-///
-/// Identical to `compile_program_binding` when every role resolves. When a
-/// role does not resolve only because of candidate-dependent facts (a missing
-/// component or target, an incompatible type, an unavailable capability),
-/// every such role is reported with the Program nodes and execution groups it
-/// affects, and no binding is produced. Malformed input, corrupt or ambiguous
-/// retained facts and unexpected failures still throw
-/// ProgramBindingCompilerError: they never become a non-executable Program.
+/// Resolve a direct signal against one already-qualified compiled catalog.
+/// Missing or ambiguous matches fail; target/runtime provenance always comes
+/// from the exact retained row, including for derived changed-outside inputs.
+[[nodiscard]] core::ProgramSignalBindingDTO resolve_program_signal_binding(
+    const core::ProgramSignalReferenceDTO &reference,
+    std::span<const RetainedIoSignalConfiguration> signals);
+
+/// Resolve a direct component/target pair against the retained qualified
+/// component type. Missing identities are candidate-dependent; malformed or
+/// ambiguous retained catalog data remains an error.
+[[nodiscard]] std::optional<ProgramBindingUnresolvedReason>
+probe_program_target(const core::ControllableComponentId& component_id,
+                     const core::CommandTargetId& target_id,
+                     const RetainedBundle& retained_bundle,
+                     const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Exact retained component type, qualified through the same catalog owner
+/// used by Program binding and reference checks.
+[[nodiscard]] core::ComponentTypeDTO qualified_program_component_type(
+    const core::ControllableComponentId& component_id,
+    const RetainedBundle& retained_bundle,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Qualify one global capability against the exact retained catalog and cell.
+[[nodiscard]] bool probe_program_cell_capability(
+    const core::ProgramCapabilityRequirementDTO& requirement,
+    const RetainedBundle& retained_bundle,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Probe a required capability on one explicitly addressed target using the
+/// same qualified catalog, provider and command-schema resolution as the
+/// Program binding compiler. A candidate-dependent absence is returned;
+/// corrupt, inconsistent or ambiguous retained inputs still throw. This is a
+/// resolution primitive, not a complete Program reference validator.
+[[nodiscard]] std::optional<ProgramBindingUnresolvedReason>
+probe_program_target_capability(
+    const core::ControllableComponentId& component_id,
+    const core::CommandTargetId& target_id,
+    const core::ProgramCapabilityRequirementDTO& requirement,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Qualify several capabilities for the same target with one retained catalog
+/// closure. Results correspond to the input order; no state survives the call.
+[[nodiscard]] std::vector<std::optional<ProgramBindingUnresolvedReason>>
+probe_program_target_capabilities(
+    const core::ControllableComponentId& component_id,
+    const core::CommandTargetId& target_id,
+    std::span<const core::ProgramCapabilityRequirementDTO> requirements,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Bind one preserved authored Program to one candidate cell. When an exact
+/// target cannot resolve due to a candidate-dependent fact, report it with
+/// affected nodes and execution groups and produce no binding. Malformed
+/// input, corrupt or ambiguous retained facts and unexpected failures throw.
 [[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
     const ProgramBindingContract &program_contract,
-    core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle &retained_bundle,
     const VerifiedRetainedModelMap &retained_model_map,
     const ICatalogArtifactSource &catalog_artifact_store);
 
-/// As above, with no model map for an empty candidate cell. This overload
-/// can only return a named non-executable outcome when all assigned component
-/// roles are absent; it never creates a binding without verified model data.
+/// As above, including an absent model map for an empty candidate cell. It
+/// never creates a binding without the required verified model data.
 [[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
     const ProgramBindingContract &program_contract,
-    core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle &retained_bundle,
     const std::optional<VerifiedRetainedModelMap> &retained_model_map,
     const ICatalogArtifactSource &catalog_artifact_store);
@@ -168,7 +226,7 @@ compile_direct_control_io_program_binding(
     const VerifiedRetainedModelMap &retained_model_map,
     const ICatalogArtifactSource &catalog_artifact_store);
 
-/// TCP-C: the robot's exact Deployment TCP inventory, sorted by owner entry
+/// The robot's exact Deployment TCP inventory, sorted by owner entry
 /// triple with the robot's End-effector row first when present. Equal display
 /// names or compiled frames do not merge distinct owner entries. `inventory`
 /// supplies other direct-control robots for the interim mounted-elsewhere

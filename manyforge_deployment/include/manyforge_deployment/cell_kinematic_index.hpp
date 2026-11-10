@@ -47,7 +47,7 @@ class CellKinematicIndex final {
   /// The components mounted directly on `parent`, in graph edge order.
   [[nodiscard]] std::vector<core::ControllableComponentId> children_of(
       const core::ControllableComponentId& parent) const;
-  /// The tool on `parent`'s `interface`: the primary child there (B5; graph
+  /// The tool on `parent`'s `interface`: the primary child there (graph
   /// validation requires exactly one primary, on a tool, when two or more
   /// components tagged `tool` share the interface); else the first child that
   /// has a default TCP, so a sibling without a TCP (a camera that is no tool)
@@ -63,14 +63,14 @@ class CellKinematicIndex final {
   [[nodiscard]] std::vector<core::ControllableComponentId> ancestors_of(
       const core::ControllableComponentId& component) const;
 
-  // TCP defaults (B5, B1).
+  // TCP defaults.
 
   /// The component's compiled default TCP; null when it has none.
   [[nodiscard]] const core::ComponentDefaultTcpDTO* default_tcp_of(
       const core::ControllableComponentId& component) const;
-  /// The End-effector TCP of `robot` (B1, a default mark on one entry): the
+  /// The End-effector TCP of `robot` (a default mark on one entry): the
   /// default TCP of the tool on its `flange`, none when that tool has no
-  /// default (C-P2, no fallback); else the robot's own default TCP; else
+  /// default (no fallback); else the robot's own default TCP; else
   /// `{robot, robot_target, flange}`. Direct (one level); resolves no names.
   [[nodiscard]] std::optional<core::TcpEntryDTO> end_effector_entry(
       const core::ControllableComponentId& robot,

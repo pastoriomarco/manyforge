@@ -18,8 +18,7 @@
 
 namespace manyforge::core {
 
-/// Pose-source borrow / retry policy (spec §"Pose-Source Apply During
-/// Validation", COLLISION_CHECKING_OWNERSHIP_PLAN Chunk 5).
+/// Pose-source borrow / retry policy.
 ///
 /// Validation borrows one immutable collision-world revision at start.
 /// Pose-source applies may publish newer revisions while validation runs but
@@ -135,8 +134,7 @@ struct CollisionValidationDecisionBundle {
   std::vector<CollisionValidationWaypointRecord> waypoint_records;
 };
 
-/// CollisionValidationCoordinator (spec/210 §3.8.1,
-/// COLLISION_CHECKING_OWNERSHIP_PLAN Chunk 5).
+/// CollisionValidationCoordinator.
 ///
 /// The coordinator is the authoritative pre-execution validation surface
 /// for collision. It:
@@ -155,7 +153,7 @@ struct CollisionValidationDecisionBundle {
 ///     cally, never downgrading kInconclusiveFail / kStopRequested.
 ///
 /// The coordinator is single-threaded by design. Parallelism is added by the
-/// ParallelCollisionValidationWorkerPool (Chunk 7), which runs multiple
+/// ParallelCollisionValidationWorkerPool, which runs multiple
 /// coordinator instances against independent `ICollisionQueryEngine`
 /// instances sharing the same snapshot, and merges by lowest failing
 /// waypoint index.

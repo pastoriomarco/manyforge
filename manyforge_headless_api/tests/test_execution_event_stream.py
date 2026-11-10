@@ -1,10 +1,11 @@
-"""Event subscription stream client (contract §8.1): envelope, apply order,
+"""Event subscription stream client: envelope, apply order,
 resume from cursor, dead-link detection, reconnect and stop."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 import socket
+import json
 from threading import Event, Thread
 import time
 from typing import Any
@@ -17,8 +18,10 @@ from manyforge_headless_api.execution_event_stream import (
     ExecutionEventSubscription,
     decode_event_stream_message,
     follow_execution_events,
+    open_event_subscription,
 )
 from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.private_transport import PinnedRunRoot
 
 
 def _message(kind: str, owner: str = "kernel-1", **fields: Any) -> dict[str, Any]:
@@ -27,6 +30,31 @@ def _message(kind: str, owner: str = "kernel-1", **fields: Any) -> dict[str, Any
 
 def _event(sequence: int, owner: str = "kernel-1") -> dict[str, Any]:
     return _message("event", owner, event={"sequence": sequence, "record_kind": "operation_terminal"})
+
+
+def test_private_subscription_uses_command_v3_and_stream_v1(tmp_path) -> None:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    endpoint = tmp_path / "execution-events.sock"
+    listener.bind(str(endpoint))
+    endpoint.chmod(0o600)
+    listener.listen(1)
+    received: list[dict[str, Any]] = []
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            received.append(json.loads(connection.recv(65536)))
+            connection.send(rfc8785.dumps(_message("heartbeat", cursor=4)))
+    worker = Thread(target=serve)
+    worker.start()
+    try:
+        with open_event_subscription(PinnedRunRoot(tmp_path), 3, "kernel-1") as subscription:
+            assert subscription.receive()["api_version"] == "manyforge.execution_event_stream.v1"
+    finally:
+        listener.close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert received == [{"api_version": "manyforge.execution_command.v3", "command": "subscribe_events",
+                         "after_cursor": 3, "owner_epoch": "kernel-1"}]
 
 
 def test_envelope_is_validated_and_an_error_raises_its_code() -> None:
@@ -167,7 +195,7 @@ def test_follow_stops_within_one_receive_slice() -> None:
     host.close()
 
 
-# Headless event pump on the subscription (contract §8.1) ----------------------
+# Headless event pump on the subscription ----------------------
 
 from manyforge_headless_api.execution import (  # noqa: E402
     ExecutionEventPump,

@@ -1,14 +1,15 @@
 # Adding a component
 
 A component is a folder with one `component.yaml`, its **descriptor**: a robot,
-a tool, an I/O device, a machine, a sensor or a simulator described as data.
+a tool, an I/O device, a machine, a sensor, the AI assistant or a simulator
+described as data.
 One command family creates, checks and lists component folders:
 
 | Command | What it does |
 | --- | --- |
 | `scripts/manyforge component new <robot\|tool\|io_device\|machine> <vendor>.<name> [--into <folder>]` | Creates the folder from a template |
 | `scripts/manyforge component check <folder> [--scenario <scenario>]` | Checks the descriptor, its model files, its lane rows and the rows Apply reads |
-| `scripts/manyforge component register <folder>` | Writes a robot's or tool's model family row; lists a machine, a machine's I/O bank or a sensor in `component_models` |
+| `scripts/manyforge component register <folder>` | Writes a robot's or tool's model family row; lists a machine, a machine's I/O bank, a sensor or an assistant in `component_models` |
 | `scripts/manyforge component list [--json]` | Lists the curated components, each checked |
 
 Run them in the workbench container from the repository root; ROS is never
@@ -32,6 +33,12 @@ The kinds:
   banks). See [Add a machine](#add-a-machine).
 - **Sensor** (`sensor`, e.g. `components/sensor/manyforge.pointcloud_source`):
   a sensor type and one adapter row (`adapter_row`); no lane.
+- **AI assistant** (`assistant`, `components/assistant/manyforge.assistant`):
+  the chat behind the Composer AI tab; one adapter row (`adapter_row`); no
+  lane; at most one per cell. Its Deployment row names an `ai_model`
+  component (`model_component_id`) and an assistant profile with a chat mode
+  (`assistant_profile_id`); see the
+  [assistant cookbook](../operations/ASSISTANT_E2E_COOKBOOK.md).
 - **Simulator** (`simulator`, e.g. `manyforge_example_models/models/isaac_sim`):
   lane rows only. Enable plays the simulation, Disable pauses it.
 
@@ -45,7 +52,7 @@ and for a robot or tool `modelFamilyId` and `lanes` (`lane_free` for a
 pneumatic tool), for a machine `lanes` (its arm's) and `members`. Addable are:
 a robot with a Mock lane that is no machine's member, a tool with a Mock lane
 or lane-free, a machine whose arm has a Mock lane, a provider-form I/O device,
-a sensor and a simulator. A machine's member models are added only with their
+a sensor, an assistant and a simulator. A machine's member models are added only with their
 machine.
 
 ## Where components live
@@ -53,7 +60,7 @@ machine.
 | Kind | Folder |
 | --- | --- |
 | Robot, tool, simulator | `manyforge_example_models/models/<name>/` (URDF/SRDF live here; package mesh URIs resolve through the maintained model source root) |
-| I/O device, machine, sensor | `components/<kind>/<vendor>.<name>/` |
+| I/O device, machine, sensor, assistant | `components/<kind>/<vendor>.<name>/` |
 
 The templates are in `components/templates/<kind>/` (`robot`, `tool`,
 `io_device`, `machine`). Two folders with the same `id` and `version` but
@@ -94,7 +101,9 @@ TCP speed limit.
    Then the lane rows ([Lanes and adapters](#lanes-and-adapters)):
    - `lanes.mock`: `adapter: mock`, the arm's JTC as `controller`,
      `arrival_tolerance_rad` (0.01 for Mock; it becomes every arm joint's JTC
-     `goal`: a motion arrives when it finishes within it) and the controllers.
+     `goal`: a motion arrives when it finishes within it), `runtime_scale`
+     (`supported` when the arm's JTC claims `position` only, else
+     `unsupported`) and the controllers.
      A model of a vendor with an adapter (xArm) names `vendor: xarm` and
      `vendor_model` and runs the vendor's own controllers; any other model
      fills in `mock_controllers.yaml` (`controllers_file`) from the vendor's
@@ -152,11 +161,11 @@ TCP speed limit.
      PYTHONPATH=manyforge_behavior:. python3 manyforge_deployment/tools/generate_maintained_deployment_occurrences.py \
        --update \
        --description manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json \
-       --assistant-profiles manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json \
+       --assistant-profiles manyforge_deployment/resources/maintained/maintained_assistant_profiles.v2.json \
        --workspace-root .
      ```
 
-     It writes `<name>.component.json` and `<name>.fixed_scale.component.json`
+     It writes `<name>.component.json`
      under `manyforge_deployment/resources/maintained/catalog/component_type/`.
 
 7. **Scenario.** In a Scenario's `deployment.yaml`, add the robot component:
@@ -283,15 +292,38 @@ arrive again. Without a row there's no budget. Mock and `geometric_contact`
 inputs have no sender. A machine's I/O members are covered by their own I/O
 stream.
 
-The `geometric_contact` input names a motion robot and follows its current
-Active TCP at each evaluation, using the contact bodies of that TCP's owner.
-It is always active. Preparation wires the robot and all tools it carries,
-the robot's collision model and the Scene. No Active TCP, an owner without
-contact bodies, or an uncarried tool makes the input unavailable with a typed
-reason, rather than false. Missing, stale, busy or inconclusive geometry also
-makes it unavailable. Contact bodies static relative to the motion group give
-`contact_bodies_static`. The input is read-only and sampled; manual and timed
-Mock writes do not apply.
+### Geometric-contact inputs
+
+This input is true while the selected robot's contact bodies touch the selected Scene resource, checked against live geometry. If ManyForge can't make the check, the input is unavailable, never false. Contact bodies are the collision shapes on the robot, or on the mounted tool, that owns its Active TCP (the tool center point currently selected for that robot); a Scene resource is a named object in the cell's Scene.
+
+During setup, ManyForge prepares the selected robot, its mounted tools, the robot collision model and the cell
+Scene for this check. While the I/O source is enabled, it samples independently of whether a Program reads the
+signal. At every sample, ManyForge reads the current Active TCP and collision geometry. A Program may read this
+signal, but it does not store those live values or the contact result.
+
+A live unavailable sample uses `io_source_unavailable`; its `reason` says why:
+
+- `active_tcp_unavailable`: the robot has no current Active TCP.
+- `active_tcp_unknown`: the current Active TCP is not in this robot's TCP list.
+- `tcp_tool_not_mounted`: the TCP's tool is not mounted on this robot.
+- `active_tcp_contact_bodies_unavailable`: no contact bodies are declared for the Active TCP's component.
+- `runtime_motion_endpoint_body_unresolved`, `runtime_motion_endpoint_invalid`,
+  `runtime_motion_endpoint_body_invalid`, `runtime_collision_body_alias_table_invalid`, or
+  `runtime_collision_body_alias_unresolved`: the runtime cannot identify or validate a contact body
+  in the robot's model.
+- `observed_state_missing_or_stale`: current robot or tool positions needed for the check are
+  missing or older than their freshness limit.
+- `collision_geometry_missing_or_stale`: current collision geometry for the robot or Scene resource
+  is missing or stale.
+- `collision_geometry_unresolved`: ManyForge cannot match or prepare the contact bodies and Scene
+  resource geometry for a complete check.
+- `collision_query_busy`: the previous contact check is still running.
+- `collision_query_inconclusive`: the geometry query cannot confirm contact or no contact.
+- `contact_bodies_static`: at least one contact body is static relative to the robot's motion
+  group, so it does not move with the robot.
+
+Before the first sample, the signal has no value. A valid sample becomes stale when it is older than the configured **Maximum sample age**. Setting that age below normal sample-production time can make the sample stale. This input is read-only; manual
+and timed Mock writes do not apply.
 
 ## Add a tool
 
@@ -327,8 +359,8 @@ mesh `package://` URIs that share one folder before `meshes/`.
      finger joint (`roles.joints.fingers`) and the `gripper` section.
    - `gripper.actuation: position_commanded` is a gripper with its own
      controller. `lanes.mock` gives its Mock row: `adapter: mock`, its
-     `GripperActionController` as `controller`, `controllers_file`
-     (`mock_controllers.yaml`), `gripper_result_timeout_s` and
+     parallel gripper action controller as `controller`, `controllers_file`
+     (`mock_controllers.yaml`) and
      `gripper_stop_finish_tolerance` ([Grippers](GRIPPERS.md#stop-near-the-target)).
      A tool row has no `arrival_tolerance_rad`. An Isaac row
      (`lanes.isaac`) follows `manyforge_isaac_adapter/lane/README.md`.
@@ -395,8 +427,8 @@ mesh `package://` URIs that share one folder before `meshes/`.
      component's TCPs. A tool made from a descriptor has one target and never
      needs it.
 
-   In `assignment.yaml`, a `tool` component role selects the tool component.
-   Then:
+   Program nodes select the mounted tool directly by its component and command
+   target IDs. Then:
 
    ```bash
    scripts/manyforge component check manyforge_example_models/models/vac_gripper \
@@ -457,7 +489,11 @@ of its model's `lanes`; a machine member runs on its owner's lane.
 **Lane rows** (`lanes.<lane>` in `component.yaml`) name their `adapter`, and,
 except on a simulator, the `controller` (the arm's JTC or the tool's gripper
 controller). A robot's row also has `arrival_tolerance_rad` (every arm
-joint's JTC `goal`) and may have `goal_time_s`. Controllers come from one of:
+joint's JTC `goal`) and `runtime_scale` (`supported` or `unsupported`:
+whether its arm controller accepts runtime speed scaling; only a JTC that
+claims `position` alone does, and Load refuses with
+`component_runtime_scale_mismatch` when the generated controller differs from
+the declaration), and may have `goal_time_s`. Controllers come from one of:
 
 - `vendor: <family>` (and the vendor's keys, e.g. `vendor_model`): the vendor
   adapter's controllers, its base files plus ManyForge's additions, on this
@@ -480,7 +516,8 @@ Each has `driver.yaml` (the source repository and pinned commit, the hardware
 plugin, the base config files), `manyforge_settings.yaml` (ManyForge's
 additions, each commented with its reason) and `README.md` (what the adapter
 does, its row keys, how to add a model). Other families are `simulation_interfaces`
-(the generic simulator adapter) and `pointcloud` (the point-cloud sensor).
+(the generic simulator adapter), `pointcloud` (the point-cloud sensor) and
+`assistant` (the AI assistant).
 
 **Adapter registry.** Every adapter family is a shared library registered in
 the ament resource index `manyforge_component_adapters` (one resource per
@@ -516,12 +553,28 @@ process belongs to its owner, built with its arm member's model.
 **Capabilities.** Besides the four lifecycle actions, an adapter declares
 what it supports: `reset_position`, `power_off`, `reboot`, `io_manual_write`,
 `io_output_readback`, and a simulator's `sim_reset`. Only declared actions
-are offered.
+are offered. Declaring `sim_reset` identifies the component as a simulator;
+its state never latches the cell or blocks Execute.
 
 **Components without a lane** (a pneumatic tool driven by I/O) run on the
 host's generic adapter: Prepare, Enable, Disable and Recover succeed at once;
 its activity follows its own commands (busy during an open or close); it has
 no streams.
+
+**The AI assistant** has no lane either; its adapter runs a component process
+(the ROS node `assistant_host`) next to the execution host:
+
+| Action or event | Effect |
+| --- | --- |
+| Prepare, Recover | Start the host, which binds a loopback socket on a free port → `prepared` |
+| Enable | Start the bridge on that socket; when its `/health` answers, `enabled` with the endpoint `assistant_request` (its URL) |
+| Disable | Stop the bridge (SIGTERM, SIGKILL after 5 s): running chat requests end `cancelled`, the conversation history is dropped → `prepared` |
+| A chat request runs | Activity `busy` (lags by up to 1 s) |
+| `/health` answers | Stream `bridge` fresh (budget 5 s; none unless enabled; stale is a warning) |
+| Host or bridge exits | `fault_process_exited`: latches the cell and blocks Execute; Recover, then Enable |
+
+Its Enable does not wait for its AI model: the AI tab and Composer check the
+model separately.
 
 ## Lifecycle
 
@@ -547,7 +600,7 @@ then executes once.
 `{controllable_component_id, stream_id, budget_ns}`: the stream is fresh while
 a sample arrived within `budget_ns`. What a stale stream means belongs to the
 adapter, by kind: a robot's or I/O device's own stream going stale is a fault;
-a pose source's, camera's, sensor's or AI model's only shows as stale and
+a pose source's, camera's, sensor's, AI model's or AI assistant's only shows as stale and
 blocks Program conditions that read it. A robot or tool simulated in Isaac
 whose simulation isn't playing keeps its lifecycle with the reason
 `simulation_not_playing` and stale streams, never a fault; new motion and tool
@@ -586,7 +639,7 @@ reasons the preview (`POST /api/deployment/preview`) lists:
 
 | Reason | What changed |
 | --- | --- |
-| `adapter` | Its adapter rows: lifecycle time budget, streams, I/O device, pose-source, AI-model or sensor settings; the stream budget overrides it's built with (a robot's `measured_joints`, a pose source's streams) |
+| `adapter` | Its adapter rows: lifecycle time budget, streams, I/O device, pose-source, AI-model, sensor or assistant settings (an assistant's include its AI model's URL and token variable name); the stream budget overrides it's built with (a robot's `measured_joints`, a pose source's streams) |
 | `address` | A device address it uses, as resolved from the site settings |
 | `bindings` | Its control bindings |
 | `controllers` | Its control domains and controller configuration |
@@ -600,7 +653,8 @@ restarting anything: policies and the other stream budget overrides (I/O
 inputs, gripper feedback, sensors), takeover budgets,
 the Scene and planning model (root poses, attachment rows with their
 collision exclusions), pose sources, default TCPs (`default_tcp`), global
-rules, planner settings and the assistant settings. Replacing or removing an
+rules, planner settings and the Deployment's assistant settings (an AI
+assistant component's own fields are its spec). Replacing or removing an
 owner replaces or removes its members; the processes of removed and replaced
 components stop before any new one starts.
 
@@ -611,7 +665,7 @@ Common to every kind:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `api_version` | yes | `manyforge.component_package.v1` |
-| `kind` | yes | `robot`, `tool`, `io_device`, `machine`, `sensor` or `simulator` |
+| `kind` | yes | `robot`, `tool`, `io_device`, `machine`, `sensor`, `assistant` or `simulator` |
 | `id` | yes | `<vendor>.<name>`, each a lower-case portable id (`[a-z][a-z0-9_]*`). A Deployment component selects the model by it (`component_profile_id`); for a robot or tool `<name>` is the model family id |
 | `version` | yes | `MAJOR.MINOR.PATCH`. Bump the minor version for compatible data changes, the major version when roles or joints change |
 | `title` | yes | Human-readable name |
@@ -632,7 +686,7 @@ Robot:
 | `roles.instance_cardinality` | no | `multiple_per_cell` (default) or `one_per_cell` |
 | `tcps` | yes | `[{id, frame}]`, one or more TCPs, each a frame role named by its `id`; the first is the default TCP. An `id` that is also a frame role (`roles.frames`, or `root`) must be on that role's link, else it is refused (`component_manifest_invalid`). Only the listed frames are TCPs: a frame merely named `tcp` is an ordinary frame. `tcp` is an ordinary name, allowed for any TCP. The descriptor checker verifies each frame exists |
 | `limits.max_tcp_linear_speed_mps` | yes | The vendor TCP speed limit. Take it from the component's datasheet: checking the value is your responsibility, and ManyForge enforces whatever value is entered. `check` refuses a default or a Scenario TCP ceiling above it (`component_limit_exceeded`); Apply does not read it |
-| `lanes.<lane>` | yes | One row per lane (`mock`, `isaac`, `real`): `adapter`, `controller`, `arrival_tolerance_rad`, optional `goal_time_s`, `vendor` or `controllers_file` (a Mock row needs one of them), and the adapter's own keys ([Lanes and adapters](#lanes-and-adapters)) |
+| `lanes.<lane>` | yes | One row per lane (`mock`, `isaac`, `real`): `adapter`, `controller`, `arrival_tolerance_rad`, `runtime_scale`, optional `goal_time_s`, `vendor` or `controllers_file` (a Mock row needs one of them), and the adapter's own keys ([Lanes and adapters](#lanes-and-adapters)) |
 | `defaults` | no | Values for a new Deployment component: `initial_joint_positions_rad` (one per arm joint), `maximum_tcp_linear_speed_mps` (at or below the limit) |
 
 Tool:
@@ -650,8 +704,8 @@ Tool:
 | `gripper.states` | with a gripper | `{open, closed}`: group_states of the gripper group |
 | `gripper.attach_frame`, `gripper.touch_links` | with a gripper | The link a grasped object attaches to; the links that may touch it |
 | `gripper.command_duration_s` | pneumatic | The valve dwell in seconds |
-| `lanes.<lane>` | no | One row per lane: `adapter`, `controller` (the gripper controller), `controllers_file` on Mock, timeouts and the adapter's keys; no `arrival_tolerance_rad`. A pneumatic tool may have none |
-| `lanes.<lane>.gripper_stop_finish_tolerance` | Mock and GripperCommand Isaac rows | Finger distance to the target (the gripper's position unit, about 5% of the stroke) within which a Stop lets the command finish instead of cancelling it; see [Grippers](GRIPPERS.md#stop-near-the-target) |
+| `lanes.<lane>` | no | One row per lane: `adapter`, `controller` (the gripper controller), `controllers_file` on Mock, timeouts and the adapter's keys; no `arrival_tolerance_rad` or `runtime_scale`. A pneumatic tool may have none |
+| `lanes.<lane>.gripper_stop_finish_tolerance` | Mock and `ros_gripper_command` Isaac rows | Finger distance to the target (the gripper's position unit, about 5% of the stroke) within which a Stop lets the command finish instead of cancelling it; see [Grippers](GRIPPERS.md#stop-near-the-target) |
 
 I/O device: `signals` (required), each with `signal_name` (unique),
 `direction` (`input` or `output`) and `value_type` (`bool`). Provider form:
@@ -665,6 +719,8 @@ role once, each model a curated robot or model-form I/O device) and `lanes`
 (rows with at least `adapter`).
 
 Sensor: `sensor` (`pointcloud`) and `adapter_row` (`{adapter, ...}`).
+Assistant: `adapter_row` (`{adapter: assistant, backend: local_process,
+health_period_s, stream_budget_s}`).
 Simulator: `lanes` (rows with at least `adapter`).
 
 ## Check codes
@@ -678,7 +734,7 @@ Simulator: `lanes` (rows with at least `adapter`).
 | `component_joint_invalid` | A joint role names a missing, fixed or mimic joint |
 | `component_state_unknown` | The gripper group lacks an `open`/`closed` state, or `gripper.states` names a missing one |
 | `component_mesh_unresolved` | A mesh URI does not resolve in the package or maintained model source root |
-| `component_lane_invalid` | A robot row without `arrival_tolerance_rad`, a tool row with one, a Mock row with neither `vendor` nor `controllers_file`, a missing `controllers_file`, or a Scenario lane the model lacks |
+| `component_lane_invalid` | A robot row without `arrival_tolerance_rad` or `runtime_scale` (`supported` or `unsupported`), a tool row with either, a Mock row with neither `vendor` nor `controllers_file`, a missing `controllers_file`, or a Scenario lane the model lacks |
 | `component_joint_count_mismatch` | Initial joint positions do not match the arm joints |
 | `component_limit_exceeded` | A default or Scenario TCP ceiling is above `limits.max_tcp_linear_speed_mps` |
 | `component_not_registered` | A robot's or tool's family row is missing, or a machine, model-form I/O device or sensor isn't in `component_models`; run `register` |

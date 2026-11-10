@@ -127,7 +127,7 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   CanonicalEmptySceneAccessStatus access;
 };
 
-/// Private Q91 continuation input, captured and sealed by the original Manager
+/// Private continuation input, captured and sealed by the original Manager
 /// Apply plan before effects. Manager checks the complete plan and actual child
 /// proofs under its exact held-predecessor interlock before either owner call.
 /// Scene independently verifies the current Scene, candidate, bindings and

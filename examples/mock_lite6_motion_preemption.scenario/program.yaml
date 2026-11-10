@@ -1,8 +1,8 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -15,16 +15,6 @@
       "r5-live-trial"
     ]
   },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    }
-  },
   "description": "Mock Lite6 motion preemption. A slow priority-10 move is taken over after 1 s by a priority-50 move (expect preempted + smooth takeover or spring-back); then a priority-10 newcomer against a running priority-50 move is refused_by_priority. Both losers return success (preempted_result) so the tree continues to the outcome-key checks.",
   "forest": [
     {
@@ -34,7 +24,10 @@
           "instance_id": "start_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -63,7 +56,10 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -77,7 +73,10 @@
               "instance_id": "low_slow",
               "node_id": "motion.move_to_joint_target",
               "parameters": {
-                "base_frame_role": "base",
+                "base_frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
                 "execution_timeout_s": 30.0,
                 "goal": [
                   {
@@ -108,7 +107,10 @@
                 "planning_timeout_s": 5.0,
                 "preempted_result": "success",
                 "preemption_priority": 10,
-                "target_role": "arm",
+                "target": {
+                  "command_target_id": "arm",
+                  "component_id": "lite6_robot"
+                },
                 "tcp_endpoint": {
                   "kind": "current"
                 },
@@ -130,7 +132,10 @@
                   "instance_id": "high_newcomer",
                   "node_id": "motion.move_to_joint_target",
                   "parameters": {
-                    "base_frame_role": "base",
+                    "base_frame": {
+                      "component_id": "lite6_robot",
+                      "frame_id": "base"
+                    },
                     "execution_timeout_s": 30.0,
                     "goal": [
                       {
@@ -160,7 +165,10 @@
                     ],
                     "planning_timeout_s": 5.0,
                     "preemption_priority": 50,
-                    "target_role": "arm",
+                    "target": {
+                      "command_target_id": "arm",
+                      "component_id": "lite6_robot"
+                    },
                     "tcp_endpoint": {
                       "kind": "current"
                     },
@@ -204,7 +212,10 @@
               "instance_id": "high_slow",
               "node_id": "motion.move_to_joint_target",
               "parameters": {
-                "base_frame_role": "base",
+                "base_frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
                 "execution_timeout_s": 30.0,
                 "goal": [
                   {
@@ -234,7 +245,10 @@
                 ],
                 "planning_timeout_s": 5.0,
                 "preemption_priority": 50,
-                "target_role": "arm",
+                "target": {
+                  "command_target_id": "arm",
+                  "component_id": "lite6_robot"
+                },
                 "tcp_endpoint": {
                   "kind": "current"
                 },
@@ -256,7 +270,10 @@
                   "instance_id": "low_newcomer",
                   "node_id": "motion.move_to_joint_target",
                   "parameters": {
-                    "base_frame_role": "base",
+                    "base_frame": {
+                      "component_id": "lite6_robot",
+                      "frame_id": "base"
+                    },
                     "execution_timeout_s": 30.0,
                     "goal": [
                       {
@@ -287,7 +304,10 @@
                     "planning_timeout_s": 5.0,
                     "preempted_result": "success",
                     "preemption_priority": 10,
-                    "target_role": "arm",
+                    "target": {
+                      "command_target_id": "arm",
+                      "component_id": "lite6_robot"
+                    },
                     "tcp_endpoint": {
                       "kind": "current"
                     },
@@ -320,7 +340,10 @@
           "instance_id": "end_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -349,7 +372,10 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -397,54 +423,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.joint_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

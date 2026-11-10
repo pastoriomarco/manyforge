@@ -1,13 +1,13 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:5c21a3f2dff3205f807c8cc7c89cd29401a1152f2efc095df032a817c3aec8ba
+program_revision: sha256:dbcf2c9d29e8636d774a7904204043c96e6d95ae01daab1a806c4a19746b3d39
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
   without synchronized timing.
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - manyforge-only
@@ -17,82 +17,6 @@ compatibility:
   - dual-robot
   - lite6
   - ur5e
-component_roles:
-  lite6_robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-  ur5e_robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-target_roles:
-  lite6_arm:
-    component_role: lite6_robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
-  ur5e_arm:
-    component_role: ur5e_robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
 scene:
 - scene_resource_id: ground
   shape:
@@ -177,10 +101,11 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: lite6_joint_motion
     parameters:
-      target_role: lite6_arm
-      base_frame_role: base
+      target: {component_id: lite6_robot, command_target_id: arm}
+      base_frame: {component_id: lite6_robot, frame_id: base}
       tcp_endpoint:
-        kind: current
+        kind: default_of_target
+        target: {component_id: lite_gripper, command_target_id: gripper}
       goal:
       - joint_name: joint1
         position_rad: 0.3
@@ -215,10 +140,11 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: ur5e_joint_motion
     parameters:
-      target_role: ur5e_arm
-      base_frame_role: base
+      target: {component_id: ur5e_robot, command_target_id: arm}
+      base_frame: {component_id: ur5e_robot, frame_id: base}
       tcp_endpoint:
-        kind: current
+        kind: default_of_target
+        target: {component_id: robotiq_2f_85, command_target_id: gripper}
       goal:
       - joint_name: shoulder_pan_joint
         position_rad: -0.45

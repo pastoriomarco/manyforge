@@ -25,11 +25,12 @@ class IScheduler;
 
 namespace manyforge::roboplan_backend {
 
-/// Q78 / design §7.5 "the Manager owns the controller-manager process": the
+/// The Manager owns the controller-manager process: the
 /// command and process ownership of one component's controller launch. The
 /// execution host (itself a Manager-owned child) writes the generated
-/// artifacts and runs CCLC, so it starts each component's launch between the
-/// two: after the artifacts are written and before CCLC activates the arm.
+/// artifacts and runs the core component coordinator, so it starts each
+/// component's launch after the artifacts are written and before the
+/// coordinator enables the arm.
 /// ROS-free: the launch is an external `ros2 launch` process.
 
 class ControllerLaunchProcessError final : public std::runtime_error {
@@ -59,11 +60,11 @@ struct ControllerLaunchCommand final {
   std::string frame_prefix;
   std::string controllers_yaml;
   /// ros2_control and Isaac launches keep their processes across Apply when their exact
-  /// launch identity is unchanged (Q21, DX224.3).
+  /// launch identity is unchanged.
   bool keep_across_apply{false};
 };
 
-/// The command of every ros2_control component (CONTRACTS §12):
+/// The command of every ros2_control component:
 /// `ros2_control.launch.py` with the artifact's launch arguments.
 [[nodiscard]] ControllerLaunchCommand
 ros2_control_launch_command(const ControllerLaunchArtifacts &artifacts);
@@ -283,8 +284,8 @@ private:
   std::string last_incident_context_;
 };
 
-/// Per-host owner of every component's controller launch (Q66: one controller
-/// manager per component). Never restarts a process by itself (Q80): an exited
+/// Per-host owner of every component's controller launch (one controller
+/// manager per component). Never restarts a process by itself: an exited
 /// launch is reported through `fault_source` until the next activation of that
 /// component starts it again.
 class ControllerLaunchSupervisor final {
@@ -295,7 +296,7 @@ public:
   };
 
   explicit ControllerLaunchSupervisor(
-      std::chrono::milliseconds stop_grace = std::chrono::seconds(10));
+      std::chrono::milliseconds stop_grace = core::kControllerLaunchStopGrace);
   ~ControllerLaunchSupervisor();
   ControllerLaunchSupervisor(const ControllerLaunchSupervisor &) = delete;
   ControllerLaunchSupervisor &
@@ -315,7 +316,7 @@ public:
                                const std::filesystem::path &artifacts_root,
                                std::string context = {});
 
-  /// CONTRACTS §6 driver restart: stop exactly `current` and start its
+  /// Driver restart: stop exactly `current` and start its
   /// command again in its own artifacts root (a driver that doesn't
   /// reconnect by itself, e.g. after a controller reboot). Throws
   /// ControllerLaunchProcessError when the launch cannot be started.
@@ -377,7 +378,7 @@ public:
   [[nodiscard]] std::optional<ControllerLaunchObservation>
   observe(const std::string &controllable_component_id);
 
-  /// A fault source for the component's lifecycle (Q80): the exit reason of
+  /// A fault source for the component's lifecycle: the exit reason of
   /// exactly `process` once it has exited, absent while it runs.
   [[nodiscard]] static std::function<std::optional<std::string>()> fault_source(
       std::shared_ptr<ControllerLaunchProcess> process,

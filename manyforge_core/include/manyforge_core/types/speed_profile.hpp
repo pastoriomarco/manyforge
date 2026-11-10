@@ -4,7 +4,7 @@
 
 namespace manyforge::core {
 
-/// Speed profile DTO (spec §3.3)
+/// Speed profile DTO
 struct SpeedProfileDTO {
     double velocity_scale = 1.0;              // (0, 1]
     double acceleration_scale = 1.0;          // (0, 1]

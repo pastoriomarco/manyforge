@@ -1,7 +1,7 @@
 """Pure authoring-document tree/scene delta reduction.
 
 This module owns no conversations, caches, Composer state, callback response,
-or assistant wire. H0/I6 session owners may feed explicit snapshots into this
+or assistant wire. Session owners may feed explicit snapshots into this
 bounded reducer after the new Program and scene contracts are qualified.
 """
 from __future__ import annotations

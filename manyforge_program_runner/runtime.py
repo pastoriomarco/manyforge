@@ -53,6 +53,7 @@ from manyforge_behavior.program import (
     INTERRUPT_STATE_NAMESPACE,
     Program,
     ProgramValidationError,
+    ProgramFrameReferenceError,
     is_interrupt_state_key,
 )
 from manyforge_behavior.production_ports import (
@@ -80,6 +81,7 @@ from manyforge_behavior.program_scheduling import (
     ProgramSchedulingError,
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_behavior.program_frame_facts import ProgramFrameFacts
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.models import (
     ManualProgramHandover,
@@ -158,18 +160,18 @@ from .diagnostics import ProgramDiagnosticPublisher
 _LOGGER = logging.getLogger(__name__)
 # A transport without the rule-state channel has no global rules to wait for.
 _NO_GLOBAL_RULES: Final = RuleCatalog("", None, 1, "", "", (), ())
-PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v1"
+PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v2"
 PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v1"
 PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v1"
 PERSISTENT_KEY_RECONCILIATION_VERSION: Final = (
     "manyforge.persistent_key_reconciliation.v1"
 )
 PROGRAM_NODE_PREVIEW_INTENT_VERSION: Final = (
-    "manyforge.program_node_correction_preview_intent.v1"
+    "manyforge.program_node_correction_preview_intent.v2"
 )
 _MAX_INFLIGHT_COMMANDS: Final = 4_096
 # Recovery actions that release Program motion; the non-moving
-# acknowledge_and_continue and the Reset path stay available (spec 450 §5.2).
+# acknowledge_and_continue and the Reset path stay available.
 # Continue releases the hold's groups by Retry's rule, so it is checked alike.
 _MOTION_PRODUCING_RECOVERY_ACTIONS: Final = frozenset(
     {
@@ -232,7 +234,9 @@ def _validate_persistent_value(
     try:
         store.write(declaration.key, value)
     except ProgramValueError as error:
-        raise ProgramRunnerError("persistent_key_value_invalid", str(error)) from error
+        cause = error.__cause__
+        details = cause.details if isinstance(cause, ProgramFrameReferenceError) else None
+        raise ProgramRunnerError("persistent_key_value_invalid", str(error), details=details) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,10 +433,10 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_journal_version_unsupported", str(error)
             ) from error
-        # One synchronous BB key sender per captured Run (contract 52, BBK-1).
-        # Key None is the cell-level source between Runs (SX-2088).
+        # One synchronous BB key sender per captured Run.
+        # Key None is the cell-level source between Runs.
         self._bbkey_publishers: dict[str | None, ProgramBlackboardKeyPublisher] = {}
-        # SX-2182: sources whose baseline waits for the global rule catalog of
+        # Sources whose baseline waits for the global rule catalog of
         # their own publication: (publisher, store, Program keys, deadline ns).
         self._bbkey_pending: dict[
             str | None,
@@ -450,16 +454,16 @@ class ProgramRuntime:
         self._bbkey_idle_store: ProgramValueStore | None = None
         self._bbkey_publishers_lock = RLock()
         # The Run and between-Runs stores are registered independently of BB
-        # publication: W0 still needs the robot-owned Active TCP values.
+        # publication: a Program with no keys still needs the robot-owned Active TCP values.
         self._active_tcp_stores_lock = Lock()
         self._active_tcp_stores: dict[
             str | None, tuple[ProgramValueStore, dict[str, tuple[str, ...]]]
         ] = {}
         self._active_tcp_mirror = ActiveTcpMirror(on_change=self._write_active_tcp)
-        # F-2: one source creation at a time (check, retire, create, install,
+        # One source creation at a time (check, retire, create, install,
         # start). Held across I/O, so never the publishers lock above.
         self._bbkey_source_lock = RLock()
-        # F-2: the publisher fence held by between-Runs faults until every
+        # The publisher fence held by between-Runs faults until every
         # loss is confirmed or superseded by an ACKed successor.
         self._bbkey_fence_lock = Lock()
         # Unconfirmed losses: token -> the lost source's creation ordinal.
@@ -467,11 +471,11 @@ class ProgramRuntime:
         self._bbkey_source_ordinals = count(1)
         self._bbkey_fence_reference: str | None = None
         self._bbkey_fence_permanent = False
-        # Contract 64: the Kernel's global rule states, mirrored into the
+        # The Kernel's global rule states, mirrored into the
         # reserved interrupt_state.<rule_id> keys of the current stores.
         self._interrupt_state_mirror: InterruptRuleStateMirror | None = None
         self._interrupt_state_run_id: str | None = None
-        # The grasp-lost key mirror's own Run binding (SX-261): bound before
+        # The grasp-lost key mirror's own Run binding: bound before
         # the Running CAS, separate from the interrupt-state mirror's.
         self._carried_object_lost_run_id: str | None = None
         self._carried_object_lost_run_active = False
@@ -637,7 +641,7 @@ class ProgramRuntime:
             maximum_retained_runs=config.maximum_retained_runs,
         )
         self._terminal_observation_lock = RLock()
-        # The latest run's `ProgramRunEnd` as observed at its end (§9).
+        # The latest run's `ProgramRunEnd` as observed at its end.
         self._run_ends: dict[str, dict[str, Any]] = {}
         self._pending_terminal_snapshots: dict[str, dict[str, Any]] = {}
         self._runtime_controls: dict[str, ProgramRuntimeControls] = {}
@@ -1234,7 +1238,7 @@ class ProgramRuntime:
 
     def _simulation_node_requirements(
         self, node_id: str, parameters: Mapping[str, Any]
-    ) -> tuple[bool, frozenset[str]]:
+    ) -> tuple[bool, frozenset[tuple[str, str, str]]]:
         entry = self._environment.catalog.get(node_id)
         effective = {
             parameter.id: parameter.default
@@ -1242,7 +1246,7 @@ class ProgramRuntime:
         }
         effective.update(parameters)
         simulator = False
-        targets: set[str] = set()
+        targets: set[tuple[str, str, str]] = set()
         for requirement in entry.required_capabilities:
             if (requirement.when_parameter is not None
                 and effective.get(requirement.when_parameter) != requirement.when_equals):
@@ -1260,10 +1264,21 @@ class ProgramRuntime:
                     )
                 simulator = True
             if requirement.scope == "target_binding":
-                role = effective.get(requirement.target_parameter)
-                if not isinstance(role, str) or not role:
-                    raise ProgramRunOwnerError("Program simulation dependency has no exact target role")
-                targets.add(role)
+                reference = effective.get(requirement.target_parameter)
+                if not isinstance(reference, Mapping):
+                    raise ProgramRunOwnerError("Program simulation dependency has no exact reference")
+                component = reference.get("component_id")
+                if not isinstance(component, str) or not component:
+                    raise ProgramRunOwnerError("Program simulation dependency has an invalid component")
+                if set(reference) == {"component_id", "command_target_id"}:
+                    kind, identity = "target", reference["command_target_id"]
+                elif set(reference) == {"component_id", "signal_name"}:
+                    kind, identity = "signal", reference["signal_name"]
+                else:
+                    raise ProgramRunOwnerError("Program simulation dependency reference is invalid")
+                if not isinstance(identity, str) or not identity:
+                    raise ProgramRunOwnerError("Program simulation dependency identity is invalid")
+                targets.add((kind, component, identity))
         return simulator, frozenset(targets)
 
     def _simulation_context_requirement(
@@ -1294,7 +1309,7 @@ class ProgramRuntime:
         tree = program.get("tree")
         if not isinstance(tree, Mapping):
             raise ProgramRunOwnerError("Program simulation dependency has no normalized tree")
-        target_roles: set[str] = set()
+        references: set[tuple[str, str, str]] = set()
         simulator_node = False
         pending = [tree]
         while pending:
@@ -1304,9 +1319,9 @@ class ProgramRuntime:
                 raise ProgramRunOwnerError("Program simulation dependency has invalid parameters")
             simulator, targets = self._simulation_node_requirements(node["node_id"], parameters)
             simulator_node |= simulator
-            target_roles.update(targets)
+            references.update(targets)
             pending.extend(rows(node.get("children", ())))
-        if not simulator_node and not target_roles:
+        if not simulator_node and not references:
             return False, unavailable
 
         projection = self._headless.manager_graph()
@@ -1378,21 +1393,28 @@ class ProgramRuntime:
                     eligible |= isaac_dependency(component)
             return True, configured if eligible else unavailable
 
-        targets = rows(program_binding.get("target_role_bindings"))
-        components = rows(program_binding.get("component_role_bindings"))
+        targets = rows(program_binding.get("target_bindings"))
+        components = rows(program_binding.get("component_bindings"))
+        signals = rows(program_binding.get("signal_bindings"))
         selected: set[str] = set()
-        for role in target_roles:
-            matches = [row for row in targets if row.get("target_role_id") == role]
+        for kind, component, identity in references:
+            if kind == "signal":
+                matches = [row for row in signals if row.get("reference") == {
+                    "component_id": component, "signal_name": identity
+                }]
+                if len(matches) != 1 or not isinstance(matches[0].get("target"), Mapping):
+                    raise ProgramRunOwnerError("Program simulation dependency has ambiguous signal binding")
+                target_identity = matches[0]["target"]
+            else:
+                target_identity = {"component_id": component, "command_target_id": identity}
+            if target_identity.get("component_id") != component:
+                raise ProgramRunOwnerError("Program simulation dependency signal crosses its component")
+            matches = [row for row in targets if row.get("target") == target_identity]
             if len(matches) != 1:
                 raise ProgramRunOwnerError("Program simulation dependency has ambiguous target binding")
-            target = matches[0]
-            component = target.get("controllable_component_id")
-            matches = [row for row in components
-                       if row.get("component_role_id") == target.get("component_role_id")]
-            if (not isinstance(component, str) or not component or len(matches) != 1
-                or matches[0].get("controllable_component_id") != component
-                or not isinstance(target.get("command_target_id"), str)
-                or not target["command_target_id"]):
+            matches = [row for row in components if row.get("component_id") == component]
+            if (len(matches) != 1 or not isinstance(target_identity.get("command_target_id"), str)
+                or not target_identity["command_target_id"]):
                 raise ProgramRunOwnerError("Program simulation dependency crosses its component binding")
             selected.add(component)
         # A provider-only I/O component (provider-kind control domain and no
@@ -1431,7 +1453,7 @@ class ProgramRuntime:
                 if profile_id != "manyforge.ros2_control_execution_runtime" or component in io_providers:
                     continue
                 matches = [row for row in ros_profiles(unit) if row.get("controllable_component_id") == component]
-                # A no-output pneumatic tool (merge 6 D4: No output, or driven
+                # A no-output pneumatic tool (No output, or driven
                 # through pneumatic I/O) is lane-free: no controller profile and
                 # no simulator row, as for the provider-only I/O component above.
                 if not matches and any(
@@ -1610,7 +1632,7 @@ class ProgramRuntime:
             and failure_code
         ):
             return cycle.reset_phase
-        # Schema-v4 UI6-F candidates briefly recorded a known scene-owner
+        # Schema-v4 candidates briefly recorded a known scene-owner
         # rejection as generic reconciliation with phase ``failed``. No claim
         # release was attempted, so the same exact scene convergence remains
         # safely idempotent and can be repaired in place after upgrade.
@@ -1979,7 +2001,7 @@ class ProgramRuntime:
             None if run is None else run["node_status_revision"]
         )
         result["recovery_offer"] = recovery_offer
-        # CONTRACTS §9: why the run ended (None while it runs): the cycle-level
+        # Why the run ended (None while it runs): the cycle-level
         # notice reads it instead of inferring "finished" from `failure`.
         result["run_end"] = None if run is None else run.get("run_end")
         # This is the single shared browser observation. Publishing the exact
@@ -2131,7 +2153,7 @@ class ProgramRuntime:
             return controls
 
     def _optional_controls(self, program_run_id: str) -> ProgramRuntimeControls | None:
-        """Read C2 controls without making legacy terminal cycles unreadable."""
+        """Read runtime controls without making legacy terminal cycles unreadable."""
 
         try:
             return self._controls(program_run_id)
@@ -2172,7 +2194,7 @@ class ProgramRuntime:
         *,
         cycle_generation: int,
     ) -> list[dict[str, Any]]:
-        """Every active failure hold, one offer each (contract item 39): the
+        """Every active failure hold, one offer each: the
         hold's own motion groups, its captured Stop scope, and its offer."""
         if program_run_id is None or not self._offer_cycle_current(
             program_run_id, cycle_generation
@@ -2309,7 +2331,7 @@ class ProgramRuntime:
         }
 
     def _project_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        # Program-run status v1 stays a stable owner contract. C2 state is a
+        # Program-run status v1 stays a stable owner contract. Runtime-control state is a
         # separate joined projection so adding controls never weakens or
         # silently version-skews existing run consumers.
         projected = deepcopy(dict(value))
@@ -2341,7 +2363,7 @@ class ProgramRuntime:
                 )
                 return
             settlement = {
-                "schema_version": "manyforge.program_cycle_start_settlement.v1",
+                "schema_version": "manyforge.program_cycle_start_settlement.v2",
                 "kind": "proven_no_effect",
                 "claim": None,
                 "program_run_id": current.program_run_id,
@@ -2361,7 +2383,7 @@ class ProgramRuntime:
             journal.require_reconciliation(expected_generation=current.cycle_generation)
             return
         settlement: dict[str, Any] = {
-            "schema_version": "manyforge.program_cycle_start_settlement.v1",
+            "schema_version": "manyforge.program_cycle_start_settlement.v2",
             "kind": "proven_no_effect",
             "claim": deepcopy(current.claim),
             "program_run_id": current.program_run_id,
@@ -2454,7 +2476,7 @@ class ProgramRuntime:
             prepared_scene = settlement.get("prepared_scene")
             if (
                 settlement.get("schema_version")
-                != "manyforge.program_cycle_start_settlement.v1"
+                != "manyforge.program_cycle_start_settlement.v2"
                 or settlement.get("claim") != cycle.claim
                 or not isinstance(prepared_scene, Mapping)
                 or (prepared_scene != {} and prepared_scene.get("schema_version")
@@ -3000,7 +3022,7 @@ class ProgramRuntime:
 
     def _reset_rule_activation(self) -> None:
         """Every global rule returns to its `active_at_start` at the end of
-        every run (completed, failed, stopped) and at Reset (CONTRACTS §8)."""
+        every run (completed, failed, stopped) and at Reset."""
 
         try:
             self._kernel.reset_rule_activation()
@@ -3115,7 +3137,7 @@ class ProgramRuntime:
                     self._bbkey_fence_permanent = True
                     return
                 self._bbkey_open_losses[token] = ordinal
-            # F-2: the cell-level source between Runs guards no Run. Drop it
+            # The cell-level source between Runs guards no Run. Drop it
             # locally; the sender has already failed closed in the Kernel: it
             # declared its own continuity lost (an exact-sender sequence gap),
             # so every BB-backed global-rule input is unavailable and gated
@@ -3181,7 +3203,7 @@ class ProgramRuntime:
         self, settles: Callable[[object, int], bool], outcome: str
     ) -> None:
         """Settle the matching unconfirmed between-Runs losses; release the
-        fence only when none is left and no Run fault holds it (F-2)."""
+        fence only when none is left and no Run fault holds it."""
 
         with self._bbkey_fence_lock:
             settled = [key for key, lost in self._bbkey_open_losses.items() if settles(key, lost)]
@@ -3221,12 +3243,12 @@ class ProgramRuntime:
     ) -> None:
         """Send the baseline of the fixed union W = Program keys ∪ the global
         rules' keys only once the catalog of this source's full context
-        (owner epoch, publication, bundle, graph) is known (SX-2182/2184) and
+        (owner epoch, publication, bundle, graph) is known and
         the Kernel has installed the source (no ``bb_source_not_ready``).
         Until then the source is pending: its writes only commit, and the next
         liveness observation starts it again with a baseline built from the
-        store then (BBK-1 (a)). A pending source keeps its original
-        ``deadline_ns`` (SX-2209)."""
+        store then. A pending source keeps its original
+        ``deadline_ns``."""
 
         def pend() -> None:
             with self._bbkey_publishers_lock:
@@ -3249,7 +3271,7 @@ class ProgramRuntime:
             publisher.retire()
             return
         scope = publisher.scope
-        # Diagnostic (F-2): one bounded line per baseline sender, so two
+        # Diagnostic: one bounded line per baseline sender, so two
         # senders of one scope can be told apart (WARNING: the Runner
         # configures no log level, so INFO would not reach the container log).
         _LOGGER.warning(
@@ -3353,7 +3375,7 @@ class ProgramRuntime:
             self._seed_interrupt_states(store, context)
         catalog = self._catalog_for_context(context)
         if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
-            return None  # W0: no sender, no baseline.
+            return None  # No keys: no sender, no baseline.
         publisher = self._new_bbkey_publisher(
             ProgramBlackboardPublicationScope(
                 owner_epoch=owner_epoch,
@@ -3378,7 +3400,7 @@ class ProgramRuntime:
         Identity: Runner owner epoch + Applied binding and publication +
         Program-cycle generation. Baseline: persistent keys' stored values,
         run-only keys their declared `initial` (else null), node_outcome.*
-        `none` (contract 105). Every new
+        `none`. Every new
         Applied publication is a new source; unchanged identity (a repeated
         Apply notice) keeps the source.
         """
@@ -3402,9 +3424,9 @@ class ProgramRuntime:
         cycle_generation = self._journal.read().cycle_generation
         with self._bbkey_publishers_lock:
             current = self._bbkey_publishers.get(None)
-        # F-2: an unchanged identity keeps its source before anything else.
+        # An unchanged identity keeps its source before anything else.
         # The Kernel keeps the baseline of this exact scope; a local retire
-        # followed by a new sender of the same scope (e.g. W0 below on a
+        # followed by a new sender of the same scope (e.g. the no-keys case below on a
         # transient catalog read) would send that baseline again, and the
         # Kernel refuses the repeat (`program_bb_sequence_stale`).
         if (
@@ -3422,7 +3444,11 @@ class ProgramRuntime:
             Program.from_dict(deepcopy(applied["program"]), self._environment.catalog),
             retained_bundle_id=applied.get("retained_bundle_id"),
             graph_revision=applied.get("graph_revision"),
-        ).with_active_tcp_binding(applied["program_binding"])
+        ).with_active_tcp_binding(applied["program_binding"]).with_program_frame_facts(
+            ProgramFrameFacts.from_capture(applied["program_frame_facts"], {
+                **applied, "applied_record_digest": applied["source"]["record_digest"],
+            })
+        )
         persistent = {
             key: declaration
             for key, declaration in program.blackboard_keys.items()
@@ -3437,9 +3463,9 @@ class ProgramRuntime:
         )
         self._register_active_tcp_store(None, store, applied["program_binding"], context[0])
         if no_publisher:
-            return  # W0: Active TCP is mirrored, but no BB source is sent.
+            return  # No keys: Active TCP is mirrored, but no BB source is sent.
         # A fresh store: run-scoped keys hold their declared `initial`, or null
-        # when omitted (the value the next Run starts from, contract 105),
+        # when omitted (the value the next Run starts from),
         # node_outcome.* `none`.
         publisher = self._new_bbkey_publisher(
             ProgramBlackboardPublicationScope(
@@ -3502,7 +3528,7 @@ class ProgramRuntime:
         return generation
 
     def _reset_bbkey_publication(self, program_run_id: str) -> None:
-        """Reset retires the Run's source locally (DX-1281): no clearing
+        """Reset retires the Run's source locally: no clearing
         frame; the between-Runs baseline that follows carries run-only keys
         at their declared `initial`, or null when omitted. Keys keep their last value while the
         Run is held or finished, so the sender lives until here."""
@@ -3523,13 +3549,13 @@ class ProgramRuntime:
 
     def _learn_condition_keys(self, program: Program) -> tuple[str, ...]:
         """Learn the Applied Program's condition keys. The source adds the
-        global rules' keys of its own publication (SX-2170/2182)."""
+        global rules' keys of its own publication."""
 
         self._applied_condition_keys = program.interrupt_condition_keys
         return self._applied_condition_keys
 
     def _cell_bbkey_union(self) -> tuple[str, ...]:
-        """The Program part of the cell-level union (contract 52, SX-2088):
+        """The Program part of the cell-level union:
         the keys the Applied Program's interrupt conditions name, as last
         learned from a cold Apply or a Run start. The global rules'
         ``referenced_program_blackboard_keys`` join when the source starts,
@@ -3541,7 +3567,7 @@ class ProgramRuntime:
         """Start the between-Runs source (Reset already advanced the cycle).
 
         A start failure is logged, never a logged success, and changes no
-        source (F-2): an unchanged identity keeps its source, which the Kernel
+        source: an unchanged identity keeps its source, which the Kernel
         still holds, and a new Applied publication retires the old source in
         the Kernel itself. The next Reset or Run start establishes the source.
         Startup, Apply notices and Reset reach here on different workers: one
@@ -3556,23 +3582,26 @@ class ProgramRuntime:
 
     # Active TCP values belong to robot handles, independent of BB publishing.
     @staticmethod
-    def _active_tcp_roles(binding: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
-        roles: dict[str, list[str]] = {}
-        for row in binding.get("target_role_bindings", ()):
+    def _active_tcp_targets(binding: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+        targets: dict[str, list[str]] = {}
+        for row in binding.get("target_bindings", ()):
             if not isinstance(row, Mapping) or "robot_tcps" not in row:
                 continue
-            robot, role = row.get("controllable_component_id"), row.get("target_role_id")
-            if isinstance(robot, str) and robot and isinstance(role, str) and role:
-                roles.setdefault(robot, []).append(role)
-        return {robot: tuple(sorted(set(names))) for robot, names in roles.items()}
+            target = row.get("target")
+            if not isinstance(target, Mapping):
+                continue
+            robot, command = target.get("component_id"), target.get("command_target_id")
+            if isinstance(robot, str) and robot and isinstance(command, str) and command:
+                targets.setdefault(robot, []).append(command)
+        return {robot: tuple(sorted(set(names))) for robot, names in targets.items()}
 
     @staticmethod
     def _write_store_active_tcp(
         store: ProgramValueStore, roles: Mapping[str, tuple[str, ...]],
         robot: str, entry: Mapping[str, Any] | None,
     ) -> None:
-        for role in roles.get(robot, ()):
-            store.write_active_tcp(role, entry)
+        for command_target in roles.get(robot, ()):
+            store.write_active_tcp(robot, command_target, entry)
 
     def _write_active_tcp(self, robot: str, entry: Mapping[str, Any] | None) -> None:
         with self._active_tcp_stores_lock:
@@ -3596,7 +3625,7 @@ class ProgramRuntime:
         if owners:
             owner = next(iter(owners))
             # Without a follower, only an ordered read may establish an owner.
-            # LR-2: concurrent reads across owner replacement can return out of
+            # Concurrent reads across owner replacement can return out of
             # order; a late old-owner answer can replace the newer owner/value.
             if ordered and not self._has_active_tcp_follower():
                 self._active_tcp_mirror.set_owner(owner)
@@ -3615,7 +3644,7 @@ class ProgramRuntime:
 
     def _read_active_tcp_ordered(self) -> None:
         # The host orders accepted commands; a connection delayed before its
-        # enqueue remains the explicitly approved LR-1 residual (DX-3074).
+        # enqueue remains the explicitly approved residual.
         self._apply_active_tcp_reading(self._kernel.read_active_tcp(ordered=True), ordered=True)
 
     def _refresh_active_tcp(self) -> None:
@@ -3639,7 +3668,7 @@ class ProgramRuntime:
         self, name: str | None, store: ProgramValueStore, binding: Mapping[str, Any],
         owner_epoch: str,
     ) -> None:
-        roles = self._active_tcp_roles(binding)
+        roles = self._active_tcp_targets(binding)
         # This epoch came from the captured execution identity or the existing
         # cell-admission owner fence, not from a stream record.
         self._active_tcp_mirror.set_owner_if_absent(owner_epoch)
@@ -3694,7 +3723,7 @@ class ProgramRuntime:
             raise ActiveTcpWireError("Active TCP result is not current for the fenced owner")
         return applied is True
 
-    # Global-rule state mirror (contract 64) ---------------------------------
+    # Global-rule state mirror ----------------------------------------------
 
     def _global_rule_catalog(self) -> RuleCatalog | None:
         """The Kernel's installed global rule catalog (``events`` reply
@@ -3712,7 +3741,7 @@ class ProgramRuntime:
     def _catalog_for_context(self, context: tuple[str, int, str, str]) -> RuleCatalog | None:
         """The catalog of exactly this full context (owner epoch, publication
         generation, bundle, graph), or None while it is not yet known: null or
-        another context is never an empty policy (SX-2182/2184); a
+        another context is never an empty policy; a
         ``verified_empty`` catalog is the proof of "no global rules". Without a
         rule-state channel there is none to wait for."""
 
@@ -3747,7 +3776,7 @@ class ProgramRuntime:
     def _with_global_rule_keys(
         self, program: Program, *, retained_bundle_id: Any, graph_revision: Any
     ) -> Program:
-        """Declare the reserved ``interrupt_state.<rule_id>`` keys (contract 64)."""
+        """Declare the reserved ``interrupt_state.<rule_id>`` keys."""
 
         rule_ids = self._applied_global_rule_ids(
             retained_bundle_id=str(retained_bundle_id), graph_revision=str(graph_revision)
@@ -3835,8 +3864,8 @@ class ProgramRuntime:
     ) -> None:
         """Write every ``interrupt_state.<rule_id>`` key the store already
         declares (its qualified Applied global rules). Unknown states (None,
-        e.g. an unknown catalog) make each of them unavailable, never clear
-        (SX-2208); a rule absent from known states is unavailable too."""
+        e.g. an unknown catalog) make each of them unavailable, never clear;
+        a rule absent from known states is unavailable too."""
 
         prefix = f"{INTERRUPT_STATE_NAMESPACE}."
         for key in store.program.blackboard_keys:
@@ -4021,7 +4050,7 @@ class ProgramRuntime:
     ) -> None:
         """A new store sees the current states of exactly its full context
         (owner epoch, publication, bundle, graph) from its first tick; states
-        of another context are unavailable for it (SX-2207)."""
+        of another context are unavailable for it."""
 
         mirror = self._interrupt_state_mirror
         self._write_interrupt_states(
@@ -4040,7 +4069,7 @@ class ProgramRuntime:
         """B-run-1: refuse Execute while a robot has no End-effector TCP.
 
         The execution owner states the fact per robot motion target: its
-        Robot Control ``tcp_frame_role_id`` is null exactly when the robot has
+        Robot Control ``tcp_frame`` is null exactly when the robot has
         no End-effector TCP (the tool on its flange has no default TCP). The
         rule itself is not evaluated here.
         """
@@ -4056,7 +4085,7 @@ class ProgramRuntime:
             for target in component.get("targets", ()):
                 if (
                     target.get("presentation") == "motion"
-                    and target.get("command", {}).get("tcp_frame_role_id") is None
+                    and target.get("command", {}).get("tcp_frame") is None
                 ):
                     robot = component.get("controllable_component_id")
                     raise ProgramRunnerError(
@@ -4068,8 +4097,8 @@ class ProgramRuntime:
     def _require_run_readiness(self, can: str) -> None:
         """Refuse Execute (``can_execute``), a stopped run's Resume (``can_resume``)
         or a held motion group's Run/Resume (``motion_clear``) with
-        the first reason of the one ``RunReadiness`` owner (CONTRACTS §10,
-        ``GET /api/program/readiness``); the Runner computes none itself."""
+        the first reason of the one ``RunReadiness`` owner
+        (``GET /api/program/readiness``); the Runner computes none itself."""
 
         try:
             readiness = self._headless.request("GET", "/api/program/readiness")
@@ -4257,7 +4286,7 @@ class ProgramRuntime:
                 if declared is not run_admission.program:
                     run_admission = replace(run_admission, program=declared)
                 # A `rules.set_active` naming a rule the Deployment lacks
-                # blocks Execute (CONTRACTS §9).
+                # blocks Execute.
                 unknown_rules = sorted(
                     set(declared.rule_activation_rule_ids)
                     - set(self._applied_global_rule_ids(
@@ -4275,7 +4304,7 @@ class ProgramRuntime:
                 self._require_end_effector_tcps()
                 pre_claim_dropped: tuple[Any, ...] = ()
                 if self._persistent_keys is not None:
-                    # Spec 400 §7.3: Run is refused, not started, while the
+                    # Run is refused, not started, while the
                     # register cannot be reconciled. A plain write failure
                     # leaves no remembered fault, so storage is reconciled
                     # here before any claim; the post-claim check below stays
@@ -4533,9 +4562,9 @@ class ProgramRuntime:
                         "program_run_superseded_by_stop",
                         "Program Stop was accepted before Run admission completed",
                     )
-                # The Run's fixed referenced-key union (contract 52): the keys
+                # The Run's fixed referenced-key union: the keys
                 # its interrupt conditions name plus the installed global
-                # rules' condition keys (SX-2170). The baseline must be
+                # rules' condition keys. The baseline must be
                 # captured here, before the first tick.
                 self._start_bbkey_publication(
                     program_run_id,
@@ -4849,8 +4878,10 @@ class ProgramRuntime:
                 ],
             )
         except NodeInputProposalError as error:
+            cause = error.__cause__
+            details = cause.details if isinstance(cause, ProgramFrameReferenceError) else None
             raise ProgramRunnerError(
-                "program_node_preview_input_invalid", str(error)
+                "program_node_preview_input_invalid", str(error), details=details
             ) from error
         except ProgramRunOwnerError as error:
             raise ProgramRunnerError("program_run_not_found", str(error)) from error
@@ -4877,12 +4908,7 @@ class ProgramRuntime:
                 "program_node_preview_input_invalid", str(error)
             ) from error
         target = participant.target
-        result["target"] = {
-            "target_role_id": target.target_role_id,
-            "component_role_id": target.component_role_id,
-            "controllable_component_id": target.controllable_component_id,
-            "command_target_id": target.command_target_id,
-        }
+        result["target"] = target.reference()
         result["operation"] = operation
         return result
 
@@ -5001,7 +5027,7 @@ class ProgramRuntime:
             except ProgramRunOwnerError as error:
                 reject(ProgramRunnerError("program_run_not_found", str(error)))
             # Run/Resume names its run by id, epoch and selection revision;
-            # tree ticks raise the run revision without changing that (N8).
+            # tree ticks raise the run revision without changing that.
             if (
                 kind not in {"start_motion", "resume_motion"}
                 and live.run_revision != request.expected_run_revision
@@ -5181,7 +5207,7 @@ class ProgramRuntime:
             if (
                 not isinstance(projection, Mapping)
                 or projection.get("schema_version")
-                != "manyforge.committed_scenario_activation.v3"
+                != "manyforge.committed_scenario_activation.v4"
                 or not isinstance(projection.get("origin"), Mapping)
             ):
                 raise ProgramRunnerError(
@@ -5214,7 +5240,16 @@ class ProgramRuntime:
                 program = Program.from_dict(
                     deepcopy(projection["program"]), self._environment.catalog
                 )
-            except (KeyError, TypeError, ProgramValidationError) as error:
+                if projection["program_frame_facts"] is not None:
+                    wire_facts = projection["program_frame_facts"]
+                    program = program.with_program_frame_facts(
+                        ProgramFrameFacts.from_capture(wire_facts, {
+                            **projection,
+                            "applied_record_digest": projection["record_digest"],
+                            "program_revision": program.program_revision,
+                        })
+                    )
+            except (KeyError, TypeError, ValueError) as error:
                 raise ProgramRunnerError(
                     "persistent_key_program_unavailable",
                     f"Applied Program cannot be read: {error}",
@@ -5614,6 +5649,14 @@ class ProgramRuntime:
                     f"blackboard key {request.key!r} is read-only for the operator",
                 )
             if action == "set":
+                if (declaration.type == "stored_pose" and isinstance(request.value, Mapping)
+                        and isinstance(request.value.get("frame_ref"), Mapping)
+                        and request.value["frame_ref"].get("kind") == "target_frame"
+                        and getattr(program, "_program_frame_facts", None) is None):
+                    raise ProgramRunnerError(
+                        "persistent_key_program_unavailable",
+                        "Applied Program has no captured frame facts",
+                    )
                 _validate_persistent_value(program, declaration, request.value)
             program_run_id = self._require_persistent_fence(activation, request)
             if program_run_id is None:
@@ -5806,7 +5849,7 @@ class ProgramRuntime:
                     else "manual_failure"
                 ),
                 # A failed result has no output; its resolution never carries
-                # Continue's marker (item 11).
+                # Continue's marker.
                 result=request.output if request.outcome == "succeeded" else None,
             )
             controls.audit_value(
@@ -5950,12 +5993,12 @@ class ProgramRuntime:
                 )
             if request.action_id in _MOTION_PRODUCING_RECOVERY_ACTIONS:
                 # Held motion continues: like a group's Run/Resume it needs
-                # motion_clear (CONTRACTS §10), refused before any effect.
+                # motion_clear, refused before any effect.
                 try:
                     self._require_run_readiness("motion_clear")
                 except ProgramRunnerError as error:
                     reject(error)
-                # Spec 450 §5.2: the Kernel refuses these while operator-alarm
+                # The Kernel refuses these while operator-alarm
                 # attention gates the held node's resources. Ask it before any
                 # effect so a refusal leaves the held attempt untouched; an
                 # alarm on disjoint resources does not block this recovery.

@@ -16,13 +16,13 @@
 
 namespace manyforge::core {
 
-// Normalized collision DTOs (spec §3.8.1).
+// Normalized collision DTOs.
 //
 // These DTOs shipped the ManyForge-owned collision contract. They were
 // populated alongside CollisionCheckRequestDTO / CollisionCheckResultDTO
 // during the rollout, before the kernel migrated to consuming them.
 
-/// Stable, engine-independent collision body id (spec §3.8.1).
+/// Stable, engine-independent collision body id.
 ///
 /// Normative formats (one of):
 ///   component/<component>/model/<model>/body/<role>/collision/<index>
@@ -34,11 +34,11 @@ namespace manyforge::core {
 /// names. Multi-component scenes carry exact component and model identity.
 using CollisionBodyId = std::string;
 
-/// Collision-world revision (spec §3.8.1).
+/// Collision-world revision.
 ///
-/// The unit of traceability for authoritative collision decisions. Chunk 1
-/// diagnostic wrappers may leave CollisionResult::collision_world_revision
-/// empty until the Chunk 2 ledger and atomic publisher land.
+/// The unit of traceability for authoritative collision decisions.
+/// Diagnostic wrappers may leave CollisionResult::collision_world_revision
+/// empty.
 struct CollisionWorldRevision {
   /// Monotonic counter; never decreases within a process lifetime.
   std::uint64_t revision_id = 0;
@@ -48,7 +48,7 @@ struct CollisionWorldRevision {
   std::string content_hash;
 };
 
-/// Canonical unordered pair of collision body ids (spec §3.8.1).
+/// Canonical unordered pair of collision body ids.
 ///
 /// Canonical form: body_a <= body_b in lexicographic order. The canonical
 /// form is the on-the-wire representation so equality and sorting are
@@ -72,8 +72,7 @@ struct CollisionPairId {
   }
 };
 
-/// Per-pair classification produced by the policy evaluator (spec §3.8.1,
-/// added in Chunk 3 of the collision-ownership plan).
+/// Per-pair classification produced by the policy evaluator.
 enum class CollisionPairClassification {
   kBlockingCollision,
   kAllowedStaticStatic,
@@ -86,8 +85,7 @@ enum class CollisionPairClassification {
   kDiagnosticIncomplete,
 };
 
-/// Per-pair output bundle emitted alongside CollisionResult::normalized_pairs
-/// (spec §3.8.1, added in Chunk 3).
+/// Per-pair output bundle emitted alongside CollisionResult::normalized_pairs.
 struct CollisionPairResult {
   CollisionPairId pair;
   CollisionPairClassification classification =
@@ -109,14 +107,14 @@ struct CollisionPairClearance {
   double signed_clearance_m = 0.0;
 };
 
-/// Logical owner of a collision body (spec §3.8.1).
+/// Logical owner of a collision body.
 enum class CollisionOwnerKind {
   kComponentModelBody,
   kSceneResource,
   kRuntimeObject,
 };
 
-/// Geometry kind for a collision body (spec §3.8.1).
+/// Geometry kind for a collision body.
 enum class CollisionGeometryKind {
   kBox,
   kSphere,
@@ -127,7 +125,7 @@ enum class CollisionGeometryKind {
   kCompound,
 };
 
-/// Normalized descriptor for one geometry element (spec §3.8.1).
+/// Normalized descriptor for one geometry element.
 struct CollisionGeometryDescriptor {
   CollisionBodyId body_id;
   CollisionOwnerKind owner_kind = CollisionOwnerKind::kSceneResource;
@@ -160,7 +158,7 @@ struct CollisionGeometryDescriptor {
   std::optional<std::int64_t> memory_estimate_bytes;
 };
 
-/// Query surface (spec §3.8.1). Names which subsystem issued the query.
+/// Query surface. Names which subsystem issued the query.
 enum class CollisionSurface {
   kPreExecutionValidation,
   kPredictedRuntimeMonitor,
@@ -170,7 +168,7 @@ enum class CollisionSurface {
   kPlannerHint,
 };
 
-/// Engine sampling strategy for the query (spec §3.8.1).
+/// Engine sampling strategy for the query.
 enum class CollisionSamplingMode {
   kWaypointOnly,
   kInterpolatedDiscrete,
@@ -260,12 +258,10 @@ struct CollisionClearanceMargins {
   }
 };
 
-/// Normalized collision query (spec §3.8.1).
+/// Normalized collision query.
 ///
-/// Superset of CollisionCheckRequestDTO. Chunk 1 mirrors the existing
-/// CollisionCheckRequestDTO shape (RobotStateDTO only); trajectory-segment
-/// queries land in Chunk 5 when the validation coordinator becomes the
-/// entry point.
+/// Superset of CollisionCheckRequestDTO; mirrors the
+/// CollisionCheckRequestDTO shape (RobotStateDTO only).
 struct CollisionQuery {
   std::string query_id;
   std::optional<std::string> validation_id;
@@ -296,7 +292,7 @@ struct CollisionQuery {
   std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
 };
 
-/// Engine result status (spec §3.8.1).
+/// Engine result status.
 enum class CollisionEngineStatus {
   kOk,
   kTimeout,
@@ -306,8 +302,8 @@ enum class CollisionEngineStatus {
   kEngineError,
 };
 
-/// Normalized decision derived from an engine result and the active policy
-/// (spec §3.8.1). Distinct from CollisionDecision, which is the
+/// Normalized decision derived from an engine result and the active policy.
+/// Distinct from CollisionDecision, which is the
 /// kernel-facing summary across one or more CollisionResult values.
 enum class CollisionDecisionResult {
   kPass,
@@ -317,11 +313,7 @@ enum class CollisionDecisionResult {
   kInconclusiveFail,
 };
 
-/// Normalized collision result (spec §3.8.1).
-///
-/// Populated alongside CollisionCheckResultDTO during Chunks 1-4 of the
-/// collision-ownership plan. The kernel migrates to consuming this DTO in
-/// Chunk 5.
+/// Normalized collision result.
 struct CollisionResult {
   bool in_collision = false;
 
@@ -367,7 +359,7 @@ struct CollisionResult {
   /// Sorted by pair; a subset of `normalized_pairs`.
   std::vector<CollisionPairClearance> clearance_violations;
 
-  /// Per-pair classification produced by the Chunk 3 policy evaluator.
+  /// Per-pair classification produced by the policy evaluator.
   /// Includes observed-pair classifications and may include policy-state
   /// transition entries (for example kSupportContactSeparated) for pairs absent
   /// from normalized_pairs at the current sample. Sorted by (body_a, body_b)
@@ -423,8 +415,7 @@ enum class ContactReleaseEvidenceMode {
   kBinaryContact,
 };
 
-/// One entry in CollisionPolicySnapshot::support_contacts (spec §3.8.1,
-/// added in Chunk 3).
+/// One entry in CollisionPolicySnapshot::support_contacts.
 struct SupportContactPolicyEntry {
   CollisionPairId pair;
   CollisionContactPolicyMode mode =
@@ -475,8 +466,7 @@ struct ContactGraspPolicyEntry {
                          const ContactGraspPolicyEntry&) = default;
 };
 
-/// Policy-revision twin of CollisionWorldRevision (spec §3.8.1, added in
-/// Chunk 3).
+/// Policy-revision twin of CollisionWorldRevision.
 struct CollisionPolicyRevision {
   std::uint64_t revision_id = 0;
   std::string content_hash;
@@ -486,7 +476,7 @@ struct CollisionPolicyRevision {
 };
 
 /// Immutable policy configuration consumed by the policy evaluator for one
-/// validation / execution pass (spec §3.8.1, added in Chunk 3).
+/// validation / execution pass.
 ///
 /// Snapshots are immutable for one validation or execution pass. A runtime
 /// policy edit creates a new revision and cannot mutate an already running
@@ -523,7 +513,7 @@ struct CollisionPolicySnapshot {
                          const CollisionPolicySnapshot&) = default;
 };
 
-/// Severity grade of a CollisionDecision (spec §3.8.1).
+/// Severity grade of a CollisionDecision.
 enum class CollisionDecisionSeverity {
   kNone,
   kWarn,
@@ -531,7 +521,7 @@ enum class CollisionDecisionSeverity {
 };
 
 /// Recommended kernel action derived from one or more CollisionResult
-/// values (spec §3.8.1).
+/// values.
 enum class CollisionDecisionAction {
   kDispatch,
   kReject,
@@ -539,13 +529,9 @@ enum class CollisionDecisionAction {
   kInconclusive,
 };
 
-/// Kernel-facing summary across one or more CollisionResult values
-/// (spec §3.8.1).
+/// Kernel-facing summary across one or more CollisionResult values.
 ///
-/// The kernel consumes CollisionDecision, not raw CollisionResult values,
-/// starting in Chunk 5 of the collision-ownership plan. In Chunks 1-4
-/// CollisionDecision may be constructed but is not the kernel's source of
-/// truth.
+/// The kernel consumes CollisionDecision, not raw CollisionResult values.
 struct CollisionDecision {
   bool accepted = true;
   std::optional<std::int64_t> first_failing_waypoint;
@@ -557,9 +543,7 @@ struct CollisionDecision {
   std::optional<std::string> failure_archive_id;
 };
 
-/// Thread-safety class for a collision engine adapter (spec
-/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Engine Capability And Mismatch
-/// Policy", added in Chunk 8).
+/// Thread-safety class for a collision engine adapter.
 enum class CollisionEngineThreadSafetyClass {
   /// Each adapter instance owns mutable state and MUST be called from one
   /// thread (or under an external mutex). Calling concurrently from
@@ -587,8 +571,7 @@ enum class RuntimeCollisionQueryMemoryModel {
   kMeasuredBounded,
 };
 
-/// Engine capability descriptor (spec COLLISION_CHECKING_OWNERSHIP_PLAN
-/// §"Engine Capability And Mismatch Policy", added in Chunk 8 groundwork).
+/// Engine capability descriptor.
 ///
 /// Every adapter (RoboPlan / manyforge_collision / future MoveIt2 /
 /// future direct-Pinocchio) publishes one of these so callers can decide
@@ -644,6 +627,9 @@ struct CollisionEngineCapabilityDescriptor {
   /// Free-form notes — e.g. "octree collision not yet supported",
   /// "support-contact requires policy snapshot attached".
   std::vector<std::string> known_unsupported_cases;
+  /// Diagnostic geometry queries enumerate colliding pairs without applying
+  /// policy exemptions. Absent evidence must not be displayed as clear.
+  bool diagnostic_reports_all_collision_pairs = false;
 };
 
 /// Validate the exact distance-scope capability declaration.  Empty,
@@ -692,8 +678,7 @@ struct CollisionEngineCapabilityDescriptor {
                             });
 }
 
-/// Compare-mode policy (spec COLLISION_CHECKING_OWNERSHIP_PLAN §"Engine
-/// Capability And Mismatch Policy", added in Chunk 8 groundwork).
+/// Compare-mode policy.
 enum class CollisionEngineCompareMode {
   /// Secondary engine records mismatches but never blocks execution.
   kShadowCompare,
@@ -704,17 +689,14 @@ enum class CollisionEngineCompareMode {
   kQualificationCompare,
 };
 
-/// Disposition of one mismatch record (spec §"Engine Capability And
-/// Mismatch Policy").
+/// Disposition of one mismatch record.
 enum class CollisionEngineMismatchDisposition {
   kTolerated,
   kBlocking,
   kQualificationOnly,
 };
 
-/// Canonical engine-mismatch record (spec COLLISION_CHECKING_OWNERSHIP_PLAN
-/// §"Engine Capability And Mismatch Policy", added in Chunk 8 groundwork).
-/// Mismatch records must include both engines, the world / policy revisions
+/// Canonical engine-mismatch record. Mismatch records must include both engines, the world / policy revisions
 /// active at the time of the mismatch, normalized body pairs, the trajectory
 /// coordinate (waypoint / time), and the final disposition.
 struct CollisionEngineMismatchRecord {
@@ -738,9 +720,7 @@ struct CollisionEngineMismatchRecord {
       CollisionEngineMismatchDisposition::kTolerated;
 };
 
-/// Categorical reason a collision validation failed (spec
-/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Failure archive groundwork",
-/// added by the kernel-architecture sprint C-arch chunk). Distinct from
+/// Categorical reason a collision validation failed. Distinct from
 /// `CollisionDecisionResult` because archive consumers want to slice by
 /// *why* the kernel rejected dispatch, not just the resulting action.
 enum class CollisionFailureKind {
@@ -756,17 +736,14 @@ enum class CollisionFailureKind {
   /// Engine returned `kEngineError` (raised exception, internal
   /// inconsistency, backend unavailability).
   kEngineError,
-  /// Cancellation observed via `CollisionCancellationToken` (spec/260
-  /// §8 handshake).
+  /// Cancellation observed via `CollisionCancellationToken`.
   kCancelled,
   /// Workers borrowed different `CollisionWorldRevision`s, or the
   /// revision drifted across the validation pass.
   kSceneChangedDuringValidation,
 };
 
-/// One archived collision-validation failure (spec
-/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Failure archive groundwork",
-/// added by the kernel-architecture sprint C-arch chunk).
+/// One archived collision-validation failure.
 ///
 /// Pushed by the `CollisionValidationCoordinator` (or by callers wrapping
 /// it) only when a validation pass produces a non-`kDispatch` decision.

@@ -22,13 +22,14 @@ import type { ExecutionObservationTransportStatus } from '../types/viewerObserva
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import {
   appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
-  executionGroupTargetLabels, executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
+  executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
   executionSelectionIsQuiescent, type ExecutionGroupFallback, type ExecutionGroupScope,
 } from '../state/programExecutionGroups';
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
 import { ActivateExecuteDialog } from './ActivateExecuteDialog';
+import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { ActiveTcpHoldHistory, activeTcpSnapshot, type ResumeTcpChange } from '../state/activeTcpResume';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
@@ -637,13 +638,9 @@ export function ProgramRuntimePanel({
           </p>
           <ul>
             {state.nonExecutable.unresolvedReferences.map((reference) => (
-              <li key={`${reference.component_role_id}/${reference.target_role_id ?? ''}`}>
-                {reference.target_role_id !== null
-                  ? <>Target role <code>{reference.target_role_id}</code></>
-                  : <>Component role <code>{reference.component_role_id}</code></>}
-                {' → '}
-                <code>{reference.controllable_component_id}</code>
-                {reference.command_target_id !== null && <code>/{reference.command_target_id}</code>}
+              <li key={`${reference.target.component_id}/${reference.target.command_target_id}`}>
+                <code>{reference.target.component_id}</code>
+                <code>/{reference.target.command_target_id}</code>
                 {': '}
                 {reference.reason.replaceAll('_', ' ')}
               </li>
@@ -995,7 +992,10 @@ export function ProgramRuntimePanel({
           appliedRevision={state.applied.programRevision}
           runId={state.run?.capture.programRunId ?? null}
           sceneResourceIds={sceneResourceIds}
-          frameProgram={state.applied.program}
+          frameProgram={{
+            program: state.applied.program,
+            frames: state.applied.programBinding.frame_bindings.map((row) => row.reference),
+          }}
           client={persistentValues}
         />
       )}
@@ -1047,7 +1047,7 @@ function transportRecoveryFacts(
   const { state, cycleState, cycleFailure } = program;
   const manualRecovery = robot.currentStatus?.manualOperations
     .filter(manualOperationRequiresRecovery) ?? [];
-  // CONTRACTS §5: the backend's cell latch, derived from component states.
+  // The backend's cell latch, derived from component states.
   const cellLatch = program.cellLatch?.latched === true ? program.cellLatch : null;
   const recoveryOffer = state.controls?.recoveryOffer;
   // The held node's own failure first: parallel branches can hold several
@@ -1238,9 +1238,9 @@ export function deriveTransportGuidance({
     });
   }
   if (facts.cellLatch !== null) {
-    // R1: one error item for the latch; every active cause in its message.
+    // One error item for the latch; every active cause in its message.
     // Nothing here acknowledges or clears it: it clears by itself when every
-    // component is healthy and idle (R2).
+    // component is healthy and idle.
     notices.push({
       id: 'cell.latch',
       severity: 'error',
@@ -1269,7 +1269,7 @@ export function deriveTransportGuidance({
       }],
     });
   } else if (facts.resetRequired) {
-    // CONTRACTS §9: the run's own end reason names why it ended.
+    // The run's own end reason names why it ended.
     const runEnd = program.state.run?.runEnd == null ? null : runEndPresentation(program.state.run.runEnd);
     if (runEnd !== null) {
       notices.push({
@@ -1328,10 +1328,6 @@ function useTransportGroups(program: ProgramRuntimeController) {
   const scopes = useMemo(() => !membershipKnown || state.applied === null ? [] : executionGroupScopes(
     [state.applied.program.tree], Object.keys(state.applied.program.execution_groups ?? {}),
   ), [state.applied, membershipKnown]);
-  // Robot names only from the binding of exactly that Applied revision.
-  const targetLabels = useMemo(() => !membershipKnown || state.applied === null ? {}
-    : executionGroupTargetLabels(state.applied.program.target_roles, state.applied.programBinding),
-  [state.applied, membershipKnown]);
   const projectedSelections = state.controls?.executionSelections.groups;
   const selections = projectedSelections !== undefined && projectedSelections.length > 0
     ? projectedSelections
@@ -1347,17 +1343,15 @@ function useTransportGroups(program: ProgramRuntimeController) {
   // Count deliberately hidden named groups; All is a coverage fallback, not a hidden-group badge.
   const hiddenGroupCount = namedGroups
     .filter((group) => !display.shown.includes(group.groupId)).length;
-  // A group's motion components, from the Applied binding (rule hold scope, §8).
+  // A group's motion components, from the Applied binding (rule hold scope).
   const groupMotionComponentIds = (groupId: string): string[] => {
-    const roles = scopes.find((scope) => scope.groupId === groupId)?.motionTargetRoleIds ?? [];
-    return (state.applied?.programBinding.target_role_bindings ?? [])
-      .filter((row) => roles.includes(row.target_role_id))
-      .map((row) => row.controllable_component_id);
+    const targets = scopes.find((scope) => scope.groupId === groupId)?.motionTargetKeys ?? [];
+    return [...new Set(targets.map((key) => key.split('/')[0]!))];
   };
+  // Targets show as `component/target`, the Program's own references.
   const groupTitle = (groupId: string) => {
-    const targets = scopes.find((scope) => scope.groupId === groupId)?.targetRoleIds ?? [];
-    return targets.length === 0 ? groupId
-      : `${groupId}: ${targets.map((id) => targetLabels[id] ?? id).join(', ')}`;
+    const targets = scopes.find((scope) => scope.groupId === groupId)?.targetKeys ?? [];
+    return targets.length === 0 ? groupId : `${groupId}: ${targets.join(', ')}`;
   };
   return {
     selections, allGroup, visibleGroups, hiddenGroupCount, fallback: display.fallback, groupTitle,
@@ -1369,8 +1363,6 @@ function useTransportGroups(program: ProgramRuntimeController) {
 export interface DraftGroupVisibility {
   /** The Draft's memberships, including "all". Never used for runtime admission. */
   scopes: ExecutionGroupScope[];
-  /** Target-role labels; robot names only from an authoritative binding. */
-  targetLabels?: Record<string, string>;
   hidden: string[] | undefined;
   /** The Draft's choice differs from the Applied Program's. */
   pendingApply: boolean;
@@ -1407,7 +1399,7 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
           disabled={groups.onChange === undefined}
         >
           <SettingsSubheading title="Displayed groups" scope="program" />
-          {groups.scopes.map(({ groupId, hardwareNodeIds, targetRoleIds }) => {
+          {groups.scopes.map(({ groupId, hardwareNodeIds, targetKeys }) => {
             const reason = preferred.includes(groupId)
               ? executionGroupVisibilityUnavailableReason(groups.scopes, preferred.filter((id) => id !== groupId))
               : null;
@@ -1423,7 +1415,7 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
               {automatic && <span className="hint"> (shown automatically)</span>}
               <span className="hint" title="Move, gripper command and I/O output nodes">
                 {hardwareNodeIds.length} hardware node{hardwareNodeIds.length === 1 ? '' : 's'}
-                {targetRoleIds.length > 0 && ` · ${targetRoleIds.map((id) => groups.targetLabels?.[id] ?? id).join(', ')}`}
+                {targetKeys.length > 0 && ` · ${targetKeys.join(', ')}`}
               </span>
             </label>;
           })}
@@ -1479,7 +1471,7 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
   );
 }
 
-// Both Reset options start off each time the confirmation opens (spec 450).
+// Both Reset options start off each time the confirmation opens.
 const NO_RESET_OPTIONS: Required<ProgramResetOptions> = {
   reloadInitialScene: false,
   resetRobotPosition: false,
@@ -1497,6 +1489,7 @@ export function ProgramTransportControls({
   enabled,
   program,
   robot,
+  authoringAdmissionAllowed = null,
   observationTransport,
   onOpenRuntimeHistory,
   onOpenRobotControls,
@@ -1507,6 +1500,8 @@ export function ProgramTransportControls({
   enabled: boolean;
   program: ProgramRuntimeController;
   robot: RobotControlController;
+  /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
+  authoringAdmissionAllowed?: boolean | null;
   observationTransport?: ExecutionObservationTransportStatus;
   onOpenRuntimeHistory?: () => void;
   onOpenRobotControls?: () => void;
@@ -1516,6 +1511,7 @@ export function ProgramTransportControls({
   viewerPreviewActive?: boolean;
   resetReloadRequest?: number;
 }) {
+  const authoringAdmissionTooltip = useAuthoringAdmissionTooltip();
   const [detailsOpen, setDetailsOpen] = useState(false);
   const tcpHoldHistory = useRef(new ActiveTcpHoldHistory());
   const locallyStartedRun = useRef(false);
@@ -1547,7 +1543,7 @@ export function ProgramTransportControls({
   const [continueIntent, setContinueIntent] = useState<
     Pick<CycleRecoveryOffer, 'offerId' | 'offerRevision' | 'nodeInstanceId'> | null
   >(null);
-  // Installation settings (UA7W.11); they never add a confirmation to Stop.
+  // Installation settings; they never add a confirmation to Stop.
   const preferences = useComposerSettings().settings.motionPanel;
   const detailsButton = useRef<HTMLButtonElement>(null);
   const haltButton = useRef<HTMLButtonElement>(null);
@@ -1596,7 +1592,7 @@ export function ProgramTransportControls({
     ? state.applied.programBinding : null;
   const currentTcp = activeTcpSnapshot(runBinding, robot.tcpResumeStatus ?? null,
     runCapture?.graphRevision ?? '', runCapture?.retainedBundleId ?? '');
-  // DX-3102 accepts that the Runner and TCP streams have no shared ordering
+  // The Runner and TCP streams have no shared ordering
   // at Hold, so this GUI observation is not an exact hold-time TCP reading.
   const observedRun = robot.tcpResumeCycle?.run ?? null;
   const observedControls = robot.tcpResumeCycle?.runtimeControls ?? null;
@@ -1615,6 +1611,7 @@ export function ProgramTransportControls({
     .map((group) => `group:${group.groupId}`);
   if (resumeCycleMatches && observedRun?.state === 'full_stopped') heldTcpKeys.push('full');
   else if (resumeCycleMatches && observedRun?.state === 'full_stopping') unknownTcpKeys.push('full');
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- TCP hold history intentionally observes every commit.
   useEffect(() => {
     if (robot.tcpResumeConnectionLost === true) {
       tcpHoldHistory.current.clear();
@@ -1646,15 +1643,15 @@ export function ProgramTransportControls({
   const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
   const programFullStopped = state.run?.state === 'full_stopped';
-  // CONTRACTS §10: Execute and Resume follow the backend's RunReadiness. The
+  // Execute and Resume follow the backend's RunReadiness. The
   // GUI adds only the in-flight guard, the Applied Program the request names,
-  // the unapplied-Draft reason (Composer-side, not part of RunReadiness) and,
-  // as in M7, the Runner's own Run gate (scene preparation, Apply, runner).
+  // the Composer-side refusal (unapplied Draft, running assistant turn; not part of RunReadiness) and,
+  // the Runner's own Run gate (scene preparation, Apply, runner).
   const readiness = program.readiness;
   const canRun = enabled
     && state.applied !== null
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && program.runnerAllows('program_run')
     && readiness?.can_execute === true;
   const stopCommandPending = ['stop', 'full-stop', 'reset']
@@ -1662,20 +1659,23 @@ export function ProgramTransportControls({
   const canResumeFullStop = enabled
     && programFullStopped
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && readiness?.can_resume === true;
   const readinessReasons = (readiness?.blocked_reasons ?? []).map(blockedReasonText);
   const runRefusalCode = program.runnerAllows('program_run') ? null : program.runnerRefusal('program_run');
   const runRefusal = runRefusalCode === null ? null : humanizeReasonCode(runRefusalCode);
-  // Decision AUD-7: blocked only by components not enabled, Execute offers
+  // Blocked only by components not enabled, Execute offers
   // to activate them first ("Activate components and execute?").
   const canActivateExecute = enabled
     && state.applied !== null
     && state.pending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && program.runnerAllows('program_run')
     && program.activation.available;
-  const canRunOrResume = canRun || canResumeFullStop || canActivateExecute;
+  const authoringAdmissionBlocked = authoringAdmissionAllowed === false;
+  const executeAdmissionBlocked = authoringAdmissionBlocked && !canResumeFullStop;
+  const canRunOrResume = canResumeFullStop
+    || (!authoringAdmissionBlocked && (canRun || canActivateExecute));
   const canReset = enabled
     && state.pending === null
     && state.selectionPending.length === 0
@@ -1695,11 +1695,11 @@ export function ProgramTransportControls({
     ? focusedOffer
     : null;
   // Retry and Continue let held motion continue: like a group's Run/Resume
-  // they need motion_clear (CONTRACTS §10).
+  // they need motion_clear.
   const recoveryCommandAllowed = enabled
     && state.pending === null
     && state.controlPending === null
-    && program.draftUnappliedReason === null
+    && program.composerRefusalReason === null
     && readiness?.motion_clear === true;
   const offerControls = (
     offer: CycleRecoveryOffer,
@@ -1736,7 +1736,7 @@ export function ProgramTransportControls({
     ? null
     : offerControls(operatorOffer, 'all');
   // A hold whose node is in no named group (['all']) owns every group that
-  // no other hold names (contract item 43).
+  // no other hold names.
   const groupHold = (groupId: string) => holdsControls.find(
     (controls) => controls.hold.motionGroupIds.includes(groupId),
   ) ?? holdsControls.find(
@@ -1752,7 +1752,7 @@ export function ProgramTransportControls({
         ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
         : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`;
     }
-    return program.draftUnappliedReason
+    return program.composerRefusalReason
       ?? (controls.interventionStopScope === 'own_groups'
         ? `Retry ${offer.nodeInstanceId} and let its groups continue.`
         : recoveryHolds.length > 1
@@ -1814,7 +1814,7 @@ export function ProgramTransportControls({
   const continueLabel = continueStates.has('held') && continueStates.has('ready')
     ? 'Run or Resume'
     : continueStates.has('held') ? 'Resume' : 'Run';
-  // Idle, Reset restores only what its options select (possibly nothing, contract 141), so it always asks.
+  // Idle, Reset restores only what its options select (possibly nothing), so it always asks.
   const idleReset = cycleState === 'idle_after_reset' && !executionActive;
   // A finished, stopped or failed run asks too when Reset confirmation is on,
   // so its options can be chosen in the same step.
@@ -1964,7 +1964,7 @@ export function ProgramTransportControls({
       label: focusedHoldControls.continuePending ? 'Continuing' : 'Continue',
       enabled: focusedHoldControls.canContinue,
       reason: focusedHoldControls.canContinue ? null
-        : program.draftUnappliedReason
+        : program.composerRefusalReason
           ?? (focusedHoldControls.continueAction.enabled ? null
             : `Continue is unavailable: ${(focusedHoldControls.continueAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`),
       run: () => requestContinue(focusedHoldControls),
@@ -2055,7 +2055,7 @@ export function ProgramTransportControls({
               && group.state !== 'ready'
               && group.state !== 'stopping'
               && program.runnerAllows('program_motion_stop');
-            // §8: a rule hold whose scope meets this group gates its Run/Resume,
+            // A rule hold whose scope meets this group gates its Run/Resume,
             // Retry and Continue (the kernel refuses them with `rule_holds`).
             const ruleHold = ruleHoldMeeting(readiness?.blocked_reasons ?? [],
               groupMotionComponentIds(group.groupId));
@@ -2068,7 +2068,7 @@ export function ProgramTransportControls({
               && group.resumeAllowed
               && !releasePending
               && state.controlPending === null
-              && program.draftUnappliedReason === null
+              && program.composerRefusalReason === null
               && readiness?.motion_clear === true
               && ruleHold === null;
             const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
@@ -2139,7 +2139,7 @@ export function ProgramTransportControls({
                         ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                         : group.state === 'running'
                           ? `${group.groupId} motion is running.`
-                          : program.draftUnappliedReason
+                          : program.composerRefusalReason
                             ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
                             ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
@@ -2217,13 +2217,15 @@ export function ProgramTransportControls({
             type="button"
             className="transport-run transport-unique-control"
             disabled={!canRunOrResume || program.activation.flow !== null}
-            title={busyReason(runtimeOperation) ?? busyReason(activationOperation) ?? (canResumeFullStop
+            title={executeAdmissionBlocked
+              ? authoringAdmissionTooltip
+              : busyReason(runtimeOperation) ?? busyReason(activationOperation) ?? (canResumeFullStop
                 ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
                   ? 'Execute the exact Applied Program without starting robot motion.'
                   : canActivateExecute
                     ? `Activate the components that are not enabled, then execute the Program once.\n${readinessReasons.join('\n')}`
-                    : program.draftUnappliedReason
+                    : program.composerRefusalReason
                       ?? (readinessReasons.length > 0 ? readinessReasons.join('\n') : null)
                       ?? runRefusal
                       ?? blockedReason
@@ -2495,7 +2497,10 @@ export function ProgramTransportControls({
           </button>
         )}
       </OverlayPanel>
-      <ActivateExecuteDialog activation={program.activation} />
+      <ActivateExecuteDialog
+        activation={program.activation}
+        authoringAdmissionAllowed={authoringAdmissionAllowed}
+      />
       <OverlayPanel
         open={resumeIntent !== null}
         title="Resume with the new TCP?"
@@ -2539,7 +2544,7 @@ export function ProgramTransportControls({
                   && retryTarget?.retryAction == null && !waitsForHold
                   && group?.resumeAllowed && group.state !== 'stopping'
                   && group.resumeUnavailableReason !== 'selected_motion_stop_settling'
-                  && program.draftUnappliedReason === null
+                  && program.composerRefusalReason === null
                   && readiness?.motion_clear === true) {
                 setResumeIntent(null);
                 void program.resumeMotion([resumeIntent.groupId]);
@@ -2622,7 +2627,7 @@ export function ProgramTransportControls({
               // An ended run, or no run at all, has no live motion selections
               // (all groups are unavailable); the owner's Reset admission
               // (canReset) is authoritative there.
-              // An idle Reset may restore nothing (contract 141).
+              // An idle Reset may restore nothing.
               disabled={!canReset || (!motionSettled && !endedReset && !idleReset)}
               onClick={() => {
                 setResetIntent(null);

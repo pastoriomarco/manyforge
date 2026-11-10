@@ -40,18 +40,18 @@ the host, use the workbench or the `isaac` profile.
 
 ## What it starts
 
-Both profiles start the same five processes. The Manager in turn owns the ROS
-execution host and the planning worker.
+Both profiles start the same four processes. The Manager in turn owns the ROS
+execution host and the planning worker; the execution host starts each
+component's processes, including the AI assistant's bridge.
 
 | Process | Port | Bound to |
 |---|---|---|
 | Composer (built frontend, no Vite) | 9000 | all interfaces |
 | Headless API | 9010 | loopback |
 | Program runner | 9011 | loopback |
-| Assistant bridge | 8100 | loopback |
 | Manager | none (local sockets) | |
 
-All four ports must be free; ports are fixed. The workbench uses 3000 and 9020
+All three ports must be free; ports are fixed. The workbench uses 3000 and 9020
 for its frontend and Composer instead of 9000. Composer has no login: expose
 port 9000 only on a trusted network.
 
@@ -192,8 +192,10 @@ Sim's ROS bridge must use the same settings.
 Isaac Sim is attach-only. The launcher does not start, stop or play it. Start
 Isaac Sim on the Isaac host and open the scene before you Load the Scenario.
 
-`start` checks the local and remote source identities, starts the container
-(the call allows about 15 minutes, including the incremental build), waits
+`start` checks the local and remote source identities, runs the incremental
+native build step as its own call (`compose-dev.sh build-native`, allowed 45
+minutes for a cold build), then starts the container (this call allows about
+15 minutes for readiness only), waits
 for Manager, Headless, Program runner and Composer to report ready, and checks
 the remote source again. The container carries the labels
 `manyforge.launch-instance` and `manyforge.launch-input-digest`; `status` and
@@ -206,7 +208,8 @@ container.
 Requires a host ROS 2 install (see [Profiles](#profiles)). Run in a shell where
 that ROS environment is sourced and where `manyforge_headless_api`,
 `manyforge_program_runner`, `manyforge_composer` and
-`manyforge_assistant_bridge` import from `python3`.
+`manyforge_assistant_bridge` import from `python3` (the AI assistant
+component runs the bridge).
 
 ```bash
 manyforge-operator --state-root "$STATE_ROOT" --instance-id workbench --json \
@@ -241,7 +244,7 @@ in `state/` (the launch record is `state/operator/launch_instance.json`),
 sockets and rebuildable files in `run/`. It creates and checks this layout
 itself; paths cannot be overridden. Output goes to journald: read it with
 `journalctl -t manyforge-<instance-id>-<component>` (`manager`, `headless`,
-`program_runner`, `assistant_bridge`, `composer`).
+`program_runner`, `composer`).
 
 ## Using Composer
 
@@ -307,7 +310,7 @@ owns. Repeating `stop` on a stopped instance reports `already_stopped`.
 | `operator_configuration_invalid` | A flag is missing or invalid; the message names it. |
 | `source_dirty`, `source_identity_mismatch` | Use a clean checkout; for `isaac`, the same commit on both hosts. |
 | `package_aggregate_mismatch`, `package_aggregate_unavailable` | Recompute the digest of the exact package root; do not edit the root. |
-| `port_occupied` | Free 9000, 9010, 9011 or 8100. Ports cannot be remapped. |
+| `port_occupied` | Free 9000, 9010 or 9011. Ports cannot be remapped. |
 | `journald_unavailable` | `standard` needs `systemd-cat` and the journald socket. |
 | `readiness_timeout`, `isaac_readiness_timeout`, `runtime_container_unready` | Read the logs (`journalctl` or `docker logs <container-id>`). |
 | `runtime_host_unavailable`, `remote_protocol_invalid` | SSH or the runtime host failed. Absence cannot be proved; restore the host, then run `status`. |

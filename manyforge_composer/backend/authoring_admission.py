@@ -208,10 +208,10 @@ def draft_session_http_exception(error: DraftSessionError) -> HTTPException:
 def scenario_artifact_http_exception(error: ScenarioArtifactError) -> HTTPException:
     """A code cannot tell whether a write already happened: never marked here."""
 
-    return HTTPException(
-        status_code=error.status_code,
-        detail={"code": error.code, "message": str(error)},
-    )
+    detail = {"code": error.code, "message": str(error)}
+    if error.details is not None:
+        detail["context"] = error.details
+    return HTTPException(status_code=error.status_code, detail=detail)
 
 
 def headless_client_http_exception(
@@ -954,7 +954,9 @@ class AuthoringAdmissionCoordinator:
         try:
             response = self._client.acquire_authoring_transaction(request)
         except HeadlessClientError as error:
-            if error.code in {"headless_http_timeout", "headless_transport_error"}:
+            if error.code in {
+                "headless_http_timeout", "headless_http_unavailable", "headless_transport_error"
+            }:
                 self._block(f"local authoring acquire is uncertain: {error}")
             else:
                 with self._local_claim_lock:

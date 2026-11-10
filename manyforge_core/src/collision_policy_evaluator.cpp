@@ -34,7 +34,7 @@ bool component_body_role_matches(const std::string& body,
                                  const std::string& body_role) noexcept {
   constexpr std::string_view prefix = "component/";
   constexpr std::string_view marker = "/body/";
-  // Owner-resolved N5d bindings carry the complete instance-scoped body id.
+  // Owner-resolved bindings carry the complete instance-scoped body id.
   // The role-only branch remains for retained configured-policy decoding but
   // is never used to construct an operation-local grasp binding.
   if (body_role.rfind(prefix, 0) == 0) {

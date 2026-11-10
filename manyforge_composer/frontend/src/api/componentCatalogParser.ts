@@ -21,7 +21,7 @@ import {
   vector3At,
 } from './parsers/shared';
 
-const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
+const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor', 'assistant'];
 
 function strings(value: unknown, path: string): string[] {
   return arrayAt(value, path).map((item, index) => stringAt(item, `${path}[${index}]`));
@@ -52,7 +52,7 @@ function parseEntry(value: unknown, path: string): ComponentCatalogEntry {
   };
 }
 
-/** MACHINES-BOUNDARY §5 (amended): `{kind: "machine", model_id, title, lanes[], default_owner_id, owner_row, members[]}`. */
+/** `{kind: "machine", model_id, title, lanes[], default_owner_id, owner_row, members[]}`. */
 function parseMachineEntry(value: unknown, path: string): MachineCatalogEntry {
   const record = objectAt(value, path);
   exactKeysAt(record, ['kind', 'model_id', 'title', 'lanes', 'default_owner_id', 'owner_row', 'members'], path);

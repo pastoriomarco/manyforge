@@ -241,7 +241,7 @@ void validate_source_symbol(std::string_view symbol,
       decode_artifacts(require_member(value, "artifacts"), model_asset_id)};
 }
 
-// An offset frame's pose: finite, with a unit quaternion (the spec 420
+// An offset frame's pose: finite, with a unit quaternion (the
 // tolerance shared with every other placement pose).
 [[nodiscard]] core::PlacementPoseDTO decode_offset_pose(
     const CanonicalValue& value) {
@@ -366,7 +366,7 @@ decode_collision_bindings(const CanonicalValue& value) {
   return bindings;
 }
 
-// A model's own payload: the bounds of the old D11 Deployment
+// A model's own payload: the bounds of the old Deployment
 // `tool_payload` (mass in [0, 100] kg, centre within [-2, 2] m per axis).
 [[nodiscard]] core::ModelAssetPayloadDTO decode_payload(
     const CanonicalValue& value) {

@@ -63,32 +63,17 @@ void require_applied(const roboplan::JointInfo &info,
   }
 }
 
-}  // namespace
-
-std::shared_ptr<roboplan::Scene> make_roboplan_scene(
-    RoboPlanSceneInput input) {
-  if (input.scene_name.empty() || input.urdf_xml.empty() ||
-      input.srdf_xml.empty()) {
-    fail("scene name, URDF, and SRDF are required");
-  }
-  for (const auto &path : input.package_paths) {
-    if (!path.is_absolute() || !std::filesystem::is_directory(path)) {
-      fail("package path is not an absolute directory");
-    }
-  }
-
-  auto scene = std::make_shared<roboplan::Scene>(
-      input.scene_name, roboplan::loadUrdfSceneDescriptionFromXml(
-                            input.urdf_xml, input.package_paths));
-
+void apply_scene_semantics(roboplan::Scene &scene,
+                           const std::vector<RoboPlanJointLimitInput> &joint_limits,
+                           const std::string &srdf_xml) {
   std::map<std::string, const RoboPlanJointLimitInput *> rows;
   YAML::Node config(YAML::NodeType::Map);
   YAML::Node limits(YAML::NodeType::Map);
-  for (const auto &row : input.joint_limits) {
+  for (const auto &row : joint_limits) {
     if (row.joint_name.empty() || !rows.emplace(row.joint_name, &row).second) {
       fail("joint-limit names are empty or duplicated");
     }
-    const auto info = scene->getJointInfo(row.joint_name);
+    const auto info = scene.getJointInfo(row.joint_name);
     if (!info.has_value() || info->mimic_info.has_value()) {
       fail("joint-limit row names a foreign or mimic joint '" +
            row.joint_name + "'");
@@ -131,8 +116,8 @@ std::shared_ptr<roboplan::Scene> make_roboplan_scene(
     limits[row.joint_name] = std::move(values);
   }
 
-  for (const auto &joint_name : scene->getJointNames()) {
-    const auto info = scene->getJointInfo(joint_name);
+  for (const auto &joint_name : scene.getJointNames()) {
+    const auto info = scene.getJointInfo(joint_name);
     if (!info.has_value()) {
       fail("constructed Scene lost joint '" + joint_name + "'");
     }
@@ -147,19 +132,53 @@ std::shared_ptr<roboplan::Scene> make_roboplan_scene(
   }
 
   config["joint_limits"] = std::move(limits);
-  scene->importJointLimitsFromConfig(config);
+  scene.importJointLimitsFromConfig(config);
   for (const auto &[joint_name, row] : rows) {
-    const auto info = scene->getJointInfo(joint_name);
+    const auto info = scene.getJointInfo(joint_name);
     if (!info.has_value()) {
       fail("imported limit row disappeared for joint '" + joint_name + "'");
     }
     require_applied(*info, *row);
   }
 
-  if (const auto imported = scene->importSrdf(input.srdf_xml);
+  if (const auto imported = scene.importSrdf(srdf_xml);
       !imported.has_value()) {
     fail("SRDF import failed: " + imported.error());
   }
+}
+
+}  // namespace
+
+std::shared_ptr<roboplan::Scene> make_roboplan_scene(
+    RoboPlanSceneInput input) {
+  if (input.scene_name.empty() || input.urdf_xml.empty() ||
+      input.srdf_xml.empty()) {
+    fail("scene name, URDF, and SRDF are required");
+  }
+  for (const auto &path : input.package_paths) {
+    if (!path.is_absolute() || !std::filesystem::is_directory(path)) {
+      fail("package path is not an absolute directory");
+    }
+  }
+
+  auto scene = std::make_shared<roboplan::Scene>(
+      input.scene_name, roboplan::loadUrdfSceneDescriptionFromXml(
+                            input.urdf_xml, input.package_paths));
+
+  apply_scene_semantics(*scene, input.joint_limits, input.srdf_xml);
+  return scene;
+}
+
+std::shared_ptr<roboplan::Scene> make_collision_disabled_scene(
+    const roboplan::Scene &source, const std::string &scene_name,
+    const std::vector<RoboPlanJointLimitInput> &joint_limits,
+    const std::string &srdf_xml) {
+  roboplan::PinocchioSceneDescription description{source.getModel(),
+                                                    source.getCollisionModel()};
+  description.collision_model.removeAllCollisionPairs();
+  auto scene = std::make_shared<roboplan::Scene>(scene_name, description);
+  apply_scene_semantics(*scene, joint_limits, srdf_xml);
+  scene->setJointPositions(source.getCurrentJointPositions());
   return scene;
 }
 

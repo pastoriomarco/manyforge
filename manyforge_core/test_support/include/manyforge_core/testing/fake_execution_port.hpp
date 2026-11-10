@@ -50,8 +50,11 @@ class FakeExecutionPort final : public IExecutionPort {
   // --- IExecutionPort -----------------------------------------------------
 
   ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
-                                       const TrajectoryDTO& trajectory) override {
+                                       const TrajectoryDTO& trajectory,
+                                       std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     std::lock_guard lock(mutex_);
+    if (token && !token->TryAdmit())
+      return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt};
     commands_.emplace_back(SubmitCall{key, trajectory});
     if (RingFullLocked()) return NotReady();
     const auto result = NextResultLocked();
@@ -63,8 +66,10 @@ class FakeExecutionPort final : public IExecutionPort {
 
   ExecutionPortCommandResultDTO Replace(
       const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
-      const TrajectoryDTO& trajectory) override {
+      const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     std::lock_guard lock(mutex_);
+    if (token && !token->TryAdmit())
+      return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt};
     commands_.emplace_back(ReplaceCall{active_key, next_key, trajectory, std::nullopt});
     if (RingFullLocked()) return NotReady();
     const auto result = NextResultLocked();
@@ -76,8 +81,11 @@ class FakeExecutionPort final : public IExecutionPort {
 
   ExecutionPortCommandResultDTO ReplaceScheduled(
       const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
-      const TrajectoryDTO& trajectory, const ExecutionReplacementStartDTO& start) override {
+      const TrajectoryDTO& trajectory, const ExecutionReplacementStartDTO& start,
+      std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     std::lock_guard lock(mutex_);
+    if (token && !token->TryAdmit())
+      return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt};
     commands_.emplace_back(ReplaceCall{active_key, next_key, trajectory, start});
     if (RingFullLocked()) return NotReady();
     const auto result = NextResultLocked();
@@ -85,16 +93,26 @@ class FakeExecutionPort final : public IExecutionPort {
     return result;
   }
 
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
+  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point = std::chrono::steady_clock::time_point::max()) override {
     std::lock_guard lock(mutex_);
     commands_.emplace_back(CancelCall{key});
     return NextResultLocked();
   }
 
-  ExecutionPortCommandResultDTO SetScale(double value) override {
+  ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override {
     std::lock_guard lock(mutex_);
+    if (!IsLatestScaleSequence(sequence))
+      return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt};
     commands_.emplace_back(SetScaleCall{value});
-    return NextResultLocked();
+    const auto result = NextResultLocked();
+    if (result.dispatch != ExecutionPortDispatch::kNotDispatched) last_scale_ = value;
+    return result;
+  }
+
+  ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point) override {
+    std::lock_guard lock(mutex_);
+    return last_scale_ ? ScaleSnapshot{ScaleSnapshot::Status::kFactor, *last_scale_}
+                       : ScaleSnapshot{ScaleSnapshot::Status::kNoPriorFactor, 0.0};
   }
 
   std::optional<ExecutionGoalObservationDTO> ReadGoal(
@@ -296,6 +314,7 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   mutable std::mutex mutex_;
+  std::optional<double> last_scale_;
   std::vector<Command> commands_;
   std::vector<ExecutionPortCommandResultDTO> queued_results_;
   std::map<ExecutionGoalKey, ExecutionGoalObservationDTO> goals_;

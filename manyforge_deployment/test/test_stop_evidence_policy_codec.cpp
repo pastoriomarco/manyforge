@@ -557,7 +557,7 @@ TEST(StopEvidencePolicyCodec,
 }
 
 TEST(StopEvidencePolicyCodec, RejectsDwellAndDuplicateEvidenceDefects) {
-  // Q51: the policy has no phase budget; a dwell is bounded only by its own
+  // The policy has no phase budget; a dwell is bounded only by its own
   // positive-duration shape.
   PolicySpec long_dwell;
   long_dwell.policy_id = "long_dwell";

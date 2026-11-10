@@ -16,18 +16,20 @@ def _available_cpus() -> list[int]:
 
 
 def _profile_environment(cpus: list[int] | None = None) -> dict[str, str]:
-    # Policy-unit tests use a synthetic four-CPU launch topology. Physical CPU
+    # Policy-unit tests use a synthetic five-CPU launch topology. Physical CPU
     # availability is a separate admission rule and has its own real-host test
-    # below, so hosted CI does not need four actual CPUs to exercise the strict
+    # below, so hosted CI does not need five actual CPUs to exercise the strict
     # isolation and priority contracts.
-    cpus = cpus or [0, 1, 2, 3]
-    assert len(cpus) >= 4
+    cpus = cpus or [0, 1, 2, 3, 4]
+    assert len(cpus) >= 5
     return {
         "MANYFORGE_RT_RESOURCE_PROFILE": "strict",
         "MANYFORGE_NRT_CPU_AFFINITY": str(cpus[0]),
         "MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY": str(cpus[1]),
         "MANYFORGE_RT_CONTROLLER_COMMAND_CPU_AFFINITY": str(cpus[2]),
         "MANYFORGE_RT_RUNTIME_SAFETY_CPU_AFFINITY": str(cpus[3]),
+        # OD-58: StopControl on its own CPUs.
+        "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY": str(cpus[4]),
     }
 
 
@@ -79,11 +81,11 @@ def test_strict_resource_profile_accepts_disjoint_ordered_reservations():
 
 def test_strict_resource_profile_accepts_real_launch_topology_when_capacity_available():
     cpus = _available_cpus()
-    if len(cpus) < 4:
-        pytest.skip("launch context does not expose four CPUs")
+    if len(cpus) < 5:
+        pytest.skip("launch context does not expose five CPUs")
 
     completed = _validate(
-        _profile_environment(cpus[:4]),
+        _profile_environment(cpus[:5]),
         assume_profile_cpus_available=False,
     )
 
@@ -110,6 +112,32 @@ def test_strict_resource_profile_rejects_inverted_priority_order():
 
     assert completed.returncode != 0
     assert "controller_manager > controller_command" in completed.stderr
+
+
+def test_strict_resource_profile_requires_its_own_stop_control_cpus():
+    environment = _profile_environment()
+    del environment["MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY"]
+
+    completed = _validate(environment)
+
+    assert completed.returncode != 0
+    assert "MANYFORGE_RT_STOP_CONTROL_CPU_AFFINITY" in completed.stderr
+
+
+def test_strict_resource_profile_makes_stop_control_the_highest_lane():
+    completed = _run_shell(
+        f"source {str(_HELPER)!r}; manyforge_validate_rt_resource_profile && "
+        'printf "%s\\n" "$MANYFORGE_RT_STOP_CONTROL_PRIORITY"',
+        _profile_environment(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().splitlines()[-1] == "48"
+
+    environment = _profile_environment()
+    environment["MANYFORGE_RT_STOP_CONTROL_PRIORITY"] = "45"
+    completed = _validate(environment)
+    assert completed.returncode != 0
+    assert "stop_control > controller_command > runtime_safety" in completed.stderr
 
 
 def test_strict_resource_profile_rejects_unbounded_cpu_range():

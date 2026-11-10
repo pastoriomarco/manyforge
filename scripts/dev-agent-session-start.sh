@@ -77,7 +77,6 @@ echo "    Shared resources uploaded."
 echo ">>> [3/4] Restoring worker workspaces..."
 
 ACTIVE_TASKS=()
-# Add task IDs here when starting new Phase 1 batches, e.g.:
 # Add task IDs here when starting new sessions, e.g.:
 # ACTIVE_TASKS=("s3-bindings")
 ACTIVE_TASKS=()

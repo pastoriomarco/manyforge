@@ -27,8 +27,13 @@ inline constexpr std::int64_t kDefaultComponentInstallBudgetNs = 10'000'000'000L
 /// which waits for the sum of their budgets (`budgets_ns`, by component id:
 /// the authored budget, else the default, see
 /// `component_composition_budgets_ns`; a removed component is absent from the
-/// candidate's budgets and its stop takes the default, the host's stop grace).
-/// An Apply that installs and removes nothing waits one default budget.
+/// candidate's budgets and takes the default). Each of them may also retire a
+/// launch first (a removed or replaced component; an added one isn't told
+/// apart here): a hung one takes the host's stop grace before its group
+/// SIGKILL and reap, so each adds `core::kControllerLaunchStopGrace` (a
+/// lone hung arm outlasted a bound equal to that grace, and the timeout shut
+/// the execution host down). An Apply that installs and removes nothing
+/// waits one default budget.
 [[nodiscard]] inline std::chrono::milliseconds HostApplyTimeout(
     const HostApplyRequest &request,
     const std::map<std::string, std::int64_t, std::less<>> &budgets_ns) {
@@ -39,7 +44,8 @@ inline constexpr std::int64_t kDefaultComponentInstallBudgetNs = 10'000'000'000L
     const auto budget = budgets_ns.find(component.value());
     total += std::chrono::nanoseconds(budget == budgets_ns.end()
                                           ? kDefaultComponentInstallBudgetNs
-                                          : budget->second);
+                                          : budget->second) +
+             manyforge::core::kControllerLaunchStopGrace;
   };
   for (const auto &component : request.components)
     if (!std::binary_search(request.retained_components.begin(),

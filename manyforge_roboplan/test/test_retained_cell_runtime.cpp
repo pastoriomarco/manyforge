@@ -32,7 +32,7 @@
 #include <manyforge_roboplan/retained_execution_host.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
-#ifdef MANYFORGE_A1_ROS_GRIPPER_CELL_TEST
+#ifdef MANYFORGE_ROS_GRIPPER_CELL_TEST
 #include <manyforge_roboplan/retained_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
 #include <roboplan/core/scene.hpp>
@@ -88,8 +88,6 @@ RetainedCellRuntimeInput EmptyCellInput() {
   const auto component_name = "robot." + suffix;
   const auto model_name = "robot.model." + suffix;
   value.program_binding_id = core::ProgramBindingId("program-binding." + suffix);
-  value.component_role_id = core::ComponentRoleId("robot." + suffix);
-  value.target_role_id = core::TargetRoleId("arm." + suffix);
   value.controllable_component_id =
       core::ControllableComponentId(component_name);
   for (auto &model : value.model_bindings) {
@@ -105,6 +103,7 @@ RetainedCellRuntimeInput EmptyCellInput() {
     }
   }
   for (auto &frame : value.frame_bindings) {
+    frame.reference.component_id = value.controllable_component_id;
     frame.model_instance_id = core::ModelInstanceId(model_name);
     frame.compiled_frame_name = "mf2_robot_" + suffix + "_" +
                                 frame.compiled_frame_name;
@@ -343,8 +342,6 @@ TEST(RetainedCellRuntimeTest,
       core::ProgramBindingId("candidate.program-binding");
   value.retained_bundle_id = core::RetainedBundleId("candidate.bundle");
   value.graph_revision = core::GraphRevision("candidate.graph");
-  value.component_role_id = core::ComponentRoleId("candidate.robot");
-  value.target_role_id = core::TargetRoleId("candidate.arm");
   auto sealed = core::verify_runtime_participant_binding(std::move(value));
   ASSERT_TRUE(sealed.ok()) << sealed.error().message;
   const auto candidate = std::move(sealed.value());
@@ -408,10 +405,9 @@ TEST(RetainedCellRuntimeTest,
 TEST(RetainedCellRuntimeTest,
      RetainedGripperResealKeepsItsPhysicalOwnerAcrossANewBundle) {
   auto gripper_value = qualification_fixture::make_binding().value();
-  gripper_value.component_role_id = core::ComponentRoleId("gripper");
-  gripper_value.target_role_id = core::TargetRoleId("gripper");
   gripper_value.controllable_component_id =
       core::ControllableComponentId("gripper.1");
+  for (auto &frame : gripper_value.frame_bindings) frame.reference.component_id = gripper_value.controllable_component_id;
   gripper_value.component_type_id = core::ComponentTypeId("aggregate.gripper");
   gripper_value.command_target_id = core::CommandTargetId("gripper.target");
   gripper_value.capability_id = core::CapabilityId("tool.gripper.command");
@@ -545,7 +541,7 @@ TEST(RetainedCellRuntimeTest,
   RemoveJournalFiles(journal_path);
 }
 
-#ifdef MANYFORGE_A1_ROS_GRIPPER_CELL_TEST
+#ifdef MANYFORGE_ROS_GRIPPER_CELL_TEST
 #endif
 
 TEST(RetainedCellRuntimeTest,
@@ -590,7 +586,7 @@ TEST(RetainedCellRuntimeTest,
      ProgramResolverPreservesContactPoliciesAndFencesThePhysicalOwner) {
   auto physical_value = qualification_fixture::make_binding().value();
   physical_value.collision_body_bindings = {
-      {core::CollisionBodyRoleId("tool_collision"),
+      {{physical_value.controllable_component_id, core::CollisionBodyRoleId("tool_collision")},
        core::ModelInstanceId("robot.model"),
        core::ModelRevision("model-revision"),
        {"tool_body"}}};
@@ -607,12 +603,8 @@ TEST(RetainedCellRuntimeTest,
       core::ContactPolicyId("probe_contact_policy"),
       core::ContactPolicyRevision("contact-policy-revision"),
       core::RuntimeObjectId("trial.probe_object"),
-      {{program_value.component_role_id,
-        program_value.target_role_id,
-        program_value.controllable_component_id,
-        program_value.command_target_id,
+      {{{program_value.controllable_component_id, core::CollisionBodyRoleId("tool_collision")},
         core::ModelRoleId("body"),
-        core::CollisionBodyRoleId("tool_collision"),
         core::ModelInstanceId("robot.model"),
         core::ModelRevision("model-revision"),
         {core::make_component_collision_body_id(
@@ -666,8 +658,8 @@ TEST(RetainedCellRuntimeTest,
 TEST(RetainedCellRuntimeTest,
      ProgramResolverAcceptsAProgramViewWithFewerCollisionBodiesThanItsOwner) {
   const auto body = [](const char *role, const char *name) {
-    return core::ProgramCollisionBodyRoleBindingDTO{
-        core::CollisionBodyRoleId(role), core::ModelInstanceId("robot.model"),
+    return core::ProgramCollisionBodyBindingDTO{
+        {core::ControllableComponentId("robot.1"), core::CollisionBodyRoleId(role)}, core::ModelInstanceId("robot.model"),
         core::ModelRevision("model-revision"), {name}};
   };
   auto physical_value = qualification_fixture::make_binding().value();
@@ -734,8 +726,8 @@ TEST(RetainedCellRuntimeTest,
   auto physical_value = program_value;
   physical_value.frame_bindings.insert(
       std::next(physical_value.frame_bindings.begin()),
-      core::ProgramFrameRoleBindingDTO{
-          core::FrameRoleId("flange"), core::ModelInstanceId("robot.model"),
+      core::ProgramFrameBindingDTO{
+          {core::ControllableComponentId("robot.1"), core::FrameRoleId("flange")}, core::ModelInstanceId("robot.model"),
           core::ModelRevision("model-revision"), "link_eef"});
   const auto physical_binding =
       core::verify_runtime_participant_binding(std::move(physical_value));
@@ -799,57 +791,40 @@ TEST(RetainedCellRuntimeTest,
       {frame("lite6_robot", "lite6_robot.model", "base", "link_base"), {}},
       {frame("lite_gripper", "lite_gripper.model", "tcp", "link_tcp"), {}}};
   const auto binding = [](const char *model, const char *role, const char *name) {
-    return core::ProgramFrameRoleBindingDTO{
-        core::FrameRoleId(role), core::ModelInstanceId(model),
+    return core::ProgramFrameBindingDTO{
+        {core::ControllableComponentId(std::string(model) == "lite_gripper.model" ? "lite_gripper" : "lite6_robot"), core::FrameRoleId(role)}, core::ModelInstanceId(model),
         core::ModelRevision(std::string(model) + "-rev"), name};
   };
   const core::ControllableComponentId robot("lite6_robot");
-  // M7: the owners come from the cell kinematic index (one row per model
-  // that ends a retained path), no longer from a per-call path scan.
-  const std::vector<RetainedSceneFrameModelOwnerInput> owners{
-      {core::ModelInstanceId("lite6_robot.model"), robot},
-      {core::ModelInstanceId("lite_gripper.model"),
-       core::ControllableComponentId("lite_gripper")}};
+  // The explicit frame reference carries its own component owner.
   const core::ResolvedFrameDTO tool_tcp = program_binding_frame(
-      owners, robot, binding("lite_gripper.model", "tcp", "link_tcp"));
+      binding("lite_gripper.model", "tcp", "link_tcp"));
   EXPECT_EQ(tool_tcp, core::ResolvedFrameDTO(paths[2].terminal_frame));
   const core::ResolvedFrameDTO base = program_binding_frame(
-      owners, robot, binding("lite6_robot.model", "base", "link_base"));
+      binding("lite6_robot.model", "base", "link_base"));
   EXPECT_EQ(base, core::ResolvedFrameDTO(paths[1].terminal_frame));
-  // A model with no retained path keeps the binding's component.
-  EXPECT_EQ(program_binding_frame(owners, robot,
-                                  binding("other.model", "tcp", "tool0"))
+  // A frame reference keeps its owner even without a retained path.
+  EXPECT_EQ(program_binding_frame(binding("other.model", "tcp", "tool0"))
                 .controllable_component_id,
             robot);
 }
 
-// M7 U2 oracle (R16): the M6b `program_binding_frame` path scan, copied
-// verbatim, equals the owner rows built from the cell kinematic index, for
-// every binding component and every model: mounted and chained tools,
-// prefix-related ids, a passive model, a model-free component, a model with
-// no retained path, and repeated paths of one model.
-namespace m6b_oracle {
+// Direct frame references retain their component owner independently of model and target names.
+namespace path_scan_oracle {
 core::ResolvedComponentModelFrameDTO program_binding_frame(
     const std::vector<core::KinematicFramePathDTO> &frame_paths,
     const core::ControllableComponentId &binding_component,
-    const core::ProgramFrameRoleBindingDTO &frame) {
-  auto owner = binding_component;
-  for (const auto &path : frame_paths) {
-    const auto *model =
-        std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
-    if (model != nullptr && model->model_instance_id == frame.model_instance_id) {
-      owner = model->controllable_component_id;
-      break;
-    }
-  }
+    const core::ProgramFrameBindingDTO &frame) {
+  static_cast<void>(frame_paths);
+  static_cast<void>(binding_component);
   return core::ResolvedComponentModelFrameDTO{
-      std::move(owner), frame.model_instance_id, frame.frame_role_id,
+      frame.reference.component_id, frame.model_instance_id, frame.reference.frame_id,
       frame.compiled_frame_name, frame.model_revision};
 }
-} // namespace m6b_oracle
+} // namespace path_scan_oracle
 
 TEST(RetainedCellRuntimeTest,
-     ProgramBindingFrameOwnersFromTheIndexEqualTheM6bPathScan) {
+     ProgramBindingFramePreservesDirectComponentOwner) {
   const auto component = [](const char *id, std::vector<const char *> models) {
     core::ControllableComponentDTO row{core::ControllableComponentId(id),
                                        core::ComponentTypeId(std::string(id) + "_type"),
@@ -903,7 +878,6 @@ TEST(RetainedCellRuntimeTest,
       {frame("arm.tool", "arm.tool.model", "tcp", "link_tcp"), {}},
       {frame("arm.tool.nozzle", "arm.tool.nozzle.model", "tip", "nozzle_tip"), {}}};
   const deployment::CellKinematicIndex index(graph, paths);
-  const auto owners = retained_scene_frame_model_owners(index);
 
   const std::vector<const char *> models{
       "arm.model", "arm.tool.model", "arm.tool.nozzle.model", "ur5.model",
@@ -912,12 +886,12 @@ TEST(RetainedCellRuntimeTest,
                                              "io_box", "ur5"};
   for (const auto *binding_component : components) {
     for (const auto *model : models) {
-      const core::ProgramFrameRoleBindingDTO binding{
-          core::FrameRoleId("tcp"), core::ModelInstanceId(model),
+      const core::ProgramFrameBindingDTO binding{
+          {core::ControllableComponentId(binding_component), core::FrameRoleId("tcp")}, core::ModelInstanceId(model),
           core::ModelRevision(std::string(model) + "-rev"), "link_tcp"};
       const core::ControllableComponentId bound(binding_component);
-      EXPECT_EQ(program_binding_frame(owners, bound, binding),
-                m6b_oracle::program_binding_frame(paths, bound, binding))
+      EXPECT_EQ(program_binding_frame(binding),
+                path_scan_oracle::program_binding_frame(paths, bound, binding))
           << binding_component << " / " << model;
     }
   }
@@ -932,7 +906,7 @@ TEST(RetainedCellRuntimeTest,
   }
 }
 
-// G6 [C-P6]: a component without its own live state source is local when
+// A component without its own live state source is local when
 // anything it is mounted on is local: lite6 + a pneumatic gripper (no
 // coordinate publication) resolves the gripper's own frames and the objects it
 // carries (before: program_reference_robot_not_local). A tool on a robot

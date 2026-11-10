@@ -102,7 +102,7 @@ def test_catalog_offers_curated_rows_with_kinds_tags_and_assemblies() -> None:
     assert "articulated-arm" in robot["tags"] and "gripper" not in robot["tags"]
     assert robot["lane"] == "manyforge-only"
     assert [row["component_id"] for row in robot["components"]] == ["ur10e_robot"]
-    # AUD-5: a UFactory arm is always a machine member, added with its machine
+    # A UFactory arm is always a machine member, added with its machine
     # entry; no catalog entry offers it (or any machine row) alone.
     assert not [entry for entry in _row_entries(catalog)
                 if {"lite6_robot", "lite6", "uf850_robot"}
@@ -297,7 +297,7 @@ def test_profile_facts_carry_each_targets_tcp_roles_and_default(
 
     types = tmp_path / "component_type"
     types.mkdir()
-    # A two-target tool with a `tcp` on both targets (B5: its Deployment row
+    # A two-target tool with a `tcp` on both targets (its Deployment row
     # chooses the default), a one-target tool and a bracket without TCPs.
     for family, targets in (
         ("dual", [target("tool_b", ["tcp"], "tcp"), target("tool_a", ["tcp", "edge"], "tcp")]),
@@ -338,11 +338,11 @@ def test_maintained_models_declare_one_tcp_target_each() -> None:
     assert profiles["ufactory.lite_gripper"]["tcpTargets"] == [
         {"commandTargetId": "gripper", "tcpFrameRoleIds": ["tcp"], "defaultTcpFrameRoleId": "tcp"},
     ]
-    # No maintained model needs a Deployment `default_tcp` (B5 sweep).
+    # No maintained model needs a Deployment `default_tcp`.
     assert all(len(facts["tcpTargets"]) <= 1 for facts in profiles.values())
 
 
-# --- machines (CONTRACTS §16, BOUNDARY §5) ----------------------------------
+# --- machines ---------------------------------------------------------------
 
 
 def test_machine_entries_come_from_the_machine_models() -> None:
@@ -421,6 +421,40 @@ def test_sensor_entries_come_from_the_sensor_models() -> None:
                                                     "source_frame_id": "camera_link"}},
     }
     assert validate_deployment_intent(_intent([row]), source="sensor")["components"] == [row]
+
+
+def test_the_assistant_model_is_offered_like_a_sensor(monkeypatch) -> None:
+    path = "components/assistant/manyforge.assistant/component.yaml"
+    descriptor = {
+        "kind": "assistant",
+        "id": "manyforge.assistant",
+        "title": "AI assistant (Composer chat bridge)",
+        "adapter_row": {"adapter": "assistant", "backend": "local_process",
+                        "health_period_s": 1.0, "stream_budget_s": 5.0},
+    }
+    read = catalog_module._descriptor
+    monkeypatch.setattr(catalog_module, "_descriptor",
+                        lambda name: descriptor if name == path else read(name))
+    sources = json.loads(catalog_module._SOURCES.read_text(encoding="utf-8"))
+    sources["component_models"] = [
+        name for name in sources["component_models"] if name != path
+    ] + [path]
+
+    entries = catalog_module._lane_free_entries(sources)
+
+    assert [entry["kind"] for entry in entries] == ["sensor", "assistant"]
+    entry = entries[-1]
+    assert entry["entryId"] == "model/manyforge.assistant"
+    assert entry["componentId"] == "assistant"
+    assert entry["lane"] is None and entry["modelFamilyId"] is None
+    # No sensor defaults: the Add panel asks for the model and the profile.
+    assert entry["components"] == [{
+        "component_id": "assistant",
+        "component_profile_id": "manyforge.assistant",
+        "target_settings": {},
+        "configuration": {"runtime_kind": "assistant", "runtime_configuration": {}},
+    }]
+    assert _kind(entry["components"][0], []) == "assistant"
 
 
 def test_machine_rows_are_not_offered_alone_and_owner_is_not_followed() -> None:

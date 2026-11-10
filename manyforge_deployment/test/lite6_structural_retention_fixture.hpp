@@ -110,8 +110,9 @@ struct Lite6StructuralRetentionFixture final {
 
 [[nodiscard]] inline CanonicalValue lite6_model_asset_identity(
     std::span<const Lite6InputArtifact> artifacts,
-    std::string_view arm_collision_role = "arm_collision") {
-  return CanonicalValue(CanonicalValue::Object{
+    std::string_view arm_collision_role = "arm_collision",
+    bool include_subset_body = false) {
+  auto identity = CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kModelAssetApiVersion))},
       {"model_asset_id",
@@ -189,13 +190,30 @@ struct Lite6StructuralRetentionFixture final {
            }),
        })},
   });
+  if (!include_subset_body) return identity;
+  auto object = identity.as_object();
+  for (auto &[key, value] : object) {
+    if (key != "collision_body_role_bindings") continue;
+    auto bodies = value.as_array();
+    bodies.emplace_back(CanonicalValue::Object{
+        {"collision_body_role_id", CanonicalValue("arm_link1")},
+        {"source_link_names", CanonicalValue(CanonicalValue::Array{CanonicalValue("link1")})}});
+    std::sort(bodies.begin(), bodies.end(), [](const auto &left, const auto &right) {
+      return left.find_object_member("collision_body_role_id")->as_string() <
+             right.find_object_member("collision_body_role_id")->as_string();
+    });
+    value = CanonicalValue(std::move(bodies));
+    return CanonicalValue(std::move(object));
+  }
+  throw std::logic_error("Lite6 model fixture has no collision body bindings");
 }
 
 [[nodiscard]] inline std::string lite6_model_asset_document(
     std::span<const Lite6InputArtifact> artifacts,
-    std::string_view arm_collision_role = "arm_collision") {
+    std::string_view arm_collision_role = "arm_collision",
+    bool include_subset_body = false) {
   const CanonicalValue identity =
-      lite6_model_asset_identity(artifacts, arm_collision_role);
+      lite6_model_asset_identity(artifacts, arm_collision_role, include_subset_body);
   std::string preimage{"manyforge.content-identity.v1"};
   preimage.push_back('\0');
   preimage.append("catalog-record-revision/model_asset");
@@ -261,10 +279,11 @@ load_lite6_source_artifacts() {
 
 [[nodiscard]] inline Lite6StructuralRetentionFixture
 make_lite6_structural_retention_fixture(
-    std::string_view arm_collision_role = "arm_collision") {
+    std::string_view arm_collision_role = "arm_collision",
+    bool include_subset_body = false) {
   auto artifacts = load_lite6_source_artifacts();
   const std::string catalog_bytes =
-      lite6_model_asset_document(artifacts, arm_collision_role);
+      lite6_model_asset_document(artifacts, arm_collision_role, include_subset_body);
   const CanonicalValue catalog =
       parse_strict_json_model_yaml(catalog_bytes).root();
   const auto* revision_value =
@@ -491,12 +510,12 @@ qualify_lite6_passive_deployment(
   const CanonicalValue deployment_value(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id",
-       CanonicalValue("i3_lite6_passive_fixture")},
+       CanonicalValue("lite6_passive_fixture")},
       {"deployment_revision",
        CanonicalValue(
            "sha256:0000000000000000000000000000000000000000000000000000000000000000")},
-      {"cell_id", CanonicalValue("i3_lite6_passive_cell")},
-      {"name", CanonicalValue("I3 Lite6 passive fixture")},
+      {"cell_id", CanonicalValue("lite6_passive_cell")},
+      {"name", CanonicalValue("Lite6 passive fixture")},
       {"catalogs", catalogs},
       {"graph", graph},
       {"desired_control_configurations",

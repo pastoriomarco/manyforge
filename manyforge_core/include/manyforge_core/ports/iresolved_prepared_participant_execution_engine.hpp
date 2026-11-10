@@ -203,6 +203,13 @@ class IResolvedPreparedParticipantExecutionEngine {
     return Result<bool>::Err(ErrorCode::kUnsupportedCapability);
   }
 
+  /// Program Reset only: retire exact unknown successor membership after the
+  /// rebuilt owner's qualified rest, without a command or outcome rewrite.
+  virtual Result<bool> RetireRebuiltUnknownPreparedMotion(std::uint64_t /*source_id*/,
+                                                           std::uint64_t /*candidate_id*/) {
+    return Result<bool>::Err(ErrorCode::kUnsupportedCapability);
+  }
+
   /// Read one exact incumbent source without changing preparation or effects.
   virtual Result<PreparedMotionReplacementSourceDTO> CaptureMotionReplacementSource(
       std::uint64_t /*execution_id*/) const {

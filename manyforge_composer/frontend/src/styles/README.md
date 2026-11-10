@@ -66,7 +66,7 @@ Severity looks, reused everywhere:
   - put layout in the surface file of its family, using tokens only.
   - Add a new file only for a new surface family, and import it in
     `index.css` after the files it must override.
-- **Program nodes:** the approved design is D3 in UI6-I-VC; the reference page
+- **Program nodes:** the approved design's reference page
   is `frontend/design/program-node-design.html`. Icons are in
   `src/components/programNodeGlyphs.tsx`.
 
@@ -81,5 +81,4 @@ Severity looks, reused everywhere:
 A few repeated preludes are allowlisted because rules of equal specificity sit
 between them, and merging would change which declaration wins.
 
-`tests/style-inventory/inventory.py` writes the before/after inventory used
-by UI6-I-VC.
+`tests/style-inventory/inventory.py` writes the before/after style inventory.

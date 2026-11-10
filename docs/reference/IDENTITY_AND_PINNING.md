@@ -43,7 +43,6 @@ starts `not_prepared` or `offline` and is prepared again.
 | Node catalog content version | `EXPECTED_CONTENT_VERSION` in `manyforge_behavior/manyforge_behavior/catalog.py`; the extension descriptor's `catalog_content_version`; `kBuiltinCatalogContentVersion` in `manyforge_deployment/src/build_manifest.cpp` | Catalog load, extension selection, compiler build manifest | A Program names the exact active catalog version |
 | Node catalog digest | `catalog_digest` in `node_catalog.yaml`; `EXPECTED_BUILTIN_CATALOG_DIGEST` in `catalog.py` | Catalog load; node environment | The loaded catalog equals the reviewed one |
 | Node environment manifest | `manyforge_behavior/resources/node_environment_manifest.yaml` | CMake configure; workbench start (regenerated and compared) | Provenance of the node code an Apply uses |
-| Assistant instrument registry | `manyforge_deployment/resources/assistant/assistant_instrument_registry_source.v1.json` | CMake configure | Assistant tools match the node schemas the backend validates |
 | Generated closed schemas | `closed_schema/value/…io_provider_execution.v1.yaml`, `…pose_source.v2.yaml`; their revisions in `registry.v1.yaml` and tests | Schema registry load | Bundles and providers agree on a schema |
 | Alarm catalog digest | `descriptor_digest` in `manyforge_headless/resources/operator-alarm-catalog.v1.yaml`; its test | Headless start | Alarm definitions are intact; the digest is recorded in alarm snapshots |
 | Maintained Deployment sources | `manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json`; assistant profile and template digests in `manyforge_deployment/tools/check_maintained_deployment_sources.py` | Source checker | Maintained examples come from the reviewed description |
@@ -66,7 +65,7 @@ python3 scripts/regen.py --check  --build-dir <build>/ros-integration --require-
 
 - Steps, in order: `project-snapshots`, `catalog-pin`, `node-catalog`,
   `closed-schemas`, `alarm-catalog`, `maintained-sources`,
-  `program-binding-transport`, `assistant-registry`, `node-environment`,
+  `program-binding-transport`, `node-environment`,
   `program-revisions`*, `model-assets`*, `maintained-occurrences`, `scenario-pins`,
   `rest-contracts`. `--list` prints them; `--only a,b` runs a subset.
 - \* The native steps need built tools: `manyforge_program_revision`, and
@@ -103,5 +102,5 @@ python3 scripts/regen.py --check  --build-dir <build>/ros-integration --require-
 - The vendor and lane driver commits and the RoboPlan pin: change them
   together with the image build (`driver.yaml`, `Dockerfile.ros-lyrical-full`,
   `scripts/setup-docker.sh`), then rebuild the image.
-- The release golden (`scripts/qualification/review_canonical_empty_release_golden.py`),
+- The release golden (`scripts/review_canonical_empty_release_golden.py`),
   which is updated only when publishing a new frozen candidate.

@@ -32,6 +32,8 @@ struct IkRequestDTO final {
   /// adapters may omit them.
   CollisionWorldSnapshotPtr retained_collision_world{};
   std::shared_ptr<const CollisionPolicySnapshot> retained_collision_policy{};
+  PlannerCollisionMode collision_mode{PlannerCollisionMode::kEnforced};
+  std::optional<TolerancesDTO> diagnostic_tolerances{};
 };
 
 /// Result of a single-shot IK solve.
@@ -47,7 +49,7 @@ struct IkResultDTO {
   std::optional<ErrorDTO> error;
 };
 
-/// Planner backend interface (spec 220 §2)
+/// Planner backend interface
 ///
 /// Responsibilities:
 /// - Plan motions from a PlanRequestDTO and return a time-parameterized TrajectoryDTO

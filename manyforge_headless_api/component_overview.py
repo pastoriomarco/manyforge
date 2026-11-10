@@ -88,7 +88,7 @@ class ComponentOverviewFacts:
     # Component model v2: the host's published component model (or None).
     component_model: ComponentModel | None
     errors: Mapping[str, Mapping[str, Any]]
-    # Read for Execute readiness (§10) only; the Overview doesn't use it.
+    # Read for Execute readiness only; the Overview doesn't use it.
     applied_program_status: Mapping[str, Any] | None = None
 
     def reduce(self) -> dict[str, Any]:
@@ -218,6 +218,9 @@ def _component_state_tiles(
         if lifecycle == "fault":
             reason = state.get("fault", {}).get("code")
             detail = state.get("fault", {}).get("message", "fault")
+        elif "stop" in state:
+            reason = state["stop"]["code"]
+            detail = state["stop"]["message"]
         else:
             reason = state.get("reason", {}).get("code")
             detail = state.get("reason", {}).get("message", lifecycle.replace("_", " "))
@@ -226,9 +229,9 @@ def _component_state_tiles(
             _component(
                 tile_id,
                 state["component_id"],
-                # An owner has no Enable: `prepared` is its usable state (§16).
+                # An owner has no Enable: `prepared` is its usable state.
                 _HEALTHY
-                if lifecycle == "prepared" and state["component_id"] in owners
+                if lifecycle == "prepared" and state["component_id"] in owners and "stop" not in state
                 else _LIFECYCLE_STATUS[lifecycle],
                 detail,
                 required=True,
@@ -481,7 +484,7 @@ def build_component_overview(
         if isinstance(profile, str) and profile and profile not in runtime_profiles:
             runtime_profiles.append(profile)
 
-    # Component model v2 (R4): one tile per component, taken from its
+    # Component model v2: one tile per component, taken from its
     # ComponentState as the execution host publishes it; nothing re-derived.
     component_tile_ids = _component_state_tiles(components, component_model, errors)
 
@@ -492,7 +495,7 @@ def build_component_overview(
     applied_detail: str | None = None
     if applied_error.get("code") == "program_not_selected":
         # An Applied `no_program` outcome is a normal state: Execute is
-        # unavailable, not an error (spec 450, Scenario New).
+        # unavailable, not an error (Scenario New).
         applied_reason = "program_not_selected"
         applied_detail = "no Program is selected; Execute is unavailable"
     elif applied_error:
@@ -680,7 +683,7 @@ def build_component_overview(
     targets_error = _fact_error(errors, "execution_targets") or _mapping(
         targets_response_error
     )
-    # execution_targets.v3 (H1a-IF.2): component-owned targets, no primary.
+    # execution_targets.v3: component-owned targets, no primary.
     commandable_rows = [
         (_mapping(component), _mapping(target))
         for component in _sequence(targets.get("components"))

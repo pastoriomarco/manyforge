@@ -1,3 +1,6 @@
+#include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+#include "../src/prepared_command_session_internal.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -51,6 +54,7 @@
 #include <vector>
 
 #include "../src/program_stop_projection_internal.hpp"
+#include "../src/resource_addressed_execution_kernel_internal.hpp"
 
 namespace manyforge::core {
 
@@ -59,6 +63,48 @@ class StopControlExecutorTestAccess final {
   static void WakeAfterClockAdvance(ResourceAddressedExecutionKernel& kernel) noexcept {
     kernel.stop_control_executor_->WakeForClockAdvanceTest();
   }
+  static bool SourceOwnsTerminalSlots(ResourceAddressedExecutionKernel& kernel, const OperationId& id) {
+    std::lock_guard lock(kernel.state_mutex_);
+    const auto* source = kernel.find_active_operation_locked(id);
+    if (!source || source->participants.size() != 1U || source->state.participants.size() != 1U)
+      return false;
+    const auto& participant = source->participants.front();
+    if (participant.slot_state != ResourceSlotState::kTerminal || participant.resources.empty())
+      return false;
+    const auto snapshot = kernel.resource_slots_->coherent_snapshot();
+    return std::all_of(participant.resources.begin(), participant.resources.end(),
+        [&](const auto& resource) {
+          const auto slot = std::find_if(snapshot.slots.begin(), snapshot.slots.end(),
+              [&](const auto& row) { return row.resource_id == resource; });
+          return slot != snapshot.slots.end() && slot->state == ResourceSlotState::kTerminal &&
+                 slot->owner && *slot->owner == participant.slot_owner;
+        });
+  }
+  static std::pair<std::uint64_t, std::uint64_t> SeedRetiredUnknownTakeover(
+      ResourceAddressedExecutionKernel& kernel, const OperationId& id) {
+    std::lock_guard lock(kernel.state_mutex_);
+    auto* source = kernel.find_active_operation_locked(id);
+    if (!source || source->pending_motion_takeover.empty() || source->state.participants.size() != 1U ||
+        source->state.state != OperationStateKind::kInterventionRequired ||
+        !source->state.participants.front().terminal_fact ||
+        source->state.participants.front().terminal_fact->effect != ParticipantEffectKnowledge::kEffectUncertain)
+      return {};
+    auto& candidate = *source->pending_motion_takeover.mapped();
+    auto& row = candidate.state.participants.front();
+    const ErrorDTO error{"candidate_unknown", "owner contact lost", {}};
+    candidate.state.state = row.state = OperationStateKind::kInterventionRequired;
+    row.terminal_error = error;
+    row.terminal_fact = ParticipantExecutionFact{ParticipantExecutionFactKind::kLocalFailure,
+                                                 ParticipantEffectKnowledge::kEffectUncertain, error};
+    return {source->participants.front().subordinate_id,
+            candidate.participants.front().preparation_id};
+  }
+  static void SetTakeoverBorrow(ResourceAddressedExecutionKernel& kernel,
+                                const OperationId& id, bool active) {
+    std::lock_guard lock(kernel.state_mutex_);
+    auto* source = kernel.find_active_operation_locked(id);
+    if (source) source->takeover_advance_in_flight = active;
+  }
 };
 
 }  // namespace manyforge::core
@@ -66,6 +112,66 @@ class StopControlExecutorTestAccess final {
 namespace {
 
 using namespace manyforge::core;
+
+TEST(PreparedCommandAdmissionTest, RechecksChangedEffectAfterUnlockedObservation) {
+  struct Session : detail::PreparedCommandSessionLifecycle {
+    explicit Session(const char* value) : digest(value) {}
+    ContentDigest digest;
+    int effect{1};
+  };
+  auto prior = std::make_shared<Session>("prior");
+  prior->preparation_id = 7U;
+  prior->state = ResolvedPreparedCapabilityCommandStateDTO::kDispatched;
+  auto candidate = std::make_shared<Session>("candidate");
+  std::atomic<std::shared_ptr<Session>> resident{prior};
+  std::mutex resident_mutex;
+  std::uint64_t next = 8U;
+  unsigned observations = 0;
+  const auto admitted = detail::AdmitPreparedCommandSession(
+      candidate, resident, resident_mutex, next,
+      [](const Session& session) { return &session.digest; },
+      [](const Session& session) { return std::optional{session.effect}; },
+      [&](int effect) {
+        std::lock_guard lock(prior->mutex);
+        ++observations;
+        if (observations == 1U) prior->effect = 2;
+        return effect == 2;
+      });
+  EXPECT_FALSE(admitted.ok());
+  EXPECT_EQ(observations, 2U);
+  EXPECT_EQ(resident.load(), prior);
+}
+
+TEST(PreparedCommandAdmissionTest, RechecksReplacementResidentAfterUnlockedObservation) {
+  struct Session : detail::PreparedCommandSessionLifecycle {
+    explicit Session(const char* value) : digest(value) {}
+    ContentDigest digest;
+    int effect{1};
+  };
+  auto prior = std::make_shared<Session>("prior");
+  prior->state = ResolvedPreparedCapabilityCommandStateDTO::kDispatched;
+  auto newer = std::make_shared<Session>("newer");
+  newer->state = ResolvedPreparedCapabilityCommandStateDTO::kPrepared;
+  auto candidate = std::make_shared<Session>("candidate");
+  std::atomic<std::shared_ptr<Session>> resident{prior};
+  std::mutex resident_mutex;
+  std::uint64_t next = 8U;
+  bool replaced = false;
+  const auto admitted = detail::AdmitPreparedCommandSession(
+      candidate, resident, resident_mutex, next,
+      [](const Session& session) { return &session.digest; },
+      [](const Session& session) { return std::optional{session.effect}; },
+      [&](int) {
+        if (!replaced) {
+          std::lock_guard lock(resident_mutex);
+          resident.store(newer);
+          replaced = true;
+        }
+        return false;
+      });
+  EXPECT_FALSE(admitted.ok());
+  EXPECT_EQ(resident.load(), newer);
+}
 
 template <typename Predicate>
 bool wait_until(Predicate&& predicate,
@@ -80,7 +186,7 @@ bool wait_until(Predicate&& predicate,
   return true;
 }
 
-/// One component's state as an adapter publishes it (CONTRACTS §1).
+/// One component's state as an adapter publishes it.
 [[nodiscard]] ComponentState CellComponentState(std::string component_id,
                                                 const ComponentLifecycle lifecycle,
                                                 const ComponentActivity activity) {
@@ -627,6 +733,20 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return Result<bool>::Ok(true);
   }
 
+  Result<bool> RetireRebuiltUnknownPreparedMotion(std::uint64_t source_id,
+                                                   std::uint64_t candidate_id) override {
+    ++retire_rebuilt_unknown_calls;
+    if (!rebuilt_unknown_retirement_allowed || source_id != rebuilt_unknown_source_id ||
+        candidate_id != rebuilt_unknown_candidate_id)
+      return Result<bool>::Err(ErrorCode::kExecutionRejected);
+    std::lock_guard lock(prepared_motion_mutex_);
+    if (!replacement_snapshot || replacement_snapshot->execution_id != candidate_id)
+      return Result<bool>::Err(ErrorCode::kMissingReference);
+    replacement_snapshot.reset();
+    replacement_request.reset();
+    return Result<bool>::Ok(true);
+  }
+
   Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
                                           const StopCertificateDTO& certificate) override {
     ++prepare_cold_motion_calls;
@@ -917,7 +1037,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<MotionPreviewResultDTO> preview_motion(ExecuteRequestDTO request,
                                                 CollisionWorldLeaseInventory projection_inventory,
                                                 RobotStateDTO start_state, std::uint32_t,
-                                                std::stop_token) override {
+                                                std::stop_token,
+                                                std::optional<MotionPathPreview>* path_preview) override {
+    if (path_preview != nullptr) path_preview->reset();
     ++preview_calls;
     last_preview = request;
     const RobotStateDTO final_state{start_state.joint_names, start_state.positions_rad, {}};
@@ -1111,9 +1233,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       const ResolvedRuntimeScaleCommandDTO& command) override {
     ++runtime_scale_calls;
     Trace("engine:set_runtime_scale");
-    if (runtime_scale_effect_hook) {
-      runtime_scale_effect_hook();
+    std::function<void()> effect_hook;
+    {
+      std::lock_guard lock(runtime_scale_mutex_);
+      effect_hook = runtime_scale_effect_hook;
     }
+    if (effect_hook) effect_hook();
+    std::lock_guard lock(runtime_scale_mutex_);
     if (!runtime_scale.supported) {
       return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
           ErrorDTO{std::string(to_string(ErrorCode::kUnsupportedCapability)),
@@ -1155,9 +1281,19 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                         runtime_scale.acknowledgement_timestamp_ns});
   }
 
+  void store_runtime_scale_setting(const double scale, const std::uint64_t sequence) override {
+    std::lock_guard lock(runtime_scale_mutex_);
+    stored_runtime_scale_settings.emplace_back(scale, sequence);
+  }
+  [[nodiscard]] std::vector<std::pair<double, std::uint64_t>> StoredRuntimeScaleSettings() const {
+    std::lock_guard lock(runtime_scale_mutex_);
+    return stored_runtime_scale_settings;
+  }
+
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
       const OperationId& operation_id, const ControlBindingId& control_binding_id) const override {
     const auto dispatched = LastExecuteSnapshot();
+    std::lock_guard lock(runtime_scale_mutex_);
     if (!last_runtime_scale_command.has_value() ||
         last_runtime_scale_command->operation_id != operation_id ||
         last_runtime_scale_command->control_binding_id != control_binding_id ||
@@ -1200,6 +1336,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         : runtime_scale.active          ? RuntimeScaleApplicationState::kApplied
                                         : RuntimeScaleApplicationState::kPending,
         runtime_scale.error});
+  }
+
+  bool notify_exact_gripper_owner_loss_recorded(const std::string& gripper_id, std::uint64_t,
+                                                std::uint64_t) override {
+    return exact_owner_notification_accept &&
+           (expected_owner_notification_gripper.empty() ||
+            gripper_id == expected_owner_notification_gripper);
   }
 
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
@@ -1329,7 +1472,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         status.last_error = ErrorCode::kExecutionAborted;
       }
     }
-    runtime_scale.active = to == ExecutionState::kExecuting;
+    {
+      std::lock_guard lock(runtime_scale_mutex_);
+      runtime_scale.active = to == ExecutionState::kExecuting;
+    }
     if (!scripted_ending(to)) {
       return KernelEvent{
           KernelEventType::kStateTransition, next_execution_id, 0, from, to, std::move(error), {}};
@@ -1457,8 +1603,14 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::atomic<int> runtime_scale_calls{};
   mutable std::atomic<int> recovery_assessment_calls{};
   std::atomic<int> recovery_action_calls{};
+  std::atomic<int> retire_rebuilt_unknown_calls{};
+  bool rebuilt_unknown_retirement_allowed{};
+  std::uint64_t rebuilt_unknown_source_id{};
+  std::uint64_t rebuilt_unknown_candidate_id{};
   std::uint64_t next_execution_id{41U};
   Result<std::uint64_t> next_execute_result = Result<std::uint64_t>::Ok(41U);
+  bool exact_owner_notification_accept{true};
+  std::string expected_owner_notification_gripper;
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
   Result<void> next_command_validation = Result<void>::Ok();
   StopResultDTO next_stop_result{true, std::nullopt};
@@ -1467,6 +1619,38 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<JsonValueDTO> next_stop_evidence;
   ResetResultDTO next_reset_result{true, std::nullopt};
   AcknowledgeCompletedResultDTO next_acknowledge_result{true, std::nullopt};
+  template <typename Mutator>
+  void UpdateRuntimeScale(Mutator&& mutate) {
+    std::lock_guard lock(runtime_scale_mutex_);
+    std::forward<Mutator>(mutate)(runtime_scale);
+  }
+  [[nodiscard]] RuntimeScaleMechanismStatusDTO RuntimeScaleSnapshot() const {
+    std::lock_guard lock(runtime_scale_mutex_);
+    return runtime_scale;
+  }
+  [[nodiscard]] std::optional<ResolvedRuntimeScaleCommandDTO> RuntimeScaleCommandSnapshot() const {
+    std::lock_guard lock(runtime_scale_mutex_);
+    return last_runtime_scale_command;
+  }
+  void SetRuntimeScaleCommand(std::optional<ResolvedRuntimeScaleCommandDTO> command) {
+    std::lock_guard lock(runtime_scale_mutex_);
+    last_runtime_scale_command = std::move(command);
+  }
+  void SetRuntimeScaleResult(Result<void> result) {
+    std::lock_guard lock(runtime_scale_mutex_);
+    next_runtime_scale_result = std::move(result);
+  }
+  void SetRuntimeScaleEffectHook(std::function<void()> hook) {
+    std::lock_guard lock(runtime_scale_mutex_);
+    runtime_scale_effect_hook = std::move(hook);
+  }
+  [[nodiscard]] RuntimeScaleMechanismAvailability runtime_scale_availability()
+      const noexcept override {
+    return scale_availability.load();
+  }
+  std::atomic<RuntimeScaleMechanismAvailability> scale_availability{
+      RuntimeScaleMechanismAvailability::kAvailable};
+  mutable std::mutex runtime_scale_mutex_;
   Result<void> next_runtime_scale_result = Result<void>::Ok();
   RuntimeScaleMechanismStatusDTO runtime_scale{true, false, 1.0, 1.0, 0.0, 1U, 1, std::nullopt};
   ExecutionStatus status{};
@@ -1540,6 +1724,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::optional<ResolvedPreparedCapabilityCommandSnapshotDTO> prepared_command_snapshot;
   std::optional<ExecuteRequestDTO> last_preview;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
+  /// OD-72: each speed setting the Kernel stored as this participant's ramp
+  /// target (value, sequence).
+  std::vector<std::pair<double, std::uint64_t>> stored_runtime_scale_settings;
   std::optional<GripperCommandRequestDTO> last_command;
   [[nodiscard]] std::optional<ResolvedParticipantStopStageDTO> LastStopStageSnapshot() const {
     std::lock_guard lock(last_stop_mutex_);
@@ -2230,7 +2417,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 [[nodiscard]] ResolvedStopBasePlanDTO stop_base_plan_for(
     const RuntimeParticipantBinding& participant, const bool qualify_fast_fallback = false) {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
   if (bytes.ends_with('\n')) {
@@ -2602,7 +2789,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 }
 
 [[nodiscard]] RuntimeParticipantBinding make_binding(
-    std::string target_role, std::string command_target, std::string capability,
+    std::string command_target, std::string capability,
     CoordinateKind kind, std::optional<ProgramCommandSchemaRefDTO> command_schema = std::nullopt,
     bool include_second_angular_resource = false,
     std::string planner_capability_revision =
@@ -2640,12 +2827,8 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
         ContactPolicyRevision("contact-policy-revision"),
         RuntimeObjectId("selected_object"),
         {ProgramContactGraspBodyBindingDTO{
-            ComponentRoleId("robot"),
-            TargetRoleId("gripper"),
-            ControllableComponentId("robot.1"),
-            CommandTargetId("gripper"),
+            {ControllableComponentId("robot.1"), body_role},
             ModelRoleId("body"),
-            body_role,
             ModelInstanceId("robot.model"),
             ModelRevision("model-revision"),
             {make_component_collision_body_id(ControllableComponentId("robot.1"),
@@ -2658,8 +2841,6 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       ProgramBindingId(test_digest('1')),
       RetainedBundleId(test_digest('6')),
       GraphRevision(test_digest('7')),
-      ComponentRoleId("robot"),
-      TargetRoleId(std::move(target_role)),
       ControllableComponentId("robot.1"),
       ComponentTypeId("aggregate.robot"),
       ComponentTypeRevision("aggregate-revision"),
@@ -2673,9 +2854,9 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
           ModelGroupRoleId("command_group"), ModelInstanceId("robot.model"),
           kind == CoordinateKind::kAngular ? "mf2_arm_group" : "mf2_gripper_group",
           std::move(compiled_group_joint_names)}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "mf2_base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+       ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "mf2_tcp"}},
       std::move(resources),
       {},
@@ -2715,7 +2896,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       std::move(contact_grasps)};
   if (kind == CoordinateKind::kAngular) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+        {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   }
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
@@ -2744,11 +2925,9 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   value.program_id = ProgramId("program.direct-control");
   value.program_revision = ProgramRevision(test_digest('2'));
   value.program_binding_id = ProgramBindingId(test_digest('3'));
-  value.component_role_id = ComponentRoleId("controlled_component");
-  value.target_role_id = TargetRoleId("command_target");
   if (value.motion_endpoint) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+        {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   }
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
@@ -2773,6 +2952,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     }
   }
   for (auto& frame : value.frame_bindings) {
+    frame.reference.component_id = value.controllable_component_id;
     frame.model_instance_id = ModelInstanceId("robot.model.2");
     frame.compiled_frame_name = "mf2_robot_2_" + frame.compiled_frame_name;
   }
@@ -2796,7 +2976,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   }
   if (value.motion_endpoint) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+        {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   }
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
@@ -2809,8 +2989,6 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     const RuntimeParticipantBinding& source, const std::string& suffix) {
   auto value = source.value();
   const bool angular = value.resources.front().coordinate_kind == CoordinateKind::kAngular;
-  value.component_role_id = ComponentRoleId("robot_" + suffix);
-  value.target_role_id = TargetRoleId(value.target_role_id.value() + "_" + suffix);
   value.controllable_component_id = ControllableComponentId("robot." + suffix);
   for (auto& model : value.model_bindings) {
     model.model_instance_id = ModelInstanceId("robot.model." + suffix);
@@ -2823,6 +3001,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     }
   }
   for (auto& frame : value.frame_bindings) {
+    frame.reference.component_id = value.controllable_component_id;
     frame.model_instance_id = ModelInstanceId("robot.model." + suffix);
     frame.compiled_frame_name = "mf2_robot_" + suffix + "_" + frame.compiled_frame_name;
   }
@@ -2847,7 +3026,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   }
   if (value.motion_endpoint) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+        {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   }
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
@@ -2860,11 +3039,13 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     const RuntimeParticipantBinding& source) {
   auto value = second_same_type_occurrence(source).value();
   value.controllable_component_id = source.value().controllable_component_id;
-  value.target_role_id = TargetRoleId("arm.overlap");
+  for (auto& frame : value.frame_bindings)
+    frame.reference.component_id = value.controllable_component_id;
+  value.command_target_id = CommandTargetId("arm.overlap");
   value.resources.front().resource_id = source.value().resources.front().resource_id;
   if (value.motion_endpoint) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+        {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   }
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
@@ -2910,9 +3091,9 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
   return result;
 }
 
-/// Report each component's lifecycle to the Kernel as the coordinator would
-/// (CONTRACTS §1): commands are admitted exactly while a component reports
-/// `enabled`. Components left out are no longer in the cell.
+/// Report each component's lifecycle to the Kernel as the coordinator would:
+/// commands are admitted exactly while a component reports `enabled`.
+/// Components left out are no longer in the cell.
 void report_component_lifecycles(
     ResourceAddressedExecutionKernel& kernel,
     const std::vector<std::pair<ControllableComponentId, ComponentLifecycle>>& lifecycles) {
@@ -3003,10 +3184,10 @@ void enable_component_commands(ResourceAddressedExecutionKernel& kernel,
       RetainedBundleId(test_digest('6')),
       std::nullopt,
       {OperationParticipantIntentDTO{
-          ComponentRoleId("robot"), TargetRoleId("arm"),
+          {ControllableComponentId("robot.1"), CommandTargetId("arm")},
           CapabilityId("execution.trajectory.execute"), std::nullopt,
           MotionParticipantIntentDTO{MoveId("move.1"),
-                                     FrameRoleId("base"),
+                                     {ControllableComponentId("robot.1"), FrameRoleId("base")},
                                      CurrentTcpDTO{},
                                      TolerancesDTO{0.01, 0.001, 0.01},
                                      SpeedProfileDTO{},
@@ -3028,13 +3209,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.resident-projection"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -3055,6 +3237,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   return operation;
 }
 
+void retarget(OperationParticipantIntentDTO& participant, const ControllableComponentId& component,
+              const CommandTargetId& target) {
+  participant.target = {component, target};
+  if (auto* motion = std::get_if<MotionParticipantIntentDTO>(&participant.payload)) {
+    motion->base_frame.component_id = component;
+  }
+}
+
 [[nodiscard]] OperationIntentDTO coordinated_motion_operation(
     std::string request_id, const std::size_t participant_count = 2U) {
   auto operation = motion_operation(std::move(request_id));
@@ -3063,8 +3253,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   for (std::size_t index = 1U; index < participant_count; ++index) {
     auto participant = operation.participants.front();
     const auto suffix = std::to_string(index + 1U);
-    participant.component_role_id = ComponentRoleId("robot_" + suffix);
-    participant.target_role_id = TargetRoleId("arm_" + suffix);
+    participant.target.component_id = ControllableComponentId("robot." + suffix);
+    std::get<MotionParticipantIntentDTO>(participant.payload).base_frame.component_id = participant.target.component_id;
     std::get<MotionParticipantIntentDTO>(participant.payload).move_id = MoveId("move." + suffix);
     operation.participants.push_back(std::move(participant));
   }
@@ -3077,7 +3267,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   auto operation = motion_operation(std::move(request_id));
   operation.participants.front() = OperationParticipantIntentDTO{
-      ComponentRoleId("robot"), TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
+      {ControllableComponentId("robot.1"), CommandTargetId("gripper.target")}, CapabilityId("tool.gripper.command"),
       std::nullopt,
       CapabilityCommandIntentDTO{
           schema.command_schema_id,
@@ -3096,8 +3286,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   for (std::size_t index = 1U; index < participant_count; ++index) {
     auto participant = operation.participants.front();
     const auto suffix = std::to_string(index + 1U);
-    participant.component_role_id = ComponentRoleId("robot_" + suffix);
-    participant.target_role_id = TargetRoleId("gripper_" + suffix);
+    participant.target.component_id = ControllableComponentId("robot." + suffix);
 
     operation.participants.push_back(std::move(participant));
   }
@@ -3108,8 +3297,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto operation = motion_operation(std::move(request_id));
   operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
   auto command = command_operation().participants.front();
-  command.component_role_id = ComponentRoleId("robot_2");
-  command.target_role_id = TargetRoleId("gripper_2");
+  command.target.component_id = ControllableComponentId("robot.2");
   operation.participants.push_back(std::move(command));
   return operation;
 }
@@ -3118,7 +3306,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  return make_binding("arm", "arm", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  return make_binding("arm", "tool.gripper.command", CoordinateKind::kLinear, schema);
 }
 
 // Surviving prepare-all/Stop/recovery fixtures: one motion and ordinary commands.
@@ -3169,18 +3357,6 @@ TEST(ResourceAddressedExecutionKernelTest,
                        std::nullopt};
 }
 
-[[nodiscard]] RuntimeScaleRequestDTO runtime_scale_request(std::string request_id,
-                                                           const OperationAcceptedDTO& accepted,
-                                                           std::uint64_t expected_revision,
-                                                           std::uint64_t expected_generation,
-                                                           double scale) {
-  return RuntimeScaleRequestDTO{
-      PublicRequestContextDTO{RequestId(std::move(request_id)), RequestOwnerEpoch("kernel.epoch.1"),
-                              "test", std::nullopt},
-      accepted.operation_id, OperationRevision(expected_revision),
-      RuntimeScaleGeneration(expected_generation), scale};
-}
-
 [[nodiscard]] ProgramRunExecutionCaptureDTO program_execution_capture() {
   const auto intent = motion_operation();
   auto binding = std::make_shared<ProgramBindingDTO>(ProgramBindingDTO{
@@ -3191,26 +3367,19 @@ TEST(ResourceAddressedExecutionKernelTest,
       intent.expected_retained_bundle_id,
       intent.expected_graph_revision,
       {"test.catalog", "1", ContentDigest(test_digest('0')), ContentDigest(test_digest('0'))},
-      {},
-      {},
-      {ContentDigest(test_digest('0')), ContentDigest(test_digest('0')), {}, {}}});
+      {}, {}, {}, {}, {},
+      {ContentDigest(test_digest('0')), {}, {}}});
   const auto physical =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular).value();
-  ProgramTargetRoleBindingDTO target{physical.target_role_id,
-                                     physical.component_role_id,
-                                     physical.controllable_component_id,
-                                     physical.command_target_id,
-                                     {},
-                                     {{ResourceRoleId("arm_joints"),
-                                       {physical.resources.front().resource_id},
-                                       {physical.resources.front().compiled_resource_name}}},
-                                     {},
-                                     {}};
-  binding->target_role_bindings.push_back(std::move(target));
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular).value();
+  ProgramTargetBindingDTO target{
+      {physical.controllable_component_id, physical.command_target_id}, {}, {}, {},
+      {{ResourceRoleId("arm_joints"), {physical.resources.front().resource_id},
+        {physical.resources.front().compiled_resource_name}}}, {}};
+  binding->target_bindings.push_back(std::move(target));
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("move"),
                    "kernel.operation",
-                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+                   {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
                   {ProgramNodeInstanceId("timer"), "orchestration.clock", {}}};
   table->named_selections = {{"arm", {0U}}, {"supervision", {1U}}};
   return {intent.request_context.request_owner_epoch,
@@ -3243,6 +3412,293 @@ TEST(ResourceAddressedExecutionKernelTest,
       0U};
   return kernel.UpdateCellAdmissionReadiness(ready);
 }
+
+TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertaintyIsJournaledForExactActiveExecution) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(motion_operation("request.late-cancel"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls.load() == 1; }));
+  const auto mapped = kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id);
+  ASSERT_TRUE(mapped.ok()) << mapped.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants[0].terminal_fact.has_value());
+  EXPECT_EQ(state.value().participants[0].terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_FALSE(journal.states.empty());
+    EXPECT_EQ(journal.states.back().state, OperationStateKind::kInterventionRequired);
+    ASSERT_TRUE(journal.states.back().participants[0].terminal_fact.has_value());
+    EXPECT_EQ(journal.states.back().participants[0].terminal_fact->effect,
+              ParticipantEffectKnowledge::kEffectUncertain);
+  }
+  EXPECT_TRUE(kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id).ok());
+  {
+    std::lock_guard lock(journal.mutex);
+    journal.fail_next_kind = "state:subordinate_state_observed";
+  }
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id).ok());
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id + 1U).ok());
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(nullptr, engine.next_execution_id).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest, LateGripperCancelUsesExactCommandAndDurableProjection) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(binding, engine)}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(command_operation("request.gripper-late-cancel"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto preparation = engine.next_execution_id;
+  const auto command = engine.next_command_result.command_id;
+  const auto generation = engine.next_command_result.generation;
+  const CommandTargetId target("gripper.target");
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation + 1U, command, generation, target).ok());
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation, command + 1U, generation, target).ok());
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation, command, generation + 1U, target).ok());
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation, command, generation,
+                                                   CommandTargetId("other.target")).ok());
+  {
+    std::lock_guard lock(journal.mutex);
+    journal.fail_next_kind = "state:subordinate_state_observed";
+  }
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation, command, generation, target).ok());
+  const auto projected = kernel.record_late_cancel_uncertain(&engine, preparation, command, generation, target);
+  ASSERT_TRUE(projected.ok()) << projected.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  EXPECT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(state.value().participants[0].terminal_fact);
+  EXPECT_EQ(state.value().participants[0].terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+  EXPECT_TRUE(kernel.record_late_cancel_uncertain(&engine, preparation, command, generation, target).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GripperLateCancelFailureBeforeReceiptIsDrained) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.expected_owner_notification_gripper = "robot.1";
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto slot = std::make_shared<GripperLateCancelSlot>();
+  unsigned int notifications = 0;
+  slot->state_changed = [&] {
+    std::lock_guard lock(slot->mutex);
+    ++notifications;
+  };
+  slot->state = GripperLateCancelState::kFailed;
+  slot->preparation_id = engine.next_execution_id;
+  slot->command_id = engine.next_command_result.command_id;
+  slot->generation = engine.next_command_result.generation;
+  slot->target = CommandTargetId("gripper.target");
+  slot->gripper_id = "robot.1";
+  engine.next_command_result.late_cancel_slot = slot;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(binding, engine)}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(command_operation("request.gripper-failure-before-receipt"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  {
+    std::lock_guard lock(slot->mutex);
+    EXPECT_TRUE(slot->receipt_installed);
+    EXPECT_EQ(slot->state, GripperLateCancelState::kHandedOff);
+  }
+  EXPECT_EQ(notifications, 1U);
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants[0].terminal_fact);
+  EXPECT_EQ(state.value().participants[0].terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GripperReceiptDoesNotDuplicateClaimedLateCancelHandoff) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.expected_owner_notification_gripper = "robot.1";
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto slot = std::make_shared<GripperLateCancelSlot>();
+  slot->state = GripperLateCancelState::kFailed;
+  slot->preparation_id = engine.next_execution_id;
+  slot->command_id = engine.next_command_result.command_id;
+  slot->generation = engine.next_command_result.generation;
+  slot->target = CommandTargetId("gripper.target");
+  slot->gripper_id = "robot.1";
+  engine.next_command_result.late_cancel_slot = slot;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(binding, engine)}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  std::promise<void> entered_promise;
+  auto entered = entered_promise.get_future();
+  std::promise<void> release_promise;
+  auto release = release_promise.get_future().share();
+  auto worker = std::async(std::launch::async, [&] {
+    const bool claimed = !slot->handoff_running.exchange(true);
+    entered_promise.set_value();
+    release.wait();
+    if (!claimed) return Result<void>::Err({"test_claim_failed", "worker did not claim", {}});
+    const auto result = kernel.record_late_cancel_uncertain(&engine, slot->preparation_id,
+        slot->command_id, slot->generation, *slot->target);
+    slot->handoff_running.store(false);
+    return result;
+  });
+  entered.wait();
+  const auto accepted = kernel.execute(command_operation("request.gripper-claimed-handoff"));
+  EXPECT_TRUE(accepted.ok());
+  {
+    std::lock_guard lock(slot->mutex);
+    EXPECT_TRUE(slot->receipt_installed);
+    EXPECT_EQ(slot->state, GripperLateCancelState::kFailed);
+  }
+  std::size_t writes_before = 0;
+  {
+    std::lock_guard lock(journal.mutex);
+    writes_before = std::count(journal.calls.begin(), journal.calls.end(),
+                               "state:subordinate_state_observed");
+  }
+  // The already-claimed worker remains the sole writer after receipt install.
+  release_promise.set_value();
+  const auto written = worker.get();
+  EXPECT_TRUE(written.ok());
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(),
+                         "state:subordinate_state_observed"), writes_before + 1U);
+  }
+  ASSERT_TRUE(accepted.ok());
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants[0].terminal_fact);
+  EXPECT_EQ(state.value().participants[0].terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GripperLateCancelFailureRetainedWhenExactSessionMissing) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.exact_owner_notification_accept = false;
+  FakeOperationJournal journal;
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto slot = std::make_shared<GripperLateCancelSlot>();
+  unsigned int notifications = 0;
+  slot->state_changed = [&] {
+    std::lock_guard lock(slot->mutex);
+    ++notifications;
+  };
+  slot->state = GripperLateCancelState::kFailed;
+  slot->preparation_id = engine.next_execution_id;
+  slot->command_id = engine.next_command_result.command_id;
+  slot->generation = engine.next_command_result.generation;
+  slot->target = CommandTargetId("gripper.target");
+  slot->gripper_id = "robot.1";
+  engine.next_command_result.late_cancel_slot = slot;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(binding, engine)}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(command_operation("request.gripper-session-missing"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  {
+    std::lock_guard lock(slot->mutex);
+    EXPECT_TRUE(slot->receipt_installed);
+    EXPECT_EQ(slot->state, GripperLateCancelState::kFailed);
+  }
+  EXPECT_EQ(notifications, 0U);
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants[0].terminal_fact);
+  EXPECT_EQ(state.value().participants[0].terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+}
+
+
+TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertaintyRefusesFinalizedOperation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(motion_operation("request.late-cancel-terminal"));
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls.load() == 1; }));
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kCompleted;
+  }));
+  const auto refused = kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "late_cancel_operation_terminal");
+  const auto state = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok());
+  EXPECT_EQ(state.value().state, OperationStateKind::kCompleted);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertaintyDoesNotAcknowledgeJournalFailure) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(ready_cell_admission(kernel).ok());
+  const auto accepted = kernel.execute(motion_operation("request.late-cancel-journal-failure"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls.load() == 1; }));
+  {
+    std::lock_guard lock(journal.mutex);
+    journal.fail_next_kind = "state:subordinate_state_observed";
+  }
+  const auto result = kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id);
+  EXPECT_FALSE(result.ok());
+  ASSERT_TRUE(kernel.get_operation_journal_write_fault());
+}
+
 
 [[nodiscard]] Result<CellAdmissionClaimDTO> claim_program_execution(
     ResourceAddressedExecutionKernel& kernel) {
@@ -3303,11 +3759,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
 
@@ -3346,11 +3803,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
   config.operation_admission_gate = &gate;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
@@ -3391,14 +3849,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
+  FakeOperationJournal journal;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, default_journal, std::move(config));
+      clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -3406,14 +3866,20 @@ TEST(ResourceAddressedExecutionKernelTest,
       table->nodes.begin() + 1,
       {ProgramNodeInstanceId("move.second"),
        "kernel.operation",
-       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}});
   table->named_selections = {{"arm", {0U}}, {"arm.second", {1U}}, {"supervision", {2U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
   start_program_motion(kernel, "arm");
 
+  // Hold the admission inside its durable acceptance: the Program-run
+  // admission is pending until Execute ends admission, which (point 5) is now
+  // before the motion's subordinate Prepare, so the hold is the acceptance
+  // write, still within admission.
   HeldSettlementCall dispatch;
-  engine.execute_return_hook = dispatch.Blocker();
+  journal.SetConcurrentRecordHook([hold = dispatch.Blocker()](std::string_view kind) {
+    if (kind == "operation_accepted") hold();
+  });
   auto execution = std::async(std::launch::async, [&] {
     return kernel.execute(scoped_motion_operation("pending.program.motion"));
   });
@@ -3452,10 +3918,10 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 [[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_control_selector(
-    std::string component_role = "robot", std::string target_role = "arm") {
+    std::string component_id = "robot.1", std::string target_id = "arm") {
   return RuntimeScaleControlSelectorDTO{ProgramBindingId(test_digest('1')),
-                                        ComponentRoleId(std::move(component_role)),
-                                        TargetRoleId(std::move(target_role))};
+                                        ControllableComponentId(std::move(component_id)),
+                                        CommandTargetId(std::move(target_id))};
 }
 
 [[nodiscard]] RuntimeScaleControlRequestDTO runtime_scale_control_request(
@@ -3468,10 +3934,10 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 [[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_group_selector() {
   return {ProgramBindingId(test_digest('1')),
-          ComponentRoleId(""),
-          TargetRoleId(""),
-          {{ComponentRoleId("robot"), TargetRoleId("arm")},
-           {ComponentRoleId("robot_2"), TargetRoleId("arm_2")}}};
+          ControllableComponentId(""),
+          CommandTargetId(""),
+          {{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+           {ControllableComponentId("robot.2"), CommandTargetId("arm")}}};
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -3483,18 +3949,19 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeOperationJournal journal;
     FakeParticipantEngine first_engine, second_engine, third_engine;
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine),
          registration(coordinated_occurrence(first, "2"), second_engine),
          registration(coordinated_occurrence(first, "3"), third_engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(kernel
                     .set_runtime_scale_control(
                         runtime_scale_control_request("scale.independent.first", 0U, 0.2))
                     .ok());
     auto second_request = runtime_scale_control_request("scale.independent.second", 0U, 0.8);
-    second_request.selector = runtime_scale_control_selector("robot_2", "arm_2");
+    second_request.selector = runtime_scale_control_selector("robot.2", "arm");
     ASSERT_TRUE(kernel.set_runtime_scale_control(second_request).ok());
     auto group_request = runtime_scale_control_request("scale.synchronized", 0U, 0.35);
     group_request.selector = runtime_scale_group_selector();
@@ -3518,10 +3985,10 @@ TEST(ResourceAddressedExecutionKernelTest,
               RuntimeScaleControlGeneration(configured ? 1U : 0U));
     auto overlapping = runtime_scale_control_request("scale.overlapping", 0U, 0.65);
     overlapping.selector = {ProgramBindingId(test_digest('1')),
-                            ComponentRoleId(""),
-                            TargetRoleId(""),
-                            {{ComponentRoleId("robot_2"), TargetRoleId("arm_2")},
-                             {ComponentRoleId("robot_3"), TargetRoleId("arm_3")}}};
+                            ControllableComponentId(""),
+                            CommandTargetId(""),
+                            {{ControllableComponentId("robot.2"), CommandTargetId("arm")},
+                             {ControllableComponentId("robot.3"), CommandTargetId("arm")}}};
     ASSERT_TRUE(kernel.set_runtime_scale_control(overlapping).ok());
     EXPECT_EQ(first_engine.runtime_scale_calls, 0);
     EXPECT_EQ(second_engine.runtime_scale_calls, 0);
@@ -3541,8 +4008,9 @@ TEST(ResourceAddressedExecutionKernelTest,
 
     ASSERT_TRUE(kernel.execute(motion_operation("motion.independent.1")).ok());
     auto peer = motion_operation("motion.independent.2");
-    peer.participants.front().component_role_id = ComponentRoleId("robot_2");
-    peer.participants.front().target_role_id = TargetRoleId("arm_2");
+    peer.participants.front().target.component_id = ControllableComponentId("robot.2");
+    peer.participants.front().target.command_target_id = CommandTargetId("arm");
+    std::get<MotionParticipantIntentDTO>(peer.participants.front().payload).base_frame.component_id = peer.participants.front().target.component_id;
     ASSERT_TRUE(kernel.execute(peer).ok());
     ASSERT_TRUE(first_engine.last_prepared_request);
     ASSERT_TRUE(second_engine.last_prepared_request);
@@ -3575,18 +4043,19 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleGroupRejectsMalformedOrCl
   FakeOperationJournal journal;
   FakeParticipantEngine first_engine, second_engine;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto first_registration = registration(first, first_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {first_registration, registration(coordinated_occurrence(first, "2"), second_engine)}, clock,
       scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   for (int malformed = 0; malformed < 4; ++malformed) {
     auto request = runtime_scale_control_request("scale.bad." + std::to_string(malformed), 0U, 0.5);
     request.selector = runtime_scale_group_selector();
-    if (malformed == 0) request.selector.component_role_id = ComponentRoleId("robot");
+    if (malformed == 0) request.selector.component_id = ControllableComponentId("robot.1");
     if (malformed == 1) request.selector.group_targets.pop_back();
     if (malformed == 2) request.selector.group_targets[1] = request.selector.group_targets[0];
-    if (malformed == 3) request.selector.group_targets[1].target_role_id = TargetRoleId("missing");
+    if (malformed == 3) request.selector.group_targets[1].command_target_id = CommandTargetId("missing");
     const auto status = kernel.get_runtime_scale_control(request.selector);
     ASSERT_TRUE(status.ok());
     EXPECT_FALSE(status.value().supported);
@@ -3606,6 +4075,73 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleGroupRejectsMalformedOrCl
   EXPECT_EQ(second_engine.runtime_scale_calls, 0);
 }
 
+// OD-62: runtime scale is supported only while the lane can scale and its
+// controller listens for scale input; a lane that cannot scale is an
+// unqualified route, a silent controller refuses scale and motion admission.
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleFollowsTheLaneAndTheControllerListening) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  const auto arm = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(arm, engine);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registered}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(route_configuration_for(registered),
+                                                          {registered})
+                  .ok());
+  enable_component_commands(kernel, registered);
+
+  // No subscriber: unsupported with the typed reason, and refused.
+  engine.scale_availability = RuntimeScaleMechanismAvailability::kControllerNotListening;
+  const auto silent = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(silent.ok());
+  EXPECT_FALSE(silent.value().supported);
+  ASSERT_TRUE(silent.value().reason.has_value());
+  EXPECT_EQ(silent.value().reason->details.at("reason"), "runtime_scale_controller_not_listening");
+  const auto refused =
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.silent", 0U, 0.5));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "runtime_scale_controller_not_listening");
+  // A motion on a qualified route fails closed while the controller is silent.
+  const auto blocked = kernel.execute(motion_operation("request.motion.silent"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "runtime_scale_controller_not_listening");
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  // A subscriber appears: supported, and the setting is accepted.
+  engine.scale_availability = RuntimeScaleMechanismAvailability::kAvailable;
+  const auto listening = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(listening.ok());
+  EXPECT_TRUE(listening.value().supported);
+  const auto accepted =
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.listening", 0U, 0.5));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  // The subscriber goes: unsupported again.
+  engine.scale_availability = RuntimeScaleMechanismAvailability::kControllerNotListening;
+  const auto gone = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(gone.ok());
+  EXPECT_FALSE(gone.value().supported);
+  EXPECT_EQ(gone.value().reason->details.at("reason"), "runtime_scale_controller_not_listening");
+
+  // A lane that cannot scale is an unqualified route: no runtime-scale
+  // control, and its motion runs without a runtime-scale contract.
+  engine.scale_availability = RuntimeScaleMechanismAvailability::kLaneUnsupported;
+  const auto incapable = kernel.get_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(incapable.ok());
+  EXPECT_FALSE(incapable.value().supported);
+  EXPECT_EQ(incapable.value().reason->details.at("reason"), "runtime_scale_control_unsupported");
+  const auto admitted = kernel.execute(motion_operation("request.motion.incapable"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  const auto sent = engine.LastExecuteSnapshot();
+  ASSERT_TRUE(sent.has_value());
+  EXPECT_FALSE(sent->initial_runtime_scale.has_value());
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      IndependentProgramGroupProjectsAndAppliesOneSettingToBothOperations) {
   FakeClock clock;
@@ -3613,31 +4149,29 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeParticipantEngine first_engine, second_engine;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 32U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(coordinated_occurrence(first, "2"), second_engine)},
       clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  auto second_target = binding->target_role_bindings.front();
-  second_target.component_role_id = ComponentRoleId("robot_2");
-  second_target.target_role_id = TargetRoleId("arm_2");
-  second_target.controllable_component_id = ControllableComponentId("robot_2");
-  second_target.command_target_id = CommandTargetId("arm");
-  binding->target_role_bindings.push_back(std::move(second_target));
+  auto second_target = binding->target_bindings.front();
+  second_target.target = {ControllableComponentId("robot.2"), CommandTargetId("arm")};
+  binding->target_bindings.push_back(std::move(second_target));
   capture.binding = std::move(binding);
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("a"),
                    "kernel.operation",
-                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+                   {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
                   {ProgramNodeInstanceId("b"),
                    "kernel.operation",
-                   {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}};
+                   {{{ControllableComponentId("robot.2"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}}};
   table->named_selections = {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
@@ -3648,10 +4182,11 @@ TEST(ResourceAddressedExecutionKernelTest,
       ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("a"), "attempt.a"};
   ASSERT_TRUE(kernel.execute(first_intent).ok());
   auto second_intent = motion_operation("group.scale.second");
-  second_intent.participants.front().component_role_id = ComponentRoleId("robot_2");
-  second_intent.participants.front().target_role_id = TargetRoleId("arm_2");
+  second_intent.participants.front().target.component_id = ControllableComponentId("robot.2");
+  second_intent.participants.front().target.command_target_id = CommandTargetId("arm");
   second_intent.participants.front().execution_scope =
       ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("b"), "attempt.b"};
+  std::get<MotionParticipantIntentDTO>(second_intent.participants.front().payload).base_frame.component_id = second_intent.participants.front().target.component_id;
   ASSERT_TRUE(kernel.execute(second_intent).ok());
   EXPECT_EQ(first_engine.dispatch_prepared_motion_calls, 1);
   EXPECT_EQ(second_engine.dispatch_prepared_motion_calls, 1);
@@ -3659,8 +4194,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(second_engine.last_prepared_request);
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-  first_engine.runtime_scale.active = true;
-  second_engine.runtime_scale.active = true;
+  first_engine.UpdateRuntimeScale([](auto& scale) { scale.active = true; });
+  second_engine.UpdateRuntimeScale([](auto& scale) { scale.active = true; });
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
 
   const auto projected = kernel.present_runtime_scale_control(runtime_scale_control_selector());
@@ -3675,10 +4210,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(first_engine.runtime_scale_calls, first_calls + 1);
   EXPECT_EQ(second_engine.runtime_scale_calls, second_calls + 1);
-  ASSERT_TRUE(first_engine.last_runtime_scale_command);
-  ASSERT_TRUE(second_engine.last_runtime_scale_command);
-  EXPECT_DOUBLE_EQ(first_engine.last_runtime_scale_command->requested_scale, 0.4);
-  EXPECT_DOUBLE_EQ(second_engine.last_runtime_scale_command->requested_scale, 0.4);
+  const auto first_scale_command = first_engine.RuntimeScaleCommandSnapshot();
+  const auto second_scale_command = second_engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(first_scale_command);
+  ASSERT_TRUE(second_scale_command);
+  EXPECT_DOUBLE_EQ(first_scale_command->requested_scale, 0.4);
+  EXPECT_DOUBLE_EQ(second_scale_command->requested_scale, 0.4);
   EXPECT_DOUBLE_EQ(kernel.get_runtime_scale_control(request.selector).value().requested_scale, 0.4);
 }
 
@@ -3689,14 +4226,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeParticipantEngine first_engine, second_engine;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(first, "2");
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 32U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
 
   auto capture = program_execution_capture();
@@ -3704,28 +4242,25 @@ TEST(ResourceAddressedExecutionKernelTest,
   capture.program_binding_id = authored_binding;
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
   binding->program_binding_id = authored_binding;
-  auto second_target = binding->target_role_bindings.front();
-  second_target.component_role_id = ComponentRoleId("robot_2");
-  second_target.target_role_id = TargetRoleId("arm_2");
-  second_target.controllable_component_id = second.value().controllable_component_id;
-  second_target.command_target_id = second.value().command_target_id;
-  binding->target_role_bindings.push_back(std::move(second_target));
+  auto second_target = binding->target_bindings.front();
+  second_target.target = {second.value().controllable_component_id, second.value().command_target_id};
+  binding->target_bindings.push_back(std::move(second_target));
   capture.binding = std::move(binding);
   capture.table = std::make_shared<ProgramExecutionTableDTO>(ProgramExecutionTableDTO{
       {{ProgramNodeInstanceId("a"),
         "kernel.operation",
-        {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+        {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
        {ProgramNodeInstanceId("b"),
         "kernel.operation",
-        {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}},
+        {{{ControllableComponentId("robot.2"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}}},
       {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}}});
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
 
   RuntimeScaleControlSelectorDTO selector{authored_binding,
-                                          ComponentRoleId(""),
-                                          TargetRoleId(""),
-                                          {{ComponentRoleId("robot"), TargetRoleId("arm")},
-                                           {ComponentRoleId("robot_2"), TargetRoleId("arm_2")}}};
+                                          ControllableComponentId(""),
+                                          CommandTargetId(""),
+                                          {{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                                           {ControllableComponentId("robot.2"), CommandTargetId("arm")}}};
   const auto status = kernel.get_runtime_scale_control(selector);
   ASSERT_TRUE(status.ok()) << status.error().message;
   EXPECT_TRUE(status.value().supported);
@@ -3741,13 +4276,14 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAdmissionExcludesHeldProgramAnd
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     auto direct = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     direct.intrinsic_direct_control = true;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(kernel).ok());
     if (program_claim) {
       ASSERT_TRUE(claim_program_execution(kernel).ok());
@@ -3801,12 +4337,13 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAdmissionJournalFailureIsLogged
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 4U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   journal.fail_next_kind = "operation_accepted";
   ASSERT_FALSE(kernel.execute(motion_operation("rejected.before.effect")).ok());
@@ -3828,11 +4365,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular),
                     engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.before.internal-fault"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
 
@@ -3864,18 +4402,19 @@ TEST(ResourceAddressedExecutionKernelTest, OutputWriteAdmissionFollowsTheCellLat
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto registered = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   const auto component = registered.binding.value().controllable_component_id;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registered}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const IoSignalId output{ControllableComponentId("plc"), "DO0"};
-  // CONTRACTS §7: allowed when idle (no rule catalog, no latch).
+  // Allowed when idle (no rule catalog, no latch).
   EXPECT_TRUE(kernel.admit_output_write(output, true).ok());
   report_component_lifecycles(kernel, {{component, ComponentLifecycle::kEnabled}});
   const auto operation = kernel.execute(motion_operation("request.manual.output.latch"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  // A component fault while something executes latches the cell (§5).
+  // A component fault while something executes latches the cell.
   report_component_lifecycles(kernel, {{component, ComponentLifecycle::kFault}});
   ASSERT_TRUE(kernel.get_cell_latch().latched);
   const auto refused = kernel.admit_output_write(output, false);
@@ -3885,7 +4424,7 @@ TEST(ResourceAddressedExecutionKernelTest, OutputWriteAdmissionFollowsTheCellLat
 }
 
 TEST(ResourceAddressedExecutionKernelTest, ManualOutputWriteWaitsOnlyWhileMotionExecutes) {
-  // CONTRACTS §7: a manual write is refused only while motion executes; a
+  // A manual write is refused only while motion executes; a
   // Program write goes through the same admission while it does.
   FakeClock clock;
   ManualScheduler scheduler;
@@ -3893,11 +4432,12 @@ TEST(ResourceAddressedExecutionKernelTest, ManualOutputWriteWaitsOnlyWhileMotion
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const IoSignalId output{ControllableComponentId("plc"), "DO0"};
   EXPECT_TRUE(kernel.admit_output_write(output, true).ok());
   // A running Program with no motion executing: allowed.
@@ -3934,11 +4474,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular),
                     engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.degraded.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
 
@@ -4016,12 +4557,13 @@ TEST(ResourceAddressedExecutionKernelTest, ManualNoEffectAndTerminalReleaseRemai
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 4U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   for (int attempt = 0; attempt < 8; ++attempt) {
     SCOPED_TRACE(attempt);
@@ -4062,15 +4604,16 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     auto target = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute",
+        make_binding("arm", "execution.trajectory.execute",
                      CoordinateKind::kAngular),
         engine);
     target.intrinsic_direct_control = manual;
     ResourceAddressedExecutionKernelConfig config{
         RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {target}, clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
 
     if (manual) {
       ASSERT_TRUE(ready_cell_admission(kernel).ok());
@@ -4100,12 +4643,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto operation = kernel.execute(motion_operation());
   ASSERT_TRUE(operation.ok());
@@ -4139,12 +4683,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto operation = kernel.execute(motion_operation("manual.retired"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -4223,15 +4768,16 @@ TEST(ResourceAddressedExecutionKernelTest, LongServiceStopSurvivesRealJournalAnd
     ManualScheduler scheduler;
     clock.set(timestamp);
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     std::optional<StopAcceptedDTO> accepted_stop;
     std::optional<StopCertificateDTO> terminal;
     {
       FakeParticipantEngine engine;
       SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-      ResourceAddressedExecutionKernel kernel(
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
           {registration(binding, engine)}, clock, scheduler, journal,
           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      auto& kernel = *kernel_heap_test_owner;
       const auto operation = kernel.execute(motion_operation());
       ASSERT_TRUE(operation.ok()) << operation.error().message;
       EXPECT_EQ(operation.value().accepted_at_ns, timestamp);
@@ -4260,9 +4806,10 @@ TEST(ResourceAddressedExecutionKernelTest, LongServiceStopSurvivesRealJournalAnd
     // journal recovery DTO. No prior motion or Stop is dispatched again.
     FakeParticipantEngine replacement_engine;
     SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-    ResourceAddressedExecutionKernel replacement(
+    auto replacement_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, replacement_engine)}, clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.2"), CellId("cell.test"), 8U});
+    auto& replacement = *replacement_heap_test_owner;
     const auto recovered = replacement.get_stop_certificate(terminal->stop_certificate_id);
     ASSERT_TRUE(recovered.ok()) << recovered.error().message;
     EXPECT_EQ(recovered.value(), *terminal);
@@ -4284,18 +4831,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   const auto a_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto b_binding = second_same_type_occurrence(a_binding);
   FakeParticipantEngine a_engine, b_engine;
   SqliteOperationJournal journal(database, CellId("cell.test"), 32U);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(a_binding, a_engine), registration(b_binding, b_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto a_operation = kernel.execute(motion_operation("request.lean-stop.a"));
   ASSERT_TRUE(a_operation.ok()) << a_operation.error().message;
   auto b_intent = motion_operation("request.lean-stop.b");
   b_intent.program_binding_id = b_binding.value().program_binding_id;
+  retarget(b_intent.participants.front(), b_binding.value().controllable_component_id,
+           b_binding.value().command_target_id);
   const auto b_operation = kernel.execute(b_intent);
   ASSERT_TRUE(b_operation.ok()) << b_operation.error().message;
   a_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -4428,7 +4978,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeClock clock;
     ManualScheduler scheduler;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
@@ -4437,7 +4987,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       auto direct = registration(binding, engine);
       direct.intrinsic_direct_control = true;
       SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-      ResourceAddressedExecutionKernel owner({direct}, clock, scheduler, journal, config);
+      auto owner_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+      auto& owner = *owner_heap_test_owner;
       ASSERT_TRUE(ready_cell_admission(owner).ok());
       ASSERT_TRUE(owner.execute(motion_operation()).ok());
       if (retired) {
@@ -4455,7 +5006,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     auto direct = registration(binding, engine);
     direct.intrinsic_direct_control = true;
     SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-    ResourceAddressedExecutionKernel successor({direct}, clock, scheduler, journal, config);
+    auto successor_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+    auto& successor = *successor_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(successor).ok());
     ASSERT_TRUE(successor.reconcile_manual_operation_admission().ok());
     EXPECT_TRUE(successor.GetAuthoringAdmission().authoring_allowed);
@@ -4472,7 +5024,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 }
 
-// R3: an unclean restart with a held manual claim and an offline robot never
+// An unclean restart with a held manual claim and an offline robot never
 // blocks New/Load or Apply; motion alone waits until the cell settles.
 TEST(ResourceAddressedExecutionKernelTest, PredecessorManualClaimReconcilesWhileRobotOffline) {
   TemporaryOperationJournal temporary;
@@ -4480,7 +5032,7 @@ TEST(ResourceAddressedExecutionKernelTest, PredecessorManualClaimReconcilesWhile
   FakeClock clock;
   ManualScheduler scheduler;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
@@ -4489,7 +5041,8 @@ TEST(ResourceAddressedExecutionKernelTest, PredecessorManualClaimReconcilesWhile
     auto direct = registration(binding, engine);
     direct.intrinsic_direct_control = true;
     SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-    ResourceAddressedExecutionKernel owner({direct}, clock, scheduler, journal, config);
+    auto owner_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+    auto& owner = *owner_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(owner).ok());
     ASSERT_TRUE(owner.execute(motion_operation()).ok());
     ASSERT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);  // manual claim held
@@ -4499,7 +5052,8 @@ TEST(ResourceAddressedExecutionKernelTest, PredecessorManualClaimReconcilesWhile
   auto direct = registration(binding, engine);
   direct.intrinsic_direct_control = true;
   SqliteOperationJournal journal(database, CellId("cell.test"), 8U);
-  ResourceAddressedExecutionKernel successor({direct}, clock, scheduler, journal, config);
+  auto successor_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& successor = *successor_heap_test_owner;
   ASSERT_EQ(successor.resource_snapshot().front().state,
             ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
   const auto arm = binding.value().controllable_component_id.value();
@@ -4548,7 +5102,7 @@ TEST(ResourceAddressedExecutionKernelTest, BootstrapInventoryCannotCertifyUnknow
       ManualScheduler scheduler;
       clock.set(100);
       const auto binding =
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
       FakeParticipantEngine engine;
       if (predecessor == 2) {
         engine.prepare_failure = ErrorDTO{"execution_rejected", "injected preparation failure", {}};
@@ -4560,8 +5114,9 @@ TEST(ResourceAddressedExecutionKernelTest, BootstrapInventoryCannotCertifyUnknow
         ResourceAddressedExecutionKernelConfig original_config{RequestOwnerEpoch("kernel.epoch.1"),
                                                                CellId("cell.test"), 8U};
         original_config.manager_liveness_required_set = EmptyManagerLivenessSet();
-        ResourceAddressedExecutionKernel owner({qualified}, clock, scheduler, journal,
+        auto owner_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({qualified}, clock, scheduler, journal,
                                                original_config);
+        auto& owner = *owner_heap_test_owner;
         if (predecessor == 1 || predecessor == 2) {
           const auto result = owner.execute(motion_operation());
           ASSERT_TRUE(result.ok());
@@ -4614,7 +5169,8 @@ TEST(ResourceAddressedExecutionKernelTest, BootstrapInventoryCannotCertifyUnknow
       std::sort(config.empty_runtime_resource_inventory.begin(),
                 config.empty_runtime_resource_inventory.end());
       SqliteOperationJournal journal(snapshot, CellId("cell.test"), 8U);
-      ResourceAddressedExecutionKernel replacement({}, clock, scheduler, journal, config);
+      auto replacement_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({}, clock, scheduler, journal, config);
+      auto& replacement = *replacement_heap_test_owner;
       const auto request = PublicRequestContextDTO{
           RequestId("request.bootstrap.stop"), config.request_owner_epoch, "test", std::nullopt};
       const auto stopped = [&] {
@@ -4666,11 +5222,12 @@ TEST(ResourceAddressedExecutionKernelTest, LongServiceJournalFailureCannotUndoNa
                                      throw std::runtime_error("injected journal clock failure");
                                    return std::string("2026-09-06T12:00:00.000000001Z");
                                  });
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation());
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   fail.store(true);
@@ -4714,16 +5271,19 @@ TEST(ResourceAddressedExecutionKernelTest,
         ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)), "IK has no solution",
                  {{"reason", "native_ik_no_solution"}}};
     const auto planning_binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto failed_binding = second_same_type_occurrence(planning_binding);
     SqliteOperationJournal journal(database, CellId("cell.test"), 32U);
-    ResourceAddressedExecutionKernel kernel({registration(planning_binding, planning_engine),
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(planning_binding, planning_engine),
                                              registration(failed_binding, failed_engine)},
                                             clock, scheduler, journal,
                                             {epoch, CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
 
     auto failed_intent = motion_operation("request.joined.ik-failed");
     failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+    retarget(failed_intent.participants.front(), failed_binding.value().controllable_component_id,
+             failed_binding.value().command_target_id);
     const auto failed = kernel.execute(failed_intent);
     ASSERT_TRUE(failed.ok()) << failed.error().message;
     const auto held = kernel.get_operation_state(failed.value().operation_id);
@@ -4818,11 +5378,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   SqliteOperationJournal journal(temporary.directory / "operation.sqlite3", CellId("cell.test"),
                                  8U);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation());
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   auto request = stop_request("request.foreign-epoch.stop", operation.value(), 1U);
@@ -4877,11 +5438,12 @@ TEST(ResourceAddressedExecutionKernelTest, StopDeadlineOverflowIsRejectedWithout
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   clock.set(std::numeric_limits<std::int64_t>::max() - 1);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const FullStopIntentDTO intent{
       PublicRequestContextDTO{RequestId("request.overflow.stop"),
                               RequestOwnerEpoch("kernel.epoch.1"), "test", std::nullopt},
@@ -4894,12 +5456,12 @@ TEST(ResourceAddressedExecutionKernelTest, StopDeadlineOverflowIsRejectedWithout
 
 TEST(ResourceAddressedExecutionKernelTest,
      IndependentlyQualifiedParticipantsKeepTheirOwnStopTimingWithoutASharedEnvelope) {
-  // Q51/D3: each robot is bounded by its own profile; differing Stop timing
+  // Each robot is bounded by its own profile; differing Stop timing
   // between participants is not refused and no cell-wide envelope exists.
   const auto first_binding =
-      make_binding("arm.a", "arm.a", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm.a", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding =
-      make_binding("arm.b", "arm.b", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm.b", "execution.trajectory.execute", CoordinateKind::kAngular);
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine, second_engine;
@@ -4921,7 +5483,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(ready.ok()) << ready.error().message;
   second.stop_readiness = ready.value();
   EXPECT_NO_THROW((ResourceAddressedExecutionKernel(
-      {first, second}, clock, scheduler, journal,
+      {first, second}, clock, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U})));
   EXPECT_EQ(first_engine.stop_calls.load(), 0);
   EXPECT_EQ(second_engine.stop_calls.load(), 0);
@@ -4929,16 +5491,16 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      EachRobotEscalatesAtItsOwnControlledDeadlineAndTheStopEndsWithTheLast) {
-  // Q51 (SX-264): two robots with different controlled-Stop profiles in one
+  // Two robots with different controlled-Stop profiles in one
   // Stop. Robot A (deceleration 1.0 s) has a 1.5 s deadline, robot B
   // (deceleration 2.0 s) 2.5 s. Neither provider ever confirms its
   // controlled stage. The Kernel's watchdog adds a normal motion's no-report
-  // bound to each (M6): A at 1.5 + 10 = 11.5 s, B at 2.5 + 10 = 12.5 s. A
+  // bound to each: A at 1.5 + 10 = 11.5 s, B at 2.5 + 10 = 12.5 s. A
   // escalates to its hard stage at its own 11.5 s while B is still inside
   // its bound; B escalates only at 12.5 s; the Stop is reported finished only
   // after B, the last robot, has finished.
   const auto a_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto b_binding = second_same_type_occurrence(a_binding);
   FakeClock clock;
   ManualScheduler scheduler;
@@ -4951,9 +5513,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(b.default_fault_stop_profile.has_value());
   b.default_operator_stop_profile->deceleration_time_s = 2.0;
   b.default_fault_stop_profile->deceleration_time_s = 2.0;
-  ResourceAddressedExecutionKernel kernel({a, b}, clock, scheduler, default_journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({a, b}, clock, scheduler, default_journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall a_nominal, b_nominal;
   std::optional<RemainingStopBudgetDTO> a_controlled_budget, b_controlled_budget;
   a_engine.translate_stop_stage_hook = [&, hold = a_nominal.Blocker(),
@@ -4974,6 +5537,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(a_operation.ok()) << a_operation.error().message;
   auto b_intent = motion_operation("request.two-robot.b");
   b_intent.program_binding_id = b_binding.value().program_binding_id;
+  retarget(b_intent.participants.front(), b_binding.value().controllable_component_id,
+           b_binding.value().command_target_id);
   const auto b_operation = kernel.execute(b_intent);
   ASSERT_TRUE(b_operation.ok()) << b_operation.error().message;
   const auto stopped = kernel.full_stop(FullStopIntentDTO{
@@ -5044,13 +5609,14 @@ TEST(ResourceAddressedExecutionKernelTest, ResolvesPortableMotionAndReservesExac
   ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_TRUE(result.ok()) << result.error().message << ": "
@@ -5091,13 +5657,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.motion.held-prepare"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message << ": "
@@ -5129,13 +5696,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
                                     "injected preparation failure",
                                     {{"reason", "injected_preparation_failure"}}};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.motion.rejected-prepare"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5157,13 +5725,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.monitor-prepare.fail"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5236,13 +5805,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.recovery_assessment.execution_id = 41U;
   engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
   engine.recovery_assessment.allowed_actions = {RecoveryAction::kAcknowledgeAndContinue};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.recovery.accept"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5309,13 +5879,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.recovery.reject"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5358,13 +5929,14 @@ TEST(ResourceAddressedExecutionKernelTest, RecoveryAssessmentFailsClosedWhenTheP
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.throw_during_recovery_assessment = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.recovery.assessment-throw"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -5379,13 +5951,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.recovery.assessment-race"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
@@ -5409,13 +5982,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.throw_during_recovery = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.recovery.action-throw"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
@@ -5440,7 +6014,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(replay.ok());
   EXPECT_EQ(replay.error().details.at("reason"), "operation_recovery_outcome_unresolved");
   EXPECT_EQ(engine.recovery_action_calls, 1);
-  // R2: the unresolved outcome keeps its own resources; it closes nothing
+  // The unresolved outcome keeps its own resources; it closes nothing
   // cell-wide.
   const auto blocked = kernel.execute(motion_operation("request.after-recovery-throw"));
   ASSERT_FALSE(blocked.ok());
@@ -5452,13 +6026,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.recovery.stop-race"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5498,13 +6073,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.motion.cancel-prepare"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -5580,12 +6156,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     engine.status_at_stop_fence = ExecutionStatus{};
     engine.status_at_stop_fence->state = terminal_state;
     engine.status_at_stop_fence->execution_id = engine.next_execution_id;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("request.early-terminal"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     const auto stopped =
@@ -5630,18 +6207,19 @@ TEST(ResourceAddressedExecutionKernelTest,
     engine.status_at_stop_fence->state =
         unrelated_terminal ? ExecutionState::kStopped : ExecutionState::kValidating;
     engine.status_at_stop_fence->execution_id = engine.next_execution_id + unrelated_terminal;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("request.unsettled-prepare"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     const auto stopped =
         kernel.stop(stop_request("request.unsettled-prepare.stop", accepted.value(), 1U));
     ASSERT_TRUE(stopped.ok()) << stopped.error().message;
-    // Q60: the never-dispatched goal's Stop closes at once, but neither the
+    // The never-dispatched goal's Stop closes at once, but neither the
     // cancellation acknowledgement nor another execution's terminal is the
     // participant's settlement: that waits for its own cancellation terminal.
     EXPECT_TRUE(wait_until([&] {
@@ -5668,12 +6246,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.defer_prepare_completion = true;
   engine.prepared_cancel_terminal_state = ExecutionState::kValidating;
   engine.cancel_prepared_motion_hook = [] { throw std::runtime_error("cancel failed"); };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.cancel-deadline"));
   ASSERT_TRUE(operation.ok());
   const auto stopped =
@@ -5699,7 +6278,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                      .value()
                      .participants.front()
                      .terminal_fact);
-    // Q29: InterventionRequired without a cell-wide Stop-fault latch.
+    // InterventionRequired without a cell-wide Stop-fault latch.
     EXPECT_FALSE(kernel.get_cell_latch().latched);
     EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value().state,
               OperationStateKind::kInterventionRequired);
@@ -5719,21 +6298,22 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      StopClosesAtOnceForANeverDispatchedGoalWhoseCancelHasNotReturned) {
-  // Q60: a Stop does not wait, with no time limit, for the cancel of a goal
+  // A Stop does not wait, with no time limit, for the cancel of a goal
   // that was never dispatched. Nothing moved: the Stop closes at once and the
-  // cancellation is tidied up on its own late terminal. Q51: no Stop deadline
+  // cancellation is tidied up on its own late terminal. No Stop deadline
   // is involved either way.
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   engine.prepared_cancel_terminal_state = ExecutionState::kValidating;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.cancel-not-returned"));
   ASSERT_TRUE(operation.ok());
   const auto stopped =
@@ -5783,12 +6363,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.carried-lost"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -5801,7 +6382,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     return kernel.get_stop_status(stopped.value().stop_id).value().state ==
            StopStatusStateDTO::kSucceeded;
   }));
-  // F-6a (D, stop_motion: true): the Program's own Stop, settled at its first
+  // With `stop_motion: true`, the Program's own Stop, settled at its first
   // stage, leaves the moving motion Stopped with the typed cause its node
   // fails with, and the requester class is the Program's, not the operator's.
   const auto state = kernel.get_operation_state(operation.value().operation_id).value();
@@ -5823,7 +6404,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                "ordinary_program_stop");
 }
 
-// SX-519: the requester is authoritative provenance, never a caller's labels.
+// The requester is authoritative provenance, never a caller's labels.
 // A Stop through the public route (its own transport) that claims a Program
 // source is an operator Stop and keeps the operator hold or today's Failed hold.
 TEST(ResourceAddressedExecutionKernelTest,
@@ -5846,12 +6427,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.spoofed"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -5889,12 +6471,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   engine.next_stop_result = {false, ErrorDTO{"nominal_rejected", "nominal refused", {}}};
   engine.translate_stop_stage_hook = [&] {
     if (engine.translate_stop_stage_calls >= 2) engine.next_stop_result = {true, std::nullopt};
@@ -5930,12 +6513,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto operation = kernel.execute(motion_operation("manual.carried-lost"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -5965,12 +6549,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   engine.prepared_cancel_terminal_state = ExecutionState::kValidating;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.late-cancel-reply"));
   ASSERT_TRUE(operation.ok());
   const auto stopped =
@@ -6035,12 +6620,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   engine.prepared_cancel_terminal_state = ExecutionState::kValidating;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.late-cancel-failure"));
   ASSERT_TRUE(operation.ok());
   const auto stopped =
@@ -6070,8 +6656,8 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      DispatchedOrUnknownSendStillWaitsForItsPhysicalStopStage) {
-  // Q60 applies only to work proved never dispatched. A goal whose dispatch
-  // call is still in flight (effect unknown) or has returned keeps the
+  // Closing at once applies only to work proved never dispatched. A goal
+  // whose dispatch call is still in flight (effect unknown) or has returned keeps the
   // physical Stop-stage path and its wait.
   for (const bool dispatch_returned : {false, true}) {
     SCOPED_TRACE(dispatch_returned);
@@ -6082,12 +6668,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     HeldSettlementCall held_stage;
     if (!dispatch_returned) engine.execute_return_hook = held_dispatch.Blocker();
     engine.translate_stop_stage_hook = held_stage.Blocker();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto executing = std::async(std::launch::async, [&] {
       return kernel.execute(motion_operation("request.dispatched-send"));
     });
@@ -6146,14 +6733,15 @@ TEST(ResourceAddressedExecutionKernelTest,
     other.gripper_status.command_id = other.next_execution_id;
     engine.defer_prepare_completion = true;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     auto registrations = std::vector{registration(binding, engine)};
     if (coordinated)
       registrations.push_back(
           registration(coordinated_occurrence(grouped_command_binding(), "2"), other));
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         std::move(registrations), clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     HeldSettlementCall prepare;
     engine.prepare_motion_hook = prepare.Blocker();
     auto executing = std::async(std::launch::async, [&] {
@@ -6176,7 +6764,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       executing.get();
       continue;
     }
-    // Q51: no shared Stop deadline expires the in-flight preparation.
+    // No shared Stop deadline expires the in-flight preparation.
     clock.set(stopped.value().accepted_at_ns + 3'600'000'000'000LL);
     EXPECT_FALSE(wait_until(
         [&] {
@@ -6216,13 +6804,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
   engine.prepared_cancel_terminal_state = ExecutionState::kFailed;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.motion.cancel-prepare-fails"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -6252,7 +6841,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(certificate.value().terminal_error.has_value());
   EXPECT_EQ(certificate.value().terminal_error->details.at("reason"),
             "prepared_cancel_terminal_failed");
-  // Q29: no cell-wide latch; the operation keeps its resources until Reset.
+  // No cell-wide latch; the operation keeps its resources until Reset.
   EXPECT_FALSE(kernel.get_cell_latch().latched);
   const auto next = kernel.execute(motion_operation("request.after-cancel-prepare-failure"));
   ASSERT_FALSE(next.ok());
@@ -6271,15 +6860,16 @@ TEST(ResourceAddressedExecutionKernelTest,
       first_engine.prepare_bounded_time_law = second_engine.prepare_bounded_time_law =
           third_engine.prepare_bounded_time_law = bounded;
       const auto first =
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
       auto registrations =
           std::vector{registration(first, first_engine),
                       registration(coordinated_occurrence(first, "2"), second_engine)};
       if (count == 3U)
         registrations.push_back(registration(coordinated_occurrence(first, "3"), third_engine));
-      ResourceAddressedExecutionKernel kernel(
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
           std::move(registrations), clock, scheduler, journal,
           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      auto& kernel = *kernel_heap_test_owner;
       const auto calls_before = journal.calls;
       const auto rejected =
           kernel.execute(coordinated_motion_operation("request.unsupported", count));
@@ -6311,14 +6901,15 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine first_engine, second_engine;
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     auto first_registration = registration(first, first_engine);
     auto second_registration = registration(coordinated_occurrence(first, "2"), second_engine);
     first_registration.deployment_maximum_tcp_linear_speed_mps = 0.15;
     second_registration.deployment_maximum_tcp_linear_speed_mps = 0.25;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {first_registration, second_registration}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     auto intent = motion_operation("speed.single");
     std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
         .speed_profile.max_tcp_linear_speed_mps = 0.25;
@@ -6329,8 +6920,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                   .max_tcp_linear_speed_mps, 0.15);
     if (second_motion) {
       auto peer = motion_operation("speed.peer");
-      peer.participants.front().component_role_id = ComponentRoleId("robot_2");
-      peer.participants.front().target_role_id = TargetRoleId("arm_2");
+      retarget(peer.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
       std::get<MotionParticipantIntentDTO>(peer.participants.front().payload)
           .speed_profile.max_tcp_linear_speed_mps = 0.25;
       ASSERT_TRUE(kernel.execute(peer).ok());
@@ -6354,13 +6944,12 @@ TEST(ResourceAddressedExecutionKernelTest, MotionRequestStampsTheTcpFrameWithIts
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     auto value =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular)
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular)
             .value();
     if (tool) {
       value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-          TargetRoleId("gripper"),
-          CommandTargetId("gripper"),
-          {FrameRoleId("tcp"), ModelInstanceId("gripper.model"),
+          {ControllableComponentId("gripper.1"), CommandTargetId("gripper")},
+          {{ControllableComponentId("gripper.1"), FrameRoleId("tcp")}, ModelInstanceId("gripper.model"),
            ModelRevision("gripper-revision"), "mf2_gripper_tcp"},
           {}};
     }
@@ -6368,14 +6957,15 @@ TEST(ResourceAddressedExecutionKernelTest, MotionRequestStampsTheTcpFrameWithIts
     ASSERT_TRUE(sealed.ok()) << sealed.error().message;
     auto selected = registration(std::move(sealed.value()), engine);
     if (tool) selected.motion_endpoint_owner = ControllableComponentId("gripper.1");
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {selected}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto intent = motion_operation("owner.stamp");
     if (tool) {
       std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).tcp_endpoint =
-          TcpEntryDTO{ControllableComponentId("gripper.1"), CommandTargetId("gripper"),
-                      FrameRoleId("tcp")};
+          TcpEntryReferenceDTO{{ControllableComponentId("gripper.1"), CommandTargetId("gripper")},
+                               {ControllableComponentId("gripper.1"), FrameRoleId("tcp")}};
     }
     const auto accepted = kernel.execute(intent);
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -6409,10 +6999,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.defer_prepare_completion = true;
   const auto first = grouped_command_binding();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(grouped_motion_commands_operation("request.motion.coordinated.held", 2U, 1U));
@@ -6447,10 +7038,11 @@ TEST(ResourceAddressedExecutionKernelTest,
                                            {{"reason", "injected_coordinated_prepare_failure"}}};
   const auto first = grouped_command_binding();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(
       grouped_motion_commands_operation("request.motion.coordinated.failure", 2U, 1U));
@@ -6487,10 +7079,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.defer_prepare_completion = true;
   const auto first = grouped_command_binding();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation =
       kernel.execute(grouped_motion_commands_operation("request.abort-lifetime", 2U, 1U));
   ASSERT_TRUE(operation.ok());
@@ -6554,12 +7147,13 @@ TEST(ResourceAddressedExecutionKernelTest, AcceptedResetCannotRetireHeldCoordina
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto first = make_binding("gripper.target", "tool.gripper.command",
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_command_operation("request.reset-before-abort"));
   });
@@ -6604,11 +7198,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   engine.defer_prepare_completion = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.reset-held-read"));
   ASSERT_TRUE(operation.ok());
   HeldSettlementCall held;
@@ -6645,11 +7240,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   first_engine.defer_prepare_completion = true;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(grouped_command_binding(), "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation =
       kernel.execute(grouped_motion_commands_operation("request.terminal-prepare"));
   ASSERT_TRUE(operation.ok());
@@ -6684,17 +7280,18 @@ void exercise_late_coordinated_preparation(bool abort_finishes_first, bool late_
   FakeOperationJournal journal;
   first_engine.defer_prepare_completion = true;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   const auto second =
-      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
                                           CoordinateKind::kLinear, schema),
                              "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall held_prepare;
   HeldSettlementCall held_abort;
   HeldSettlementCall held_late_cancel;
@@ -6785,11 +7382,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     first_engine.defer_prepare_completion = true;
     SqliteOperationJournal journal(database, CellId("cell.test"), 32U);
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto second = coordinated_occurrence(grouped_command_binding(), "2");
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
         journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation =
         kernel.execute(grouped_motion_commands_operation("request.abort-sibling"));
     ASSERT_TRUE(operation.ok());
@@ -6837,10 +7435,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.defer_prepare_completion = true;
   const auto first = grouped_command_binding();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(grouped_motion_commands_operation("request.motion.coordinated.stop", 2U, 1U));
@@ -6881,10 +7480,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.defer_prepared_dispatch_effect = true;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine)}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.motion.dispatch-handoff"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -6924,11 +7524,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(grouped_command_binding(), "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(grouped_motion_commands_operation("request.motion.coordinated.collision"));
@@ -7009,14 +7610,15 @@ TEST(ResourceAddressedExecutionKernelTest,
     idle_gripper.gripper_status.current_position = 0.3;
     idle_gripper.gripper_status.target_position = 0.3;
     const auto arm =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto gripper = coordinated_occurrence(grouped_command_binding(), "2");
     auto arm_registration = registration_with_collision_cancel(arm, arm_engine);
     arm_registration.default_fault_stop_profile.reset();
     if (!operator_profile) arm_registration.default_operator_stop_profile.reset();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {std::move(arm_registration), registration(gripper, idle_gripper)}, clock, scheduler,
         journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("request.collision.no-fault-profile"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     arm_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7088,13 +7690,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   gripper_engine.next_command_result.command_id = gripper_engine.next_execution_id;
   gripper_engine.gripper_status.command_id = gripper_engine.next_execution_id;
   const auto arm =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto gripper = coordinated_occurrence(grouped_command_binding(), "2");
   gripper_engine.gripper_status.gripper_id = gripper.value().command_target_id.value();
   gripper_engine.gripper_status.generation = gripper_engine.next_command_result.generation;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(arm, arm_engine), registration(gripper, gripper_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted =
       kernel.execute(grouped_motion_commands_operation("request.collision.completed-command"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -7159,13 +7762,14 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeOperationJournal journal;
     FakeParticipantEngine engine;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     auto participant = registration_with_collision_cancel(binding, engine);
     const auto strongest =
         participant.stop_readiness->value().resolved_stop_base_plan.escalation_stages.size() - 1U;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {std::move(participant)}, clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("request.collision-cancel.row-skipped"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7212,13 +7816,14 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeOperationJournal journal;
     FakeParticipantEngine arm_engine, gripper_engine;
     const auto arm =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto gripper = coordinated_occurrence(grouped_command_binding(), "2");
     auto arm_registration = registration(arm, arm_engine);
     arm_registration.default_fault_stop_profile.reset();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {std::move(arm_registration), registration(gripper, gripper_engine)}, clock, scheduler,
         journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto journal_calls = journal.calls;
     const auto rejected =
         kernel.execute(mixed ? grouped_motion_commands_operation("request.cancel-unqualified")
@@ -7247,12 +7852,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(motion_operation("request.motion.collision.backend-terminal"));
@@ -7288,7 +7894,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  // Item 19: a runtime collision outside an operator Stop ends
+  // A runtime collision outside an operator Stop ends
   // InterventionRequired through the ordinary outcome path once contained.
   EXPECT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
   ASSERT_EQ(operation.value().participants.size(), 1U);
@@ -7336,12 +7942,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.motion.observation-lost"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7361,6 +7968,9 @@ TEST(ResourceAddressedExecutionKernelTest,
     return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded &&
            operation.value().state == OperationStateKind::kInterventionRequired;
   }));
+  // The Stop's acceptance projection is an asynchronous forensic job; the
+  // Stop can already be Succeeded before the journal has recorded its intent.
+  ASSERT_TRUE(wait_until([&] { return journal.stop_acceptance_calls.load() == 1; }));
 
   {
     std::lock_guard lock(journal.mutex);
@@ -7398,12 +8008,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.collision.program-reset"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7459,12 +8070,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.collision.proof-reuse"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7529,10 +8141,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding = with_colocated_supporting_capability(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine)}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(motion_operation("request.motion.collision.colocated-stop-provider"));
@@ -7582,29 +8195,26 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      CoordinatedOverlapRejectsBeforePrepareAndLeavesTheResourceTableUnchanged) {
+  // A resource belongs to exactly one component. Two components claiming one
+  // resource are refused when the registry is built (Stop readiness), before
+  // any operation can be admitted or prepared.
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto overlapping_value = coordinated_occurrence(first, "2").value();
-  overlapping_value.controllable_component_id = first.value().controllable_component_id;
   overlapping_value.resources.front().resource_id = first.value().resources.front().resource_id;
   auto overlapping = verify_runtime_participant_binding(std::move(overlapping_value));
   ASSERT_TRUE(overlapping.ok()) << overlapping.error().message;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(overlapping.value(), second_engine)}, clock,
-      scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
-
-  const auto rejected =
-      kernel.execute(coordinated_motion_operation("request.motion.coordinated.overlap"));
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"), "coordinated_participant_resource_overlap");
+  EXPECT_THROW(static_cast<void>(manyforge::core::testing::make_heap_resource_addressed_kernel(
+                   {registration(first, first_engine), registration(overlapping.value(), second_engine)},
+                   clock, scheduler, default_journal,
+                   {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U})),
+               std::invalid_argument);
   EXPECT_EQ(first_engine.prepare_motion_calls, 0);
   EXPECT_EQ(second_engine.prepare_motion_calls, 0);
-  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
-  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
 // Read-only failure diagnostics: no additional control or execution requests.
@@ -7666,13 +8276,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto first = grouped_command_binding();
   first_engine.gripper_status.gripper_id = first.value().command_target_id.value();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
   const auto third = coordinated_occurrence(grouped_command_binding(), "3");
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(
       grouped_motion_commands_operation("request.motion.coordinated.partial", 3U, 1U));
@@ -7742,15 +8353,16 @@ TEST(ResourceAddressedExecutionKernelTest,
       Result<std::uint64_t>::Err(ErrorDTO{"execution_rejected", "injected partial dispatch", {}});
   const auto first = grouped_command_binding();
   first_engine.gripper_status.gripper_id = first.value().command_target_id.value();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(
            coordinated_occurrence(
-               make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+               make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
                "2"),
            second_engine),
        registration(coordinated_occurrence(grouped_command_binding(), "3"), third_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall held;
   third_engine.cancel_prepared_command_hook = held.Blocker();
   auto executing = std::async(std::launch::async, [&] {
@@ -7778,13 +8390,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto reconfiguring = std::async(std::launch::async, [&] {
     return kernel.reconfigure_runtime_participants({registration(first, first_engine)});
   });
-  EXPECT_EQ(reconfiguring.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
   EXPECT_TRUE(kernel.get_operation_projection(expected.operation_id).value().resident);
   held.Release();
   EXPECT_TRUE(executing.get().ok());
-  // Ordinary reconfiguration is serialized behind initial submission. Its
-  // post-drain admission may reject or retain this terminal operation, but
-  // it cannot replace the engine while the cancellation is borrowed.
+  // Execute releases submission ordering once the operation is admitted
+  // (OD-67), so reconfiguration no longer waits for this dispatch phase. It
+  // may reject or retain this resident operation, but it cannot replace the
+  // engine while the cancellation is borrowed.
   const auto reconfigured = reconfiguring.get();
   if (reconfigured.ok()) {
     EXPECT_TRUE(kernel.participant_engine_in_use(&third_engine));
@@ -7822,7 +8434,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                           {{"reason", "injected_dispatch_failure"}}});
   const auto first = grouped_command_binding();
   const auto second = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
   const auto third = coordinated_occurrence(grouped_command_binding(), "3");
   FakeOperationJournal journal;
   std::promise<void> partial_journal_entered;
@@ -7835,10 +8447,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     partial_journal_entered.set_value();
     release_future.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(grouped_motion_commands_operation(
@@ -7873,12 +8486,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto first = make_binding("gripper.target", "tool.gripper.command",
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(coordinated_command_operation("request.command.coordinated.success"));
@@ -7919,12 +8533,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto first = make_binding("gripper.target", "tool.gripper.command",
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(coordinated_command_operation("request.command.coordinated.failure"));
@@ -7961,16 +8576,17 @@ TEST(ResourceAddressedExecutionKernelTest,
     release_future.wait();
   };
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto command_source = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto command_source = make_binding("gripper.target", "tool.gripper.command",
                                            CoordinateKind::kLinear, schema);
   const auto command = coordinated_occurrence(command_source, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(motion, motion_engine), registration(command, command_engine)}, clock,
       scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_motion_command_operation("request.mixed.coordinated.held"));
@@ -8003,19 +8619,20 @@ TEST(ResourceAddressedExecutionKernelTest, UnscopedMixedOperationCannotPreemptBu
   FakeParticipantEngine motion_engine, command_engine;
   motion_engine.supports_motion_replacement = true;
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   const auto command =
-      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
                                           CoordinateKind::kLinear, schema),
                              "2");
   auto motion_registration = registration(motion, motion_engine);
   motion_registration.motion_takeover_preparation_budget_s = 1.0;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {motion_registration, registration(command, command_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto incumbent = kernel.execute(motion_operation("mixed.unscoped.incumbent"));
   ASSERT_TRUE(incumbent.ok()) << incumbent.error().message;
   motion_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -8048,12 +8665,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto first = make_binding("gripper.target", "tool.gripper.command",
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_command_operation("request.command.coordinated.stop"));
@@ -8114,15 +8732,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto first = make_binding("gripper.target", "tool.gripper.command",
                                   CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
   const auto third = coordinated_occurrence(first, "3");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine),
        registration(third, third_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted =
       kernel.execute(coordinated_command_operation("request.command.coordinated.partial", 3U));
@@ -8160,11 +8779,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto unqualified = unqualified_registration(binding, engine);
   unqualified.stop_execution_port = nullptr;
 
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {std::move(unqualified)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"),
@@ -8173,6 +8792,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           {},
           nullptr,
           binding.value().graph_revision});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
@@ -8188,14 +8808,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto unqualified = registration(binding, engine);
   unqualified.participant_policy.reset();
 
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {std::move(unqualified)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
@@ -8212,12 +8833,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.robot.1"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -8229,6 +8851,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(first_engine.last_execute->binding.resources.front(), ResourceId("robot.joint_1"));
   auto second_operation = motion_operation("request.robot.2");
   second_operation.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_operation.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_operation);
   ASSERT_TRUE(second.ok()) << second.error().message;
   EXPECT_EQ(first_engine.execute_calls, 1);
@@ -8290,18 +8914,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto overlapping_binding = second_occurrence_sharing_first_resource(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(overlapping_binding, second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.overlap.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto overlapping = motion_operation("request.overlap.second");
   overlapping.program_binding_id = overlapping_binding.value().program_binding_id;
-  overlapping.participants.front().target_role_id = TargetRoleId("arm.overlap");
+  overlapping.participants.front().target.command_target_id = CommandTargetId("arm.overlap");
   const auto rejected = kernel.execute(overlapping);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "resource_scope_busy");
@@ -8323,16 +8948,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, engine), registration(second_binding, engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.shared-engine.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second = motion_operation("request.shared-engine.second");
   second.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto rejected = kernel.execute(second);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "participant_engine_busy");
@@ -8357,12 +8985,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.late-event.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
@@ -8393,37 +9022,30 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     ControlsStopAndRuntimeScaleRemainScopedToTheNamedDisjointOperation) {
+     ControlsAndStopRemainScopedToTheNamedDisjointOperation) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.scoped.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.scoped.second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-
-  const auto scaled = kernel.set_runtime_scale(
-      runtime_scale_request("request.scoped.scale.second", second.value(), 1U, 0U, 0.4));
-  ASSERT_TRUE(scaled.ok()) << scaled.error().message;
-  EXPECT_EQ(first_engine.runtime_scale_calls, 1);
-  EXPECT_EQ(second_engine.runtime_scale_calls, 2);
-  const auto second_scale = kernel.get_runtime_scale(second.value().operation_id);
-  ASSERT_TRUE(second_scale.ok()) << second_scale.error().message;
-  EXPECT_EQ(second_scale.value().runtime_scale_generation, RuntimeScaleGeneration(1U));
-  EXPECT_DOUBLE_EQ(second_scale.value().requested_scale, 0.4);
 
   const auto stopped = kernel.stop(stop_request("request.scoped.stop.second", second.value(), 1U));
   ASSERT_TRUE(stopped.ok()) << stopped.error().message;
@@ -8447,17 +9069,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.program-run.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.program-run.second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -8532,19 +9157,22 @@ TEST(ResourceAddressedExecutionKernelTest,
         ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)), "IK has no solution",
                  {{"reason", "native_ik_no_solution"}}};
     const auto dispatched_binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto failed_binding = second_same_type_occurrence(dispatched_binding);
-    ResourceAddressedExecutionKernel kernel({registration(dispatched_binding, dispatched_engine),
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(dispatched_binding, dispatched_engine),
                                              registration(failed_binding, failed_engine)},
                                             clock, scheduler, default_journal,
                                             {RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
 
     const auto dispatched = kernel.execute(motion_operation("request.incident.dispatched"));
     ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
     dispatched_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
     auto failed_intent = motion_operation("request.incident.ik-failed");
     failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+    retarget(failed_intent.participants.front(), failed_binding.value().controllable_component_id,
+             failed_binding.value().command_target_id);
     const auto failed = kernel.execute(failed_intent);
     ASSERT_TRUE(failed.ok()) << failed.error().message;
     EXPECT_EQ(failed_engine.dispatch_prepared_motion_calls, 0);
@@ -8624,18 +9252,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine failed_engine;
   failed_engine.defer_prepare_completion = true;
   const auto dispatched_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto failed_binding = second_same_type_occurrence(dispatched_binding);
-  ResourceAddressedExecutionKernel kernel({registration(dispatched_binding, dispatched_engine),
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(dispatched_binding, dispatched_engine),
                                            registration(failed_binding, failed_engine)},
                                           clock, scheduler, default_journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto dispatched = kernel.execute(motion_operation("request.race.dispatched"));
   ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
   dispatched_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   auto failed_intent = motion_operation("request.race.planning");
   failed_intent.program_binding_id = failed_binding.value().program_binding_id;
+  retarget(failed_intent.participants.front(), failed_binding.value().controllable_component_id,
+           failed_binding.value().command_target_id);
   const auto failed = kernel.execute(failed_intent);
   ASSERT_TRUE(failed.ok()) << failed.error().message;
 
@@ -8703,10 +9334,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   // stage result. Only the exact natural-completion settlement avoids
   // escalation; a still-active goal whose Stop fails, or an aborted goal,
   // escalates to the hard floor. A contained escalation is a degraded Stop
-  // without a cell-wide latch (item 25).
+  // without a cell-wide latch.
   // Live 2026-10-28 (Real): the soft stage failed and the participant settled
   // its cancelled goal while the hard floor ran. A contained escalation
-  // leaves the cell admissible (Q29), whenever the settlement arrives.
+  // leaves the cell admissible, whenever the settlement arrives.
   enum class Race {
     kNaturalCompletion,
     kStillActiveStopFailed,
@@ -8720,10 +9351,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, engine)}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("request.race.natural"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -8856,10 +9488,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     second_engine.defer_prepare_completion = true;
     const auto first = grouped_command_binding();
     const auto second = coordinated_occurrence(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine), registration(second, second_engine)}, clock,
         scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation =
         kernel.execute(grouped_motion_commands_operation("request.racing.abort", 2U, 1U));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -8899,12 +9532,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.uncertain.dispatched"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -8934,11 +9568,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
@@ -9029,11 +9664,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRe
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
 
@@ -9091,11 +9727,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltStopsRunningWorkUntilResum
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   // Execute and Run: the motion node is Running (between operations here).
@@ -9136,11 +9773,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramResumeReleasesMixedStoppedAndR
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -9148,7 +9786,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramResumeReleasesMixedStoppedAndR
   table->nodes.insert(table->nodes.begin() + 1,
                       {ProgramNodeInstanceId("place"),
                        "kernel.operation",
-                       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"),
+                       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"),
                          true}}});
   table->named_selections = {{"arm", {0U}}, {"place", {1U}}, {"supervision", {2U}}};
   capture.table = table;
@@ -9193,11 +9831,12 @@ TEST(ResourceAddressedExecutionKernelTest, IndividualReleaseDoesNotWaitForUnrela
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -9205,7 +9844,7 @@ TEST(ResourceAddressedExecutionKernelTest, IndividualReleaseDoesNotWaitForUnrela
       table->nodes.begin() + 1,
       {ProgramNodeInstanceId("place"),
        "kernel.operation",
-       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}});
   table->named_selections.clear();
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
@@ -9263,11 +9902,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSceneClaimOrdersAgainstStopWit
   config.cell_admission_settlement_validator = [](const auto&, const auto&) {
     return Result<void>::Ok();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const auto parent = claim_program_execution(kernel);
   ASSERT_TRUE(parent.ok());
   auto capture = program_execution_capture();
@@ -9455,11 +10095,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionIdleOverlapHasOneHold
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   start_program_motion(kernel);
@@ -9508,11 +10149,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionUnknownContainsThroug
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   start_program_motion(kernel);
@@ -9540,23 +10182,24 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine, second_engine;
   const auto base =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 128U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(coordinated_occurrence(base, "a"), first_engine),
        registration(coordinated_occurrence(base, "b"), second_engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("a"),
                    "kernel.operation",
-                   {{TargetRoleId("arm_a"), CapabilityId("execution.trajectory.execute"), true}}},
+                   {{{ControllableComponentId("robot.a"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
                   {ProgramNodeInstanceId("b"),
                    "kernel.operation",
-                   {{TargetRoleId("arm_b"), CapabilityId("execution.trajectory.execute"), true}}}};
+                   {{{ControllableComponentId("robot.b"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}}};
   table->named_selections = {{"a", {0U}}, {"b", {1U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
@@ -9565,8 +10208,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   for (const auto* name : {"a", "b"}) {
     auto intent = motion_operation(std::string("execute.") + name);
     auto& participant = intent.participants.front();
-    participant.component_role_id = ComponentRoleId(std::string("robot_") + name);
-    participant.target_role_id = TargetRoleId(std::string("arm_") + name);
+    retarget(participant, ControllableComponentId(std::string("robot.") + name), CommandTargetId("arm"));
     participant.execution_scope =
         ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId(name), "attempt.1"};
     const auto admitted = kernel.execute(intent);
@@ -9661,11 +10303,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   start_program_motion(kernel);
@@ -9700,27 +10343,28 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto base =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(base, first_engine),
        registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine),
        registration(coordinated_occurrence(base, "3"), independent_engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("a"),
                    "kernel.operation",
-                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+                   {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
                   {ProgramNodeInstanceId("b"),
                    "kernel.operation",
-                   {{TargetRoleId("arm_2"), CapabilityId("tool.gripper.command"), true}}},
+                   {{{ControllableComponentId("robot.2"), CommandTargetId("arm")}, CapabilityId("tool.gripper.command"), true}}},
                   {ProgramNodeInstanceId("c"),
                    "kernel.operation",
-                   {{TargetRoleId("arm_3"), CapabilityId("execution.trajectory.execute"), true}}}};
+                   {{{ControllableComponentId("robot.3"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}}};
   table->named_selections = {{"a", {0U}}, {"both_arms", {0U, 1U}}, {"c", {2U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
@@ -9731,16 +10375,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto admitted_first = kernel.execute(first);
   ASSERT_TRUE(admitted_first.ok()) << admitted_first.error().message;
   auto second = command_operation("execute.selected.command");
-  second.participants.front().component_role_id = ComponentRoleId("robot_2");
-  second.participants.front().target_role_id = TargetRoleId("arm_2");
+  retarget(second.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
 
   second.participants.front().execution_scope =
       ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("b"), "attempt.1"};
   const auto admitted_second = kernel.execute(second);
   ASSERT_TRUE(admitted_second.ok()) << admitted_second.error().message;
   auto independent = motion_operation("execute.independent");
-  independent.participants.front().component_role_id = ComponentRoleId("robot_3");
-  independent.participants.front().target_role_id = TargetRoleId("arm_3");
+  retarget(independent.participants.front(), ControllableComponentId("robot.3"), CommandTargetId("arm"));
   independent.participants.front().execution_scope =
       ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("c"), "attempt.1"};
   const auto other = kernel.execute(independent);
@@ -9836,15 +10478,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine tool;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
   direct.intrinsic_direct_control = true;
   const auto tool_binding =
-      make_binding("gripper", "gripper", "tool.gripper.command", CoordinateKind::kLinear);
+      make_binding("gripper", "tool.gripper.command", CoordinateKind::kLinear);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct, registration(tool_binding, tool)}, clock,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct, registration(tool_binding, tool)}, clock,
                                           scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   auto manual = motion_operation("manual.inspect");
   manual.program_run_id = ProgramRunId("manual.run");
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
@@ -9854,31 +10497,26 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  auto alias = binding->target_role_bindings.front();
-  alias.target_role_id = TargetRoleId("arm_alias");
-  binding->target_role_bindings.push_back(alias);
-  auto gripper = alias;
-  gripper.target_role_id = tool_binding.value().target_role_id;
-  gripper.component_role_id = tool_binding.value().component_role_id;
-  gripper.controllable_component_id = tool_binding.value().controllable_component_id;
-  gripper.command_target_id = tool_binding.value().command_target_id;
-  binding->target_role_bindings.push_back(gripper);
+  auto gripper = binding->target_bindings.front();
+  gripper.target = {tool_binding.value().controllable_component_id,
+                    tool_binding.value().command_target_id};
+  binding->target_bindings.push_back(gripper);
   capture.binding = binding;
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {
       {ProgramNodeInstanceId("move"),
        "kernel.operation",
-       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
       {ProgramNodeInstanceId("read"),
        "kernel.command_target",
-       {{TargetRoleId("arm"), CapabilityId("state.observed.current")}}},
+       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("state.observed.current")}}},
       {ProgramNodeInstanceId("second_move"),
        "kernel.operation",
-       {{TargetRoleId("arm_alias"), CapabilityId("execution.trajectory.execute"), true}}},
+       {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}},
       {ProgramNodeInstanceId("sleep"), "orchestration.clock", {}},
       {ProgramNodeInstanceId("tool"),
        "kernel.command_target",
-       {{TargetRoleId("gripper"), CapabilityId("tool.gripper.command"), true}}}};
+       {{{ControllableComponentId("robot.1"), CommandTargetId("gripper")}, CapabilityId("tool.gripper.command"), true}}}};
   table->named_selections = {
       {"arm_first", {0U}}, {"arm_producers", {0U, 2U}}, {"supervision", {1U, 3U}}};
   capture.table = table;
@@ -9918,19 +10556,20 @@ TEST(ResourceAddressedExecutionKernelTest, ManualUnusedTargetAcceptsInitialSelec
   FakeParticipantEngine arm;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), arm);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   table->nodes = {{ProgramNodeInstanceId("read"),
                    "kernel.command_target",
-                   {{TargetRoleId("arm"), CapabilityId("state.observed.current")}}}};
+                   {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("state.observed.current")}}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
   auto manual = motion_operation("manual.unused.target");
@@ -9955,23 +10594,23 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAvailabilityDistinguishesSettle
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto physical =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto alias = same_control_scope_program_alias(physical);
   auto direct = registration(alias, engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(physical, engine), direct}, clock,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(physical, engine), direct}, clock,
                                           scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   auto manual = motion_operation("manual.availability");
   manual.program_id = alias.value().program_id;
   manual.program_revision = alias.value().program_revision;
   manual.program_binding_id = alias.value().program_binding_id;
   manual.program_run_id = ProgramRunId("manual.run");
-  manual.participants.front().component_role_id = alias.value().component_role_id;
-  manual.participants.front().target_role_id = alias.value().target_role_id;
+  retarget(manual.participants.front(), alias.value().controllable_component_id, alias.value().command_target_id);
   const auto idle = kernel.get_manual_control_availability(manual);
   ASSERT_TRUE(idle.ok());
   EXPECT_TRUE(idle.value().available);
@@ -10033,13 +10672,14 @@ TEST(ResourceAddressedExecutionKernelTest, HeldManualAdmissionRetainsParentAndSt
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     auto direct = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     direct.intrinsic_direct_control = true;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     const auto parent = claim_program_execution(kernel);
     ASSERT_TRUE(parent.ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
@@ -10198,11 +10838,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramCaptureIsClaimBoundAndCannotBe
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   EXPECT_FALSE(kernel.register_program_run_capture(program_execution_capture()).ok());
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto stale = program_execution_capture();
@@ -10243,11 +10884,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -10274,11 +10916,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 16U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
     start_program_motion(kernel);
@@ -10329,7 +10972,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     auto crossed_frame = next;
     crossed_frame.request_context.request_id = RequestId("continuation.crossed-frame");
     std::get<MotionParticipantIntentDTO>(crossed_frame.participants.front().payload)
-        .base_frame_role_id = FrameRoleId("tcp");
+        .base_frame.frame_id = FrameRoleId("tcp");
     const auto crossed = kernel.execute(crossed_frame);
     ASSERT_FALSE(crossed.ok());
     EXPECT_EQ(crossed.error().details.at("reason"), "program_motion_continuation_mismatch");
@@ -10375,16 +11018,16 @@ TEST(
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine, other_engine;
-    const auto binding = make_binding(
-        "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     auto registered = registration_with_collision_cancel(binding, engine);
     if (fault == "cancel")
       registered.default_fault_stop_profile.reset();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {std::move(registered),
          registration(coordinated_occurrence(binding, "2"), other_engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted =
         kernel.execute(motion_operation("retry.collision.matrix"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -10411,8 +11054,7 @@ TEST(
     }));
     if (fault == "later_stop") {
       auto other = motion_operation("retry.disjoint.stop");
-      other.participants.front().component_role_id = ComponentRoleId("robot_2");
-      other.participants.front().target_role_id = TargetRoleId("arm_2");
+      retarget(other.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
       const auto other_accepted = kernel.execute(other);
       ASSERT_TRUE(other_accepted.ok()) << other_accepted.error().message;
       other_engine.emit_transition(ExecutionState::kPlanning,
@@ -10471,11 +11113,12 @@ TEST(
   ResourceAddressedExecutionKernelConfig config{
       RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular),
                     engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -10600,11 +11243,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{
         RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
                                    CoordinateKind::kAngular),
                       engine)},
         clock, scheduler, default_journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     if (program_scope) {
       ASSERT_TRUE(claim_program_execution(kernel).ok());
       auto capture = program_execution_capture();
@@ -10666,12 +11310,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("owner.revision"));
   ASSERT_TRUE(operation.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -10736,12 +11381,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation =
       kernel.execute(motion_operation("operator.stop.retry"));
   ASSERT_TRUE(operation.ok());
@@ -10786,11 +11432,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                                           request.reconciliation_evidence_digest});
       return Result<CellAdmissionReconcileValidationDTO>::Ok(std::move(validation));
     };
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     const auto claim = claim_program_execution(kernel);
     ASSERT_TRUE(claim.ok());
     auto capture = program_execution_capture();
@@ -10926,12 +11573,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
     const bool collision = phase == "collision";
-    const auto binding = make_binding(
-        "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+    const auto binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {collision ? registration_with_collision_cancel(binding, engine)
                    : registration(binding, engine)},
         clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     const auto claim = claim_program_execution(kernel);
     ASSERT_TRUE(claim.ok());
     auto capture = program_execution_capture();
@@ -11049,11 +11696,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 16U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
     start_program_motion(kernel);
@@ -11111,12 +11759,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(grouped_motion_commands_operation("coordinated.equivalent"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -11192,12 +11841,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(grouped_motion_commands_operation("coordinated.semantic"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -11223,17 +11873,17 @@ TEST(ResourceAddressedExecutionKernelTest, RecoveryWaitsForSharedStopCertificate
   ManualScheduler scheduler;
   FakeParticipantEngine first_engine, second_engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(coordinated_occurrence(binding, "a"), first_engine),
        registration(coordinated_occurrence(binding, "b"), second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   std::vector<OperationAcceptedDTO> operations;
   for (const auto* suffix : {"a", "b"}) {
     auto intent = motion_operation(std::string("shared.recovery.") + suffix);
-    intent.participants.front().component_role_id = ComponentRoleId(std::string("robot_") + suffix);
-    intent.participants.front().target_role_id = TargetRoleId(std::string("arm_") + suffix);
+    retarget(intent.participants.front(), ControllableComponentId(std::string("robot.") + suffix), CommandTargetId("arm"));
     const auto admitted = kernel.execute(intent);
     ASSERT_TRUE(admitted.ok()) << admitted.error().message;
     operations.push_back(admitted.value());
@@ -11312,11 +11962,12 @@ TEST(ResourceAddressedExecutionKernelTest, ReconciledProgramClaimCannotRetainAdm
     }
     return Result<CellAdmissionReconcileValidationDTO>::Ok(std::move(validation));
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const auto claim = claim_program_execution(kernel);
   ASSERT_TRUE(claim.ok());
   auto capture = program_execution_capture();
@@ -11386,11 +12037,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   start_program_motion(kernel);
@@ -11401,7 +12053,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   forged.participants.front().execution_scope->node_instance_id = ProgramNodeInstanceId("timer");
   EXPECT_FALSE(kernel.execute(forged).ok());
   forged = scoped_motion_operation("wrong-target");
-  forged.participants.front().target_role_id = TargetRoleId("other-arm");
+  forged.participants.front().target.command_target_id = CommandTargetId("other-arm");
   EXPECT_FALSE(kernel.execute(forged).ok());
   forged = scoped_motion_operation("wrong-binding");
   forged.program_binding_id = ProgramBindingId(test_digest('2'));
@@ -11428,7 +12080,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramStopOvertakesResolvedButUnadmi
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto registered = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   ResourceAddressedExecutionKernel* owner = nullptr;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
@@ -11440,8 +12092,9 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramStopOvertakesResolvedButUnadmi
     EXPECT_TRUE(stopped.ok());
     return Result<RuntimeParticipantExecutionRegistration>::Ok(registered);
   };
-  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, default_journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registered}, clock, scheduler, default_journal,
                                           std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   owner = &kernel;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
@@ -11461,17 +12114,20 @@ TEST(ResourceAddressedExecutionKernelTest, BlockedControlOnOneOperationCannotDel
   FakeParticipantEngine first_engine;
   FakeParticipantEngine second_engine;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.concurrent-control.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.concurrent-control.second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
   first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -11526,12 +12182,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto initial_cell_stop = kernel.cell_stop_action_projection();
   EXPECT_EQ(initial_cell_stop.expected_stop_generation, StopGeneration(0U));
   EXPECT_FALSE(initial_cell_stop.latest_terminal.has_value());
@@ -11591,12 +12248,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto operation = kernel.execute(motion_operation("request.stop-recovery-owner"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -11627,12 +12285,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.settle_contained_failure_as_ack = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(motion_operation("request.stop.failed-ack"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -11756,12 +12415,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine engine;
     engine.settle_contained_failure_as_ack = true;
     engine.addressed_stop_terminal_fact_override = invalid_fact;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
 
     const auto accepted = kernel.execute(motion_operation(request_prefix + ".execute"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -11811,12 +12471,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     settlement_entered_promise.set_value();
     release_settlement.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto operation = kernel.execute(motion_operation("request.stop-settlement-order"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -11859,12 +12520,13 @@ TEST(ResourceAddressedExecutionKernelTest,
       ErrorDTO{"participant_terminal_unavailable",
                "participant could not commit the addressed Stop terminal",
                {}};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto operation = kernel.execute(motion_operation("request.stop-settlement-failure"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -11890,7 +12552,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(certificate.value().failed.empty());
   ASSERT_TRUE(certificate.value().terminal_error.has_value());
   EXPECT_EQ(certificate.value().terminal_error->code, "participant_terminal_unavailable");
-  EXPECT_FALSE(kernel.get_cell_latch().latched);  // Q29
+  EXPECT_FALSE(kernel.get_cell_latch().latched);
   const auto operation_state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(operation_state.ok()) << operation_state.error().message;
   EXPECT_EQ(operation_state.value().state, OperationStateKind::kInterventionRequired);
@@ -11904,12 +12566,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.return_mismatched_participant_stop_settlement = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto operation = kernel.execute(motion_operation("request.stop-settlement-mismatch"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
@@ -11943,13 +12606,14 @@ TEST(ResourceAddressedExecutionKernelTest, UsesOneInjectedGateForTheActualSlotTa
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeResourceAdmissionGate gate;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto blocked = kernel.execute(motion_operation());
   ASSERT_FALSE(blocked.ok());
@@ -11986,11 +12650,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeResourceAdmissionGate gate;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {unqualified_registration(binding, engine)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
   const auto& path = *binding.value().control_path;
   const ConfigurationFenceScopeDTO scope{
       {binding.value().controllable_component_id},
@@ -12030,7 +12695,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(1234);
   FakeParticipantEngine engine;
   const auto physical =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto dynamic_value = physical.value();
   dynamic_value.program_id = ProgramId("program.dynamic");
   dynamic_value.program_revision = ProgramRevision(test_digest('4'));
@@ -12043,7 +12708,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   intent.program_revision = ProgramRevision(test_digest('4'));
   intent.program_binding_id = ProgramBindingId(test_digest('5'));
   std::size_t resolver_calls = 0U;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(physical, engine)}, clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U,
@@ -12053,6 +12718,7 @@ TEST(ResourceAddressedExecutionKernelTest,
             return Result<RuntimeParticipantExecutionRegistration>::Ok(
                 registration(dynamic.value(), engine));
           }});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto result = kernel.execute(intent);
   ASSERT_TRUE(result.ok()) << result.error().message;
@@ -12068,15 +12734,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                        std::nullopt, false,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
@@ -12101,27 +12768,28 @@ TEST(ResourceAddressedExecutionKernelTest, MotionRequiresTheExactCapturedEndpoin
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto intent = motion_operation();
-    // Active TCP (M7): an entry must be the captured endpoint's own entry.
-    TcpEntryDTO entry{ControllableComponentId("robot.1"), CommandTargetId("arm"),
-                      FrameRoleId("tcp")};
+    // Active TCP: an entry must be the captured endpoint's own entry.
+    TcpEntryReferenceDTO entry{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                               {ControllableComponentId("robot.1"), FrameRoleId("tcp")}};
     if (wrong_owner)
-      entry.component_id = ControllableComponentId("other_robot");
+      entry.frame.component_id = ControllableComponentId("other_robot");
     else
-      entry.frame_role_id = FrameRoleId("base");
+      entry.frame.frame_id = FrameRoleId("base");
     std::get<MotionParticipantIntentDTO>(intent.participants.front().payload).tcp_endpoint = entry;
     const auto result = kernel.execute(intent);
     ASSERT_FALSE(result.ok());
-    // The sealed binding names target and frame; the owner is the
-    // registration's (B7), checked when the request is built.
-    EXPECT_EQ(result.error().details.at("reason"),
-              wrong_owner ? "motion_frame_role_unresolved" : "runtime_motion_mapping_incomplete");
+    // With direct references the entry's frame owner is part of the selector,
+    // so a foreign owner is refused by the registry's mapping check, like a
+    // foreign frame.
+    EXPECT_EQ(result.error().details.at("reason"), "runtime_motion_mapping_incomplete");
     EXPECT_EQ(engine.execute_calls, 0);
   }
 }
@@ -12134,24 +12802,28 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     auto value =
-        make_binding(
-            "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
             false, "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce", true)
             .value();
     auto& policy = value.contact_grasp_bindings.front();
-    const auto body = policy.allowed_body_bindings.front();
+    auto body = policy.allowed_body_bindings.front();
     policy.allowed_body_bindings.clear();
     policy.bodies_from_motion_endpoint = true;
     auto frame = value.frame_bindings.back();
-    frame.frame_role_id = FrameRoleId("finger_center");
+    frame.reference = {ControllableComponentId("gripper.1"), FrameRoleId("finger_center")};
+    // Direct references: an endpoint body is owned by the endpoint's frame
+    // owner, and its semantic ids are derived from that owner.
+    body.body.component_id = frame.reference.component_id;
+    for (std::size_t index = 0; index < body.collision_body_ids.size(); ++index)
+      body.collision_body_ids[index] = make_component_collision_body_id(
+          body.body.component_id, frame.model_instance_id, body.body.collision_body_id, index);
     frame.compiled_frame_name = "mf2_finger_center";
-    frame.contact_body_role_ids =
-        scenario == 2 ? std::vector<CollisionBodyRoleId>{}
-                      : std::vector<CollisionBodyRoleId>{body.collision_body_role_id};
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-        TargetRoleId("gripper"), CommandTargetId("gripper"), std::move(frame),
+        {ControllableComponentId("gripper.1"), CommandTargetId("gripper")}, std::move(frame),
         scenario == 2 ? std::vector<ProgramContactGraspBodyBindingDTO>{}
-                      : std::vector<ProgramContactGraspBodyBindingDTO>{body}};
+                      : std::vector<ProgramContactGraspBodyBindingDTO>{body},
+        scenario == 2 ? std::vector<CollisionBodyRoleId>{}
+                      : std::vector<CollisionBodyRoleId>{body.body.collision_body_id}};
     if (scenario == 3) value.motion_endpoint.reset();
     auto binding = verify_runtime_participant_binding(std::move(value));
     ASSERT_TRUE(binding.ok()) << binding.error().message;
@@ -12167,15 +12839,16 @@ TEST(ResourceAddressedExecutionKernelTest,
     auto selected_registration = registration(std::move(projected.value()), engine);
     selected_registration.deployment_maximum_tcp_linear_speed_mps = 0.15;
     selected_registration.motion_endpoint_owner = ControllableComponentId("gripper.1");
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {selected_registration}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto intent = motion_operation();
     auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
     motion.speed_profile.max_tcp_linear_speed_mps = scenario == 1 ? 0.1 : 0.25;
     if (scenario != 3) {
-      motion.tcp_endpoint = TcpEntryDTO{ControllableComponentId("gripper.1"),
-                                        CommandTargetId("gripper"), FrameRoleId("finger_center")};
+      motion.tcp_endpoint = TcpEntryReferenceDTO{{ControllableComponentId("gripper.1"), CommandTargetId("gripper")},
+                                               {ControllableComponentId("gripper.1"), FrameRoleId("finger_center")}};
     }
     if (scenario != 1) {
       motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
@@ -12218,14 +12891,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(1234);
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                        std::nullopt, false,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation("request.preview.1");
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
@@ -12247,6 +12921,49 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(journal.calls, std::vector<std::string>{"begin"});
 }
 
+TEST(ResourceAddressedExecutionKernelTest,
+     PreviewReceiptUsesTheActualPreparationTcpCapture) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto registered = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+                   std::nullopt, false,
+                   "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+                   true), engine);
+  std::uint64_t reads = 0U;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.participant_resolver = [&](const OperationIntentDTO&, std::size_t) {
+    auto selected = registered;
+    selected.preview_tcp_capture = PreviewTcpCapture{
+        {{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+         {ControllableComponentId("robot.1"), FrameRoleId("tcp")}},
+        7U, ++reads, PreviewTcpCaptureSource::kActiveTcp};
+    return Result<RuntimeParticipantExecutionRegistration>::Ok(std::move(selected));
+  };
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registered}, clock, scheduler, journal, std::move(config));
+  auto intent = motion_operation("request.preview.capture");
+  const SceneRevision scene{SceneId("sha256:" + std::string(64U, 'a')), 1U,
+                            ContentDigest("sha256:" + std::string(64U, 'b'))};
+  intent.expected_scene_revision = scene;
+  auto session = owner->begin_motion_preview_session(intent);
+  ASSERT_TRUE(session.ok()) << session.error().message;
+  ASSERT_TRUE(session.value()->resolve_binding(intent).ok());
+  const auto earlier_reads = reads;
+  CollisionWorldLeaseInventory inventory{};
+  inventory.projection_binding.projection_revision.scene_revision = scene;
+  inventory.bundle.world = std::make_shared<CollisionWorldSnapshot>();
+  auto result = session.value()->preview_motion(
+      intent, std::move(inventory), RobotStateDTO{{"mf2_joint_1"}, {0.0}, {}});
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().resolved_tcp);
+  EXPECT_GT(reads, earlier_reads);
+  EXPECT_EQ(result.value().resolved_tcp->sequence, reads);
+  EXPECT_EQ(result.value().resolved_tcp->registration_generation, 7U);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, PreviewConflictsUsePhysicalResourcesAndEngine) {
   for (const int scenario : {0, 1, 2}) {
     SCOPED_TRACE(scenario);  // disjoint, same resources, shared engine
@@ -12256,19 +12973,19 @@ TEST(ResourceAddressedExecutionKernelTest, PreviewConflictsUsePhysicalResourcesA
     FakeParticipantEngine second_engine;
     FakeOperationJournal journal;
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto second = scenario == 1 ? second_occurrence_sharing_first_resource(first)
                                       : second_same_type_occurrence(first);
     auto& preview_engine = scenario == 2 ? first_engine : second_engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine), registration(second, preview_engine)}, clock, scheduler,
         journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto active = kernel.execute(motion_operation("active.arm"));
     ASSERT_TRUE(active.ok()) << active.error().message;
     auto preview = motion_operation("preview.other");
     preview.program_binding_id = second.value().program_binding_id;
-    preview.participants.front().component_role_id = second.value().component_role_id;
-    preview.participants.front().target_role_id = second.value().target_role_id;
+    retarget(preview.participants.front(), second.value().controllable_component_id, second.value().command_target_id);
     auto session = kernel.begin_motion_preview_session(preview);
     ASSERT_EQ(session.ok(), scenario == 0) << (session.ok() ? "" : session.error().message);
     if (session.ok()) {
@@ -12286,12 +13003,13 @@ TEST(ResourceAddressedExecutionKernelTest, HeldManualPreviewRechecksContextBetwe
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   const auto capture = program_execution_capture();
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
@@ -12325,10 +13043,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto physical =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto pose = with_planner_capability(physical, "planning.motion.pose_goal");
   const auto cartesian = with_planner_capability(physical, "planning.motion.cartesian_path");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(pose, engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U,
@@ -12341,6 +13059,7 @@ TEST(ResourceAddressedExecutionKernelTest,
             return Result<RuntimeParticipantExecutionRegistration>::Ok(
                 registration(selected, engine));
           }});
+  auto& kernel = *kernel_heap_test_owner;
   auto primary = motion_operation("request.preview.pose");
   auto& primary_motion = std::get<MotionParticipantIntentDTO>(primary.participants.front().payload);
   primary_motion.motion = PoseGoalDTO{Pose3DTO{}};
@@ -12370,11 +13089,12 @@ TEST(ResourceAddressedExecutionKernelTest, RefusesEveryMotionInterruptScopeBefor
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   auto intent = motion_operation("request.interrupt.scope");
   MotionInterruptScopeDTO scope;
@@ -12402,7 +13122,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       FakeParticipantEngine engine;
       FakeOperationJournal journal;
       auto target = registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine);
       target.intrinsic_direct_control = manual;
       OrdinaryMotionJerkPolicy profile{true, {}};
@@ -12415,7 +13135,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                     CellId("cell.test"), 8U};
       config.manager_liveness_required_set = EmptyManagerLivenessSet();
-      ResourceAddressedExecutionKernel kernel({target}, clock, scheduler, journal, config);
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({target}, clock, scheduler, journal, config);
+      auto& kernel = *kernel_heap_test_owner;
       ASSERT_TRUE(ready_cell_admission(kernel).ok());
       auto intent = motion_operation("request.ordinary.jerk");
       auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
@@ -12455,14 +13176,15 @@ TEST(ResourceAddressedExecutionKernelTest, ManualCeilingsApplyAtBothPreviewAndEx
       FakeParticipantEngine engine;
       FakeOperationJournal journal;
       auto target = registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine);
       target.intrinsic_direct_control = manual;
       target.direct_control_joint_limits = {{"joint_1", {0.7, 1.2, std::nullopt}}};
       ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                     CellId("cell.test"), 8U};
       config.manager_liveness_required_set = EmptyManagerLivenessSet();
-      ResourceAddressedExecutionKernel kernel({target}, clock, scheduler, journal, config);
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({target}, clock, scheduler, journal, config);
+      auto& kernel = *kernel_heap_test_owner;
       ASSERT_TRUE(ready_cell_admission(kernel).ok());
       auto intent = motion_operation("request.manual.caps");
       auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
@@ -12502,15 +13224,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine other_engine;
   FakeOperationJournal journal;
   const auto physical =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto pose = with_planner_capability(physical, "planning.motion.pose_goal");
   const auto cartesian = with_planner_capability(physical, "planning.motion.cartesian_path");
   const auto unrelated =
-      make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
+      make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear,
                    ProgramCommandSchemaRefDTO{
                        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
                        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))});
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(pose, primary_engine), registration(unrelated, other_engine)}, clock, scheduler,
       journal,
       ResourceAddressedExecutionKernelConfig{
@@ -12525,6 +13247,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                 is_cartesian ? static_cast<IResolvedParticipantExecutionEngine&>(other_engine)
                              : static_cast<IResolvedParticipantExecutionEngine&>(primary_engine)));
           }});
+  auto& kernel = *kernel_heap_test_owner;
   auto primary = motion_operation("request.preview.engine.pose");
   auto& primary_motion = std::get<MotionParticipantIntentDTO>(primary.participants.front().payload);
   primary_motion.motion = PoseGoalDTO{Pose3DTO{}};
@@ -12551,11 +13274,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation("request.preview.stale");
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
@@ -12572,15 +13296,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                        std::nullopt, false,
                        "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
                        true),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto expect_policy_object_named = [](const ErrorDTO& error) {
     EXPECT_EQ(error.code, "missing_reference");
     EXPECT_EQ(error.details.at("reason"), "contact_grasp_runtime_object_unresolved");
@@ -12615,12 +13340,13 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsResourceRoleSpellingUsedAsASou
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   std::get<JointGoalDTO>(motion.motion).joint_names = {"arm_joints"};
@@ -12635,14 +13361,15 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStalePlannerCapabilityRevision
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
                        std::nullopt, false,
                        "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto result = kernel.execute(motion_operation());
   ASSERT_FALSE(result.ok());
@@ -12654,12 +13381,13 @@ TEST(ResourceAddressedExecutionKernelTest, PreservesAuthoredSourceJointOrderingD
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular, std::nullopt, true),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2", "joint_1"}, {0.4, -0.2}};
@@ -12683,12 +13411,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular, std::nullopt, true),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
   motion.motion = JointGoalDTO{{"joint_2"}, {0.4}};
@@ -12708,12 +13437,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto intent = motion_operation();
 
   const auto first = kernel.execute(intent);
@@ -12739,12 +13469,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto intent = motion_operation("request.acceptance-reply-lost");
   const auto accepted = kernel.execute(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -12780,12 +13511,13 @@ TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAnd
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -12818,11 +13550,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -12833,7 +13566,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   for (int sample = 1; sample <= 1000; ++sample) {
     clock.set(sample * 1'000'000);
     engine.status.progress = sample / 1001.0;
-    engine.runtime_scale.acknowledgement_timestamp_ns = clock.now();
+    engine.UpdateRuntimeScale([&](auto& scale) { scale.acknowledgement_timestamp_ns = clock.now(); });
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
     const auto current = kernel.get_operation_state(accepted.value().operation_id);
     ASSERT_TRUE(current.ok());
@@ -12867,12 +13600,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -12891,12 +13625,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -12914,12 +13649,13 @@ TEST(ResourceAddressedExecutionKernelTest, RejectsStaleEpochBeforeResolutionOrSu
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
 
@@ -12995,9 +13731,13 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
   std::atomic<int> closes{};
   std::atomic<int> opens{};
   std::atomic<bool> actual_owner_proof{};
+  std::shared_ptr<const std::atomic<std::uint64_t>> admission_token;
+  std::uint64_t admission_token_expected{};
   std::atomic<bool> authorization_unsettled{};
   bool reject_delivery{};
   std::atomic_bool refuse_validation{};
+  std::atomic_bool rebuilt_pending{};
+  std::atomic<int> rebuilt_retirements{};
   Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
     if (refuse_validation)
       return Result<void>::Err(ErrorDTO{"actual_prepare_refused", "Actual pneumatic preparation refused", {}});
@@ -13014,6 +13754,8 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
     {
       std::lock_guard lock(mutex);
+      admission_token = request.admission_token;
+      admission_token_expected = request.admission_token_expected;
       actual_owner_proof = request.addressed_identity && request.committed_owner_is_current &&
           request.owner_lifecycle_generation == status.lifecycle_generation &&
           request.committed_owner_is_current(*request.addressed_identity);
@@ -13038,6 +13780,34 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
     std::lock_guard lock(mutex);
     return status;
   }
+  bool rebuilt_unknown_pending(const std::string& id, std::uint64_t command_id,
+                               std::uint64_t generation) const override {
+    std::lock_guard lock(mutex);
+    return rebuilt_pending && status.gripper_id == id && status.command_id == command_id &&
+           status.generation == generation && status.state == GripperCommandState::kExecuting;
+  }
+  std::shared_ptr<const void> rebuilt_unknown_owner(const std::string& id, std::uint64_t command_id,
+                                                    std::uint64_t generation) const override {
+    std::lock_guard lock(mutex);
+    if (!rebuilt_pending || status.gripper_id != id || status.command_id != command_id ||
+        status.generation != generation || status.state != GripperCommandState::kExecuting) return {};
+    return rebuilt_owner;
+  }
+  Result<void> retire_rebuilt_unknown(const std::string& id, std::uint64_t command_id,
+                                      std::uint64_t generation,
+                                      const std::shared_ptr<const void>& expected_owner) override {
+    std::lock_guard lock(mutex);
+    if (!rebuilt_pending || expected_owner != rebuilt_owner || status.gripper_id != id ||
+        status.command_id != command_id || status.generation != generation ||
+        status.state != GripperCommandState::kExecuting)
+      return Result<void>::Err(ErrorDTO{"stale_gripper_state", "stale owner", {}});
+    rebuilt_pending = false;
+    ++rebuilt_retirements;
+    status.state = GripperCommandState::kIdle;
+    ++status.revision;
+    return Result<void>::Ok();
+  }
+  std::shared_ptr<const void> rebuilt_owner = std::make_shared<int>(1);
   std::function<void()> status_read_hook;
   void finish(const bool failed) {
     std::lock_guard lock(mutex);
@@ -13071,6 +13841,215 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
     return Result<void>::Ok();
   }
 };
+
+TEST(ResourceAddressedExecutionKernelTest, RebuiltUnknownGripperJournalsBeforeRetirementAndCloses) {
+  for (const bool measured : {false, true}) {
+    SCOPED_TRACE(measured);
+    FinalPneumaticTestBackend backend;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    GripperParticipantEngine gripper(backend, clock);
+    GripperOwnerRecoveryEvidence evidence;
+    evidence.owner = backend.rebuilt_owner;
+    evidence.mode = measured ? GripperOwnerRecoveryProofMode::kMeasured
+                             : GripperOwnerRecoveryProofMode::kNoFeedback;
+    evidence.first_sequence = 2U;
+    evidence.joint_order_token = "gripper-joint";
+    ObservedStateEvidenceDTO sample;
+    sample.sequence = 1U;
+    sample.sampled_at_ns = clock.now();
+    sample.freshness_budget_ns = 1'000'000'000;
+    sample.complete = true;
+    sample.at_rest = true;
+    sample.joint_order_token = "gripper-joint";
+    sample.source_identity = "measured.gripper";
+    sample.authority_profile = "measured";
+    sample.measured_authority = true;
+    if (measured) evidence.sample = sample;
+    gripper.InstallGripperOwnerRecoverySource([&](const auto&, auto, auto, const auto&) {
+      return std::optional<GripperOwnerRecoveryEvidence>(evidence);
+    });
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
+                                                       CoordinateKind::kLinear, schema), gripper);
+    auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {row}, clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *owner;
+    const auto accepted = kernel.execute(command_operation(measured ? "rebuild.gripper.measured" : "rebuild.gripper.no-feedback"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    backend.rebuilt_pending = true;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    auto state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    ASSERT_EQ(state.value().state, OperationStateKind::kInterventionRequired);
+    ASSERT_EQ(state.value().participants.size(), 1U);
+    ASSERT_TRUE(state.value().participants.front().terminal_fact);
+    EXPECT_EQ(state.value().participants.front().terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+    if (measured) {
+      EXPECT_EQ(backend.rebuilt_retirements, 0);
+      sample.sequence = 2U;
+      sample.at_rest = false;
+      evidence.sample = sample;
+      gripper.AdvanceGripperOwnerRecovery();
+      EXPECT_EQ(backend.rebuilt_retirements, 0);
+      sample.sequence = 3U;
+      sample.at_rest = true;
+      evidence.sample = sample;
+      gripper.AdvanceGripperOwnerRecovery();
+      EXPECT_EQ(backend.rebuilt_retirements, 0);
+      // A second rebuild cannot use the first owner's partially accumulated proof.
+      backend.rebuilt_owner = std::make_shared<int>(2);
+      clock.advance(210'000'000);
+      sample.sequence = 4U;
+      sample.sampled_at_ns = clock.now();
+      evidence.sample = sample;
+      gripper.AdvanceGripperOwnerRecovery();
+      EXPECT_EQ(backend.rebuilt_retirements, 0);
+      evidence.owner = backend.rebuilt_owner;
+      evidence.first_sequence = 5U;
+      sample.sequence = 5U;
+      evidence.sample = sample;
+      gripper.AdvanceGripperOwnerRecovery();
+      EXPECT_EQ(backend.rebuilt_retirements, 0);
+      clock.advance(210'000'000);
+      sample.sequence = 6U;
+      sample.sampled_at_ns = clock.now();
+      evidence.sample = sample;
+      gripper.AdvanceGripperOwnerRecovery();
+    }
+    EXPECT_EQ(backend.rebuilt_retirements, 1);
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    state = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(state.ok());
+    ASSERT_TRUE(state.value().participants.front().terminal_fact);
+    EXPECT_EQ(state.value().participants.front().terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+    const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    ASSERT_TRUE(projection.ok());
+    ASSERT_TRUE(projection.value().assessment.eligible_close);
+    const auto local = gripper.get_recovery_assessment();
+    EXPECT_EQ(local.reason_code, measured ? kOwnerRebuildObservedAtRest : kOwnerRebuildNoFeedback);
+    const auto& assessment = projection.value().assessment;
+    KernelRecoveryActionRequestDTO request{"rebuild.gripper.close", RecoveryAction::kCloseOperation,
+        "program_runner", assessment.assessment_revision, assessment.control_command_epoch,
+        assessment.execution_id, assessment.stop_certificate_id, assessment.stop_owner_generation,
+        "normal reset", false};
+    const auto closed = kernel.apply_operation_recovery_action(
+        accepted.value().operation_id, projection.value().operation_revision, request);
+    ASSERT_TRUE(closed.ok()) << closed.error().message;
+    ASSERT_TRUE(closed.value().accepted);
+    const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+    ASSERT_TRUE(history.ok());
+    ASSERT_FALSE(history.value().resident);
+    ASSERT_TRUE(history.value().operation.participants.front().terminal_fact);
+    EXPECT_EQ(history.value().operation.participants.front().terminal_fact->effect, ParticipantEffectKnowledge::kEffectUncertain);
+    EXPECT_EQ(backend.commands, 1);
+    EXPECT_EQ(backend.closes, 0);
+    EXPECT_EQ(backend.opens, 0);
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramResetRetiresExactRebuiltUnknownGripper) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FinalPneumaticTestBackend backend;
+  GripperParticipantEngine gripper(backend, clock);
+  GripperOwnerRecoveryEvidence evidence;
+  evidence.owner = backend.rebuilt_owner;
+  evidence.mode = GripperOwnerRecoveryProofMode::kNoFeedback;
+  gripper.InstallGripperOwnerRecoverySource([&](const auto&, auto, auto, const auto&) {
+    return std::optional<GripperOwnerRecoveryEvidence>(evidence);
+  });
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper.target", "tool.gripper.command",
+                                    CoordinateKind::kLinear, schema);
+  auto row = LogicalGripperRegistration(binding, gripper);
+  ProgramCycleStatusDTO resetting{
+      RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kResetting,
+      ProgramRunId("run.1"), std::nullopt, ContentDigest(test_digest('b')),
+      AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("gripper.reset"),
+                              ContentDigest(test_digest('a')), true, false, std::nullopt}};
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) { return Result<void>::Ok(); };
+  config.cell_admission_program_reset_status_source = [&](const auto, const auto&, const auto&) {
+    return Result<ProgramCycleStatusDTO>::Ok(resetting);
+  };
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *owner;
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  auto capture = program_execution_capture();
+  auto program_binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  const auto& physical = binding.value();
+  program_binding->target_bindings = {{{physical.controllable_component_id, physical.command_target_id}, {}, {}, {},
+      {{physical.resources.front().resource_role_id, {physical.resources.front().resource_id},
+        {physical.resources.front().compiled_resource_name}}}, {}, {}}};
+  capture.binding = std::move(program_binding);
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  table->nodes = {{ProgramNodeInstanceId("grip"), "kernel.operation",
+                   {{{physical.controllable_component_id, physical.command_target_id},
+                     CapabilityId("tool.gripper.command"), true}}}};
+  capture.table = std::move(table);
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
+  auto intent = command_operation("program.gripper.owner-loss");
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("grip"), "grip.attempt.1"};
+  const auto accepted = kernel.execute(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  backend.rebuilt_pending = true;
+  // A mismatched replacement must not use another owner's no-feedback proof.
+  backend.rebuilt_owner = std::make_shared<int>(2);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(backend.rebuilt_retirements, 0);
+  const auto before = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(before.ok());
+  ASSERT_TRUE(before.value().participants.front().terminal_fact);
+  EXPECT_EQ(before.value().participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  const auto& held = parent.value();
+  ASSERT_TRUE(kernel.ReleaseCellAdmissionClaim(
+      {held.intent.owner_role, held.intent.owner_epoch, held.intent.owner_transaction_id,
+       held.intent.request_id, held.intent.request_payload_digest, held.acquired_admission_generation,
+       held.claim_generation,
+       {CellAdmissionSettlementKindDTO::kExplicitReset, ContentDigest(test_digest('2'))}}).ok());
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(
+      {true, resetting, true, 1U, 1U, true, true, 0U, 0U, 0U}).ok());
+  const auto reset_id = ProgramResetClaimRequestId(resetting);
+  ASSERT_TRUE(reset_id.ok());
+  const CellAdmissionClaimIntentDTO reset{
+      CellAdmissionClaimKindDTO::kProgramReset, CellAdmissionOwnerRoleDTO::kProgramRunner,
+      resetting.program_runner_owner_epoch, reset_id.value().value(), reset_id.value(),
+      resetting.accepted_reset->request_payload_digest,
+      kernel.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
+  EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(reset).ok());
+  EXPECT_TRUE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+  evidence.owner = backend.rebuilt_owner;
+  gripper.AdvanceGripperOwnerRecovery();
+  ASSERT_EQ(backend.rebuilt_retirements, 1);
+  const auto acquired = kernel.AcquireCellAdmissionClaim(reset);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  const auto after = kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(after.ok());
+  EXPECT_FALSE(after.value().resident);
+  ASSERT_TRUE(after.value().operation.participants.front().terminal_fact);
+  EXPECT_EQ(after.value().operation.participants.front().terminal_fact,
+            before.value().participants.front().terminal_fact);
+  EXPECT_EQ(backend.commands, 1);
+  EXPECT_EQ(backend.closes, 0);
+  EXPECT_EQ(backend.opens, 0);
+}
 
 TEST(ResourceAddressedExecutionKernelTest,
      GripperResetReportsUnsettledAuthorizationAndRecoversAfterSettlement) {
@@ -13227,18 +14206,22 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticZeroMovingCertificateRetains
     const ProgramCommandSchemaRefDTO schema{
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema), gripper);
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     HeldSettlementCall returned;
     backend.return_hook = returned.Blocker();
     auto execution = std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
     ASSERT_TRUE(returned.Entered());
     EXPECT_TRUE(backend.actual_owner_proof);
+    ASSERT_TRUE(backend.admission_token);
+    EXPECT_EQ(backend.admission_token->load(), backend.admission_token_expected);
     const auto stopped = kernel.full_stop(FullStopIntentDTO{
         {RequestId("pneumatic.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
     ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_EQ(backend.admission_token->load(), backend.admission_token_expected);
     const bool certified = wait_until([&] {
       const auto result = kernel.get_stop_status(stopped.value().stop_id);
       return result.ok() && result.value().stop_certificate.has_value();
@@ -13277,6 +14260,7 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticZeroMovingCertificateRetains
     returned.Release();
     const auto accepted = execution.get();
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_NE(backend.admission_token->load(), backend.admission_token_expected);
     backend.finish(failed_result);
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
     const auto state = kernel.get_operation_state(accepted.value().operation_id);
@@ -13344,11 +14328,12 @@ TEST(ResourceAddressedExecutionKernelTest, StopCertifiesMovingScopeWhilePneumati
     GripperParticipantEngine gripper(backend, clock);
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto motion = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema), "2");
-    ResourceAddressedExecutionKernel kernel({registration(motion, arm), LogicalGripperRegistration(command, gripper)},
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(motion, arm), LogicalGripperRegistration(command, gripper)},
         clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(coordinated_motion_command_operation("mixed.pneumatic"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -13426,11 +14411,12 @@ TEST(ResourceAddressedExecutionKernelTest, MovingSettlementFaultPreservesOwedPne
     GripperParticipantEngine output(backend, clock);
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema), "2");
-    ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
         clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(coordinated_motion_command_operation("moving.fault.owed.output"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -13482,13 +14468,14 @@ TEST(ResourceAddressedExecutionKernelTest, CoordinatedStopBeforeBarrierDisposesR
     else forwarder.prepare_hook = prepare.Blocker();
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema), "2");
     auto ordinary = LogicalGripperRegistration(command, output);
     ordinary.prepared_motion_engine = &forwarder;
-    ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler, default_journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), ordinary}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto executing = std::async(std::launch::async, [&] {
       return kernel.execute(coordinated_motion_command_operation("precommit.stop"));
     });
@@ -13540,11 +14527,12 @@ TEST(ResourceAddressedExecutionKernelTest, ReleasedCoordinatedBarrierDoesNotStra
   arm.execute_return_hook = first_dispatch.Blocker();
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
       CoordinateKind::kLinear, schema), "2");
-  ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
       clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_motion_command_operation("barrier.already.released"));
   });
@@ -13587,8 +14575,14 @@ TEST(ResourceAddressedExecutionKernelTest, ReleasedCoordinatedBarrierDoesNotStra
   backend.finish(false);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
-  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value().participants.back().state,
-            OperationStateKind::kCompleted);
+  // A reconcile pass skips a participant its Stop still owns (the host's
+  // scheduler reconciles periodically), so keep reconciling until it settles.
+  EXPECT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return kernel.get_operation_state(accepted.value().operation_id).value().participants.back().state ==
+           OperationStateKind::kCompleted;
+  })) << static_cast<int>(
+      kernel.get_operation_state(accepted.value().operation_id).value().participants.back().state);
   EXPECT_EQ(backend.closes, 0);
 }
 
@@ -13599,12 +14593,13 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticCallbackReconcilesDuringMovi
   output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto motion = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
       CoordinateKind::kLinear, schema), "2");
   output.gripper_status.gripper_id = command.value().command_target_id.value();
-  ResourceAddressedExecutionKernel kernel({registration(motion, arm), LogicalGripperRegistration(command, output)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(motion, arm), LogicalGripperRegistration(command, output)},
       clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(coordinated_motion_command_operation("mixed.callback"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   arm.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -13630,7 +14625,7 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticCallbackReconcilesDuringMovi
 }
 
 TEST(ResourceAddressedExecutionKernelTest, ComponentStreamHoldRefusesNewCommandsUntilLifted) {
-  // CP9: a `fault`/`blocking` stream that is not live blocks new commands of
+  // A `fault`/`blocking` stream that is not live blocks new commands of
   // its component with the published typed refusal; lifting it re-admits.
   FakeClock clock;
   ManualScheduler scheduler;
@@ -13638,9 +14633,10 @@ TEST(ResourceAddressedExecutionKernelTest, ComponentStreamHoldRefusesNewCommands
   output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
-  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+  const auto command = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto component = command.value().controllable_component_id;
   const ErrorDTO hold{"invalid_state_transition", "Component gripper stream s is stale.",
                       {{"reason", "component_stream_stale"}, {"stream_id", "s"}}};
@@ -13655,7 +14651,7 @@ TEST(ResourceAddressedExecutionKernelTest, ComponentStreamHoldRefusesNewCommands
 }
 
 TEST(ResourceAddressedExecutionKernelTest, CellWideComponentStreamHoldRefusesEveryComponentUntilLifted) {
-  // CP9: a component without motion of its own (a pose source) has no
+  // A component without motion of its own (a pose source) has no
   // commands; its `blocking`/`fault` stream holds new motion cell-wide.
   FakeClock clock;
   ManualScheduler scheduler;
@@ -13663,9 +14659,10 @@ TEST(ResourceAddressedExecutionKernelTest, CellWideComponentStreamHoldRefusesEve
   output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
-  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+  const auto command = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const ControllableComponentId pose_source("isaac_scene_objects");
   const ErrorDTO hold{"invalid_state_transition", "Component isaac_scene_objects stream is stale.",
                       {{"reason", "component_stream_stale"}, {"stream_id", "poses/box/latch"}}};
@@ -13693,9 +14690,10 @@ TEST(ResourceAddressedExecutionKernelTest, ForeignCommandTargetIdentityOrGenerat
     output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
-    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+    const auto command = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
         default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(command_operation("foreign.command"));
     ASSERT_TRUE(accepted.ok());
     const auto exact = output.gripper_status;
@@ -13726,8 +14724,8 @@ TEST(ResourceAddressedExecutionKernelTest, IntrinsicManualPneumaticRemainsIndepe
     GripperParticipantEngine owner(backend, clock);
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    const auto motion = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
     auto direct = LogicalGripperRegistration(command, owner);
     direct.intrinsic_direct_control = true;
     HeldSettlementCall before_entry;
@@ -13735,7 +14733,8 @@ TEST(ResourceAddressedExecutionKernelTest, IntrinsicManualPneumaticRemainsIndepe
     if (accept_before_stop) direct.prepared_motion_engine = &forwarder;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(kernel).ok());
     const auto moving = kernel.execute(motion_operation("manual.peer.arm"));
     ASSERT_TRUE(moving.ok());
@@ -13792,17 +14791,16 @@ namespace {
 ProgramRunExecutionCaptureDTO pneumatic_policy_capture(const RuntimeParticipantBinding& physical) {
   auto capture = program_execution_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  binding->target_role_bindings.front().target_role_id = TargetRoleId("gripper");
-  binding->target_role_bindings.front().command_target_id = physical.value().command_target_id;
-  binding->target_role_bindings.front().controllable_component_id = physical.value().controllable_component_id;
-  binding->target_role_bindings.front().resource_role_bindings = {
+  binding->target_bindings.front().target = {physical.value().controllable_component_id,
+                                            physical.value().command_target_id};
+  binding->target_bindings.front().resource_role_bindings = {
       {physical.value().resources.front().resource_role_id,
        {physical.value().resources.front().resource_id},
        {physical.value().resources.front().compiled_resource_name}}};
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   const std::vector<ProgramNodeTargetEffectDTO> effects{
-      {TargetRoleId("gripper"), CapabilityId("tool.gripper.command"), true},
-      {TargetRoleId("gripper"), CapabilityId("tool.gripper.feedback"), false}};
+      {{ControllableComponentId("robot.1"), CommandTargetId("gripper.target")}, CapabilityId("tool.gripper.command"), true},
+      {{ControllableComponentId("robot.1"), CommandTargetId("gripper.target")}, CapabilityId("tool.gripper.feedback"), false}};
   // Exact source/Behavior fixture: z_root sequence inherit -> c_branch sequence
   // Hold -> a_child,b_sibling gripper.command_position Continue (.01 linear_m).
   table->nodes = {
@@ -13837,11 +14835,12 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticAdmissionMatchesActualBehavi
     GripperParticipantEngine owner(backend, clock);
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
         default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
     const auto ready = kernel.get_program_execution_scope(ProgramRunId("run.1"));
@@ -13880,8 +14879,8 @@ pneumatic_inheritance_matrix_capture(const RuntimeParticipantBinding &physical,
   auto capture = pneumatic_policy_capture(physical);
   auto table = std::make_shared<ProgramExecutionTableDTO>();
   const std::vector<ProgramNodeTargetEffectDTO> effects{
-      {TargetRoleId("gripper"), CapabilityId("tool.gripper.command"), true},
-      {TargetRoleId("gripper"), CapabilityId("tool.gripper.feedback"), false}};
+      {{ControllableComponentId("robot.1"), CommandTargetId("gripper.target")}, CapabilityId("tool.gripper.command"), true},
+      {{ControllableComponentId("robot.1"), CommandTargetId("gripper.target")}, CapabilityId("tool.gripper.feedback"), false}};
   if (fixture == "chain") {
     // Exact real-gripper CapturesBehaviorStopPolicyDefaultsAndCatalogKinds:
     // a_root -> b_composite -> c_decorator(inverter) -> d_leaf(gripper
@@ -13983,14 +14982,15 @@ TEST(ResourceAddressedExecutionKernelTest,
         CommandSchemaRevision(
             std::string(kGripperPositionCommandSchemaRevision))};
     const auto physical =
-        make_binding("gripper", "gripper.target", "tool.gripper.command",
+        make_binding("gripper.target", "tool.gripper.command",
                      CoordinateKind::kLinear, schema);
     ResourceAddressedExecutionKernelConfig config{
         RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {LogicalGripperRegistration(physical, owner)}, clock, scheduler,
         default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     const auto capture =
         pneumatic_inheritance_matrix_capture(physical, test_case.fixture);
@@ -14055,13 +15055,14 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsIntrinsicManualPneumati
   GripperParticipantEngine owner(backend, clock);
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto motion = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   auto direct = LogicalGripperRegistration(command, owner);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto moving = kernel.execute(motion_operation("full.manual.arm"));
   ASSERT_TRUE(moving.ok());
@@ -14083,7 +15084,7 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsIntrinsicManualPneumati
   // Neither unresolved identity nor a moving payload acquires the pneumatic exception.
   auto unknown = manual;
   unknown.request_context.request_id = RequestId("full.manual.unknown");
-  unknown.participants.front().target_role_id = TargetRoleId("unknown");
+  unknown.participants.front().target.command_target_id = CommandTargetId("unknown");
   const auto refused_unknown = kernel.execute(unknown);
   ASSERT_FALSE(refused_unknown.ok());
   EXPECT_EQ(refused_unknown.error().details.at("reason"), "runtime_participant_unavailable");
@@ -14116,14 +15117,15 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopWithoutFaultLeavesMotionAdmis
   FakeParticipantEngine position;
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto motion = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   auto direct = LogicalGripperRegistration(physical, position);
   direct.intrinsic_direct_control = true;
   ASSERT_EQ(position.gripper_actuation_kind("gripper.target"), GripperActuationKind::kPositionCommanded);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto stopped = kernel.full_stop(FullStopIntentDTO{
       {RequestId("full.position.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
@@ -14149,10 +15151,11 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsSourceDerivedContinueWi
   GripperParticipantEngine owner(backend, clock);
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler, default_journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler, default_journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_inheritance_matrix_capture(physical, "root")).ok());
   const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
@@ -14198,7 +15201,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto physical = make_binding("gripper.target", "tool.gripper.command",
                                      CoordinateKind::kLinear, schema);
   auto direct = LogicalGripperRegistration(physical, owner);
   direct.intrinsic_direct_control = true;
@@ -14206,7 +15209,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{
       RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   ASSERT_FALSE(kernel.get_cell_latch().latched);
 
@@ -14266,12 +15270,13 @@ TEST(ResourceAddressedExecutionKernelTest, PreparedPneumaticHoldCancelsBeforeEng
     PreparedGripperForwarder forwarder(owner, before_entry.Blocker());
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
     auto row = LogicalGripperRegistration(physical, owner);
     row.prepared_motion_engine = &forwarder;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
     const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
@@ -14328,12 +15333,13 @@ TEST(ResourceAddressedExecutionKernelTest, EnginePrecommitCancellationRetiresLoc
     PreparedGripperForwarder forwarder(owner, before_entry.Blocker());
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
     auto row = LogicalGripperRegistration(physical, owner);
     row.prepared_motion_engine = &forwarder;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
     const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
@@ -14455,11 +15461,12 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticDefaultHoldAndPositionRetain
                                                                 : GripperActuationKind::kPositionCommanded;
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+    const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, engine)}, clock, scheduler,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(physical, engine)}, clock, scheduler,
         default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     auto capture = pneumatic_policy_capture(physical);
     auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -14486,8 +15493,9 @@ TEST(ResourceAddressedExecutionKernelTest, CapturedPolicyRejectsMalformedClosedP
     FakeParticipantEngine engine;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({registration(make_binding("arm", "arm",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(make_binding("arm",
         "execution.trajectory.execute", CoordinateKind::kAngular), engine)}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     auto capture = program_execution_capture();
     auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -14509,10 +15517,11 @@ TEST(ResourceAddressedExecutionKernelTest, UnconfirmedPneumaticDeliveryIsFinalCo
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
       CoordinateKind::kLinear, schema), gripper);
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto state = kernel.get_operation_state(accepted.value().operation_id);
@@ -14552,11 +15561,12 @@ TEST(ResourceAddressedExecutionKernelTest, FinalPneumaticFailureRemainsFinalWhil
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto first = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto first = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   const auto second = coordinated_occurrence(first, "2");
-  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(first, first_engine),
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(first, first_engine),
       LogicalGripperRegistration(second, second_engine)}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(coordinated_command_operation("pneumatic.two"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   first_backend.finish(true);
@@ -14629,9 +15639,10 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticAcknowledgementDoesNotReopen
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto binding = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
-  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(binding, pneumatic_owner)},
+  const auto binding = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(binding, pneumatic_owner)},
       clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   // A real Position command's existing scoped Stop closes its moving gate.
   GripperCommandRequestDTO position_before;
   position_before.gripper_id = "position.target";
@@ -14726,11 +15737,12 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
     const ProgramCommandSchemaRefDTO schema{
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
                                                         CoordinateKind::kLinear, schema), gripper);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {row}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     HeldSettlementCall dispatch_return;
     if (hold_dispatch_return) backend.return_hook = dispatch_return.Blocker();
     auto executing =
@@ -14760,7 +15772,7 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
         },
         std::chrono::seconds(1)));
     if (hold_dispatch_return) {
-      // Q58 (as `main`): the gripper's Stop is a fire-and-forget cancel; the
+      // As `main`, the gripper's Stop is a fire-and-forget cancel; the
       // Stop does not wait for the still-returning command.
       const bool published = wait_until(
           [&] {
@@ -14791,6 +15803,14 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
     const RemainingStopBudgetDTO budget{stopped.value().stop_id,
                                          attempt->result.request.stop_generation, 0, {}};
     EXPECT_EQ(gripper.TranslateStopStage(attempt->result.request, budget, {}), attempt->result);
+    if (!hold_dispatch_return) {
+      // The command already returned: the local settlement's invalidation
+      // follows the published stage result asynchronously. Fence against
+      // foreign requests only once both invalidations are in.
+      ASSERT_TRUE(wait_until([&] { return backend.invalidations.load() == 2; },
+                             std::chrono::seconds(5)))
+          << backend.invalidations.load();
+    }
     const int fenced_invalidations = backend.invalidations.load();
     for (const bool foreign_goal : {true, false}) {
       auto foreign = attempt->result.request;
@@ -14871,7 +15891,7 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
               GripperCommandState::kExecuting);
     EXPECT_EQ(backend.invalidations.load(), 2);
     backend.return_hook = {};
-    // DX758: failed local fencing is distinct from unavailable cancel data.
+    // Failed local fencing is distinct from unavailable cancel data.
     GripperParticipantEngine unfenced(backend, clock);
     const auto unfenced_preparation = unfenced.PrepareCapabilityCommand(request);
     ASSERT_TRUE(unfenced_preparation.ok());
@@ -14893,7 +15913,222 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
   }
 }
 
-// A ROS action gripper whose cancel terminal arrives after the Stop (Q58).
+// The gripper Stop translation releases the session mutex across the backend
+// invalidation (the ROS cancel request): the kernel's concurrent fence on the
+// same session completes while that invalidation is blocked.
+TEST(ResourceAddressedExecutionKernelTest, GripperStopTranslationDoesNotHoldSessionAcrossInvalidate) {
+  class Backend final : public IGripperCommandBackend {
+   public:
+    mutable std::mutex mutex;
+    GripperCommandStatusDTO status;
+    std::function<void()> invalidate_hook;
+    std::atomic<int> invalidations{};
+    GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
+      std::lock_guard lock(mutex);
+      status.gripper_id = request.gripper_id;
+      status.command_id = 41U;
+      status.generation = 73U;
+      status.state = GripperCommandState::kExecuting;
+      ++status.revision;
+      return {true, 41U, 73U, std::nullopt};
+    }
+    GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+      std::lock_guard lock(mutex);
+      return status;
+    }
+    GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+                                                    std::uint64_t, const std::string&,
+                                                    const std::string&,
+                                                    const std::string&) override {
+      return {};
+    }
+    void invalidate_gripper_commands(GripperInvalidationReason) noexcept override {
+      if (invalidate_hook) invalidate_hook();
+      std::lock_guard lock(mutex);
+      status.state = GripperCommandState::kIdle;
+      ++status.generation;
+      ++status.revision;
+      ++invalidations;
+    }
+    void authorize_gripper_commands() noexcept override {}
+  } backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
+                                                      CoordinateKind::kLinear, schema), gripper);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {row}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
+  auto executing =
+      std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
+  ASSERT_EQ(executing.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  const auto accepted = executing.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+
+  HeldSettlementCall invalidate;
+  backend.invalidate_hook = invalidate.Blocker();
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("gripper.unlocked.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}},
+      StopGeneration(0U),
+      {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(invalidate.Entered());
+
+  // Stop translation is now inside invalidate_gripper_commands.
+  auto fence = std::async(std::launch::async,
+                          [&] { return gripper.fence_addressed_participant_stop(1U); });
+  const bool fenced_while_blocked =
+      fence.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  const bool observed_while_blocked = gripper.ObservePreparedCapabilityCommand(1U).ok();
+  invalidate.Release();
+  EXPECT_TRUE(fenced_while_blocked);
+  EXPECT_TRUE(observed_while_blocked);
+  EXPECT_EQ(fence.get(), AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+
+  ASSERT_TRUE(wait_until(
+      [&] {
+        const auto status = kernel.get_stop_status(stopped.value().stop_id);
+        return status.ok() &&
+               std::any_of(status.value().attempted_stage_results.begin(),
+                           status.value().attempted_stage_results.end(), [](const auto& attempt) {
+                             return attempt.authority ==
+                                        StopStageResultAuthorityDTO::kAuthoritative &&
+                                    attempt.result.outcome ==
+                                        ParticipantStopStageOutcomeDTO::kSucceeded &&
+                                    !attempt.result.error.has_value();
+                           });
+      },
+      std::chrono::seconds(2)));
+  // The recorded translation is replayed for the same stage, with no second
+  // invalidation.
+  const auto stop_readback = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(stop_readback.ok());
+  const auto attempt = std::find_if(
+      stop_readback.value().attempted_stage_results.begin(),
+      stop_readback.value().attempted_stage_results.end(), [](const auto& item) {
+        return item.authority == StopStageResultAuthorityDTO::kAuthoritative &&
+               item.result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded;
+      });
+  ASSERT_NE(attempt, stop_readback.value().attempted_stage_results.end());
+  const RemainingStopBudgetDTO budget{stopped.value().stop_id,
+                                       attempt->result.request.stop_generation, 0, {}};
+  // Physical containment plus the local settlement's invalidation.
+  ASSERT_TRUE(wait_until([&] { return backend.invalidations.load() == 2; },
+                         std::chrono::seconds(5)))
+      << backend.invalidations.load();
+  EXPECT_EQ(gripper.TranslateStopStage(attempt->result.request, budget, {}), attempt->result);
+  EXPECT_EQ(backend.invalidations.load(), 2);
+}
+
+// OD-67 / audit 3.7-3.8: Execute holds submission ordering only through
+// admission. While a gripper dispatch is blocked inside command_gripper (the
+// ROS publish or goal send), the speed control and another admission complete;
+// the setting written meanwhile seeds that admission, and replays stay exact.
+TEST(ResourceAddressedExecutionKernelTest, BlockedGripperDispatchDoesNotHoldSubmissionOrdering) {
+  class Backend final : public IGripperCommandBackend {
+   public:
+    mutable std::mutex mutex;
+    GripperCommandStatusDTO status;
+    std::function<void()> command_hook;
+    std::atomic<int> commands{};
+    GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
+      if (command_hook) command_hook();
+      std::lock_guard lock(mutex);
+      ++commands;
+      status.gripper_id = request.gripper_id;
+      status.command_id = 41U;
+      status.generation = 73U;
+      status.state = GripperCommandState::kExecuting;
+      ++status.revision;
+      return {true, 41U, 73U, std::nullopt};
+    }
+    GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+      std::lock_guard lock(mutex);
+      return status;
+    }
+    GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+                                                    std::uint64_t, const std::string&,
+                                                    const std::string&,
+                                                    const std::string&) override {
+      return {};
+    }
+    void invalidate_gripper_commands(GripperInvalidationReason) noexcept override {
+      std::lock_guard lock(mutex);
+      status.state = GripperCommandState::kIdle;
+      ++status.generation;
+      ++status.revision;
+    }
+    void authorize_gripper_commands() noexcept override {}
+  } backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    arm),
+       LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
+                                               CoordinateKind::kLinear, schema),
+                                  gripper)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
+
+  HeldSettlementCall dispatch;
+  backend.command_hook = dispatch.Blocker();
+  const auto command_intent = command_operation("request.blocked.command");
+  auto commanding = std::async(std::launch::async, [&] { return kernel.execute(command_intent); });
+  ASSERT_TRUE(dispatch.Entered());
+
+  const auto scale_request = runtime_scale_control_request("request.blocked.scale", 0U, 0.4);
+  auto scaling = std::async(std::launch::async,
+                            [&] { return kernel.set_runtime_scale_control(scale_request); });
+  const bool scaled_while_blocked =
+      scaling.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  auto moving = std::async(std::launch::async,
+                           [&] { return kernel.execute(motion_operation("request.blocked.motion")); });
+  const bool admitted_while_blocked =
+      moving.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  dispatch.Release();
+  EXPECT_TRUE(scaled_while_blocked);
+  EXPECT_TRUE(admitted_while_blocked);
+
+  const auto commanded = commanding.get();
+  ASSERT_TRUE(commanded.ok()) << commanded.error().message;
+  const auto scaled = scaling.get();
+  ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+  EXPECT_EQ(scaled.value().control_generation, RuntimeScaleControlGeneration(1U));
+  const auto moved = moving.get();
+  ASSERT_TRUE(moved.ok()) << moved.error().message;
+  EXPECT_NE(moved.value().operation_id, commanded.value().operation_id);
+  // The setting recorded before the motion's admission seeds that motion.
+  ASSERT_TRUE(arm.last_execute.has_value());
+  ASSERT_TRUE(arm.last_execute->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(arm.last_execute->initial_runtime_scale->requested_scale, 0.4);
+  EXPECT_EQ(backend.commands.load(), 1);
+
+  // Replays after the interleaving return the original decisions, with no
+  // second provider command.
+  const auto command_replay = kernel.execute(command_intent);
+  ASSERT_TRUE(command_replay.ok()) << command_replay.error().message;
+  EXPECT_EQ(command_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(command_replay.value().operation_id, commanded.value().operation_id);
+  const auto scale_replay = kernel.set_runtime_scale_control(scale_request);
+  ASSERT_TRUE(scale_replay.ok()) << scale_replay.error().message;
+  EXPECT_EQ(scale_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(scale_replay.value().control_generation, scaled.value().control_generation);
+  EXPECT_EQ(backend.commands.load(), 1);
+}
+
+// A ROS action gripper whose cancel terminal arrives after the Stop.
 // Admission closes on every invalidation and reopens only through
 // try_authorize once that terminal has arrived (b9c5798c).
 class CancelTerminalGripperBackend final : public IGripperCommandBackend {
@@ -14963,11 +16198,12 @@ TEST(ResourceAddressedExecutionKernelTest, GripperFullStopSettlesBeforeItsCancel
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
                                                       CoordinateKind::kLinear, schema), gripper);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {row}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto stopped = kernel.full_stop(FullStopIntentDTO{
@@ -15005,7 +16241,7 @@ TEST(ResourceAddressedExecutionKernelTest, GripperFullStopSettlesBeforeItsCancel
 
 TEST(ResourceAddressedExecutionKernelTest,
      ManualGripperStopRetiresOnlyAfterTheControllerCancelTerminal) {
-  // Q58: the Stop settles before the controller reports the cancelled goal.
+  // The Stop settles before the controller reports the cancelled goal.
   // The automatic manual retirement (Reset) waits for that terminal instead
   // of failing into InterventionRequired.
   CancelTerminalGripperBackend backend;
@@ -15015,7 +16251,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  auto direct = LogicalGripperRegistration(make_binding("gripper", "gripper.target",
+  auto direct = LogicalGripperRegistration(make_binding("gripper.target",
                                                         "tool.gripper.command",
                                                         CoordinateKind::kLinear, schema),
                                            gripper);
@@ -15023,7 +16259,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, default_journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   auto manual = command_operation("manual.cancel.command");
   manual.program_run_id = ProgramRunId("manual.run");
@@ -15068,11 +16305,12 @@ TEST(ResourceAddressedExecutionKernelTest, GripperStopResumeReopensAdmissionAfte
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
                                                       CoordinateKind::kLinear, schema), gripper);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {row}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto before_stop = kernel.get_operation_state(accepted.value().operation_id);
@@ -15161,11 +16399,12 @@ TEST(ResourceAddressedExecutionKernelTest, GripperStopFencesTheActualReleasedBut
     const ProgramCommandSchemaRefDTO schema{
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto row = LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
                                                         CoordinateKind::kLinear, schema), gripper);
     row.prepared_motion_engine = &forwarder;
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto executing = std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
     const bool entered = before_entry.Entered();
     if (!entered) before_entry.Release();
@@ -15221,13 +16460,14 @@ TEST(ResourceAddressedExecutionKernelTest,
     const ProgramCommandSchemaRefDTO schema{
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto binding = command ? make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto binding = command ? make_binding("gripper.target", "tool.gripper.command",
                                                 CoordinateKind::kLinear, schema)
-                                 : make_binding("arm", "arm", "execution.trajectory.execute",
+                                 : make_binding("arm", "execution.trajectory.execute",
                                                 CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, engine)}, clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     HeldSettlementCall prepared_write;
     journal.record_hook = [&, hold_prepared_write = prepared_write.Blocker(),
                            command](std::string_view kind) {
@@ -15264,14 +16504,15 @@ TEST(ResourceAddressedExecutionKernelTest,
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto command =
-      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
                                           CoordinateKind::kLinear, schema),
                              "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(motion, motion_engine), registration(command, command_engine)}, clock,
       scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall dispatch_return, observation_write;
   command_engine.dispatch_prepared_command_hook = dispatch_return.Blocker();
   journal.record_hook = [&, hold_observation_write =
@@ -15330,12 +16571,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -15388,12 +16630,13 @@ TEST(ResourceAddressedExecutionKernelTest, GripperCommandCarriesWaitForDurationO
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("gripper.target", "tool.gripper.command",
                                    CoordinateKind::kLinear, schema),
                       engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(
         with_options({CommandOptionDTO{CommandOptionId("wait_for_duration"), true},
                       CommandOptionDTO{CommandOptionId("command_duration_s"), 0.5}}));
@@ -15406,12 +16649,13 @@ TEST(ResourceAddressedExecutionKernelTest, GripperCommandCarriesWaitForDurationO
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("gripper.target", "tool.gripper.command",
                                    CoordinateKind::kLinear, schema),
                       engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(command_operation());
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     ASSERT_TRUE(engine.last_command.has_value());
@@ -15422,12 +16666,13 @@ TEST(ResourceAddressedExecutionKernelTest, GripperCommandCarriesWaitForDurationO
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("gripper.target", "tool.gripper.command",
                                    CoordinateKind::kLinear, schema),
                       engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto rejected =
         kernel.execute(with_options({CommandOptionDTO{CommandOptionId("wait_for_duration"), 1.0}}));
     ASSERT_FALSE(rejected.ok());
@@ -15452,12 +16697,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
@@ -15508,12 +16754,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     prepare_entered.set_value();
     release_future.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
@@ -15574,12 +16821,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     prepare_entered.set_value();
     release_future.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto executing =
       std::async(std::launch::async, [&] { return kernel.execute(command_operation()); });
@@ -15638,11 +16886,12 @@ TEST(ResourceAddressedExecutionKernelTest,
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_TRUE(preview.ok()) << preview.error().message;
@@ -15665,11 +16914,12 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTa
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_FALSE(preview.ok());
@@ -15707,10 +16957,11 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityPreviewUsesResolvedGripperT
         CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
     FakeOperationJournal journal;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("gripper.target", "tool.gripper.command",
                                    CoordinateKind::kLinear, schema), engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
 
     const auto preview = kernel.preview_capability_command(command_operation());
     ASSERT_TRUE(preview.ok()) << preview.error().message;
@@ -15734,14 +16985,15 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityPreviewAllowsIndependentAct
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-           make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+           make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
            arm),
-       registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+       registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     gripper)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel.execute(motion_operation("active.arm")).ok());
   const auto preview = kernel.preview_capability_command(command_operation("preview.gripper"));
   ASSERT_TRUE(preview.ok()) << preview.error().message;
@@ -15761,12 +17013,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   rejected_engine.next_command_validation = Result<void>::Err(
       ErrorDTO{"gripper_position_limit_violation", "outside retained limits", {}});
   FakeOperationJournal rejected_journal;
-  ResourceAddressedExecutionKernel rejected_kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto rejected_kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     rejected_engine)},
       clock, scheduler, rejected_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& rejected_kernel = *rejected_kernel_heap_test_owner;
   const auto rejected = rejected_kernel.execute(command_operation());
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().code, "gripper_position_limit_violation");
@@ -15777,11 +17030,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("gripper.target", "tool.gripper.command",
                                  CoordinateKind::kLinear, schema),
                     engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(command_operation());
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
 
@@ -15828,12 +17082,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.settlement.first"));
   ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
                              << executed.error().details.at("reason");
@@ -15903,12 +17158,13 @@ TEST(ResourceAddressedExecutionKernelTest,
         ManualScheduler scheduler;
         FakeParticipantEngine engine;
         FakeOperationJournal journal;
-        ResourceAddressedExecutionKernel kernel(
-            {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+        auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+            {registration(make_binding("arm", "execution.trajectory.execute",
                                        CoordinateKind::kAngular),
                           engine)},
             clock, scheduler, journal,
             {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+        auto& kernel = *kernel_heap_test_owner;
         const auto executed = kernel.execute(motion_operation("request.failed-settlement"));
         ASSERT_TRUE(executed.ok()) << executed.error().message;
         if (initial_reset) {
@@ -16057,12 +17313,19 @@ TEST(ResourceAddressedExecutionKernelTest,
       FakeParticipantEngine first_engine, second_engine;
       FakeOperationJournal journal;
       const auto first =
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-      ResourceAddressedExecutionKernel kernel(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
           {registration(first, first_engine),
            registration(coordinated_occurrence(first, "2"), second_engine)},
           clock, scheduler, journal,
           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      auto& kernel = *kernel_heap_test_owner;
+      HeldSettlementCall fault_write;
+      if (initial_reset && fault_write_fails) {
+        journal.SetConcurrentRecordHook([hold = fault_write.Blocker()](std::string_view kind) {
+          if (kind == "state:operation_reset_failed") hold();
+        });
+      }
       const auto executed = kernel.execute(motion_operation("request.scoped-fault"));
       ASSERT_TRUE(executed.ok()) << executed.error().message;
       if (initial_reset) {
@@ -16092,6 +17355,9 @@ TEST(ResourceAddressedExecutionKernelTest,
                                            before.value().operation_revision.value());
       ASSERT_TRUE(
           (initial_reset ? kernel.reset(request) : kernel.acknowledge_completed(request)).ok());
+      if (initial_reset && fault_write_fails) {
+        ASSERT_TRUE(fault_write.Entered());
+      }
       ASSERT_TRUE(wait_until([&] {
         const auto state = kernel.get_operation_state(executed.value().operation_id);
         return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
@@ -16100,12 +17366,20 @@ TEST(ResourceAddressedExecutionKernelTest,
       ASSERT_FALSE(blocked.ok());
       EXPECT_NE(blocked.error().details.at("reason"), "motion_admission_closed");
       if (fault_write_fails) {
-        ASSERT_TRUE(kernel.get_operation_journal_write_fault());
+        if (initial_reset) {
+          EXPECT_FALSE(kernel.get_operation_journal_write_fault());
+          fault_write.Release();
+        }
+        ASSERT_TRUE(wait_until([&] { return kernel.get_operation_journal_write_fault().has_value(); }));
+        const auto fault = kernel.get_operation_journal_write_fault();
+        ASSERT_TRUE(fault.has_value());
+        EXPECT_EQ(fault->write_kind, initial_reset ? "operation_reset_failed"
+                                                   : "operation_acknowledge_completed_failed");
+        EXPECT_EQ(fault->error.code, "operation_journal_test_failure");
       }
       auto disjoint = motion_operation("request.scoped-fault.disjoint");
       disjoint.program_run_id = ProgramRunId("run.2");
-      disjoint.participants.front().component_role_id = ComponentRoleId("robot_2");
-      disjoint.participants.front().target_role_id = TargetRoleId("arm_2");
+      retarget(disjoint.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
       const auto concurrent = kernel.execute(std::move(disjoint));
       ASSERT_TRUE(concurrent.ok()) << concurrent.error().message;
       const auto failed = kernel.get_operation_state(executed.value().operation_id);
@@ -16148,18 +17422,18 @@ TEST(ResourceAddressedExecutionKernelTest, HeldCleanupFaultWriteCannotDelayDisjo
   FakeParticipantEngine first_engine, second_engine;
   FakeOperationJournal journal;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(coordinated_occurrence(first, "2"), second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall fault_write;
   const auto first_operation = kernel.execute(motion_operation("request.held-fault.first"));
   ASSERT_TRUE(first_operation.ok());
   auto other_intent = motion_operation("request.held-fault.other");
   other_intent.program_run_id = ProgramRunId("run.2");
-  other_intent.participants.front().component_role_id = ComponentRoleId("robot_2");
-  other_intent.participants.front().target_role_id = TargetRoleId("arm_2");
+  retarget(other_intent.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
   const auto other = kernel.execute(std::move(other_intent));
   ASSERT_TRUE(other.ok()) << other.error().message;
   second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -16206,12 +17480,13 @@ TEST(ResourceAddressedExecutionKernelTest,
       ManualScheduler scheduler;
       FakeParticipantEngine engine;
       FakeOperationJournal journal;
-      ResourceAddressedExecutionKernel kernel(
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
           {registration(
-              make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+              make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
               engine)},
           clock, scheduler, journal,
           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+      auto& kernel = *kernel_heap_test_owner;
       const auto operation = kernel.execute(motion_operation("request.held-observation"));
       ASSERT_TRUE(operation.ok());
       engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -16227,7 +17502,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       };
       auto observing = std::async(std::launch::async, [&] {
         if (scale_observation) {
-          engine.runtime_scale.applied_scale = 0.6;
+          engine.UpdateRuntimeScale([](auto& scale) { scale.applied_scale = 0.6; });
           return kernel.reconcile_subordinate_state();
         }
         engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
@@ -16291,11 +17566,12 @@ TEST(ResourceAddressedExecutionKernelTest,
         grouped_command_binding().value().command_target_id.value();
     FakeOperationJournal journal;
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine),
          registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation =
         kernel.execute(grouped_motion_commands_operation("request.concurrent-captures"));
     ASSERT_TRUE(operation.ok());
@@ -16357,11 +17633,12 @@ TEST(ResourceAddressedExecutionKernelTest, ThrownObservationWriteReleasesCommitF
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.thrown-capture"));
   ASSERT_TRUE(operation.ok());
   const auto before = kernel.get_operation_state(operation.value().operation_id);
@@ -16377,7 +17654,7 @@ TEST(ResourceAddressedExecutionKernelTest, ThrownObservationWriteReleasesCommitF
   ASSERT_TRUE(fault);
   EXPECT_EQ(fault->write_kind, "subordinate_state_observed");
   const auto captured = journal.states.size();
-  // DX1133 preserves this existing background reconciliation append. Its
+  // This preserves the existing background reconciliation append. Its
   // success does not replace the first retained journal fault fact.
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(journal.states.size(), captured + 1U);
@@ -16395,11 +17672,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine first_engine, second_engine;
     FakeOperationJournal journal;
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto second = coordinated_occurrence(grouped_command_binding(), "2");
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine), registration(second, second_engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     EXPECT_FALSE(kernel.get_operation_journal_write_fault());
     journal.record_hook = [](std::string_view kind) {
       if (kind == "operation_accepted") throw std::runtime_error("admission write threw");
@@ -16449,11 +17727,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
                                    CoordinateKind::kAngular), engine)},
         clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("journal.control-or-scale"));
     ASSERT_TRUE(operation.ok());
     engine.emit_transition(ExecutionState::kPlanning,
@@ -16463,8 +17742,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     const std::string kind = scale ? "runtime_scale_accepted" : "control_accepted";
     journal.fail_next_kind = kind;
     if (scale) {
-      EXPECT_FALSE(kernel.set_runtime_scale(
-          runtime_scale_request("journal.scale.failed", operation.value(), 1U, 0U, 0.5)).ok());
+      // The setting is accepted; applying it to the live operation fails
+      // at its journal write.
+      const auto scaled = kernel.set_runtime_scale_control(
+          runtime_scale_control_request("journal.scale.failed", 0U, 0.5));
+      ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+      EXPECT_FALSE(scaled.value().active_operation_id.has_value());
     } else {
       EXPECT_FALSE(kernel.acknowledge_completed(
           control_request("journal.control.failed", operation.value(), 1U)).ok());
@@ -16520,11 +17803,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
                                    CoordinateKind::kAngular), engine)},
         clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     journal.record_hook = [&](std::string_view kind) {
       if (kind == "operation_accepted") throw std::runtime_error(message);
     };
@@ -16545,10 +17829,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute",
                                  CoordinateKind::kAngular), engine)},
       clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   start_program_motion(kernel);
@@ -16592,10 +17877,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, engine)}, clock, scheduler, journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.recovery-commit"));
     ASSERT_TRUE(operation.ok());
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -16610,22 +17896,23 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                   "test"};
     engine.next_recovery_result =
         KernelRecoveryActionResultDTO{recovery.request_id, recovery.action, true, {}, std::nullopt};
-    const auto scale =
-        runtime_scale_request("request.recovery-commit.scale", operation.value(), 1U, 0U, 0.5);
+    const auto scale = runtime_scale_control_request("request.recovery-commit.scale", 0U, 0.5);
     HeldSettlementCall held;
     if (storage_first) {
       journal.record_hook = [&, hold_held = held.Blocker()](std::string_view kind) {
         if (kind == "runtime_scale_accepted") hold_held();
       };
       auto changing =
-          std::async(std::launch::async, [&] { return kernel.set_runtime_scale(scale); });
+          std::async(std::launch::async, [&] { return kernel.set_runtime_scale_control(scale); });
       EXPECT_TRUE(held.Entered());
       const auto blocked = kernel.apply_operation_recovery_action(operation.value().operation_id,
                                                                   OperationRevision(1U), recovery);
       EXPECT_FALSE(blocked.ok());
       EXPECT_EQ(engine.recovery_action_calls, 0);
       held.Release();
-      EXPECT_TRUE(changing.get().ok());
+      const auto changed = changing.get();
+      ASSERT_TRUE(changed.ok()) << changed.error().message;
+      EXPECT_EQ(changed.value().active_operation_id, operation.value().operation_id);
     } else {
       engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired);
       engine.recovery_action_hook = held.Blocker();
@@ -16634,8 +17921,10 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                       OperationRevision(1U), recovery);
       });
       EXPECT_TRUE(held.Entered());
-      const auto blocked = kernel.set_runtime_scale(scale);
-      EXPECT_FALSE(blocked.ok());
+      // The setting is accepted; the recovering operation refuses it.
+      const auto blocked = kernel.set_runtime_scale_control(scale);
+      ASSERT_TRUE(blocked.ok()) << blocked.error().message;
+      EXPECT_FALSE(blocked.value().active_operation_id.has_value());
       const auto before = kernel.get_operation_state(operation.value().operation_id);
       engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
       EXPECT_EQ(kernel.get_operation_state(operation.value().operation_id).value(), before.value());
@@ -16662,10 +17951,11 @@ TEST(ResourceAddressedExecutionKernelTest, RecoveryCannotRetireAnInitialDispatch
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall held;
   engine.execute_return_hook = held.Blocker();
   const auto intent = motion_operation("request.recovery-dispatch");
@@ -16703,15 +17993,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.reset.aggregate-first"));
   ASSERT_TRUE(first.ok());
   auto second_intent = motion_operation("request.reset.aggregate-second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   ASSERT_TRUE(kernel.execute(second_intent).ok());
   HeldSettlementCall held;
   second_engine.translate_stop_stage_hook = held.Blocker();
@@ -16757,11 +18050,67 @@ TEST(ResourceAddressedExecutionKernelTest, DurableOwnerAdmissionFailureRefusesCo
   FakeOperationJournal journal;
   journal.begin_owner_epoch_error = ErrorDTO{"journal_unavailable", "fixture refusal", {}};
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   EXPECT_THROW((ResourceAddressedExecutionKernel(
-                   {registration(binding, engine)}, clock, scheduler, journal,
+                   {registration(binding, engine)}, clock, journal,
                    {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U})),
                std::runtime_error);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ReleasedSubscriptionCannotDeliverToReusedEngineAddress) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine reused_engine, other_engine;
+  FakeOperationJournal journal;
+  const auto binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto original = registration(binding, reused_engine);
+  // Another component on the same graph revision, so the original can return.
+  const auto other = registration(coordinated_occurrence(binding, "2"), other_engine);
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {original}, clock, scheduler, journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *owner;
+
+  const auto stale_execution_id = reused_engine.next_execution_id;
+  HeldSettlementCall captured;
+  auto dispatch = std::async(std::launch::async, [&] {
+    reused_engine.emit_transition_after_callback_capture(
+        ExecutionState::kPlanning, ExecutionState::kCompleted, captured.Blocker());
+  });
+  // Release even if a later assertion fails, before the future joins.
+  struct ReleaseGate { HeldSettlementCall& gate; ~ReleaseGate() { gate.Release(); } } release{captured};
+  ASSERT_TRUE(captured.Entered());
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(route_configuration_for(other), {other}).ok());
+  ::testing::internal::CaptureStderr();
+  const auto released = wait_until([&] { return kernel.release_retired_engine(&reused_engine).ok(); });
+  const auto release_log = ::testing::internal::GetCapturedStderr();
+  ASSERT_TRUE(released);
+  EXPECT_NE(release_log.find("\"event\":\"retired_engine_subscription_release\""), std::string::npos);
+  EXPECT_NE(release_log.find("\"component_id\":\"" + binding.value().controllable_component_id.value() + "\""), std::string::npos);
+  EXPECT_NE(release_log.find("\"subscription_sequence_id\":1,\"result\":\"released\""), std::string::npos);
+  ASSERT_EQ(reused_engine.subscription_count(), 0U);
+  const auto republished =
+      kernel.publish_runtime_route_configuration(route_configuration_for(original), {original});
+  ASSERT_TRUE(republished.ok()) << republished.error().message << " " << republished.error().details.at("reason");
+  ASSERT_EQ(reused_engine.subscription_count(), 1U);
+  enable_component_commands(kernel, original);
+  const auto accepted = kernel.execute(motion_operation("request.reused-subscription"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(reused_engine.get_status().execution_id, stale_execution_id);
+  const auto before = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(before.ok());
+  captured.Release();
+  dispatch.get();
+  const auto after = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(after.ok());
+  EXPECT_EQ(after.value(), before.value());
+
+  // The captured and new events use the same fake subordinate execution ID.
+  // A delivery through the new subscription must remain actionable.
+  reused_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  const auto completed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(completed.ok());
+  EXPECT_NE(completed.value(), before.value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResidentCleanupLane) {
@@ -16778,12 +18127,13 @@ TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResident
   retired_engine.reset_effect_hook = record_worker;
   FakeOperationJournal journal;
   const auto original =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto candidate = registration(select_candidate_product(original), current_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(original, retired_engine),
        registration(coordinated_occurrence(original, "2"), unused_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall fault_write;
   const auto executed = kernel.execute(motion_operation("request.retired-cleanup"));
   ASSERT_TRUE(executed.ok());
@@ -16835,6 +18185,51 @@ TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResident
   EXPECT_EQ(current_engine.subscription_count(), 1U);
 }
 
+// OD-72: a speed-effect call runs on a captured engine with no Kernel lock
+// held; it is a lifetime borrow, so engine retirement is refused (and later
+// succeeds) while it runs. The speed change itself is never refused.
+TEST(ResourceAddressedExecutionKernelTest, EngineRetirementWaitsForAnInFlightSpeedEffect) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine, unused_engine, current_engine;
+  FakeOperationJournal journal;
+  const auto original =
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto candidate = registration(select_candidate_product(original), current_engine);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(original, engine),
+       registration(coordinated_occurrence(original, "2"), unused_engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto executed = kernel.execute(motion_operation("request.scale-borrow"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  ASSERT_TRUE(
+      kernel.publish_runtime_route_configuration(route_configuration_for(candidate), {candidate})
+          .ok());
+  ASSERT_FALSE(kernel.participant_engine_in_use(&unused_engine));
+  // The published route now addresses the candidate Program binding; the
+  // control reaches its registered engine and the resident motion's engine.
+  HeldSettlementCall effect;
+  engine.SetRuntimeScaleEffectHook(effect.Blocker());
+  current_engine.SetRuntimeScaleEffectHook(effect.Blocker());
+  auto request = runtime_scale_control_request("request.scale-borrow.scale", 0U, 0.4);
+  request.selector.program_binding_id = candidate.binding.value().program_binding_id;
+  auto scaled = std::async(std::launch::async,
+                           [&] { return kernel.set_runtime_scale_control(request); });
+  ASSERT_TRUE(effect.Entered());
+  const auto busy = kernel.release_retired_engine(&unused_engine);
+  effect.Release();
+  ASSERT_FALSE(busy.ok());
+  EXPECT_EQ(busy.error().details.at("reason"), "operation_control_reconfiguration_busy");
+  const auto accepted = scaled.get();
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.SetRuntimeScaleEffectHook({});
+  current_engine.SetRuntimeScaleEffectHook({});
+  ASSERT_TRUE(wait_until([&] { return kernel.release_retired_engine(&unused_engine).ok(); }));
+  EXPECT_EQ(unused_engine.subscription_count(), 0U);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCleanupEffect) {
   for (const bool reset_returns_first : {false, true}) {
     for (const int reset_result : {0, 1, 2}) {
@@ -16847,12 +18242,13 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
         ManualScheduler scheduler;
         FakeParticipantEngine engine;
         FakeOperationJournal journal;
-        ResourceAddressedExecutionKernel kernel(
-            {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+        auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+            {registration(make_binding("arm", "execution.trajectory.execute",
                                        CoordinateKind::kAngular),
                           engine)},
             clock, scheduler, journal,
             {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+        auto& kernel = *kernel_heap_test_owner;
         HeldSettlementCall reset_effect, stop_settlement;
         const auto executed = kernel.execute(motion_operation("request.overlap-reset"));
         ASSERT_TRUE(executed.ok());
@@ -16935,7 +18331,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
         std::string reconfiguration_error;
         ASSERT_TRUE(wait_until([&] {
           const auto result = kernel.reconfigure_runtime_participants({registration(
-              make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+              make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
               engine)});
           if (!result.ok()) reconfiguration_error = result.error().message;
           return result.ok();
@@ -16946,7 +18342,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
         ASSERT_TRUE(wait_until([&] {
           const auto state = kernel.get_operation_projection(executed.value().operation_id);
           if (!state.ok()) return false;
-          // Q29: a successful Reset completes after any Stop outcome.
+          // A successful Reset completes after any Stop outcome.
           if (!reset_fails) return !state.value().resident;
           if (!state.value().resident ||
               state.value().operation.state != OperationStateKind::kInterventionRequired)
@@ -16963,7 +18359,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldResetAndFullStopHaveOneOrderedCle
             kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
         ASSERT_TRUE(unchanged.ok());
         EXPECT_EQ(unchanged.value(), certificate.value());
-        EXPECT_FALSE(kernel.get_cell_latch().latched);  // Q29
+        EXPECT_FALSE(kernel.get_cell_latch().latched);
       }
     }
   }
@@ -16974,11 +18370,12 @@ TEST(ResourceAddressedExecutionKernelTest, VisibleCleanupFaultAlreadyHasAReusabl
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.control-lane"));
   ASSERT_TRUE(executed.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
@@ -17023,11 +18420,12 @@ TEST(ResourceAddressedExecutionKernelTest, CompletionCleanupCannotOvertakeInitia
       engine.emit_transition(ExecutionState::kPlanning, feedback);
       hold();
     };
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     auto executing = std::async(std::launch::async, [&] {
       return kernel.execute(motion_operation("request.superseded-settlement"));
     });
@@ -17114,11 +18512,12 @@ TEST(ResourceAddressedExecutionKernelTest, SettlementFailureRemainsTraceableAfte
   {
     FakeParticipantEngine engine;
     SqliteOperationJournal journal(database, CellId("cell.test"), 32U);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, {epoch, CellId("cell.test"), 16U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto executed = kernel.execute(motion_operation("request.durable-settlement"));
     ASSERT_TRUE(executed.ok()) << executed.error().message;
     failed_operation = executed.value().operation_id;
@@ -17171,12 +18570,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
                              << executed.error().details.at("reason");
@@ -17218,12 +18618,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kFailed,
@@ -17261,12 +18662,13 @@ TEST(ResourceAddressedExecutionKernelTest, ResetAfterAnInterveningStopResolvesTo
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -17303,12 +18705,13 @@ TEST(ResourceAddressedExecutionKernelTest, ResetWithAnOldRevisionWhileTheStopSet
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -17338,12 +18741,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.reset.executing"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -17384,12 +18788,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = coordinated_occurrence(grouped_command_binding(), "2");
   second_engine.gripper_status.gripper_id = second.value().command_target_id.value();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
       default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto executed =
       kernel.execute(grouped_motion_commands_operation("request.control.coordinated.reset"));
@@ -17424,16 +18829,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine motion_engine;
   FakeParticipantEngine command_engine;
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto command_source = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto command_source = make_binding("gripper.target", "tool.gripper.command",
                                            CoordinateKind::kLinear, schema);
   const auto command = coordinated_occurrence(command_source, "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(motion, motion_engine), registration(command, command_engine)}, clock,
       scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto executed =
       kernel.execute(coordinated_motion_command_operation("request.control.mixed.acknowledge"));
@@ -17475,11 +18881,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     journal_entered.set_value();
     release_future.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.control.blocked-journal"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -17512,11 +18919,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.control.malformed"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -17543,20 +18951,22 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
+  const auto scale_command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(scale_command.has_value());
   EXPECT_EQ(engine.runtime_scale_calls, 1);
-  const auto& exact = *engine.last_runtime_scale_command;
+  const auto& exact = *scale_command;
   EXPECT_EQ(exact.operation_id, executed.value().operation_id);
   EXPECT_EQ(exact.participant_id, executed.value().participant_assignments.front().participant_id);
   EXPECT_EQ(exact.controller_goal_id, engine.last_execute->binding.controller_goal_id);
@@ -17587,16 +18997,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.scale.invalid-observation"));
   ASSERT_TRUE(executed.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
-  const auto good = engine.runtime_scale;
+  const auto good = engine.RuntimeScaleSnapshot();
   const std::vector<std::function<void(RuntimeScaleMechanismStatusDTO&)>> invalidate{
       [](auto& value) { value.acknowledgement_timestamp_ns = -1; },
       [](auto& value) { value.acknowledgement_sequence = 9'007'199'254'740'992ULL; },
@@ -17608,7 +19019,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       [](auto& value) { value.applied_scale = 1.1; },
       [](auto& value) { value.applied_scale = std::numeric_limits<double>::infinity(); }};
   for (const auto& corrupt : invalidate) {
-    corrupt(engine.runtime_scale);
+    engine.UpdateRuntimeScale([&](auto& scale) { corrupt(scale); });
     journal.fail_next_kind = "state:runtime_scale_status_invalid";
     const auto failed_write = kernel.reconcile_subordinate_state();
     ASSERT_FALSE(failed_write.ok());
@@ -17628,7 +19039,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto count = journal.calls.size();
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
     EXPECT_EQ(journal.calls.size(), count);
-    engine.runtime_scale = good;
+    engine.UpdateRuntimeScale([&](auto& scale) { scale = good; });
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
     EXPECT_EQ(kernel.get_runtime_scale(executed.value().operation_id).value().state,
               RuntimeScaleApplicationState::kApplied);
@@ -17641,11 +19052,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.scale.observation"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -17657,8 +19069,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto baseline = records();
   for (std::int64_t sample = 1; sample <= 1000; ++sample) {
     clock.set(sample * 1'000'000);
-    engine.runtime_scale.acknowledgement_timestamp_ns = clock.now();
-    ++engine.runtime_scale.acknowledgement_sequence;
+    engine.UpdateRuntimeScale([&](auto& scale) {
+      scale.acknowledgement_timestamp_ns = clock.now();
+      ++scale.acknowledgement_sequence;
+    });
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   }
   EXPECT_EQ(records(), baseline);
@@ -17666,7 +19080,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(current.ok());
   EXPECT_EQ(current.value().updated_at_ns, clock.now());
   EXPECT_EQ(current.value().participants.front().acknowledgement_sequence,
-            engine.runtime_scale.acknowledgement_sequence);
+            engine.RuntimeScaleSnapshot().acknowledgement_sequence);
 
   // A stale source still creates one failure, not silence or repeated rows.
   clock.set(clock.now() + 100'000'001);
@@ -17679,30 +19093,32 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   }
   EXPECT_EQ(records(), baseline + 1U);
-  engine.runtime_scale.acknowledgement_timestamp_ns = clock.now();
-  ++engine.runtime_scale.acknowledgement_sequence;
+  engine.UpdateRuntimeScale([&](auto& scale) {
+    scale.acknowledgement_timestamp_ns = clock.now();
+    ++scale.acknowledgement_sequence;
+  });
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 2U);
 
   // Operation progress remains current but is not a scaler audit transition.
-  engine.runtime_scale.virtual_trajectory_time_s = 0.5;
+  engine.UpdateRuntimeScale([](auto& scale) { scale.virtual_trajectory_time_s = 0.5; });
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 2U);
   current = kernel.get_runtime_scale(executed.value().operation_id);
   ASSERT_TRUE(current.ok());
   EXPECT_DOUBLE_EQ(current.value().participants.front().virtual_trajectory_time_s, 0.5);
-  engine.runtime_scale.applied_scale = 0.6;
+  engine.UpdateRuntimeScale([](auto& scale) { scale.applied_scale = 0.6; });
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 3U);
 
   // Failed reads are an episode too; a recovered current sample is recorded.
-  const auto command = engine.last_runtime_scale_command;
-  engine.last_runtime_scale_command.reset();
+  const auto command = engine.RuntimeScaleCommandSnapshot();
+  engine.SetRuntimeScaleCommand(std::nullopt);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 4U);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 4U);
-  engine.last_runtime_scale_command = command;
+  engine.SetRuntimeScaleCommand(command);
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(records(), baseline + 5U);
 }
@@ -17713,12 +19129,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   clock.set(1234);
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto initial = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(initial.ok()) << initial.error().message;
@@ -17752,8 +19169,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(engine.last_execute.has_value());
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
   EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.4);
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.4);
+  const auto scale_command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(scale_command.has_value());
+  EXPECT_DOUBLE_EQ(scale_command->requested_scale, 0.4);
 
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
   const auto acknowledged = kernel.acknowledge_completed(
@@ -17784,12 +19202,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 2U});
+  auto& kernel = *kernel_heap_test_owner;
 
   for (std::uint64_t cycle = 0U; cycle < 8U; ++cycle) {
     const auto executed =
@@ -17814,18 +19233,6 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(control.ok()) << control.error().message;
   }
 
-  const auto active = kernel.execute(motion_operation("request.bounded.scale-operation"));
-  ASSERT_TRUE(active.ok()) << active.error().message;
-  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-  for (std::uint64_t update = 0U; update < 8U; ++update) {
-    const auto status = kernel.get_runtime_scale(active.value().operation_id);
-    ASSERT_TRUE(status.ok()) << status.error().message;
-    const auto accepted = kernel.set_runtime_scale(runtime_scale_request(
-        "request.bounded.scale." + std::to_string(update), active.value(),
-        status.value().operation_revision.value(), status.value().runtime_scale_generation.value(),
-        0.1 * static_cast<double>((update % 8U) + 1U)));
-    ASSERT_TRUE(accepted.ok()) << "update " << update << ": " << accepted.error().message;
-  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -17833,12 +19240,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.scale.control.live-operation"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -17850,8 +19258,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(accepted.value().control_generation, RuntimeScaleControlGeneration(1U));
   ASSERT_TRUE(accepted.value().active_operation_scale_generation.has_value());
   EXPECT_EQ(*accepted.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
+  const auto scale_command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(scale_command.has_value());
+  EXPECT_DOUBLE_EQ(scale_command->requested_scale, 0.25);
 
   const auto status = kernel.get_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(status.ok()) << status.error().message;
@@ -17860,10 +19269,51 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(*status.value().effective_scale, 0.25);
   EXPECT_EQ(status.value().application_state, RuntimeScaleApplicationState::kApplied);
 
-  const auto stale = kernel.set_runtime_scale_control(
+  // OD-72: latest value wins; an outdated expected generation is never
+  // refused.
+  const auto outdated = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.stale", 0U, 0.5));
-  ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().details.at("reason"), "runtime_scale_control_generation_stale");
+  ASSERT_TRUE(outdated.ok()) << outdated.error().message;
+  EXPECT_EQ(outdated.value().control_generation, RuntimeScaleControlGeneration(2U));
+  const auto latest = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(latest.has_value());
+  EXPECT_DOUBLE_EQ(latest->requested_scale, 0.5);
+}
+
+// OD-72: a speed change reaches the participant's ramp target even with no
+// operation resident, ordered by a rising value sequence; a later motion's
+// seed is ordered after it.
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleControlStoresTheLatestValueAtAnIdleParticipant) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
+  ASSERT_TRUE(kernel.set_runtime_scale_control(
+                        runtime_scale_control_request("request.scale.idle.1", 0U, 0.3))
+                  .ok());
+  // An outdated expected generation is not refused (latest value wins).
+  ASSERT_TRUE(kernel.set_runtime_scale_control(
+                        runtime_scale_control_request("request.scale.idle.2", 0U, 0.6))
+                  .ok());
+  const auto stored = engine.StoredRuntimeScaleSettings();
+  ASSERT_EQ(stored.size(), 2U);
+  EXPECT_DOUBLE_EQ(stored[0].first, 0.3);
+  EXPECT_DOUBLE_EQ(stored[1].first, 0.6);
+  EXPECT_GT(stored[1].second, stored[0].second);
+  EXPECT_GT(stored[0].second, 0U);
+  const auto executed = kernel.execute(motion_operation("request.scale.idle.motion"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  const auto dispatched = engine.LastExecuteSnapshot();
+  ASSERT_TRUE(dispatched.has_value());
+  ASSERT_TRUE(dispatched->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(dispatched->initial_runtime_scale->requested_scale, 0.6);
+  EXPECT_GT(dispatched->initial_runtime_scale->value_sequence, stored[1].second);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -17872,19 +19322,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto program_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto direct_control_binding = same_control_scope_program_alias(program_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(program_binding, engine), registration(direct_control_binding, engine)}, clock,
       scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto configured = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.shared", 0U, 0.4));
   ASSERT_TRUE(configured.ok()) << configured.error().message;
   const RuntimeScaleControlSelectorDTO direct_selector{
       direct_control_binding.value().program_binding_id,
-      direct_control_binding.value().component_role_id,
-      direct_control_binding.value().target_role_id};
+      direct_control_binding.value().controllable_component_id,
+      direct_control_binding.value().command_target_id};
   const auto shared_projection = kernel.get_runtime_scale_control(direct_selector);
   ASSERT_TRUE(shared_projection.ok()) << shared_projection.error().message;
   EXPECT_EQ(shared_projection.value().control_generation, RuntimeScaleControlGeneration(1U));
@@ -17894,8 +19345,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   direct.program_id = direct_control_binding.value().program_id;
   direct.program_revision = direct_control_binding.value().program_revision;
   direct.program_binding_id = direct_control_binding.value().program_binding_id;
-  direct.participants.front().component_role_id = direct_control_binding.value().component_role_id;
-  direct.participants.front().target_role_id = direct_control_binding.value().target_role_id;
+  retarget(direct.participants.front(), direct_control_binding.value().controllable_component_id, direct_control_binding.value().command_target_id);
   const auto executed = kernel.execute(direct);
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
@@ -17911,33 +19361,27 @@ TEST(ResourceAddressedExecutionKernelTest,
       runtime_scale_control_request("request.scale.control.shared.live", 1U, 0.25));
   ASSERT_TRUE(retimed.ok()) << retimed.error().message;
   EXPECT_EQ(retimed.value().active_operation_id, executed.value().operation_id);
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
+  const auto scale_command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(scale_command.has_value());
+  EXPECT_DOUBLE_EQ(scale_command->requested_scale, 0.25);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     RuntimeScaleCapabilityDoesNotCreateAnotherPersistentSetting) {
+     RuntimeScaleControlAliasSelectorSharesThePersistentSetting) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  auto scale_value = motion.value();
-  scale_value.capability_id = CapabilityId("execution.runtime_scale.operation_scoped");
-  scale_value.control_path->control_binding_id = ControlBindingId("binding.arm.scale");
-  scale_value.control_path->control_binding_revision = ControlBindingRevision(test_digest('e'));
-  const auto scale = verify_runtime_participant_binding(std::move(scale_value));
-  ASSERT_TRUE(scale.ok()) << scale.error().message;
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto direct_motion = same_control_scope_program_alias(motion);
-  const auto direct_scale = same_control_scope_program_alias(scale.value());
-  ResourceAddressedExecutionKernel kernel(
-      {registration(scale.value(), engine), registration(motion, engine),
-       registration(direct_scale, engine), registration(direct_motion, engine)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(motion, engine), registration(direct_motion, engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const RuntimeScaleControlSelectorDTO direct_selector{direct_motion.value().program_binding_id,
-                                                       direct_motion.value().component_role_id,
-                                                       direct_motion.value().target_role_id};
+                                                       direct_motion.value().controllable_component_id,
+                                                       direct_motion.value().command_target_id};
 
   const auto initial = kernel.get_runtime_scale_control(direct_selector);
   ASSERT_TRUE(initial.ok());
@@ -17960,13 +19404,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
   EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.6);
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
-  const auto active_scale = kernel.get_runtime_scale(executed.value().operation_id);
-  ASSERT_TRUE(active_scale.ok());
-  const auto private_scale = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.alias.operation", executed.value(),
-                            active_scale.value().operation_revision.value(),
-                            active_scale.value().runtime_scale_generation.value(), 0.4));
-  ASSERT_TRUE(private_scale.ok()) << private_scale.error().message;
   const auto persistent = kernel.get_runtime_scale_control(direct_selector);
   ASSERT_TRUE(persistent.ok());
   EXPECT_DOUBLE_EQ(persistent.value().requested_scale, 0.6);
@@ -17975,35 +19412,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     OperationScaleCapabilityAloneDoesNotOwnPersistentScaling) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.runtime_scale.operation_scoped",
-                                 CoordinateKind::kAngular),
-                    engine)},
-      clock, scheduler, default_journal,
-      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
-  const auto status = kernel.get_runtime_scale_control(runtime_scale_control_selector());
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(status.value().supported);
-  EXPECT_TRUE(status.value().frozen);
-  ASSERT_TRUE(status.value().reason.has_value());
-  EXPECT_EQ(status.value().reason->details.at("reason"), "runtime_scale_control_unsupported");
-  const auto set = kernel.set_runtime_scale_control(
-      runtime_scale_control_request("request.scale.no-motion", 0U, 0.4));
-  ASSERT_FALSE(set.ok());
-  EXPECT_EQ(engine.runtime_scale_calls, 0);
-}
-
-TEST(ResourceAddressedExecutionKernelTest,
      RuntimeScaleControlStillRejectsDistinctMotionAuthorities) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto other_value = first.value();
   other_value.control_path->control_binding_id = ControlBindingId("binding.arm.other");
   other_value.control_path->control_binding_revision = ControlBindingRevision(test_digest('e'));
@@ -18013,7 +19427,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   // Do not relax that stronger registration invariant to merge aliases.
   EXPECT_THROW(
       (ResourceAddressedExecutionKernel(
-          {registration(first, engine), registration(other.value(), engine)}, clock, scheduler,
+          {registration(first, engine), registration(other.value(), engine)}, clock,
           default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U})),
       std::invalid_argument);
   EXPECT_EQ(engine.runtime_scale_calls, 0);
@@ -18026,12 +19440,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation("request.scale.control.stop-race"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -18040,10 +19455,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto scale_entered = scale_entered_promise.get_future();
   std::promise<void> release_scale_promise;
   const auto release_scale = release_scale_promise.get_future().share();
-  engine.runtime_scale_effect_hook = [&] {
+  engine.SetRuntimeScaleEffectHook([&] {
     scale_entered_promise.set_value();
     release_scale.wait();
-  };
+  });
   auto scale_future = std::async(std::launch::async, [&] {
     return kernel.set_runtime_scale_control(
         runtime_scale_control_request("request.scale.control.stop-race.update", 0U, 0.4));
@@ -18082,12 +19497,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto configured = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.before-reset", 0U, 0.35));
@@ -18127,57 +19543,27 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(engine.last_execute->initial_runtime_scale->requested_scale, 0.35);
 }
 
-TEST(ResourceAddressedExecutionKernelTest,
-     RuntimeScaleIsGenerationFencedReplaySafeAndZeroIsNotStop) {
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleControlZeroHoldsTheOperationAndIsNotStop) {
   FakeClock clock;
   ManualScheduler scheduler;
   clock.set(10);
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
-  ASSERT_TRUE(executed.ok()) << executed.error().message << ": "
-                             << executed.error().details.at("reason");
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
 
-  const auto first_request =
-      runtime_scale_request("request.scale.1", executed.value(), 1U, 0U, 0.25);
-  const auto first = kernel.set_runtime_scale(first_request);
-  ASSERT_TRUE(first.ok()) << first.error().message;
-  EXPECT_EQ(first.value().runtime_scale_generation, RuntimeScaleGeneration(1U));
-  EXPECT_EQ(engine.runtime_scale_calls, 2);
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_EQ(engine.last_runtime_scale_command->operation_revision, OperationRevision(1U));
-  EXPECT_EQ(engine.last_runtime_scale_command->requested_runtime_scale_generation,
-            RuntimeScaleGeneration(1U));
-  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.25);
-
-  const auto replay = kernel.set_runtime_scale(first_request);
-  ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
-  EXPECT_EQ(engine.runtime_scale_calls, 2);
-
-  auto conflict = first_request;
-  conflict.scale = 0.5;
-  const auto conflicting = kernel.set_runtime_scale(conflict);
-  ASSERT_FALSE(conflicting.ok());
-  EXPECT_EQ(conflicting.error().code, "request_id_conflict");
-  EXPECT_EQ(engine.runtime_scale_calls, 2);
-
-  const auto stale = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.stale", executed.value(), 1U, 0U, 0.5));
-  ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().details.at("reason"), "runtime_scale_generation_stale");
-  EXPECT_EQ(engine.runtime_scale_calls, 2);
-
-  const auto held = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.hold", executed.value(), 1U, 1U, 0.0));
+  const auto held =
+      kernel.set_runtime_scale_control(runtime_scale_control_request("request.scale.hold", 0U, 0.0));
   ASSERT_TRUE(held.ok()) << held.error().message;
-  EXPECT_EQ(held.value().runtime_scale_generation, RuntimeScaleGeneration(2U));
+  EXPECT_EQ(held.value().active_operation_id, executed.value().operation_id);
+  EXPECT_EQ(held.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
   EXPECT_EQ(engine.stop_calls, 0);
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok());
@@ -18189,20 +19575,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(status.value().effective_scale, 0.0);
   ASSERT_EQ(status.value().participants.size(), 1U);
   EXPECT_TRUE(status.value().participants.front().supported);
-  EXPECT_EQ(status.value().participants.front().accepted_generation, RuntimeScaleGeneration(2U));
-
-  // Like Stop, the caller's operation revision is informational: scaling
-  // resolves to the operation's current revision.
-  const auto calls_before_resolved = engine.runtime_scale_calls.load();
-  const auto resolved = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.other-revision", executed.value(), 7U, 2U, 0.5));
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  EXPECT_EQ(resolved.value().operation_revision, OperationRevision(1U));
-  EXPECT_EQ(resolved.value().runtime_scale_generation, RuntimeScaleGeneration(3U));
-  EXPECT_GT(engine.runtime_scale_calls.load(), calls_before_resolved);
-  ASSERT_TRUE(engine.last_runtime_scale_command.has_value());
-  EXPECT_EQ(engine.last_runtime_scale_command->operation_revision, OperationRevision(1U));
-  EXPECT_DOUBLE_EQ(engine.last_runtime_scale_command->requested_scale, 0.5);
+  EXPECT_EQ(status.value().participants.front().accepted_generation, RuntimeScaleGeneration(1U));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -18219,12 +19592,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     stage_entered_promise.set_value();
     release_stage.wait();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -18302,16 +19676,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(stale.value().stop_generation, StopGeneration(3U));
   EXPECT_EQ(engine.stop_calls, 1);
 
-  const auto scaling_after_stop = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.after-stop", executed.value(), 2U, 0U, 0.5));
-  ASSERT_FALSE(scaling_after_stop.ok());
-  EXPECT_EQ(scaling_after_stop.error().details.at("reason"), "runtime_scale_state_invalid");
-  // S1: the revision read before the Stop resolves to the current operation,
-  // whose stopped state still refuses the scale.
-  const auto old_scaling_after_stop = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.old-after-stop", executed.value(), 1U, 0U, 0.5));
-  ASSERT_FALSE(old_scaling_after_stop.ok());
-  EXPECT_EQ(old_scaling_after_stop.error().details.at("reason"), "runtime_scale_state_invalid");
+  // The stopped operation takes no new speed: the setting is retained only.
+  const auto scaling_after_stop = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.after-stop", 0U, 0.5));
+  ASSERT_TRUE(scaling_after_stop.ok()) << scaling_after_stop.error().message;
+  EXPECT_FALSE(scaling_after_stop.value().active_operation_id.has_value());
   EXPECT_EQ(engine.runtime_scale_calls, 1);
 }
 
@@ -18324,12 +19693,13 @@ TEST(ResourceAddressedExecutionKernelTest,
       StopResultDTO{false, ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
                                     "controller rejected Stop",
                                     {{"reason", "controller_stop_rejected"}}}};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine, true)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -18392,16 +19762,17 @@ TEST(ResourceAddressedExecutionKernelTest,
     std::atomic<unsigned> calls{};
     engine.translate_stop_stage_hook = [&] {
       if (calls.fetch_add(1U) == 0U)
-        // Q51: the robot's own controlled deadline (deceleration 1.0 s +
+        // The robot's own controlled deadline (deceleration 1.0 s +
         // 0.5 s) from the Stop request, plus a normal motion's no-report
-        // bound (10 s, M6): the Kernel's watchdog.
+        // bound (10 s): the Kernel's watchdog.
         clock.AdvanceAtNextCallerRead(11'500'000'000 + relative_to_deadline);
     };
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.deadline-result.execute"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     const auto stopped =
@@ -18426,7 +19797,7 @@ TEST(ResourceAddressedExecutionKernelTest,
               expired ? StopStageResultAuthorityDTO::kSupersededLate
                       : StopStageResultAuthorityDTO::kAuthoritative);
     // The deadline watchdog's hard floor contained the motion: a degraded
-    // Stop, never a cell-wide latch (item 25).
+    // Stop, never a cell-wide latch.
     EXPECT_FALSE(kernel.get_cell_latch().latched);
     const auto terminal = kernel.get_operation_state(operation.value().operation_id);
     ASSERT_TRUE(terminal.ok()) << terminal.error().message;
@@ -18452,13 +19823,14 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine engine;
     FakeParticipantEngine unaffected_engine;
     const auto binding =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
     const auto unaffected_binding = second_same_type_occurrence(binding);
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, engine, intermediate),
          registration(unaffected_binding, unaffected_engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     // Release both seams before destroying the Kernel, including assertion failures.
     HeldSettlementCall nominal, strongest;
     if (!timeout)
@@ -18479,8 +19851,8 @@ TEST(ResourceAddressedExecutionKernelTest,
         kernel.stop(stop_request("request.blocked-stage.stop", operation.value(), 1U));
     ASSERT_TRUE(stopped.ok()) << stopped.error().message;
     // The nominal stage's controlled deadline is 1.5 s in the retained fixture
-    // (deceleration 1.0 s + 0.5 s, Q51); its watchdog adds a normal motion's
-    // 10 s no-report bound (M6). The StopControl watchdog observes the
+    // (deceleration 1.0 s + 0.5 s); its watchdog adds a normal motion's
+    // 10 s no-report bound. The StopControl watchdog observes the
     // owner clock and advances
     // to the already-prepared software-hard stage without waiting for the
     // blocked nominal provider lane to return.
@@ -18498,18 +19870,20 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(engine.last_stop_stage->participant_stop_plan.stage_commands.back()
                   .resolved_stage.stage_kind,
               StopEscalationStageKind::kSoftwareHard);
-    // Q57: the hard stage carries no Kernel deadline; its lane bounds it.
+    // The hard stage carries no Kernel deadline; its lane bounds it.
     ASSERT_TRUE(engine.last_stop_budget.has_value());
     EXPECT_FALSE(engine.last_stop_budget->remaining_controlled_deadline_ns.has_value());
     EXPECT_EQ(engine.translate_stop_stage_calls.load(), 2);
     const auto pending = kernel.get_stop_status(stopped.value().stop_id);
     ASSERT_TRUE(pending.ok());
     EXPECT_FALSE(pending.value().stop_certificate.has_value());
-    // Escalating to the hard floor is not a cell-wide Stop fault (item 25):
+    // Escalating to the hard floor is not a cell-wide Stop fault:
     // no latch is published and a disjoint robot stays admissible.
     EXPECT_FALSE(kernel.get_cell_latch().latched);
     auto unaffected_intent = motion_operation("request.blocked-stage.unaffected");
     unaffected_intent.program_binding_id = unaffected_binding.value().program_binding_id;
+    retarget(unaffected_intent.participants.front(), unaffected_binding.value().controllable_component_id,
+             unaffected_binding.value().command_target_id);
     const auto unaffected = kernel.execute(unaffected_intent);
     EXPECT_TRUE(unaffected.ok()) << unaffected.error().message;
     // The rejected nominal call has returned before the strongest lane starts.
@@ -18548,16 +19922,19 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto first = kernel.execute(motion_operation("request.concurrent-stop.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.concurrent-stop.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -18584,7 +19961,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       std::chrono::seconds(10)));
 }
 
-// Q29: a collision on one robot's Stop path ends that operation
+// A collision on one robot's Stop path ends that operation
 // InterventionRequired but no longer latches the cell, so a disjoint robot's
 // prepared motion still dispatches (as `main`, which had no cell latch).
 TEST(ResourceAddressedExecutionKernelTest,
@@ -18594,17 +19971,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine first_engine, second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall nominal, strongest;
   const auto first = kernel.execute(motion_operation("request.fault-gate.first"));
   ASSERT_TRUE(first.ok());
   second_engine.defer_prepare_completion = true;
   auto intent = motion_operation("request.fault-gate.second");
   intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(intent);
   ASSERT_TRUE(second.ok());
   first_engine.translate_stop_stage_hook = [calls = std::make_shared<std::atomic<unsigned>>(0),
@@ -18640,11 +20020,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   clock.set(100);
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.malformed-stop.execute"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
 
@@ -18687,7 +20068,7 @@ TEST(ResourceAddressedExecutionKernelTest,
          status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
 }
 
-// D3: one internal fault per runtime. A repeating throw requests no second
+// One internal fault per runtime. A repeating throw requests no second
 // Full Stop, and motion admission stays closed until restart.
 TEST(ResourceAddressedExecutionKernelTest, InternalFaultStopsOnceAndKeepsMotionClosed) {
   FakeClock clock;
@@ -18696,11 +20077,12 @@ TEST(ResourceAddressedExecutionKernelTest, InternalFaultStopsOnceAndKeepsMotionC
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                            16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   kernel.ContainInternalFault("scheduler_runtime_safety_callback_exception");
   std::optional<StopAcceptedDTO> internal_stop;
@@ -18754,11 +20136,12 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteFaultDoesNotBlockMotion) 
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                            16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   journal.fail_next_kind = "operation_accepted";
   ASSERT_FALSE(kernel.execute(motion_operation("request.journal.rejected")).ok());
@@ -18773,7 +20156,7 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteFaultDoesNotBlockMotion) 
   EXPECT_EQ(fault->write_kind, "operation_accepted");
 }
 
-// ---- Cell latch (CONTRACTS §5, plan R1-R3) ---------------------------------
+// ---- Cell latch --------------------------------------------------------------
 
 [[nodiscard]] FullStopIntentDTO CellLatchFullStop(const std::string& request_id) {
   return FullStopIntentDTO{PublicRequestContextDTO{RequestId(request_id),
@@ -18785,9 +20168,9 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteFaultDoesNotBlockMotion) 
 
 struct CellLatchFixture final {
   CellLatchFixture()
-      : binding(make_binding("arm", "arm", "execution.trajectory.execute",
+      : binding(make_binding("arm", "execution.trajectory.execute",
                              CoordinateKind::kAngular)),
-        kernel({registration(binding, engine)}, clock, scheduler, journal, [] {
+        kernel({registration(binding, engine)}, clock, journal, [] {
           ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                         CellId("cell.test"), 16U};
           config.manager_liveness_required_set = EmptyManagerLivenessSet();
@@ -18825,7 +20208,7 @@ TEST(CellLatchTest, BeforeARunAnUnhealthyComponentDoesNotLatch) {
   const auto latch = fixture.kernel.get_cell_latch();
   EXPECT_FALSE(latch.latched);
   EXPECT_TRUE(latch.causes.empty());
-  // Execute is the components' readiness to block (§10), not the Kernel's.
+  // Execute is the components' readiness to block, not the Kernel's.
   EXPECT_TRUE(fixture.kernel.execute(motion_operation("request.latch.before-run")).ok());
 }
 
@@ -18842,7 +20225,7 @@ TEST(CellLatchTest, AStopWithAComponentInFaultLatchesAndRefusesExecution) {
   ASSERT_TRUE(latch.causes.front().fault.has_value());
   EXPECT_EQ(latch.causes.front().fault->code, FaultCode::kProtectiveStop);
 
-  // R1: manual motion and Program dispatch are refused; Stop stays available.
+  // Manual motion and Program dispatch are refused; Stop stays available.
   const auto motion = fixture.kernel.execute(motion_operation("request.latch.motion"));
   ASSERT_FALSE(motion.ok());
   EXPECT_EQ(motion.error().code, "cell_latched");
@@ -18898,7 +20281,7 @@ TEST(CellLatchTest, AComponentRemovedFromTheCellStopsCounting) {
       {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle),
        CellComponentState("gripper", ComponentLifecycle::kOffline, ComponentActivity::kUnknown)});
   ASSERT_TRUE(fixture.kernel.get_cell_latch().latched);
-  // Close/Apply removed the gripper (R3).
+  // Close/Apply removed the gripper.
   fixture.kernel.observe_component_states(
       {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
   EXPECT_FALSE(fixture.kernel.get_cell_latch().latched);
@@ -18934,7 +20317,7 @@ TEST(CellLatchTest, EveryAcceptedStopCallsTheStopListenerOnce) {
   fixture.Stop("request.latch.listener.stop");
   EXPECT_EQ(calls.load(), 1);
   // The first Stop has ended and its reserve slot is released, so the same
-  // request id is a new accepted Stop and interrupts again (CONTRACTS §2).
+  // request id is a new accepted Stop and interrupts again.
   const auto again = fixture.kernel.full_stop(CellLatchFullStop("request.latch.listener.stop"));
   ASSERT_TRUE(again.ok()) << again.error().message;
   EXPECT_EQ(again.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
@@ -18961,6 +20344,30 @@ TEST(CellLatchTest, AFaultDuringExecutionLatchesWithoutAStop) {
   const auto next = fixture.kernel.execute(motion_operation("request.latch.next"));
   ASSERT_FALSE(next.ok());
   EXPECT_EQ(next.error().code, "cell_latched");
+}
+
+TEST(CellLatchTest, EstopDuringExecutionLatchesUntilStopClears) {
+  CellLatchFixture fixture;
+  fixture.kernel.observe_component_states(
+      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
+  const auto running = fixture.kernel.execute(motion_operation("request.latch.estop.running"));
+  ASSERT_TRUE(running.ok()) << running.error().message;
+  auto stopped = CellComponentState(fixture.Arm(), ComponentLifecycle::kPrepared,
+                                    ComponentActivity::kIdle);
+  stopped.stop = ComponentStop{StopCode::kEstop, "E-stop not cleared", "C2", "Emergency stop", 42};
+  fixture.kernel.observe_component_states({stopped});
+  const auto latch = fixture.kernel.get_cell_latch();
+  ASSERT_TRUE(latch.latched);
+  ASSERT_EQ(latch.causes.size(), 1U);
+  EXPECT_EQ(latch.causes.front().kind, CellLatchCauseKind::kStop);
+  ASSERT_TRUE(latch.causes.front().stop);
+  EXPECT_EQ(latch.causes.front().stop->vendor_code, "C2");
+  const auto refused = fixture.kernel.execute(motion_operation("request.latch.estop.next"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "cell_latched");
+  stopped.stop.reset();
+  fixture.kernel.observe_component_states({stopped});
+  EXPECT_FALSE(fixture.kernel.get_cell_latch().latched);
 }
 
 TEST(CellLatchTest, SeveralCausesAddUpAndAllMustBeResolved) {
@@ -19022,15 +20429,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.aggregate.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -19142,15 +20552,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.aggregate-ordinary.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate-ordinary.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -19212,15 +20625,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.aggregate-two.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.aggregate-two.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -19290,9 +20706,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
@@ -19302,10 +20718,13 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              nullptr,
                                              std::nullopt,
                                              1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.reserve-full.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.reserve-full.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -19354,9 +20773,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
@@ -19366,10 +20785,13 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              nullptr,
                                              std::nullopt,
                                              1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.reuse.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.reuse.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -19417,9 +20839,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   };
 
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
@@ -19429,9 +20851,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              nullptr,
                                              std::nullopt,
                                              1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.projection-reuse.first.execute"));
   auto second_intent = motion_operation("request.projection-reuse.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
 
   std::optional<StopAcceptedDTO> first_stop;
@@ -19502,9 +20927,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   };
 
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
@@ -19516,9 +20941,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              1U,
                                              2U,
                                              1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.projection-capacity.execute.1"));
   auto second_intent = motion_operation("request.projection-capacity.execute.2");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
 
   bool first_projection_started = false;
@@ -19578,11 +21006,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.stop-journal.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   journal.fail_next_kind = "stop_accepted";
@@ -19619,11 +21048,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     journal.fail_next_kind = failed_write;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.terminal-projection.execute"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     const auto stopped =
@@ -19661,14 +21091,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   std::optional<RecoveredStopJournalStateDTO> recovered;
   {
     FakeParticipantEngine predecessor_engine;
     FakeOperationJournal predecessor_journal;
-    ResourceAddressedExecutionKernel predecessor(
+    auto predecessor_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(binding, predecessor_engine)}, clock, scheduler, predecessor_journal,
         {RequestOwnerEpoch("kernel.epoch.old"), CellId("cell.test"), 8U});
+    auto& predecessor = *predecessor_heap_test_owner;
     auto intent = motion_operation("request.recovered-stop.execute");
     intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
     const auto operation = predecessor.execute(intent);
@@ -19701,9 +21132,10 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                              {},
                                                              {},
                                                              {}};
-  ResourceAddressedExecutionKernel replacement(
+  auto replacement_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, replacement_engine)}, clock, scheduler, replacement_journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 8U});
+  auto& replacement = *replacement_heap_test_owner;
   const auto status = replacement.get_stop_status(recovered->accepted.stop_id);
   ASSERT_TRUE(status.ok()) << status.error().message;
   ASSERT_TRUE(status.value().stop_certificate.has_value());
@@ -19733,10 +21165,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     release_journal.wait();
   };
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   auto execution = std::async(std::launch::async, [&] {
     return kernel.execute(motion_operation("request.blocked-journal.execute"));
@@ -19791,15 +21224,16 @@ void VerifyRecognizedFullStopDoesNotWaitForBlockedCellAdmissionJournalWrite(
     release_claim_journal.wait();
   };
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
   config.cell_admission_settlement_validator = [](const auto&, const auto&) {
     return Result<void>::Ok();
   };
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   if (retain_active_resource) {
     const auto executed = kernel.execute(motion_operation("request.active-before-claim"));
     ASSERT_TRUE(executed.ok()) << executed.error().message;
@@ -19881,7 +21315,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("reset.position.1"),
                               ContentDigest(test_digest('a')), false, true, std::nullopt}};
   auto direct = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   direct.intrinsic_direct_control = true;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
@@ -19892,7 +21326,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       pending_position_read.Hold();
     return Result<ProgramCycleStatusDTO>::Ok(resetting);
   };
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto request_id = ProgramResetClaimRequestId(resetting);
   ASSERT_TRUE(request_id.ok());
@@ -19975,7 +21410,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ManagerLivenessRequiredSetDTO liveness{
       CellId("cell.test"),
       RetainedBundleId("bundle.test"),
@@ -19990,8 +21425,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
   config.manager_liveness_required_set = liveness;
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
 
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
@@ -20084,12 +21520,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     release_claim.wait();
   };
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 1U,
@@ -20135,11 +21572,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.blocked-disjoint.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
 
@@ -20153,6 +21591,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   };
   auto second_intent = motion_operation("request.blocked-disjoint.second.execute");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   auto second_execution =
       std::async(std::launch::async, [&] { return kernel.execute(second_intent); });
   const auto entered_status = journal_entered.wait_for(std::chrono::seconds(10));
@@ -20184,15 +21624,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine second_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.reused-for-stop"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("request.reused-for-stop.second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
 
@@ -20210,22 +21653,23 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
-  engine.next_runtime_scale_result =
+  engine.SetRuntimeScaleResult(
       Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
                                  "scale handoff failed",
-                                 {{"reason", "scale_handoff_failed"}}});
+                                 {{"reason", "scale_handoff_failed"}}}));
 
-  const auto accepted = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.failure", executed.value(), 1U, 0U, 0.5));
+  const auto accepted = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.failure", 0U, 0.5));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto failed = kernel.get_runtime_scale(executed.value().operation_id);
   ASSERT_TRUE(failed.ok());
@@ -20235,13 +21679,14 @@ TEST(ResourceAddressedExecutionKernelTest,
             "scale_handoff_failed");
 
   FakeParticipantEngine unsupported_engine;
-  unsupported_engine.runtime_scale.supported = false;
-  ResourceAddressedExecutionKernel unsupported_kernel(
+  unsupported_engine.UpdateRuntimeScale([](auto& scale) { scale.supported = false; });
+  auto unsupported_kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           unsupported_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& unsupported_kernel = *unsupported_kernel_heap_test_owner;
   auto unsupported_intent = motion_operation("request.motion.unsupported");
   const auto unsupported = unsupported_kernel.execute(unsupported_intent);
   ASSERT_TRUE(unsupported.ok()) << unsupported.error().message;
@@ -20261,12 +21706,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   auto direct = motion_operation("request.direct.1");
   direct.participants.front().action_span =
       ActionSpanDTO{ActionSource::kDirectControl, "direct/session.1", "run.1", "", "", ""};
@@ -20303,11 +21749,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.timeline_mutex = &timeline_mutex;
   journal.timeline = &timeline;
   journal.timeline_mutex = &timeline_mutex;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   {
     std::lock_guard lock(timeline_mutex);
     timeline.clear();
@@ -20328,12 +21775,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine rejected_engine;
   FakeOperationJournal failing_journal;
   failing_journal.fail_next_kind = "operation_accepted";
-  ResourceAddressedExecutionKernel failing_kernel(
+  auto failing_kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           rejected_engine)},
       clock, scheduler, failing_journal,
       {RequestOwnerEpoch("kernel.epoch.failure"), CellId("cell.test"), 16U});
+  auto& failing_kernel = *failing_kernel_heap_test_owner;
   auto rejected_intent = motion_operation("request.motion.failure");
   rejected_intent.request_context.request_owner_epoch = RequestOwnerEpoch("kernel.epoch.failure");
   const auto rejected = failing_kernel.execute(rejected_intent);
@@ -20355,11 +21803,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.timeline_mutex = &timeline_mutex;
   journal.timeline = &timeline;
   journal.timeline_mutex = &timeline_mutex;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 32U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto executed = kernel.execute(motion_operation());
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -20368,8 +21817,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     std::lock_guard lock(timeline_mutex);
     timeline.clear();
   }
-  const auto scaled = kernel.set_runtime_scale(
-      runtime_scale_request("request.scale.ordered", executed.value(), 1U, 0U, 0.5));
+  const auto scaled = kernel.set_runtime_scale_control(
+      runtime_scale_control_request("request.scale.ordered", 0U, 0.5));
   ASSERT_TRUE(scaled.ok()) << scaled.error().message;
   {
     std::lock_guard lock(timeline_mutex);
@@ -20435,12 +21884,13 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   FakeParticipantEngine stop_engine;
   FakeOperationJournal stop_journal;
-  ResourceAddressedExecutionKernel stop_kernel(
+  auto stop_kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           stop_engine)},
       clock, scheduler, stop_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& stop_kernel = *stop_kernel_heap_test_owner;
   const auto stop_execution = stop_kernel.execute(motion_operation("request.motion.stop-order"));
   ASSERT_TRUE(stop_execution.ok()) << stop_execution.error().message;
   stop_engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -20460,7 +21910,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto& value = binding.value();
   const auto& control = *value.control_path;
   const OperationId old_operation("operation:old-owner:1");
@@ -20510,9 +21960,10 @@ TEST(ResourceAddressedExecutionKernelTest,
       {},
       {}};
 
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.new"), CellId("cell.test"), 1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto historical = kernel.get_operation_state(old_operation);
   ASSERT_TRUE(historical.ok()) << historical.error().message;
   EXPECT_EQ(historical.value().state, OperationStateKind::kInterventionRequired);
@@ -20541,11 +21992,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto candidate_binding = select_candidate_product(predecessor_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
   ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
@@ -20602,13 +22054,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine peer_engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto peer = coordinated_occurrence(binding, "2");
   const auto first_registration = registration(binding, engine);
   const auto peer_registration = registration(peer, peer_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {first_registration, peer_registration}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto saved_request = runtime_scale_control_request("scale.saved", 0U, 0.4);
   ASSERT_TRUE(kernel.set_runtime_scale_control(saved_request).ok());
   const auto admitted = kernel.execute(motion_operation("motion.before-unknown-route"));
@@ -20638,7 +22091,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.runtime_scale_calls, calls);
 
   auto peer_request = runtime_scale_control_request("scale.peer", 0U, 0.7);
-  peer_request.selector = runtime_scale_control_selector("robot_2", "arm_2");
+  peer_request.selector = runtime_scale_control_selector("robot.2", "arm");
   const auto peer_status = kernel.get_runtime_scale_control(peer_request.selector);
   ASSERT_TRUE(peer_status.ok());
   EXPECT_FALSE(peer_status.value().frozen);
@@ -20679,11 +22132,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto candidate_binding = select_candidate_product(predecessor_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto candidate_registration = registration(candidate_binding, candidate_engine);
 
   const auto reconfigured = kernel.reconfigure_runtime_participants({candidate_registration});
@@ -20750,11 +22204,12 @@ TEST(ResourceAddressedExecutionKernelTest, RouteReadinessNeverGrantsComponentCom
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto registered = registration(binding, engine);
-  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registered}, clock, scheduler, journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto published =
       kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered});
   ASSERT_TRUE(published.ok()) << published.error().message;
@@ -20772,7 +22227,7 @@ TEST(ResourceAddressedExecutionKernelTest, RouteReadinessNeverGrantsComponentCom
   EXPECT_EQ(engine.execute_calls, 1);
 }
 
-// CONTRACTS §2/§6: the execution host publishes the active controller
+// The execution host publishes the active controller
 // configuration after `enable`; commands then follow the component's own
 // state: refused while it reports anything but `enabled`.
 TEST(ResourceAddressedExecutionKernelTest, CommandEligibilityFollowsTheReportedComponentState) {
@@ -20781,11 +22236,12 @@ TEST(ResourceAddressedExecutionKernelTest, CommandEligibilityFollowsTheReportedC
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto registered = registration(binding, engine);
-  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registered}, clock, scheduler, journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto component = binding.value().controllable_component_id;
   ASSERT_TRUE(
       kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered})
@@ -20809,7 +22265,7 @@ TEST(ResourceAddressedExecutionKernelTest, CommandEligibilityFollowsTheReportedC
   EXPECT_EQ(engine.execute_calls, 1);
 }
 
-// SIM-1: a simulated component stays `enabled` while its simulation isn't
+// A simulated component stays `enabled` while its simulation isn't
 // playing (reason `simulation_not_playing`); new commands are refused with
 // that reason, never a latch, and admitted once it plays again.
 TEST(ResourceAddressedExecutionKernelTest, ASimulationNotPlayingRefusesNewCommandsWithItsReason) {
@@ -20818,11 +22274,12 @@ TEST(ResourceAddressedExecutionKernelTest, ASimulationNotPlayingRefusesNewComman
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto registered = registration(binding, engine);
-  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registered}, clock, scheduler, journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto component = binding.value().controllable_component_id;
   ASSERT_TRUE(
       kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered})
@@ -20851,11 +22308,12 @@ TEST(ResourceAddressedExecutionKernelTest, RouteRepublicationNeitherEnablesNorCl
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto registered = registration(binding, engine);
-  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registered}, clock, scheduler, journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto configuration = route_configuration_for(registered);
   ASSERT_TRUE(kernel.publish_runtime_route_configuration(configuration, {registered}).ok());
   const auto component = binding.value().controllable_component_id;
@@ -20878,6 +22336,85 @@ TEST(ResourceAddressedExecutionKernelTest, RouteRepublicationNeitherEnablesNorCl
   EXPECT_EQ(engine.execute_calls, 1);
 }
 
+// OD-65: the pre-started Stop-stage attempt workers follow the cell, not the
+// ceiling: built before the reconfiguration commit, swapped at it, and the
+// retired pool drained after the Kernel locks are released.
+TEST(ResourceAddressedExecutionKernelTest,
+     StopStageAttemptPoolFollowsTheCellUpToItsCeiling) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm_engine;
+  FakeParticipantEngine peer_engine;
+  FakeOperationJournal journal;
+  const auto arm =
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto peer = in_domain_of(
+      make_binding("gripper.target", "tool.gripper.command",
+                   CoordinateKind::kLinear, schema),
+      arm, "robot.2");
+  const auto arm_registration = registration(arm, arm_engine, false, {arm, peer});
+  const auto peer_registration = registration(peer, peer_engine, false, {arm, peer});
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.prequalified_max_live_stop_participants = 2U;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {arm_registration}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
+
+  // One Stop-qualified participant: one participant's lanes, not the ceiling's.
+  EXPECT_EQ(kernel.stop_stage_attempt_pool_participants(), 1U);
+
+  // Growing the cell resizes the pool at the commit.
+  const auto grown = kernel.reconfigure_runtime_participants({arm_registration, peer_registration});
+  ASSERT_TRUE(grown.ok()) << grown.error().message;
+  EXPECT_EQ(kernel.stop_stage_attempt_pool_participants(), 2U);
+
+  // An unchanged cell keeps its pool.
+  const auto same = kernel.reconfigure_runtime_participants({arm_registration, peer_registration});
+  ASSERT_TRUE(same.ok()) << same.error().message;
+  EXPECT_EQ(kernel.stop_stage_attempt_pool_participants(), 2U);
+
+  // Shrinking releases the surplus workers.
+  const auto shrunk = kernel.reconfigure_runtime_participants({arm_registration});
+  ASSERT_TRUE(shrunk.ok()) << shrunk.error().message;
+  EXPECT_EQ(kernel.stop_stage_attempt_pool_participants(), 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     StopStageAttemptPoolNeverGrowsPastItsCeiling) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm_engine;
+  FakeParticipantEngine peer_engine;
+  FakeOperationJournal journal;
+  const auto arm =
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto peer = in_domain_of(
+      make_binding("gripper.target", "tool.gripper.command",
+                   CoordinateKind::kLinear, schema),
+      arm, "robot.2");
+  const auto arm_registration = registration(arm, arm_engine, false, {arm, peer});
+  const auto peer_registration = registration(peer, peer_engine, false, {arm, peer});
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.prequalified_max_live_stop_participants = 1U;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {arm_registration}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
+  ASSERT_EQ(kernel.stop_stage_attempt_pool_participants(), 1U);
+
+  const auto refused = kernel.reconfigure_runtime_participants({arm_registration, peer_registration});
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "stop_stage_attempt_prequalification_exceeded");
+  EXPECT_EQ(kernel.stop_stage_attempt_pool_participants(), 1U);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      SharedDomainEligibilityStaysSpecificToEachComponent) {
   FakeClock clock;
@@ -20886,20 +22423,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine peer_engine;
   FakeOperationJournal journal;
   const auto arm =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   const auto peer = in_domain_of(
-      make_binding("gripper", "gripper.target", "tool.gripper.command",
+      make_binding("gripper.target", "tool.gripper.command",
                    CoordinateKind::kLinear, schema),
       arm, "robot.2");
   const auto arm_registration = registration(arm, arm_engine, false, {arm, peer});
   const auto peer_registration = registration(peer, peer_engine, false, {arm, peer});
-  ResourceAddressedExecutionKernel kernel({arm_registration, peer_registration}, clock, scheduler,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({arm_registration, peer_registration}, clock, scheduler,
                                           journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto published = kernel.publish_runtime_route_configuration(
       route_configuration_for(arm_registration, peer),
       {arm_registration, peer_registration});
@@ -20932,7 +22470,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto binding = make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto binding = make_binding("gripper.target", "tool.gripper.command",
                                     CoordinateKind::kLinear, schema);
   auto gripper_registration = registration(binding, gripper_engine);
   // A gripper-only capability command has no arm motion policy requirement.
@@ -20943,7 +22481,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
   config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
   config.prequalified_max_live_stop_participants = 1U;
-  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto& component = binding.value().controllable_component_id;
   const auto& path = *binding.value().control_path;
@@ -20999,8 +22538,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {unqualified_registration(binding, engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"),
@@ -21008,6 +22547,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              {},
                                              nullptr,
                                              binding.value().graph_revision});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto blocked = kernel.execute(motion_operation("request.motion.bootstrap-closed"));
   ASSERT_FALSE(blocked.ok());
@@ -21045,7 +22585,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.cell_admission_settlement_validator = [](const auto&, const auto&) {
     return Result<void>::Ok();
   };
-  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
 
   const CellAdmissionReadinessSnapshotDTO ready{
       true,
@@ -21065,7 +22606,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(kernel.resource_snapshot().empty());
 
   const auto successor = select_candidate_product(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular));
   const auto installed = kernel.reconfigure_runtime_participants({registration(successor, engine)});
   ASSERT_TRUE(installed.ok()) << installed.error().message;
   EXPECT_EQ(kernel.resource_snapshot().size(), 1U);
@@ -21095,8 +22636,9 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                 CellId("cell.test"), 16U, {}, &gate};
   config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('6'));
   config.empty_runtime_graph_revision = GraphRevision(test_digest('7'));
-  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({}, clock, scheduler, journal,
                                           std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
 
   const ConfigurationFenceScopeDTO scope{};
   ASSERT_TRUE(scope.valid());
@@ -21108,7 +22650,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       *gate.held_fence_id, scope);
   ASSERT_TRUE(installed.ok()) << installed.error().message;
 
-  auto next = make_binding("arm", "arm", "execution.trajectory.execute",
+  auto next = make_binding("arm", "execution.trajectory.execute",
                            CoordinateKind::kAngular).value();
   next.retained_bundle_id = candidate_bundle;
   next.graph_revision = candidate_graph;
@@ -21128,14 +22670,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.mixed-candidate-product");
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = coordinated_occurrence(first_binding, "2");
   const auto first = registration(first_binding, first_engine);
   const auto second = registration(second_binding, second_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {first, second}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
   const auto current_slots = kernel.resource_table_snapshot();
 
   const ConfigurationFenceScopeDTO no_controller_change{};
@@ -21194,8 +22737,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   gate.reject_reservation = false;
   ASSERT_TRUE(kernel.execute(motion_operation("request.original.1")).ok());
   auto peer = motion_operation("request.original.2");
-  peer.participants.front().component_role_id = ComponentRoleId("robot_2");
-  peer.participants.front().target_role_id = TargetRoleId("arm_2");
+  retarget(peer.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
   ASSERT_TRUE(kernel.execute(peer).ok());
   EXPECT_EQ(first_engine.execute_calls, 1);
   EXPECT_EQ(second_engine.execute_calls, 1);
@@ -21212,10 +22754,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('6'));
   config.empty_runtime_graph_revision = GraphRevision(test_digest('7'));
   config.prequalified_max_live_stop_participants = 1U;
-  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto binding = select_candidate_product(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular));
   int commit_calls = 0;
   const auto installed = kernel.reconfigure_runtime_product(
       {unqualified_registration(binding, engine)}, {}, [&]() {
@@ -21240,7 +22783,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto predecessor_configuration =
       route_configuration_for(registration(predecessor_binding, engine));
 
@@ -21256,10 +22799,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto current_binding = verify_runtime_participant_binding(std::move(current_value));
   ASSERT_TRUE(current_binding.ok()) << current_binding.error().message;
 
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {unqualified_registration(current_binding.value(), engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.2"),
                                              CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto adopted = kernel.adopt_runtime_route_configuration_predecessor(
       predecessor_configuration, {unqualified_registration(current_binding.value(), engine)});
   ASSERT_TRUE(adopted.ok()) << adopted.error().message;
@@ -21289,15 +22833,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine candidate_engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto candidate_value = select_candidate_product(predecessor_binding).value();
   candidate_value.control_path->active_control_configuration_id =
       ActiveControlConfigurationId("active.replaced");
   auto sealed_candidate = verify_runtime_participant_binding(std::move(candidate_value));
   ASSERT_TRUE(sealed_candidate.ok()) << sealed_candidate.error().message;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto predecessor = kernel.execute(motion_operation("request.motion.predecessor"));
   ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
 
@@ -21318,10 +22863,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine predecessor_engine;
   FakeOperationJournal journal;
   const auto predecessor_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(predecessor_binding, predecessor_engine)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto reconfigured = kernel.reconfigure_runtime_participants({});
   ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
@@ -21345,15 +22891,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.component-removal");
-  const auto retained_binding = make_binding(
-      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto retained_binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto removed_binding = coordinated_occurrence(retained_binding, "2");
   const auto retained = registration(retained_binding, retained_engine);
   const auto removed = registration(removed_binding, removed_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {retained, removed}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto& removed_path = *removed_binding.value().control_path;
   const ConfigurationFenceScopeDTO scope{
@@ -21411,8 +22957,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.candidate-revision-mismatch");
-  const auto predecessor_binding = make_binding(
-      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto predecessor_binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto candidate_value = predecessor_binding.value();
   candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
   candidate_value.graph_revision = GraphRevision(test_digest('9'));
@@ -21421,10 +22966,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(candidate_binding.ok()) << candidate_binding.error().message;
   const auto predecessor = registration(predecessor_binding, predecessor_engine);
   const auto candidate = registration(candidate_binding.value(), candidate_engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {predecessor}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
   const auto previous_slots = kernel.resource_table_snapshot();
 
   const auto& old_path = *predecessor_binding.value().control_path;
@@ -21463,8 +23009,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.policy-only");
-  const auto predecessor = make_binding(
-      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto predecessor = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto candidate_value = predecessor.value();
   candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
   candidate_value.graph_revision = GraphRevision(test_digest('9'));
@@ -21475,10 +23020,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto candidate_registration = registration(candidate.value(), engine);
   candidate_registration.motion_takeover_preparation_budget_s = 2.5;
   candidate_registration.motion_takeover_planning_budget_s = 1.0;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {predecessor_registration}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
 
   const ConfigurationFenceScopeDTO no_physical_change{};
   gate.held_scope = no_physical_change;
@@ -21499,8 +23045,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.product-reseal");
-  const auto predecessor = make_binding(
-      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto predecessor = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto candidate_value = predecessor.value();
   candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
   candidate_value.graph_revision = GraphRevision(test_digest('9'));
@@ -21509,10 +23054,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
   const auto predecessor_registration = registration(predecessor, engine);
   const auto candidate_registration = registration(candidate.value(), engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {predecessor_registration}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
 
   const ConfigurationFenceScopeDTO no_physical_change{};
   gate.held_scope = no_physical_change;
@@ -21582,8 +23128,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine predecessor_engine, candidate_engine;
   FakeOperationJournal journal;
   FakeResourceAdmissionGate gate;
-  const auto binding = make_binding(
-      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto binding = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto& path = *binding.value().control_path;
   const ConfigurationFenceScopeDTO scope{
       {binding.value().controllable_component_id},
@@ -21594,10 +23139,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   const ConfigurationFenceId fence_id("fence.released-during-preparation");
   gate.held_fence_id = fence_id;
   gate.held_scope = scope;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, predecessor_engine)}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
   const auto previous_slots = kernel.resource_table_snapshot();
   // The subscription is prepared after the initial authority check and before
   // mutation admission. Inject release at this exact boundary, without sleeps.
@@ -21632,7 +23178,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeResourceAdmissionGate gate;
   gate.held_fence_id = ConfigurationFenceId("fence.component-set-commit");
   const auto predecessor =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto candidate_value = predecessor.value();
   candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
   candidate_value.graph_revision = GraphRevision(test_digest('9'));
@@ -21641,10 +23187,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
   const auto predecessor_registration = registration(predecessor, engine);
   const auto candidate_registration = registration(candidate.value(), engine);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {predecessor_registration}, clock, scheduler, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  auto& kernel = *kernel_heap_test_owner;
 
   const ConfigurationFenceScopeDTO unchanged_resources{};
   gate.held_scope = unchanged_resources;
@@ -21697,9 +23244,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
       std::vector<RuntimeParticipantExecutionRegistration>{registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, journal,
+      clock, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                              8U});
   const auto executed = kernel->execute(motion_operation("request.retirement.captured-event"));
@@ -21753,10 +23300,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
       std::vector<RuntimeParticipantExecutionRegistration>{registration(
-          make_binding("arm", "arm", "execution.trajectory.execute",
+          make_binding("arm", "execution.trajectory.execute",
                        CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, journal,
+      clock, journal,
       ResourceAddressedExecutionKernelConfig{
           RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
   const auto executed =
@@ -21804,9 +23351,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
       std::vector<RuntimeParticipantExecutionRegistration>{registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, journal,
+      clock, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                              8U});
   const auto executed = kernel->execute(motion_operation("request.retirement.completion"));
@@ -21882,9 +23429,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
       std::vector<RuntimeParticipantExecutionRegistration>{registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, journal,
+      clock, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                              8U});
   const auto executed = kernel->execute(motion_operation("request.retirement.failure"));
@@ -21941,9 +23488,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   journal.recovery.replaced_unclosed_owner_epoch = RequestOwnerEpoch("kernel.epoch.predecessor");
   auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
       std::vector<RuntimeParticipantExecutionRegistration>{registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
-      clock, scheduler, journal,
+      clock, journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
                                              8U});
   EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "owner_closed"), 0);
@@ -21978,11 +23525,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
   engine.recovery_assessment.allowed_actions = {RecoveryAction::kAcknowledgeAndContinue};
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second = second_same_type_occurrence(first);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, engine), registration(second, other_engine)}, clock, scheduler,
       journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
 
   const auto failed = kernel.execute(motion_operation("request.held.failure"));
   ASSERT_TRUE(failed.ok()) << failed.error().message;
@@ -21996,8 +23544,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
   auto disjoint = motion_operation("preview.disjoint");
   disjoint.program_binding_id = second.value().program_binding_id;
-  disjoint.participants.front().component_role_id = second.value().component_role_id;
-  disjoint.participants.front().target_role_id = second.value().target_role_id;
+  retarget(disjoint.participants.front(), second.value().controllable_component_id, second.value().command_target_id);
   EXPECT_TRUE(kernel.begin_motion_preview_session(disjoint).ok());
   // Preview had no effect: the held failure, its revision and the robot's
   // execution exclusion are unchanged.
@@ -22042,13 +23589,14 @@ TEST(ResourceAddressedExecutionKernelTest, HeldFailureWithDispatchedEffectStillR
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.held.dispatched"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -22062,7 +23610,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldFailureWithDispatchedEffectStillR
   EXPECT_EQ(preview.error().details.at("reason"), "motion_preview_operation_busy");
 }
 
-// --- Operator-alarm motion attention (spec 450 §5.2, spec 530 §11) -------
+// --- Operator-alarm motion attention -----------------------------------------
 
 constexpr Duration kAttentionMaximumAgeNs = 2'000'000'000;
 constexpr const char* kAttentionHostBootId = "boot.test";
@@ -22146,11 +23694,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
 
   ASSERT_TRUE(kernel
                   .PublishOperatorAlarmAttention(attention_snapshot(
@@ -22178,11 +23727,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel
                   .PublishOperatorAlarmAttention(attention_snapshot(
                       1U, {alarm_member("other.robot",
@@ -22192,11 +23742,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   ASSERT_TRUE(disjoint.ok()) << disjoint.error().message;
 
   FakeParticipantEngine second_engine;
-  ResourceAddressedExecutionKernel blocked(
+  auto blocked_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           second_engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& blocked = *blocked_heap_test_owner;
   ASSERT_TRUE(blocked
                   .PublishOperatorAlarmAttention(attention_snapshot(
                       1U, {alarm_member("cell.scope", {})}))
@@ -22218,11 +23769,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   second_engine.next_command_result.command_id = second_engine.next_execution_id;
   second_engine.gripper_status.command_id = second_engine.next_execution_id;
   const auto first =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first, first_engine),
        registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(
       kernel
           .PublishOperatorAlarmAttention(attention_snapshot(
@@ -22248,11 +23800,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   engine.defer_prepare_completion = true;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
   const auto accepted = kernel.execute(motion_operation("alarm.predispatch"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -22307,11 +23860,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
     journal.record_hook = [&, block = held.Blocker()](std::string_view kind) {
       if (kind == "state:subordinate_motion_prepared") block();
     };
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, attention_config());
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
     const auto accepted = kernel.execute(motion_operation("alarm.write.window"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -22355,11 +23909,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
       if (kind == "state:coordinated_prepare_barrier_complete") block();
     };
     const auto first =
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    ResourceAddressedExecutionKernel kernel(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(first, first_engine),
          registration(coordinated_occurrence(grouped_command_binding(), "2"), second_engine)},
         clock, scheduler, journal, attention_config());
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
     const auto accepted = kernel.execute(grouped_motion_commands_operation("alarm.barrier.window"));
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -22395,11 +23950,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   const auto availability = [&](const std::string& request) {
     const auto result = kernel.execute(motion_operation(request));
     EXPECT_FALSE(result.ok());
@@ -22426,11 +23982,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.PublishOperatorAlarmAttention(attention_snapshot(7U));
   ASSERT_TRUE(accepted.ok());
   EXPECT_EQ(accepted.value().owner_epoch, "alarm.owner.1");
@@ -22481,11 +24038,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   const auto epoch = [](std::size_t index) { return "alarm.owner." + std::to_string(index); };
   // Far more than any former retirement bound: every newer incarnation wins.
   constexpr std::size_t kReplacements = 200U;
@@ -22530,11 +24088,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeParticipantEngine engine;
   auto config = attention_config();
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
   ASSERT_TRUE(kernel
@@ -22583,11 +24142,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
   engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryMotionFromCurrentState,
                                                 RecoveryAction::kAcknowledgeAndContinue};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
   const auto accepted = kernel.execute(motion_operation("alarm.recovery.motion"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -22640,25 +24200,26 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeParticipantEngine engine;
   auto config = attention_config();
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   // Robot A's node "move" and robot B's node "move.b" in one captured run.
   auto capture = program_execution_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  auto robot_b = binding->target_role_bindings.front();
-  robot_b.target_role_id = TargetRoleId("arm_b");
+  auto robot_b = binding->target_bindings.front();
+  robot_b.target.component_id = ControllableComponentId("robot.b");
   robot_b.resource_role_bindings.front().resource_ids = {ResourceId("robot.b.joint_1")};
-  binding->target_role_bindings.push_back(std::move(robot_b));
+  binding->target_bindings.push_back(std::move(robot_b));
   capture.binding = std::move(binding);
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
   table->nodes.insert(table->nodes.begin() + 1,
                       {ProgramNodeInstanceId("move.b"),
                        "kernel.operation",
-                       {{TargetRoleId("arm_b"), CapabilityId("execution.trajectory.execute"),
+                       {{{ControllableComponentId("robot.b"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"),
                          true}}});
   table->named_selections = {{"arm", {0U, 1U}}, {"supervision", {2U}}};
   capture.table = std::move(table);
@@ -22713,11 +24274,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     auto direct = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     direct.intrinsic_direct_control = true;
-    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, default_journal,
                                             manual_kernel_config());
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(kernel).ok());
     ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(1U)).ok());
     const auto admitted = kernel.execute(motion_operation("manual.alarm.motion"));
@@ -22739,11 +24301,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
     engine.recovery_assessment.status = RecoveryAssessmentStatus::kActionRequired;
     engine.recovery_assessment.allowed_actions = {RecoveryAction::kRetryMotionFromCurrentState};
     auto direct = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     direct.intrinsic_direct_control = true;
-    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, default_journal,
                                             manual_kernel_config());
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(kernel).ok());
     ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(gating(1U)).ok());
     const auto accepted = kernel.execute(motion_operation("manual.alarm.recovery"));
@@ -22785,11 +24348,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   const OperatorAlarmAttentionConfigurationDTO previous{RetainedBundleId(test_digest('4')),
                                                          GraphRevision(test_digest('5'))};
   const auto fault = alarm_member("arm.fault", {"robot.old.joint_1"});
@@ -22829,11 +24393,12 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, attention_config());
+  auto& kernel = *kernel_heap_test_owner;
   std::vector<OperatorAlarmAttentionMemberDTO> members;
   for (std::size_t index = 0U; index < kMaximumOperatorAlarmAttentionMembers; ++index) {
     auto id = std::to_string(index);
@@ -22866,18 +24431,19 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, CompositionWithoutAlarmO
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel.execute(motion_operation("alarm.unconfigured")).ok());
 }
 
 
-// --- Track 1 step 3: participant facts, Stop-path collisions -----------------
+// --- Participant facts, Stop-path collisions ----------------------------------
 
 [[nodiscard]] ExecutionStatus fact_status(std::uint64_t execution_id, ExecutionState phase,
                                           ParticipantExecutionFact fact) {
@@ -22889,7 +24455,7 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, CompositionWithoutAlarmO
 }
 
 // The addressed Kernel, not the participant, commits operation outcomes from
-// the reported facts. A planning timeout is a planning failure (P2): Failed
+// the reported facts. A planning timeout is a planning failure: Failed
 // participant, InterventionRequired operation, never Stopped.
 TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromParticipantFacts) {
   struct Case {
@@ -22938,11 +24504,12 @@ TEST(ResourceAddressedExecutionKernelTest, AddressedKernelDerivesOutcomesFromPar
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation(std::string("request.fact.") + item.name));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     {
@@ -23004,12 +24571,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall on_path;
   engine.translate_stop_stage_hook = [hold = on_path.Blocker(),
                                       calls = std::make_shared<std::atomic<unsigned>>(0)] {
@@ -23045,7 +24613,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.get_stop_certificate(status.stop_certificate->stop_certificate_id);
   ASSERT_TRUE(certificate.ok());
   EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededEscalated);
-  // Q29: no cell-wide Stop-fault latch (as `main`).
+  // No cell-wide Stop-fault latch (as `main`).
   EXPECT_FALSE(kernel.get_cell_latch().latched);
   const auto state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(state.ok());
@@ -23067,12 +24635,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   HeldSettlementCall spring_back;
   engine.translate_stop_stage_hook = [hold = spring_back.Blocker(),
                                       calls = std::make_shared<std::atomic<unsigned>>(0)] {
@@ -23128,12 +24697,13 @@ TEST(ResourceAddressedExecutionKernelTest, CollisionAfterTerminalStopDoesNotReop
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.late-collision"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -23162,7 +24732,7 @@ TEST(ResourceAddressedExecutionKernelTest, CollisionAfterTerminalStopDoesNotReop
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 }
 
-// Q27 (as `main` EK:8082-8221): Reset while busy runs the deployment's
+// As `main`: Reset while busy runs the deployment's
 // operator Stop profile first and issues the lane's hard stop directly only
 // when no profile is configured; then it completes. Neither is a degraded
 // Stop or an escalation, and neither latches the cell.
@@ -23174,12 +24744,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     auto arm = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     if (!operator_profile) arm.default_operator_stop_profile.reset();
-    ResourceAddressedExecutionKernel kernel({arm}, clock, scheduler, default_journal,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({arm}, clock, scheduler, default_journal,
                                             {RequestOwnerEpoch("kernel.epoch.1"),
                                              CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.reset-busy"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -23215,7 +24786,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 }
 
-// Item 40: when the slider has held a motion at zero for the user-set hold
+// When the slider has held a motion at zero for the user-set hold
 // timeout, the participant reports it and the Kernel ends the operation
 // Stopped with no error through its own Stop (the lane's hard stop), exactly
 // once, like an operator Stop and without a cell-wide latch.
@@ -23223,10 +24794,11 @@ TEST(ResourceAddressedExecutionKernelTest, CloseGuardAllowsIdleInstalledEngineAn
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   EXPECT_TRUE(kernel.participant_engine_in_use(&engine)); // Registration is not motion.
   {
     auto lease = kernel.AcquireCellCloseAdmissionLease();
@@ -23264,10 +24836,11 @@ TEST(ResourceAddressedExecutionKernelTest, CloseGuardRejectsActualUncertainTermi
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
-      {registration(make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("request.close.uncertain"));
   ASSERT_TRUE(accepted.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -23282,28 +24855,29 @@ TEST(ResourceAddressedExecutionKernelTest, CloseGuardRejectsActualUncertainTermi
 
 // 1d: a restart's unclosed predecessor arms the cell latch (shown while a
 // component is unhealthy) and ends by itself once every component reports
-// healthy and idle: its orphan resources are released (R2).
+// healthy and idle: its orphan resources are released.
 TEST(ResourceAddressedExecutionKernelTest, RestartOrphansEndWhenEveryComponentIsHealthyAndIdle) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   journal.recovery.replaced_unclosed_owner_epoch = RequestOwnerEpoch("kernel.epoch.old");
   journal.recovery.unreconciled_resources = {ResourceId("robot.joint_1")};
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_EQ(kernel.resource_snapshot().front().state,
             ResourceSlotState::kUnreconciledExternalOrOrphanGoal);
   ASSERT_FALSE(kernel.execute(motion_operation("request.orphan.blocked")).ok());
-  // Before the first component report, readiness names the restart (R4).
+  // Before the first component report, readiness names the restart.
   const auto awaiting = kernel.ReadExecutionBlocks();
   ASSERT_EQ(awaiting.size(), 1U);
   EXPECT_EQ(awaiting.front().code, "execution_host_restart_awaiting_components");
   const auto arm = binding.value().controllable_component_id.value();
-  // Healthy but busy: no latch cause, so readiness names the restart (R4).
+  // Healthy but busy: no latch cause, so readiness names the restart.
   kernel.observe_component_states(
       {CellComponentState(arm, ComponentLifecycle::kEnabled, ComponentActivity::kBusy)});
   EXPECT_FALSE(kernel.get_cell_latch().latched);
@@ -23328,12 +24902,13 @@ TEST(ResourceAddressedExecutionKernelTest, ZeroSpeedHoldTimeoutEndsTheOperationS
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.zero-hold"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -23377,7 +24952,7 @@ TEST(ResourceAddressedExecutionKernelTest, ZeroSpeedHoldTimeoutEndsTheOperationS
   EXPECT_FALSE(state.value().participants.front().terminal_error.has_value());
   EXPECT_EQ(state.value().active_stop_id, stop_id);
   EXPECT_FALSE(kernel.get_cell_latch().latched);
-  // Q31: recorded as the hold-timeout Stop it requested, never an escalation.
+  // Recorded as the hold-timeout Stop it requested, never an escalation.
   const auto status = kernel.get_stop_status(*stop_id);
   ASSERT_TRUE(status.ok());
   const auto certificate =
@@ -23387,7 +24962,7 @@ TEST(ResourceAddressedExecutionKernelTest, ZeroSpeedHoldTimeoutEndsTheOperationS
   ASSERT_EQ(certificate.value().lane_hard_stop_requested.size(), 1U);
 }
 
-// Q18 on the current backends: a Stop ramp that the controller finished
+// On the current backends, a Stop ramp that the controller finished
 // outside its goal tolerance is `main`'s confirmed-but-not-settled case. The
 // participant ends InterventionRequired and no second Stop command is issued.
 TEST(ResourceAddressedExecutionKernelTest,
@@ -23400,12 +24975,13 @@ TEST(ResourceAddressedExecutionKernelTest,
                       "managed FJT terminal soft-stop goal failed: goal tolerance violated",
                       {{"reason", "stop_goal_tolerance_violated"},
                        {"controller_result_code", "-5"}}}};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto operation = kernel.execute(motion_operation("request.goal-tolerance"));
   ASSERT_TRUE(operation.ok()) << operation.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -23429,11 +25005,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(participant.terminal_error->details.at("emergency_fallback"),
             "not_attempted_controlled_stop_already_confirmed");
   EXPECT_EQ(participant.terminal_error->details.at("hard_stop_transitioned"), "false");
-  // Q29: no cell-wide Stop-fault latch (as `main`).
+  // No cell-wide Stop-fault latch (as `main`).
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 }
 
-// Q33: a hard stop the Stop planner chose as the right Stop ends Stopped with
+// A hard stop the Stop planner chose as the right Stop ends Stopped with
 // no error (main's ros2_control operator path); a hard stop used as a
 // fallback after a failed soft Stop keeps the degraded-Stop error.
 TEST(ResourceAddressedExecutionKernelTest,
@@ -23451,12 +25027,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     engine.translate_stop_stage_hook = [&, calls = std::make_shared<unsigned>(0U)] {
       if ((*calls)++ > 0U) engine.next_stop_result = StopResultDTO{true, std::nullopt};
     };
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto operation = kernel.execute(motion_operation("request.planner-hard"));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -23493,7 +25070,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 // =============================================================================
 // Core robot participant over IExecutionPort as the participant's Stop-stage
-// port behind the real addressed Kernel (shared execution design §4.2, §7.7).
+// port behind the real addressed Kernel.
 // A scripted stock-JTC stand-in drives the fake port: one controller cycle per
 // millisecond of fake time. Until a test starts a Stop it runs on its own
 // thread; from then on it runs in lockstep with the participant's Stop-stage
@@ -23537,7 +25114,7 @@ class ScriptedJtc final {
  public:
   struct Script {
     /// Cycles from a replacement's start until it reports kSucceeded; the
-    /// success hold (cursor 0, reference velocity 0) follows (SX-162/164).
+    /// success hold (cursor 0, reference velocity 0) follows.
     int replacement_cycles{40};
     /// Cycles of cancel braking before the reference reaches zero.
     int cancel_cycles{20};
@@ -23666,7 +25243,7 @@ class ScriptedJtc final {
         break;
       case Mode::kCancel:
         if (factor_.load() == 0.0) {
-          // At factor 0 the cancel trajectory cannot advance (Q35): JTC
+          // At factor 0 the cancel trajectory cannot advance: JTC
           // keeps reporting its frozen state and acknowledges the cancel.
           Sample(cursor_, 0.5 * cursor_, 0.0);
           if (cycle_ == 2) {
@@ -23761,7 +25338,7 @@ struct PortParticipantCell {
     arm.stop_execution_port = participant.get();
     if (!operator_profile) arm.default_operator_stop_profile.reset();
     kernel = std::make_unique<ResourceAddressedExecutionKernel>(
-        std::vector<RuntimeParticipantExecutionRegistration>{arm}, clock, scheduler, journal,
+        std::vector<RuntimeParticipantExecutionRegistration>{arm}, clock, journal,
         ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
                                                CellId("cell.test"), 8U});
   }
@@ -23809,7 +25386,7 @@ struct PortParticipantCell {
   }
 
   RuntimeParticipantBinding binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   FakeClock clock;
   ManualScheduler scheduler;
   FakeOperationJournal journal;
@@ -23878,7 +25455,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(std::get<std::string>(evidence.at("hard_stop_level").value),
               controlled_hard_stop ? "controlled_hard_stop" : "jtc_cancel_decelerate_on_cancel");
     EXPECT_EQ(cell.Calls<JtcPort::CancelCall>().empty(), controlled_hard_stop);
-    // Item 25 / Q33: a fallback hard stop ends Stopped with the degraded-Stop
+    // A fallback hard stop ends Stopped with the degraded-Stop
     // error and no cell-wide latch.
     const auto terminal = cell.kernel->get_operation_state(operation.operation_id);
     ASSERT_TRUE(terminal.ok());
@@ -23899,7 +25476,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(cell.kernel->reset(control_request("request.port.reset", operation, cell.Revision(operation))).ok());
     ASSERT_TRUE(wait_until([&] { return cell.engine.certified_reset_calls.load() == 1; },
                            std::chrono::seconds(10)));
-    // Q27: the operator profile's soft Stop first (a replacement through the
+    // The operator profile's soft Stop first (a replacement through the
     // participant), else the lane's hard stop (level 3 here); no cancel.
     const auto replaces = cell.Calls<JtcPort::ReplaceCall>();
     ASSERT_EQ(replaces.size(), 1U);
@@ -23918,9 +25495,9 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      PortParticipantStopAtAppliedFactorZeroIsThePlainCancelWithoutError) {
-  // Q45: JTC reports an applied factor of exactly 0 at the Stop request: the
+  // JTC reports an applied factor of exactly 0 at the Stop request: the
   // Stop is the plain cancel, finished on factor 0 plus the positive cancel
-  // acknowledgement (Q35), and the motion ends Stopped with no error.
+  // acknowledgement, and the motion ends Stopped with no error.
   PortParticipantCell cell;
   ScriptedJtc jtc(*cell.port, cell.clock, cell.waits, {});
   const auto operation = cell.Execute("request.port.zero.execute");
@@ -23966,10 +25543,10 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      PortParticipantStopDuringARampDownFollowsTheFrozenFactorStop) {
-  // Q45 applies only to an applied 0: while the controller still applies a
-  // non-zero factor (the ramp-down to the last sent 0 in progress) the Stop is
+  // The plain cancel applies only to an applied 0: while the controller still
+  // applies a non-zero factor (the ramp-down to the last sent 0 in progress) the Stop is
   // the normal frozen-factor Stop. Frozen at 0 it cannot be planned, so the
-  // hard-stop fallback ends Stopped with the degraded-Stop error (Q33).
+  // hard-stop fallback ends Stopped with the degraded-Stop error.
   PortParticipantCell cell;
   cell.participant->set_runtime_velocity_scale(0.0);  // last value sent: 0
   ScriptedJtc jtc(*cell.port, cell.clock, cell.waits, {});
@@ -24017,11 +25594,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.cell_admission_settlement_validator = [](const auto&, const auto&) {
     return Result<void>::Ok();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const CellAdmissionClaimIntentDTO old_intent{CellAdmissionClaimKindDTO::kManagerApply,
                                                CellAdmissionOwnerRoleDTO::kManager,
@@ -24165,13 +25743,14 @@ TEST(ResourceAddressedExecutionKernelTest, OrdinaryPrepareFailureAndStopWaitForT
   };
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
       CoordinateKind::kLinear, schema), "2");
   auto ordinary = LogicalGripperRegistration(command, output);
   ordinary.prepared_motion_engine = &forwarder;
-  ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler, journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), ordinary}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_motion_command_operation("failure.waiting.writer"));
   });
@@ -24232,12 +25811,13 @@ TEST(ResourceAddressedExecutionKernelOperatorAlarmTest, ContinueCommandFinalAlar
   };
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   auto registration = LogicalGripperRegistration(physical, output);
   registration.prepared_motion_engine = &forwarder;
   auto config = attention_config();
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({registration}, clock, scheduler, journal, config);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration}, clock, scheduler, journal, config);
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(1U)).ok());
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
@@ -24296,11 +25876,12 @@ TEST(ResourceAddressedExecutionKernelTest, FailedMovingStopDisposesLaterExcluded
   arm.execute_return_hook = first_dispatch.Blocker();
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-  const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  const auto command = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+  const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto command = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
       CoordinateKind::kLinear, schema), "2");
-  ResourceAddressedExecutionKernel kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), LogicalGripperRegistration(command, output)},
       clock, scheduler, default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   auto executing = std::async(std::launch::async, [&] {
     return kernel.execute(coordinated_motion_command_operation("fault.before.later.command"));
   });
@@ -24308,7 +25889,7 @@ TEST(ResourceAddressedExecutionKernelTest, FailedMovingStopDisposesLaterExcluded
   const auto before = output.ObservePreparedCapabilityCommand(1U);
   ASSERT_TRUE(before.ok());
   ASSERT_EQ(before.value().state, ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
-  // Ordinary exhausted Stop is participant-scoped under Q29. A contained
+  // Ordinary exhausted Stop is participant-scoped. A contained
   // internal fault supplies the independent cell-admission closure.
   kernel.ContainInternalFault("test_moving_fault");
   ASSERT_TRUE(wait_until([&] {
@@ -24355,13 +25936,14 @@ TEST(ResourceAddressedExecutionKernelTest, PreparedCancellationRetryRetainsOwner
     PreparedGripperForwarder forwarder(owner, before_dispatch.Blocker());
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto physical = make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema);
     auto row = LogicalGripperRegistration(physical, owner);
     row.prepared_motion_engine = &forwarder;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(pneumatic_policy_capture(physical)).ok());
     start_program_motion(kernel);
@@ -24483,13 +26065,14 @@ TEST(ResourceAddressedExecutionKernelTest, MixedResetRetainsUnknownOrdinaryPrepa
     PreparedGripperForwarder forwarder(owner, [] {});
     const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
         CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-    const auto moving = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-    const auto physical = coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+    const auto moving = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto physical = coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
         CoordinateKind::kLinear, schema), "2");
     auto ordinary = LogicalGripperRegistration(physical, owner);
     ordinary.prepared_motion_engine = &forwarder;
-    ResourceAddressedExecutionKernel kernel({registration(moving, arm), ordinary}, clock, scheduler,
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(moving, arm), ordinary}, clock, scheduler,
         default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     auto executing = std::async(std::launch::async, [&] {
       return kernel.execute(coordinated_motion_command_operation("mixed.reset.actual.fault"));
     });
@@ -24501,7 +26084,7 @@ TEST(ResourceAddressedExecutionKernelTest, MixedResetRetainsUnknownOrdinaryPrepa
     ASSERT_EQ(prepared.value().state, ResolvedPreparedCapabilityCommandStateDTO::kPrepared);
     ASSERT_FALSE(prepared.value().dispatch_result);
     // A contained internal fault closes admission. An ordinary failed
-    // software-hard stage alone does not latch the cell under preserved Q29.
+    // software-hard stage alone does not latch the cell.
     kernel.ContainInternalFault("test_moving_fault");
     ASSERT_TRUE(wait_until([&] {
       return kernel.cell_stop_action_projection().latest_terminal.has_value();
@@ -24595,9 +26178,10 @@ TEST(ResourceAddressedExecutionKernelTest, OrdinaryPneumaticAckRetiresOnceAcross
       GripperParticipantEngine owner(backend, clock);
       const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
           CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
-      const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
-      ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
+      const auto physical = make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+      auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({LogicalGripperRegistration(physical, owner)}, clock, scheduler,
           journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+      auto& kernel = *kernel_heap_test_owner;
       const auto accepted = kernel.execute(command_operation("ordinary.ack.stop.ordering"));
       ASSERT_TRUE(accepted.ok()) << accepted.error().message;
       EXPECT_EQ(backend.commands, 1);
@@ -24689,11 +26273,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_execution_capture();
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -24730,11 +26315,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
     ProgramRunnerContactLossDTO loss{
@@ -24775,11 +26361,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   config.cell_admission_settlement_validator = [](const auto&, const auto&) {
     return Result<void>::Ok();
   };
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const auto acquired = claim_program_execution(kernel);
   ASSERT_TRUE(acquired.ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
@@ -24824,12 +26411,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine engine;
   engine.prepare_call_failure =
       ErrorDTO{"request_refused", "non-retryable preparation failure", {}};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("close.no_effect"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
@@ -24898,12 +26486,13 @@ TEST(ResourceAddressedExecutionKernelTest, GeneralCloseConsumesFinalPneumaticFai
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   auto row =
-      LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      LogicalGripperRegistration(make_binding("gripper.target", "tool.gripper.command",
                                               CoordinateKind::kLinear, schema),
                                  gripper);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {row}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(command_operation("close.pneumatic"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
@@ -24951,12 +26540,13 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto accepted = kernel.execute(motion_operation("close.unknown"));
     ASSERT_TRUE(accepted.ok());
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -24991,12 +26581,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("close.stopped"));
   ASSERT_TRUE(accepted.ok());
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -25177,14 +26768,15 @@ TEST(ResourceAddressedExecutionKernelTest,
 #endif
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
   row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
   row.motion_takeover_preparation_budget_s = 10.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
   start_program_motion(kernel);
@@ -25322,7 +26914,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     // The historical golden qualifies hold only. These two new authored
     // lists require an explicitly fast-capable sealed test base as well.
     auto row = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine, false, {}, false, permission >= 3U);
     row.motion_takeover_preparation_budget_s = 10.0;
     if (spring_permitted) {
@@ -25340,7 +26932,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
     start_program_motion(kernel);
@@ -25437,14 +27030,15 @@ TEST(ResourceAddressedExecutionKernelTest,
     FakeOperationJournal journal;
     engine.supports_motion_replacement = true;
     auto row = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     row.motion_takeover_preparation_budget_s = 0.5;
     row.motion_takeover_planning_budget_s = planning;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
     start_program_motion(kernel);
@@ -25472,12 +27066,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25541,12 +27136,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture({10U, 5U, 10U, 0U})).ok());
   start_program_motion(kernel);
@@ -25580,12 +27176,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25645,12 +27242,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25692,6 +27290,9 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(slot.owner);
     EXPECT_EQ(slot.owner->operation_id, original.value().operation_id);
   }
+  // The Stop's acceptance projection is an asynchronous forensic job.
+  ASSERT_TRUE(wait_until([&] { return journal.stop_acceptance_calls.load() == 1; }));
+  std::lock_guard lock(journal.mutex);
   ASSERT_TRUE(journal.last_stop_affected_state);
   ASSERT_EQ(journal.last_stop_affected_state->operations.size(), 1U);
   EXPECT_EQ(journal.last_stop_affected_state->operations.front().operation_id,
@@ -25709,12 +27310,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.supports_motion_replacement = true;
   engine.defer_prepare_completion = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25778,6 +27380,53 @@ TEST(ResourceAddressedExecutionKernelTest,
 namespace {
 // Disjoint integration gaps after the parent owner's takeover tests. Reuse the
 // existing fixture and its real identity-fenced replacement/Stop hooks.
+TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertainReplacementUsesTakeoverReconciliation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto kernel_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto source = kernel.execute(takeover_intent(0U, "late-cancel.source"));
+  ASSERT_TRUE(source.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "late-cancel.successor"));
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto candidate_execution_id = engine.next_replacement_id - 1U;
+  engine.next_stop_result = {false, ErrorDTO{"takeover_stop_failed", "containment unproved", {}}};
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kEffectUncertain);
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    static_cast<void>(kernel.record_late_cancel_uncertain(&engine, candidate_execution_id));
+    const auto projection = kernel.get_operation_projection(candidate.value().operation_id);
+    return projection.ok() && projection.value().operation.state == OperationStateKind::kInterventionRequired &&
+        projection.value().operation.participants.front().terminal_fact &&
+        projection.value().operation.participants.front().terminal_fact->effect ==
+            ParticipantEffectKnowledge::kEffectUncertain;
+  }));
+  {
+    std::lock_guard lock(journal.mutex);
+    journal.fail_next_kind = "state:late_cancel_uncertainty_confirmed";
+  }
+  EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, candidate_execution_id).ok());
+  EXPECT_TRUE(kernel.record_late_cancel_uncertain(&engine, candidate_execution_id).ok());
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, source.value().operation_id);
+  }
+  EXPECT_EQ(engine.replacement_owner_commits.load(), 0);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      UncertainSentTakeoverEndsUnsentNextWithNoEffectAndRetainsThePhysicalOwner) {
   FakeClock clock;
@@ -25786,12 +27435,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25856,6 +27506,124 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     ProgramResetRetiresRebuiltUnknownTakeoverWithoutChangingEitherOutcome) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  ProgramCycleStatusDTO resetting{
+      RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kResetting,
+      ProgramRunId("run.1"), std::nullopt, ContentDigest(test_digest('b')),
+      AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("unknown.reset"),
+                              ContentDigest(test_digest('a')), true, false, std::nullopt}};
+  auto row = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  config.cell_admission_settlement_validator = [](const auto&, const auto&) {
+    return Result<void>::Ok();
+  };
+  config.cell_admission_program_reset_status_source = [&](const auto, const auto&, const auto&) {
+    return Result<ProgramCycleStatusDTO>::Ok(resetting);
+  };
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *owner;
+  const auto parent = claim_program_execution(kernel);
+  ASSERT_TRUE(parent.ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "rebuild.reset.original"));
+  ASSERT_TRUE(original.ok());
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, "rebuild.reset.candidate"));
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  // Model the old owner's unknown result through the real participant event;
+  // the callback journals it and terminalizes the source's owned slot.
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired,
+                         ErrorDTO{"source_unknown", "owner contact lost", {}});
+  ASSERT_TRUE(StopControlExecutorTestAccess::SourceOwnsTerminalSlots(
+      kernel, original.value().operation_id));
+  const auto [source_id, candidate_id] =
+      StopControlExecutorTestAccess::SeedRetiredUnknownTakeover(kernel, original.value().operation_id);
+  ASSERT_NE(source_id, 0U);
+  ASSERT_NE(candidate_id, 0U);
+  const auto source_before = kernel.get_operation_state(original.value().operation_id);
+  const auto candidate_before = kernel.get_operation_state(candidate.value().operation_id);
+  ASSERT_TRUE(source_before.ok());
+  ASSERT_TRUE(candidate_before.ok());
+  engine.rebuilt_unknown_source_id = source_id;
+  engine.rebuilt_unknown_candidate_id = candidate_id;
+  engine.rebuilt_unknown_retirement_allowed = true;
+  engine.recovery_assessment.execution_id = source_id;
+  engine.recovery_assessment.execution_state = ExecutionState::kInterventionRequired;
+  engine.recovery_assessment.recovery_class = RecoveryClass::kUnknownFault;
+  engine.recovery_assessment.status = RecoveryAssessmentStatus::kResetRequired;
+  engine.recovery_assessment.reason_code = "owner_rebuild_observation_pending";
+  engine.recovery_assessment.assessment_revision = 1U;
+  engine.recovery_action_hook = [&] {
+    ASSERT_TRUE(engine.last_recovery_request);
+    const auto& request = *engine.last_recovery_request;
+    engine.next_recovery_result =
+        KernelRecoveryActionResultDTO{request.request_id, request.action, true, {}, std::nullopt};
+  };
+  const auto& held = parent.value();
+  ASSERT_TRUE(kernel.ReleaseCellAdmissionClaim(
+      {held.intent.owner_role, held.intent.owner_epoch, held.intent.owner_transaction_id,
+       held.intent.request_id, held.intent.request_payload_digest, held.acquired_admission_generation,
+       held.claim_generation,
+       {CellAdmissionSettlementKindDTO::kExplicitReset, ContentDigest(test_digest('2'))}}).ok());
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(
+      {true, resetting, true, 1U, 1U, true, true, 0U, 0U, 0U}).ok());
+  const auto reset_id = ProgramResetClaimRequestId(resetting);
+  ASSERT_TRUE(reset_id.ok());
+  const CellAdmissionClaimIntentDTO reset{
+      CellAdmissionClaimKindDTO::kProgramReset, CellAdmissionOwnerRoleDTO::kProgramRunner,
+      resetting.program_runner_owner_epoch, reset_id.value().value(), reset_id.value(),
+      resetting.accepted_reset->request_payload_digest,
+      kernel.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
+  const auto cancel_before = engine.cancel_prepared_motion_calls.load();
+  const auto stop_before = engine.stop_calls.load();
+  EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(reset).ok());
+  EXPECT_EQ(engine.retire_rebuilt_unknown_calls.load(), 0);
+  EXPECT_TRUE(kernel.get_operation_projection(original.value().operation_id).value().resident);
+  EXPECT_TRUE(kernel.get_operation_projection(candidate.value().operation_id).value().resident);
+  engine.recovery_assessment.reason_code = "owner_rebuild_observed_at_rest";
+  engine.recovery_assessment.eligible_close = true;
+  ++engine.recovery_assessment.assessment_revision;
+  StopControlExecutorTestAccess::SetTakeoverBorrow(kernel, original.value().operation_id, true);
+  EXPECT_FALSE(kernel.AcquireCellAdmissionClaim(reset).ok());
+  EXPECT_EQ(engine.retire_rebuilt_unknown_calls.load(), 0);
+  StopControlExecutorTestAccess::SetTakeoverBorrow(kernel, original.value().operation_id, false);
+  const auto acquired = kernel.AcquireCellAdmissionClaim(reset);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  const auto source_after = kernel.get_operation_projection(original.value().operation_id);
+  const auto candidate_after = kernel.get_operation_projection(candidate.value().operation_id);
+  ASSERT_TRUE(source_after.ok());
+  ASSERT_TRUE(candidate_after.ok());
+  EXPECT_FALSE(source_after.value().resident);
+  EXPECT_FALSE(candidate_after.value().resident);
+  EXPECT_EQ(source_after.value().operation.participants.front().terminal_fact,
+            source_before.value().participants.front().terminal_fact);
+  EXPECT_EQ(candidate_after.value().operation.participants.front().terminal_fact,
+            candidate_before.value().participants.front().terminal_fact);
+  EXPECT_EQ(source_after.value().operation.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(candidate_after.value().operation.state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(engine.retire_rebuilt_unknown_calls.load(), 1);
+  EXPECT_EQ(engine.cancel_prepared_motion_calls.load(), cancel_before);
+  EXPECT_EQ(engine.stop_calls.load(), stop_before);
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_NE(std::find(journal.calls.begin(), journal.calls.end(),
+                        "state:owner_rebuilt_unknown_takeover_retired"), journal.calls.end());
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      PostCommitStopSelectsOnlyTheSuccessorAndLatePredecessorFactsCannotMutateIt) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -25863,12 +27631,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -25978,12 +27747,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -26074,12 +27844,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -26151,13 +27922,14 @@ TEST(ResourceAddressedExecutionKernelTest,
     engine.supports_motion_replacement = true;
     engine.defer_prepare_completion = !moving;
     auto row = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     row.motion_takeover_preparation_budget_s = 1.0;
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
     start_program_motion(kernel);
@@ -26247,14 +28019,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   // proves NoEffect. Strict possibly-sent replay/overlap is a Kernel test.
   engine.replacement_dispatch_phase = PreparedMotionReplacementPhaseDTO::kNoEffect;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
   row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
   row.motion_takeover_preparation_budget_s = 10.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
   start_program_motion(kernel);
@@ -26346,17 +28119,18 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeParticipantEngine command;
   FakeOperationJournal journal;
   const auto motion =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const ProgramCommandSchemaRefDTO schema{
       CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
   const auto output =
-      coordinated_occurrence(make_binding("gripper", "gripper.target", "tool.gripper.command",
+      coordinated_occurrence(make_binding("gripper.target", "tool.gripper.command",
                                           CoordinateKind::kLinear, schema),
                              "2");
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(motion, arm), registration(output, command)}, clock, scheduler, journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
   const OperationId operation_id("operation.kernel.epoch.1.1");
   const ErrorDTO original_failure{"planner_failed", "recorded sibling failure", {}};
   const ParticipantExecutionFact reported{ParticipantExecutionFactKind::kLocalFailure,
@@ -26430,15 +28204,18 @@ IoSignalDescriptorDTO program_io_descriptor() {
 ProgramRunExecutionCaptureDTO program_io_capture() {
   auto capture = program_execution_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  binding->target_role_bindings.front().signal_role_bindings.push_back(
-      {ResourceRoleId("ready"), "ready", IoSignalValueType::kBoolean, IoSignalDirection::kInput,
-       IoTransitionCapability::kSampledOnly,
+  const ProgramSignalReferenceDTO ready{ControllableComponentId("robot.1"), "ready"};
+  const ProgramTargetReferenceDTO target{ControllableComponentId("robot.1"), CommandTargetId("arm")};
+  binding->target_bindings.front().signal_references.push_back(ready);
+  binding->signal_bindings.push_back(
+      {ready, target, RuntimeUnitId("runtime.1"), IoSignalValueType::kBoolean,
+       IoSignalDirection::kInput, IoTransitionCapability::kSampledOnly,
        ComputeIoSignalDescriptorDigest(program_io_descriptor()).value()});
   capture.binding = std::move(binding);
   auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
   table->nodes.push_back({ProgramNodeInstanceId("wait"),
                           "kernel.command_target",
-                          {{TargetRoleId("arm"), CapabilityId("io.gpio.wait_for_input"), false}}});
+                          {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("io.gpio.wait_for_input"), false}}});
   capture.table = std::move(table);
   return capture;
 }
@@ -26451,8 +28228,7 @@ ProgramIoWatchRequestDTO program_io_watch_request() {
           capture.claim_generation,
           capture.program_run_id,
           {ProgramNodeInstanceId("wait"), "wait.attempt.1"},
-          TargetRoleId("arm"),
-          ResourceRoleId("ready"),
+          {ControllableComponentId("robot.1"), "ready"},
           true};
 }
 
@@ -26474,11 +28250,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     auto service = program_io_service(clock);
     ASSERT_TRUE(kernel
                     .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
@@ -26562,11 +28339,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchResolvesRoleChangedOuts
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   // The read-back output `clamp` of the bound target, beside the input.
   const IoSignalId clamp{ControllableComponentId("robot.1"), "clamp"};
   const IoSignalDescriptorDTO output{clamp,
@@ -26580,9 +28358,17 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchResolvesRoleChangedOuts
                                      std::nullopt,
                                      false,
                                      true};
+  auto no_readback = output;
+  no_readback.signal_id.name = "no_readback";
+  no_readback.output_resource = ResourceId("resource.no_readback");
+  no_readback.readback = false;
+  auto controller_owned = output;
+  controller_owned.signal_id.name = "controller_owned";
+  controller_owned.output_resource = ResourceId("resource.controller_owned");
+  controller_owned.controller_owned = true;
   auto created = IoSignalSubsystem::Create(
-      {RequestOwnerEpoch("kernel.epoch.1"), 1U, {program_io_descriptor(), output}},
-      {3U, 3U, 4U, 8U, 512U, 1024U}, clock);
+      {RequestOwnerEpoch("kernel.epoch.1"), 1U, {program_io_descriptor(), output, no_readback, controller_owned}},
+      {3U, 5U, 4U, 8U, 512U, 1024U}, clock);
   ASSERT_TRUE(created.ok()) << created.error().message;
   const auto service = std::shared_ptr<IoSignalSubsystem>(std::move(created.value()));
   ASSERT_TRUE(kernel.InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
@@ -26590,23 +28376,43 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchResolvesRoleChangedOuts
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   auto capture = program_io_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  auto &roles = binding->target_role_bindings.front().signal_role_bindings;
-  roles.push_back({ResourceRoleId("clamp"), "clamp", IoSignalValueType::kBoolean,
-                   IoSignalDirection::kOutput, IoTransitionCapability::kSampledOnly,
-                   ComputeIoSignalDescriptorDigest(output).value()});
-  std::sort(roles.begin(), roles.end(), [](const auto &left, const auto &right) {
-    return left.resource_role_id < right.resource_role_id;
+  const ProgramSignalReferenceDTO clamp_ref{ControllableComponentId("robot.1"), "clamp"};
+  auto& refs = binding->target_bindings.front().signal_references;
+  refs.push_back(clamp_ref);
+  refs.push_back({ControllableComponentId("robot.1"), "no_readback"});
+  refs.push_back({ControllableComponentId("robot.1"), "controller_owned"});
+  std::sort(refs.begin(), refs.end());
+  auto& signals = binding->signal_bindings;
+  signals.push_back({clamp_ref, {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                     RuntimeUnitId("runtime.1"), IoSignalValueType::kBoolean,
+                     IoSignalDirection::kOutput, IoTransitionCapability::kSampledOnly,
+                     ComputeIoSignalDescriptorDigest(output).value()});
+  for (const auto* descriptor : {&no_readback, &controller_owned}) {
+    signals.push_back({{descriptor->signal_id.controllable_component_id, descriptor->signal_id.name},
+                       {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                       RuntimeUnitId("runtime.1"), IoSignalValueType::kBoolean,
+                       IoSignalDirection::kOutput, IoTransitionCapability::kSampledOnly,
+                       ComputeIoSignalDescriptorDigest(*descriptor).value()});
+  }
+  std::sort(signals.begin(), signals.end(), [](const auto& left, const auto& right) {
+    return left.reference < right.reference;
   });
   capture.binding = std::move(binding);
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
-  // CONTRACTS §7: `<role>.changed_outside` names the output's core-held
+  // `<role>.changed_outside` names the output's core-held
   // signal; on an input role it is refused.
   auto request = program_io_watch_request();
-  request.resource_role_id = ResourceRoleId("ready.changed_outside");
+  request.signal.signal_name = "ready.changed_outside";
   const auto on_input = kernel.RegisterProgramIoWatch(request);
   ASSERT_FALSE(on_input.ok());
   EXPECT_EQ(on_input.error().details.at("reason"), "io_signal_direction_mismatch");
-  request.resource_role_id = ResourceRoleId("clamp.changed_outside");
+  for (const auto* name : {"no_readback.changed_outside", "controller_owned.changed_outside"}) {
+    request.signal.signal_name = name;
+    const auto unavailable = kernel.RegisterProgramIoWatch(request);
+    ASSERT_FALSE(unavailable.ok());
+    EXPECT_EQ(unavailable.error().details.at("reason"), "io_signal_changed_outside_unavailable");
+  }
+  request.signal.signal_name = "clamp.changed_outside";
   const auto watch = kernel.RegisterProgramIoWatch(request);
   ASSERT_TRUE(watch.ok()) << watch.error().message;
   EXPECT_EQ(kernel.ReadProgramIoWatch(watch.value()).value().state, IoWatchState::kPending);
@@ -26627,11 +28433,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchRefusesStaleScopeAndUni
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   auto request = program_io_watch_request();
   EXPECT_FALSE(kernel.RegisterProgramIoWatch(request).ok());
   auto service = program_io_service(clock);
@@ -26658,7 +28465,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchRefusesStaleScopeAndUni
   ASSERT_FALSE(refused.ok());
   EXPECT_EQ(refused.error().details.at("reason"), "io_watch_node_unsupported");
   request = program_io_watch_request();
-  request.resource_role_id = ResourceRoleId("another.input");
+  request.signal.signal_name = "another.input";
   refused = kernel.RegisterProgramIoWatch(request);
   ASSERT_FALSE(refused.ok());
   EXPECT_EQ(refused.error().details.at("reason"), "io_signal_unbound");
@@ -26672,11 +28479,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(
-          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
           engine)},
       clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   auto changed = program_io_descriptor();
   changed.freshness.maximum_age_ns = 101;
   ASSERT_TRUE(kernel
@@ -26702,11 +28510,12 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramIoWatchRetiresWhenKernelOwnerD
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(kernel
                     .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
                                                    GraphRevision(test_digest('7')))
@@ -26756,10 +28565,10 @@ struct ProgramIoScopeFixture final {
   }
 
   ProgramIoScopeFixture()
-      : kernel({registration(make_binding("arm", "arm", "execution.trajectory.execute",
+      : kernel({registration(make_binding("arm", "execution.trajectory.execute",
                                           CoordinateKind::kAngular),
                              engine)},
-               clock, scheduler, default_journal, config()),
+               clock, default_journal, config()),
         service(program_io_service(clock)) {
     if (!kernel
              .InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
@@ -26969,7 +28778,7 @@ struct IoRuleIntegrationFixture final {
   FakeParticipantEngine third_engine;
   FakeOperationJournal journal;
   RuntimeParticipantBinding binding = CodecQualifiedPlannerBinding(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
   RuntimeParticipantBinding other_binding =
       CodecQualifiedPlannerBinding(coordinated_occurrence(binding, "2"), '2');
   RuntimeParticipantBinding third_binding =
@@ -27104,7 +28913,7 @@ struct IoRuleIntegrationFixture final {
     if (independent_companion) participants.push_back(registration(other_binding, other_engine));
     participants.push_back(std::move(resolved));
     kernel = std::make_unique<ResourceAddressedExecutionKernel>(
-        std::move(participants), clock, scheduler, journal, std::move(config));
+        std::move(participants), clock, journal, std::move(config));
     if (two_policies) {
       auto other = program_io_descriptor();
       other.signal_id.name = "other";
@@ -27178,8 +28987,8 @@ struct IoRuleIntegrationFixture final {
     auto intent = scoped ? Intent("other.io.rule.operation")
                          : motion_operation("other.independent.operation");
     auto& other = intent.participants.front();
-    other.component_role_id = other_binding.value().component_role_id;
-    other.target_role_id = other_binding.value().target_role_id;
+    retarget(other, other_binding.value().controllable_component_id,
+             other_binding.value().command_target_id);
     auto& motion = std::get<MotionParticipantIntentDTO>(other.payload);
     motion.move_id = MoveId("move.other");
     if (scoped) {
@@ -27243,7 +29052,7 @@ struct IoRuleIntegrationFixture final {
   }
 };
 
-// F-6a (D): a node-level signal trip (`on_signal: failure` decides the node
+// A node-level signal trip (`on_signal: failure` decides the node
 // result in the Runner) is the Program's own Stop. Settled at its first stage,
 // the operation is Stopped with the Program's requester class, so the Runner
 // fails the node into its Fallback instead of holding it for the operator.
@@ -27751,14 +29560,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto first_binding = grouped_command_binding();
   first_engine.gripper_status.gripper_id = first_binding.value().command_target_id.value();
   const auto second_binding = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
   const auto third_binding = coordinated_occurrence(grouped_command_binding(), "3");
   third_engine.gripper_status.gripper_id = third_binding.value().command_target_id.value();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine),
        registration(third_binding, third_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(
       grouped_motion_commands_operation("partial.proof.motion-and-commands", 3U, 1U));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -27832,14 +29642,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto first_binding = grouped_command_binding();
   first_engine.gripper_status.gripper_id = first_binding.value().command_target_id.value();
   const auto second_binding = coordinated_occurrence(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
   const auto third_binding = coordinated_occurrence(grouped_command_binding(), "3");
   third_engine.gripper_status.gripper_id = third_binding.value().command_target_id.value();
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine),
        registration(third_binding, third_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(
       grouped_motion_commands_operation("partial.reacquired.motion-and-commands", 3U, 1U));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -27903,11 +29714,12 @@ TEST(ResourceAddressedExecutionKernelTest, StopOwnerDriftRefusesBeforeReserveWit
   FakeParticipantEngine engine;
   FakeParticipantEngine other_engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine), registration(coordinated_occurrence(binding, "2"), other_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("drift.motion"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   const auto state = kernel.get_operation_state(accepted.value().operation_id).value();
@@ -27934,9 +29746,8 @@ TEST(ResourceAddressedExecutionKernelTest, StopOwnerDriftRefusesBeforeReserveWit
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
 
   auto next = motion_operation("drift.after");
-  next.participants.front().component_role_id = ComponentRoleId("robot_2");
-  next.participants.front().target_role_id = TargetRoleId("arm_2");
-  // R2: an internal refusal belongs to no component and latches nothing; a
+  retarget(next.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
+  // An internal refusal belongs to no component and latches nothing; a
   // disjoint component's motion is admitted.
   const auto admitted = kernel.execute(next);
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
@@ -27961,13 +29772,12 @@ void drift_operation_owner(ResourceAddressedExecutionKernel& kernel, const Opera
 // Unresolvable target: refused by admission when closed, by resolution otherwise.
 OperationIntentDTO admission_probe(std::string request_id) {
   auto probe = motion_operation(std::move(request_id));
-  probe.participants.front().component_role_id = ComponentRoleId("robot_9");
-  probe.participants.front().target_role_id = TargetRoleId("arm_9");
+  retarget(probe.participants.front(), ControllableComponentId("robot.9"), CommandTargetId("arm"));
   return probe;
 }
 }  // namespace
 
-// Review M3 finding 2: a refused containment Full Stop (D4 owner drift) is
+// A refused containment Full Stop (owner drift) is
 // recorded with its refusal code, not shown as contained, and not retried.
 TEST(ResourceAddressedExecutionKernelTest,
      InternalFaultRecordsARefusedContainmentStopWithItsCode) {
@@ -27975,11 +29785,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({registration(binding, engine)}, clock, scheduler,
                                           default_journal,
                                           {RequestOwnerEpoch("kernel.epoch.1"),
                                            CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto accepted = kernel.execute(motion_operation("internal.refused.motion"));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   drift_operation_owner(kernel, accepted.value().operation_id);
@@ -28009,16 +29820,16 @@ TEST(ResourceAddressedExecutionKernelTest, ScopedStopIgnoresOwnerDriftInUnrelate
   FakeParticipantEngine engine;
   FakeParticipantEngine other_engine;
   const auto binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
-  ResourceAddressedExecutionKernel kernel(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(binding, engine), registration(coordinated_occurrence(binding, "2"), other_engine)},
       clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto target = kernel.execute(motion_operation("unrelated-drift.target"));
   ASSERT_TRUE(target.ok()) << target.error().message;
   auto unrelated_intent = motion_operation("unrelated-drift.other");
-  unrelated_intent.participants.front().component_role_id = ComponentRoleId("robot_2");
-  unrelated_intent.participants.front().target_role_id = TargetRoleId("arm_2");
+  retarget(unrelated_intent.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
   const auto unrelated = kernel.execute(unrelated_intent);
   ASSERT_TRUE(unrelated.ok()) << unrelated.error().message;
   drift_operation_owner(kernel, unrelated.value().operation_id);
@@ -28050,9 +29861,9 @@ TEST(ResourceAddressedExecutionKernelTest, ScopedStopCoalescedToFullRefusesOwner
   FakeParticipantEngine third_engine;
   FakeOperationJournal journal;
   const auto first_binding =
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto second_binding = second_same_type_occurrence(first_binding);
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {registration(first_binding, first_engine), registration(second_binding, second_engine),
        registration(coordinated_occurrence(first_binding, "3"), third_engine)},
       clock, scheduler, journal,
@@ -28063,15 +29874,17 @@ TEST(ResourceAddressedExecutionKernelTest, ScopedStopCoalescedToFullRefusesOwner
                                              nullptr,
                                              std::nullopt,
                                              1U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("coalesce-drift.first"));
   ASSERT_TRUE(first.ok()) << first.error().message;
   auto second_intent = motion_operation("coalesce-drift.second");
   second_intent.program_binding_id = second_binding.value().program_binding_id;
+  retarget(second_intent.participants.front(), second_binding.value().controllable_component_id,
+           second_binding.value().command_target_id);
   const auto second = kernel.execute(second_intent);
   ASSERT_TRUE(second.ok()) << second.error().message;
   auto third_intent = motion_operation("coalesce-drift.third");
-  third_intent.participants.front().component_role_id = ComponentRoleId("robot_3");
-  third_intent.participants.front().target_role_id = TargetRoleId("arm_3");
+  retarget(third_intent.participants.front(), ControllableComponentId("robot.3"), CommandTargetId("arm"));
   const auto third = kernel.execute(third_intent);
   ASSERT_TRUE(third.ok()) << third.error().message;
 
@@ -28326,12 +30139,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   }));
 }
 
-// An escalated P1 whose stronger stage contained the motion but whose
+// An escalated first Stop whose stronger stage contained the motion but whose
 // settlement is unproven stays a non-proof, as the nominal one does.
 TEST(ResourceAddressedExecutionKernelTest,
      ProgramRunContainmentPhysicallyStopsUnsettledPriorEvidence) {
   for (const bool escalated : {false, true}) {
-    SCOPED_TRACE(escalated ? "escalated P1" : "nominal P1");
+    SCOPED_TRACE(escalated ? "escalated first Stop" : "nominal first Stop");
     IoRuleIntegrationFixture fixture(true, true);
     fixture.engine.participant_stop_settlement_error = ErrorDTO{
         "prior_settlement_unproven", "Prior participant settlement is unproven", {}};
@@ -28384,13 +30197,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
 }
 
-// A source loss that persisted through a settled P1 leaves its own
+// A source loss that persisted through a settled first Stop leaves its own
 // interrupt_source_unavailable terminal error, not the degraded-Stop
-// diagnostic. Neither the nominal nor the escalated P1 is then a proof.
+// diagnostic. Neither the nominal nor the escalated first Stop is then a proof.
 TEST(ResourceAddressedExecutionKernelTest,
      ProgramRunContainmentPhysicallyStopsSettledSourceLossEvidence) {
   for (const bool escalated : {false, true}) {
-    SCOPED_TRACE(escalated ? "escalated P1" : "nominal P1");
+    SCOPED_TRACE(escalated ? "escalated first Stop" : "nominal first Stop");
     IoRuleIntegrationFixture fixture;
     ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
     ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
@@ -28493,12 +30306,12 @@ TEST(ResourceAddressedExecutionKernelTest,
                   .newly_fenced_operation_revisions.empty());
 }
 
-// Both terminal outcomes of the physical P1 Stop are exercised: nominal, and
-// escalated through the existing injected first-stage refusal. The escalated
-// P1 settles with the degraded-Stop diagnostic; its certificate row is the
-// proof, as for any Stop kind, and the result stays escalated.
-// The attributed variant's refusal names the operation, so P1's certificate
-// terminal error may be attributed to it.
+// Both terminal outcomes of the physical first Stop are exercised: nominal,
+// and escalated through the existing injected first-stage refusal. The
+// escalated first Stop settles with the degraded-Stop diagnostic; its
+// certificate row is the proof, as for any Stop kind, and the result stays
+// escalated. The attributed variant's refusal names the operation, so the
+// first Stop's certificate terminal error may be attributed to it.
 TEST(ResourceAddressedExecutionKernelTest,
      ProgramRunContainmentReusesExactSettledIoRuleStopProof) {
   struct Variant final {
@@ -28506,9 +30319,10 @@ TEST(ResourceAddressedExecutionKernelTest,
     bool refusal_names_operation;
     const char* name;
   };
-  for (const auto& variant : {Variant{false, false, "nominal P1"},
-                              Variant{true, false, "escalated P1"},
-                              Variant{true, true, "escalated P1, refusal names operation"}}) {
+  for (const auto& variant : {Variant{false, false, "nominal first Stop"},
+                              Variant{true, false, "escalated first Stop"},
+                              Variant{true, true,
+                                      "escalated first Stop, refusal names operation"}}) {
     SCOPED_TRACE(variant.name);
     const bool escalated = variant.escalated;
     const auto expected_result = escalated ? StopCertificateResultDTO::kSucceededEscalated
@@ -28558,25 +30372,26 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(first_certificate.ok()) << first_certificate.error().message;
     ASSERT_EQ(first_certificate.value().result, expected_result);
     if (variant.refusal_names_operation) {
-      // Recorded in the XML: the P1 certificate terminal error this variant probes.
+      // Recorded in the XML: the first Stop's certificate terminal error this
+      // variant probes.
       const auto& terminal_error = first_certificate.value().terminal_error;
-      ::testing::Test::RecordProperty("p1_certificate_terminal_error",
+      ::testing::Test::RecordProperty("first_certificate_terminal_error",
                                       terminal_error ? terminal_error->code : "<none>");
       if (terminal_error) {
         const auto detail = terminal_error->details.find("operation_id");
         ::testing::Test::RecordProperty(
-            "p1_certificate_terminal_error_operation_id",
+            "first_certificate_terminal_error_operation_id",
             detail != terminal_error->details.end() ? detail->second : "<none>");
       }
     }
     if (escalated) {
       EXPECT_GE(fixture.engine.translate_stop_stage_calls, 2);
-      // The reused P1 proof carries the degraded-Stop diagnostic.
-      const auto& p1_fact = stopped_operation.participants.front().terminal_fact;
-      ASSERT_TRUE(p1_fact);
-      EXPECT_EQ(p1_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
-      ASSERT_TRUE(p1_fact->error);
-      EXPECT_EQ(p1_fact->error->code, kErrorMotionInterruptBackendStopFailed);
+      // The reused first-Stop proof carries the degraded-Stop diagnostic.
+      const auto& first_stop_fact = stopped_operation.participants.front().terminal_fact;
+      ASSERT_TRUE(first_stop_fact);
+      EXPECT_EQ(first_stop_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+      ASSERT_TRUE(first_stop_fact->error);
+      EXPECT_EQ(first_stop_fact->error->code, kErrorMotionInterruptBackendStopFailed);
     }
     const auto calls_before_containment = fixture.engine.translate_stop_stage_calls.load();
 
@@ -28590,7 +30405,8 @@ TEST(ResourceAddressedExecutionKernelTest,
       const auto status = fixture.kernel->get_stop_status(containment.value().stop_id);
       return status.ok() && status.value().stop_certificate.has_value();
     }));
-    // Re-checked after P2's terminal proof settled: the worker is asynchronous.
+    // Re-checked after the containment's terminal proof settled: the worker is
+    // asynchronous.
     EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_before_containment);
     const auto second_status = fixture.kernel->get_stop_status(containment.value().stop_id).value();
     const auto second_certificate =
@@ -28606,9 +30422,10 @@ TEST(ResourceAddressedExecutionKernelTest,
               stopped_operation);
 
     // A later operation-scoped operator REQUEST must still reuse the original
-    // physical P1 proof; P2 added only the fresh Run fence and did not rewrite
-    // operation A. P1 is IO-rule ORIGIN, so this covers operator-request reuse
-    // of an IO-origin proof, not an operator-ORIGIN physical proof.
+    // physical first-Stop proof; the containment added only the fresh Run fence
+    // and did not rewrite operation A. The first Stop is IO-rule ORIGIN, so this
+    // covers operator-request reuse of an IO-origin proof, not an
+    // operator-ORIGIN physical proof.
     const auto repeated = fixture.kernel->stop(stop_request(
         "operator.repeated-settled-proof", accepted.value(),
         stopped_operation.operation_revision.value(),
@@ -29061,9 +30878,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(fixture.Publish(1, false).ok());
   ASSERT_TRUE(fixture.PublishOther(1, false).ok());
   auto other_intent = motion_operation("other.independent.operation");
-  other_intent.participants.front().component_role_id =
-      fixture.other_binding.value().component_role_id;
-  other_intent.participants.front().target_role_id = fixture.other_binding.value().target_role_id;
+  retarget(other_intent.participants.front(), fixture.other_binding.value().controllable_component_id,
+           fixture.other_binding.value().command_target_id);
   const auto independent = fixture.kernel->execute(other_intent);
   ASSERT_TRUE(independent.ok()) << independent.error().message;
   const auto accepted = fixture.kernel->execute(fixture.Intent());
@@ -29267,6 +31083,9 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      IoRuleIntegrationThresholdAllowsContainedLaterStageAfterEarlierStageTimeout) {
+  // Set once the held stage-0 call is past its block: the hook object may be
+  // cleared only after that (the stop-stage worker still runs it until then).
+  std::atomic<bool> nominal_returned{false};
   IoRuleIntegrationFixture fixture(false, false, 18, false, false, false, false, 0, {}, 1U);
   ASSERT_TRUE(fixture.Publish(1, false).ok());
   const auto accepted = fixture.kernel->execute(fixture.Intent());
@@ -29274,7 +31093,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
   HeldSettlementCall nominal;
   fixture.engine.translate_stop_stage_hook = [&, block = nominal.Blocker()] {
-    if (fixture.engine.last_stop_stage->stage_index == 0U) block();
+    if (fixture.engine.last_stop_stage->stage_index == 0U) {
+      block();
+      nominal_returned.store(true);
+    }
   };
   ASSERT_TRUE(fixture.Publish(2, true).ok());
   ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
@@ -29286,7 +31108,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(before.active_stop_id);
   const auto stop = fixture.kernel->get_stop_status(*before.active_stop_id).value();
   // The Kernel's watchdog: the controlled deadline plus a normal motion's
-  // no-report bound (M6).
+  // no-report bound.
   fixture.clock.set(stop.accepted.accepted_at_ns +
                     controlled_stage_watchdog_ns(budget.elapsed_since_stop_ns +
                                                  *budget.remaining_controlled_deadline_ns));
@@ -29312,6 +31134,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto retained = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
   EXPECT_EQ(retained.participants.front().io_rule_outcomes.front().terminal_cause,
             MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(wait_until([&] { return nominal_returned.load(); }));
   fixture.engine.translate_stop_stage_hook = {};
 }
 
@@ -29488,11 +31311,11 @@ struct BbKernelIntegrationFixture final {
         return Result<void>::Ok();
       };
     auto participant = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
     participant.intrinsic_direct_control = direct_control;
     kernel = std::make_unique<ResourceAddressedExecutionKernel>(
         std::vector<RuntimeParticipantExecutionRegistration>{std::move(participant)},
-        clock, scheduler, journal, std::move(config));
+        clock, journal, std::move(config));
     auto created = IoSignalSubsystem::Create({RequestOwnerEpoch("kernel.epoch.1"), 1U, {}},
                                              {1U, 1U, 16U, 8U, 512U, 1024U}, clock);
     if (!created.ok()) throw std::logic_error("BB fixture source failed");
@@ -29683,7 +31506,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      BbKernelIntegrationIdleBaselineBeforeObservedResetCycleIsNotReadyThenAccepted) {
-  // M4 D-M4-1: the Runner journals its new Idle cycle and sends the
+  // The Runner journals its new Idle cycle and sends the
   // between-Runs baseline before the Manager heartbeat delivers that cycle.
   BbKernelIntegrationFixture fixture(false, true);
   const auto claim = claim_program_execution(*fixture.kernel);
@@ -30339,7 +32162,7 @@ struct GlobalRuleCatalogFixture final {
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
     config.operation_admission_gate = &gate;
     kernel = std::make_unique<ResourceAddressedExecutionKernel>(
-        std::vector<RuntimeParticipantExecutionRegistration>{}, clock, scheduler, journal,
+        std::vector<RuntimeParticipantExecutionRegistration>{}, clock, journal,
         std::move(config));
     if (!ready_cell_admission(*kernel).ok())
       throw std::logic_error("global catalog fixture readiness failed");
@@ -30845,7 +32668,7 @@ struct GlobalMotionRuleFixture final {
   FakeParticipantEngine engine, other_engine;
   GlobalRuleCatalogTestGate gate;
   RuntimeParticipantBinding binding = IoRuleIntegrationFixture::CodecQualifiedPlannerBinding(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), '1');
   RuntimeParticipantBinding other_binding = IoRuleIntegrationFixture::CodecQualifiedPlannerBinding(
       coordinated_occurrence(binding, "2"), '2');
   std::atomic<int> processing_requests{0};
@@ -30923,7 +32746,7 @@ struct GlobalMotionRuleFixture final {
     }
     kernel = std::make_unique<ResourceAddressedExecutionKernel>(
         std::vector{std::move(primary), registration(other_binding, other_engine)},
-        clock, scheduler, journal, std::move(config));
+        clock, journal, std::move(config));
     if (!ready_cell_admission(*kernel).ok()) throw std::logic_error("global readiness failed");
     if (additional_loss_guard) {
       auto other = program_io_descriptor();
@@ -31022,8 +32845,7 @@ struct GlobalMotionRuleFixture final {
   OperationIntentDTO Intent(bool other = false, std::string id = "global.motion") {
     auto intent = motion_operation(std::move(id));
     if (other) {
-      intent.participants.front().component_role_id = other_binding.value().component_role_id;
-      intent.participants.front().target_role_id = other_binding.value().target_role_id;
+      retarget(intent.participants.front(), other_binding.value().controllable_component_id, other_binding.value().command_target_id);
     }
     if (!other && node_profile)
       std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
@@ -31106,7 +32928,7 @@ bool wait_global_rule_state(GlobalMotionRuleFixture& fixture, IoGlobalRuleState 
 
 
 
-// F-6a (D): spec 260 §2.8.4. A gate trip on a moving motion, settled at its
+// A gate trip on a moving motion, settled at its
 // first stage by the gate's own Stop, is the Program's ordinary failure: the
 // row stays Stopped, the requester class is the Program's, the operation
 // closes and the same engine moves again (the Fallback's safe-pose move).
@@ -31220,7 +33042,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 
 
-// CONTRACTS §7 (one admission for every output write): before a rule's first
+// One admission for every output write: before a rule's first
 // reading it holds no output writes; once it watches, a tripped `everything`
 // rule holds them, naming the rule.
 TEST(ResourceAddressedExecutionKernelTest, GlobalRuleEverythingHoldsOutputWritesOnceItWatches) {
@@ -31293,7 +33115,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(InstallAtomicBlackboardGlobalRule(fixture).ok());
   ASSERT_TRUE(ready_cell_admission(*fixture.kernel).ok());
   // Before the first key baseline the rule can't watch yet: its state key is
-  // withdrawn (CONTRACTS §8), but it holds nothing.
+  // withdrawn, but it holds nothing.
   const auto projection = fixture.kernel->ReadInterruptRuleStateBaseline();
   ASSERT_TRUE(projection);
   EXPECT_EQ(projection->status, IoRuleStateProjectionStatusDTO::kReady);
@@ -31326,7 +33148,7 @@ bool journaled_trip_then_clear(FakeOperationJournal& journal, const std::string&
   });
 }
 
-// BBK-1 (live M9 part_lost_guard race): the ACK of a key write means the
+// The ACK of a key write means the
 // rules evaluated it. A motion admitted right after the ACK of `false` is not
 // refused by the stale trip, with no separate evidence pass in between.
 TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeyWriteIsEvaluatedBeforeItsAck) {
@@ -31344,7 +33166,7 @@ TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeyWriteIsEvaluatedBefo
   ASSERT_TRUE(released.ok()) << released.error().message;
 }
 
-// BBK-1: true then false in quick succession is two evaluations, never the
+// True then false in quick succession is two evaluations, never the
 // latest value: the rule trips on the true, then clears on the false.
 TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeyPulseTripsTheRuleThenClears) {
   BbKernelIntegrationFixture fixture(false, false, false, false);
@@ -31359,7 +33181,7 @@ TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeyPulseTripsTheRuleThe
   ASSERT_TRUE(motion.ok()) << motion.error().message;
 }
 
-// BBK-1 (a): a forward the Kernel refuses after the source exists (here the
+// A forward the Kernel refuses after the source exists (here the
 // sender's own exact-sender gap) is source loss: the rule can't watch and
 // holds its scope.
 TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeySourceLossHoldsTheScope) {
@@ -31426,7 +33248,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(old.ok());
     EXPECT_EQ(old.value().status, IoProgramBlackboardAcknowledgementStatus::kSuperseded);
     EXPECT_FALSE(old.value().accepted_sequence);
-    // D-M4-2: the Manager's transition close (not current) is not a teardown.
+    // The Manager's transition close (not current) is not a teardown.
     auto closed = fixture.readiness;
     closed.program_cycle_status_current = false;
     ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(closed, &affected).ok());
@@ -31591,7 +33413,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      BbKernelManagerTransitionClosesAcrossRunEndAndResetKeepSourceAndGlobalRule) {
-  // M4 D-M4-2: the Manager closes readiness (not current) before every Run
+  // The Manager closes readiness (not current) before every Run
   // end and Reset step, then publishes the new current cycle. The BB source
   // stays live, frames in the close are retryable not-ready, and the global
   // rule over the key never latches on source loss.
@@ -31679,7 +33501,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      BbKernelRunnerContactFailureWhileIdleRetiresSourceAtReceiverExpiry) {
-  // SX-369: a Runner contact or publisher failure while Idle (also
+  // A Runner contact or publisher failure while Idle (also
   // TerminalAwaitingReset/Resetting) carries no Runner loss; the Manager sends
   // the same cycle with current=false, which alone keeps the source (GL). The
   // failed renewal sends no native heartbeat, so the native receiver expires
@@ -31768,7 +33590,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           initial.value().source_epoch, {"ingress_overflow", "actual source overflow", {}}).ok());
     } else if (source_loss == 2) {
       // An actual Runner change retires the source (a not-current close alone
-      // does not, D-M4-2).
+      // does not).
       fixture.readiness.program_cycle_status->program_runner_owner_epoch =
           RequestOwnerEpoch("program.owner.replacement");
       ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
@@ -31890,7 +33712,7 @@ class MockNodeStartBoundaryService final : public IIoSignalService {
     if (failure) return Result<ProgramNodeMockSimulationAcknowledgementDTO>::Err(*failure);
     ProgramNodeMockSimulationAcknowledgementDTO reply{request.scope, 123, {}};
     for (const auto& signal : request.signals)
-      reply.signals.push_back({signal.target_role_id, signal.resource_role_id, disposition});
+      reply.signals.push_back({signal.signal, disposition});
     return Result<ProgramNodeMockSimulationAcknowledgementDTO>::Ok(std::move(reply));
   }
   Result<void> EndProgramNodeMockSimulation(
@@ -31937,9 +33759,9 @@ struct MockNodeStartKernelFixture final {
   explicit MockNodeStartKernelFixture(IoSignalDescriptorDTO descriptor = program_io_descriptor(),
                                       bool install_service = true)
       : service(std::make_shared<MockNodeStartBoundaryService>(program_io_service(clock, std::move(descriptor)))),
-        kernel({registration(make_binding("arm", "arm", "execution.trajectory.execute",
+        kernel({registration(make_binding("arm", "execution.trajectory.execute",
                                            CoordinateKind::kAngular), engine)},
-               clock, scheduler, default_journal, ProgramIoScopeFixture::config()) {
+               clock, default_journal, ProgramIoScopeFixture::config()) {
     if ((install_service &&
          !kernel.InstallProgramIoSignalService(service, RetainedBundleId(test_digest('6')),
                                                GraphRevision(test_digest('7'))).ok()) ||
@@ -31952,7 +33774,7 @@ struct MockNodeStartKernelFixture final {
     return {{watch.request_owner_epoch, watch.program_binding_id, watch.program_runner_owner_epoch,
              watch.claim_generation, watch.program_run_id, watch.node,
              std::numeric_limits<std::uint64_t>::max()},
-            {{watch.target_role_id, watch.resource_role_id, false,
+            {{watch.signal, false,
               ProgramMockSimulationChangeDTO{0U, true}}}};
   }
   Result<void> retire() {
@@ -31993,7 +33815,7 @@ TEST(ResourceAddressedExecutionKernelTest, MockNodeStartChecksCurrentCapturedSco
   refused(request, "io_watch_scope_invalid");
   request = original; request.scope.node.node_instance_id = ProgramNodeInstanceId("timer");
   refused(request, "mock_simulation_node_mismatch");
-  request = original; request.signals.front().resource_role_id = ResourceRoleId("unbound");
+  request = original; request.signals.front().signal.signal_name = "unbound";
   refused(request, "io_signal_unbound");
   request = original; request.scope.node_start_index = 0U;
   refused(request, "mock_simulation_invalid");
@@ -32303,10 +34125,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                  CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
                                    CoordinateKind::kAngular), engine)},
         clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     auto capture = program_execution_capture();
     auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
@@ -32314,7 +34137,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     // beside the moving effect. Only the latter is Stopping at acceptance.
     table->nodes.insert(table->nodes.begin() + 1,
         {ProgramNodeInstanceId("place"), "kernel.operation",
-         {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+         {{{ControllableComponentId("robot.1"), CommandTargetId("arm")}, CapabilityId("execution.trajectory.execute"), true}}});
     table->nodes.insert(table->nodes.begin() + 2,
         {ProgramNodeInstanceId("reader"), "orchestration.clock", {}});
     table->named_selections = {{"arm", {0U}}, {"place", {1U}},
@@ -32410,10 +34233,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                  CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel(
-        {registration(make_binding("arm", "arm", "execution.trajectory.execute",
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
                                    CoordinateKind::kAngular), engine)},
         clock, scheduler, journal, std::move(config));
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
     start_program_motion(kernel);
@@ -32498,7 +34322,7 @@ void VerifyPreemptedMotionResetAdmission(const bool hold_terminal_publication) {
       AcceptedProgramResetDTO{RequestOwnerEpoch("operator.reset"), RequestId("preempted.reset"),
                               ContentDigest(test_digest('a')), true, false, std::nullopt}};
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 10.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 16U};
@@ -32509,7 +34333,8 @@ void VerifyPreemptedMotionResetAdmission(const bool hold_terminal_publication) {
   config.cell_admission_program_reset_status_source = [&](const auto, const auto&, const auto&) {
     return Result<ProgramCycleStatusDTO>::Ok(resetting);
   };
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   const auto parent = claim_program_execution(kernel);
   ASSERT_TRUE(parent.ok());
   ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
@@ -32631,12 +34456,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -32678,12 +34504,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -32758,7 +34585,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(planned_global_source_change(fixture, false).ok());
   ASSERT_TRUE(planned_global_source_change(fixture, true).ok());
 }
-// CONTRACTS §8: `stop` + `hold` issues the operator's Stop on the rule's
+// `stop` + `hold` issues the operator's Stop on the rule's
 // scope only, never latches the cell, gates the scope while the condition
 // holds, and clears by itself.
 TEST(ResourceAddressedExecutionKernelTest, GlobalRuleStopHoldStopsScopeAndGatesUntilClear) {
@@ -32787,7 +34614,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleStopHoldStopsScopeAndGatesU
   const auto& row = ended.participants.front();
   EXPECT_NE(row.state, OperationStateKind::kFailed);
   EXPECT_FALSE(row.terminal_error && row.terminal_error->code == "interrupt_fault");
-  // The hold Stop names its rule for the run end (§9 `stopped_by: rule`).
+  // The hold Stop names its rule for the run end (`stopped_by: rule`).
   ASSERT_TRUE(row.terminal_fact);
   ASSERT_TRUE(row.terminal_fact->error);
   EXPECT_EQ(row.terminal_fact->error->details.at("stopped_by"), "rule");
@@ -32800,7 +34627,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleStopHoldStopsScopeAndGatesU
   const auto holds = fixture.kernel->ReadRuleHolds();
   ASSERT_EQ(holds.size(), 1U);
   EXPECT_EQ(holds.front().details.at("rule_id"), "global.guard");
-  // Its scope, for readiness (§10): the group's components.
+  // Its scope, for readiness: the group's components.
   EXPECT_EQ(holds.front().details.at("scope"), "execution_groups");
   EXPECT_EQ(holds.front().details.at("component_ids"),
             fixture.binding.value().controllable_component_id.value());
@@ -32889,7 +34716,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifyOnlyPublishesTripped)
   ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
 }
 
-// R1, §8: interrupt evaluation is paused during a cell latch, not blind. A
+// Interrupt evaluation is paused during a cell latch, not blind. A
 // rule whose condition became true meanwhile trips when the latch ends: the
 // Kernel requests rule processing then, and the trip is the level, not a
 // lost edge.
@@ -32902,7 +34729,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleTrueDuringALatchTripsWhenIt
   state.lifecycle = ComponentLifecycle::kEnabled;
   state.activity = ComponentActivity::kIdle;
   // The arm is busy when the Stop arrives; a Stop with every component already
-  // healthy and idle clears its latch condition at once (CONTRACTS §5, R2).
+  // healthy and idle clears its latch condition at once.
   auto busy = state;
   busy.activity = ComponentActivity::kBusy;
   fixture.kernel->observe_component_states({busy});
@@ -32929,8 +34756,8 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleTrueDuringALatchTripsWhenIt
   EXPECT_EQ(held.error().code, "rule_holds");
 }
 
-// BBK-1 (d): a true→false pulse while the cell is latched (evaluation
-// paused, R1) is not lost: the registration keeps the trip, so the rule trips
+// A true→false pulse while the cell is latched (evaluation
+// paused) is not lost: the registration keeps the trip, so the rule trips
 // and then clears when the latch ends.
 TEST(ResourceAddressedExecutionKernelTest, GlobalRulePulseDuringALatchTripsWhenItEnds) {
   GlobalMotionRuleFixture fixture;
@@ -32964,7 +34791,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRulePulseDuringALatchTripsWhenI
   EXPECT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
 }
 
-// AUD-6: a `stop` + `hold` rule is the operator's Stop. With nothing in its
+// A `stop` + `hold` rule is the operator's Stop. With nothing in its
 // scope moving, its trip still holds the run at once (every running node
 // held, as the Stop button's group `all`); Resume waits with `rule_holds`.
 TEST(ResourceAddressedExecutionKernelTest, GlobalHoldRuleWithNothingMovingHoldsTheRun) {
@@ -32998,7 +34825,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalHoldRuleWithNothingMovingHoldsT
   EXPECT_EQ(refused.error().details.at("reason"), "program_node_stop_fence_active");
 }
 
-// AUD-6: `fail_node` keeps the run going: no hold; the next motion in scope
+// `fail_node` keeps the run going: no hold; the next motion in scope
 // fails at once with `rule_holds` and the tree handles it.
 TEST(ResourceAddressedExecutionKernelTest, GlobalFailNodeRuleWithNothingMovingLeavesTheRunGoing) {
   GlobalMotionRuleFixture fixture(false, true, IoRuleOnTripDTO::kStop,
@@ -33135,7 +34962,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRulePlannedSourceDisableHoldsOn
   EXPECT_TRUE(allowed.ok()) << allowed.error().message;
 }
 
-// CONTRACTS §7: a component that becomes `prepared` starts its outputs'
+// A component that becomes `prepared` starts its outputs'
 // core-held `changed_outside` signals false; staying prepared changes nothing.
 TEST(ResourceAddressedExecutionKernelTest, ComponentBecomingPreparedClearsItsOutsideChanges) {
   GlobalRuleCatalogFixture fixture;
@@ -33162,6 +34989,40 @@ TEST(ResourceAddressedExecutionKernelTest, ComponentBecomingPreparedClearsItsOut
   EXPECT_EQ(observed->cleared_components, (std::vector<std::string>{"gripper.io", "gripper.io"}));
 }
 
+TEST(ResourceAddressedExecutionKernelTest, EstopPresentationDoesNotClearOutsideChanges) {
+  GlobalRuleCatalogFixture fixture;
+  const auto source = fixture.Service(9U);
+  const auto observed = std::make_shared<GlobalRuleCatalogObservedService>(source);
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(true).ok());
+  ASSERT_TRUE(fixture.kernel->RestoreGlobalIoRuleCatalog(
+      fixture.context, fixture.EmptyCatalog(fixture.context, source), observed).ok());
+  ASSERT_TRUE(fixture.kernel->SetRouteRecoveryPending(false).ok());
+
+  ComponentState owner;
+  owner.component_id = "machine";
+  owner.lifecycle = ComponentLifecycle::kPrepared;
+  owner.activity = ComponentActivity::kIdle;
+  ComponentState io;
+  io.component_id = "gripper.io";
+  io.owner_id = owner.component_id;
+  io.lifecycle = ComponentLifecycle::kEnabled;
+  io.activity = ComponentActivity::kIdle;
+  fixture.kernel->observe_component_states({owner, io});
+  observed->cleared_components.clear();
+
+  owner.stop = ComponentStop{StopCode::kEstop, "E-stop not cleared", "C2", "Emergency stop", 1};
+  const auto projected = presented_member_state(io, owner);
+  ASSERT_EQ(projected.lifecycle, ComponentLifecycle::kPrepared);
+  fixture.kernel->observe_component_states({owner, projected});
+  EXPECT_TRUE(observed->cleared_components.empty());
+
+  owner.stop.reset();
+  fixture.kernel->observe_component_states({owner, io});
+  io.lifecycle = ComponentLifecycle::kPrepared;
+  fixture.kernel->observe_component_states({owner, io});
+  EXPECT_EQ(observed->cleared_components, std::vector<std::string>{"gripper.io"});
+}
+
 
 
 
@@ -33171,12 +35032,12 @@ TEST(ResourceAddressedExecutionKernelTest, ComponentBecomingPreparedClearsItsOut
 
 }  // namespace
 
-// ---- Active TCP (M7): Set TCP admission, atomic step, preempt TCP rule -----
+// ---- Active TCP: Set TCP admission, atomic step, preempt TCP rule ----------
 namespace {
 
-[[nodiscard]] TcpEntryDTO arm_own_tcp() {
-  return TcpEntryDTO{ControllableComponentId("robot.1"), CommandTargetId("arm"),
-                     FrameRoleId("tcp")};
+[[nodiscard]] TcpEntryReferenceDTO arm_own_tcp() {
+  return TcpEntryReferenceDTO{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                              {ControllableComponentId("robot.1"), FrameRoleId("tcp")}};
 }
 
 [[nodiscard]] OperationIntentDTO set_tcp_operation(std::string request_id) {
@@ -33190,14 +35051,14 @@ namespace {
   auto value = source.value();
   const auto found =
       std::find_if(value.frame_bindings.begin(), value.frame_bindings.end(),
-                   [&](const auto& row) { return row.frame_role_id == frame; });
+                   [&](const auto& row) { return row.reference.frame_id == frame; });
   value.motion_endpoint->frame = *found;
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) throw std::logic_error(sealed.error().message);
   return std::move(sealed.value());
 }
 
-// T-A2, T-A2b: with "Send TCP offset to controller" on, Set TCP holds the robot
+// With "Send TCP offset to controller" on, Set TCP holds the robot
 // and gets the existing busy refusal while a move is admitted; off, it holds
 // nothing and runs during the move.
 TEST(ResourceAddressedExecutionKernelTest, SetTcpWithOffsetSyncIsRefusedWhileAMoveIsAdmitted) {
@@ -33206,17 +35067,18 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpWithOffsetSyncIsRefusedWhileAMo
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
-    std::vector<TcpEntryDTO> applied;
+    std::vector<TcpEntryReferenceDTO> applied;
     auto row = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
-    row.set_tcp = SetTcpStep{holds_robot, [&](const TcpEntryDTO& entry, bool) {
+    row.set_tcp = SetTcpStep{holds_robot, [&](const TcpEntryReferenceDTO& entry, bool) {
                                applied.push_back(entry);
                                return Result<void>::Ok();
                              }};
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {row}, clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto at_rest = kernel.execute(set_tcp_operation("set_tcp.at_rest"));
     ASSERT_TRUE(at_rest.ok()) << at_rest.error().message;
     ASSERT_EQ(applied.size(), 1U);
@@ -33239,7 +35101,7 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpWithOffsetSyncIsRefusedWhileAMo
   }
 }
 
-// T-MQ15: the step is atomic. While a holding Set TCP runs no move of that
+// The step is atomic. While a holding Set TCP runs no move of that
 // robot is admitted, and a Stop neither waits for it nor ends it.
 TEST(ResourceAddressedExecutionKernelTest, SetTcpIsAtomicHoldsTheRobotAndAStopDoesNotEndIt) {
   FakeClock clock;
@@ -33250,8 +35112,8 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpIsAtomicHoldsTheRobotAndAStopDo
   auto released = release.get_future().share();
   std::atomic<int> finished{0};
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
-  row.set_tcp = SetTcpStep{true, [&](const TcpEntryDTO&, bool) {
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.set_tcp = SetTcpStep{true, [&](const TcpEntryReferenceDTO&, bool) {
                              entered.set_value();
                              released.wait();
                              ++finished;
@@ -33260,8 +35122,9 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpIsAtomicHoldsTheRobotAndAStopDo
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, default_journal,
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, default_journal,
                                           std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   auto setting = std::async(std::launch::async,
                             [&] { return kernel.execute(set_tcp_operation("set_tcp.atomic")); });
   ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(10)), std::future_status::ready);
@@ -33290,12 +35153,13 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpIsRefusedTypedWithoutAStepOrWhe
   ManualScheduler scheduler;
   {
     FakeParticipantEngine engine;
-    ResourceAddressedExecutionKernel kernel(
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {registration(
-            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
             engine)},
         clock, scheduler, default_journal,
         {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *kernel_heap_test_owner;
     const auto refused = kernel.execute(set_tcp_operation("set_tcp.unavailable"));
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"), "set_tcp_unavailable");
@@ -33304,18 +35168,19 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpIsRefusedTypedWithoutAStepOrWhe
   }
   FakeParticipantEngine engine;
   auto failing = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
-  failing.set_tcp = SetTcpStep{true, [](const TcpEntryDTO& entry, bool) {
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  failing.set_tcp = SetTcpStep{true, [](const TcpEntryReferenceDTO& entry, bool) {
                                  return Result<void>::Err(tcp_tool_not_mounted_error(
                                      ControllableComponentId("robot.1"), entry));
                                }};
-  ResourceAddressedExecutionKernel kernel(
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
       {failing}, clock, scheduler, default_journal,
       {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
   const auto refused = kernel.execute(set_tcp_operation("set_tcp.not_mounted"));
   ASSERT_FALSE(refused.ok());
   EXPECT_EQ(refused.error().details.at("reason"), "tcp_tool_not_mounted");
-  // A2b: a failure after admission carries its receipt.
+  // A failure after admission carries its receipt.
   EXPECT_EQ(refused.error().details.at("immediate_step"), "admitted");
   EXPECT_EQ(refused.error().details.at("request_id"), "set_tcp.not_mounted");
   EXPECT_FALSE(refused.error().details.at("operation_id").empty());
@@ -33324,33 +35189,34 @@ TEST(ResourceAddressedExecutionKernelTest, SetTcpIsRefusedTypedWithoutAStepOrWhe
   ASSERT_TRUE(move.ok()) << move.error().message;
 }
 
-// A2a-1: Set TCP needs neither an enabled robot nor open motion admission.
+// Set TCP needs neither an enabled robot nor open motion admission.
 TEST(ResourceAddressedExecutionKernelTest, SetTcpIsAcceptedWhileMotionAdmissionIsClosed) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
   FakeOperationJournal journal;
-  std::vector<TcpEntryDTO> applied;
+  std::vector<TcpEntryReferenceDTO> applied;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
-  row.set_tcp = SetTcpStep{true, [&](const TcpEntryDTO& entry, bool) {
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.set_tcp = SetTcpStep{true, [&](const TcpEntryReferenceDTO& entry, bool) {
                              applied.push_back(entry);
                              return Result<void>::Ok();
                            }};
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                 CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   kernel.ContainInternalFault("test_internal_fault");
   const auto move = kernel.execute(motion_operation("set_tcp.closed_move"));
   ASSERT_FALSE(move.ok());
   EXPECT_EQ(move.error().details.at("reason"), "motion_admission_closed");
   const auto set = kernel.execute(set_tcp_operation("set_tcp.while_closed"));
   ASSERT_TRUE(set.ok()) << set.error().message;
-  EXPECT_EQ(applied, std::vector<TcpEntryDTO>{arm_own_tcp()});
+  EXPECT_EQ(applied, std::vector<TcpEntryReferenceDTO>{arm_own_tcp()});
 }
 
-// T-A2b for Robot control: with the checkbox off, a manual Set TCP runs while
+// For Robot control: with the checkbox off, a manual Set TCP runs while
 // the caller's own manual jog holds the robot; with it on, the robot is busy.
 TEST(ResourceAddressedExecutionKernelTest, ManualSetTcpDuringOwnJogFollowsTheCheckbox) {
   for (const bool holds_robot : {false, true}) {
@@ -33360,11 +35226,11 @@ TEST(ResourceAddressedExecutionKernelTest, ManualSetTcpDuringOwnJogFollowsTheChe
     FakeParticipantEngine engine;
     int applied = 0;
     auto direct = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
         engine);
     direct.intrinsic_direct_control = true;
-    direct.set_tcp = SetTcpStep{holds_robot, [&](const TcpEntryDTO&, const bool robot_control) {
-                                  // A2a-2: Robot control's Set TCP is recorded as such.
+    direct.set_tcp = SetTcpStep{holds_robot, [&](const TcpEntryReferenceDTO&, const bool robot_control) {
+                                  // Robot control's Set TCP is recorded as such.
                                   EXPECT_TRUE(robot_control);
                                   ++applied;
                                   return Result<void>::Ok();
@@ -33372,7 +35238,8 @@ TEST(ResourceAddressedExecutionKernelTest, ManualSetTcpDuringOwnJogFollowsTheChe
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
     config.manager_liveness_required_set = EmptyManagerLivenessSet();
-    ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal, config);
+    auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({direct}, clock, scheduler, default_journal, config);
+    auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(ready_cell_admission(kernel).ok());
     auto jog = motion_operation("set_tcp.manual.jog");
     jog.program_run_id = ProgramRunId("manual.run");
@@ -33392,7 +35259,7 @@ TEST(ResourceAddressedExecutionKernelTest, ManualSetTcpDuringOwnJogFollowsTheChe
   }
 }
 
-// T-MQ2, T-C2c, T-A1: a preempt resolving to another TCP is refused before
+// A preempt resolving to another TCP is refused before
 // anything is prepared, the same on every lane; a Current preempt is accepted.
 TEST(ResourceAddressedExecutionKernelTest, PreemptNamingAnotherTcpIsRefusedAndCurrentIsAccepted) {
   FakeClock clock;
@@ -33401,7 +35268,7 @@ TEST(ResourceAddressedExecutionKernelTest, PreemptNamingAnotherTcpIsRefusedAndCu
   FakeOperationJournal journal;
   engine.supports_motion_replacement = true;
   auto row = registration(
-      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
   row.motion_takeover_preparation_budget_s = 1.0;
   auto base_tcp = row;
   base_tcp.binding = endpoint_on_frame(row.binding, FrameRoleId("base"));
@@ -33413,10 +35280,11 @@ TEST(ResourceAddressedExecutionKernelTest, PreemptNamingAnotherTcpIsRefusedAndCu
     const auto* motion =
         std::get_if<MotionParticipantIntentDTO>(&operation.participants.front().payload);
     return Result<RuntimeParticipantExecutionRegistration>::Ok(
-        motion != nullptr && std::holds_alternative<TcpEntryDTO>(motion->tcp_endpoint) ? base_tcp
+        motion != nullptr && std::holds_alternative<TcpEntryReferenceDTO>(motion->tcp_endpoint) ? base_tcp
                                                                                        : row);
   };
-  ResourceAddressedExecutionKernel kernel({row}, clock, scheduler, journal, std::move(config));
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
   start_program_motion(kernel);
@@ -33426,7 +35294,8 @@ TEST(ResourceAddressedExecutionKernelTest, PreemptNamingAnotherTcpIsRefusedAndCu
 
   auto other = takeover_intent(1U, "tcp.other");
   std::get<MotionParticipantIntentDTO>(other.participants.front().payload).tcp_endpoint =
-      TcpEntryDTO{ControllableComponentId("robot.1"), CommandTargetId("arm"), FrameRoleId("base")};
+      TcpEntryReferenceDTO{{ControllableComponentId("robot.1"), CommandTargetId("arm")},
+                           {ControllableComponentId("robot.1"), FrameRoleId("base")}};
   const auto refused = kernel.execute(other);
   ASSERT_FALSE(refused.ok());
   EXPECT_EQ(refused.error().details.at("reason"), "tool_context_change_during_motion");

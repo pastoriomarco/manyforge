@@ -35,9 +35,9 @@ lanes:
     adapter: mock
     controller: joint_trajectory_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 0.5
-    gripper_result_timeout_s: 15.0
 defaults:
   initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
   maximum_tcp_linear_speed_mps: 0.25

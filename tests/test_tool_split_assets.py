@@ -52,6 +52,17 @@ def _by_name(root: ET.Element, tag: str) -> dict[str, bytes]:
     return {node.get("name"): _normalized(node) for node in root.findall(tag)}
 
 
+def _without_added_acceleration(arm: ET.Element, combined: ET.Element) -> ET.Element:
+    """The arm as cut: its README adds joint acceleration limits (URDF 1.2) the combined bundle lacks."""
+    if combined.find("joint/limit[@acceleration]") is not None:
+        return arm
+    copy = ET.fromstring(ET.tostring(arm))
+    copy.attrib.pop("version", None)
+    for limit in copy.iter("limit"):
+        limit.attrib.pop("acceleration", None)
+    return copy
+
+
 @pytest.mark.parametrize(("combined", "mount", "arm", "tool", "stem"), CUTS)
 def test_checked_in_bundles_are_the_cut_of_the_combined_bundles(
     combined: str, mount: str, arm: str, tool: str, stem: str
@@ -62,7 +73,14 @@ def test_checked_in_bundles_are_the_cut_of_the_combined_bundles(
         (MODELS / combined / f"{stem}.srdf").read_text(),
         mount_joint=mount, arm_name=arm, tool_name=tool_name,
     )
-    assert model.arm_urdf == (MODELS / arm / f"{arm}.urdf").read_text()
+    arm_urdf = (MODELS / arm / f"{arm}.urdf").read_text()
+    combined_root = ET.parse(MODELS / combined / f"{stem}.urdf").getroot()
+    arm_root = ET.fromstring(arm_urdf)
+    if _without_added_acceleration(arm_root, combined_root) is arm_root:
+        assert model.arm_urdf == arm_urdf
+    else:
+        assert _normalized(ET.fromstring(model.arm_urdf)) == _normalized(
+            _without_added_acceleration(arm_root, combined_root))
     assert model.arm_srdf == (MODELS / arm / f"{arm}.srdf").read_text()
     assert model.tool_urdf == (MODELS / tool_name / f"{tool}.urdf").read_text()
     assert model.tool_srdf == (MODELS / tool_name / f"{tool}.srdf").read_text()
@@ -74,7 +92,7 @@ def test_the_cut_keeps_every_link_joint_and_pose(
 ) -> None:
     tool_name = tool.split(".")[0]
     whole = ET.parse(MODELS / combined / f"{stem}.urdf").getroot()
-    arm_root = ET.parse(MODELS / arm / f"{arm}.urdf").getroot()
+    arm_root = _without_added_acceleration(ET.parse(MODELS / arm / f"{arm}.urdf").getroot(), whole)
     tool_root = ET.parse(MODELS / tool_name / f"{tool}.urdf").getroot()
     mount_link = f"{tool_name}_mount"
     parent = whole.find(f"joint[@name='{mount}']/parent").get("link")
@@ -296,36 +314,34 @@ def test_standalone_robotiq_fixture_keeps_its_own_catalog() -> None:
 
 @pytest.mark.parametrize("family_id", ARMS)
 def test_robot_component_type_offers_its_flange(family_id: str) -> None:
-    for suffix in (".component", ".fixed_scale.component"):
-        document = json.loads((COMPONENT_TYPES / f"{family_id}{suffix}.json").read_text())
-        assert document["attachment_interfaces"] == [{
-            "accepts_tags": ["tool"], "attachment_interface_id": "flange",
-            "frame_role_id": "flange", "max_attachments": 1, "model_role_id": "arm_model",
-        }]
-        assert document["tags"] == ["articulated-arm"]
-        (target,) = document["command_targets"]
-        assert target["command_target_id"] == "arm"
-        assert [row["frame_role_id"] for row in target["frame_roles"]] == ["base", "flange"]
+    document = json.loads((COMPONENT_TYPES / f"{family_id}.component.json").read_text())
+    assert document["attachment_interfaces"] == [{
+        "accepts_tags": ["tool"], "attachment_interface_id": "flange",
+        "frame_role_id": "flange", "max_attachments": 1, "model_role_id": "arm_model",
+    }]
+    assert document["tags"] == ["articulated-arm"]
+    (target,) = document["command_targets"]
+    assert target["command_target_id"] == "arm"
+    assert [row["frame_role_id"] for row in target["frame_roles"]] == ["base", "flange"]
 
 
 @pytest.mark.parametrize("family_id", TOOLS)
 def test_tool_component_type_mounts_at_its_root(family_id: str) -> None:
-    for suffix in (".component", ".fixed_scale.component"):
-        document = json.loads((COMPONENT_TYPES / f"{family_id}{suffix}.json").read_text())
-        assert document["model_roles"] == [{"cardinality": "exactly_one", "model_role_id": "tool_model"}]
-        assert document["component_root"] == {"frame_role_id": "mount", "model_role_id": "tool_model"}
-        assert document["attachment_interfaces"] == [{
-            "accepts_tags": ["articulated-arm"], "attachment_interface_id": "mount",
-            "frame_role_id": "mount", "max_attachments": 1, "model_role_id": "tool_model",
-        }]
-        assert sorted(document["tags"]) == ["gripper", "tool"]
-        (target,) = document["command_targets"]
-        assert target["command_target_id"] == "gripper"
-        # Each TCP under its own name (the 2F-85 also has `base`), `tcp` the default.
-        tcps = _families()[family_id].get("tcp_frame_role_ids", ["tcp"])
-        assert [(row["frame_role_id"], row["asset_frame_role_id"], row["tcp"])
-                for row in target["frame_roles"]] == [(role, role, True) for role in sorted(tcps)]
-        assert target["default_tcp_frame_role_id"] == "tcp"
+    document = json.loads((COMPONENT_TYPES / f"{family_id}.component.json").read_text())
+    assert document["model_roles"] == [{"cardinality": "exactly_one", "model_role_id": "tool_model"}]
+    assert document["component_root"] == {"frame_role_id": "mount", "model_role_id": "tool_model"}
+    assert document["attachment_interfaces"] == [{
+        "accepts_tags": ["articulated-arm"], "attachment_interface_id": "mount",
+        "frame_role_id": "mount", "max_attachments": 1, "model_role_id": "tool_model",
+    }]
+    assert sorted(document["tags"]) == ["gripper", "tool"]
+    (target,) = document["command_targets"]
+    assert target["command_target_id"] == "gripper"
+    # Each TCP under its own name (the 2F-85 also has `base`), `tcp` the default.
+    tcps = _families()[family_id].get("tcp_frame_role_ids", ["tcp"])
+    assert [(row["frame_role_id"], row["asset_frame_role_id"], row["tcp"])
+            for row in target["frame_roles"]] == [(role, role, True) for role in sorted(tcps)]
+    assert target["default_tcp_frame_role_id"] == "tcp"
 
 
 def _generator():
@@ -347,10 +363,9 @@ def test_component_types_without_a_tcp_list_are_unchanged(family_id: str) -> Non
     # `flange`) generates the same bytes as the shipped component types.
     generator = _generator()
     family = _families()[family_id]
-    for runtime_scaling, suffix in ((True, ".component"), (False, ".fixed_scale.component")):
-        document = generator.component_type_document(family, runtime_scaling=runtime_scaling)
-        shipped = (COMPONENT_TYPES / f"{family_id}{suffix}.json").read_bytes()
-        assert generator.pretty_bytes(document) == shipped, suffix
+    document = generator.component_type_document(family)
+    shipped = (COMPONENT_TYPES / f"{family_id}.component.json").read_bytes()
+    assert generator.pretty_bytes(document) == shipped
 
 
 def test_a_tool_tcp_list_names_its_tcps_and_default() -> None:
@@ -366,17 +381,16 @@ def test_a_tool_tcp_list_names_its_tcps_and_default() -> None:
         {"frame_role_id": "tip", "source_link_name": "lite_gripper_base_link"},
     ]
     family["tcp_frame_role_ids"] = ["cup_center", "tip"]
-    for runtime_scaling in (True, False):
-        document = generator.component_type_document(family, runtime_scaling=runtime_scaling)
-        (target,) = document["command_targets"]
-        assert target["frame_roles"] == [
-            {"asset_frame_role_id": role, "contact_body_role_ids": ["gripper_fingers"],
-             "frame_role_id": role, "model_role_id": "tool_model", "tcp": True}
-            for role in ("cup_center", "tip")
-        ]
-        assert target["default_tcp_frame_role_id"] == "cup_center"
-        assert document["component_root"] == {"frame_role_id": "mount",
-                                              "model_role_id": "tool_model"}
+    document = generator.component_type_document(family)
+    (target,) = document["command_targets"]
+    assert target["frame_roles"] == [
+        {"asset_frame_role_id": role, "contact_body_role_ids": ["gripper_fingers"],
+         "frame_role_id": role, "model_role_id": "tool_model", "tcp": True}
+        for role in ("cup_center", "tip")
+    ]
+    assert target["default_tcp_frame_role_id"] == "cup_center"
+    assert document["component_root"] == {"frame_role_id": "mount",
+                                          "model_role_id": "tool_model"}
     family["tcp_frame_role_ids"] = ["tip", "cup_center"]
     (target,) = generator.component_type_document(family)["command_targets"]
     assert target["default_tcp_frame_role_id"] == "tip"
@@ -417,6 +431,7 @@ def test_mock_lane_rows_split_arm_and_gripper_controllers() -> None:
         row = data["lanes"]["mock"]
         assert row["adapter"] == "mock"
         assert ("arrival_tolerance_rad" in row) == (name in ARMS)
+        assert (row.get("runtime_scale") == "supported") == (name in ARMS)
         if "vendor" in row:  # a vendor's controllers (the xArm arms)
             continue
         controllers = yaml.safe_load((folder / row["controllers_file"]).read_text())
@@ -427,7 +442,7 @@ def test_mock_lane_rows_split_arm_and_gripper_controllers() -> None:
         }
         assert types["__controller__"] == (
             "joint_trajectory_controller/JointTrajectoryController" if name in ARMS
-            else "position_controllers/GripperActionController")
+            else "parallel_gripper_action_controller/GripperActionController")
 
 
 @pytest.mark.parametrize("name", ARMS + TOOLS)
@@ -449,7 +464,6 @@ def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
     # components, mounted flange -> mount, each on its own Mock row.
     project = ROOT / "examples" / "mock_uf850_xarm_gripper.scenario"
     deployment = json.loads((project / "deployment.yaml").read_text())
-    assignment = json.loads((project / "assignment.yaml").read_text())
     families = _families()
     [attachment] = deployment["attachments"]
     assert (attachment["parent"], attachment["child"]) == (
@@ -457,7 +471,7 @@ def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
         {"component_id": "xarm_gripper", "interface": "mount"},
     )
     components = {row["component_id"]: row for row in deployment["components"]}
-    # AUD-5: the UF850 is a machine on Mock; its arm keeps the robot's id and
+    # The UF850 is a machine on Mock; its arm keeps the robot's id and
     # its I/O members are deactivated.
     assert set(components) == {"uf850", "uf850_robot", "uf850_robot_controller_io",
                                "uf850_robot_tool_io", "xarm_gripper"}
@@ -489,6 +503,14 @@ def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
     assert gripper["mount_frame"] == "xarm_gripper_mount"
     assert sorted(row["stream_id"] for row in tool["component_streams"]) == [
         "gripper_feedback", "measured_joints"]
-    roles = {row["component_role_id"]: row["controllable_component_id"]
-             for row in assignment["component_roles"]}
-    assert roles == {"robot": "uf850_robot", "tool": "xarm_gripper"}
+    # The Program names the robot and the tool by component reference.
+    def referenced(value: object) -> set[str]:
+        if isinstance(value, dict):
+            found = {value["component_id"]} if isinstance(value.get("component_id"), str) else set()
+            return found.union(*(referenced(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(referenced(item) for item in value))
+        return set()
+
+    assert referenced(json.loads((project / "program.yaml").read_text())) == {
+        "uf850_robot", "xarm_gripper"}

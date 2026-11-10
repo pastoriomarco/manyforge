@@ -208,7 +208,7 @@ def test_gripper_hold_and_readiness_no_longer_depend_on_arm_gate() -> None:
 
 
 def test_cancel_holds_current_fingers_before_accepting() -> None:
-    """N10b: like the stock controller, the accepted cancel already holds."""
+    """Like the stock controller, the accepted cancel already holds."""
     from types import SimpleNamespace
     import threading
     from rclpy.action import CancelResponse

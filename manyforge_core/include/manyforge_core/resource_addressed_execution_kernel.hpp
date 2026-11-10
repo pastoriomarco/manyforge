@@ -50,11 +50,11 @@ struct ActiveOperationParticipant;
 
 inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
 
-/// A2a-2: an immediate component step. A short direct Kernel call: admitted
+/// An immediate component step. A short direct Kernel call: admitted
 /// like an operation of its component, then the adapter's atomic step runs
 /// synchronously, outside the Kernel locks, and nothing is stored (no
 /// operation record, journal entry or acknowledgement). No Stop ends it.
-/// Users: Set TCP (A2a); the tool payload update (`set_tcp_load`, A2b).
+/// Users: Set TCP; the tool payload update (`set_tcp_load`).
 struct ImmediateComponentStep final {
   /// Hold the component's engine for the step: refused (`participant_engine_busy`)
   /// while an operation of that engine is admitted, and no operation of that
@@ -64,21 +64,21 @@ struct ImmediateComponentStep final {
   std::function<Result<void>()> run;
 };
 
-/// Active TCP (M7, T-MQ15, T-A2): a robot's Set TCP, an immediate component
+/// Active TCP: a robot's Set TCP, an immediate component
 /// step. The resolver supplies it with the robot's motion-target registration;
 /// the resolved entry is `tcp_entry_of(*binding.motion_endpoint,
 /// motion_endpoint_owner.value_or(binding.controllable_component_id))`.
 struct SetTcpStep final {
   /// "Send TCP offset to controller" on: Set TCP holds the robot
   /// (`ImmediateComponentStep::holds_engine`). Off: it holds nothing and may
-  /// run during a move (T-A2b).
+  /// run during a move.
   bool holds_robot{};
   /// The robot's confirmed TCP step, then the commit. Ok once the robot's
   /// Active TCP is `entry` (also when it already was, and while the robot is
-  /// not enabled: A2a-1). `robot_control`: the registration's
+  /// not enabled). `robot_control`: the registration's
   /// `intrinsic_direct_control` (Robot control's Set TCP, else a Program's),
-  /// recorded with the change (A2a-2).
-  std::function<Result<void>(const TcpEntryDTO& entry, bool robot_control)> apply;
+  /// recorded with the change.
+  std::function<Result<void>(const TcpEntryReferenceDTO& entry, bool robot_control)> apply;
 };
 
 struct RuntimeParticipantExecutionRegistration final {
@@ -145,14 +145,17 @@ struct RuntimeParticipantExecutionRegistration final {
   std::optional<MotionInterruptScopeDTO> captured_node_interrupt_scope{};
   /// Optional earlier suffix-planning deadline from the applied Deployment.
   std::optional<double> motion_takeover_planning_budget_s{};
-  /// B7: the owner of this operation's motion-endpoint frame (the motion
+  /// The owner of this operation's motion-endpoint frame (the motion
   /// component or a tool mounted on it), resolved from the cell kinematic
   /// index. It stamps the request's TCP frame; absent means the motion
   /// component itself.
   std::optional<ControllableComponentId> motion_endpoint_owner{};
-  /// Active TCP (M7): present on a robot's motion-target registration that
+  /// Active TCP: present on a robot's motion-target registration that
   /// can set its Active TCP. Absent: Set TCP is refused (`set_tcp_unavailable`).
   std::optional<SetTcpStep> set_tcp{};
+  std::optional<PreviewTcpCapture> preview_tcp_capture{};
+  // Kernel-assigned event subscription identity; never supplied as authority by a resolver.
+  std::uint64_t engine_subscription_id{};
 };
 
 using RuntimeParticipantAdmissionResolver =
@@ -183,7 +186,7 @@ struct OperationJournalWriteFaultDTO final {
                          const OperationJournalWriteFaultDTO&) = default;
 };
 
-/// First contained internal fault (D3: a callback threw on the Stop/safety
+/// First contained internal fault (a callback threw on the Stop/safety
 /// path) in this Workbench owner. Motion admission stays closed while it is
 /// held; it is retained until owner destruction (Workbench restart), like the
 /// operation-journal write fault. Later throws only increase `later_count`.
@@ -309,10 +312,14 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// names one identical non-empty graph revision.
   std::optional<GraphRevision> graph_revision;
   std::size_t emergency_stop_correlation_capacity{kMaximumEmergencyStopCorrelationEntries};
-  /// Maximum number of participants whose Stop cascades may be live at once.
-  /// Zero derives the exact bound from the initially registered execution
-  /// engines. A nonzero value permits later reconfiguration growth without
-  /// allocating attempt isolation after Stop ingress opens.
+  /// Maximum number of participants whose Stop cascades may be live at once:
+  /// the ceiling a reconfiguration may grow to. Zero derives it from the
+  /// initially registered execution engines. The pre-started Stop-stage
+  /// attempt workers are sized to the current cell's Stop-qualified
+  /// participants (at least one), never to this ceiling: reconfiguration
+  /// builds a resized pool before its commit, swaps it in at the commit and
+  /// drains and joins the retired pool after releasing every Kernel lock, so
+  /// no worker is ever created on the Stop path.
   std::size_t prequalified_max_live_stop_participants{};
   /// Fixed asynchronous acceptance/terminal forensic-projection slots. Zero
   /// derives the normal correlation-plus-terminal-history bound. A smaller
@@ -395,7 +402,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
  public:
   ResourceAddressedExecutionKernel(
       std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
-      IScheduler& scheduler, IOperationJournal& journal,
+      IOperationJournal& journal,
       ResourceAddressedExecutionKernelConfig config);
   ~ResourceAddressedExecutionKernel();
 
@@ -414,7 +421,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Resolve, reserve, and submit one portable operation. Exact replay returns
   /// the original owner-minted identities and performs no subordinate call.
   ///
-  /// Active TCP (M7, T-MQ15, A2a-2): a Set TCP intent
+  /// Active TCP: a Set TCP intent
   /// (`SetTcpParticipantIntentDTO`) runs as an immediate component step
   /// (`execute_immediate_step`). The call returns when the step finished:
   /// Ok = the robot's Active TCP is the resolved entry; Err = typed refusal or
@@ -471,7 +478,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopStatusDTO> get_stop_status(const StopId& stop_id) const;
   [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
       const StopCertificateId& certificate_id) const;
-  /// Component model v2 (CONTRACTS §5): the execution host passes the
+  /// Component model v2: the execution host passes the
   /// current state of every component in the cell on every change. Components
   /// absent from `states` no longer count. Nothing is stored or journaled.
   void observe_component_states(std::vector<ComponentState> states);
@@ -487,15 +494,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// (`execution_host_restart_awaiting_components`) or for every component
   /// to be idle (`execution_host_restart_settling`, when no latch cause shows
   /// it). Each
-  /// blocks motion; nothing blocks invisibly (CONTRACTS §10).
+  /// blocks motion; nothing blocks invisibly.
   [[nodiscard]] std::vector<ErrorDTO> ReadExecutionBlocks() const;
-  /// CONTRACTS §2: called once for every newly accepted Stop (operator Stop
+  /// Called once for every newly accepted Stop (operator Stop
   /// and Halt, a rule's Stop, Reset's Stop, a containment Stop), outside the
   /// Kernel's locks, so the host interrupts every component action in
   /// progress. Set once by the execution host before the Kernel runs.
   void set_stop_listener(std::function<void()> on_stop_accepted);
-  [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
-      const RuntimeScaleRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
       const OperationId& operation_id) const;
   [[nodiscard]] Result<RuntimeScaleControlAcceptedDTO> set_runtime_scale_control(
@@ -592,7 +597,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   installed_global_io_rule_catalog() const;
   [[nodiscard]] std::optional<IoRuleStateProjectionDTO> ReadInterruptRuleStateBaseline() const;
 
-  /// CONTRACTS §8 activation (node `rules.set_active`): succeeds at once; an
+  /// Rule activation (node `rules.set_active`): succeeds at once; an
   /// unknown rule id is refused with `rule_unknown`. Activating a rule whose
   /// condition holds trips it at once.
   [[nodiscard]] Result<void> set_rule_active(const InterruptPolicyId& rule_id, bool active);
@@ -602,10 +607,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// `stop` rule whose condition holds after its trip, or any active rule
   /// that can't watch its signals. Readiness reads this; nothing recomputes it.
   [[nodiscard]] std::vector<ErrorDTO> ReadRuleHolds() const;
-  /// CONTRACTS §7 (node `io.clear_outside_change`): clears the core-held
+  /// Node `io.clear_outside_change`: clears the core-held
   /// `<signal_id>.changed_outside` flag of one output; writes nothing.
   [[nodiscard]] Result<void> clear_outside_change(const IoSignalId& output);
-  /// CONTRACTS §7 (one write path): admission of every output write, manual
+  /// One write path: admission of every output write, manual
   /// or Program, made through the execution host's `set_io_output`. Refused
   /// `cell_latched` while the cell latch holds, and `rule_holds` (with
   /// `rule_id`) while an active rule whose scope covers the signal
@@ -634,7 +639,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// The host retains its actual shared composition currentness guard through
   /// this call and verifies the retained context against that publication.
   /// Public fields never establish Applied ownership or receiver time.
-  /// BBK-1: an accepted frame is evaluated by the rules before the ACK
+  /// An accepted frame is evaluated by the rules before the ACK
   /// returns, so the Runner's next admission sees it.
   [[nodiscard]] Result<IoProgramBlackboardAcknowledgementDTO> PublishProgramBlackboard(
       const IoProgramBlackboardPublicationDTO& publication);
@@ -681,6 +686,15 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   /// Read-only owner projection. Subordinate polling and state advancement are
   /// performed only by reconcile_subordinate_state(), never by this method.
+  /// Journal an exact active subordinate's unresolved late cancellation.
+  /// Success means an effect-uncertain intervention is durably projected;
+  /// callers retain their pending evidence on any refusal or write failure.
+  [[nodiscard]] Result<void> record_late_cancel_uncertain(
+      IResolvedParticipantExecutionEngine* engine, std::uint64_t execution_id);
+  [[nodiscard]] Result<void> record_late_cancel_uncertain(
+      IResolvedParticipantExecutionEngine* engine, std::uint64_t preparation_id,
+      std::uint64_t command_id, std::uint64_t generation, const CommandTargetId& target);
+
   [[nodiscard]] Result<OperationStateDTO> get_operation_state(
       const OperationId& operation_id) const override;
 
@@ -732,6 +746,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
 
+  /// Live participants the current pre-started Stop-stage attempt pool
+  /// isolates (its lane count is this times kMaxStopEscalationStages).
+  [[nodiscard]] std::size_t stop_stage_attempt_pool_participants() const;
+
   /// Select one verified runtime product before route readiness is published.
   [[nodiscard]] Result<void> reconfigure_runtime_product(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
@@ -754,10 +772,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Publish the candidate-side active-configuration identities already
   /// declared by the installed registrations while the exact durable Apply
   /// fence still closes every affected resource. This does not publish Stop
-  /// readiness or create a CCLC route predecessor: route-fence admission sees
-  /// the separately tracked authoritative publication inventory. CCLC must
-  /// replace these staged facts with independently verified readiness before
-  /// addressed command admission can reopen.
+  /// readiness or create a published route predecessor: route-fence admission
+  /// sees the separately tracked authoritative publication inventory. The
+  /// execution host must replace these staged facts with independently
+  /// verified readiness before addressed command admission can reopen.
   [[nodiscard]] Result<void> stage_current_runtime_configuration_facts_under_apply_fence(
       const ConfigurationFenceScopeDTO& scope);
 
@@ -765,8 +783,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// replacement without claiming that the new provider incarnation is
   /// Stop-ready. The supplied registrations must name the predecessor's
   /// domain/configuration but carry no readiness for that domain. This keeps
-  /// operation admission closed while allowing CCLC to acquire the exact
-  /// route fence and publish a freshly observed successor configuration.
+  /// operation admission closed while allowing the execution host to acquire
+  /// the exact route fence and publish a freshly observed successor
+  /// configuration.
   [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO>
   adopt_runtime_route_configuration_predecessor(
       ActiveControlConfigurationDTO configuration,
@@ -824,7 +843,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
-  struct RuntimeScaleReplayEntry;
   struct RuntimeScaleControlReplayEntry;
   struct RuntimeScaleControlSetting;
   struct RuntimeScaleControlResolution;
@@ -841,6 +859,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id, OperationRevision expected_operation_revision,
       const KernelRecoveryActionRequestDTO& request);
   [[nodiscard]] Result<void> retire_preempted_motion_operations();
+  [[nodiscard]] Result<void> retire_rebuilt_motion_operations_for_program_reset(
+      const ProgramRunId& run_id);
+  [[nodiscard]] Result<bool> retire_rebuilt_unknown_takeover_for_program_reset(
+      const OperationId& incumbent_id);
   [[nodiscard]] Result<void> retire_operation_ownership_locked(
       const OperationId& operation_id, bool clear_continuation,
       bool discard_node_continuations = false);
@@ -858,7 +880,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct PreviewSession;
 
   [[nodiscard]] bool operation_control_reconfiguration_busy_locked() const;
-  /// Spec 450 §5.2 attention test for Program work over exact resources.
+  /// Attention test for Program work over exact resources.
   /// No refusal when the composition carries no alarm-attention policy.
   [[nodiscard]] std::optional<ErrorDTO> operator_alarm_attention_refusal_locked(
       const std::vector<ResourceId>& reserved_resources) const;
@@ -916,13 +938,19 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] OperationReadProjectionDTO operation_projection_locked(
       const OperationStateDTO& state, bool active, bool control_pending) const;
   [[nodiscard]] std::optional<OperationId> find_event_operation_locked(
-      const IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id) const;
-  void on_engine_event(IResolvedParticipantExecutionEngine* engine, const KernelEvent& event);
+      const IResolvedParticipantExecutionEngine* engine, std::uint64_t subordinate_id,
+      std::optional<std::uint64_t> subscription_id = std::nullopt) const;
+  void on_engine_event(IResolvedParticipantExecutionEngine* engine, std::uint64_t subscription_id,
+                       const KernelEvent& event);
   [[nodiscard]] Result<void> apply_subordinate_state(
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
       std::uint64_t subordinate_id, OperationStateKind state, double progress,
       std::optional<ErrorDTO> terminal_error, bool observe_current_motion = false,
-      std::optional<ParticipantExecutionFact> terminal_fact = std::nullopt);
+      std::optional<ParticipantExecutionFact> terminal_fact = std::nullopt,
+      bool require_unfinalized_motion = false, bool* durable_applied = nullptr,
+      std::optional<std::uint64_t> exact_gripper_preparation = std::nullopt,
+      std::optional<std::uint64_t> exact_gripper_generation = std::nullopt,
+      std::optional<CommandTargetId> exact_gripper_target = std::nullopt);
   void stamp_operation_capture_locked(ActiveOperation& operation, OperationStateDTO& state);
   void retain_operation_journal_write_fault_locked(
       std::string_view write_kind, const ErrorDTO& failure,
@@ -940,9 +968,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine = nullptr,
       std::optional<ErrorDTO> failure = {});
   using ActiveOperationNode = std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type;
+  /// Called under Execute's submission ordering; `end_admission` releases it
+  /// once the takeover is durably published, before its cancel and advance.
   [[nodiscard]] Result<std::optional<OperationAcceptedDTO>> try_accept_motion_takeover(
       ActiveOperationNode& prepared_operation, ReplayEntry& prepared_replay,
-      const RuntimeParticipantExecutionRegistration& registration);
+      const RuntimeParticipantExecutionRegistration& registration,
+      const std::function<void()>& end_admission);
   [[nodiscard]] Result<void> advance_motion_takeover(const OperationId& incumbent_id);
   [[nodiscard]] Result<void> advance_motion_takeover_impl(const OperationId& incumbent_id);
   [[nodiscard]] Result<void> commit_motion_takeover_owner_locked(
@@ -1026,31 +1057,33 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> release_prepared_dispatch_barrier(
       const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
       std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product);
-  /// Q58: the exact local settlement a completed Stop handed to this
+  /// The exact local settlement a completed Stop handed to this
   /// command's dispatch return. A failed settlement fails closed.
   void settle_deferred_capability_stop(const OperationId& operation_id,
                                        IResolvedParticipantExecutionEngine* participant_engine,
                                        IResolvedParticipantExecutionEngine* settlement_engine,
                                        const AddressedParticipantStopSettlementRequestDTO& request);
-  /// Q60: perform, on the Stop lane, the exact settlements that closed Stops
+  /// Perform, on the Stop lane, the exact settlements that closed Stops
   /// deferred to their never-dispatched participants' late cancellation
   /// terminals. A late failure is retained on the participant; one not proved
   /// an already-failed preparation fails closed (as a failed Stop settlement).
   void settle_deferred_pre_dispatch_cancellations() noexcept;
+  /// Runs under execute()'s submission_mutex_; calls `end_admission` (which
+  /// releases it) once the operation is durably admitted, before dispatch.
   [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
-      const OperationIntentDTO& intent);
-  /// A2a-2: run one immediate component step. Validates and resolves the
+      const OperationIntentDTO& intent, const std::function<void()>& end_admission);
+  /// Run one immediate component step. Validates and resolves the
   /// single-participant intent, asks `step_for` for the step of the resolved
   /// registration (its refusal is returned), admits it (origin: Program node
   /// scope as a non-motion transaction, or manual readiness unless Robot
   /// control's own manual claim already covers the component; the
-  /// `holds_engine` busy rule; no "enabled" or "motion admission open" check,
-  /// A2a-1), then runs it outside the Kernel locks. Nothing is stored.
+  /// `holds_engine` busy rule; no "enabled" or "motion admission open"
+  /// check), then runs it outside the Kernel locks. Nothing is stored.
   [[nodiscard]] Result<OperationAcceptedDTO> execute_immediate_step(
       const OperationIntentDTO& intent,
       const std::function<Result<ImmediateComponentStep>(
           const RuntimeParticipantExecutionRegistration&)>& step_for);
-  /// Active TCP (M7): the Set TCP user of `execute_immediate_step`.
+  /// Active TCP: the Set TCP user of `execute_immediate_step`.
   [[nodiscard]] Result<OperationAcceptedDTO> execute_set_tcp(const OperationIntentDTO& intent);
   /// Dispatch none, cancel every prepared participant and release the
   /// reservation. A coordinated participant failure names its engine; a null
@@ -1094,8 +1127,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
       std::unique_lock<std::mutex>& state_lock, ActiveOperation& operation,
       RuntimeScaleStatusDTO status, const char* reason);
+  /// Applies the control setting to one live operation (`set_runtime_scale_control`).
+  /// `value_sequence`: the order of this value at the participant (OD-72).
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
-      const RuntimeScaleRequestDTO& request, bool retain_public_replay);
+      const RuntimeScaleRequestDTO& request, std::uint64_t value_sequence);
   [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_target_locked(
       const RuntimeScaleControlSelectorDTO& selector) const;
   [[nodiscard]] Result<RuntimeScaleControlScope> resolve_runtime_scale_control_locked(
@@ -1105,7 +1140,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] double runtime_scale_setting_for_binding_locked(
       const RuntimeParticipantBindingDTO& binding) const noexcept;
   void ProgressStop(StopControlWorkToken token) noexcept override;
-  void StageAttemptCompleted(StopStageAttemptHandle handle) noexcept override;
+  void StageAttemptCompleted(BoundedStopStageAttemptExecutor& source,
+                             StopStageAttemptHandle handle) noexcept override;
+  [[nodiscard]] bool stop_stage_attempts_owned_locked() const noexcept;
   void OperationControlEffectCompleted(BoundedOperationControlExecutor& executor,
                                        OperationControlEffectHandle handle) noexcept override;
   void settle_completed_control_locked(const OperationId& operation_id);
@@ -1115,14 +1152,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
   [[nodiscard]] Result<CellAdmissionClaimDTO> acquire_cell_admission_claim(
       const CellAdmissionClaimIntentDTO& intent);
-  /// Cell latch (CONTRACTS §5), state_mutex_ held. `arm` arms the latch
+  /// Cell latch, state_mutex_ held. `arm` arms the latch
   /// condition; the arm clears when every component is healthy and idle.
   void observe_component_states_locked(std::vector<ComponentState> states);
   void refresh_cell_latch_locked(bool arm);
   /// Every component in the cell is healthy and idle (or latch-exempt).
   [[nodiscard]] bool cell_settled_locked() const;
   [[nodiscard]] bool cell_latched_locked() const;
-  /// `cell_latched` while latched (R1), else nothing.
+  /// `cell_latched` while latched, else nothing.
   [[nodiscard]] std::optional<ErrorDTO> cell_latch_refusal_locked() const;
   /// A run, a node, manual motion or I/O is executing.
   [[nodiscard]] bool execution_in_progress_locked() const;
@@ -1160,11 +1197,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
   void refresh_manager_liveness_inhibition();
   /// The operator's Program Stop (`stop_program_selection`) under the lock;
-  /// a global `stop`/`hold` rule trip issues the same (CONTRACTS §8).
+  /// a global `stop`/`hold` rule trip issues the same.
   [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection_locked(
       const ProgramExecutionSelectionRequestDTO& request, StopWorkHandoff& handoff,
       TimePoint accepted_at_ns);
-  /// AUD-6: the Program run hold of global rule `index` (`hold_run`).
+  /// The Program run hold of global rule `index` (`hold_run`).
   [[nodiscard]] Result<void> hold_program_run_for_rule_locked(std::size_t index,
                                                               StopWorkHandoff& handoff);
   [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
@@ -1176,12 +1213,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>
       runtime_route_configuration_readbacks_;
   std::set<ControlDomainId> runtime_route_configuration_publication_required_;
-  /// CP9 stream holds (state_mutex_): refusal of new commands per component.
+  /// Stream holds (state_mutex_): refusal of new commands per component.
   std::map<ControllableComponentId, ErrorDTO> component_stream_holds_;
-  /// CP9 holds of components without motion: refusal of every component.
+  /// Stream holds of components without motion: refusal of every component.
   std::map<ControllableComponentId, ErrorDTO> cell_stream_holds_;
   IClock& clock_;
-  IScheduler& scheduler_;
   IOperationJournal& journal_;
   ResourceAddressedExecutionKernelConfig config_;
   // Activation-pinned; changed only under state_mutex_, never a mutable forwarder.
@@ -1227,9 +1263,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramBindingDTO& actual_binding) const;
   std::unique_ptr<KernelCellAdmissionOwner> cell_admission_owner_;
 
-  // Serializes public Execute admission while permitting synchronous engine
-  // callbacks to take state_mutex_. The subordinate execute call is required
-  // to be prompt/non-blocking by its port contract.
+  // Serializes public Execute admission (through registration, durable
+  // acceptance and the subordinate Prepare) with runtime-scale settings,
+  // reconfiguration and the other ordered submissions, while permitting
+  // synchronous engine callbacks to take state_mutex_. Not held across
+  // operation dispatch or a runtime-scale live effect (OD-67, audit 3.8);
+  // motion takeover acceptance still advances under it.
   mutable std::mutex submission_mutex_;
   mutable std::mutex operation_recovery_mutex_;
   mutable std::mutex state_mutex_;
@@ -1288,7 +1327,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;
   std::vector<StopReplayEntry> stop_replay_ledger_;
-  std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
   std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
   std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
   struct OperationRecoveryReplayEntry;
@@ -1315,6 +1353,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // Kernel state or asynchronous lane is retired.
   std::shared_ptr<EngineEventIngress> engine_event_ingress_;
   std::vector<EngineSubscription> engine_subscriptions_;
+  std::uint64_t next_engine_subscription_id_{1};
   // Engaged exactly once during successful construction and replaced only by
   // a fully validated runtime reconfiguration.
   std::optional<GraphRevision> stop_graph_revision_;
@@ -1331,18 +1370,24 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::unique_ptr<BoundedStopStageAttemptExecutor> stop_stage_attempt_executor_;
   std::unique_ptr<BoundedOperationControlExecutor> operation_control_executor_;
   bool operation_control_reconfiguration_in_progress_{};
+  /// OD-72: speed-effect calls running on captured raw engine pointers with
+  /// no lock held (an operation's scale effects, a setting stored at its
+  /// participants). Guarded by `state_mutex_`. A lifetime borrow only: it
+  /// makes engine retirement wait for them (it never refuses or delays a
+  /// speed change).
+  std::size_t runtime_scale_effect_calls_in_flight_{};
   std::size_t prequalified_max_live_stop_participants_{};
   // A restart found its predecessor unclosed (an unterminated Stop, an
   // unclosed owner epoch or orphan resources). It counts as a Stop for the
   // cell latch (every unhealthy component shows) and ends once every
   // component reports healthy and idle: the orphan resources are released
-  // (R2; no Force close).
+  // (no Force close).
   bool motion_admission_unreconciled_{};
   std::vector<ResourceId> recovered_orphan_resources_;
   std::uint64_t next_operation_id_{1U};
   std::uint64_t next_stop_id_{1U};
   StopGeneration cell_stop_generation_{0U};
-  /// Cell latch inputs (CONTRACTS §5): the last observed state of every
+  /// Cell latch inputs: the last observed state of every
   /// component in the cell, and whether a latch condition is armed.
   std::vector<ComponentState> component_states_;
   bool cell_latch_armed_{};
@@ -1353,7 +1398,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // the owner update with this mirror.
   bool manager_liveness_motion_inhibited_{};
   std::mutex manager_liveness_mutex_;
-  /// A2a-2: engines held by a running immediate component step
+  /// Engines held by a running immediate component step
   /// (`ImmediateComponentStep::holds_engine`). Guarded by `state_mutex_`.
   std::set<IResolvedParticipantExecutionEngine*> immediate_step_engines_;
   std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
@@ -1362,7 +1407,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // (until host restart) and while the Manager is lost (until it is alive
   // again); both belong to no component and show in readiness
   // (`ReadExecutionBlocks`). A journal write fault blocks nothing. Every
-  // other cause is component state the cell latch derives (CONTRACTS §5, R2).
+  // other cause is component state the cell latch derives.
   [[nodiscard]] bool motion_admission_closed_locked() const noexcept {
     return internal_fault_.has_value() || manager_liveness_motion_inhibited_;
   }

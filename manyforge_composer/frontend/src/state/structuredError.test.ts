@@ -14,37 +14,44 @@ describe('structured error display', () => {
       code: 'owner_request_failed',
       message: 'frame role tool0 is not available',
       details: {
-        reason: 'frame_role_unresolved',
-        reference_type: 'frame_role',
+        reason: 'frame_unresolved',
+        reference_type: 'component_frame',
         reference_id: 'tool0',
-        target_role_id: 'arm',
+        component_id: 'arm',
       },
       origin: { kind: 'owner', nodeInstanceId: 'move_to_pick', ownerApi: 'scene.frames' },
     })).toEqual({
       title: 'owner request failed',
       message: 'frame role tool0 is not available',
       rows: [
-        { label: 'Reason', value: 'frame_role_unresolved' },
-        { label: 'Reference', value: "frame_role 'tool0' of target role 'arm'" },
+        { label: 'Reason', value: 'frame_unresolved' },
+        { label: 'Reference', value: "component_frame 'tool0' of component 'arm'" },
         { label: 'Origin', value: "scene.frames for node 'move_to_pick'" },
       ],
     });
+  });
+
+  it('preserves a qualified reference carried as a structured detail', () => {
+    expect(structuredErrorRows({
+      details: { reference: { component_id: 'arm', frame_id: 'base' } },
+      origin: null,
+    })).toEqual([{ label: 'Reference', value: '{"component_id":"arm","frame_id":"base"}' }]);
   });
 
   it('does not repeat a reason or reference the owner message already names', () => {
     // describe_owner_failure: the Runner message names details.reason and the reference.
     expect(structuredErrorText({
       code: 'request_ledger_full',
-      message: "cell-admission request rejected (claim_capacity_exhausted; reference frame_role 'tool0' of target role 'arm')",
+      message: "cell-admission request rejected (claim_capacity_exhausted; reference component_frame 'tool0' of component 'arm')",
       details: {
         reason: 'claim_capacity_exhausted',
-        reference_type: 'frame_role',
+        reference_type: 'component_frame',
         reference_id: 'tool0',
-        target_role_id: 'arm',
+        component_id: 'arm',
       },
       origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'kernel.cell_admission' },
     })).toBe(
-      "cell-admission request rejected (claim_capacity_exhausted; reference frame_role 'tool0' of target role 'arm')"
+      "cell-admission request rejected (claim_capacity_exhausted; reference component_frame 'tool0' of component 'arm')"
         + " (Origin: kernel.cell_admission for node 'move')",
     );
     // Only a whole-token mention counts as named.

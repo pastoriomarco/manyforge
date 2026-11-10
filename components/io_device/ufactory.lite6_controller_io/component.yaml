@@ -3,7 +3,7 @@
 # family reads and writes it through its owner's connection; Mock and Isaac
 # lanes: the host's Mock I/O (outputs read back). Declared I/O only: the
 # controller accepts writes to missing outputs.
-# Lite 6 control box: CI0-CI7, CO0-CO7 (XARM_CONTROLLER_FACTS).
+# Lite 6 control box: CI0-CI7, CO0-CO7.
 api_version: manyforge.component_package.v1
 kind: io_device
 id: ufactory.lite6_controller_io
@@ -12,7 +12,7 @@ title: UFACTORY Lite 6 control-box I/O
 license: BSD-3-Clause
 provenance:
   source: https://github.com/pastoriomarco/xarm_ros2
-  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+  notes: recorded UFACTORY controller facts
 signals:
   - {signal_name: CI0, direction: input, value_type: bool}
   - {signal_name: CI1, direction: input, value_type: bool}

@@ -61,6 +61,7 @@ export function heldNodePreviewText(preview: HeldNodePreviewState): string {
 }
 
 export interface HeldNodePreviewInputs {
+  visible?: boolean;
   runtime: ProgramRuntimeController;
   workspace: ProgramWorkspaceController;
   snapshot: ComposerHeadlessState | null;
@@ -78,6 +79,7 @@ export interface HeldNodePreviewInputs {
  * to decide whether Apply, Reset or Retry may be sent.
  */
 export function useHeldNodePreview({
+  visible = true,
   runtime,
   workspace,
   snapshot,
@@ -120,9 +122,12 @@ export function useHeldNodePreview({
   // never shown as ready for the current one.
   const executionOwnerEpoch = snapshot?.executionControlStatus?.ownerEpoch ?? null;
   const inputs = changes?.kind === 'inputs' ? changes.inputs : null;
-  const requestKey = held === null || inputs === null
+  const [visibility, setVisibility] = useState({ visible, epoch: 0 });
+  if (visibility.visible !== visible) setVisibility({ visible, epoch: visibility.epoch + 1 });
+  const requestKey = !visible || held === null || inputs === null
     ? null
     : JSON.stringify([
+      visibility.epoch,
       held.run.ownerEpoch, executionOwnerEpoch, held.offer.programRunId, held.offer.nodeInstanceId,
       held.offer.nodeAttemptId, held.run.capture.programBindingId,
       held.run.capture.programRevision, inputs,
@@ -138,6 +143,11 @@ export function useHeldNodePreview({
   const wanted = useRef<string | null>(null);
   const inFlight = useRef<string | null>(null);
   const waiting = useRef<{ key: string; request: ProgramNodeCorrectionPreviewRequest } | null>(null);
+  useEffect(() => {
+    if (visible) return;
+    wanted.current = null;
+    waiting.current = null;
+  }, [visible]);
   const request = useCallback((key: string, body: ProgramNodeCorrectionPreviewRequest) => {
     const send = (sentKey: string, sent: ProgramNodeCorrectionPreviewRequest) => {
       inFlight.current = sentKey;
@@ -166,6 +176,7 @@ export function useHeldNodePreview({
   }, []);
   useEffect(() => {
     wanted.current = requestKey;
+    if (!visible) setReply(null);
     const { held: current, inputs: proposed } = basis.current;
     if (requestKey === null || current === null || proposed === null) {
       waiting.current = null;
@@ -187,11 +198,11 @@ export function useHeldNodePreview({
     // Coalesce edits before anything reaches the single in-flight slot.
     const timer = window.setTimeout(() => request(key, body), ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [request, requestKey]);
+  }, [request, requestKey, visible]);
 
   // Null when there is nothing to preview: no held failed node, or the Draft
   // gives it the captured inputs.
-  const preview: HeldNodePreviewState | null = changes === null || changes.kind === 'unchanged'
+  const preview: HeldNodePreviewState | null = !visible || changes === null || changes.kind === 'unchanged'
     ? null
     : changes.kind === 'unavailable'
       ? { status: 'unavailable', reason: changes.reason }

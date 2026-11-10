@@ -1,3 +1,5 @@
+#include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+
 #include <gtest/gtest.h>
 #include <sqlite3.h>
 #include <unistd.h>
@@ -1051,7 +1053,7 @@ public:
   std::function<Result<ManagerComponentProcessInventoryResultDTO>(
       const ManagerComponentProcessInventoryRequestDTO &)> installed_processes;
 
-  // CONTRACTS §15 fake host: records each Apply and answers succeeded, or
+  // Fake host: records each Apply and answers succeeded, or
   // the scripted result, or throws on the scripted call (a lost exchange).
   [[nodiscard]] Result<HostApplyResult>
   ApplyOnHost(const RuntimeUnitId &runtime_unit_id,
@@ -1112,7 +1114,7 @@ public:
       throw std::runtime_error("managed Kernel cell-admission response timed out");
     }
     if (!held_claim_.has_value()) {
-      // S1: the expected generation is evidence only; the Kernel records the
+      // The expected generation is evidence only; the Kernel records the
       // claim at its current generation, which a Disable may have moved.
       held_claim_ = core::CellAdmissionClaimDTO{
           intent, core::CellAdmissionClaimGeneration(1U),
@@ -1849,7 +1851,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     EXPECT_FALSE(journal.ReadFenceAcceptance(intent.apply_id, intent.apply_generation).has_value());
     EXPECT_FALSE(journal.ReadRuntimeConvergenceIntent(intent.apply_id, intent.apply_generation).has_value());
   }
-  // The ROS runtime manifest is infrastructure-only, like native's (DX-228):
+  // The ROS runtime manifest is infrastructure-only, like native's:
   // a controller-configuration change is not a host-product change, so host
   // continuity holds. The drifted candidate's motion-limit table names a
   // target its component does not host; that configuration must still be
@@ -2086,7 +2088,7 @@ TEST(ManagerNamedApplyCoordinator,
   // 6: a Composer authoring-parent claim is settled after the fence.
   // 7: restart after the fence receipt, before claim settlement.
   // 8: the claim was acquired at a newer generation than the request named
-  //    (a Disable moved it first, S1); it is still acknowledged and settled.
+  //    (a Disable moved it first); it is still acknowledged and settled.
   for (const int scenario : {0, 1, 2, 3, 4, 5, 6, 7, 8}) {
     SCOPED_TRACE(scenario);
     ScopedPackageRoot package_root;
@@ -3066,7 +3068,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(authored_scene_reads, 0);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.owner.LogicalSnapshot()),
               actual_scene.snapshot_bytes);
-    // One host Apply (CONTRACTS §15), before publication; no Finalize.
+    // One host Apply, before publication; no Finalize.
     EXPECT_EQ(runtime_composition.calls, 1);
     ASSERT_TRUE(runtime_composition.last_request.has_value());
     EXPECT_TRUE(runtime_composition.last_request->valid());
@@ -3123,9 +3125,9 @@ TEST(ManagerNamedApplyCoordinator,
      HostApplyFailuresRetainDistinctOriginalTerminalEvidence) {
   // 1: the host exchange is lost; 3: the original acknowledgement fails after
   // the host accepted; 4: the host's typed Scenario composition refusal;
-  // 5: the host refuses an enabled replaced or removed component (CONTRACTS
-  // §15), a known failure with no publication; 6: a host failure the host
-  // caught before changing anything installed (`effect: none`, H1).
+  // 5: the host refuses an enabled replaced or removed component, a
+  // known failure with no publication; 6: a host failure the host
+  // caught before changing anything installed (`effect: none`).
   for (const int failing_call : {1, 3, 4, 5, 6}) {
     SCOPED_TRACE(failing_call);
     ScopedPackageRoot package_root;
@@ -3165,8 +3167,9 @@ TEST(ManagerNamedApplyCoordinator,
           return ValidateManagerApplyCellAdmissionSettlementReadOnly(
               database, cell_id, claim, release);
         };
-    core::ResourceAddressedExecutionKernel cell_admission(
+    auto cell_admission_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {}, kernel_clock, kernel_scheduler, operation_journal, std::move(kernel_config));
+    auto& cell_admission = *cell_admission_heap_test_owner;
     const core::ProgramCycleStatusDTO idle{
         core::RequestOwnerEpoch("program.failed-composition"), 1U,
         core::ProgramCycleStateDTO::kIdleAfterReset,
@@ -3338,7 +3341,7 @@ TEST(ManagerNamedApplyCoordinator,
       EXPECT_EQ(failure.producer, kExecutionHostProducer);
     }
     // A host refusal changed nothing: it is before-effect and releases its
-    // fence and claim at once (like CLAIM-1), so authoring and New work again.
+    // fence and claim at once, so authoring and New work again.
     EXPECT_EQ(failure.effect_boundary, known ? ManagerApplyEffectBoundary::kBeforeEffect
                                              : ManagerApplyEffectBoundary::kUnknown);
     if (failing_call == 5) {
@@ -3429,7 +3432,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_THROW(coordinator.AcknowledgeFailedApply(failed->apply_id, failed->apply_generation,
                                                     core::RequestId("ack.unknown"), "operator"),
                  core::TypedError);
-    // N7 (R3, CONTRACTS §15): New releases the fence and claim the failed
+    // New releases the fence and claim the failed
     // Apply still holds, whatever it changed; the failure stays retained.
     const auto released =
         coordinator.ReleaseFailedApplyForNew(core::RequestId("composer-new.1"), "manyforge_composer");
@@ -3668,7 +3671,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     scene_owner.after_configuration_stage = [&] {
       if (lose_stage_response) throw std::runtime_error("lost original configuration Stage response");
     };
-    // The one host Apply (CONTRACTS §15) runs before Scene Begin and
+    // The one host Apply runs before Scene Begin and
     // publication; the host installs the candidate routes under the fence.
     runtime_composition.installed = [&](const HostApplyRequest &input) {
       events.push_back("HostApply");
@@ -3727,7 +3730,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         : std::string("no terminal failure");
     SCOPED_TRACE(failure_detail);
     if (eligibility == 4) {
-      // CONTRACTS §11: a component whose process is gone is replaced without a
+      // A component whose process is gone is replaced without a
       // clean Disable; the Apply passes the refusal and acquires its fence.
       EXPECT_FALSE(first->terminal_outcome && first->terminal_outcome->failure &&
                    first->terminal_outcome->failure->failure_code ==

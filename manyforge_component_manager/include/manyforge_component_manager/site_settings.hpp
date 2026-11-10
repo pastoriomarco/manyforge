@@ -63,7 +63,7 @@ private:
 ResolveSiteDeviceAddress(const std::optional<SiteSettings> &settings,
                          std::string_view device_address_ref);
 
-/// The address of `device_address_ref` as `spec` resolved it (FP-2: the
+/// The address of `device_address_ref` as `spec` resolved it (the
 /// host builds a component from its spec only); the same errors as
 /// ResolveSiteDeviceAddress.
 [[nodiscard]] core::Result<std::string>

@@ -144,7 +144,7 @@ inline constexpr std::string_view kGripperPositionCommandSchemaId = "gripper.com
 inline constexpr std::string_view kGripperPositionCommandSchemaRevision =
     "sha256:b8e74c2c32f4bf438905efe148b7fbf6f452bb91c1bf83a30b0404a1c2533f08";
 
-/// Build-owned first I6 command family. Its semantic revision is pinned to
+/// Build-owned first command family. Its semantic revision is pinned to
 /// the exact normalized catalog record shipped by manyforge_deployment.
 [[nodiscard]] inline CommandSchemaDTO builtin_gripper_position_command_schema() {
   const auto* capability = find_builtin_capability_definition("tool.gripper.command");

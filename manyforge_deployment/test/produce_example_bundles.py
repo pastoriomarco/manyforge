@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile every example Scenario's Deployment into its retained bundle.
 
-Test fixture producer for the component build spec tests (parity with the M8
+Test fixture producer for the component build spec tests (parity with the earlier
 identity, collision-exclusion edits): for each `examples/*.scenario`, the
 ordinary activation preparer compiles the Deployment without a Program (the
 bundle does not depend on it), except that a Deployment with a global rule
@@ -9,9 +9,9 @@ scoped to execution groups is compiled with its Scenario's Program, which
 resolves those groups; `<output>/<scenario>.json` receives the sealed retained
 bundle as RFC 8785 canonical JSON, and `<output>/packages/<scenario>/activation`
 keeps its retained package (model map, planning model and model sources) for
-the description parity test (N17 S2). Each compile is also checked: every arm's
+the description parity test. Each compile is also checked: every arm's
 controller profile carries its authored operator Stop decelerations, the same
-values as its compiled Stop rows (Q48).
+values as its compiled Stop rows.
 """
 
 from __future__ import annotations

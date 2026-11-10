@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_example_nodes"
-version = "0.2.0"
+version = "0.2.1"
 description = "Reviewed read-only ManyForge node-package example"
 requires-python = ">=3.11"
 

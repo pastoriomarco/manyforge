@@ -91,6 +91,11 @@ case "$command" in
     ;;
   image) printf '%s\\n' "$MANYFORGE_DEV_IMAGE" ;;
   run)
+    if [[ ${1:-} == --rm ]]; then
+      printf 'native build output\\n'
+      [[ ${FAKE_NATIVE_BUILD_FAIL:-false} != true ]] || exit 69
+      exit 0
+    fi
     : > "$FAKE_DOCKER_STARTED"
     printf '%s\\n' "${FAKE_ACTUAL_ID:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
     ;;
@@ -101,12 +106,13 @@ case "$command" in
     [[ ${FAKE_STOP_FAIL:-false} != true ]] || exit 1
     : > "$FAKE_DOCKER_STOPPED"
     ;;
-  cp)
-    [[ ${FAKE_COPY_FAIL:-false} != true ]] || exit 1
-    /bin/tar --create --file - --directory "$FAKE_CONTAINER_ROOT" manyforge-state
-    ;;
   logs)
     [[ ${FAKE_LOGS_FAIL:-false} != true ]] || exit 1
+    if [[ ${FAKE_EVIDENCE_WRITE_FAIL:-false} == true ]]; then
+      # The launcher streams these logs into <mount>/evidence/<partial>/.docker.log.next;
+      # occupying that path makes the evidence write fail after a successful logs read.
+      mkdir -p "$FAKE_ACTUAL_STATE_ROOT/evidence/.mounted-${FAKE_ACTUAL_ID:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}.partial/.docker.log.next"
+    fi
     if [[ -n ${FAKE_LOG_BYTES:-} ]]; then
       python3 -c 'import os,sys;sys.stdout.buffer.write(b"x"*int(os.environ["FAKE_LOG_BYTES"])+b"END")'
     else
@@ -154,13 +160,17 @@ esac
         "program evidence", encoding="utf-8"
     )
 
+    # A workbench container always has its runtime root bind-mounted at
+    # /tmp/manyforge-state (start runs it with that mount): by default the fake
+    # container's runtime root is the seeded state above. Pass "" to model a
+    # legacy container without it.
+    settings.setdefault("FAKE_ACTUAL_STATE_ROOT", str(state))
     if settings.get("FAKE_ACTUAL_STATE_ROOT"):
         Path(settings["FAKE_ACTUAL_STATE_ROOT"]).mkdir(parents=True, exist_ok=True)
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "MANYFORGE_DEV_CACHE_BASE": str(tmp_path / "cache"),
-        "FAKE_CONTAINER_ROOT": str(container_root),
         "FAKE_WORKSPACE": str(REPOSITORY_ROOT),
         "FAKE_DOCKER_CALLS": str(tmp_path / "docker-calls"),
         "FAKE_DOCKER_STOPPED": str(tmp_path / "docker-stopped"),
@@ -199,23 +209,24 @@ def test_stop_with_evidence_preserves_quiescent_state_and_removes_container(
         line for line in completed.stdout.splitlines() if line.startswith(prefix)
     )
     evidence_path = Path(evidence_line.removeprefix(prefix))
-    assert evidence_path.parent == tmp_path / "cache" / "evidence"
+    # Mount-based capture: evidence lands in the container's actual state mount.
+    state = (tmp_path / "container" / "manyforge-state").resolve()
+    assert evidence_path.parent == state / "evidence"
     assert re.fullmatch(r"\d{8}T\d{6}Z\.\d{9}", evidence_path.name)
-    assert (evidence_path / "manyforge-state/manager/journal.sqlite3").read_text(
+    # The quiescent durable state stays in place in the mounted runtime root;
+    # the capture adds only the bounded console tail and the stopped summary.
+    assert (state / "manager/journal.sqlite3").read_text(
         encoding="utf-8"
     ) == "manager evidence"
-    assert not (evidence_path / "manyforge-state/installed-targets").exists()
-    assert not (evidence_path / "manyforge-state/artifacts/raw-artifacts").exists()
-    assert not (
-        evidence_path / "manyforge-state/artifacts/prepared-activations"
-    ).exists()
-    assert (evidence_path / "manyforge-state/artifacts/programs/program.json").exists()
-    assert not (
-        evidence_path / "manyforge-state/execution-run/manyforge-retained-planning-0123"
-    ).exists()
+    assert (state / "artifacts/programs/program.json").read_text(
+        encoding="utf-8"
+    ) == "program evidence"
     assert (
-        evidence_path / "manyforge-state/execution-run/resolved-stop-base-plans/plan.json"
-    ).exists()
+        state / "execution-run/resolved-stop-base-plans/plan.json"
+    ).read_text(encoding="utf-8") == "stop evidence"
+    assert {entry.name for entry in evidence_path.iterdir()} == {
+        "docker.log", "docker-inspect.json"
+    }
     assert (evidence_path / "docker.log").read_text(encoding="utf-8") == (
         "preserved log\n"
     )
@@ -229,14 +240,24 @@ def test_stop_with_evidence_preserves_quiescent_state_and_removes_container(
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text(
         encoding="utf-8"
     ).splitlines()
-    assert calls[-1].startswith("rm ")
-    copy_index = next(
-        index for index, call in enumerate(calls) if call.startswith("cp ")
+    assert not any(call.startswith("cp ") for call in calls)
+    summary_index = next(
+        index for index, call in enumerate(calls)
+        if call.startswith("inspect --format {\"container_id\"")
     )
     logs_index = next(
         index for index, call in enumerate(calls) if call.startswith("logs ")
     )
-    assert copy_index < logs_index
+    remove_index = next(
+        index for index, call in enumerate(calls) if call.startswith("rm ")
+    )
+    assert summary_index < logs_index < remove_index
+    # Removal is the last container mutation; only the read-only root check of
+    # the quiescent rotation follows it.
+    assert not any(
+        call.startswith(("stop ", "logs ", "rm ", "run "))
+        for call in calls[remove_index + 1:]
+    )
 
 
 def test_stop_with_evidence_refuses_to_copy_if_container_is_still_running(
@@ -265,7 +286,7 @@ def test_stop_with_evidence_does_not_mask_docker_stop_failure(tmp_path: Path) ->
     assert "rm " not in calls
 
 
-@pytest.mark.parametrize("failure_setting", ["FAKE_COPY_FAIL", "FAKE_LOGS_FAIL"])
+@pytest.mark.parametrize("failure_setting", ["FAKE_EVIDENCE_WRITE_FAIL", "FAKE_LOGS_FAIL"])
 def test_stop_with_evidence_keeps_stopped_container_and_partial_copy_on_failure(
     tmp_path: Path, failure_setting: str
 ) -> None:
@@ -277,8 +298,13 @@ def test_stop_with_evidence_keeps_stopped_container_and_partial_copy_on_failure(
     assert "Partial evidence:" in completed.stderr
     assert "capture failed, container retained" in completed.stderr
     assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-    partials = list((tmp_path / "cache" / "evidence").glob("*.partial"))
+    # Each injection fails its own step: the evidence write, or docker logs.
+    if failure_setting == "FAKE_EVIDENCE_WRITE_FAIL":
+        assert "Could not write console tail" in completed.stderr
+    partials = list((tmp_path / "container/manyforge-state/evidence").glob("*.partial"))
     assert len(partials) == 1
+    assert (partials[0] / "docker-inspect.json").is_file()
+    assert not (partials[0] / "docker.log").exists()
 
 
 def test_stop_with_evidence_reports_remove_failure_after_completed_snapshot(
@@ -292,7 +318,7 @@ def test_stop_with_evidence_reports_remove_failure_after_completed_snapshot(
     assert "Evidence was preserved at " in completed.stderr
     assert "could not be removed" in completed.stderr
     assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-    evidence_entries = list((tmp_path / "cache" / "evidence").iterdir())
+    evidence_entries = list((tmp_path / "container/manyforge-state/evidence").iterdir())
     assert len(evidence_entries) == 1
     assert not evidence_entries[0].name.endswith(".partial")
 
@@ -373,6 +399,7 @@ case "$1" in
   image) printf 'sha256:test\\n' ;;
   container) ;;
   run)
+    [[ $2 != --rm ]] || exit 0
     : > "$FAKE_DOCKER_STARTED"
     printf '%s\\n' "${FASTDDS_BUILTIN_TRANSPORTS-unset}" > "$FAKE_DOCKER_STARTED.transports"
     printf '%s\\n' "${MANYFORGE_MOTION_TRACE_DIR-unset}" > "$FAKE_DOCKER_STARTED.trace"
@@ -413,7 +440,19 @@ esac
         return
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    command = next(call for call in calls if call.startswith("run "))
+    command = next(call for call in calls if call.startswith("run -d "))
+    # Native builds run first, in the serve container's image, identity, build
+    # inputs and source/cache mounts, without the runtime state.
+    build = next(call for call in calls if call.startswith("run --rm "))
+    assert calls.index(build) < calls.index(command)
+    assert build.endswith("sha256:test python3 scripts/dev-workbench.py build")
+    for shared in (f"--user {os.getuid()}:{os.getgid()}", "--env HOME=/runner/home",
+                   "--env MANYFORGE_BUILD_DIR=/runner/build", f"-v {workspace}:/workspace",
+                   f"-v {tmp_path / 'cache/images/test'}:/runner", "--network host",
+                   "--env MANYFORGE_ROS2_CONTROL_BUILD_TESTING",
+                   "--env MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", "-e MANYFORGE_DEV_BUILD_JOBS="):
+        assert shared in build and shared in command
+    assert "/tmp/manyforge-state" not in build and "MANYFORGE_DEV_COLD_SESSION_ID" not in build
     # The launcher always exports the variable, so it is always forwarded by name.
     assert "--env MANYFORGE_MOTION_TRACE_DIR" in command
     for name in experiments:
@@ -482,7 +521,7 @@ def test_developer_start_forwards_explicit_site_settings(tmp_path: Path) -> None
     command = next(
         call
         for call in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-        if call.startswith("run ")
+        if call.startswith("run -d ")
     )
     assert command.count(f"-v {inputs}:{inputs}:ro") == 1
     assert command.endswith(
@@ -525,7 +564,7 @@ def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path,
         assert not state_root.exists()
     else:
         assert completed.returncode == 0, completed.stderr
-        assert f"-v {state_root}:/tmp/manyforge-state" in next(call for call in calls if call.startswith("run "))
+        assert f"-v {state_root}:/tmp/manyforge-state" in next(call for call in calls if call.startswith("run -d "))
 
 
 def test_start_mounts_external_project_folders_with_stable_composer_roots(tmp_path: Path) -> None:
@@ -551,7 +590,7 @@ def test_start_mounts_external_project_folders_with_stable_composer_roots(tmp_pa
     assert completed.returncode == 0, completed.stderr
     command = next(
         line for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-        if line.startswith("run ")
+        if line.startswith("run -d ")
     )
     roots = ["/projects/user projects", "/projects/user projects-2", "/projects/user projects-3"]
     for folder, root in zip(folders, roots):
@@ -582,7 +621,7 @@ def test_start_accepts_site_without_project_folders(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     command = next(
         line for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-        if line.startswith("run ")
+        if line.startswith("run -d ")
     )
     assert "MANYFORGE_DEV_PROJECT_ROOTS" not in command
 
@@ -757,8 +796,10 @@ def test_plain_container_removal_keeps_live_durable_state_files(tmp_path: Path) 
     journal = state_root / "execution-state/operation-journal.sqlite3"
     journal.parent.mkdir(parents=True)
     journal.write_bytes(b"existing durable evidence")
-    completed, _ = _run_launcher(tmp_path, "stop")
-    assert completed.returncode == 0
+    # The container's state mount is this runtime root, as start creates it.
+    completed, _ = _run_launcher(tmp_path, "stop", FAKE_ACTUAL_STATE_ROOT=str(state_root))
+    assert completed.returncode == 0, completed.stderr
+    assert list((state_root / "evidence").glob("*/docker.log"))
     assert journal.read_bytes() == b"existing durable evidence"
 
 
@@ -820,30 +861,36 @@ def test_g_plain_stop_exports_exact_container_logs_before_removal(tmp_path):
     completed = _invoke_g(environment, "stop")
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    assert next(c for c in calls if c.startswith("cp ")).startswith("cp " + "d" * 64 + ":")
-    assert calls[-1] == "rm " + "d" * 64
-    evidence = next(Path(environment["MANYFORGE_DEV_EVIDENCE_ROOT"]).iterdir())
+    assert not any(c.startswith("cp ") for c in calls)
+    assert calls.index("logs " + "d" * 64) < calls.index("rm " + "d" * 64)
+    assert not any(c.startswith(("stop ", "logs ", "rm ", "run "))
+                   for c in calls[calls.index("rm " + "d" * 64) + 1:])
+    state = tmp_path / "container/manyforge-state"
+    evidence = next((state / "evidence").iterdir())
     assert not (evidence / "docker-logs-reference.txt").exists()
-    assert (evidence / "manyforge-state/manager/journal.sqlite3").read_text() == "manager evidence"
+    assert (evidence / "docker.log").read_text() == "preserved log\n"
+    assert json.loads((evidence / "docker-inspect.json").read_text())["container_id"] == "d" * 64
+    assert (state / "manager/journal.sqlite3").read_text() == "manager evidence"
 
 
 @pytest.mark.parametrize("operation", ["stop", "reuse_exited"])
 def test_g_export_failure_keeps_container_and_never_starts_replacement(tmp_path, operation):
-    environment = _g_environment(tmp_path, FAKE_COPY_FAIL="true", FAKE_INITIAL_EXITED="true")
+    environment = _g_environment(tmp_path, FAKE_EVIDENCE_WRITE_FAIL="true", FAKE_INITIAL_EXITED="true")
     completed = _invoke_g(environment, *(["stop"] if operation == "stop" else ["start"]))
     assert completed.returncode == 69, completed.stderr
+    assert "capture failed, container retained" in completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    assert any(c.startswith("cp ") for c in calls)
+    assert "logs " + "d" * 64 in calls
     assert not any(c.startswith(("rm ", "run ")) for c in calls)
     assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-    assert len(list(Path(environment["MANYFORGE_DEV_EVIDENCE_ROOT"]).glob("*.partial"))) == 1
+    assert len(list((tmp_path / "container/manyforge-state/evidence").glob("*.partial"))) == 1
 
 
 def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_cleanup(tmp_path):
     environment = _g_environment(tmp_path, FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true")
     # Keep scratch on the repository's mounted filesystem, independently of the
     # invoking user's HOME. Production rejects /tmp and tmpfs; no bypass is used.
-    with tempfile.TemporaryDirectory(prefix="manyforge-q93-fixture-", dir=REPOSITORY_ROOT) as persistent:
+    with tempfile.TemporaryDirectory(prefix="manyforge-launcher-fixture-", dir=REPOSITORY_ROOT) as persistent:
         install = tmp_path / "qualified-package"
         install.mkdir()
         workspace = tmp_path / "workspace"
@@ -860,7 +907,7 @@ def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_c
     row = json.loads(completed.stdout)
     assert row["container_id"] == "d" * 64 and row["running"] is False
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    command = next(c for c in calls if c.startswith("run "))
+    command = next(c for c in calls if c.startswith("run -d "))
     assert "--network host" in command
     assert "--log-driver json-file" in command and "--log-opt max-size=50m --log-opt max-file=3" in command
     assert "--env ROS_DOMAIN_ID" in command and "--env ROS_STATIC_PEERS" in command
@@ -985,7 +1032,8 @@ def test_legacy_transition_refuses_nonempty_target_before_removal(tmp_path):
     root = tmp_path / "target"
     root.mkdir()
     (root / "journal.sqlite3").write_bytes(b"unrelated existing state")
-    completed, environment = _run_launcher(tmp_path, "start", FAKE_INITIAL_EXITED="true", MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(root))
+    completed, environment = _run_launcher(tmp_path, "start", FAKE_INITIAL_EXITED="true",
+        MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(root), FAKE_ACTUAL_STATE_ROOT="")
     assert completed.returncode == 69 and "legacy unmounted transition" in completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text()
     assert "rm " not in calls and "run " not in calls and "cp " not in calls
@@ -1080,11 +1128,21 @@ def test_symlinked_cache_ancestor_can_capture_stop(tmp_path,mounted):
     alias.symlink_to(actual,target_is_directory=True)
     root=alias/"cache/runtime/manyforge-development-workbench"
     root.mkdir(parents=True)
-    settings={"FAKE_ACTUAL_STATE_ROOT":str(root)} if mounted else {}
+    settings={"FAKE_ACTUAL_STATE_ROOT":str(root) if mounted else ""}
     completed,environment=_run_launcher(tmp_path,"stop",MANYFORGE_DEV_CACHE_BASE=str(alias/"cache"),**settings)
+    if not mounted:
+        # A stopped container without its state mount is refused and kept.
+        assert completed.returncode==69
+        assert "Cannot capture stopped container without its /tmp/manyforge-state mount." in completed.stderr
+        assert "Container is stopped and retained" in completed.stderr
+        assert Path(environment["FAKE_DOCKER_STOPPED"]).exists()
+        assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
+        calls=Path(environment["FAKE_DOCKER_CALLS"]).read_text()
+        assert "logs " not in calls and "rm " not in calls
+        return
     assert completed.returncode==0,completed.stderr
     assert Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-    evidence=actual/"cache/runtime/manyforge-development-workbench/evidence" if mounted else actual/"cache/evidence"
+    evidence=actual/"cache/runtime/manyforge-development-workbench/evidence"
     assert list(evidence.glob("*/docker.log"))
 
 
@@ -1102,17 +1160,6 @@ def test_mounted_symlinked_evidence_descendant_stops_but_refuses_capture(tmp_pat
     assert not list(outside.iterdir())
 
 
-def test_repeated_legacy_capture_failures_replace_the_same_owned_partial(tmp_path):
-    environment=_fake_docker_environment(tmp_path,FAKE_COPY_FAIL="true")
-    for _ in range(3):
-        completed=subprocess.run(["bash",str(LAUNCHER),"stop"],env=environment,capture_output=True,text=True)
-        assert completed.returncode==69
-        partials=list((tmp_path/"cache/evidence").glob("*.partial"))
-        assert len(partials)==1 and partials[0].name==".legacy-"+"d"*64+".partial"
-        assert json.loads((partials[0]/"docker-inspect.json").read_text())["container_id"]=="d"*64
-    assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-
-
 def test_symlinked_cache_ancestor_can_start_new_workbench(tmp_path):
     launcher = _copy_writable_launcher(tmp_path)
     actual=tmp_path/"actual-storage"
@@ -1126,22 +1173,6 @@ def test_symlinked_cache_ancestor_can_start_new_workbench(tmp_path):
     assert completed.returncode==0,completed.stderr
     assert (actual/"cache/runtime/manyforge-development-workbench").is_dir()
     assert "run " in Path(environment["FAKE_DOCKER_CALLS"]).read_text()
-
-
-def test_failed_inspect_never_replaces_existing_legacy_partial(tmp_path):
-    partial=tmp_path/"cache/evidence"/(".legacy-"+"d"*64+".partial")
-    partial.mkdir(parents=True)
-    (partial/"copied-journal").write_bytes(b"old sole evidence")
-    (partial/"docker-inspect.json").write_text(json.dumps({"container_id":"d"*64,"image":"sha256:test",
-        "mounts":[{"Type":"bind","Source":str(REPOSITORY_ROOT),"Destination":"/workspace"}],"state":{"running":False}}))
-    completed,environment=_run_launcher(tmp_path,"stop",FAKE_SUMMARY_FAIL="true")
-    assert completed.returncode==69
-    assert "Could not inspect the stopped-container capture" in completed.stderr
-    assert Path(environment["FAKE_DOCKER_STOPPED"]).exists()
-    assert (partial/"copied-journal").read_bytes()==b"old sole evidence"
-    assert len(list(partial.parent.glob("*.partial")))==1
-    assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
-
 
 
 def test_repeated_mounted_log_failures_reuse_one_partial_and_keep_previous_tail(tmp_path):
@@ -1183,8 +1214,8 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     docker = tmp_path/'bin/docker'
     fake = docker.read_text().replace('|| ${FAKE_INITIAL_EXITED:-false} == true',
         '|| ( ${FAKE_INITIAL_EXITED:-false} == true && ! -e "$FAKE_DOCKER_STARTED" )')
-    fake = fake.replace('  run)\n    : > "$FAKE_DOCKER_STARTED"',
-        '  run)\n    rm -f -- "$FAKE_DOCKER_STOPPED"\n    : > "$FAKE_DOCKER_STARTED"')
+    fake = fake.replace('    : > "$FAKE_DOCKER_STARTED"',
+        '    rm -f -- "$FAKE_DOCKER_STOPPED"\n    : > "$FAKE_DOCKER_STARTED"')
     docker.write_text(fake)
     durable = root/'execution-state/operation-journal.sqlite3'
     durable.parent.mkdir()
@@ -1204,7 +1235,7 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment['FAKE_DOCKER_CALLS']).read_text().splitlines()
     position = lambda command: next(index for index, call in enumerate(calls) if call.startswith(command+' '))
-    assert position('stop') < position('logs') < position('rm') < position('run')
+    assert position('stop') < position('logs') < position('rm') < position('run --rm') < position('run -d')
     archived = list((root / "previous-sessions").iterdir())
     assert len(archived) == 1
     archived_durable = archived[0] / "execution-state/operation-journal.sqlite3"
@@ -1215,8 +1246,7 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     assert (captured/'docker.log').read_bytes() == b'preserved log\n'
     assert {p.name for p in captured.iterdir()} == {'docker-inspect.json', 'docker.log'}
     assert json.loads((captured/'docker-inspect.json').read_text())['container_id'] == 'd'*64
-    assert f'-v {root}:/tmp/manyforge-state' in calls[position('run')]
-
+    assert f'-v {root}:/tmp/manyforge-state' in calls[position('run -d')]
 
 
 def test_owned_extra_entries_removed_in_place_without_adding_failed_capture_siblings(tmp_path):
@@ -1291,3 +1321,52 @@ def test_build_prepares_sources_then_builds_the_default_full_ros_image(tmp_path:
         f"image=manyforge-ros-lyrical-full suite={suite}",
     ]
     assert "compose-dev.sh start" in completed.stdout
+
+
+def test_start_native_build_failure_exits_before_session_or_serve_container(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    root = tmp_path / "runtime"
+    environment = _fake_docker_environment(tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false", MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(root),
+        FAKE_NATIVE_BUILD_FAIL="true")
+    completed = subprocess.run(["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False)
+    assert completed.returncode == 69
+    # Build output streams to the start log; stdout stays for the start result.
+    assert "native build output" in completed.stderr
+    assert "Native build failed" in completed.stderr
+    assert completed.stdout == ""
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert any(call.startswith("run --rm ") for call in calls)
+    assert not any(call.startswith("run -d ") for call in calls)
+    assert not (root / "current").exists()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_build_native_runs_only_the_start_build_step(tmp_path: Path, fails: bool) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    environment = _fake_docker_environment(tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false", FAKE_NATIVE_BUILD_FAIL=str(fails).lower(),
+        MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS="/qualified/setup.bash")
+    completed = subprocess.run(["bash", str(launcher), "build-native"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False)
+    assert "native build output" in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    runs = [call for call in calls if call.startswith("run ")]
+    assert len(runs) == 1 and runs[0].startswith("run --rm ")
+    assert runs[0].endswith("sha256:test python3 scripts/dev-workbench.py build")
+    for shared in (f"--user {os.getuid()}:{os.getgid()}", "--env HOME=/runner/home",
+                   f"-v {launcher.parents[1]}:/workspace",
+                   f"-v {tmp_path / 'cache/images/test'}:/runner",
+                   "--env MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS"):
+        assert shared in runs[0]
+    assert not (tmp_path / "cache/runtime").exists()
+    if fails:
+        assert completed.returncode == 69
+        assert "Native build failed" in completed.stderr
+        assert completed.stdout == ""
+    else:
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == "Native build complete.\n"

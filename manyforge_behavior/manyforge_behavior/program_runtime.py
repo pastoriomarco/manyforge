@@ -263,8 +263,10 @@ class ProgramRunAttemptSource:
         )
 
 
-def _effectful_target_roles(entry: Any, parameters: Mapping[str, Any]) -> frozenset[str]:
-    """Target roles a node's effectful target-binding requirements name.
+def _effectful_targets(
+    entry: Any, parameters: Mapping[str, Any], program_binding: Mapping[str, Any]
+) -> frozenset[tuple[str, str]]:
+    """Exact targets named by a node's effectful requirements.
 
     The same rule the Kernel's captured node table uses for a node's
     effectful target effects: a ``when`` condition and the target parameter
@@ -280,7 +282,7 @@ def _effectful_target_roles(entry: Any, parameters: Mapping[str, Any]) -> frozen
     def effective(parameter_id: str) -> Any:
         return parameters[parameter_id] if parameter_id in parameters else defaults.get(parameter_id)
 
-    roles: set[str] = set()
+    targets: set[tuple[str, str]] = set()
     for requirement in entry.required_capabilities:
         if (
             requirement.scope != "target_binding"
@@ -293,10 +295,27 @@ def _effectful_target_roles(entry: Any, parameters: Mapping[str, Any]) -> frozen
             and effective(requirement.when_parameter) != requirement.when_equals
         ):
             continue
-        role = effective(requirement.target_parameter)
-        if isinstance(role, str) and role:
-            roles.add(role)
-    return frozenset(roles)
+        reference = effective(requirement.target_parameter)
+        if not isinstance(reference, Mapping):
+            raise ProgramRuntimeError("effectful node has no component reference")
+        if "signal_name" in reference:
+            rows = program_binding.get("signal_bindings", ())
+            if not isinstance(rows, (list, tuple)):
+                raise ProgramRuntimeError("captured signal bindings are invalid")
+            matches = [row for row in rows if isinstance(row, Mapping)
+                       and row.get("reference") == reference]
+            if len(matches) != 1 or not isinstance(matches[0].get("target"), Mapping):
+                raise ProgramRuntimeError("effectful signal has no unique captured target")
+            target = matches[0]["target"]
+            if target.get("component_id") != reference.get("component_id"):
+                raise ProgramRuntimeError("effectful signal target has a different component")
+        else:
+            target = reference
+        component, command = target.get("component_id"), target.get("command_target_id")
+        if not isinstance(component, str) or not component or not isinstance(command, str) or not command:
+            raise ProgramRuntimeError("effectful node target is invalid")
+        targets.add((component, command))
+    return frozenset(targets)
 
 
 def _program_node_ids(node: ProgramTreeNode) -> tuple[str, ...]:
@@ -311,7 +330,7 @@ def _presented_node_status(behaviour: py_trees.behaviour.Behaviour) -> str:
         return "held"
     status = getattr(behaviour, "presented_status", behaviour.status)
     if status is py_trees.common.Status.INVALID:
-        # A cancellable leaf stopped while running (spec 440 §4.6).
+        # A cancellable leaf stopped while running.
         if getattr(behaviour, "presented_interrupted", False):
             return "interrupted"
         # A stop whose cancellation the owner refused is a failure.
@@ -330,6 +349,7 @@ class ExecutableProgramRun:
         program: Program,
         environment: NodeEnvironment,
         capture: ProgramRunCapture,
+        program_binding: Mapping[str, Any],
         readiness: NodeExecutionReadiness,
         ports: NodeAdapterPorts,
         program_clock: ProgramClock | None = None,
@@ -367,24 +387,28 @@ class ExecutableProgramRun:
             )
         if readiness.program_binding_id != capture.program_binding_id:
             raise ProgramRuntimeError("readiness facts select another Program Binding")
+        if not isinstance(program_binding, Mapping) or program_binding.get("program_binding_id") != capture.program_binding_id:
+            raise ProgramRuntimeError("Program Binding does not match the captured identity")
 
         self._program = program
         self._environment = environment
         self._capture = capture
-        motion_target_by_node: dict[str, str] = {}
-        effect_targets_by_node: dict[str, frozenset[str]] = {}
+        motion_target_by_node: dict[str, tuple[str, str]] = {}
+        effect_targets_by_node: dict[str, frozenset[tuple[str, str]]] = {}
         pending_nodes = [program.tree]
         while pending_nodes:
             node = pending_nodes.pop()
             if node.node_id in MOTION_NODE_IDS or node.node_id in INTERRUPT_MOTION_NODE_IDS:
-                target_role = node.parameters.get("target_role")
-                if isinstance(target_role, str) and target_role:
-                    motion_target_by_node[node.instance_id] = target_role
-            effect_targets_by_node[node.instance_id] = _effectful_target_roles(
-                environment.catalog.get(node.node_id), node.parameters
+                target = node.parameters.get("target")
+                if isinstance(target, Mapping):
+                    component, command = target.get("component_id"), target.get("command_target_id")
+                    if isinstance(component, str) and component and isinstance(command, str) and command:
+                        motion_target_by_node[node.instance_id] = (component, command)
+            effect_targets_by_node[node.instance_id] = _effectful_targets(
+                environment.catalog.get(node.node_id), node.parameters, program_binding
             )
             pending_nodes.extend(node.children)
-        self._selection_effect_target_roles = MappingProxyType({
+        self._selection_effect_targets = MappingProxyType({
             group_id: tuple(sorted({
                 role
                 for node_id in node_ids
@@ -392,7 +416,7 @@ class ExecutableProgramRun:
             }))
             for group_id, node_ids in program.execution_selections.items()
         })
-        self._selection_motion_target_roles = MappingProxyType({
+        self._selection_motion_targets = MappingProxyType({
             group_id: tuple(sorted({
                 motion_target_by_node[node_id]
                 for node_id in node_ids
@@ -438,7 +462,7 @@ class ExecutableProgramRun:
         capture_topology(program.tree)
         self._scope_node_ids = tuple(sorted(node_children))
         self._scope_identity: tuple[str, str, int] | None = None
-        # AUD-6: the global rule whose `hold` holds this run, from the latest
+        # The global rule whose `hold` holds this run, from the latest
         # Kernel scope read (None once Resume releases it); the run end names it.
         self._stopped_by_rule_id: str | None = None
         # The run's one Program clock. Its owner freezes it while the run is
@@ -461,7 +485,7 @@ class ExecutableProgramRun:
         # Owner-task leaves by node: drained after each tick, and restarted
         # (motion retry budget) when the operator releases a hold over them.
         self._task_adapters: dict[str, OwnerTaskAdapter] = {}
-        # Decision 138: each node's nearest Hold scope (None: Continue up to
+        # Each node's nearest Hold scope (None: Continue up to
         # the root), for the held-node mask of the Run's Mock snapshot.
         self._hold_scopes: dict[str, str | None] = {}
         root = self._build_node(
@@ -473,7 +497,7 @@ class ExecutableProgramRun:
         self._tree.setup()
         self._lock = RLock()
         self._stopped = False
-        # Decision 135: unconfirmed Mock ENDs/pause states already reported.
+        # Unconfirmed Mock ENDs/pause states already reported.
         self._mock_ends_reported: set[tuple[str, str]] = set()
 
     def _build_node(
@@ -736,7 +760,7 @@ class ExecutableProgramRun:
                     adapter.restart_retry_series()
 
     def simulation_stop_nodes(self) -> frozenset[str]:
-        """SIM-1: nodes refused with `simulation_not_playing` whose operator
+        """Nodes refused with `simulation_not_playing` whose operator
         Stop the run owner hasn't sent yet."""
 
         with self._lock:
@@ -826,7 +850,7 @@ class ExecutableProgramRun:
             return status
 
     def _settle_mock_ends(self, *, final: bool) -> None:
-        """Decision 135: resend this Run's unanswered node ENDs unchanged on
+        """Resend this Run's unanswered node ENDs unchanged on
         every tick; when the tree ends with an END still unanswered, its
         cancellation is unproven and the history says so (once)."""
 
@@ -1143,10 +1167,10 @@ class ExecutableProgramRun:
     def execution_selections(self) -> Mapping[str, tuple[str, ...]]:
         return self._program.execution_selections
 
-    def execution_selection_motion_target_roles(
+    def execution_selection_motion_targets(
         self, group_id: str
-    ) -> tuple[str, ...]:
-        """Return captured motion target roles in one execution selection.
+    ) -> tuple[tuple[str, str], ...]:
+        """Return captured component/target identities in one selection.
 
         The selection is resolved from the immutable Program captured for this
         run.  It is presentation metadata only: command admission still uses
@@ -1154,24 +1178,24 @@ class ExecutableProgramRun:
         """
 
         try:
-            return self._selection_motion_target_roles[group_id]
+            return self._selection_motion_targets[group_id]
         except KeyError as error:
             raise ProgramRuntimeError(
                 "execution selection is not in this capture"
             ) from error
 
-    def execution_selection_effect_target_roles(
+    def execution_selection_effect_targets(
         self, group_id: str
-    ) -> tuple[str, ...]:
-        """Return the target roles of every effectful node in one selection.
+    ) -> tuple[tuple[str, str], ...]:
+        """Return the component/target identities of effectful nodes.
 
         With the sealed Program Binding these name the exact resources the
         Kernel reserves for the selection's Run/Resume; presentation uses
-        them to anticipate operator-alarm motion attention (spec 450 §5.2).
+        them to anticipate operator-alarm motion attention.
         """
 
         try:
-            return self._selection_effect_target_roles[group_id]
+            return self._selection_effect_targets[group_id]
         except KeyError as error:
             raise ProgramRuntimeError(
                 "execution selection is not in this capture"
@@ -1184,8 +1208,8 @@ class ExecutableProgramRun:
         *,
         node_instance_id: str | None = None,
     ) -> dict[str, Any]:
-        """The selection DTO. ``node_instance_id`` (release only, contract 43
-        / SX-2020) names one captured held node with ``group_ids: []``."""
+        """The selection DTO. ``node_instance_id`` (release only)
+        names one captured held node with ``group_ids: []``."""
         if self._scope_identity is None:
             raise ProgramRuntimeError("Program execution scope is not captured")
         if node_instance_id is not None and (

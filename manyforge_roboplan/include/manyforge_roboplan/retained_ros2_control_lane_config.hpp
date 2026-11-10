@@ -28,7 +28,7 @@ make_retained_ros2_control_measured_state_descriptor(
     const core::ActiveControlConfigurationDTO &reconciled_configuration,
     const RetainedMeasuredJointStateLane &lane);
 
-/// CP9: the component's declared `stream_id` row (budget/severity/recovery
+/// The component's declared `stream_id` row (budget/severity/recovery
 /// defaults); throws when the component does not declare the stream.
 [[nodiscard]] const deployment::ros2_control_execution_runtime_contract::
     Configuration::ComponentStream &
@@ -55,7 +55,7 @@ retained_component_stream(
         &configuration,
     const core::RuntimeParticipantBinding &motion_binding);
 
-/// CONTRACTS §16: the machines of `configuration` whose owner no arm member
+/// The machines of `configuration` whose owner no arm member
 /// builds (no controller profile names it as owner: its arm is deactivated).
 /// The host builds each one's owner as a component of its own, running the
 /// machine's process where the machine has one (`deactivated_arm`); in
@@ -86,7 +86,7 @@ retained_ros2_control_armless_machines(
 [[nodiscard]] std::string retained_ros2_control_sole_group(
     const core::RuntimeParticipantBinding &binding, const char *description);
 
-/// CP9: one value. The component's effective `measured_joints` budget (its
+/// One value. The component's effective `measured_joints` budget (its
 /// row, or the Deployment override the stream registry applies on top of the
 /// declared row) is also the participant's in-motion staleness check.
 [[nodiscard]] core::Duration retained_ros2_control_measured_joints_budget_ns(
@@ -102,7 +102,10 @@ retained_ros2_control_armless_machines(
     std::string_view hardware_component_name,
     const std::vector<std::string> &transport_joints,
     const ControllerLaneRates &rates, double stop_completion_timeout_s,
-    core::Duration controller_state_max_age_ns);
+    core::Duration controller_state_max_age_ns,
+    // Whether the lane's controller accepts runtime speed scaling: the lane
+    // row's declared `runtime_scale`, which its written launch matches.
+    bool supports_scale);
 
 /// Read only the strict authored row for this exact selected component/target.
 /// Coordinate kind and transport names never select actuator semantics.
@@ -117,9 +120,8 @@ void configure_retained_gripper_output_mode(
     const deployment::ros2_control_execution_runtime_contract::Configuration& configuration,
     const core::RuntimeParticipantBinding& binding);
 
-/// Populate the existing stock Mock GripperCommand transport from the exact
-/// binding, the tool's lane row (`gripper_result_timeout_s`,
-/// `gripper_stop_finish_tolerance`) and its written
+/// Populate the existing stock Mock ParallelGripperCommand transport from the exact
+/// binding, the tool's lane row (`gripper_stop_finish_tolerance`) and its written
 /// controllers. No motion participant is constructed.
 /// The arm builder and the no-motion owner share these unchanged lane values.
 void configure_retained_mock_gripper_action(
@@ -131,15 +133,16 @@ void configure_retained_mock_gripper_action(
     const std::string& controller_manager);
 
 /// The ROS execution configuration of a Mock component from its model lane
-/// row (`hard_stop_completion_timeout_s`, `gripper_result_timeout_s`) and its
-/// written launch artifacts (controller names, cadence, reset writer). Lane facts: Q65 (Isaac's: lead-in `stop_traj_delta_s` 0.1 s,
+/// row (`hard_stop_completion_timeout_s`) and its
+/// written launch artifacts (controller names, cadence, reset writer). Lane facts: Isaac's (lead-in `stop_traj_delta_s` 0.1 s,
 /// Stop sample period 0.01 s, tracking
-/// tolerance 0.05 rad with timeout 0), Q79 (hard-stop completion and gripper
+/// tolerance 0.05 rad with timeout 0), hard-stop completion and gripper
 /// result timeouts per model family; completion policy `position_reached`
-/// through the stock GripperActionController's GripperCommand action), the
-/// controller cadence read from the Track 2 template the controller runs, and
+/// through the stock parallel gripper action controller's
+/// ParallelGripperCommand action, the
+/// controller cadence read from the template the controller runs, and
 /// the per-joint cancel deceleration the generated controllers file carries
-/// (the deployment's operator Stop profile, Q48), keyed by model source joint.
+/// (the deployment's operator Stop profile), keyed by model source joint.
 /// No Isaac guard. The arm's configuration has no gripper (a tool is its
 /// own component).
 /// The in-motion staleness check is the effective `measured_joints` budget.
@@ -164,16 +167,16 @@ struct RealLaneRowGates final {
 };
 [[nodiscard]] RealLaneRowGates real_lane_row_gates(const ModelLaneRow &row);
 
-/// CP8 step 1 / R7 package 2: the ROS execution configuration of a Real
+/// The ROS execution configuration of a Real
 /// component from its vendor's `lanes.real` row (`hard_stop_completion_timeout_s`,
 /// `joint_state_freshness_s`, `start_tolerance_rad`, `completion_state_timeout_s`,
 /// `arrival_tolerance_rad`) and its written launch artifacts. The arm's state
 /// authority is measured: the measured JointState lane on `<ns>/joint_states`
-/// with the component's `measured_joints` stream row (CP9, the same row Mock
+/// with the component's `measured_joints` stream row (the same row Mock
 /// and Isaac declare; its effective budget also sets the in-motion staleness
 /// check) is the addressed arm state.
 /// Mock's shared JTC wiring, the profile's controller cadence and the
-/// deployment's per-joint cancel deceleration (Q48). No scheduled replacement (not qualified on a real robot).
+/// deployment's per-joint cancel deceleration. No scheduled replacement (not qualified on a real robot).
 [[nodiscard]] RetainedRos2ControlBackendConfig
 make_retained_real_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration

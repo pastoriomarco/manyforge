@@ -34,7 +34,7 @@
 namespace manyforge::xarm_control {
 
 /// The adapter family name in the `manyforge_component_adapters` resource
-/// index (CONTRACTS §6) and in `lanes.real.adapter`.
+/// index and in `lanes.real.adapter`.
 inline constexpr std::string_view kXArmAdapterFamily = "xarm";
 
 /// One xArm machine's connection: the execution host's pieces its owner runs
@@ -56,7 +56,7 @@ struct XArmMachineInputs final {
   std::function<bool()> launch_settling;
 };
 
-/// One machine (CONTRACTS §16): the owner adapter with the driver services
+/// One machine: the owner adapter with the driver services
 /// and the subscriptions it holds; its members register with `owner`.
 struct XArmMachine final {
   std::shared_ptr<XArmRobotStatesTransport> robot_states;
@@ -68,7 +68,8 @@ struct XArmMachine final {
 /// Creates the subscriptions and service clients on `node` (stamping receipt
 /// on `clock`); both outlive the machine.
 [[nodiscard]] XArmMachine make_xarm_machine(rclcpp::Node &node, core::IClock &clock,
-                                            XArmMachineInputs inputs);
+                                            XArmMachineInputs inputs,
+                                            const XArmRosOwner *ros_owner = nullptr);
 
 /// One probe of the controller's command port (TCP 502), bounded by
 /// `timeout` (`reboot.probe_interval_ms`): whether it accepts a connection now.

@@ -7,7 +7,7 @@
 
 namespace manyforge::core {
 
-/// Q50 (refines §3.1): the one owner of the association of controller evidence
+/// The one owner of the association of controller evidence
 /// with one goal (Submit, Replace or level-3 brake). Kept isolated so the rule
 /// can be reverted in one place.
 ///
@@ -83,7 +83,7 @@ class ExecutionSampleAssociation final {
     return anchor_.has_value();
   }
 
-  /// Recognition delay (Q50 "measure"): dispatch to anchor on the local clock.
+  /// Recognition delay: dispatch to anchor on the local clock.
   [[nodiscard]] std::optional<Duration> recognition_delay_ns() const {
     std::lock_guard lock(mutex_);
     if (!anchor_) return std::nullopt;

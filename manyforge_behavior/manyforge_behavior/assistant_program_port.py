@@ -23,7 +23,9 @@ from threading import Event, RLock
 import time
 import unicodedata
 from types import MappingProxyType
-from typing import Any, Final, Protocol
+from typing import Any, Callable, Final, Protocol
+
+from manyforge_behavior.program import ProgramValidationError, _program_direct_reference
 
 from manyforge_behavior.nodes.model import (
     ModelOutputValidationError,
@@ -48,7 +50,7 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.json_scalars import nonnegative_int64_value
 
 
-_RETAINED_ASSISTANT_API: Final = "manyforge.retained_assistant.v1"
+_RETAINED_ASSISTANT_API: Final = "manyforge.retained_assistant.v3"
 _SCENE_SOURCE_API: Final = "manyforge.logical_scene_source.v1"
 _SCENE_POSE_QUERY_API: Final = "manyforge.scene_resource_pose_query.v1"
 _SCENE_POSE_RESPONSE_API: Final = "manyforge.scene_resource_pose_response.v1"
@@ -361,6 +363,8 @@ class ProgramModelAuditSink(Protocol):
 class _SceneTransport(Protocol):
     def scene(self) -> dict[str, Any]: ...
 
+    def lookup_component_frame(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _AssistantContract:
@@ -573,7 +577,6 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
             "projection_digest",
             "audit_policy",
             "model_endpoint_aliases",
-            "provider_aliases",
             "modes",
             "prompt_templates",
             "instruments",
@@ -630,6 +633,10 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
         _text(row["external_resource_alias"], field="external_resource_alias")
         _text(row["model_id"], field="model_id", maximum_bytes=4_096)
         contract = dict(_mapping(row["request_contract"], field="request_contract"))
+        # EXPERIMENTAL `reasoning: on|off` and `sampling` apply to the
+        # bridge's chat only.
+        contract.pop("reasoning", None)
+        contract.pop("sampling", None)
         _exact(
             contract,
             {
@@ -1010,8 +1017,15 @@ def _json_schema(
                                     "scene_resource",
                                 ],
                             },
-                            "target_role": {"type": "string"},
-                            "frame_role": {"type": "string"},
+                            "frame": {
+                                "type": "object",
+                                "properties": {
+                                    "component_id": {"type": "string"},
+                                    "frame_id": {"type": "string"},
+                                },
+                                "required": ["component_id", "frame_id"],
+                                "additionalProperties": False,
+                            },
                             "scene_resource_id": {"type": "string"},
                         },
                         "required": ["kind"],
@@ -1071,12 +1085,12 @@ def _validate_program_model_outputs(
     parsed: Any,
     declaration: Mapping[str, Any],
     program: Mapping[str, Any],
+    frame_lookup: Callable[[Mapping[str, Any]], None],
 ) -> None:
     """Close Program-identity semantics outside the JSON-schema subset."""
 
     if not isinstance(parsed, Mapping):
         return
-    target_roles = _mapping(program.get("target_roles"), field="target_roles")
     scene_ids = {
         _text(
             _mapping(row, field="Program scene row").get("scene_resource_id"),
@@ -1106,32 +1120,13 @@ def _validate_program_model_outputs(
         if kind == "cell_frame":
             expected_frame_fields = {"kind"}
         elif kind == "target_frame":
-            expected_frame_fields = {"kind", "target_role", "frame_role"}
-            target_role = _text(
-                frame.get("target_role"),
-                field=f"model output {name}.frame_ref.target_role",
-            )
-            frame_role = _text(
-                frame.get("frame_role"),
-                field=f"model output {name}.frame_ref.frame_role",
-            )
+            expected_frame_fields = {"kind", "frame"}
+            reference = _mapping(frame.get("frame"), field=f"model output {name}.frame_ref.frame")
             try:
-                target = _mapping(
-                    target_roles[target_role],
-                    field=f"target role {target_role}",
-                )
-            except KeyError as exc:
-                raise ModelOutputValidationError(
-                    f"$.{name}.frame_ref.target_role: undeclared target role"
-                ) from exc
-            required_frames = _sequence(
-                target.get("required_frame_roles", ()),
-                field=f"target role {target_role}.required_frame_roles",
-            )
-            if frame_role not in required_frames:
-                raise ModelOutputValidationError(
-                    f"$.{name}.frame_ref.frame_role: undeclared frame role"
-                )
+                _program_direct_reference(dict(reference), path=f"$.{name}.frame_ref.frame", member="frame_id")
+            except ProgramValidationError as exc:
+                raise ModelOutputValidationError(str(exc)) from exc
+            frame_lookup(reference)
         elif kind == "scene_resource":
             expected_frame_fields = {"kind", "scene_resource_id"}
             scene_resource_id = _text(
@@ -1234,6 +1229,29 @@ class HeadlessProgramSceneSource:
         if not callable(getattr(transport, "scene", None)):
             raise TypeError("scene transport has no callable scene")
         self._transport = transport
+
+    def validate_component_frame(
+        self, context: ProgramRunPortContext, frame: Mapping[str, Any]
+    ) -> None:
+        """Check a model-supplied frame in the exact captured retained model."""
+        lookup = getattr(self._transport, "lookup_component_frame", None)
+        if not callable(lookup):
+            raise RuntimeError("static component-frame lookup is unavailable")
+        request = {
+            "schema_version": "manyforge.component_frame_lookup.v1",
+            "retained_bundle_id": context.retained_bundle_id,
+            "graph_revision": context.graph_revision,
+            "frame": dict(frame),
+        }
+        try:
+            response = lookup(request)
+        except Exception as exc:
+            if getattr(exc, "code", None) in {"component_reference_missing", "frame_missing"}:
+                raise ModelOutputValidationError(f"component frame is absent: {dict(frame)!r}") from exc
+            raise
+        expected = {**request, "schema_version": "manyforge.component_frame_lookup_result.v1", "exists": True}
+        if not isinstance(response, Mapping) or dict(response) != expected:
+            raise RuntimeError("static component-frame lookup crossed its captured identity")
 
     def _snapshot(
         self, context: ProgramRunPortContext
@@ -2254,6 +2272,7 @@ class ProgramAssistantPort:
                 parsed,
                 declaration,
                 context.capture.program,
+                lambda frame: self._scene_source.validate_component_frame(context.capture, frame),
             )
         except (ModelOutputValidationError, ProgramAssistantPortError) as exc:
             reason = (

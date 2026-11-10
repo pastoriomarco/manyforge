@@ -6,8 +6,8 @@
 # contract (manyforge_deployment/test/test_program_contract.cpp) run every
 # case, so both refuse the same values.
 #
-# Each suite builds its own valid base Program whose target role `arm`
-# requires the frame roles `base` and `tcp`, replaces its `scene` with the one
+# Each suite builds its own valid v3 base Program with direct frame references,
+# replaces its `scene` with the one
 # below, declares `blackboard_keys` plus the case's `keys`, and puts the `node`
 # template in its tree with the case's `value` (when given) as the pose it
 # writes. `accepted` cases must load; `refused` cases must be refused with an
@@ -39,9 +39,9 @@ node:
       orientation: {rpy_deg: [0.0, 0.0, 90.0]}
 
 accepted:
-  - name: a pose in a frame of a declared target role
+  - name: a pose in a direct component frame
     value:
-      frame_ref: {kind: target_frame, target_role: arm, frame_role: tcp}
+      frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
       position_m: [0.0, 0.0, 0.1]
       orientation: {rpy_deg: [180.0, 0.0, 0.0]}
   - name: a unit quaternion pose on a declared scene resource
@@ -63,12 +63,41 @@ accepted:
         allowed_frames:
           - {kind: cell_frame}
           - {kind: scene_resource, scene_resource_id: table}
-          - {kind: target_frame, target_role: arm, frame_role: base}
-          - {kind: target_frame, target_role: arm, frame_role: tcp}
+          - {kind: target_frame, frame: {component_id: lite6_robot, frame_id: base}}
+          - {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
         initial:
-          frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
+          frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: base}}
           position_m: [0.3, 0.0, 0.2]
           orientation: {xyzw: [0.0, 0.0, 0.0, 1.0]}
+
+  # Resolution of missing direct references is tested at the shared validator boundary.
+  - name: a syntactically valid pose in an unbound component frame
+    value:
+      frame_ref: {kind: target_frame, frame: {component_id: gantry, frame_id: tcp}}
+      position_m: [0.1, 0.2, 0.3]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+  - name: a syntactically valid pose in an unbound frame
+    value:
+      frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: camera}}
+      position_m: [0.1, 0.2, 0.3]
+      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+  - name: a syntactically valid allowed frame on an unbound component
+    keys:
+      - key: tool_goal
+        type: stored_pose
+        access: read_write
+        persistence: run
+        allowed_frames: [{kind: target_frame, frame: {component_id: gantry, frame_id: tcp}}]
+  - name: a syntactically valid initial pose in an unbound frame
+    keys:
+      - key: tool_goal
+        type: stored_pose
+        access: read_write
+        persistence: run
+        initial:
+          frame_ref: {kind: target_frame, frame: {component_id: lite6_robot, frame_id: camera}}
+          position_m: [0.3, 0.0, 0.2]
+          orientation: {rpy_deg: [0.0, 0.0, 0.0]}
 
 refused:
   - name: a pose with an extra member
@@ -137,18 +166,6 @@ refused:
       position_m: [0.1, 0.2, 0.3]
       orientation: {rpy_deg: [0.0, 0.0, 0.0]}
     reason: "value.frame_ref.scene_resource_id: does not name a declared scene resource"
-  - name: a pose in a frame of an undeclared target role
-    value:
-      frame_ref: {kind: target_frame, target_role: gantry, frame_role: tcp}
-      position_m: [0.1, 0.2, 0.3]
-      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
-    reason: "value.frame_ref.target_role: does not name a declared target role"
-  - name: a pose in a frame role the target does not require
-    value:
-      frame_ref: {kind: target_frame, target_role: arm, frame_role: camera}
-      position_m: [0.1, 0.2, 0.3]
-      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
-    reason: "value.frame_ref.frame_role: is not required by the selected target role"
   - name: allowed frames on a key that is not a pose
     keys:
       - key: speed
@@ -172,8 +189,8 @@ refused:
         access: read_write
         persistence: run
         allowed_frames:
-          - {kind: target_frame, target_role: arm, frame_role: tcp}
-          - {kind: target_frame, target_role: arm, frame_role: base}
+          - {kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}
+          - {kind: target_frame, frame: {component_id: lite6_robot, frame_id: base}}
     reason: "allowed_frames: must be duplicate-free and canonical-sorted"
   - name: a repeated allowed frame
     keys:
@@ -183,14 +200,6 @@ refused:
         persistence: run
         allowed_frames: [{kind: cell_frame}, {kind: cell_frame}]
     reason: "allowed_frames: must be duplicate-free and canonical-sorted"
-  - name: an allowed frame of an undeclared target role
-    keys:
-      - key: tool_goal
-        type: stored_pose
-        access: read_write
-        persistence: run
-        allowed_frames: [{kind: target_frame, target_role: gantry, frame_role: tcp}]
-    reason: "allowed_frames[0].target_role: does not name a declared target role"
   - name: an allowed frame on an undeclared scene resource
     keys:
       - key: tool_goal
@@ -205,7 +214,7 @@ refused:
         type: stored_pose
         access: read_write
         persistence: run
-        allowed_frames: [{kind: target_frame, target_role: arm, frame_role: tcp}]
+        allowed_frames: [{kind: target_frame, frame: {component_id: lite6_robot, frame_id: tcp}}]
         initial:
           frame_ref: {kind: cell_frame}
           position_m: [0.3, 0.0, 0.2]
@@ -233,17 +242,6 @@ refused:
           position_m: [0.3, 0.0, 0.2]
           orientation: {xyzw: [0.0, 0.0, 0.0, 1.000001]}
     reason: "initial.orientation.xyzw: must already be a unit quaternion"
-  - name: an initial pose in a frame role the target does not require
-    keys:
-      - key: tool_goal
-        type: stored_pose
-        access: read_write
-        persistence: run
-        initial:
-          frame_ref: {kind: target_frame, target_role: arm, frame_role: camera}
-          position_m: [0.3, 0.0, 0.2]
-          orientation: {rpy_deg: [0.0, 0.0, 0.0]}
-    reason: "initial.frame_ref.frame_role: is not required by the selected target role"
   - name: an initial pose with an extra member
     keys:
       - key: tool_goal

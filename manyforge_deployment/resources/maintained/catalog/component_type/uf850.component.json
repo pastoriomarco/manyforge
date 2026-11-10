@@ -35,10 +35,6 @@
           "capability_id": "execution.reset"
         },
         {
-          "capability_definition_revision": "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
-          "capability_id": "execution.runtime_scale.operation_scoped"
-        },
-        {
           "capability_definition_revision": "sha256:3ed811803c31726c758e227fc52bd57854cc6e7fa09dff0fd117d41800d4f8b9",
           "capability_id": "execution.stop.soft"
         },
@@ -123,7 +119,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "uf850.component",
-  "component_type_revision": "sha256:5d4c305976aee102f9ca373d6cdb39b0ec937f064182039073fa6dcc5a6c1e0d",
+  "component_type_revision": "sha256:29dfe024f1753f956c2c742e4678bf4793ea071a87eb27d39b9631401da2906a",
   "model_mounts": [],
   "model_roles": [
     {

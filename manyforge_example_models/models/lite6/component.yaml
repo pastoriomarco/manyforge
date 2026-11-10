@@ -1,6 +1,6 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/lite6`.
-# The arm only: a tool mounts on `flange` as its own component (merge 6).
+# The arm only: a tool mounts on `flange` as its own component.
 api_version: manyforge.component_package.v1
 kind: robot
 id: ufactory.lite6
@@ -25,7 +25,7 @@ roles:
     arm_joints: [joint1, joint2, joint3, joint4, joint5, joint6]
   collision_bodies:
     arm_collision: [link1, link2, link3, link4, link5, link6, link_base]
-tcps:                             # without a tool; a mounted tool's default TCP wins (D1)
+tcps:                             # without a tool; a mounted tool's default TCP wins
   - {id: flange, frame: link_eef}
 limits:
   max_tcp_linear_speed_mps: 0.5
@@ -36,27 +36,28 @@ lanes:
     vendor_model: lite6             # xarm_controller/config/lite6_controllers.yaml
     controller: lite6_traj_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
   real:                           # xArm adapter (manyforge_xarm_control/vendor/README.md)
     adapter: xarm
     controller: lite6_traj_controller
     arrival_tolerance_rad: 0.01     # every arm joint's JTC goal
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
     vendor_model: lite6             # xarm_controller/config/lite6_controllers.yaml
     robot_type: lite
     dof: 6
     joint_agreement_tolerance_rad: 0.02  # Enable gate: measured vs reported joints
-    joint_state_freshness_s: 0.25   # measured joints older than this are stale during a motion (M7)
-    start_tolerance_rad: 0.02       # a motion starts only this close to its first point (M7)
-    completion_state_timeout_s: 1.0 # wait for the final measured state after the goal result (M7)
+    joint_state_freshness_s: 0.25   # measured joints older than this are stale during a motion
+    start_tolerance_rad: 0.02       # a motion starts only this close to its first point
+    completion_state_timeout_s: 1.0 # wait for the final measured state after the goal result
   isaac:                          # Isaac lane adapter (manyforge_isaac_adapter/lane/README.md)
     adapter: isaac
     vendor: xarm                    # the xArm controllers, as on the real lane
     vendor_model: lite6             # xarm_controller/config/lite6_controllers.yaml
     controller: lite6_traj_controller
     arrival_tolerance_rad: 0.05     # the working Isaac value (written as every arm joint's JTC `goal`)
+    runtime_scale: supported        # the arm's controller accepts runtime speed scaling
     goal_time_s: 1.0                # the working Isaac value (JTC `goal_time`)
     hard_stop_completion_timeout_s: 1.5
 defaults:

@@ -114,8 +114,9 @@ void Exec(sqlite3 *database, const std::string_view sql) {
   }
 }
 
-std::int64_t ScalarInteger(sqlite3 *database, const std::string_view sql) {
-  Statement statement(database, sql);
+std::int64_t ScalarInteger(sqlite3 *database, const std::string_view sql,
+                           PersistentStatementCache *cache) {
+  Statement statement(database, sql, cache);
   if (!statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
         "SQLite scalar row is missing");
@@ -1768,9 +1769,41 @@ ReadLegacyNativeEffectsUncertain(sqlite3 *database) {
   return uncertain != 0;
 }
 
+LogicalSceneSnapshotDTO ReadMaintenanceSnapshot(
+    MaintenanceSnapshotCache *cache, const std::int64_t sequence,
+    const bool baseline, std::string bytes) {
+  if (cache != nullptr) {
+    if (const auto *entry = cache->Find(sequence, baseline, bytes)) {
+      return entry->snapshot;
+    }
+  }
+  auto snapshot = logical_scene_codec_internal::DecodeSnapshot(bytes);
+  if (cache != nullptr) {
+    cache->Store(sequence, baseline, std::move(bytes), snapshot);
+  }
+  return snapshot;
+}
+
+ContentDigest ReadMaintenanceSnapshotHash(
+    MaintenanceSnapshotCache *cache, const std::int64_t sequence,
+    const std::string_view bytes, const LogicalSceneSnapshotDTO &snapshot) {
+  auto *entry = cache == nullptr ? nullptr : cache->Find(sequence, true, bytes);
+  if (entry != nullptr && entry->content_hash.has_value()) {
+    return *entry->content_hash;
+  }
+  auto hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot);
+  if (entry != nullptr) {
+    entry->content_hash = hash;
+  }
+  return hash;
+}
+
 std::vector<MaintenanceInitializationState>
 ReadMaintenanceInitializations(sqlite3 *database,
-                               const CellId &expected_cell_id) {
+                               const CellId &expected_cell_id,
+                               MaintenanceSnapshotCache *cache,
+                               PersistentStatementCache *statements) {
   Statement intents(
       database,
       "SELECT initialization_sequence,apply_id,apply_generation,"
@@ -1781,7 +1814,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
       "target_scene_content_hash,authoritative_snapshot_json,"
       "native_binding_count,repaired_transaction_sequence "
       "FROM logical_scene_maintenance_initialization_intents "
-      "ORDER BY initialization_sequence LIMIT 257");
+      "ORDER BY initialization_sequence LIMIT 257", statements);
   std::vector<MaintenanceInitializationState> result;
   while (intents.Step()) {
     if (result.size() >= kMaximumMaintenanceInitializations) {
@@ -1815,7 +1848,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
             SceneRevision{SceneId(intents.Text(10)),
                           static_cast<std::uint64_t>(target_revision),
                           ContentDigest(intents.Text(12))}},
-        logical_scene_codec_internal::DecodeSnapshot(intents.Text(13)),
+        ReadMaintenanceSnapshot(cache, sequence, false, intents.Text(13)),
         {},
         std::nullopt,
         std::nullopt,
@@ -1843,7 +1876,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
         "SELECT binding_ordinal,provider_binding_id,"
         "provider_binding_revision,runtime_unit_id,runtime_epoch FROM "
         "logical_scene_maintenance_initialization_bindings WHERE "
-        "initialization_sequence=? ORDER BY binding_ordinal LIMIT 257");
+        "initialization_sequence=? ORDER BY binding_ordinal LIMIT 257", statements);
     bindings.Bind(1, sequence);
     while (bindings.Step()) {
       if (bindings.Integer(0) !=
@@ -1865,12 +1898,12 @@ ReadMaintenanceInitializations(sqlite3 *database,
           "maintenance initialization binding set is inconsistent");
     }
 
-    if (ScalarInteger(database, "PRAGMA user_version") >=
+    if (ScalarInteger(database, "PRAGMA user_version", statements) >=
         kInitialSceneBaselineSchemaVersion) {
       Statement baseline_request(
           database,
           "SELECT request_digest FROM logical_scene_initial_baseline_requests "
-          "WHERE initialization_sequence=? LIMIT 2");
+          "WHERE initialization_sequence=? LIMIT 2", statements);
       baseline_request.Bind(1, sequence);
       if (baseline_request.Step()) {
         state.initial_baseline_request_digest =
@@ -1888,7 +1921,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
             "target_scene_id,target_scene_revision_id,"
             "target_scene_content_hash,snapshot_json FROM "
             "logical_scene_initial_baseline_intents WHERE "
-            "initialization_sequence=? LIMIT 2");
+            "initialization_sequence=? LIMIT 2", statements);
         baseline_intent.Bind(1, sequence);
         std::optional<ProjectionRevisionDTO> final_target;
         std::optional<LogicalSceneSnapshotDTO> final_snapshot;
@@ -1904,8 +1937,9 @@ ReadMaintenanceInitializations(sqlite3 *database,
               SceneRevision{SceneId(baseline_intent.Text(2)),
                             static_cast<std::uint64_t>(revision_id),
                             ContentDigest(baseline_intent.Text(4))}};
-          final_snapshot = logical_scene_codec_internal::DecodeSnapshot(
-              baseline_intent.Text(5));
+          const auto baseline_bytes = baseline_intent.Text(5);
+          final_snapshot = ReadMaintenanceSnapshot(cache, sequence, true,
+                                                   baseline_bytes);
           if (!final_target->valid() ||
               final_target->retained_bundle_id != state.target.retained_bundle_id ||
               final_target->graph_revision != state.target.graph_revision ||
@@ -1915,8 +1949,9 @@ ReadMaintenanceInitializations(sqlite3 *database,
                   state.target.scene_revision.revision_id ||
               final_snapshot->revision != final_target->scene_revision ||
               final_snapshot->cell_id != expected_cell_id ||
-              core::logical_scene_identity::ComputeLogicalSceneContentHash(
-                  *final_snapshot) != final_target->scene_revision.content_hash ||
+              ReadMaintenanceSnapshotHash(cache, sequence, baseline_bytes,
+                                          *final_snapshot) !=
+                  final_target->scene_revision.content_hash ||
               baseline_intent.Step()) {
             throw LogicalSceneOwnerIntegrityError(
                 "initial Scene baseline target is not an exact successor");
@@ -1926,7 +1961,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
             database,
             "SELECT state,first_error_code,first_error_message FROM "
             "logical_scene_initial_baseline_results WHERE "
-            "initialization_sequence=? LIMIT 2");
+            "initialization_sequence=? LIMIT 2", statements);
         baseline_result.Bind(1, sequence);
         if (baseline_result.Step()) {
           const auto result_state = baseline_result.Text(0);
@@ -1959,7 +1994,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
         database,
         "SELECT state,first_error_code,first_error_message,effects_unknown "
         "FROM logical_scene_maintenance_initialization_results WHERE "
-        "initialization_sequence=? LIMIT 2");
+        "initialization_sequence=? LIMIT 2", statements);
     outcome.Bind(1, sequence);
     if (outcome.Step()) {
       const auto result_state = outcome.Text(0);
@@ -2002,7 +2037,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
         "publication_generation,private_materialization_content_digest,"
         "durable_public_pointer_content_digest FROM "
         "logical_scene_maintenance_initialization_completions WHERE "
-        "initialization_sequence=? LIMIT 2");
+        "initialization_sequence=? LIMIT 2", statements);
     completion.Bind(1, sequence);
     if (completion.Step()) {
       const auto previous = completion.Integer(0);
@@ -2086,7 +2121,9 @@ namespace {
 
 DurableState
 ReadDurableState(sqlite3 *database,
-                 const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+                 const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+                 MaintenanceSnapshotCache *cache = nullptr,
+                 PersistentStatementCache *statements = nullptr) {
   DurableState state;
   state.accepted = ReadAcceptance(database, fixed_query);
   state.rebuilt = ReadRebuild(database, state.accepted);
@@ -2097,7 +2134,8 @@ ReadDurableState(sqlite3 *database,
     state.migrated_structural_completions =
         ReadMigratedStructuralCompletions(database);
     state.maintenance_initializations =
-        ReadMaintenanceInitializations(database, fixed_query.cell_id);
+        ReadMaintenanceInitializations(database, fixed_query.cell_id, cache,
+                                       statements);
     state.active_execution_host_bindings =
         ReadActiveExecutionHostBindings(database);
     state.legacy_native_effects_uncertain =
@@ -2125,8 +2163,10 @@ namespace manyforge::scene::logical_scene_owner_detail {
 
 DurableState ReadCompleteDurableState(
     sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
-  auto state = ReadDurableState(database, fixed_query);
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    MaintenanceSnapshotCache *cache,
+    PersistentStatementCache *statements) {
+  auto state = ReadDurableState(database, fixed_query, cache, statements);
   if (!state.finalization_receipt.has_value()) {
     return state;
   }
@@ -3467,7 +3507,8 @@ LogicalSceneOwner::BeginProjectionBootstrap(
   std::lock_guard lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
+  Transaction transaction(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (state.accepted.has_value()) {
     if (state.accepted->bootstrap_id != intent.bootstrap_id ||
@@ -3509,7 +3550,8 @@ LogicalSceneOwner::RebuildProjectionBootstrap(
   std::lock_guard lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
+  Transaction transaction(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (!state.accepted.has_value() ||
       request.bootstrap_id != state.accepted->bootstrap_id ||
@@ -3650,7 +3692,8 @@ LogicalSceneOwner::FinalizeProjectionBootstrap(
   }
 
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE");
+  Transaction transaction(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   state = ReadCompleteDurableState(database, impl_->fixed_query_);
   if (!state.accepted.has_value() || !state.rebuilt) {
     throw LogicalSceneOwnerIntegrityError(
@@ -3710,7 +3753,8 @@ CanonicalEmptySceneStoreIntegrityReport
 LogicalSceneOwner::VerifyIntegrity() const {
   std::lock_guard lock(impl_->mutex_);
   auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN");
+  Transaction transaction(database, "BEGIN",
+                          &impl_->maintenance_snapshot_cache_);
   ValidateDatabase(database, impl_->fixed_query_, impl_->admission_digest_);
   const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
   CanonicalEmptySceneStoreIntegrityReport report{

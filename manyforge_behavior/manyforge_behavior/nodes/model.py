@@ -1,4 +1,4 @@
-"""Pure model-output authoring helpers and the I5/I6 model-node gate.
+"""Pure model-output authoring helpers and the model-node gate.
 
 Provider HTTP calls, shared executors/clients, environment secrets, scene
 snapshot transport, retry policy, output commits, and pause/recovery ownership
@@ -24,7 +24,6 @@ from typing import Any, Final, NoReturn, Optional
 MODEL_NODE_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_model_node_unavailable"
 )
-MODEL_NODE_RESTORATION_GATES: Final = ("I5", "H0", "I6", "N")
 _MAX_TEMPLATE_CHARS: Final = 1_000_000
 _MAX_TEMPLATE_VARIABLES: Final = 256
 _MAX_SCHEMA_DEPTH: Final = 16
@@ -66,7 +65,7 @@ class ModelOutputValidationError(ValueError):
 def _raise_model_node_unavailable() -> NoReturn:
     raise ModelNodeUnavailableError(
         f"{MODEL_NODE_UNAVAILABLE_REASON_CODE}: qualified model provider and "
-        "Program-Binding execution return at I5/H0 and I6/N"
+        "Program-Binding execution are not available"
     )
 
 
@@ -620,7 +619,7 @@ def _derive_confidence(
     """Return explicit finite confidence, never an invented success default.
 
     When a schema is supplied, only a declared numeric ``confidence``
-    property participates, matching spec 470's threshold contract.
+    property participates, matching the threshold contract.
     """
     if schema is not None:
         _validate_schema_definition(
@@ -668,7 +667,7 @@ def _validate_model_output(
     *,
     min_confidence: Optional[float] = None,
 ) -> Optional[float]:
-    """Validate one output and apply spec 470's optional confidence gate."""
+    """Validate one output and apply the optional confidence gate."""
     _validate_json_schema(data, schema)
     confidence = _derive_confidence(data, schema)
     if min_confidence is None:

@@ -17,6 +17,7 @@ RetainedRos2ControlBackendConfig make_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding, const IsaacArmFacts &arm,
     const IsaacLaneSettings &settings, const roboplan_backend::ControllerLaneRates &rates,
+    const bool supports_scale,
     const std::map<std::string, double, std::less<>> &max_deceleration_on_cancel_by_source_joint,
     const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
   const auto &component = motion_binding.value().controllable_component_id;
@@ -56,7 +57,8 @@ RetainedRos2ControlBackendConfig make_isaac_ros2_control_backend_config(
       runtime_namespace, arm.controller, roboplan_backend::kHardwareComponentName,
       transport_joints, rates, arm.hard_stop_completion_timeout_s,
       roboplan_backend::retained_ros2_control_measured_joints_budget_ns(measured_lane, component,
-                                                                        stream_overrides));
+                                                                        stream_overrides),
+      supports_scale);
   config.arm.measured_joint_state_lane = std::move(measured_lane);
   for (std::size_t index = 0; index < compiled_joints.size(); ++index) {
     const auto found = max_deceleration_on_cancel_by_source_joint.find(transport_joints[index]);
@@ -121,7 +123,6 @@ void configure_isaac_gripper_action(
   gripper_config.publish_nominal_position = facts.publish_nominal_position;
   gripper_config.wait_for_action_server_timeout_s =
       settings.gripper_wait_for_action_server_timeout_s;
-  gripper_config.result_timeout_s = facts.result_timeout_s;
   gripper_config.stop_finish_tolerance = facts.stop_finish_tolerance;
   config.gripper = std::move(gripper_config);
   roboplan_backend::configure_retained_gripper_output_mode(config, configuration, gripper);

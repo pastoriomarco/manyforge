@@ -33,14 +33,11 @@ using deployment::test::maintained_activation_fixture_detail::Member;
 using deployment::test::maintained_activation_fixture_detail::Read;
 using deployment::test::maintained_activation_fixture_detail::With;
 
-/// One example Scenario cell and the single role pair its Program binds.
-/// The role declarations are read from the Scenario's own program.yaml.
+/// One example Scenario cell and the exact command target used in its Program.
 struct Profile final {
   std::string_view scenario;
   void (*authored_mapper)(CanonicalValue::Object &);
-  std::string_view component_role;
   std::string_view component_id;
-  std::string_view target_role;
   std::string_view command_target_id;
   bool initial_scene;
 };
@@ -119,20 +116,16 @@ constexpr std::string_view kUsage =
   // The Lite 6 machine (owner `lite6`, arm member `lite6_robot`) with its
   // mounted pneumatic Lite gripper.
   if (name == "ros2-control")
-    return {"examples/mock_lite6_pick_and_place.scenario", nullptr, "robot",
-            "lite6_robot", "arm", "arm", true};
+    return {"examples/mock_lite6_pick_and_place.scenario", nullptr, "lite6_robot", "arm", true};
   // The UR10e + Robotiq 2F-140 cell with its scene-authoring assistant.
   if (name == "assistant-ros2-control")
-    return {"examples/mock_ur10e_assistant_scene_authoring.scenario", nullptr,
-            "robot", "ur10e_robot", "arm", "arm", false};
+    return {"examples/mock_ur10e_assistant_scene_authoring.scenario", nullptr, "ur10e_robot", "arm", false};
   // The Lite gripper alone: pneumatic, commanded output, with feedback.
   if (name == "gripper-pneumatic-commanded")
-    return {"examples/mock_lite6_pick_and_place.scenario", KeepOnlyLiteGripper,
-            "tool", "lite_gripper", "gripper", "gripper", false};
+    return {"examples/mock_lite6_pick_and_place.scenario", KeepOnlyLiteGripper, "lite_gripper", "gripper", false};
   // The Robotiq 2F-85 alone: a Position gripper with no arm.
   if (name == "gripper-only-robotiq-position")
-    return {"examples/mock_ur5_semantic_object_pick.scenario", KeepOnlyRobotiq,
-            "tool", "robotiq_2f_85", "gripper", "gripper", false};
+    return {"examples/mock_ur5_semantic_object_pick.scenario", KeepOnlyRobotiq, "robotiq_2f_85", "gripper", false};
   throw std::invalid_argument(std::string(kUsage));
 }
 
@@ -157,50 +150,48 @@ void Publish(const std::filesystem::path &package_root,
 struct ProgramPublication final {
   core::ProgramBindingId binding_id;
   core::ProgramRevision program_revision;
-  /// The exact authored assignment the binding was compiled from.
-  CanonicalValue role_assignment;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
 };
 
-/// A timer-only Program declaring the profile's role pair exactly as the
-/// Scenario's own Program declares it.
+/// A timer-first Program that retains the exact v3 target/frame test inputs.
+/// The fallback succeeds on the timer and never executes the following node.
 [[nodiscard]] ProgramPublication PublishProgram(
     const std::filesystem::path &package_root,
     const detail::PreparedActivationMaterialization &physical,
     const Profile &profile) {
   using V = CanonicalValue;
-  const auto source =
-      deployment::parse_strict_json_model_yaml(
-          Read(std::filesystem::path(MANYFORGE_WORKSPACE_ROOT) /
-               profile.scenario / "program.yaml"))
-          .root();
   deployment::test::ProgramOptions options;
   options.catalog_content_version =
       physical.bundle->value().catalogs.node_environment.content_version;
-  options.logic_only = true;
   auto authored = deployment::test::make_program_root(options);
   authored = With(std::move(authored), "program_id", V("program_apply_fixture"));
   authored = With(std::move(authored), "name", V("Manager Apply fixture"));
-  authored = With(std::move(authored), "component_roles",
-                  V(V::Object{{std::string(profile.component_role),
-                               Member(Member(source, "component_roles"),
-                                      profile.component_role)}}));
-  auto target_role = Member(Member(source, "target_roles"), profile.target_role);
-  if (profile.target_role == "arm") {
-    // Process tests resolve transforms between two of the arm's frame roles;
-    // every example arm model names `base` and `flange`.
-    target_role = With(std::move(target_role), "required_frame_roles",
-                       V(V::Array{V("base"), V("flange")}));
+  const V target(V::Object{{"component_id", V(std::string(profile.component_id))},
+                           {"command_target_id", V(std::string(profile.command_target_id))}});
+  V::Object selected_parameters{{"target", target}};
+  const bool arm = profile.command_target_id == "arm";
+  if (arm) {
+    const V base(V::Object{{"component_id", V(std::string(profile.component_id))},
+                            {"frame_id", V("base")}});
+    const V flange(V::Object{{"component_id", V(std::string(profile.component_id))},
+                              {"frame_id", V("flange")}});
+    selected_parameters.emplace_back("base_frame", base);
+    selected_parameters.emplace_back("goal", V(V::Object{
+        {"frame_ref", V(V::Object{{"kind", V("target_frame")}, {"frame", flange}})},
+        {"position_m", V(V::Array{V(0.0), V(0.0), V(0.0)})},
+        {"orientation", V(V::Object{{"xyzw", V(V::Array{V(0.0), V(0.0), V(0.0), V(1.0)})}})}}));
+  } else {
+    selected_parameters.emplace_back("expected_state", V("idle"));
   }
-  authored = With(std::move(authored), "target_roles",
-                  V(V::Object{{std::string(profile.target_role),
-                               std::move(target_role)}}));
-  authored = With(std::move(authored), "tree",
-                  deployment::parse_strict_json_model_yaml(R"({
-        "node_id":"sequence","instance_id":"root","parameters":{},
-        "children":[{"node_id":"timer","instance_id":"apply_fixture_timer",
-                     "parameters":{"duration_s":0.001},"children":[]}]})")
-                      .root());
+  const V selected(V::Object{
+      {"node_id", V(arm ? "motion.move_to_pose" : "gripper.check_status")},
+      {"instance_id", V("retained_target_probe")},
+      {"parameters", V(std::move(selected_parameters))}, {"children", V(V::Array{})}});
+  const auto timer = deployment::parse_strict_json_model_yaml(
+      R"({"node_id":"timer","instance_id":"apply_fixture_timer","parameters":{"duration_s":0.001},"children":[]})").root();
+  authored = With(std::move(authored), "tree", V(V::Object{
+      {"node_id", V("fallback")}, {"instance_id", V("apply_fixture_root")},
+      {"parameters", V(V::Object{})}, {"children", V(V::Array{timer, selected})}}));
   if (profile.initial_scene) {
     // Apply never loads a Program's scene; the marker proves it stays out.
     authored = With(std::move(authored), "scene",
@@ -214,31 +205,36 @@ struct ProgramPublication final {
   }
   authored = deployment::test::with_program_revision(
       deployment::normalize_program_authoring(authored));
-  const auto program = deployment::verify_program_binding_contract(
-      deployment::canonical_json(authored), *physical.bundle);
-  V role_assignment(V::Object{
-      {"component_roles",
-       V(V::Array{V(V::Object{
-           {"component_role_id", V(std::string(profile.component_role))},
-           {"controllable_component_id", V(std::string(profile.component_id))},
-       })})},
-      {"target_roles",
-       V(V::Array{V(V::Object{
-           {"command_target_id", V(std::string(profile.command_target_id))},
-           {"target_role_id", V(std::string(profile.target_role))},
-       })})},
-  });
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
+  const auto program = deployment::verify_program_binding_contract(
+      deployment::canonical_json(authored), *physical.bundle, physical.model_map, catalogs);
   const auto binding = deployment::compile_program_binding(
-      *program, deployment::parse_program_role_assignment(role_assignment),
-      *physical.bundle, *physical.model_map, catalogs);
+      *program, *physical.bundle, *physical.model_map, catalogs);
+  const core::ProgramTargetReferenceDTO expected_target{
+      core::ControllableComponentId(std::string(profile.component_id)),
+      core::CommandTargetId(std::string(profile.command_target_id))};
+  if (std::none_of(binding->value().target_bindings.begin(),
+                   binding->value().target_bindings.end(), [&](const auto &row) {
+                     return row.target == expected_target;
+                   }))
+    throw std::logic_error("fixture binding lost its exact authored target");
+  if (arm)
+    for (const auto *id : {"base", "flange"}) {
+      const core::ProgramFrameReferenceDTO frame{expected_target.component_id,
+                                                  core::FrameRoleId(id)};
+      if (std::none_of(binding->value().frame_bindings.begin(),
+                       binding->value().frame_bindings.end(), [&](const auto &row) {
+                         return row.reference == frame;
+                       }))
+        throw std::logic_error("fixture binding lost an authored arm frame");
+    }
   static_cast<void>(deployment::FilesystemProgramRepository(package_root)
                         .put_if_absent(program, *physical.bundle));
   static_cast<void>(
       deployment::FilesystemProgramBindingRepository(package_root)
-          .put_if_absent(binding, *physical.bundle, *physical.model_map));
-  return {binding->program_binding_id(), program->value().program_revision,
-          std::move(role_assignment), program};
+          .put_if_absent(binding, *physical.bundle, *physical.model_map,
+                         catalogs));
+  return {binding->program_binding_id(), program->value().program_revision, program};
 }
 
 /// Publish one real prepared activation of the physical cell per Scenario ID
@@ -265,7 +261,7 @@ struct ProgramPublication final {
             "optional",
         },
         *physical.bundle, *physical.model_map, *program.program,
-        program.role_assignment, catalogs, raw_artifacts);
+        catalogs, raw_artifacts);
     static_cast<void>(repository.put_if_absent(prepared));
     CanonicalValue::Object summary;
     for (const auto &[name, value] : prepared.normalized_root().as_object()) {
@@ -308,7 +304,6 @@ void WriteMetadata(
       {"program_binding_id", V(program.binding_id.value())},
       {"program_id", V("program_apply_fixture")},
       {"program_revision", V(program.program_revision.value())},
-      {"program_role_assignment", program.role_assignment},
   }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {

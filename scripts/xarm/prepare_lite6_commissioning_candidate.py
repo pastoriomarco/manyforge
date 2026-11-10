@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retain bounded Lite6 commissioning math behind an I10/R client gate.
+"""Retain bounded Lite6 commissioning math behind an unavailable client.
 
 The historical script combined useful, transport-neutral safety checks with
 removed Composer status and candidate endpoints.  This file now retains only
@@ -9,8 +9,8 @@ names come from the future compiled binding, so this helper does not recreate
 the old singleton ``joint1`` ... ``joint6`` addressing contract.
 
 Direct execution is unavailable before argument parsing.  The future thin
-client must bind these checks to the I6-I8 caller-neutral status/admission
-contracts and pass the I10/R fake/offline and attended acceptance rows.
+client must bind these checks to the caller-neutral status/admission
+contracts and pass fake/offline and attended acceptance rows.
 
 Exact historical source: ManyForge
 ``08222188293df8e12f90dc72e204c21f22f92ea1``, blob
@@ -143,7 +143,7 @@ def main() -> int:
 
     print(
         f"{LITE6_COMMISSIONING_UNAVAILABLE_REASON_CODE}: the caller-neutral "
-        "commissioning client returns at I10/R after I6-I8",
+        "commissioning client is not available yet",
         file=sys.stderr,
     )
     return 78

@@ -76,7 +76,7 @@ def test_launch_requires_retained_artifacts_and_no_second_pose_input():
         "gripper_controller_name",
         "frame_prefix",
         "hardware_plugin", "driver_parameters_file", "hardware_remappings",
-        "world_parent_frame",
+        "world_parent_frame", "publish_tf",
     }
 
 
@@ -271,7 +271,7 @@ def test_stock_gripper_plugin_dependency_is_declared():
     import xml.etree.ElementTree as ET
 
     manifest = ET.fromstring((ROOT / "package.xml").read_text())
-    assert "gripper_controllers" in {
+    assert "parallel_gripper_controller" in {
         dependency.text for dependency in manifest.findall("exec_depend")
     }
     assert "forward_command_controller" in {
@@ -294,7 +294,7 @@ def test_owned_nodes_disable_external_library_log_files():
         assert ast.literal_eval(arguments.elts[0]) == "--disable-external-lib-logs"
 
 
-# CP8 step 2a: the same launch runs a Real component; its hardware data comes
+# The same launch runs a Real component; its hardware data comes
 # from the generated artifacts.
 REAL_PLUGIN = "uf_robot_hardware/UFRobotSystemHardware"
 REAL_REMAPS = (

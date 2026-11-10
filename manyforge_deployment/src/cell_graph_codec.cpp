@@ -105,7 +105,7 @@ using RuntimeProfileKey = std::pair<std::string, std::string>;
   });
 }
 
-// Provider-domain members: an identity, or a CP9 pose-source stream id whose
+// Provider-domain members: an identity, or a pose-source stream id whose
 // '/'-separated segments are identities (`poses/<object_id>/<policy_id>`).
 [[nodiscard]] bool is_provider_signal_name(std::string_view spelling) noexcept {
   if (spelling.empty() ||
@@ -447,7 +447,7 @@ template <typename StrongType>
   return result;
 }
 
-// B5: a component's default TCP, `{command_target_id, frame_role_id}`.
+// A component's default TCP, `{command_target_id, frame_role_id}`.
 [[nodiscard]] std::optional<ComponentDefaultTcpDTO> parse_default_tcp(const CanonicalValue* value,
                                                                      std::string_view path) {
   if (value == nullptr) return std::nullopt;
@@ -922,7 +922,7 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
                  {"component_attachment_id", "component_attachment_revision", "parent",
                   "child", "child_interface_pose_in_parent_interface"},
                  {"primary", "collision_exclusions"}, path);
-  // B5: `primary` is written only when true.
+  // `primary` is written only when true.
   const CanonicalValue* primary = find_member(object, "primary");
   if (primary != nullptr && !(primary->is_bool() && primary->as_bool())) {
     fail(child_path(path, "primary"), "primary is true or omitted");

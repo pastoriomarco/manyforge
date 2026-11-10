@@ -431,7 +431,7 @@ TEST(ApplyAffectedScope, ExecutionHostSharedSettingChangeFencesEveryHostedCompon
   }
 }
 
-// CONTRACTS §16: a member's runtime identity includes its owner's, so a
+// A member's runtime identity includes its owner's, so a
 // change of the owner's own rows fences its members too.
 TEST(ApplyAffectedScope, ExecutionHostOwnerRowChangeFencesItsMembers) {
   auto predecessor = HostGraph();

@@ -6,10 +6,10 @@ definition digest ``1cb1bfda55185be5d04ae2a1f0af423a327248f2b81e33c5b204202ece9c
 
 The eight old ``Pose``/``parse_pose``/serializer wire cases at lines 68-121
 (digest ``ed73ee537d705664264580c03c0b553694b42fac3d7fe098d652ee913ff6ed03``)
-are current H0/I5 logical-scene-owner and future thin-client acceptance input. The
+are current logical-scene-owner and future thin-client acceptance input. The
 eight dict-key ``resolve_orientation`` cases at lines 131-179 and 233 (digest
 ``c38ec56cf62f8133269d5bb7fef87d0302dd4608577c91ad9d90646cdd6000ca``)
-are current H0/I5 scene-reference-owner and future N/I6 addressed
+are current scene-reference-owner and future addressed
 authoring-client acceptance input. Neither historical wire returns as a
 compatibility parser. Their
 underlying conversion/composition calculations remain exercised below.

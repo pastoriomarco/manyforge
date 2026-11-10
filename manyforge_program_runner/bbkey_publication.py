@@ -1,14 +1,14 @@
 """One ordered BB key sender per source: a captured Run, or the cell between Runs.
 
-BBK-1: every writer (tree node, operator control, REST, MCP) commits through
+Every writer (tree node, operator control, REST, MCP) commits through
 the source's value store, and the store forwards each committed change of a
 subscribed key synchronously under its lock, so writes reach the Kernel in
 commit order, one frame per write (never merged), and a write returns only
 after the Kernel's reply. The Kernel evaluates its rules before it ACKs.
 
 The baseline (message 1) carries every key of the union (null when unset);
-an update carries only the written key (bb-wire-shapes03). While the Kernel
-answers the baseline `bb_source_not_ready` (SX-2143: the matching Apply is
+an update carries only the written key. While the Kernel
+answers the baseline `bb_source_not_ready` (the matching Apply is
 still installing; or the Kernel has not yet observed the Runner's newer
 Program cycle), the source does not exist yet: writes only commit, and the
 owner's next start sends a baseline built from the store at that moment.
@@ -43,10 +43,10 @@ from manyforge_behavior.orchestration_values import (
 SCHEMA_VERSION: Final = "manyforge.program_bbkey_publication.v1"
 COMMAND: Final = "publish_program_bbkeys"
 FAULT_CODE: Final = "program_bbkey_publication_failed"
-# SX-2143/2146: the matching current Apply is still installing the source, or
+# The matching current Apply is still installing the source, or
 # the Kernel has not yet observed the Runner's newer Program cycle.
 SOURCE_NOT_READY_CODE: Final = "bb_source_not_ready"
-# The Kernel's typed proof that an exact-sender gap lost this source (F-2).
+# The Kernel's typed proof that an exact-sender gap lost this source.
 SEQUENCE_GAP_REASON: Final = "program_bb_sequence_gap"
 MAXIMUM_SEQUENCE: Final = 2**64 - 1
 _MAXIMUM_FAULT_MESSAGE_BYTES: Final = 1_024
@@ -118,7 +118,7 @@ def publisher_fault_error(message: str) -> dict[str, Any]:
 
 
 class ProgramBlackboardKeyPublisher:
-    """Forward one source's key writes synchronously, in commit order (BBK-1)."""
+    """Forward one source's key writes synchronously, in commit order."""
 
     def __init__(
         self,
@@ -138,9 +138,9 @@ class ProgramBlackboardKeyPublisher:
         self._submit = submit
         self._stop_run = stop_run
         self._on_fault = on_fault
-        # The Kernel ACKed this source's baseline (F-2 successor proof).
+        # The Kernel ACKed this source's baseline (successor proof).
         self._on_baseline_accepted = on_baseline_accepted
-        # The owner's monotonic creation order of its sources (F-2).
+        # The owner's monotonic creation order of its sources.
         self._source_ordinal = source_ordinal
         self._baseline_accepted = False
         self._fault_reference = fault_reference
@@ -153,7 +153,7 @@ class ProgramBlackboardKeyPublisher:
         self._retired = False
         self._source_epoch: str | None = None
         self._fault: dict[str, Any] | None = None
-        # The Kernel confirmed this faulted source lost (F-2, BBK-1 (a)).
+        # The Kernel confirmed this faulted source lost.
         self._loss_confirmed = False
 
     @property
@@ -185,7 +185,7 @@ class ProgramBlackboardKeyPublisher:
         The first call subscribes the fixed union; a later call (the Kernel
         had not installed the source yet) resends a baseline built from the
         store at that moment. False while the Kernel answers
-        `bb_source_not_ready`: until then a write only commits (BBK-1 (a)).
+        `bb_source_not_ready`: until then a write only commits.
         """
 
         with self._lock:
@@ -389,7 +389,7 @@ class ProgramBlackboardKeyPublisher:
 
     def _declare_lost(self) -> bool:
         """After a fault: make the Kernel's source of this exact scope
-        unavailable, never stale-but-usable (F-2, BBK-1 (a)). One update
+        unavailable, never stale-but-usable. One update
         frame with a sequence gap is the Kernel's existing exact-sender loss
         (`program_bb_sequence_gap`); every BB-backed rule input of this source
         then can't watch and holds its scope until a new source (Reset or Run)

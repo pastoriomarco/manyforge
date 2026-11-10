@@ -450,27 +450,41 @@ void ValidateConfigurations(
           "active-control-configuration rows are invalid or noncanonical");
 }
 
-// The predecessor-side rows an Apply fence pins at acquisition: every
-// predecessor controller domain must have its reconciled configuration.
+// The predecessor-side rows an Apply fence pins at acquisition: the
+// reconciled configuration of every predecessor controller domain that has
+// one. A domain with neither a reconciled configuration nor a route
+// publication was never Enabled (or was Disabled): nothing is installed for
+// it to pin, so it yields no row, the rule ObservedConfigurations applies for
+// releases. A domain that still has a route publication is commandable or
+// externally owned (e.g. an unreconciled external route); pinning nothing for
+// it would hide live control, so it still refuses.
 [[nodiscard]] std::vector<core::DomainActiveControlConfigurationDTO>
 SelectConfigurations(
     const std::vector<core::DomainActiveControlConfigurationDTO> &available,
+    const std::vector<core::DomainActiveControlConfigurationDTO>
+        &route_published,
     const core::ConfigurationFenceScopeDTO &scope) {
+  const auto find = [](const auto &rows, const core::ControlDomainId &id) {
+    const auto found = std::lower_bound(
+        rows.begin(), rows.end(), id,
+        [](const auto &configuration, const auto &domain_id) {
+          return configuration.control_domain_id < domain_id;
+        });
+    return found != rows.end() && found->control_domain_id == id ? &*found
+                                                                 : nullptr;
+  };
   std::vector<core::DomainActiveControlConfigurationDTO> result;
   for (const auto &domain : scope.domains) {
     if (!domain.has_controller_predecessor()) {
       continue;
     }
-    const auto found = std::lower_bound(
-        available.begin(), available.end(), domain.control_domain_id,
-        [](const auto &configuration, const auto &domain_id) {
-          return configuration.control_domain_id < domain_id;
-        });
-    Require(found != available.end() &&
-                found->control_domain_id == domain.control_domain_id,
+    if (const auto *found = find(available, domain.control_domain_id)) {
+      result.push_back(*found);
+      continue;
+    }
+    Require(find(route_published, domain.control_domain_id) == nullptr,
             "the execution owner has no reconciled active configuration for "
-            "an affected domain");
-    result.push_back(*found);
+            "an affected domain that still has a route publication");
   }
   return result;
 }
@@ -683,13 +697,14 @@ ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
   Require(table != nullptr || !resource_table_was_bound_,
           "the bound Kernel resource table is no longer available");
   if (table == nullptr) {
-    return {0U, {}, 0U, 0U};
+    return {0U, {}, 0U, 0U, {}};
   }
   const auto snapshot = table->admission_snapshot(scope.resources);
   return {snapshot.operation_resource_generation,
           snapshot.active_control_configurations,
           snapshot.affected_queued_operation_count,
-          snapshot.affected_active_operation_count};
+          snapshot.affected_active_operation_count,
+          snapshot.route_published_active_control_configurations};
 }
 
 void ManagedKernelAdmissionGate::AcquireFenceDurably(
@@ -720,8 +735,10 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
               observation.affected_active_operation_count == 0U,
           "affected operation admission is busy or changed before fence "
           "acquisition");
-  Require(SelectConfigurations(observation.active_control_configurations,
-                               scope) == expected_active_control_configurations,
+  Require(SelectConfigurations(
+              observation.active_control_configurations,
+              observation.route_published_active_control_configurations,
+              scope) == expected_active_control_configurations,
           "active control configuration changed before fence acquisition");
   for (const auto &held : held_fences_) {
     if (!ScopesOverlap(held.scope, scope))
@@ -873,7 +890,9 @@ public:
     const auto active = ReadActivePublication();
     const auto observation = admission_gate_.Observe(query.affected_scope);
     const auto configurations = SelectConfigurations(
-        observation.active_control_configurations, query.affected_scope);
+        observation.active_control_configurations,
+        observation.route_published_active_control_configurations,
+        query.affected_scope);
     const auto epoch = ExecutionHostEpoch(active);
     core::ConfigurationFenceAdmissionSnapshotDTO snapshot{
         query,
@@ -939,7 +958,8 @@ public:
                 observed.affected_active_operation_count == 0U,
             "affected operation admission is busy or changed");
     const auto active_configurations = SelectConfigurations(
-        observed.active_control_configurations, intent.scope);
+        observed.active_control_configurations,
+        observed.route_published_active_control_configurations, intent.scope);
     Require(active_configurations ==
                 intent.expected_active_control_configurations,
             "active control configuration changed before fence acquisition");

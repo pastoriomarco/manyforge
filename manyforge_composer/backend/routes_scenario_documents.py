@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 import uuid
@@ -11,7 +12,10 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from manyforge_behavior.program import Program, TcpEndpointAliasAmbiguous
+from manyforge_behavior.program import (
+    Program, ProgramFormatUnsupported,
+    require_program_format,
+)
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
@@ -37,7 +41,6 @@ from .authoring_forest import (
 from .authoring_identity import canonical_digest
 from .authoring_admission import AuthoringOperationError
 from .authoring_forest import adopt_active_catalog
-from .legacy_attach_migration import migrate_legacy_attach
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -78,6 +81,7 @@ from .scenario_artifacts import (
 )
 from .state import ComposerState, canonical_project_path
 
+_LOGGER = logging.getLogger(__name__)
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
 
@@ -146,7 +150,7 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
 
 
 class ScenarioLoadRequest(BaseModel):
-    """CONTRACTS §11 `POST /api/scenario/load` body. With an unsaved Draft the
+    """`POST /api/scenario/load` body. With an unsaved Draft the
     Load is refused unless the caller confirms `discard_unsaved`."""
 
     model_config = _DTO
@@ -156,7 +160,7 @@ class ScenarioLoadRequest(BaseModel):
 
 
 class ScenarioEmptyRequest(BaseModel):
-    """CONTRACTS §11 `POST /api/scenario/new` body: refused with
+    """`POST /api/scenario/new` body: refused with
     an unsaved Draft unless the caller confirms `discard_unsaved`."""
 
     model_config = _DTO
@@ -424,11 +428,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             project = captured_workspace["project"]
             authoring = captured_workspace["program"]["authoring"]
             deployment = captured_workspace["deployment"]["document"]
-            assignment = project["program_role_assignment"]
             complete = (
                 isinstance(authoring, dict)
                 and isinstance(deployment, dict)
-                and isinstance(assignment, dict)
             )
             # Ready only when the saved content is exactly what is Applied:
             # both Applied views read at this captured identity, both Drafts
@@ -451,7 +453,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 description=body.description.strip(),
                 program_draft=authoring,
                 deployment_draft=deployment,
-                program_role_assignment=assignment,
                 manyforge_version=_version(),
                 last_known_status=(
                     "ready" if ready else "unknown" if complete else "incomplete"
@@ -587,13 +588,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario/load", response_model=None)
     def load_document(body: ScenarioLoadRequest) -> dict[str, Any] | JSONResponse:
-        """New, then Apply of the file (CONTRACTS §11); returns ApplyResult.
+        """New, then Apply of the file; returns ApplyResult.
 
-        The file is read and checked first, so one that can't be loaded
-        leaves the cell as it is. Then the New (an Apply of the empty cell,
-        with the unsaved-Draft protection) removes every component, and the
-        Apply of the file adds and prepares each one fresh. A failed New is
-        the Load's result.
+        The document is read and its basic structure checked before New; a
+        failure at that stage leaves the cell as it is. New (an Apply of the
+        empty cell, with the unsaved-Draft protection) then removes every
+        component if it succeeds. The requested Scenario is prepared and
+        applied afterward; if that later preparation fails, the cell remains
+        empty. A failed New is the Load's result. A Manager Apply that fails
+        before any effect restores the Drafts its commit replaced.
 
         A Load whose workspace install failed contains the workspace: the
         status stays 503 and the body is the failed ApplyResult.
@@ -630,7 +633,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     @router.post("/api/scenario/new")
     def new_document(body: ScenarioEmptyRequest) -> dict[str, Any]:
         """Apply of the empty cell (the built-in Untitled Scenario); the
-        Scene is initialized. R3: New always works."""
+        Scene is initialized. New always works."""
 
         def run() -> dict[str, Any]:
             with apply_slot():
@@ -667,18 +670,16 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             diagnostics: list[dict[str, str]] = []
             if authoring is not None:
                 try:
-                    selected = authoring.get("catalog")
-                    if (isinstance(selected, dict) and selected.get("content_version") == "2.8.0"
-                            and authoring_catalog.content_version == "2.9.0"):
-                        migrate_legacy_attach(authoring, deployment,
-                                              scenario_document["program_role_assignment"])
+                    require_program_format(authoring, supported_api_version="manyforge.program.v3")
                     adopt_active_catalog(authoring, authoring_catalog)
                     validate_invariants(authoring, authoring_catalog)
                     program, diagnostics = derive_candidate(
                         authoring, authoring_catalog
                     )
-                except TcpEndpointAliasAmbiguous as error:
-                    raise ScenarioArtifactError(error.code, str(error), status_code=400) from error
+                except ProgramFormatUnsupported as error:
+                    raise ScenarioArtifactError(
+                        error.code, str(error), details=error.details
+                    ) from error
                 except AuthoringForestError as error:
                     raise ScenarioArtifactError(
                         "scenario_program_draft_invalid",
@@ -691,7 +692,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             incomplete = (
                 (program is None and not no_program)
                 or deployment is None
-                or scenario_document["program_role_assignment"] is None
             )
             if incomplete or not isinstance(deployment, dict):
                 raise ScenarioArtifactError(
@@ -728,7 +728,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             source_closure = capture_deployment_model_sources(
                 deployment, project_root=Path(source_path)
             )
-            assignment = deepcopy(scenario_document["program_role_assignment"])
             # The project folder scopes the Scenario's persistent values.
             project_path = canonical_project_path(source_path)
             captured_digest = raw_sha256_digest(
@@ -740,7 +739,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "deployment": deployment,
                         "model_source_closure": source_closure,
                         "program": program.to_dict() if program is not None else None,
-                        "program_role_assignment": assignment,
                     }
                 )
             )
@@ -760,7 +758,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "model_source_closure": source_closure,
                     "program": program.to_dict() if program is not None else None,
                     "program_authoring": deepcopy(authoring),
-                    "program_role_assignment": assignment,
                     "expected_manager_current": {
                         "retained_bundle_id": bundle,
                         "graph_revision": graph,
@@ -873,8 +870,20 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
+            # The workspace this Load replaces, captured under the claim right
+            # before the commit: a Manager Apply that then fails with no effect
+            # restores it (OD-87), so a failed Load keeps the operator's Drafts.
+            previous: dict[str, Any] = {}
+
             def commit_load() -> None:
                 nonlocal committed_snapshot
+                previous.update(
+                    program=state.draft_session.retained_state(),
+                    deployment=state.deployment_draft_session.retained_state(),
+                    source_root=state.deployment_draft_session.source_project_root,
+                    project=state.authoring_workspace.project_facts(),
+                    notice=state.startup_scenario_notice,
+                )
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
                     install=install_load,
@@ -888,6 +897,50 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 # An opened Scenario supersedes a refused startup project.
                 state.startup_scenario_notice = None
+
+            def restore_previous_workspace() -> None:
+                """Reinstall the captured workspace in one fenced commit, under
+                fresh Draft ids so no stale client fence matches it again."""
+                nonlocal committed_snapshot
+                assert committed_snapshot is not None
+                program_restore = state.draft_session.prepare_load_replacement(
+                    {**previous["program"], "draft_id": f"draft-scenario-{uuid.uuid4().hex}"},
+                    authoring_catalog,
+                )
+                deployment_restore = state.deployment_draft_session.prepare_load_replacement(
+                    {
+                        **previous["deployment"],
+                        "draft_id": f"deployment-draft-scenario-{uuid.uuid4().hex}",
+                    },
+                    source_project_root=previous["source_root"],
+                )
+
+                def install() -> bool:
+                    program_changed = state.draft_session.install_prepared_replacement(
+                        program_restore
+                    )
+                    deployment_changed = (
+                        state.deployment_draft_session.install_prepared_replacement(
+                            deployment_restore
+                        )
+                    )
+                    return program_changed or deployment_changed
+
+                expected = committed_snapshot.identity
+                try:
+                    committed_snapshot = coordinator.submit_workspace_fenced(
+                        lambda: state.authoring_workspace.replace(
+                            expected_identity=expected,
+                            install=install,
+                            project=previous["project"],
+                        )
+                    )
+                except AuthoringWorkspaceError as error:
+                    # A Draft edit after the Load's commit is newer than the
+                    # captured workspace: keep it.
+                    _LOGGER.warning("Load workspace not restored: %s", error)
+                    return
+                state.startup_scenario_notice = previous["notice"]
 
             def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
                 return state.execute_authored_deployment_candidate(
@@ -910,38 +963,48 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     )
                     current["intent"] = activation_intent(generation)
                     current["prepared"] = prepare(current["intent"])
-                    activation = coordinator.execute_external_submission(
-                        AuthoringMutationEnvelope(
-                            expected_admission_generation=generation,
-                            request_owner_epoch=body.request_owner_epoch,
-                            request_id=body.request_id,
-                        ),
-                        operation_kind="load_scenario_document",
-                        draft_id=body.draft_id,
-                        draft_revision=body.expected_draft_revision,
-                        payload={
-                            "path": source_path,
-                            "source_document_digest": source_digest,
-                            "captured_input_digest": captured_digest,
-                            "scenario_content_digest": _document_content_digest(
-                                scenario_document
+                    try:
+                        activation = coordinator.execute_external_submission(
+                            AuthoringMutationEnvelope(
+                                expected_admission_generation=generation,
+                                request_owner_epoch=body.request_owner_epoch,
+                                request_id=body.request_id,
                             ),
-                        },
-                        validate_under_claim=validate_load,
-                        submit=submit_load,
-                        commit_before_submit=commit_load,
-                        workspace=state.authoring_workspace,
-                        after_release=state.authoring_workspace.publish_commit_wake,
-                        effects=effects,
-                    )
-                    self.wait_for_manager_apply(activation)
+                            operation_kind="load_scenario_document",
+                            draft_id=body.draft_id,
+                            draft_revision=body.expected_draft_revision,
+                            payload={
+                                "path": source_path,
+                                "source_document_digest": source_digest,
+                                "captured_input_digest": captured_digest,
+                                "scenario_content_digest": _document_content_digest(
+                                    scenario_document
+                                ),
+                            },
+                            validate_under_claim=validate_load,
+                            submit=submit_load,
+                            commit_before_submit=commit_load,
+                            workspace=state.authoring_workspace,
+                            after_release=state.authoring_workspace.publish_commit_wake,
+                            effects=effects,
+                        )
+                        self.wait_for_manager_apply(activation)
+                    except Exception as error:
+                        # Only an owner-stated no-effect failure restores: the
+                        # cell still runs the previous Scenario.
+                        if committed_snapshot is not None and (
+                            getattr(error, "before_effect", False) is True
+                            or getattr(error, "code", None) == "manager_apply_rejected"
+                        ):
+                            restore_previous_workspace()
+                        raise
                     if program is None:
                         self.wait_for_scene_clear(activation)
 
             # Unsaved Drafts are refused before any component is touched.
             require_discard_confirmed()
             if path == str(UNTITLED_SCENARIO_PATH):
-                # New always works (R3, N7): a failed Apply that still holds
+                # New always works: a failed Apply that still holds
                 # the cell, whatever it changed, is released; this New then
                 # stops and removes everything the host has.
                 try:
@@ -1010,7 +1073,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 ),
                 program_draft=captured_workspace["program"]["authoring"],
                 deployment_draft=captured_workspace["deployment"]["document"],
-                program_role_assignment=project["program_role_assignment"],
                 manyforge_version=_version(),
                 last_known_status="unknown",
             )
@@ -1092,7 +1154,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
 
 def require_empty_cell(state: ComposerState) -> None:
-    """Startup never replaces an applied Scenario (as M7): the Manager's
+    """Startup never replaces an applied Scenario: the Manager's
     current cell must be empty (no model instances, no components)."""
 
     status = state.headless_client.manager_status() if state.headless_client else {}

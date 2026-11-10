@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-11-02 09:06:59 UTC
+  Last regenerated: 2026-11-09 11:41:08 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -35,7 +35,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cell/latch` | headless-runtime-client | Cell Latch |
 | `GET` | `/api/components` | headless-runtime-client | Components |
 | `POST` | `/api/components/actions` | headless-runtime-client | Component Group Action |
+| `POST` | `/api/components/recover-enable` | headless-runtime-client | Component Recover Enable Group |
 | `POST` | `/api/components/{component_id}/actions` | headless-runtime-client | Component Action |
+| `POST` | `/api/components/{component_id}/recover-enable` | headless-runtime-client | Component Recover Enable |
+| `GET` | `/api/components/{component_id}/recover-enable/preflight` | headless-runtime-client | Component Recovery Preflight |
 | `GET` | `/api/composer/settings` | composer-settings | Read Settings |
 | `PUT` | `/api/composer/settings` | composer-settings | Replace Settings |
 | `DELETE` | `/api/composer/settings/profiles/{name}` | composer-settings | Delete Profile |

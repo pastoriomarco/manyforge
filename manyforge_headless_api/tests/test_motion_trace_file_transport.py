@@ -63,7 +63,7 @@ def _write_payload(directory: Path, payload: bytes, *, owner="owner.current", st
 
 
 def _client(metadata, *, inline=None):
-    response = {"api_version": "manyforge.execution_command_response.v1", "ok": True,
+    response = {"api_version": "manyforge.execution_command_response.v4", "ok": True,
                 "command": "read_volatile_motion_trace"}
     if metadata is not ...:
         response["trace_file"] = metadata
@@ -109,7 +109,7 @@ def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypat
     monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR", raising=False)
     trace = _normal_trace()
     trace["goals"][1]["trajectory"]["points"] *= 3000
-    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v1",
+    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v4",
                               "command": "read_volatile_motion_trace", "ok": True,
                               "trace": trace})
     assert 212_992 < len(response) < 400_000
@@ -134,7 +134,7 @@ def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypat
             client = ExecutionCommandClient(tmp_path, timeout_seconds=2, attribution_transport="internal")
             assert client.read_volatile_motion_trace(_MAX_BYTES) == trace
             command = answered.result(timeout=3)
-    assert command == {"api_version": "manyforge.execution_command.v1",
+    assert command == {"api_version": "manyforge.execution_command.v3",
                        "attribution": {"transport": "internal", "assurance": "unverified",
                                        "principal_id": None},
                        "command": "read_volatile_motion_trace",
@@ -148,7 +148,7 @@ def test_large_trace_crosses_real_small_seqpacket_only_as_file_metadata(monkeypa
     payload = rfc8785.dumps(trace)
     assert 212_992 < len(payload) < _MAX_BYTES
     metadata, path = _write_payload(tmp_path, payload)
-    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v1",
+    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v4",
                               "ok": True, "command": "read_volatile_motion_trace",
                               "trace_file": metadata})
     assert len(response) < 1024

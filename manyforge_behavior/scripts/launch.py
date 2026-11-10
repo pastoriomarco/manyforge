@@ -11,7 +11,7 @@ from typing import NoReturn
 
 UNAVAILABLE_MESSAGE = (
     "composable_cell_program_runtime_unavailable: production Program execution "
-    "requires the resource-addressed I6/N binding gate"
+    "requires the resource-addressed binding, which is not available"
 )
 
 
@@ -19,7 +19,7 @@ def create_kernel(_deployment: object) -> NoReturn:
     """Reject every removed production kernel-construction path."""
     raise RuntimeError(
         "composable_cell_kernel_client_binding_unavailable: production Kernel "
-        "construction returns through the resource-addressed binding at I6/N"
+        "construction through the resource-addressed binding is not available"
     )
 
 

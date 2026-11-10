@@ -3,7 +3,7 @@
 The pure mapping remains usable during the composable-cell cutover.  The
 former effectful bridge polled Composer-owned runtime endpoints and is not
 retained as a hidden fallback; the module entrypoint stays unavailable until
-I6/N supplies addressed runtime diagnostics over the headless substrate.
+addressed runtime diagnostics over the headless substrate exist.
 
 The mapping produces one ``DiagnosticStatus`` per active backend
 fault (level/values mapped from the backend fault taxonomy) and an OK
@@ -52,10 +52,9 @@ _MAX_JSON_DEPTH: Final = 8
 _MAX_JSON_NODES: Final = 256
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I6/N"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: ROS diagnostics publication requires the "
-    f"{RESTORATION_GATE} addressed runtime diagnostic projection"
+    "addressed runtime diagnostic projection"
 )
 
 _SEVERITY_TO_LEVEL = {

@@ -32,7 +32,7 @@ _LEGACY_SESSION_ENTRIES = frozenset({
     *(name + suffix for name in ("program-cycle.sqlite3", "logical-scene.sqlite3")
       for suffix in ("", "-wal", "-shm", "-journal")),
 })
-_RECEIPT_PARTIAL = re.compile(r"\.(?:legacy|mounted)-[0-9a-f]{64}\.partial\Z")
+_RECEIPT_PARTIAL = re.compile(r"\.mounted-[0-9a-f]{64}\.partial\Z")
 _EXPORT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z(?:\.[0-9]{9})?(?:\.partial)?\Z")
 
 
@@ -248,7 +248,7 @@ def retained_candidates(rows: list[dict], workspace: Path, current_id: str,
     return candidates
 
 
-def prepare_capture(evidence: Path, timestamp: str, summary: dict, *, legacy: bool,
+def prepare_capture(evidence: Path, timestamp: str, summary: dict,
                     state_root: Path | None = None) -> Path:
     """Reuse one receipt-proven partial; unknown copies stay put."""
     if (not re.fullmatch(r"[0-9a-f]{64}", summary.get("container_id", "")) or
@@ -278,13 +278,13 @@ def prepare_capture(evidence: Path, timestamp: str, summary: dict, *, legacy: bo
             evidence_fd = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         resources.callback(os.close, evidence_fd)
         alias = Path(f"/proc/self/fd/{evidence_fd}")
-        partial_name = (".legacy-" if legacy else ".mounted-") + summary["container_id"] + ".partial"
+        partial_name = ".mounted-" + summary["container_id"] + ".partial"
         matches: list[tuple[str, tuple[int, ...]]] = []
         observations: list[str] = []
         for folder in _children(alias, observations, str(evidence)):
             if folder.is_symlink() or not folder.name.endswith(".partial"):
                 continue
-            if not legacy and not (_EXPORT_NAME.fullmatch(folder.name) or folder.name == partial_name):
+            if not (_EXPORT_NAME.fullmatch(folder.name) or folder.name == partial_name):
                 continue
             try:
                 receipt = _read_summary(folder)
@@ -292,15 +292,15 @@ def prepare_capture(evidence: Path, timestamp: str, summary: dict, *, legacy: bo
                 continue
             if (receipt.get("container_id"), receipt.get("image"), receipt.get("mounts"), receipt.get("state", {}).get("running")) != (summary["container_id"], summary.get("image"), summary.get("mounts"), False):
                 continue
-            if not legacy and receipt.get("manyforge_export_kind") != "console_tail":
+            if receipt.get("manyforge_export_kind") != "console_tail":
                 continue
             matches.append((folder.name, _identity(folder.stat(follow_symlinks=False))))
         for message in observations:
             print("WARNING ManyForge " + message, file=sys.stderr)
         existing = alias / partial_name
         if (existing.exists() or existing.is_symlink()) and not any(name == partial_name for name, _ in matches):
-            raise ValueError(("legacy" if legacy else "mounted") + " partial is unknown or changed; refusing replacement")
-        if not legacy and len(matches) > 1:
+            raise ValueError("mounted partial is unknown or changed; refusing replacement")
+        if len(matches) > 1:
             raise ValueError("multiple historical mounted partials for " + summary["container_id"] + "; preserved, no additional partial; inspect before manual cleanup")
         for name, identity in matches:
             if _identity(os.stat(name, dir_fd=evidence_fd, follow_symlinks=False)) != identity:
@@ -311,36 +311,30 @@ def prepare_capture(evidence: Path, timestamp: str, summary: dict, *, legacy: bo
                                  _mounted_children(evidence / name), set(), proof_fd)
             finally:
                 os.close(proof_fd)
-            if legacy:
-                if not shutil.rmtree.avoids_symlink_attacks:
-                    raise ValueError("platform cannot replace partial safely")
-                shutil.rmtree(name, dir_fd=evidence_fd)
-            elif name != partial_name:
+            if name != partial_name:
                 os.rename(name, partial_name, src_dir_fd=evidence_fd, dst_dir_fd=evidence_fd)
-        if legacy or not matches:
+        if not matches:
             os.mkdir(partial_name, dir_fd=evidence_fd)
         partial_fd = os.open(partial_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=evidence_fd)
         resources.callback(os.close, partial_fd)
-        summary_name = "docker-inspect.json" if legacy else ".docker-inspect.next.json"
-        if not legacy:
-            # Receipt proves ownership; extra entries are removed only within it.
-            _allocated_bytes(evidence / partial_name, os.fstat(partial_fd).st_dev,
-                             _mounted_children(evidence / partial_name), set(), partial_fd)
-            for entry in os.listdir(partial_fd):
-                row = os.stat(entry, dir_fd=partial_fd, follow_symlinks=False)
-                if entry in {"docker-inspect.json", "docker.log"} and stat.S_ISREG(row.st_mode) and row.st_size <= (65536 if entry.endswith("json") else CONSOLE_TAIL_BYTES):
-                    continue
-                if stat.S_ISDIR(row.st_mode):
-                    if not shutil.rmtree.avoids_symlink_attacks:
-                        raise ValueError("platform cannot clean owned capture safely")
-                    shutil.rmtree(entry, dir_fd=partial_fd)
-                else:
-                    os.unlink(entry, dir_fd=partial_fd)
+        summary_name = ".docker-inspect.next.json"
+        # Receipt proves ownership; extra entries are removed only within it.
+        _allocated_bytes(evidence / partial_name, os.fstat(partial_fd).st_dev,
+                         _mounted_children(evidence / partial_name), set(), partial_fd)
+        for entry in os.listdir(partial_fd):
+            row = os.stat(entry, dir_fd=partial_fd, follow_symlinks=False)
+            if entry in {"docker-inspect.json", "docker.log"} and stat.S_ISREG(row.st_mode) and row.st_size <= (65536 if entry.endswith("json") else CONSOLE_TAIL_BYTES):
+                continue
+            if stat.S_ISDIR(row.st_mode):
+                if not shutil.rmtree.avoids_symlink_attacks:
+                    raise ValueError("platform cannot clean owned capture safely")
+                shutil.rmtree(entry, dir_fd=partial_fd)
+            else:
+                os.unlink(entry, dir_fd=partial_fd)
         output_fd = os.open(summary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=partial_fd)
         with os.fdopen(output_fd, "wb") as output:
             output.write(encoded)
-        if not legacy:
-            os.replace(summary_name, "docker-inspect.json", src_dir_fd=partial_fd, dst_dir_fd=partial_fd)
+        os.replace(summary_name, "docker-inspect.json", src_dir_fd=partial_fd, dst_dir_fd=partial_fd)
         return evidence / partial_name
 
 
@@ -370,7 +364,7 @@ def _ros_session_name(name: str) -> tuple[int, int] | None:
 
 
 def create_host_ros_log_session(root: Path) -> Path:
-    """Mint order in existing directory names under Q99's state-root lock."""
+    """Mint order in existing directory names under the state-root lock."""
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(root_fd, fcntl.LOCK_EX)
@@ -472,7 +466,7 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
             try:
                 summary = _read_summary(folder)
                 if not _owned_capture(ownership_root, summary):
-                    reason = reason or "unknown or legacy capture ownership"
+                    reason = reason or "unknown capture ownership"
                 elif not folder.name.endswith(".partial"):
                     stamp, _, nanos = folder.name.partition(".")
                     order = int(datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()) * 1_000_000_000 + int(nanos or "0")
@@ -484,7 +478,7 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
             latest = max(completed, key=lambda folder: folder.name)
             units = [(folder, reason or ("most recent console capture" if folder == latest else None), order) for folder, reason, order in units]
     # Cold-session archives contain the original owner journals, including
-    # facts not imported into History. DX996/DX1003 preserve every archive;
+    # facts not imported into History. Every archive is preserved;
     # account for disk pressure, but grant no new journal retirement authority.
     previous = root / "previous-sessions"
     if _safe_inventory_path(previous, root, ownership_root, warnings) and previous.exists():
@@ -842,7 +836,6 @@ def main() -> int:
     parser.add_argument("--legacy-evidence", type=Path)
     parser.add_argument("--default-roots", type=Path)
     parser.add_argument("--timestamp")
-    parser.add_argument("--legacy", action="store_true")
     parser.add_argument("--state-root", type=Path)
     arguments = parser.parse_args()
     if arguments.command == "prepare":
@@ -852,7 +845,7 @@ def main() -> int:
                 raise ValueError("stopped-container summary exceeds 64KB")
             summary = json.loads(data)
             print(prepare_capture(arguments.path, arguments.timestamp or "", summary,
-                                  legacy=arguments.legacy, state_root=arguments.state_root))
+                                  state_root=arguments.state_root))
             return 0
         except (OSError, ValueError, TypeError, AttributeError) as error:
             print(f"Could not prepare capture: {str(error)[:300]}", file=sys.stderr)

@@ -13,9 +13,9 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kAssistantInstrumentRegistryApiVersion =
-    "manyforge.assistant_instrument_registry.v1";
+    "manyforge.assistant_instrument_registry.v2";
 inline constexpr std::string_view kRetainedAssistantProjectionApiVersion =
-    "manyforge.retained_assistant.v1";
+    "manyforge.retained_assistant.v3";
 
 class AssistantSettingsCodecError final : public std::invalid_argument {
  public:

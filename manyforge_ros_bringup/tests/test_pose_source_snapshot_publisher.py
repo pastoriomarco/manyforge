@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import rclpy
@@ -587,6 +588,139 @@ def test_simulation_worker_future_completes_on_single_threaded_executor() -> Non
         executor.remove_node(node)
         node.destroy_service(service)
         node.destroy_node()
+        if context.ok():
+            rclpy.shutdown(context=context)
+
+
+def test_pose_entity_create_task_failure_reports_owner_fault() -> None:
+    scheduling_error = RuntimeError("executor trigger failed")
+    operations: list[str] = []
+    calls: list[object] = []
+
+    def fail_create_task(task: object) -> None:
+        calls.append(task)
+        raise scheduling_error
+
+    publisher = SimpleNamespace(
+        _simulation_node=SimpleNamespace(
+            executor=SimpleNamespace(is_spinning=True, create_task=fail_create_task)
+        ),
+        _simulation_owner_fault=threading.Event(),
+    )
+    with pytest.raises(pose_source_snapshot_publisher._EntityOperationOwnerUnavailable) as exc:
+        pose_source_snapshot_publisher.PoseSourceSnapshotPublisher._dispatch_simulation_entity_operation(
+            publisher, lambda: operations.append("ran")
+        )
+
+    assert exc.value.__cause__ is scheduling_error
+    assert publisher._simulation_owner_fault.is_set()
+    assert len(calls) == 1
+    assert operations == []
+
+
+def test_pose_simulation_client_entities_use_owner_executor(tmp_path: Path) -> None:
+    from std_srvs.srv import Trigger
+
+    context = Context()
+    rclpy.init(context=context)
+    dispatcher = _FakeDispatcher()
+    executor = SingleThreadedExecutor(context=context)
+    publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
+        site_config_path=_SITE_FIXTURE,
+        manager_run_root=tmp_path,
+        dispatcher_factory=lambda _root, _config, _callback: dispatcher,
+        stream_sink_factory=_FakeSinks(),
+        context=context,
+    )
+    auxiliary = publisher.auxiliary_nodes[0]
+    owner_threads: list[int] = []
+    client_operation_threads: list[tuple[str, int]] = []
+    completed = threading.Event()
+    replies: list[object] = []
+    errors: list[Exception] = []
+
+    def respond(_request: object, response: object) -> object:
+        owner_threads.append(threading.get_ident())
+        response.success = True
+        response.message = "completed on the pose owner executor"
+        return response
+
+    service = auxiliary.create_service(
+        Trigger,
+        "/pose_source_owner_executor_service_test/read",
+        respond,
+    )
+    create_client = auxiliary.create_client
+    destroy_client = auxiliary.destroy_client
+
+    def tracked_create_client(*args: object, **kwargs: object) -> object:
+        client_operation_threads.append(("create", threading.get_ident()))
+        return create_client(*args, **kwargs)
+
+    def tracked_destroy_client(client: object) -> None:
+        client_operation_threads.append(("destroy", threading.get_ident()))
+        destroy_client(client)
+
+    auxiliary.create_client = tracked_create_client
+    auxiliary.destroy_client = tracked_destroy_client
+    executor.add_node(publisher)
+    executor.add_node(auxiliary)
+
+    client = publisher._simulation_client
+
+    def capture() -> None:
+        try:
+            replies.append(
+                client._call_service(
+                    "/pose_source_owner_executor_service_test/read",
+                    Trigger,
+                    Trigger.Request(),
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    spinner = threading.Thread(target=executor.spin, daemon=True)
+    worker = threading.Thread(target=capture, daemon=True)
+    try:
+        spinner.start()
+        deadline = time.monotonic() + 2.0
+        while not executor.is_spinning and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert executor.is_spinning
+        worker.start()
+        assert completed.wait(timeout=3.0)
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert len(replies) == 1 and replies[0].success
+        assert owner_threads
+        assert client_operation_threads == [("create", owner_threads[0])]
+
+        # The foreign lifecycle caller waits for close to run on the same
+        # executor thread; no ROS entity work happens on the poll worker.
+        client.close()
+        assert client_operation_threads == [
+            ("create", owner_threads[0]),
+            ("destroy", owner_threads[0]),
+        ]
+    finally:
+        client.cancel()
+        if worker.ident is not None:
+            worker.join(timeout=3.0)
+        assert not worker.is_alive()
+        if not client._closed:
+            client.close()
+        executor.shutdown(timeout_sec=2.0)
+        spinner.join(timeout=2.0)
+        assert not spinner.is_alive()
+        executor.remove_node(auxiliary)
+        executor.remove_node(publisher)
+        auxiliary.destroy_service(service)
+        auxiliary.destroy_node()
+        publisher.destroy_node()
         if context.ok():
             rclpy.shutdown(context=context)
 

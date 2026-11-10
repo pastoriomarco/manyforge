@@ -93,7 +93,7 @@ import { projectNodeStatuses, projectEdgeStatuses } from './programGraphStatuses
 import { valuePathParameter } from '../utils/valuePaths';
 import { CANVAS_COLORS, STATUS_COLORS } from '../styles/tokens';
 
-// UI6-I-VC D3: every node has the same fixed size (--mf-node-width/height).
+// Every node has the same fixed size (--mf-node-width/height).
 const NODE_WIDTH = 200;
 const NODE_BASE_HEIGHT = 70;
 const STAGE_PADDING = 48;

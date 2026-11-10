@@ -9,18 +9,19 @@ folder (absolute when the Draft has none). Tags come from the component-type
 catalog of the row's model family, for Program role compatibility; a family
 tagged ``tool`` is a tool, mounted on a robot's ``flange`` by an attachment row.
 
-Machines (CONTRACTS §16) come from their models instead (the description's
-``component_models``): one ``kind: machine`` entry per machine model, snake_case
-(BOUNDARY §5), after the others, with ready owner and member rows;
+Machines come from their models instead (the description's
+``component_models``): one ``kind: machine`` entry per machine model, snake_case,
+after the others, with ready owner and member rows;
 adding one posts the owner row plus one member row per member. Example rows of
 a machine (owner or member), and rows whose assembly reaches one, are not
 offered on their own.
 
-Sensors (``kind: sensor``, e.g. the point-cloud source) also come from their
-models in ``component_models``: one ordinary ``kind: sensor`` entry per model
-with a ready row under the model id's last segment (without ``topic`` and
-``source_frame_id``, which the Add panel asks for); a sensor has no lane, so its
-profile facts' ``lanes`` are empty.
+Lane-free adapter components, sensors (``kind: sensor``, e.g. the point-cloud
+source) and the AI assistant (``kind: assistant``), also come from their models
+in ``component_models``: one ordinary entry of the model's kind per model with
+a ready row under the model id's last segment (without a sensor's ``topic`` and
+``source_frame_id`` or the assistant's model and profile, which the Add panel
+asks for); they have no lane, so their profile facts' ``lanes`` are empty.
 
 Nothing here compiles or changes a Draft: the Add component Draft route adds
 the rows (and a tool's attachment row), and the Apply compiler checks them.
@@ -65,8 +66,13 @@ _RUNTIME_KINDS = {
     "pose_source": "pose_source",
     "ai_model": "ai_model",
     "sensor": "sensor",
+    "assistant": "assistant",
 }
-_KIND_ORDER = ("robot", "tool", "io_device", "pose_source", "ai_model", "sensor")
+_KIND_ORDER = (
+    "robot", "tool", "io_device", "pose_source", "ai_model", "sensor", "assistant",
+)
+# Model kinds of lane-free adapter components; each is its runtime_kind.
+_LANE_FREE_KINDS = ("sensor", "assistant")
 
 
 def _kind(row: dict[str, Any], tags: list[str]) -> str:
@@ -165,7 +171,7 @@ def _arm_row(
 def _machine_entries(
     sources: dict[str, Any], project_root: Path | None
 ) -> list[dict[str, Any]]:
-    """BOUNDARY §5 (amended): `{kind: machine, model_id, title, lanes[],
+    """`{kind: machine, model_id, title, lanes[],
     default_owner_id, owner_row, members: [{role, model_id, title, row}]}`.
     Rows are ready Deployment rows under the default ids (owner:
     `default_owner_id`, member: `<default_owner_id>_<role>`, inner references
@@ -218,28 +224,32 @@ def _machine_entries(
     return entries
 
 
-def _sensor_models(sources: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """(descriptor path, descriptor) of every `kind: sensor` component model."""
+def _lane_free_models(sources: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """(descriptor path, descriptor) of every lane-free component model
+    (`kind: sensor` or `kind: assistant`), sensors first."""
 
     models = []
     for path in sources.get("component_models", []):
         descriptor = _descriptor(path)
-        if descriptor.get("kind") == "sensor":
+        if descriptor.get("kind") in _LANE_FREE_KINDS:
             models.append((path, descriptor))
-    return sorted(models, key=lambda item: item[1]["id"])
+    return sorted(
+        models,
+        key=lambda item: (_LANE_FREE_KINDS.index(item[1]["kind"]), item[1]["id"]),
+    )
 
 
-def _sensor_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
-    """One ordinary catalog entry per sensor model: its ready row (default id
-    the model id's last segment) without the sensor's `topic` and
-    `source_frame_id`; a sensor has no lane."""
+def _lane_free_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
+    """One ordinary catalog entry per lane-free model: its ready row (default
+    id the model id's last segment, runtime_kind its kind) without the
+    runtime settings the Add panel asks for; it has no lane."""
 
     entries = []
-    for path, model in _sensor_models(sources):
+    for path, model in _lane_free_models(sources):
         component_id = model["id"].rsplit(".", 1)[-1]
         entries.append({
             "entryId": f"model/{model['id']}",
-            "kind": "sensor",
+            "kind": model["kind"],
             "componentId": component_id,
             "componentProfileId": model["id"],
             "modelFamilyId": None,
@@ -251,7 +261,9 @@ def _sensor_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
                 "component_id": component_id,
                 "component_profile_id": model["id"],
                 "target_settings": {},
-                "configuration": {"runtime_kind": "sensor", "runtime_configuration": {}},
+                "configuration": {
+                    "runtime_kind": model["kind"], "runtime_configuration": {},
+                },
             }],
         })
     return entries
@@ -371,8 +383,8 @@ def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
         if payload is not None:
             model_facts["payload"] = payload
         facts[model] = model_facts
-    # Sensor models have no model family, component type or lane.
-    for _path, descriptor in _sensor_models(sources):
+    # Lane-free models have no model family, component type or lane.
+    for _path, descriptor in _lane_free_models(sources):
         facts[descriptor["id"]] = {
             "lanes": [],
             "tags": [],
@@ -504,9 +516,9 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
         ),
     )
     sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
-    ordered += _sensor_entries(sources)
+    ordered += _lane_free_entries(sources)
     offered = {entry["componentProfileId"] for entry in ordered}
-    # BOUNDARY §5: one entry per machine model (owner plus member rows).
+    # One entry per machine model (owner plus member rows).
     ordered += _machine_entries(sources, destination)
     return {
         "schemaVersion": "manyforge.composer_component_catalog.v1",

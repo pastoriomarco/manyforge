@@ -94,8 +94,7 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
             "expected_scene_revision": None,
             "participants": [
                 {
-                    "component_role_id": command["component_role_id"],
-                    "target_role_id": command["target_role_id"],
+                    "target": command["target"],
                     "required_capability_id": target["operation_capability_id"],
                     "action_span": None,
                     "payload": _planning_motion(
@@ -109,7 +108,7 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
                         },
                     )
                     | {
-                        "base_frame_role_id": command["base_frame_role_id"],
+                        "base_frame": command["base_frame"],
                         "tcp_endpoint": {"kind": "current"},
                         "speed_profile": {
                             "velocity_scale": 1.0,

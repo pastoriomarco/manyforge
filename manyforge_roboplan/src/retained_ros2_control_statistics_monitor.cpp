@@ -8,13 +8,16 @@
 namespace manyforge::roboplan_backend {
 
 RetainedControllerStatisticsMonitor::RetainedControllerStatisticsMonitor(
-    RetainedControllerStatisticsConfig config, const core::IClock &clock,
+    RetainedControllerStatisticsConfig config,
+    std::shared_ptr<core::IClock> clock,
     Warning warning)
-    : config_(std::move(config)), clock_(clock), warning_(std::move(warning)),
+    : config_(std::move(config)), clock_(std::move(clock)),
+      warning_(std::move(warning)),
       min_name_(config_.controller_name + ".stats/periodicity/min"),
       sample_count_name_(config_.controller_name +
                          ".stats/periodicity/sample_count") {
-  if (config_.controller_manager.empty() || config_.controller_name.empty() ||
+  if (!clock_ || config_.controller_manager.empty() ||
+      config_.controller_name.empty() ||
       !std::isfinite(config_.controller_update_rate_hz) ||
       config_.controller_update_rate_hz <= 0.0 ||
       config_.warning_throttle_ns <= 0)
@@ -77,7 +80,7 @@ void RetainedControllerStatisticsMonitor::Observe(
 
 RetainedControllerStatisticsSnapshot
 RetainedControllerStatisticsMonitor::Read() const {
-  const auto now = clock_.now();
+  const auto now = clock_->now();
   std::lock_guard lock(mutex_);
   auto snapshot = snapshot_;
   if (last_receipt_ns_.has_value())
@@ -97,7 +100,7 @@ RetainedControllerStatisticsMonitor::Subscribe(
       rclcpp::QoS(10).best_effort(),
       [weak](const pal_statistics_msgs::msg::Statistics::ConstSharedPtr message) {
         if (const auto self = weak.lock())
-          self->Observe(*message, self->clock_.now());
+          self->Observe(*message, self->clock_->now());
       });
 }
 

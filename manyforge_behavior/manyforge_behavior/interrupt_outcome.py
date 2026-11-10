@@ -1,7 +1,7 @@
-"""Runner mapping of a typed interrupt result to a node result (P5, I5).
+"""Runner mapping of a typed interrupt result to a node result.
 
-The Kernel reports facts only (`io_rule_outcomes`, kernel-rule-result-wire01
-and the compact BB evidence of kernel-rule-result-wire02); the Runner maps them
+The Kernel reports facts only (`io_rule_outcomes` and the compact BB
+evidence); the Runner maps them
 for `motion.move_until_signal` / `motion.probe_search`:
 
 - a trip contained by the rule's entry stage (``terminal_cause:
@@ -10,14 +10,14 @@ for `motion.move_until_signal` / `motion.probe_search`:
   ``signal_trip``;
 - a trip contained by a later stage (``succeeded_escalated``) maps per
   ``on_signal`` only when that stage is at or before the rule's
-  ``success_through_stage_id`` in the robot's qualified Stop chain (contract
-  70; omitted = only the entry stage counts). That is the requested response:
-  success and no escalated-failure handling here (contract 69; the latch
+  ``success_through_stage_id`` in the robot's qualified Stop chain
+  (omitted = only the entry stage counts). That is the requested response:
+  success and no escalated-failure handling here (the latch
   decision is the Kernel's). A later stage is a Failure;
 - a natural completion without trip (``no_signal_trip``) maps per
-  ``on_no_signal`` (default = the existing spec 260 mapping: success for
+  ``on_no_signal`` (default = the existing mapping: success for
   move_until_signal, failure for probe_search) with ``no_signal_trip``;
-- a source loss is a Failure through normal failure handling (contract 46c);
+- a source loss is a Failure through normal failure handling;
 - an interrupted fault (``interrupted_fault``) is a Failure, never a trip
   success, even with trip evidence and a contained Stop;
 - a timeout, unknown or failed containment, a missing or malformed result
@@ -106,7 +106,7 @@ def _mapped(choice: str, outcome: str, message: str) -> InterruptNodeResult:
     return InterruptNodeResult(False, outcome, f"motion_{outcome}_mapped_failure", message)
 
 
-# Compact BB evidence (kernel-rule-result-wire02) ---------------------------
+# Compact BB evidence ------------------------------------------------------
 
 
 def _text(value: Any) -> str:
@@ -227,7 +227,7 @@ def _loss_blackboard(loss: Mapping[str, Any], registration: Mapping[str, Any]) -
     return f"BB source unavailable (last frame {last})"
 
 
-# Stop stage threshold (contract 70) ----------------------------------------
+# Stop stage threshold -----------------------------------------------------
 
 
 def contained_stages_from_stop_terminal(
@@ -387,7 +387,7 @@ def _within_success_threshold(
 
 def _rule_rows(operation: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The operation-scoped rule results of this operation: the node's own
-    rule (contract 63: a node rule references no Deployment policy, and
+    rule (a node rule references no Deployment policy, and
     global rules have activation scopes, never operation results)."""
 
     rows: list[Mapping[str, Any]] = []

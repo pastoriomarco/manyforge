@@ -2,10 +2,12 @@ import type { JsonValue } from './api';
 
 /**
  * What one Add component entry adds; a tool mounts on a robot's flange; a
- * machine is an owner with its members (CONTRACTS §16); a sensor (e.g. the
- * point-cloud source) is a `kind: sensor` model without a lane.
+ * machine is an owner with its members; a sensor (e.g. the
+ * point-cloud source) is a `kind: sensor` model without a lane; so is the
+ * AI assistant (`kind: assistant`, the AI tab's chat).
  */
-export type ComponentCatalogKind = 'machine' | 'robot' | 'tool' | 'io_device' | 'pose_source' | 'ai_model' | 'sensor';
+export type ComponentCatalogKind = 'machine' | 'robot' | 'tool' | 'io_device' | 'pose_source' | 'ai_model' | 'sensor'
+  | 'assistant';
 
 /**
  * A model's own payload (TOOLCTX), from its model asset: package data, not
@@ -64,7 +66,7 @@ export interface ComponentCatalogEntry {
   components: Array<Record<string, JsonValue>>;
 }
 
-/** One member slot of a machine model (CONTRACTS §16). */
+/** One member slot of a machine model. */
 export interface MachineCatalogMember {
   role: string;
   modelId: string;
@@ -74,7 +76,7 @@ export interface MachineCatalogMember {
 }
 
 /**
- * A machine model (`kind: machine`, MACHINES-BOUNDARY §5): adding it adds the
+ * A machine model (`kind: machine`): adding it adds the
  * owner and one member per slot, ids `<owner_id>_<role>`.
  */
 export interface MachineCatalogEntry {

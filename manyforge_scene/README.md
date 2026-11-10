@@ -56,10 +56,10 @@ same-process constructor from preflighting a WAL while last-close removes it.
 Constructor acquisition is bounded to ten seconds; Close/destruction waits for
 the gate so teardown cannot abandon a live SQLite handle merely because gate
 acquisition timed out. Concurrent teardown in one process and startup in
-another process is not qualified by this I4 foundation and requires the future
+another process is not qualified by this foundation and requires the future
 operational process-lifecycle owner plus forked replacement coverage.
 
-Not implemented in the current N5c checkpoint: component/passive-frame and
+Not implemented yet: component/passive-frame and
 carried-object activation, the complete execution-facing projection-lease
 path, sustained-history lifetime management, remote/ROS adapters, or robot
 effects. Native participants are reached only through the injected exact-

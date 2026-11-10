@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_roboplan VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_roboplan VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +16,7 @@ option(BUILD_TESTING "Build unit tests" ON)
 option(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME
   "Build the retained ros2_control/Isaac execution product" OFF)
 
-# I6 restores the selected native planning dependency as an ordinary product
+# Restore the selected native planning dependency as an ordinary product
 # target. Discover cmeel's prefix before resolving Pinocchio/RoboPlan so the
 # same pinned installation is used in test and non-test builds.
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -69,7 +69,7 @@ if(NOT TARGET manyforge_core)
   unset(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
 endif()
 
-# The I6 native projection boundary consumes the ManyForge-owned collision
+# The native projection boundary consumes the ManyForge-owned collision
 # model directly. Build it without its package-local integration suite here;
 # cumulative collision qualification remains owned by the dedicated collision
 # image/lane.
@@ -86,8 +86,8 @@ if(NOT TARGET manyforge_collision)
   unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
 endif()
 
-# The selected N3 host is a read-only consumer of I3 retained products and
-# I4's durable active-bundle publication. Embed those production libraries
+# The selected host is a read-only consumer of retained products and the
+# durable active-bundle publication. Embed those production libraries
 # without duplicating either package's independent test tree; the host does
 # not acquire compiler or Component Manager mutation authority.
 if(NOT TARGET manyforge_component_manager)
@@ -106,11 +106,11 @@ endif()
 if(NOT TARGET manyforge_component_manager OR
    NOT TARGET manyforge_deployment)
   message(FATAL_ERROR
-    "I6 native execution requires retained-product verification and the "
+    "Native execution requires retained-product verification and the "
     "active-bundle publication reader")
 endif()
 
-# I3 keeps only the bounded, file-only bridge required to qualify exact
+# Keep only the bounded, file-only bridge required to qualify exact
 # retained planning products against RoboPlan/Pinocchio. This target owns no
 # runtime scene truth, Kernel, execution backend, ROS node, or Python module.
 add_library(manyforge_roboplan_retained_consumer
@@ -200,7 +200,7 @@ target_link_libraries(manyforge_roboplan_execution_host_support
   PUBLIC manyforge_core
   PRIVATE Threads::Threads)
 
-# CONTRACTS §1: the ROS-free mapping of a ros2_control connection's
+# The ROS-free mapping of a ros2_control connection's
 # observations to the component state.
 add_library(manyforge_roboplan_ros2_control_component_state
   src/ros2_control_component_state.cpp)
@@ -210,7 +210,7 @@ target_include_directories(manyforge_roboplan_ros2_control_component_state PUBLI
 target_link_libraries(manyforge_roboplan_ros2_control_component_state
   PUBLIC manyforge_core)
 
-# Q69: ROS-free controller robot_description generation (model URDF in,
+# ROS-free controller robot_description generation (model URDF in,
 # URDF text out). Expat is the XML parser Deployment already links into every
 # host process; no other XML library is introduced.
 add_library(manyforge_roboplan_controller_robot_description
@@ -222,7 +222,7 @@ target_link_libraries(manyforge_roboplan_controller_robot_description
   PUBLIC manyforge_core
   PRIVATE EXPAT::EXPAT)
 
-# CONTRACTS §12: the vendor-free launch generator and the Mock lane's
+# The vendor-free launch generator and the Mock lane's
 # launch contribution.
 add_library(manyforge_roboplan_controller_launch_artifacts
   src/controller_launch_artifacts.cpp
@@ -235,7 +235,7 @@ target_link_libraries(manyforge_roboplan_controller_launch_artifacts
   PUBLIC manyforge_roboplan_controller_robot_description
   PRIVATE manyforge::content_identity)
 
-# Q78/§7.5: command and process ownership of the controller launches the
+# Command and process ownership of the controller launches the
 # execution host starts per component (ROS-free).
 add_library(manyforge_roboplan_controller_launch_process
   src/controller_launch_process.cpp
@@ -266,7 +266,7 @@ target_link_libraries(
 
 
 # The safety/fidelity algorithms were retained and qualified before the native
-# owner returned. I6 promotes the same implementations into the production
+# owner returned. The same implementations are promoted into the production
 # planning boundary; no duplicate test-only copy remains.
 add_library(manyforge_roboplan_planning_contracts STATIC
   src/cartesian_planning_contract.cpp
@@ -361,7 +361,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_ros_boolean_output_provider PUBLIC
     manyforge_core rclcpp::rclcpp ${std_srvs_TARGETS} ${control_msgs_TARGETS}
-    PRIVATE Threads::Threads)
+    PRIVATE Threads::Threads manyforge_ros2_control_execution)
   add_library(manyforge_ros_boolean_input_provider
     src/ros_boolean_input_provider.cpp
     src/ros_mapped_boolean_input_provider.cpp)
@@ -369,14 +369,17 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_ros_boolean_input_provider PUBLIC
-    manyforge_core rclcpp::rclcpp ${std_msgs_TARGETS} ${control_msgs_TARGETS})
+    manyforge_core rclcpp::rclcpp ${std_msgs_TARGETS} ${control_msgs_TARGETS}
+    PRIVATE manyforge_ros2_control_execution)
 
   find_package(pal_statistics_msgs REQUIRED)
   find_package(diagnostic_msgs REQUIRED)
+  target_link_libraries(manyforge_roboplan_execution_host PRIVATE
+    manyforge_ros2_control_execution ${pal_statistics_msgs_TARGETS})
   find_package(ament_cmake_core REQUIRED)
   find_package(ament_index_cpp REQUIRED)
   # The ros2_control lane runtime, the component adapter registry and the
-  # generic adapters (CONTRACTS §6). Vendor and lane families are separate
+  # generic adapters. Vendor and lane families are separate
   # libraries the registry loads; nothing here links them.
   add_library(manyforge_roboplan_ros2_control_runtime
     src/component_adapter_registry.cpp
@@ -393,6 +396,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
+  target_include_directories(manyforge_roboplan_ros2_control_runtime PRIVATE
+    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/include")
   target_link_libraries(manyforge_roboplan_ros2_control_runtime PUBLIC
     manyforge_geometric_contact_input_provider
     manyforge_mock_boolean_input_provider
@@ -414,7 +419,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_ros2_control_execution/lane"
     DESTINATION share/manyforge_ros2_control_execution)
 
-  # CONTRACTS §6: every adapter family is a shared library registered in the
+  # Every adapter family is a shared library registered in the
   # ament resource index `manyforge_component_adapters`. In this build tree
   # the index prefix is MANYFORGE_COMPONENT_ADAPTER_PREFIX (the execution
   # host's environment adds it to AMENT_PREFIX_PATH): family libraries are
@@ -438,7 +443,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   endfunction()
 
   # A model lane row's relative `controllers_file` resolves against the
-  # model folder in the `manyforge_example_models` share (CONTRACTS §12).
+  # model folder in the `manyforge_example_models` share.
   file(MAKE_DIRECTORY "${MANYFORGE_COMPONENT_ADAPTER_PREFIX}/share/manyforge_example_models")
   file(CREATE_LINK "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models"
     "${MANYFORGE_COMPONENT_ADAPTER_PREFIX}/share/manyforge_example_models/models" SYMBOLIC)
@@ -479,6 +484,21 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   manyforge_register_component_adapter_family(
     manyforge_pointcloud_adapter_family pointcloud)
 
+  # The assistant (a `kind: assistant` model); its host runs as the
+  # component's own process and owns the chat bridge.
+  add_library(manyforge_assistant_adapter_family SHARED
+    src/assistant_adapter_family.cpp
+    src/assistant_component_adapter.cpp
+    src/ros_assistant_host_link.cpp)
+  target_include_directories(manyforge_assistant_adapter_family PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(manyforge_assistant_adapter_family PRIVATE
+    manyforge_roboplan_ros2_control_runtime
+    rclcpp::rclcpp
+    ${std_msgs_TARGETS})
+  manyforge_register_component_adapter_family(
+    manyforge_assistant_adapter_family assistant)
+
   # The vendor and simulator adapter packages build their families against
   # the runtime above.
   foreach(_adapter_package manyforge_xarm_control manyforge_isaac_adapter)
@@ -492,6 +512,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_mock_adapter_family
     manyforge_simulation_adapter_family
     manyforge_pointcloud_adapter_family
+    manyforge_assistant_adapter_family
     manyforge_xarm_adapter_family
     manyforge_isaac_adapter_family)
 endif()
@@ -622,7 +643,7 @@ if(BUILD_TESTING)
     find_package(roboplan_example_models REQUIRED)
 
     if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
-      # Each test process runs in its own ROS domain (Fast DDS #6599, N16).
+      # Each test process runs in its own ROS domain (Fast DDS #6599).
       # ROS 2's run_rmw_isolated (the ament_cmake_ros isolation runner) holds
       # a free domain 1..101 for the process; LOCALHOST keeps test containers
       # on one Docker bridge apart. CMake 3.28 has no TEST_LAUNCHER;
@@ -754,7 +775,7 @@ if(BUILD_TESTING)
 
     if(NOT TARGET manyforge_collision)
       message(FATAL_ERROR
-        "I6 retained collision projection requires the authoritative "
+        "Retained collision projection requires the authoritative "
         "collision consumer target")
     endif()
 
@@ -817,6 +838,21 @@ if(BUILD_TESTING)
       manyforge_roboplan_controller_launch_process
       manyforge_roboplan_execution_host_support
       manyforge_core manyforge::content_identity GTest::gtest_main)
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+      target_sources(test_controller_launch_process PRIVATE
+        src/ros_host_composition.cpp src/execution_host_posix.cpp
+        src/execution_host_commands.cpp
+        src/product_backed_runtime_participant_resolver.cpp
+        src/sealed_program_execution_capture.cpp)
+      target_compile_definitions(test_controller_launch_process PRIVATE MANYFORGE_TEST_RETIRED_COMPOSITION)
+      target_include_directories(test_controller_launch_process PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
+      target_link_libraries(test_controller_launch_process PRIVATE
+        manyforge_roboplan_ros2_control_runtime manyforge_roboplan_retained_consumer
+        manyforge_core_sqlite_operation_journal manyforge_deployment manyforge_component_manager
+        manyforge::scene_value_codec SQLite::SQLite3 Threads::Threads)
+    endif()
 
     add_executable(test_cell_admission_command_codec
       test/test_cell_admission_command_codec.cpp)
@@ -909,35 +945,85 @@ if(BUILD_TESTING)
 
     add_executable(test_retained_backends
       test/test_retained_backends.cpp)
+    target_include_directories(test_retained_backends PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
+    target_compile_definitions(test_retained_backends PRIVATE
+      MANYFORGE_CORE_TEST_GOLDEN_DIR="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test/golden")
     target_link_libraries(test_retained_backends PRIVATE
       manyforge_roboplan_native_gripper
       manyforge_roboplan_execution_host
       GTest::gtest_main)
+    if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
+      target_link_libraries(test_retained_backends PRIVATE
+        manyforge_roboplan_ros2_control_runtime)
+    endif()
 
     if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
       add_executable(test_ros_boolean_output_provider
         test/test_ros_boolean_output_provider.cpp)
       target_link_libraries(test_ros_boolean_output_provider PRIVATE
-        manyforge_ros_boolean_output_provider GTest::gtest_main)
+        manyforge_ros_boolean_output_provider manyforge_ros2_control_execution GTest::gtest_main)
+
+      # Isolated OD55 timing build: only this binary instruments GPIO leaves.
+      add_executable(test_od55_gpio_leaf_timing
+        test/test_ros_boolean_output_provider.cpp src/ros_boolean_output_provider.cpp)
+      target_compile_definitions(test_od55_gpio_leaf_timing PRIVATE MANYFORGE_LEAF_TIMING)
+      target_include_directories(test_od55_gpio_leaf_timing PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(test_od55_gpio_leaf_timing PRIVATE
+        manyforge_core rclcpp::rclcpp ${std_srvs_TARGETS} ${control_msgs_TARGETS}
+        Threads::Threads manyforge_ros2_control_execution GTest::gtest_main)
+      add_test(NAME od55_gpio_leaf_recovery_cut
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+          $<TARGET_FILE:test_od55_gpio_leaf_timing>
+          --gtest_filter=RosBooleanOutputProviderTest.GpioRecoveryCopiesInflightAndFencesQueuedWrite)
+      set_tests_properties(od55_gpio_leaf_recovery_cut PROPERTIES TIMEOUT 30)
+      add_test(NAME od55_service_disable_during_send
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+          $<TARGET_FILE:test_od55_gpio_leaf_timing>
+          --gtest_filter=RosBooleanOutputProviderTest.ServiceDisableDoesNotWaitForAdmittedSend)
+      set_tests_properties(od55_service_disable_during_send PROPERTIES TIMEOUT 30)
+      add_test(NAME od55_service_leaf_deadline
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+          $<TARGET_FILE:test_od55_gpio_leaf_timing>
+          --gtest_filter=RosBooleanOutputProviderTest.ServiceLeafWaitPastDeadlineIsKnownUnsent)
+      set_tests_properties(od55_service_leaf_deadline PROPERTIES TIMEOUT 30)
+      add_test(NAME od55_gpio_leaf_timing
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+          $<TARGET_FILE:test_od55_gpio_leaf_timing>
+          --gtest_filter=RosBooleanOutputProviderTest.GpioLeafTimingConcurrentWriters)
+      set_tests_properties(od55_gpio_leaf_timing PROPERTIES TIMEOUT 120)
 
       add_executable(test_ros_boolean_input_provider
         test/test_ros_boolean_input_provider.cpp)
       target_link_libraries(test_ros_boolean_input_provider PRIVATE
-        manyforge_ros_boolean_input_provider GTest::gtest_main)
+        manyforge_ros_boolean_input_provider manyforge_ros2_control_execution GTest::gtest_main)
 
       add_executable(test_ros_mapped_boolean_input_provider
         test/test_ros_mapped_boolean_input_provider.cpp)
       target_link_libraries(test_ros_mapped_boolean_input_provider PRIVATE
-        manyforge_ros_boolean_input_provider GTest::gtest_main)
+        manyforge_ros_boolean_input_provider manyforge_ros2_control_execution GTest::gtest_main)
 
       add_executable(test_retained_ros2_control_backend_factory
         test/test_retained_ros2_control_backend_factory.cpp
-        test/test_retained_tool_context.cpp)
+        test/test_retained_tool_context.cpp
+        src/ros_host_composition.cpp
+        src/execution_host_posix.cpp
+        src/execution_host_commands.cpp
+        src/product_backed_runtime_participant_resolver.cpp
+        src/sealed_program_execution_capture.cpp)
       target_include_directories(test_retained_ros2_control_backend_factory PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
       target_link_libraries(test_retained_ros2_control_backend_factory PRIVATE
         manyforge_roboplan_ros2_control_runtime
-        manyforge_component_manager
+        manyforge_roboplan_execution_host_support
+        manyforge_roboplan_controller_launch_process
+        manyforge_roboplan_retained_consumer
+        manyforge_core_sqlite_operation_journal
+        manyforge_deployment manyforge_component_manager manyforge_core
+        manyforge::content_identity manyforge::scene_value_codec
+        SQLite::SQLite3 Threads::Threads
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_backend_factory)
 
@@ -966,8 +1052,43 @@ if(BUILD_TESTING)
 
       # Real addressed Kernel + the Core participant over the real JTC adapter
       # against an in-process trajectory controller (requires a ROS 2 runtime).
+      if(TARGET manyforge_ros2_control_leaf_timing_test_support)
+        # Isolated test only: use the instrumented adapter while retaining the
+        # real runtime handle, addressed Kernel, and SQLite journal fixture.
+        add_executable(test_retained_motion_leaf_timing
+          test/test_retained_motion_leaf_timing.cpp
+          src/ros_host_composition.cpp
+          src/execution_host_posix.cpp
+          src/execution_host_commands.cpp
+          src/product_backed_runtime_participant_resolver.cpp
+          src/sealed_program_execution_capture.cpp)
+        target_include_directories(test_retained_motion_leaf_timing PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
+        target_compile_definitions(test_retained_motion_leaf_timing PRIVATE
+          MANYFORGE_LEAF_TIMING
+          MANYFORGE_CORE_TEST_GOLDEN_DIR="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test/golden")
+        target_link_libraries(test_retained_motion_leaf_timing PRIVATE
+          manyforge_ros2_control_leaf_timing_test_support
+          manyforge_roboplan_ros2_control_runtime
+          manyforge_roboplan_execution_host_support
+          manyforge_roboplan_controller_launch_process
+          manyforge_roboplan_retained_consumer
+          manyforge_deployment manyforge_component_manager manyforge_core
+          manyforge::content_identity manyforge::scene_value_codec
+          SQLite::SQLite3 Threads::Threads
+          manyforge_core_sqlite_operation_journal GTest::gtest_main)
+        add_test(NAME retained_motion_leaf_timing
+          COMMAND test_retained_motion_leaf_timing --gtest_filter=RetainedMotionLeafTiming.*)
+        set_tests_properties(retained_motion_leaf_timing PROPERTIES TIMEOUT 30)
+      endif()
+
       add_executable(test_ros2_control_kernel_stop_integration
         test/test_ros2_control_kernel_stop_integration.cpp)
+      target_include_directories(test_ros2_control_kernel_stop_integration PRIVATE
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include")
+      target_compile_definitions(test_ros2_control_kernel_stop_integration PRIVATE
+        MANYFORGE_CORE_TEST_GOLDEN_DIR="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test/golden")
       target_link_libraries(test_ros2_control_kernel_stop_integration PRIVATE
         manyforge_roboplan_ros2_control_runtime
         manyforge_roboplan_execution_host_support
@@ -1005,6 +1126,19 @@ if(BUILD_TESTING)
       gtest_discover_tests(test_ros_simulation_control
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+      add_executable(test_ros_adapter_entity_owner
+        test/test_ros_adapter_entity_owner.cpp
+        src/ros_simulation_control.cpp
+        src/ros_pointcloud_bridge_link.cpp
+        src/ros_assistant_host_link.cpp)
+      target_include_directories(test_ros_adapter_entity_owner PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+      target_link_libraries(test_ros_adapter_entity_owner PRIVATE
+        manyforge_roboplan_ros2_control_runtime rclcpp::rclcpp
+        ${simulation_interfaces_TARGETS} ${std_msgs_TARGETS} GTest::gtest_main)
+      gtest_discover_tests(test_ros_adapter_entity_owner
+        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
       add_executable(test_pointcloud_source_adapter
         test/test_pointcloud_source_adapter.cpp
         src/pointcloud_source_adapter.cpp)
@@ -1013,6 +1147,16 @@ if(BUILD_TESTING)
       target_link_libraries(test_pointcloud_source_adapter PRIVATE
         manyforge_core manyforge::content_identity GTest::gtest_main)
       gtest_discover_tests(test_pointcloud_source_adapter
+        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+      add_executable(test_assistant_component_adapter
+        test/test_assistant_component_adapter.cpp
+        src/assistant_component_adapter.cpp)
+      target_include_directories(test_assistant_component_adapter PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+      target_link_libraries(test_assistant_component_adapter PRIVATE
+        manyforge_core manyforge::content_identity GTest::gtest_main)
+      gtest_discover_tests(test_assistant_component_adapter
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
       # The registry loads the real Mock and simulation_interfaces family
@@ -1050,11 +1194,11 @@ if(BUILD_TESTING)
       target_link_libraries(test_retained_cell_runtime PRIVATE
         manyforge_roboplan_ros2_control_runtime)
       target_compile_definitions(test_retained_cell_runtime PRIVATE
-        MANYFORGE_A1_ROS_GRIPPER_CELL_TEST=1)
+        MANYFORGE_ROS_GRIPPER_CELL_TEST=1)
     endif()
 
-    # Measured geometry of the retained robots, over the prepared UI6-I cell
-    # package (`manyforge_ui6i_cell_bootstrap`, where Deployment tests exist).
+    # Measured geometry of the retained robots, over the prepared dual-robot cell
+    # package (`manyforge_dual_robot_cell_bootstrap`, where Deployment tests exist).
     add_executable(test_retained_measured_robot_geometry
       test/test_retained_measured_robot_geometry.cpp)
     target_include_directories(test_retained_measured_robot_geometry PRIVATE
@@ -1063,9 +1207,9 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/src"
       "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
       "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
-    if(TARGET manyforge_ui6i_cell_bootstrap)
+    if(TARGET manyforge_dual_robot_cell_bootstrap)
       add_dependencies(test_retained_measured_robot_geometry
-        manyforge_ui6i_cell_bootstrap)
+        manyforge_dual_robot_cell_bootstrap)
     endif()
     # The maintained Lite6 Scenario is materialized through the normal
     # activation path (robot and mounted tool as separate components).
@@ -1110,7 +1254,7 @@ if(BUILD_TESTING)
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
       target_link_libraries(test_host_io_output_channels PRIVATE
         manyforge_core manyforge_mock_boolean_output_provider
-        manyforge_ros_boolean_output_provider manyforge_deployment
+        manyforge_ros_boolean_output_provider manyforge_ros2_control_execution manyforge_deployment
         manyforge_roboplan_controller_launch_artifacts
         manyforge_deployment_canonical_package_generator GTest::gtest_main)
       gtest_discover_tests(test_host_io_output_channels
@@ -1119,6 +1263,7 @@ if(BUILD_TESTING)
       add_executable(test_host_io_provider_installation
         test/test_host_io_provider_installation.cpp
         test/test_host_composition_members.cpp
+        test/test_retired_composition.cpp
         test/test_applied_program_blackboard_context.cpp
         test/test_applied_global_io_rule_installation.cpp
         test/test_global_rule_event_responses.cpp
@@ -1141,6 +1286,7 @@ if(BUILD_TESTING)
       target_include_directories(test_host_io_provider_installation PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test"
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include"
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
       get_target_property(_MANYFORGE_PROGRAM_CAPTURE_BINARY_DIR
         manyforge_prepare_activation BINARY_DIR)
@@ -1154,6 +1300,7 @@ if(BUILD_TESTING)
         manyforge_deployment_program_io_condition_compiler
         manyforge_deployment_canonical_package_generator
         manyforge_deployment manyforge_component_manager manyforge_core
+        manyforge_core_sqlite_operation_journal
         manyforge::content_identity manyforge::scene_value_codec
         SQLite::SQLite3 Threads::Threads GTest::gtest_main)
       add_dependencies(test_host_io_provider_installation
@@ -1245,7 +1392,7 @@ if(BUILD_TESTING)
       Threads::Threads
       GTest::gtest_main)
 
-    # I3 consumer-equivalence integration: embed the production deployment
+    # Consumer-equivalence integration: embed the production deployment
     # compiler without its package-local tests, generate the ordinary sealed
     # canonical-empty package and a prepared non-empty Lite6 source fixture,
     # then point-read exact retained planning inputs into real RoboPlan
@@ -1267,7 +1414,7 @@ if(BUILD_TESTING)
        NOT TARGET manyforge_deployment_admission OR
        NOT TARGET manyforge_generate_canonical_empty_package)
       message(FATAL_ERROR
-        "I3 retained-product consumer qualification requires the "
+        "Retained-product consumer qualification requires the "
         "compiler, focused admission library, and canonical-empty package "
         "generator")
     endif()
@@ -1300,13 +1447,13 @@ if(BUILD_TESTING)
 
     if(NOT Python3_Interpreter_FOUND)
       message(FATAL_ERROR
-        "I3 non-empty RoboPlan consumer qualification requires Python")
+        "Non-empty RoboPlan consumer qualification requires Python")
     endif()
     find_program(_MANYFORGE_URDFDOM_CHECK_URDF_EXECUTABLE
       NAMES check_urdf)
     if(NOT _MANYFORGE_URDFDOM_CHECK_URDF_EXECUTABLE)
       message(FATAL_ERROR
-        "I3 independent retained-model qualification requires urdfdom check_urdf")
+        "Independent retained-model qualification requires urdfdom check_urdf")
     endif()
     set(_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/lite6_lite_gripper")
@@ -1357,7 +1504,7 @@ if(BUILD_TESTING)
       "package://manyforge_example_models/models/lite6_lite_gripper/"
       _MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT
       _MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS)
-    # The split Lite6 arm and gripper (M6 tool split), beside the combined
+    # The split Lite6 arm and gripper (tool split), beside the combined
     # root: the maintained activation fixture prepares each model component.
     foreach(_lite6_split_asset lite6 lite_gripper)
       _manyforge_prepare_roboplan_model_fixture(
@@ -1376,7 +1523,6 @@ if(BUILD_TESTING)
     list(APPEND _MANYFORGE_LITE6_MAINTAINED_FIXTURE_INPUTS
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_lite6_pick_and_place.scenario/deployment.yaml"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_lite6_pick_and_place.scenario/program.yaml"
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_lite6_pick_and_place.scenario/assignment.yaml"
       ${_MANYFORGE_ROBOPLAN_LITE6_SPLIT_RESOURCE_INPUTS})
 
     set(_MANYFORGE_ROBOPLAN_IMPORT_VIEW_TOOL
@@ -1494,8 +1640,8 @@ if(BUILD_TESTING)
       generate_lite6_retained_consumer_product
       DEPENDS "${_MANYFORGE_LITE6_RETAINED_CONSUMER_MANIFEST}")
 
-    # N3 process qualification needs one ordinary retained bundle, the exact
-    # compiled Program Binding selected for it, and I4's durable active
+    # Process qualification needs one ordinary retained bundle, the exact
+    # compiled Program Binding selected for it, and the durable active
     # publication. The generator remains test-only; the production host can
     # consume any independently produced package with the same contracts.
     add_executable(generate_lite6_native_execution_fixture_tool
@@ -1522,55 +1668,55 @@ if(BUILD_TESTING)
       manyforge_component_manager
       manyforge_core)
 
-    set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT
+    set(_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_execution_fixture")
-    set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST
-      "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
+    set(_MANYFORGE_NATIVE_EXECUTION_FIXTURE_MANIFEST
+      "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}/manifest.json")
     add_custom_command(
-      OUTPUT "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
+      OUTPUT "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_MANIFEST}"
       COMMAND
         "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}"
       COMMAND
         "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}"
       COMMAND
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
         --output-root
-        "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+        "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}"
         --fixture-kind application-ros
       DEPENDS
         generate_lite6_native_execution_fixture_tool
         ${_MANYFORGE_LITE6_MAINTAINED_FIXTURE_INPUTS}
       VERBATIM)
     add_custom_target(generate_lite6_native_execution_fixture ALL
-      DEPENDS "${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
+      DEPENDS "${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_MANIFEST}")
     add_dependencies(test_managed_kernel_admission_gate
       generate_lite6_native_execution_fixture)
     target_compile_definitions(test_managed_kernel_admission_gate PRIVATE
-      MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT="${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}")
 
-    # M1 standalone Position source uses a genuine Robotiq-only retained model.
-    # Historical pneumatic CLI selections remain separate R5 fixture inputs.
+    # The standalone Position source uses a genuine Robotiq-only retained model.
+    # Historical pneumatic CLI selections remain separate fixture inputs.
     if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     # Retain native-named output paths used by the owning process test.
-    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT
+    set(_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_gripper_only_fixture")
-    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST
-      "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}/manifest.json")
+    set(_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST
+      "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}/manifest.json")
     add_custom_command(
-      OUTPUT "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}"
+      OUTPUT "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}"
       COMMAND
         "${CMAKE_COMMAND}" -E rm -rf
-        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+        "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
       COMMAND
         "${CMAKE_COMMAND}" -E make_directory
-        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+        "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
       COMMAND
         "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
-        --output-root "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+        --output-root "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
         --fixture-kind gripper-only-robotiq-position
       DEPENDS
         generate_lite6_native_execution_fixture_tool
@@ -1581,7 +1727,7 @@ if(BUILD_TESTING)
         ${_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_INPUTS}
       VERBATIM)
     add_custom_target(generate_lite6_native_gripper_only_fixture ALL
-      DEPENDS "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}")
+      DEPENDS "${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}")
 
     endif()
 
@@ -1612,7 +1758,6 @@ if(BUILD_TESTING)
         generate_lite6_native_execution_fixture_tool
         "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_ur5_pick_and_place.scenario/deployment.yaml"
         "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_ur5_pick_and_place.scenario/program.yaml"
-        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/examples/mock_ur5_pick_and_place.scenario/assignment.yaml"
         "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.urdf"
         "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/model.srdf"
         "${_MANYFORGE_UR5_ARM_ONLY_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
@@ -1721,8 +1866,8 @@ if(BUILD_TESTING)
     target_compile_definitions(
       test_retained_execution_host_unit_adapter PRIVATE
       MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT="${_MANYFORGE_UR5_ARM_ONLY_FIXTURE_ROOT}"
-      MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT="${_MANYFORGE_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT="${_MANYFORGE_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT="${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_ros2_control_execution_host_pick_place_planning_fixture>"
       MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_ros2_control_execution_host_projection_fixture>"
@@ -1833,7 +1978,7 @@ if(BUILD_TESTING)
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     if(TARGET test_retained_execution_host_unit_adapter)
     # The execution host loads its adapter families from the build tree's
-    # ament prefix (CONTRACTS §6), as scripts/test-all.sh does.
+    # ament prefix, as scripts/test-all.sh does.
     gtest_discover_tests(test_retained_execution_host_unit_adapter
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
@@ -1869,7 +2014,7 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-    get_target_property(_MANYFORGE_UI6I_BOOTSTRAP_BINARY_DIR
+    get_target_property(_MANYFORGE_DUAL_ROBOT_BOOTSTRAP_BINARY_DIR
       manyforge_prepare_activation BINARY_DIR)
     gtest_discover_tests(test_retained_measured_robot_geometry
       PROPERTIES
@@ -1877,23 +2022,23 @@ if(BUILD_TESTING)
         # gtest_discover_tests splits a ';' list into separate properties, so
         # the second variable goes through its own single-item property.
         ENVIRONMENT_MODIFICATION
-          "MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT=set:${_MANYFORGE_UI6I_BOOTSTRAP_BINARY_DIR}/ui6i-dual-scenario-fixture/retained-package"
+          "MANYFORGE_DUAL_ROBOT_CELL_BOOTSTRAP_ROOT=set:${_MANYFORGE_DUAL_ROBOT_BOOTSTRAP_BINARY_DIR}/dual-robot-scenario-fixture/retained-package"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-        FIXTURES_REQUIRED Ui6iCellBootstrapPackage)
-    # The Deployment package's UI6-I bootstrap target isn't part of this
+        FIXTURES_REQUIRED DualRobotCellBootstrapPackage)
+    # The Deployment package's dual-robot cell bootstrap target isn't part of this
     # build; produce the same prepared package as this test's fixture.
-    add_test(NAME Ui6iCellBootstrapPackage
+    add_test(NAME DualRobotCellBootstrapPackage
       COMMAND "${CMAKE_COMMAND}" -E env
         "PYTHONPATH=${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_behavior:${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
         "${Python3_EXECUTABLE}"
         "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test/produce_activation_package.py"
         --tool "$<TARGET_FILE:manyforge_prepare_activation>"
         --workspace "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
-        --package-root "${_MANYFORGE_UI6I_BOOTSTRAP_BINARY_DIR}/ui6i-dual-scenario-fixture/retained-package"
+        --package-root "${_MANYFORGE_DUAL_ROBOT_BOOTSTRAP_BINARY_DIR}/dual-robot-scenario-fixture/retained-package"
         --publish-canonical-empty
-        --scenario "examples/mock_dual_arm_shared_group.scenario=ui6i_ur5e_lite6_wall_cell")
-    set_tests_properties(Ui6iCellBootstrapPackage PROPERTIES
-      FIXTURES_SETUP Ui6iCellBootstrapPackage TIMEOUT 300)
+        --scenario "examples/mock_dual_arm_shared_group.scenario=dual_robot_wall_cell")
+    set_tests_properties(DualRobotCellBootstrapPackage PROPERTIES
+      FIXTURES_SETUP DualRobotCellBootstrapPackage TIMEOUT 300)
     gtest_discover_tests(test_ros2_control_component_state
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"

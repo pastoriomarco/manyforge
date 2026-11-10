@@ -153,3 +153,40 @@ jobs:
             docker run --rm -v "${worktree}:/target" python:3.12-slim \
               bash -lc 'rm -rf /target' 2>/dev/null || rm -rf "${worktree}"
           fi
+
+  # OD-25 is staged for the cumulative gate; remove this explicit hold in a
+  # later release, after one manual run of this job on the local runner.
+  ros-backed-tsan:
+    name: ROS-backed ThreadSanitizer
+    if: ${{ false }}
+    runs-on: [self-hosted, manyforge-local]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run four ROS-backed binaries with ThreadSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${MANYFORGE_LOCAL_ROS_CI_IMAGE:-manyforge-ros-lyrical-full}"
+          image_id="$(docker image inspect "${image}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable ROS image identity for ${image}" >&2
+            exit 1
+          fi
+          results="${RUNNER_TEMP}/ros-tsan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${results}"
+          echo "Qualified image: ${image_id}"
+          docker run --rm --network none --security-opt seccomp=unconfined \
+            -e WORKSPACE=/workspace \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e MANYFORGE_ROS_TSAN_RESULTS_DIR=/results \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${results}:/results" -w /workspace "${image_id}" \
+            setarch "$(uname -m)" -R bash scripts/ci/run-ros-backed-tsan.sh
+      - name: Upload complete TSan reports and GTest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros-backed-tsan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ros-tsan-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error

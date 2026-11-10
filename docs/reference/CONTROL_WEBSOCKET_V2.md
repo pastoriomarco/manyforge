@@ -35,7 +35,7 @@ measured product profile, not per-session tuning knobs.
 
 The shell fact `held_run_draft_edit_allowed` (boolean) sits beside
 `authoring_admission`: true only while a Program run exists, nothing of it is
-moving and nothing can start (spec 450 §5.1.1). Headless derives it from the
+moving and nothing can start. Headless derives it from the
 same capture as `program_cycle` and `execution_control_state`; Composer
 applies the same rule to each Draft edit, and the browser only reads it.
 
@@ -65,7 +65,7 @@ host's component model can't be read, each of the four keys below is `null`
 
 | Shell key | Value | Same value over REST |
 |---|---|---|
-| `component_state` | list of every `ComponentState` (`component_id`, `owner_id`, `role`, `lifecycle`, `fault`, `reason`, `activity`, `streams`, `capabilities`, `action`, `last_action`, `details`, `observed_at_ns`), in cell order | `GET /api/components` |
+| `component_state` | list of every `ComponentState` (`component_id`, `owner_id`, `role`, `lifecycle`, `fault`, `reason`, `activity`, `streams`, `capabilities`, `action`, `last_action`, `details`, `endpoints` (only while enabled and serving), `observed_at_ns`), in cell order | `GET /api/components` |
 | `cell_latch` | `{latched, causes[]: {component_id, kind, fault?}}` | `GET /api/cell/latch` |
 | `io_signals` | list of every `SignalSample` (`signal_id`, `value`, `source`, `age_ns`, `fresh`, `controller_owned`) | `GET /api/io` |
 | `run_readiness` | `{can_execute, can_resume, motion_clear, blocked_reasons[]}` | `GET /api/program/readiness` |

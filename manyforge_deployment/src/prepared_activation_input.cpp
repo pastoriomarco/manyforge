@@ -3,6 +3,7 @@
 #include <manyforge_deployment/content_identity.hpp>
 
 #include "verified_retained_bundle_internal.hpp"
+#include "prepared_catalog_source_internal.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -343,7 +344,6 @@ PreparedActivationInput::PreparedActivationInput(
     std::optional<core::ProgramRevision> program_revision,
     std::optional<core::ProgramBindingId> program_binding_id,
     std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
-    core::ProgramRoleAssignmentDTO program_role_assignment,
     core::ContentDigest node_environment_digest, std::string assistant_mode,
     CanonicalValue normalized_root,
     VerifiedPreparedActivationClosure closure)
@@ -357,7 +357,6 @@ PreparedActivationInput::PreparedActivationInput(
       program_revision_(std::move(program_revision)),
       program_binding_id_(std::move(program_binding_id)),
       program_outcome_(std::move(program_outcome)),
-      program_role_assignment_(std::move(program_role_assignment)),
       node_environment_digest_(std::move(node_environment_digest)),
       assistant_mode_(std::move(assistant_mode)),
       normalized_root_(std::move(normalized_root)), closure_(std::move(closure)) {}
@@ -469,7 +468,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   const auto &payload = member(value, "activation_payload");
   require_exact_fields(payload,
                        {"catalog_artifacts", "program", "program_binding",
-                        "program_role_assignment", "raw_artifacts",
+                        "raw_artifacts",
                         "retained_bundle"},
                        "activation_payload");
   auto bundle = detail::RetainedBundleReloadAuthority::reload(
@@ -513,6 +512,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
     fail("prepared activation may omit model data only for an empty candidate "
          "with no executable Program");
   }
+  const detail::PreparedCatalogSource catalog_source(catalog_artifacts);
   std::shared_ptr<const ProgramBindingContract> program;
   if (no_program) {
     if (!member(payload, "program").is_null() || assistant_mode != "optional") {
@@ -520,7 +520,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
     }
   } else {
     program = verify_program_binding_contract(
-        canonical_json(member(payload, "program")), *bundle);
+        canonical_json(member(payload, "program")), *bundle, model_map, catalog_source);
     if (program == nullptr || program->value().program_id != *program_id ||
         program->value().program_revision != *program_revision) {
       fail("prepared activation Program differs from its summary");
@@ -533,7 +533,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       fail("prepared activation binding has no retained model map");
     }
     binding = reload_verified_program_binding(canonical_json(binding_value),
-                                              *bundle, *model_map);
+                                              *bundle, *model_map, catalog_source);
     if (binding == nullptr ||
         binding->program_binding_id().value() != *program_binding_id ||
         binding->value().program_id != program->value().program_id ||
@@ -557,18 +557,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
     fail("prepared activation non-executable Program outcome differs from "
          "its summary");
   }
-  core::ProgramRoleAssignmentDTO role_assignment;
-  try {
-    role_assignment =
-        parse_program_role_assignment(member(payload, "program_role_assignment"));
-  } catch (const ProgramBindingOutcomeError &error) {
-    fail(std::string("prepared activation role assignment is invalid: ") +
-         error.what());
-  }
-  if (no_program && (!role_assignment.component_roles.empty() ||
-                     !role_assignment.target_roles.empty())) {
-    fail("no_program must not carry role assignments");
-  }
   const bool assistant_available = bundle->value().assistant.has_value();
   if ((assistant_mode == "required" && !assistant_available) ||
       (assistant_mode == "forbidden" && assistant_available)) {
@@ -590,7 +578,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       program_binding_id.has_value()
           ? std::optional(core::ProgramBindingId(*program_binding_id))
           : std::nullopt,
-      std::move(program_outcome), std::move(role_assignment),
+      std::move(program_outcome),
       core::ContentDigest(node_environment_digest), assistant_mode, value,
       std::move(closure));
 }

@@ -9,11 +9,16 @@ import { CellComponentsCard, ComponentStatePanel } from './ComponentStatePanel';
 const api = vi.hoisted(() => ({
   action: vi.fn(),
   groupAction: vi.fn(),
+  recoverEnablePreflight: vi.fn(),
+  recoverEnable: vi.fn(),
 }));
 
 vi.mock('../api/client', async (original) => ({
   ...(await original<typeof import('../api/client')>()),
-  api: { components: { action: api.action, groupAction: api.groupAction } },
+  api: { components: {
+    action: api.action, groupAction: api.groupAction,
+    recoverEnablePreflight: api.recoverEnablePreflight, recoverEnable: api.recoverEnable,
+  } },
 }));
 
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
@@ -94,7 +99,7 @@ describe('ComponentStatePanel', () => {
   });
 });
 
-describe('ComponentStatePanel in a machine (CONTRACTS §16)', () => {
+describe('ComponentStatePanel in a machine', () => {
   const owner = state({
     component_id: 'lite6', lifecycle: 'fault', capabilities: ['power_off', 'reboot'],
     fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'recover',
@@ -135,7 +140,7 @@ describe('ComponentStatePanel in a machine (CONTRACTS §16)', () => {
   });
 });
 
-describe('ComponentActions power confirmation (CONTRACTS §16)', () => {
+describe('ComponentActions power confirmation', () => {
   const owner = state({ component_id: 'lite6', capabilities: ['power_off', 'reboot'] });
   const arm = state({ component_id: 'lite6_robot', owner_id: 'lite6', role: 'arm', lifecycle: 'enabled' });
   const io = state({ component_id: 'lite6_io', owner_id: 'lite6', role: 'controller_io' });
@@ -185,12 +190,14 @@ describe('ComponentActions power confirmation (CONTRACTS §16)', () => {
     });
   }
 
-  it('other actions run without a confirmation', async () => {
-    api.action.mockResolvedValueOnce({ action: 'recover' });
+  it('other actions run without a confirmation; a machine recovers as a group', async () => {
+    // A machine's Recover runs as a group so its unprepared members prepare after it.
+    api.groupAction.mockResolvedValueOnce({ action: 'recover' });
     const { root, button, dialogs } = await mounted();
     try {
       await act(() => button('Recover').onClick?.());
-      expect(api.action).toHaveBeenCalledExactlyOnceWith('lite6', 'recover');
+      expect(api.groupAction).toHaveBeenCalledExactlyOnceWith('recover', ['lite6']);
+      expect(api.action).not.toHaveBeenCalled();
       expect(dialogs()).toHaveLength(0);
     } finally { await act(() => root.unmount()); }
   });
@@ -300,5 +307,48 @@ describe('CellComponentsCard', () => {
     const html = renderToStaticMarkup(<CellComponentsCard enabled states={[state({ lifecycle: 'enabled' })]} />);
     expect(html).toMatch(/disabled=""[^>]*>Enable all<\/button>/);
     expect(renderToStaticMarkup(<CellComponentsCard enabled states={null} />)).toContain('Component states unavailable');
+  });
+});
+
+describe('Recover and enable (OD-54)', () => {
+  const stop = { code: 'estop' as const, message: 'E-stop pressed or not yet cleared', since_ns: 1, vendor_code: 'C2' };
+  const machine = state({ component_id: 'lite6', stop });
+  const arm = state({ owner_id: 'lite6', reason: { code: 'stopped_by_estop', message: '' } });
+
+  it('labels Enable "Recover and enable" while the machine reports an e-stop, and shows the e-stop', () => {
+    const armHtml = renderToStaticMarkup(<ComponentStatePanel enabled state={arm} states={[machine, arm]} />);
+    expect(armHtml).toContain('>Recover and enable</button>');
+    expect(armHtml).toContain('Stopped by e-stop');
+    const machineHtml = renderToStaticMarkup(<ComponentStatePanel enabled state={machine} states={[machine, arm]} />);
+    expect(machineHtml).toContain('<dd>E-stop</dd>');
+    expect(machineHtml).toContain('E-stop pressed or not yet cleared (C2)');
+    // Without a fault or e-stop it stays plain Enable.
+    expect(renderToStaticMarkup(<ComponentStatePanel enabled state={state()} />)).toContain('>Enable</button>');
+  });
+
+  it('asks with the causes first, then sends exactly what was shown', async () => {
+    api.recoverEnablePreflight.mockResolvedValue({ snapshot_id: 's1', components: [
+      { component_id: 'lite6', owner_id: null, stop, eligibility: 'recover',
+        cause: { code: 'estop', message: 'E-stop', vendor_code: 'C2', vendor_text: null, clearable: true,
+          operator_action: 'recover', concerns: ['lite6_robot'] } },
+      { component_id: 'lite6_robot', owner_id: 'lite6', cause: null, stop: null, eligibility: 'unknown' }] });
+    api.recoverEnable.mockResolvedValue({ action: 'enable' });
+    const { host, find, all } = reactPropsHost();
+    (window as unknown as { requestAnimationFrame: (callback: () => void) => number }).requestAnimationFrame = () => 1;
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    try {
+      await act(() => root.render(<ComponentStatePanel enabled state={arm} states={[machine, arm]} />));
+      await act(() => find((props) => props.type === 'button' && props.children === 'Recover and enable').onClick?.());
+      await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+      expect(api.action).not.toHaveBeenCalled();
+      expect(all((props) => props.id === 'component-lite6_robot-recover-enable-title')[0]?.children)
+        .toBe('Recover and enable lite6_robot?');
+      expect(all((props) => props.children === 'lite6: E-stop pressed or not yet cleared (C2)')).toHaveLength(1);
+      await act(() => find((props) => props.type === 'button' && props.className === 'transport-run'
+        && props.children === 'Recover and enable').onClick?.());
+      expect(api.recoverEnable).toHaveBeenCalledExactlyOnceWith('lite6_robot', expect.objectContaining({ snapshot_id: 's1' }));
+      expect(api.action).not.toHaveBeenCalled();
+    } finally { await act(() => root.unmount()); }
   });
 });

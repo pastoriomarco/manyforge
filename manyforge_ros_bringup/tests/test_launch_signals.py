@@ -26,6 +26,7 @@ LAUNCH_FILES = {
     "isaac_gripper.launch.py": "_launch_setup",
     "sim_plc.launch.py": "launch_setup",
     "pointcloud_source.launch.py": "launch_setup",
+    "assistant.launch.py": "launch_setup",
 }
 
 

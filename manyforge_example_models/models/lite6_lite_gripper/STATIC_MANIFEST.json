@@ -2,8 +2,8 @@
   "files": [
     {
       "path": "README.md",
-      "sha256": "e94f3acc70569b84e8aff52beed3818380538975526a6316d83114ba357dd23d",
-      "size_bytes": 3002
+      "sha256": "da5cd90ed11a618933bc553a1891b56eaac80e5c40fc004065b16b744a959fb0",
+      "size_bytes": 2607
     },
     {
       "path": "licenses/xarm_ros2.LICENSE",

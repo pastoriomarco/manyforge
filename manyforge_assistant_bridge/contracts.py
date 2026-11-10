@@ -57,6 +57,13 @@ class ComposerDraftContext(_ClosedModel):
     program_revision: Annotated[str | None, Field(alias="programRevision", pattern=_DIGEST)] = None
     program: dict[str, Any] | None
     diagnostics: Annotated[list[dict[str, Any]], Field(max_length=100_000)]
+    # The request's one reference validation: the candidate's selector facts
+    # (null when the validation was refused or no Program is loaded) and its
+    # typed reference diagnostics.
+    selector_facts: dict[str, Any] | None = Field(default=None, alias="selectorFacts")
+    reference_diagnostics: Annotated[
+        list[dict[str, Any]], Field(alias="referenceDiagnostics", max_length=100_000)
+    ] = []
     node_environment_digest: Annotated[
         str, Field(alias="nodeEnvironmentDigest", pattern=_DIGEST)
     ]

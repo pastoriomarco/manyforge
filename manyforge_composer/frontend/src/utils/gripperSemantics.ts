@@ -2,7 +2,7 @@ const TOKEN_LABELS: Record<string, string> = {
   position_commanded: 'Position commanded',
   pneumatic: 'Pneumatic',
   native_kinematic: 'Native kinematic',
-  ros_gripper_command: 'ROS GripperCommand',
+  ros_gripper_command: 'ROS ParallelGripperCommand',
   isaac_joint_state_effort: 'Isaac JointState effort',
   plc_gripper_request: 'PLC gripper request',
   native_backend: 'Native backend',

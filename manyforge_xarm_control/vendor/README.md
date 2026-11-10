@@ -27,7 +27,7 @@ Every addition is in `manyforge_settings.yaml` with its reason. In short:
 
 ## What the adapter does
 
-An xArm is one machine (`kind: machine`, e.g. `ufactory.lite6_machine`) with an owner and members: the arm, the controller I/O and the tool I/O (CONTRACTS §16). The owner holds what is machine-wide (the driver process, the connection, the controller's error register, power); members are refused while it isn't prepared.
+An xArm is one machine (`kind: machine`, e.g. `ufactory.lite6_machine`) with an owner and members: the arm, the controller I/O and the tool I/O. The owner holds what is machine-wide (the driver process, the connection, the controller's error register, power); members are refused while it isn't prepared.
 
 | Component | Action | xArm sequence |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ An xArm is one machine (`kind: machine`, e.g. `ufactory.lite6_machine`) with an 
 
 | Model | Machine (`components/machine/`) | Arm `component.yaml` | Vendor model | Notes |
 | --- | --- | --- | --- | --- |
-| UFACTORY Lite 6 | `ufactory.lite6_machine` | `manyforge_example_models/models/lite6` | `lite6` | measured on the robot (XARM_CONTROLLER_FACTS) |
+| UFACTORY Lite 6 | `ufactory.lite6_machine` | `manyforge_example_models/models/lite6` | `lite6` | measured on the robot |
 | UFACTORY 850 | `ufactory.uf850_machine` | `manyforge_example_models/models/uf850` | `uf850` | I/O list to verify on a robot |
 
 xArm 5/6/7 use the same adapter and settings; they need only their model folders (below).
@@ -78,6 +78,7 @@ lanes:
     adapter: xarm
     controller: xarm6_traj_controller   # the vendor controller file's arm controller
     arrival_tolerance_rad: 0.01
+    runtime_scale: supported            # the arm controller claims position only
     vendor_model: xarm6                 # xarm_controller/config/xarm6_controllers.yaml
     robot_type: xarm
     dof: 6

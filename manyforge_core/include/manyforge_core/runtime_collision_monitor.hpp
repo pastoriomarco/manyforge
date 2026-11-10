@@ -51,8 +51,11 @@ class RuntimeCollisionMonitor {
   RuntimeCollisionMonitor(RuntimeCollisionMonitor&&) = delete;
   RuntimeCollisionMonitor& operator=(RuntimeCollisionMonitor&&) = delete;
 
+  [[nodiscard]] bool in_callback() const noexcept;
   void start();
   void stop(bool drain_callbacks = false);
+  // Caller first closes and drains external start/stop admission.
+  [[nodiscard]] Result<void> detach();
 
   /// Install a best-effort evidence hook invoked once when a draining stop()
   /// misses its bound and starts waiting for the stuck drain (e.g. the
@@ -77,10 +80,13 @@ class RuntimeCollisionMonitor {
   ShouldContinueCallback should_continue_callback_;
 
   mutable std::mutex mutex_;
+  std::mutex detach_mutex_;
   std::condition_variable cv_;
   ScheduleHandle handle_{0};
   std::uint64_t generation_ = 0;
   bool active_ = false;
+  bool detached_ = false;
+  bool detach_completed_ = false;
   std::uint64_t callbacks_in_flight_ = 0;
 
   mutable std::mutex contact_policy_mutex_;

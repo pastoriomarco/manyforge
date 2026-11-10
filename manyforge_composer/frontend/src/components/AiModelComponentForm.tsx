@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-import { api, type AssistantProfileAliases } from '../api/client';
+import { api, type AssistantProfiles } from '../api/client';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue } from '../types/api';
 import { jsonObject, type JsonObject } from '../utils/poseSourceAuthoring';
@@ -185,7 +185,7 @@ function AssistantModelAliases({ controller, profileId, components }: {
   profileId: string;
   components: AiModelComponent[];
 }) {
-  const [profiles, setProfiles] = useState<AssistantProfileAliases | null>(null);
+  const [profiles, setProfiles] = useState<AssistantProfiles | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     const controllerSignal = new AbortController();
@@ -200,7 +200,7 @@ function AssistantModelAliases({ controller, profileId, components }: {
   }, []);
   const document = controller.workspace?.draft.document ?? null;
   const mapping = jsonObject(document?.assistant_model_components) ?? {};
-  const aliases = profiles?.[profileId] ?? [];
+  const aliases = profiles?.[profileId]?.modelEndpointAliases ?? [];
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const choose = async (alias: string, componentId: string) => {
     const next: JsonObject = { ...mapping };
@@ -250,7 +250,7 @@ function AssistantModelAliases({ controller, profileId, components }: {
  */
 export function AiModelComponentSection({ controller, effective = null, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
-  /** `GET /api/deployment/effective` (CONTRACTS §11), read once by the editor. */
+  /** `GET /api/deployment/effective`, read once by the editor. */
   effective?: EffectiveValues | null;
   scope?: FocusedEditorScope;
 }) {

@@ -5,7 +5,7 @@ The tool: every link below `robotiq_85_base_joint`, under a new root link `robot
 origin, now relative to `robotiq_2f_85_mount`. Mounted on a robot's `flange` with an
 identity pose, every link sits exactly where the combined model had it.
 
-The default TCP is `robotiq_2f_85_mount` (D3): it is today's UR5e `tcp`
+The default TCP is `robotiq_2f_85_mount`: it is today's UR5e `tcp`
 (`tool0`), so captured poses keep their meaning. The maintained standalone
 Robotiq 2F-85 source (`manyforge_deployment/resources/maintained/model_sources/robotiq_2f_85`)
 has the same links and joints but no mount: its root is

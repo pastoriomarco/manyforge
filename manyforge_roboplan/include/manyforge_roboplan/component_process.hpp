@@ -8,7 +8,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// CONTRACTS §6 component process: the host's process launcher for a
+/// Component process: the host's process launcher for a
 /// component that runs its own process (e.g. a sensor bridge), under the
 /// host's process supervisor like every other component process. ROS-free.
 

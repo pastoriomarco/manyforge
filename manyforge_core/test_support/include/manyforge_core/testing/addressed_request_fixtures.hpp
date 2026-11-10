@@ -84,11 +84,11 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
       std::nullopt,
       RetainedBundleId("bundle:test"),
       GraphRevision("graph:test"),
-      TargetRoleId("target-role:test"),
-      {ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:base"), model_id, model_revision, "base"},
-       ProgramFrameRoleBindingDTO{FrameRoleId("frame-role:tcp"), model_id, model_revision, "tcp"}},
-      {ProgramCollisionBodyRoleBindingDTO{
-          CollisionBodyRoleId("collision-body-role:tool"), model_id, model_revision, {"tcp"}}}};
+      {component_id, CommandTargetId("target:test")},
+      {ProgramFrameBindingDTO{{component_id, FrameRoleId("frame-role:base")}, model_id, model_revision, "base"},
+       ProgramFrameBindingDTO{{component_id, FrameRoleId("frame-role:tcp")}, model_id, model_revision, "tcp"}},
+      {ProgramCollisionBodyBindingDTO{
+          {component_id, CollisionBodyRoleId("collision-body-role:tool")}, model_id, model_revision, {"tcp"}}}};
   return binding;
 }
 

@@ -1,4 +1,4 @@
-"""Test double of the execution event subscription (contract §8.1) for pump
+"""Test double of the execution event subscription for pump
 fakes written as pages: ``paged_subscription(fake, ...)`` serves the stream
 from the fake's ``identity()`` (the owner, ready or typed idle) and its page
 function ``events(owner_epoch, after_sequence, limit=...)``, translated into

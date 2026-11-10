@@ -2,7 +2,7 @@
 
 namespace manyforge::core {
 
-// A2a-2: an immediate component step is admitted like any operation of its
+// An immediate component step is admitted like any operation of its
 // component, then the adapter's atomic step runs synchronously and outside
 // the Kernel locks. It is never resident, so no Stop, reset or recovery path
 // reaches it, and nothing is journaled or acknowledged.
@@ -64,7 +64,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
     std::lock_guard admission_lock(*admission_mutex_);
     std::unique_lock state_lock(state_mutex_, std::defer_lock);
     if (manual) {
-      // T-A2b: Robot control's own manual work (a jog) already holds this
+      // Robot control's own manual work (a jog) already holds this
       // component, so its origin is proven; the busy rule below then decides
       // (a step that does not hold the engine runs during the jog).
       const auto& component = registration.binding.value().resources;
@@ -85,14 +85,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
       }
     }
     state_lock.lock();
-    // R1: a cell latch refuses every node command and manual work.
+    // A cell latch refuses every node command and manual work.
     if (auto refusal = cell_latch_refusal_locked()) {
       return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
     }
-    // A2a-1 (decided): no "component enabled" or "motion admission open"
+    // No "component enabled" or "motion admission open"
     // check; the adapter's step handles a component that is not enabled.
     // A non-motion transaction, as an output: its node's own stop policy
-    // decides whether it is sent after a Program Stop (T-MQ15).
+    // decides whether it is sent after a Program Stop.
     if (const auto scope = validate_program_execution_scope_locked(intent, true, manual);
         !scope.ok()) {
       return Result<OperationAcceptedDTO>::Err(scope.error());
@@ -133,7 +133,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
   });
   const auto ran = step->run();
   if (!ran.ok()) {
-    // A2b: a failure after admission carries the accepted receipt, so the
+    // A failure after admission carries the accepted receipt, so the
     // caller tells it from a refusal before admission (nothing ran). The
     // step's own reason stays; nothing is resident or replayed.
     auto failed = ran.error();
@@ -145,7 +145,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
   return Result<OperationAcceptedDTO>::Ok(std::move(*accepted));
 }
 
-// Active TCP (M7, T-MQ15, T-A2): Set TCP is the first immediate step. The
+// Active TCP: Set TCP is the first immediate step. The
 // checkbox decides whether it holds the robot.
 Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_set_tcp(
     const OperationIntentDTO& intent) {

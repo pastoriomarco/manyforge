@@ -269,7 +269,7 @@ namespace {
 
 [[nodiscard]] std::string GoldenBytes() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   EXPECT_TRUE(stream.is_open()) << path;
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
@@ -734,7 +734,7 @@ TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIden
   context.participant_stop_profile->jerk_limits_enabled = true;
   const auto on = MakePreparedParticipantStopPlan(base, context, resources, defaults);
   ASSERT_TRUE(on.ok()) << on.error().message;
-  // Q36: only authored jerk is frozen; the default is derived per Stop phase.
+  // Only authored jerk is frozen; the default is derived per Stop phase.
   EXPECT_TRUE(on.value().participant_stop_profile->per_joint_max_jerk.empty());
   const auto encoded = EncodePreparedParticipantStopPlan(base, on.value(), resources, defaults,
                                                          MotionInterruptNodeCategory::kGeneric);
@@ -766,7 +766,7 @@ TEST(PreparedParticipantStopPlanCodec, DeploymentDefaultFreezesTheJerkChoiceButN
       *stage.validated_contract_parameters, Resources(), "default.profile");
   ASSERT_TRUE(decoded.ok());
   EXPECT_EQ(decoded.value().jerk_limits_enabled, true);
-  // Q36: no default jerk is frozen before dispatch; the planner derives it
+  // No default jerk is frozen before dispatch; the planner derives it
   // per Stop phase from the lane's lead-in (main's formula).
   EXPECT_TRUE(decoded.value().per_joint_max_jerk.empty());
   candidate.escalation_stages.front().default_contract_parameters->erase("jerk_limits_enabled");
@@ -801,7 +801,7 @@ TEST(PreparedParticipantStopPlanCodec, RejectsPurposeCoverageAndSubstitutionConf
 
   auto precision = PreparedContext();
   precision.node_category = MotionInterruptNodeCategory::kPrecisionContact;
-  // Q131: precision-contact is editor guidance, not a Core refusal.
+  // Precision-contact is editor guidance, not a Core refusal.
   EXPECT_TRUE(
       MakePreparedParticipantStopPlan(base, std::move(precision), resources, defaults).ok());
 }
@@ -878,7 +878,7 @@ TEST(ResolvedStopBasePlanCodec, ActuationKindWireIsClosedAndPositionKeepsHardFlo
 }
 
 TEST(ResolvedStopBasePlanCodec, ReadsExactLegacyIdentityAndWritesNewAuthoredListIdentity) {
-  const auto path = std::filesystem::path(__FILE__).parent_path() / "golden" /
+  const auto path = std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) /
                     "resolved_stop_base_plan.legacy.v1.json";
   std::ifstream input(path, std::ios::binary);
   ASSERT_TRUE(input.is_open());

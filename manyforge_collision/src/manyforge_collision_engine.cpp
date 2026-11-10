@@ -1554,6 +1554,7 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.thread_safety =
       core::CollisionEngineThreadSafetyClass::kSingleContextExclusive;
   capability_.deterministic_ordering = true;
+  capability_.diagnostic_reports_all_collision_pairs = true;
   capability_.runtime_query_memory_model =
       core::RuntimeCollisionQueryMemoryModel::kMeasuredBounded;
   capability_.runtime_query_max_joints = 256;
@@ -2339,8 +2340,9 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
       if (prepared_scene->runtime_pair_bindings.size() != pair_count ||
           active_collision_data_->collisionResults.size() != pair_count ||
           active_collision_data_->activeCollisionPairs.size() != pair_count ||
-          (distance_request_mode !=
-               core::CollisionDistanceRequestMode::kNone &&
+          ((distance_request_mode !=
+                core::CollisionDistanceRequestMode::kNone ||
+            query.clearance_margins) &&
            (active_collision_data_->distanceResults.size() != pair_count ||
             active_collision_data_->distanceRequests.size() != pair_count))) {
         finish_with_duration();
@@ -2405,7 +2407,10 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
     bool any_unknown_collision = false;
     // Per colliding logical pair with a margin: the smallest signed clearance
     // over its geometry pairs. Positive and below the margin: a clearance
-    // violation, not a contact.
+    // violation, not a contact. Coal's collision result does not carry this
+    // distance: its distance_lower_bound is the distance minus the security
+    // margin, and a mesh query stops at the first triangle within the margin.
+    // So the exact signed distance is computed for these pairs.
     std::map<core::CollisionPairId, double> margin_pair_clearance;
     for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
       if (!active_collision_data_->activeCollisionPairs[pair_index]) {
@@ -2428,8 +2433,14 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
       const double margin =
           active_collision_data_->collisionRequests[pair_index].security_margin;
       if (margin > 0.0) {
-        const double clearance = active_collision_data_->collisionResults[pair_index]
-                                     .distance_lower_bound;
+        auto& distance_request =
+            active_collision_data_->distanceRequests[pair_index];
+        reset_distance_warm_start(distance_request);
+        distance_request.enable_signed_distance = true;
+        const double clearance =
+            pinocchio::computeDistance(prepared_scene->collision_model,
+                                       *active_collision_data_, pair_index)
+                .min_distance;
         auto [entry, inserted] =
             margin_pair_clearance.emplace(binding.pair, clearance);
         if (!inserted) {

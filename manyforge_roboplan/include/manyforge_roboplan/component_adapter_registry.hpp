@@ -6,6 +6,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_roboplan/component_process.hpp>
+#include <manyforge_roboplan/adapter_transport_consumer.hpp>
 #include <manyforge_roboplan/launch_contribution.hpp>
 #include <manyforge_roboplan/tool_context_hook.hpp>
 #include <manyforge_core/types/io_signal.hpp>
@@ -21,18 +22,20 @@
 #include <string_view>
 #include <vector>
 
+namespace manyforge::ros2_control_execution { class Ros2TransportResources; }
+
 namespace manyforge::roboplan_backend {
 
 class RetainedRos2ControlRuntimeHandle;
 struct Ros2ControlLaneHooks;
 
-/// CONTRACTS §6 I/O update sink (the host's I/O ingress): one acquisition of
+/// I/O update sink (the host's I/O ingress): one acquisition of
 /// a component's I/O signals, stamped at receipt on the host clock.
 using ComponentIoUpdateSink = std::function<void(
     const std::string &component_id, const std::vector<core::IoSignalUpdateDTO> &updates,
     std::int64_t received_at_ns)>;
 
-/// CONTRACTS §6, §12, §16: what the execution host hands an adapter family to
+/// What the execution host hands an adapter family to
 /// make the adapter of one component (an owner, a member or an owner-less
 /// component alike). `row` is the model's `lanes.<lane>` row the Deployment's
 /// lane selected (scalar keys typed; an owner's is its machine model's row);
@@ -45,10 +48,10 @@ struct ComponentAdapterContext final {
   std::string lane;
   ModelLaneRow row;
   content_identity::CanonicalValue lane_row;
-  /// CONTRACTS §16: the member slot (`arm`, `controller_io`, `tool_io`, ...);
+  /// The member slot (`arm`, `controller_io`, `tool_io`, ...);
   /// empty for an owner and for an owner-less component.
   std::string role;
-  /// CONTRACTS §16: the owner's handle (`ComponentAdapters::owner_handle` of
+  /// The owner's handle (`ComponentAdapters::owner_handle` of
   /// the owner's factory call) for a member; null for an owner and for an
   /// owner-less component. The host never looks inside.
   std::shared_ptr<void> owner;
@@ -67,14 +70,14 @@ struct ComponentAdapterContext final {
   /// The lane's latest fresh measured joints in axis order (joint state
   /// broadcaster); empty without a ros2_control connection.
   std::function<std::optional<std::vector<double>>()> measured_joints;
-  /// CONTRACTS §6 driver-restart entry: restarts the component's driver
+  /// Driver-restart entry: restarts the component's driver
   /// process (its controller launch) on the same command; for a driver that
   /// doesn't reconnect by itself (e.g. after a controller reboot).
   std::function<core::Result<void>(std::stop_token)> restart_driver;
-  /// CONTRACTS §6 I/O update sink: where the family's I/O components hand
+  /// I/O update sink: where the family's I/O components hand
   /// their stream samples.
   ComponentIoUpdateSink io_updates;
-  /// Whether this call makes a machine's owner (CONTRACTS §16): `role` is
+  /// Whether this call makes a machine's owner: `role` is
   /// empty and its members get `ComponentAdapters::owner_handle`.
   bool machine_owner{};
   /// The component's compiled lifecycle command time
@@ -84,10 +87,11 @@ struct ComponentAdapterContext final {
   /// The cell's id (instance value of a component that reports to the cell,
   /// e.g. a sensor bridge).
   std::string cell_id;
-  /// CONTRACTS §6 component process: the host's launcher of the component's
+  /// Component process: the host's launcher of the component's
   /// own process (`component_process.hpp`); a family that runs one starts it
   /// here, never by itself.
   ComponentProcessLauncher start_process;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> ros_entity_owner{};
 };
 
 /// What one sample of a display joint source is good for, by the family's
@@ -104,7 +108,7 @@ enum class DisplayJointSampleUse : std::uint8_t {
   kLeads,
 };
 
-/// CONTRACTS §6 display joint source: a vendor driver's own joint topic,
+/// Display joint source: a vendor driver's own joint topic,
 /// which the arm's live view follows in every mode (also while the joint
 /// state broadcaster is off), and the family's check of one sample (in the
 /// arm's joint order).
@@ -115,8 +119,8 @@ struct DisplayJointSource final {
 };
 
 /// What one factory call returns: the component's adapter; for an owner, the
-/// opaque handle the host passes to its members' factory calls (CONTRACTS
-/// §16); the tool-context hook (CONTRACTS §6: TCP offset and payload, e.g.
+/// opaque handle the host passes to its members' factory calls;
+/// the tool-context hook (TCP offset and payload, e.g.
 /// xArm `ApplyToolContext`) and the display joint source of an arm, which the
 /// host sets on its ros2_control connection.
 struct ComponentAdapters final {
@@ -124,13 +128,14 @@ struct ComponentAdapters final {
   std::shared_ptr<void> owner_handle;
   std::optional<ToolContextHook> tool_context;
   std::optional<DisplayJointSource> display_joints;
+  std::shared_ptr<AdapterTransportConsumer> ros_transport_consumer{};
 };
 
-/// One adapter family as its library exports it (CONTRACTS §6 "What a family
-/// exports"): the family id (the model row's `adapter`), the factory of one
+/// One adapter family as its library exports it: the
+/// family id (the model row's `adapter`), the factory of one
 /// component's adapter (called once per component: owners before their
 /// members) and, for a family that runs on a ros2_control lane,
-/// its launch contribution (CONTRACTS §12; null otherwise). A lane family
+/// its launch contribution (null otherwise). A lane family
 /// with its own ros2_control execution configuration (Mock, Isaac) also
 /// exports `lane` (`ros2_control_lane_family.hpp`); without it a ros2_control
 /// component runs the generic configuration of a driver that reports its own
@@ -153,7 +158,7 @@ inline constexpr std::string_view kComponentAdapterFamilySymbol =
     "manyforge_component_adapter_family";
 using ComponentAdapterFamilyEntry = const ComponentAdapterFamily *(*)();
 
-/// Adapters register through the ament resource index (CONTRACTS §6): one
+/// Adapters register through the ament resource index: one
 /// resource per family under this type, named after the family, whose content
 /// is the adapter library's file name under the package prefix's `lib/`.
 inline constexpr std::string_view kComponentAdapterResourceType =

@@ -160,7 +160,7 @@ describe('execution history filtering', () => {
     expect(markup).not.toContain('run-end');
   });
 
-  it('shows a Program run\'s end reason (CONTRACTS §9) in its event detail', () => {
+  it('shows a Program run\'s end reason in its event detail', () => {
     expect(historyRunEnd({})).toBeNull();
     expect(historyRunEnd({ run_end: { end_reason: 'completed', details: {} } }))
       .toEqual({ label: 'Completed', tone: 'neutral', text: 'Completed' });

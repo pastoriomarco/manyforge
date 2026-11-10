@@ -184,7 +184,7 @@ core::Result<core::ToolContextDTO> RetainedToolContextSource::ComposePayload(
 core::Result<core::ToolContextDTO> RetainedToolContextSource::ComposeSnapshot(
     const std::optional<std::string> &tcp_frame,
     const core::LogicalSceneSnapshotDTO *scene) const {
-  // B-run-1: no TCP at all (the robot has no End-effector TCP, so its Active
+  // No TCP at all (the robot has no End-effector TCP, so its Active
   // TCP is none): the flange, a zero offset. A move never gets here without
   // a TCP (C-P2: it is refused before).
   const auto &selected =

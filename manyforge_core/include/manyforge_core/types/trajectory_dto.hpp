@@ -8,7 +8,7 @@
 
 namespace manyforge::core {
 
-/// A single waypoint in a trajectory (spec §3.5)
+/// A single waypoint in a trajectory
 struct TrajectoryWaypointDTO {
   double time_from_start_s;                  // >= 0, strictly monotonically increasing
   std::vector<double> positions_rad;         // joint positions
@@ -30,7 +30,7 @@ struct TrajectoryRuntimeScaleBoundsDTO {
   std::optional<double> nominal_time_multiplier{};
 };
 
-/// A planned trajectory (spec §3.5)
+/// A planned trajectory
 struct TrajectoryDTO {
   /// Exact ordered operation resources represented by `joint_names`.
   /// Trajectories are currently all-angular, but their identity is the

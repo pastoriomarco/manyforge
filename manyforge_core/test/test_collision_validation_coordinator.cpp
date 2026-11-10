@@ -1,4 +1,4 @@
-// Chunk 5 unit tests for CollisionValidationCoordinator: trajectory-wide
+// Unit tests for CollisionValidationCoordinator: trajectory-wide
 // validation, support-contact state across waypoints, fail-closed
 // preservation, and pose-source borrow/retry behavior.
 

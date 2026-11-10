@@ -1,4 +1,4 @@
-"""I6/N gate for behavior-node namespace output commits.
+"""Gate for behavior-node namespace output commits.
 
 The former writer is pinned at
 ``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` blob
@@ -27,5 +27,5 @@ class BlackboardOutputMixin:
     def _write_namespace_output(self, *_args: object, **_kwargs: object) -> None:
         raise BlackboardOutputBindingUnavailableError(
             f"{BLACKBOARD_OUTPUT_UNAVAILABLE_REASON_CODE}: bound node outputs "
-            "return at I6/N"
+            "are not available"
         )

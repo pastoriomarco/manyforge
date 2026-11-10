@@ -82,7 +82,7 @@ Array member_rows(const core::CellGraphDTO &graph,
   return selected;
 }
 
-/// CP9 pose sources and AI models have no device-configured lifecycle limit
+/// Pose sources and AI models have no device-configured lifecycle limit
 /// field: the default component lifecycle budget.
 constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = kDefaultLifecycleBudgetNs;
 
@@ -228,7 +228,7 @@ CanonicalValue IoProviderDomainRecord(const core::ControlDomainDTO &domain) {
 namespace {
 
 /// A model-free provider family with one provider domain per component:
-/// CP9 pose sources and AI models. Members are stream ids.
+/// Pose sources and AI models. Members are stream ids.
 struct ModelFreeDomainKind final {
   std::string_view capability_id;
   std::string_view manifest_id;
@@ -422,7 +422,7 @@ derive_domains(const core::CellGraphDTO &graph,
                                   profile != "geometric_contact";
       // A ROS I/O connection owns its actual component and lifecycle. A
       // separate provider domain inside a physical controller component would
-      // still couple both through the component's CCLC Enable/Disable plans.
+      // still couple both through the component's Enable/Disable actions.
       // The actual graph binding proves the conflict; a profile never selects
       // an arm/controller domain or implies a remote process restart.
       if (ros_connection &&

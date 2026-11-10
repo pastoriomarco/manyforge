@@ -129,21 +129,21 @@ struct ResolvedConditionInput final {
 
 class Lowerer final {
 public:
-  Lowerer(std::span<const core::ProgramTargetRoleBindingDTO> targets,
+  Lowerer(std::span<const core::ProgramSignalBindingDTO> bindings,
           std::span<const core::ProgramBlackboardKeyDeclarationDTO> keys,
           std::span<const RetainedIoSignalConfiguration> signals,
           bool deployment_operand = false,
           bool allow_waiting_program_keys = false)
-      : targets_(targets), keys_(keys), signals_(signals),
+      : bindings_(bindings), keys_(keys), signals_(signals),
         deployment_operand_(deployment_operand),
         allow_waiting_program_keys_(deployment_operand &&
                                     allow_waiting_program_keys) {}
 
-  std::vector<detail::ProgramIoSignalRoleReference>
-  collect_signal_roles(const CanonicalValue &value) {
-    collecting_signal_roles_ = true;
+  std::vector<detail::ProgramIoSignalReference>
+  collect_signal_references(const CanonicalValue &value) {
+    collecting_signal_references_ = true;
     (void)lower(value, 1U);
-    return {signal_roles_.begin(), signal_roles_.end()};
+    return {signal_references_.begin(), signal_references_.end()};
   }
 
   detail::CompiledProgramIoCondition compile(const CanonicalValue &value) {
@@ -171,7 +171,7 @@ public:
   }
 
 private:
-  // CONTRACTS §7 (plan V2-7): `<output name>.changed_outside` is the
+  // `<output name>.changed_outside` is the
   // core-held in-process bool of an output with read-back that isn't
   // controller-owned; the core derives its signal and source.
   ResolvedConditionInput changed_outside(const std::string &component,
@@ -198,7 +198,7 @@ private:
       fail("interrupt_condition_invalid", "Expected one operand selector");
     if (const auto *key = operand.find_object_member("key")) {
       const auto &name = text(*key);
-      if (collecting_signal_roles_)
+      if (collecting_signal_references_)
         return std::nullopt;
       if (deployment_operand_ &&
           (name == "interrupt_state" || name.starts_with("interrupt_state.")))
@@ -265,47 +265,34 @@ private:
       return ResolvedConditionInput{retained->descriptor.signal_id,
                                     core::IoConditionValueKind::kBoolean};
     }
-    fields(signal, {"target_role", "resource_role"});
-    const auto &target_name = text(member(signal, "target_role"));
-    const auto &resource_name = text(member(signal, "resource_role"));
-    if (collecting_signal_roles_) {
-      signal_roles_.emplace(core::TargetRoleId(target_name),
-                            core::ResourceRoleId(resource_name));
+    fields(signal, {"component_id", "signal_name"});
+    const core::ProgramSignalReferenceDTO reference{
+        core::ControllableComponentId(text(member(signal, "component_id"))),
+        text(member(signal, "signal_name"))};
+    if (collecting_signal_references_) {
+      signal_references_.insert(reference);
       return std::nullopt;
     }
-    const auto target =
-        std::find_if(targets_.begin(), targets_.end(), [&](const auto &row) {
-          return row.target_role_id.value() == target_name;
-        });
-    if (target == targets_.end())
-      fail("io_signal_unbound", "Condition target role has no exact binding");
-    const auto role =
-        std::find_if(target->signal_role_bindings.begin(),
-                     target->signal_role_bindings.end(), [&](const auto &row) {
-                       return row.resource_role_id.value() == resource_name;
-                     });
-    if (role == target->signal_role_bindings.end())
-      fail("io_signal_unbound",
-           "Condition resource role has no signal binding");
-    const auto retained =
-        std::find_if(signals_.begin(), signals_.end(), [&](const auto &row) {
-          return row.descriptor.signal_id.controllable_component_id ==
-                     target->controllable_component_id &&
-                 row.command_target_id == target->command_target_id &&
-                 row.resource_role_id == role->resource_role_id;
-        });
-    if (retained == signals_.end())
-      fail("io_signal_unbound",
-           "Condition signal has no exact retained descriptor");
-    const auto &descriptor = retained->descriptor;
+    const auto binding = std::find_if(bindings_.begin(), bindings_.end(),
+        [&](const auto &row) { return row.reference == reference; });
+    if (binding == bindings_.end() ||
+        std::count_if(bindings_.begin(), bindings_.end(),
+            [&](const auto &row) { return row.reference == reference; }) != 1)
+      fail("io_signal_unbound", "Condition signal has no exact unique binding");
+    const auto matches = FindProgramSignalMatches(signals_, reference);
+    if (matches.size() != 1U)
+      fail("io_signal_unbound", "Condition signal has no exact unique retained descriptor");
+    const auto &match = matches.front();
+    const auto &descriptor = match.descriptor;
     const auto digest = core::ComputeIoSignalDescriptorDigest(descriptor);
-    if (!digest.ok() || digest.value() != role->signal_descriptor_digest ||
-        descriptor.signal_id.name != role->signal_name ||
-        descriptor.value_type != role->value_type ||
-        descriptor.direction != role->direction ||
-        descriptor.transition_capability != role->transition_capability)
-      fail("io_signal_unbound",
-           "Condition signal binding differs from retained descriptor");
+    if (!digest.ok() || digest.value() != binding->signal_descriptor_digest ||
+        binding->target.component_id != reference.component_id ||
+        binding->target.command_target_id != match.retained->command_target_id ||
+        binding->runtime_unit_id != match.retained->runtime_unit_id ||
+        descriptor.value_type != binding->value_type ||
+        descriptor.direction != binding->direction ||
+        descriptor.transition_capability != binding->transition_capability)
+      fail("io_signal_unbound", "Condition signal binding differs from retained descriptor");
     if (descriptor.direction != core::IoSignalDirection::kInput)
       fail("io_signal_direction_mismatch",
            "Condition requires a declared input");
@@ -414,7 +401,7 @@ private:
     return definition_.nodes.size() - 1U;
   }
 
-  std::span<const core::ProgramTargetRoleBindingDTO> targets_;
+  std::span<const core::ProgramSignalBindingDTO> bindings_;
   std::span<const core::ProgramBlackboardKeyDeclarationDTO> keys_;
   std::span<const RetainedIoSignalConfiguration> signals_;
   core::IoConditionDefinitionDTO definition_;
@@ -425,8 +412,8 @@ private:
   bool deployment_operand_;
   bool allow_waiting_program_keys_;
   std::set<std::string> waiting_keys_;
-  bool collecting_signal_roles_{};
-  std::set<detail::ProgramIoSignalRoleReference> signal_roles_;
+  bool collecting_signal_references_{};
+  std::set<detail::ProgramIoSignalReference> signal_references_;
 };
 
 bool is_program_interrupt_node(std::string_view id) {
@@ -445,7 +432,7 @@ const CanonicalValue &literal_node_condition(const CanonicalValue &node) {
     for (const auto &[path, unused] : sources->as_object()) {
       (void)unused;
       for (const std::string_view literal :
-           {"interrupt_condition", "target_role", "activation_mode",
+           {"interrupt_condition", "target", "activation_mode",
             "stop_mode", "priority", "stop_entry_stage_id",
             "success_through_stage_id", "fallback_outcome"})
         if (path == literal || path.starts_with(std::string(literal) + ".") ||
@@ -467,15 +454,34 @@ core::ErrorDTO error(const ConditionError &failure) {
 
 } // namespace
 
+core::Result<void> detail::check_program_signal_comparison(
+    const core::IoSignalDescriptorDTO &descriptor, const CanonicalValue &op,
+    const CanonicalValue &value) {
+  try {
+    if (descriptor.value_type != core::IoSignalValueType::kBoolean)
+      fail("io_signal_type_mismatch", "Unsupported signal value type");
+    auto checked = core::CheckIoCondition(
+        {{{descriptor.signal_id, core::IoConditionValueKind::kBoolean}},
+         {core::IoConditionCompareDTO{comparison(op),
+              core::IoConditionInputReferenceDTO{0U}, literal(value)}}},
+        condition_limits());
+    if (!checked.ok())
+      fail("io_signal_type_mismatch", checked.error().message);
+    return core::Result<void>::Ok();
+  } catch (const ConditionError &failure) {
+    return core::Result<void>::Err(error(failure));
+  }
+}
+
 core::Result<detail::CompiledProgramIoCondition>
 detail::compile_authored_program_io_condition(
     const CanonicalValue &condition,
-    std::span<const core::ProgramTargetRoleBindingDTO> targets,
+    std::span<const core::ProgramSignalBindingDTO> bindings,
     std::span<const core::ProgramBlackboardKeyDeclarationDTO> keys,
     std::span<const RetainedIoSignalConfiguration> signals) {
   try {
     return core::Result<CompiledProgramIoCondition>::Ok(
-        Lowerer(targets, keys, signals).compile(condition));
+        Lowerer(bindings, keys, signals).compile(condition));
   } catch (const ConditionError &failure) {
     return core::Result<CompiledProgramIoCondition>::Err(error(failure));
   }
@@ -496,14 +502,14 @@ detail::compile_authored_deployment_io_condition(
   }
 }
 
-core::Result<std::vector<detail::ProgramIoSignalRoleReference>>
-detail::collect_program_node_io_signal_roles(const CanonicalValue &node) {
-  using Reply = core::Result<std::vector<ProgramIoSignalRoleReference>>;
+core::Result<std::vector<detail::ProgramIoSignalReference>>
+detail::collect_program_node_io_signal_references(const CanonicalValue &node) {
+  using Reply = core::Result<std::vector<ProgramIoSignalReference>>;
   try {
     if (!is_program_interrupt_node(text(member(node, "node_id"))))
       return Reply::Ok({});
     return Reply::Ok(
-        Lowerer({}, {}, {}).collect_signal_roles(literal_node_condition(node)));
+        Lowerer({}, {}, {}).collect_signal_references(literal_node_condition(node)));
   } catch (const ConditionError &failure) {
     return Reply::Err(error(failure));
   } catch (const std::exception &failure) {
@@ -539,7 +545,7 @@ compile_program_io_conditions(const ProgramBindingContract &program,
         const auto &parameters = member(node, "parameters");
         const auto &condition = literal_node_condition(node);
         auto compiled = detail::compile_authored_program_io_condition(
-            condition, bound.target_role_bindings,
+            condition, bound.signal_bindings,
             program.blackboard_key_declarations(), signals.value());
         if (!compiled.ok())
           throw ConditionError(compiled.error().details.at("reason"),
@@ -607,7 +613,9 @@ compile_program_io_conditions(const ProgramBindingContract &program,
              std::move(compiled.value().condition),
              std::move(compiled.value().required_signal_sources),
              core::ProgramNodeIoRuleSemanticsDTO{
-                 core::TargetRoleId(text(member(parameters, "target_role"))),
+                 core::ProgramTargetReferenceDTO{
+                     core::ControllableComponentId(text(member(member(parameters, "target"), "component_id"))),
+                     core::CommandTargetId(text(member(member(parameters, "target"), "command_target_id")))},
                  activation, stop,
                  node_id == "motion.probe_search"
                      ? core::MotionInterruptNodeCategory::kPrecisionContact

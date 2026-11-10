@@ -4,8 +4,8 @@
 The measurement and verdict logic remains useful qualification behavior: it
 reduces timestamped commanded/observed samples without owning Stop.  The old
 live probe also constructed and preempted trajectories directly, including a
-competing cancel/send strategy.  That command body is deleted; a future I9
-probe must observe the single I8 Kernel Stop path.
+competing cancel/send strategy.  That command body is deleted; a future
+probe must observe the single Kernel Stop path.
 """
 
 from __future__ import annotations
@@ -20,10 +20,9 @@ from typing import Any, Iterable, Sequence
 
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I8/P5 + I9/I"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: live Isaac controlled-stop qualification "
-    f"requires the {RESTORATION_GATE} restoration gates"
+    "is not available yet"
 )
 MAX_EVIDENCE_SAMPLES = 4096
 MAX_VECTOR_ITEMS = 4096

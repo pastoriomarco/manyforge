@@ -712,7 +712,7 @@ TEST(IoSignalSubsystemTest, SameValuedPeriodicReceiptRefreshesItsActualReceiptBu
 
 
 TEST(IoSignalSubsystemTest, SampleValueSourceOrFreshnessChangeRaisesTheEventSignalAgeAloneDoesNot) {
-  // CONTRACTS §7: the event stream pushes `state` when a sample's value,
+  // The event stream pushes `state` when a sample's value,
   // source or freshness changes, never for its age alone.
   FakeClock clock;
   auto created = IoSignalSubsystem::Create(catalog(), limits(), clock);
@@ -790,6 +790,7 @@ TEST(IoSignalSubsystemTest, ChangedOutsideExistsOnlyForReadBackOutputsNotControl
   auto& io = *created.value();
   const auto flag = io.ReadSignal(ChangedOutsideSignalId(signal_id("valve")));
   ASSERT_TRUE(flag.ok());
+  EXPECT_EQ(flag.value().descriptor, ChangedOutsideDescriptor(output_descriptor("valve")));
   EXPECT_EQ(flag.value().descriptor.direction, IoSignalDirection::kInput);
   EXPECT_EQ(flag.value().descriptor.liveness, std::optional(IoSignalLivenessMode::kInProcess));
   EXPECT_EQ(flag.value().availability, IoSignalAvailability::kFresh);
@@ -810,6 +811,28 @@ TEST(IoSignalSubsystemTest, ChangedOutsideExistsOnlyForReadBackOutputsNotControl
   // Each core-held signal and source counts against the explicit bounds.
   EXPECT_FALSE(IoSignalSubsystem::Create(catalog({output_descriptor("valve")}),
                                          {1, 4, 8, 8, 512, 1024}, clock).ok());
+}
+
+TEST(IoSignalSubsystemTest, OutputWithoutReadbackProjectsNotReadableNotLastWrite) {
+  FakeClock clock;
+  // Without read-back nothing shows the device's state: the projection is
+  // `not_readable` with no value, never the last accepted write.
+  auto without = IoSignalSubsystem::Create(
+      catalog({output_descriptor("valve", /*readback=*/false)}), limits(), clock);
+  ASSERT_TRUE(without.ok()) << without.error().message;
+  ASSERT_TRUE(without.value()->InstallSource(kSourceB, kIncarnation, std::nullopt).ok());
+  const auto unreadable = ToSignalSample(without.value()->ReadSignal(signal_id("valve")).value());
+  EXPECT_EQ(unreadable.source, IoSignalSampleSource::kNotReadable);
+  EXPECT_FALSE(unreadable.value.has_value());
+  EXPECT_FALSE(unreadable.fresh);
+  // With read-back an output shows the device's sample; before the first one
+  // it is pending (device, no value), not not_readable.
+  auto with = IoSignalSubsystem::Create(catalog({output_descriptor("valve")}), limits(), clock);
+  ASSERT_TRUE(with.ok()) << with.error().message;
+  ASSERT_TRUE(with.value()->InstallSource(kSourceB, kIncarnation, std::nullopt).ok());
+  const auto pending = ToSignalSample(with.value()->ReadSignal(signal_id("valve")).value());
+  EXPECT_EQ(pending.source, IoSignalSampleSource::kDevice);
+  EXPECT_FALSE(pending.value.has_value());
 }
 
 TEST(IoSignalSubsystemTest, ChangedOutsideSetsOnOutsideAndClearsOnWriteClearAndPrepare) {
@@ -857,9 +880,10 @@ TEST(IoSignalSubsystemTest, ChangedOutsideSetsOnOutsideAndClearsOnWriteClearAndP
   EXPECT_EQ(flag(), std::optional(true));
   ASSERT_TRUE(io.ClearComponentOutsideChanges(ControllableComponentId("component.io")).ok());
   EXPECT_EQ(flag(), std::optional(false));
-  // A device reading or a last-write echo never sets it.
+  // A device reading never sets it; an adapter cannot report `not_readable`,
+  // which the core derives from a declared output without read-back.
   ASSERT_TRUE(publish(7U, true, IoSignalSampleSource::kDevice).ok());
-  ASSERT_TRUE(publish(8U, true, IoSignalSampleSource::kLastWrite).ok());
+  EXPECT_FALSE(publish(8U, true, IoSignalSampleSource::kNotReadable).ok());
   EXPECT_EQ(flag(), std::optional(false));
 }
 

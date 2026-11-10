@@ -6,14 +6,12 @@ endif()
 file(REMOVE_RECURSE "${MANYFORGE_TEST_BINARY_DIR}")
 file(MAKE_DIRECTORY "${MANYFORGE_TEST_BINARY_DIR}")
 set(program "${MANYFORGE_TEST_BINARY_DIR}/program.yaml")
-file(WRITE "${program}" [=[api_version: manyforge.program.v2
+file(WRITE "${program}" [=[api_version: manyforge.program.v3
 program_id: revision_tool_test
 program_revision: sha256:0000000000000000000000000000000000000000000000000000000000000000
 program_profile: composable-cell-v1
 name: Revision tool test
-catalog: {api_version: manyforge.node_catalog.v2, content_version: 2.4.0}
-component_roles: {robot: {}}
-target_roles: {}
+catalog: {api_version: manyforge.node_catalog.v3, content_version: 2.4.0}
 contact_policies:
   - api_version: manyforge.contact_policy.v1
     policy_id: revision_tool_policy

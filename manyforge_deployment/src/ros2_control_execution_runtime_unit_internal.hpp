@@ -44,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90";
+        "b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -86,7 +86,7 @@ inline constexpr std::size_t kMaxRos2ControlExecutionRuntimeManifestBytes =
 inline constexpr std::size_t
     kMaxRos2ControlExecutionLaunchDescriptorBytes = 4U * 1024U;
 
-/// Q85: reject collisions on the exclusive topics of the known Isaac profiles.
+/// Reject collisions on the exclusive topics of the known Isaac profiles.
 /// Both authored compilation and retained activation use this one check. Only
 /// an arm (a component with a motion target limit) owns those topics.
 void require_no_exclusive_ros_controller_topic_collision(
@@ -98,20 +98,14 @@ void require_no_exclusive_ros_controller_topic_collision(
 [[nodiscard]] bool ros_gripper_output_mode_is_valid(
     std::string_view actuation_kind, std::string_view output_mode) noexcept;
 
-/// Present ROS-only timeout validation shared by early authored activation
-/// selection and strict Draft/retained decoding. Absence keeps its default.
-[[nodiscard]] bool ros_gripper_delivery_result_timeout_is_valid(
-    std::string_view actuation_kind, double timeout_s) noexcept;
-
-/// Strict active ROS thirteen-field row, with an optional pneumatic-only
-/// delivery_result_timeout_s field (fourteen fields when present). The archival
-/// neutral twelve-field decoder receives only its exact private data projection.
+/// Strict active ROS thirteen-field row. The archival neutral twelve-field
+/// decoder receives only its exact private data projection.
 [[nodiscard]] std::vector<
     ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>
 decode_ros2_control_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &rows);
 
-/// CP9: the strict `component_streams` rows of one ROS unit configuration,
+/// The strict `component_streams` rows of one ROS unit configuration,
 /// sorted by (component, stream). Exactly `measured_joints` for every
 /// controller-profile component plus `gripper_feedback` for every gripper-row
 /// component; `fault` + `auto` is refused. Shared by the pre-Draft row hook
@@ -127,11 +121,11 @@ decode_ros2_control_execution_component_streams(
 [[nodiscard]] std::optional<core::StopLeadInAnchor>
 decode_ros2_control_stop_lead_in_anchor(const std::optional<std::string> &value);
 
-/// M6b: a controller profile row's optional `controller_tcp_offset_sync`
+/// A controller profile row's optional `controller_tcp_offset_sync`
 /// (absent: on); a value that is not a boolean is refused.
 [[nodiscard]] bool decode_ros2_control_tcp_offset_sync(const core::JsonValueDTO *value);
 
-/// DX817: one source classifier for the already-qualified selected graph.
+/// One source classifier for the already-qualified selected graph.
 /// Absence preserves the historical physical/default Stop contract. A returned
 /// enum comes only from the exact strict ROS target row, never a policy token.
 [[nodiscard]] std::optional<core::GripperActuationKind>

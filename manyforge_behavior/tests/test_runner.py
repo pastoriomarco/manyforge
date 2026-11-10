@@ -19,7 +19,7 @@ class RecordingTransport:
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
     def identity(self) -> dict[str, Any]:
-        # execution_identity.v2: runtime identity only (H1a-IF.2).
+        # execution_identity.v2: runtime identity only.
         return {
             "ok": True,
             "identity": {
@@ -92,24 +92,18 @@ def _applied_binding() -> dict[str, Any]:
         "program_binding_id": "binding-1",
         "graph_revision": "sha256:" + "2" * 64,
         "retained_bundle_id": "sha256:" + "3" * 64,
-        "target_role_bindings": [
+        "target_bindings": [
             {
-                "target_role_id": "arm",
-                "component_role_id": "robot",
-                "controllable_component_id": "lite6_arm",
-                "command_target_id": "arm",
-                "robot_tcps": [{"entry": {"component_id": "mounted_tool",
-                                           "target_id": "gripper", "frame_role_id": "tip"},
+                "target": {"component_id": "lite6_arm", "command_target_id": "arm"},
+                "robot_tcps": [{"entry": {"target": {"component_id": "lite6_arm", "command_target_id": "arm"},
+                                           "frame": {"component_id": "mounted_tool", "frame_id": "tip"}},
                                 "end_effector": True}],
                 "capability_bindings": [
                     _capability("execution.trajectory.execute", None)
                 ],
             },
             {
-                "target_role_id": "gripper",
-                "component_role_id": "robot",
-                "controllable_component_id": "lite6_gripper",
-                "command_target_id": "gripper",
+                "target": {"component_id": "lite6_gripper", "command_target_id": "gripper"},
                 "capability_bindings": [
                     _capability(
                         "tool.gripper.command",
@@ -129,10 +123,10 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     accepted = runner.submit_joint_goal(
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
         request_id="request-1",
         program_run_id="run-1",
-        component_role_id="robot",
-        target_role_id="arm",
+        target={"component_id": "lite6_arm", "command_target_id": "arm"},
         node_instance_id="root/move[0]",
         node_attempt_id="run-1/move[0]/attempt-1",
         move_id="move-1",
@@ -147,12 +141,13 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
     assert request["program_binding_id"] == "binding-1"
     assert request["expected_retained_bundle_id"] == "sha256:" + "3" * 64
     participant = request["participants"][0]
-    assert participant["component_role_id"] == "robot"
-    assert participant["target_role_id"] == "arm"
+    assert participant["target"] == {"component_id": "lite6_arm", "command_target_id": "arm"}
+    assert participant["execution_scope"] == {
+        "node_instance_id": "root/move[0]", "node_attempt_id": "run-1/move[0]/attempt-1"
+    }
     assert participant["payload"]["tcp_endpoint"] == {
-        "kind": "entry", "entry": {
-            "component_id": "mounted_tool", "target_id": "gripper", "frame_role_id": "tip",
-        },
+        "kind": "entry", "target": {"component_id": "lite6_arm", "command_target_id": "arm"},
+        "frame": {"component_id": "mounted_tool", "frame_id": "tip"},
     }
     assert participant["payload"]["motion"] == {
         "kind": "joint_goal",
@@ -166,12 +161,12 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
 def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
     transport = RecordingTransport()
     binding = _applied_binding()
-    binding["target_role_bindings"][0]["robot_tcps"] = []
+    binding["target_bindings"][0]["robot_tcps"] = []
     runner = OrchestratorRunner(KernelClient(transport), binding)
     with pytest.raises(ValueError, match="no unique end-effector TCP"):
         runner.submit_joint_goal(
-            request_id="request-1", program_run_id="run-1", component_role_id="robot",
-            target_role_id="arm", node_instance_id="move", node_attempt_id="attempt",
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
+            request_id="request-1", program_run_id="run-1", target={"component_id": "lite6_arm", "command_target_id": "arm"}, node_instance_id="move", node_attempt_id="attempt",
             move_id="move-1", joint_names=("joint1",), positions_rad=(0.1,),
         )
     assert transport.submitted is None
@@ -192,8 +187,7 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
     accepted = runner.submit_gripper_position(
         request_id="request-gripper-1",
         program_run_id="run-1",
-        component_role_id="robot",
-        target_role_id="gripper",
+        target={"component_id": "lite6_gripper", "command_target_id": "gripper"},
         node_instance_id="root/gripper[0]",
         node_attempt_id="run-1/gripper[0]/attempt-1",
         position_kind="linear_m",
@@ -206,7 +200,10 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
     assert accepted["accepted"]["operation_id"] == "operation-1"
     assert transport.submitted is not None
     participant = transport.submitted["participants"][0]
-    assert participant["target_role_id"] == "gripper"
+    assert participant["target"] == {"component_id": "lite6_gripper", "command_target_id": "gripper"}
+    assert participant["execution_scope"] == {
+        "node_instance_id": "root/gripper[0]", "node_attempt_id": "run-1/gripper[0]/attempt-1"
+    }
     assert participant["required_capability_id"] == "tool.gripper.command"
     assert participant["payload"] == {
         "kind": "capability_command",
@@ -233,8 +230,7 @@ def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
     runner.submit_gripper_position(
         request_id="request-gripper-1",
         program_run_id="run-1",
-        component_role_id="robot",
-        target_role_id="gripper",
+        target={"component_id": "lite6_gripper", "command_target_id": "gripper"},
         node_instance_id="root/gripper[0]",
         node_attempt_id="run-1/gripper[0]/attempt-1",
         position_kind="linear_m",
@@ -306,10 +302,10 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
 
     with pytest.raises(KernelClientResponseError, match="incomplete"):
         runner.submit_joint_goal(
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
             request_id="request-1",
             program_run_id="run-1",
-            component_role_id="robot",
-            target_role_id="arm",
+            target={"component_id": "lite6_arm", "command_target_id": "arm"},
             node_instance_id="root/move[0]",
             node_attempt_id="run-1/move[0]/attempt-1",
             move_id="move-1",
@@ -336,11 +332,13 @@ def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
     # A role the applied Program does not bind to motion is refused.
     with pytest.raises(ValueError, match="not bound"):
         runner.submit_joint_goal(
-            component_role_id="robot", target_role_id="gripper", **arguments
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
+            target={"component_id": "lite6_gripper", "command_target_id": "gripper"}, **arguments
         )
     with pytest.raises(ValueError, match="not bound"):
         runner.submit_joint_goal(
-            component_role_id="other", target_role_id="arm", **arguments
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
+            target={"component_id": "other", "command_target_id": "arm"}, **arguments
         )
     assert transport.submitted is None
 
@@ -350,12 +348,14 @@ def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
     stale_runner = OrchestratorRunner(KernelClient(transport), stale)
     with pytest.raises(KernelClientResponseError, match="differs"):
         stale_runner.submit_joint_goal(
-            component_role_id="robot", target_role_id="arm", **arguments
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
+            target={"component_id": "lite6_arm", "command_target_id": "arm"}, **arguments
         )
     assert transport.submitted is None
 
     runner.submit_joint_goal(
-        component_role_id="robot", target_role_id="arm", **arguments
+        base_frame={"component_id": "lite6_arm", "frame_id": "base"},
+        target={"component_id": "lite6_arm", "command_target_id": "arm"}, **arguments
     )
     assert transport.submitted is not None
     assert transport.submitted["program_id"] == "program-1"

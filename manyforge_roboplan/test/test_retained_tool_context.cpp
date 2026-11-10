@@ -85,7 +85,7 @@ void ExpectNear(const std::array<double, 3> &actual, const std::array<double, 3>
     EXPECT_NEAR(actual[axis], expected[axis], 1e-12) << "axis " << axis;
 }
 
-// TOOLCTX: the default TCP through the mount, and the tool's own payload at
+// The default TCP through the mount, and the tool's own payload at
 // the mount, both in the flange frame.
 TEST(RetainedToolContext, DefaultTcpAndToolPayloadInTheFlangeFrame) {
   const RetainedToolContextSource source(CellUrdf(), Frames(), nullptr);
@@ -102,7 +102,7 @@ TEST(RetainedToolContext, DefaultTcpAndToolPayloadInTheFlangeFrame) {
   ExpectNear(context.value().payload_center_of_mass_m, {0.0, 0.02, 0.05});
 }
 
-// TOOLCTX: a TCP switch changes the TCP only; a moving frame is refused.
+// A TCP switch changes the TCP only; a moving frame is refused.
 TEST(RetainedToolContext, TcpSwitchChangesTheTcpAndAMovingFrameIsRefused) {
   const RetainedToolContextSource source(CellUrdf(), Frames(), nullptr);
   const auto tool_tcp = source.Compose(std::nullopt);
@@ -132,7 +132,7 @@ TEST(RetainedToolContext, PayloadCompositionDoesNotDependOnMovingTcp) {
   EXPECT_DOUBLE_EQ(payload.value().payload_mass_kg, 1.5);
 }
 
-// B-run-1: with no End-effector mark the robot has no TCP at all: its
+// With no End-effector mark the robot has no TCP at all: its
 // context is at the flange (a zero offset, the payload kept); an explicit
 // TCP still composes.
 TEST(RetainedToolContext, NoEndEffectorMarkIsTheFlangeAndAnExplicitTcpStillComposes) {
@@ -151,7 +151,7 @@ TEST(RetainedToolContext, NoEndEffectorMarkIsTheFlangeAndAnExplicitTcpStillCompo
   EXPECT_EQ(flange.value().tcp_pose_in_flange, core::Pose3DTO{});
 }
 
-// TOOLCTX: an attached object adds its mass at its attach pose; a detach
+// An attached object adds its mass at its attach pose; a detach
 // (the next scene without it) restores the tool's payload exactly.
 TEST(RetainedToolContext, AttachAddsTheObjectAtItsPoseAndDetachRemovesIt) {
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> scene;

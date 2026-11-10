@@ -224,7 +224,7 @@ details.dcard[open] > summary:first-child::before {
 
 /* Field rows: the label's text takes a third, the field two thirds. */
 /* :where keeps this rule's weight low, so .stacked and textarea rows win. */
-.dcard label:has(> :where(input:not([type='checkbox'], [type='radio'], [type='range']), select, textarea, .dunit, .program-value-field)) {
+.dcard label:has(> :where(input:not([type='checkbox'], [type='radio'], [type='range']), select, textarea, .dunit, .program-value-field, .program-fill-target)) {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
   align-items: center;

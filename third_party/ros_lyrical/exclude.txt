@@ -1,0 +1,9 @@
+# Repositories of the sync closure that are not built: only Fast DDS is built
+# as RMW, as in the apt base. rmw_implementation lists every Tier-1 RMW as a
+# build dependency; colcon treats the absent ones as external. Connext needs
+# the proprietary RTI SDK, Zenoh a Rust toolchain.
+cyclonedds
+iceoryx
+rmw_connextdds
+rmw_cyclonedds
+rmw_zenoh

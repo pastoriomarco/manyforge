@@ -963,6 +963,8 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
 }
 
 CanonicalValue plan_request_value(const PlanRequestDTO& r) {
+  if (r.collision_mode != PlannerCollisionMode::kEnforced || r.diagnostic_qualified_target)
+    fail("diagnostic_planning_not_preparable");
   validate_replacement_request(r);
   if (r.retained_collision_world || r.retained_collision_policy || r.retained_clearance_margins)
     fail("private_collision_handles_must_be_null");

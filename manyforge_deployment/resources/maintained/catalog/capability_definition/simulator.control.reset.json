@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:7ed06295945087622e96dcd91e390a402898be91e1f94233f5c93daa35dfe23a",
+  "capability_id": "simulator.control.reset",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

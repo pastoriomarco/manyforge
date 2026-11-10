@@ -24,7 +24,7 @@ constexpr int kBusyTimeoutMilliseconds = 5000;
 // The only Program-cycle journal schema these readers accept. It equals
 // `SCHEMA_VERSION` in manyforge_program_runner/cycle_journal.py (a runner test
 // checks this); older and newer development journals are refused unchanged.
-constexpr int kProgramCycleJournalSchema = 8;
+constexpr int kProgramCycleJournalSchema = 9;
 
 class Statement final {
 public:
@@ -155,7 +155,7 @@ ExactReleaseIdentity(const core::CellAdmissionClaimDTO &claim,
        StringMember(prepared_scene, "schema_version") ==
            "manyforge.prepared_program_scene.v1");
   if (StringMember(settlement, "schema_version") !=
-          "manyforge.program_cycle_start_settlement.v1" ||
+          "manyforge.program_cycle_start_settlement.v2" ||
       (kind != "proven_no_effect" && kind != "terminal_effects_settled") ||
       DecodeCellAdmissionClaim(
           ci::canonical_json(Member(settlement, "claim"))) != claim ||
@@ -327,7 +327,7 @@ ProgramResetJournalSnapshot ReadResetSnapshot(sqlite3* database) {
         throw std::runtime_error("claimless failed Start has no exact settlement");
       const auto settlement = ci::parse_canonical_json(row.Text(10));
       const auto& prepared = Member(settlement, "prepared_scene");
-      if (StringMember(settlement, "schema_version") != "manyforge.program_cycle_start_settlement.v1" ||
+      if (StringMember(settlement, "schema_version") != "manyforge.program_cycle_start_settlement.v2" ||
           StringMember(settlement, "kind") != "proven_no_effect" ||
           !Member(settlement, "claim").is_null() ||
           StringMember(settlement, "program_run_id") != row.Text(3) ||

@@ -106,7 +106,7 @@ def test_timeouts_dto():
 
 
 def test_joint_dynamics_limit_dto():
-    """Phase 4-P5.1K — JointDynamicsLimitDTO construction + optional fields."""
+    """JointDynamicsLimitDTO construction + optional fields."""
     import manyforge_core_py
 
     empty = manyforge_core_py.JointDynamicsLimitDTO()
@@ -313,10 +313,9 @@ def test_reference_dto():
     """Test ReferenceDTO creation and attributes."""
     import manyforge_core_py
     
-    r = manyforge_core_py.ReferenceDTO(
-        manyforge_core_py.ReferenceType.kFrameRole, "base"
-    )
-    assert r.type == manyforge_core_py.ReferenceType.kFrameRole
+    r = manyforge_core_py.ReferenceDTO.component_frame("robot", "base")
+    assert r.type == manyforge_core_py.ReferenceType.kComponentFrame
+    assert r.component_id == "robot"
     assert r.id == "base"
     assert r.pose is None
 
@@ -337,9 +336,7 @@ def test_relative_motion_authoring_types_remain_available():
     """Python authors intent, while C++ resolves and mints execution requests."""
     import manyforge_core_py
 
-    ref = manyforge_core_py.ReferenceDTO(
-        manyforge_core_py.ReferenceType.kFrameRole, "base"
-    )
+    ref = manyforge_core_py.ReferenceDTO.component_frame("robot", "base")
     motion = manyforge_core_py.PoseGoalDTO(manyforge_core_py.Pose3DTO(
         manyforge_core_py.Vector3DTO(0.1, 0.0, 0.0),
         manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)

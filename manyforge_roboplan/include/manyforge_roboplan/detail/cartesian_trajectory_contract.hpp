@@ -137,7 +137,7 @@ measure_cartesian_frame_dynamics_envelope(
     const roboplan::JointTrajectory& trajectory,
     const CartesianPlanningControl& control);
 
-/// RP-3: TOPP-RA times every joint move with the active TCP at this fraction
+/// TOPP-RA times every joint move with the active TCP at this fraction
 /// of its speed limit.
 inline constexpr double kTcpSpeedTargetFraction = 0.98;
 
@@ -146,7 +146,7 @@ inline constexpr double kTcpSpeedTargetFraction = 0.98;
 using TcpPathVelocityBound =
     std::function<double(const Eigen::VectorXd&, const Eigen::VectorXd&)>;
 
-/// RP-3 TOPP-RA bound ds/dt <= 0.98 * limit / ||d(TCP)/ds|| at each grid
+/// TOPP-RA bound ds/dt <= 0.98 * limit / ||d(TCP)/ds|| at each grid
 /// point, for the active TCP relative to the base frame: linear against the
 /// TCP linear speed limit and, with a Cartesian path (time_optimal timing),
 /// angular against its angular speed limit, both times the velocity scale.
@@ -156,7 +156,7 @@ std::optional<TcpPathVelocityBound> make_tcp_speed_path_velocity_bound(
     const core::CartesianPathDTO* path,
     const std::shared_ptr<roboplan::Scene>& scene);
 
-/// RP-3 sample check: peak active-TCP speed over the trajectory samples
+/// Sample check: peak active-TCP speed over the trajectory samples
 /// divided by its limit (velocity scale included): linear against the TCP
 /// linear speed limit and, with a Cartesian path, angular against its angular
 /// speed limit; the larger ratio. Speed between samples is not measured.
@@ -166,6 +166,24 @@ std::optional<double> measure_tcp_sample_speed_ratio(
     const core::CartesianPathDTO* path,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory);
+
+/// Maximum FK endpoint chord speed divided by the scaled TCP speed limit.
+/// This measures the output waypoints using the validator's TCP/base frames;
+/// it is not a continuous-time speed bound.
+core::Result<double> measure_tcp_chord_speed_ratio(
+    const CartesianTrajectoryContractInput& request,
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const roboplan::JointTrajectory& trajectory,
+    const CartesianPlanningControl& control);
+
+/// Validator-equivalent peak chord speed after the specified uniform time
+/// multiplier, including the same per-timestamp floating-point rounding.
+core::Result<double> measure_tcp_chord_speed_mps(
+    const CartesianTrajectoryContractInput& request,
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const roboplan::JointTrajectory& trajectory,
+    const CartesianPlanningControl& control,
+    double timestamp_multiplier);
 
 core::Result<CartesianKinematicMotionBounds>
 resolve_cartesian_kinematic_motion_bounds(

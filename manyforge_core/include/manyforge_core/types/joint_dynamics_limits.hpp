@@ -9,7 +9,7 @@
 
 namespace manyforge::core {
 
-/// Per-joint absolute dynamics cap for one joint (spec/210 §3.3, Phase 4-P5.1K).
+/// Per-joint absolute dynamics cap for one joint.
 ///
 /// Each field is an ABSOLUTE cap in SI units, or std::nullopt meaning "no cap
 /// from this source for this dimension". The kernel resolves the effective cap

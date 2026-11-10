@@ -284,6 +284,24 @@ int run() {
     if (frame.type != MessageType::kPlan) {
       fail("fake worker received an unsupported request");
     }
+    if (input.model.native_scene_name == "inspect-preview-diagnostic") {
+      const auto request = worker_protocol::decode_candidate_request(frame.payload);
+      if (request.collision_mode != core::PlannerCollisionMode::kDiagnosticDisabled ||
+          !request.diagnostic_deadline_ns ||
+          (!std::holds_alternative<core::CartesianPathDTO>(request.motion) &&
+           !request.diagnostic_qualified_target))
+        fail("diagnostic fields lost in transit");
+      const auto remaining = std::chrono::duration<double>(
+          std::chrono::nanoseconds(*request.diagnostic_deadline_ns) -
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (!(remaining > 0.0 && remaining <= 2.0)) fail("diagnostic deadline restarted");
+      send_frame(descriptor, MessageType::kPlanResult,
+          worker_protocol::encode_trajectory_result(
+              core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+                  "planning_failed", "injected diagnostic failure", {{"reason", "test_failure"}}}),
+              request.diagnostic_qualified_target));
+      continue;
+    }
     if (input.model.native_scene_name == "inspect-moving-planning-budget") {
       std::optional<std::int64_t> deadline;
       const auto request = worker_protocol::decode_candidate_request(frame.payload, &deadline);

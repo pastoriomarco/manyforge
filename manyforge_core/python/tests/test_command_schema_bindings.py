@@ -1,4 +1,4 @@
-"""I6 qualified command-schema Python projection tests."""
+"""Qualified command-schema Python projection tests."""
 
 from __future__ import annotations
 

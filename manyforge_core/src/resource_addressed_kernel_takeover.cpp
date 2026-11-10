@@ -1,4 +1,5 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include <manyforge_core/execution_recovery_support.hpp>
 
 #include <cstdio>
 
@@ -24,7 +25,8 @@ namespace {
 Result<std::optional<OperationAcceptedDTO>>
 ResourceAddressedExecutionKernel::try_accept_motion_takeover(
     ActiveOperationNode& prepared_operation, ReplayEntry& prepared_replay,
-    const RuntimeParticipantExecutionRegistration& registration) {
+    const RuntimeParticipantExecutionRegistration& registration,
+    const std::function<void()>& end_admission) {
   using Outcome = Result<std::optional<OperationAcceptedDTO>>;
   if (prepared_operation.empty())
     return reject<std::optional<OperationAcceptedDTO>>(
@@ -131,10 +133,10 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
                                     {"winner_node_instance_id", origin.node_instance_id.value()},
                                     {"winner_node_attempt_id", origin.node_attempt_id}}});
     }
-    // Active TCP (M7, T-MQ2, T-C2c): a preempt keeps the running move's TCP
+    // Active TCP: a preempt keeps the running move's TCP
     // and never changes the Active TCP; one resolving to another TCP is
     // refused on every lane, before anything is prepared or sent.
-    // The requests' TCP frames carry their owners (B7), so equal frames are
+    // The requests' TCP frames carry their owners, so equal frames are
     // equal TCP entries.
     if (candidate.participants.front().motion_request->binding.tcp_frame !=
         winner->participants.front().motion_request->binding.tcp_frame) {
@@ -269,6 +271,10 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
     if (!contained.ok()) return Outcome::Err(contained.error());
     return Outcome::Err(std::move(*publication_failure));
   }
+  // Published and resident (the incumbent keeps it as its pending
+  // takeover): end submission ordering before the cancel and the advance,
+  // which prepares the successor (point 5).
+  end_admission();
   if (cancel_engine && cancel_unsent) {
     const auto cancelled = cancel_engine->CancelPreparedMotion(*cancel_unsent);
     if (!cancelled.ok()) {
@@ -802,6 +808,148 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover(
 Result<bool> ResourceAddressedExecutionKernel::fail_pending_motion_takeover(
     const OperationId& incumbent_id, const OperationId& candidate_id, ErrorDTO failure) {
   return end_pending_motion_takeover(incumbent_id, candidate_id, std::move(failure));
+}
+
+Result<bool> ResourceAddressedExecutionKernel::retire_rebuilt_unknown_takeover_for_program_reset(
+    const OperationId& incumbent_id) {
+  IResolvedParticipantExecutionEngine* local_engine{};
+  IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
+  std::uint64_t source_id{}, candidate_id{};
+  OperationId candidate_operation{std::string{}};
+  std::shared_ptr<std::mutex> identity;
+  OperationStateDTO expected_source = empty_takeover_capture_storage();
+  OperationStateDTO expected_candidate = empty_takeover_capture_storage();
+  {
+    std::lock_guard lock(state_mutex_);
+    auto* source = find_active_operation_locked(incumbent_id);
+    if (!source || source->pending_motion_takeover.empty()) return Result<bool>::Ok(false);
+    if (source->participants.size() != 1U || source->state.participants.size() != 1U ||
+        source->state.state != OperationStateKind::kInterventionRequired ||
+        source->state.active_stop_id || source->stop_effect_in_flight || source->pending_control ||
+        source->ordinary_acceptance_pending ||
+        source->coordinated_cancellation_in_flight || source->takeover_source ||
+        source->ordinary_commit_in_flight || source->recovery_effect_in_flight ||
+        source->takeover_advance_in_flight || !source->next_motion_takeover.empty() ||
+        source->dispatch_effect_in_flight() || source->reconciliation_in_flight() ||
+        source->has_pending_io_rule_response())
+      return Result<bool>::Ok(false);
+    auto& candidate = *source->pending_motion_takeover.mapped();
+    if (candidate.participants.size() != 1U || candidate.state.participants.size() != 1U ||
+        candidate.state.state != OperationStateKind::kInterventionRequired ||
+        candidate.state.active_stop_id || candidate.motion_takeover_spring_fallback ||
+        candidate.ordinary_acceptance_pending || candidate.stop_effect_in_flight ||
+        candidate.pending_control || candidate.recovery_effect_in_flight ||
+        candidate.coordinated_cancellation_in_flight ||
+        candidate.takeover_advance_in_flight || candidate.has_pending_io_rule_response())
+      return Result<bool>::Ok(false);
+    auto& source_row = source->participants.front();
+    auto& row = candidate.participants.front();
+    const auto* source_fact = selected_cause_terminal_fact(source->state.participants.front());
+    const auto* candidate_fact = selected_cause_terminal_fact(candidate.state.participants.front());
+    if (!source_fact || source_fact->effect != ParticipantEffectKnowledge::kEffectUncertain ||
+        !candidate_fact || candidate_fact->effect != ParticipantEffectKnowledge::kEffectUncertain ||
+        !source_row.engine || row.engine != source_row.engine || !row.prepared_motion_engine ||
+        dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(source_row.engine) !=
+            row.prepared_motion_engine ||
+        source_row.payload_kind != OperationParticipantPayloadKind::kMotion ||
+        row.payload_kind != OperationParticipantPayloadKind::kMotion ||
+        source_row.preparation_borrow_in_flight() || source_row.deferred_stop_settlement ||
+        source_row.deferred_cancel_settlement ||
+        source_row.subordinate_id == 0U || row.preparation_id == 0U || row.prepare_in_flight ||
+        row.prepared_advance_in_flight || row.dispatch_effect_in_flight ||
+        row.reconciliation_in_flight || row.deferred_stop_settlement ||
+        row.deferred_cancel_settlement)
+      return Result<bool>::Ok(false);
+    source->takeover_advance_in_flight = true;
+    identity = source->commit_mutex;
+    local_engine = source_row.engine;
+    prepared_engine = row.prepared_motion_engine;
+    source_id = source_row.subordinate_id;
+    candidate_id = row.preparation_id;
+    candidate_operation = candidate.state.operation_id;
+    expected_source = source->state;
+    expected_candidate = candidate.state;
+  }
+  const ScopeExit release([&] {
+    std::lock_guard lock(state_mutex_);
+    auto* source = find_active_operation_locked(incumbent_id);
+    if (source && source->commit_mutex == identity) {
+      source->takeover_advance_in_flight = false;
+      settle_completed_control_locked(incumbent_id);
+    }
+  });
+  KernelRecoveryAssessmentDTO assessment;
+  try {
+    assessment = local_engine->get_recovery_assessment();
+  } catch (...) {
+    return reject<bool>("owner rebuild assessment is unavailable",
+                        "owner_rebuild_assessment_unavailable", ErrorCode::kInternalError);
+  }
+  if (assessment.execution_id != source_id || !assessment.eligible_close ||
+      assessment.reason_code != kOwnerRebuildObservedAtRest || assessment.stop_owner_active ||
+      assessment.stronger_authority_active)
+    return Result<bool>::Ok(false);
+  Result<bool> retired = Result<bool>::Ok(false);
+  try {
+    retired = prepared_engine->RetireRebuiltUnknownPreparedMotion(source_id, candidate_id);
+  } catch (...) {
+    return reject<bool>("owner rebuild takeover cleanup outcome is unknown",
+                        "owner_rebuild_takeover_cleanup_unresolved",
+                        ErrorCode::kInvariantViolation);
+  }
+  if (!retired.ok()) return Result<bool>::Err(retired.error());
+  if (!retired.value()) return Result<bool>::Ok(false);
+
+  OperationCommitGuard commit(*this, incumbent_id);
+  OperationStateDTO capture = empty_takeover_capture_storage();
+  {
+    std::lock_guard lock(state_mutex_);
+    auto* source = find_active_operation_locked(incumbent_id);
+    if (!source || source->commit_mutex != identity || source->state.active_stop_id ||
+        source->state != expected_source ||
+        source->stop_effect_in_flight || source->pending_control ||
+        source->pending_motion_takeover.empty() ||
+        source->pending_motion_takeover.key() != candidate_operation)
+      return reject<bool>("owner changed during unknown takeover retirement",
+                          "owner_rebuild_takeover_cleanup_unresolved",
+                          ErrorCode::kInvariantViolation);
+    auto& candidate = *source->pending_motion_takeover.mapped();
+    if (candidate.state != expected_candidate ||
+        candidate.participants.front().preparation_id != candidate_id ||
+        candidate.participants.front().prepare_in_flight ||
+        candidate.participants.front().dispatch_effect_in_flight)
+      return reject<bool>("candidate changed during unknown takeover retirement",
+                          "owner_rebuild_takeover_cleanup_unresolved",
+                          ErrorCode::kInvariantViolation);
+    capture = candidate.state;
+    stamp_operation_capture_locked(candidate, capture);
+  }
+  const auto written = attempt_journal_write([&] {
+    return journal_.RecordOperationState(config_.request_owner_epoch, capture, nullptr,
+                                         "owner_rebuilt_unknown_takeover_retired");
+  });
+  if (!written.ok()) {
+    std::lock_guard lock(state_mutex_);
+    retain_operation_journal_write_fault_locked("owner_rebuilt_unknown_takeover_retired",
+                                                written.error(), &capture);
+    return Result<bool>::Err(written.error());
+  }
+  {
+    std::lock_guard lock(state_mutex_);
+    auto* source = find_active_operation_locked(incumbent_id);
+    if (!source || source->commit_mutex != identity || source->state.active_stop_id ||
+        source->state != expected_source ||
+        source->stop_effect_in_flight || source->pending_control ||
+        source->pending_motion_takeover.empty() ||
+        source->pending_motion_takeover.key() != candidate_operation ||
+        source->pending_motion_takeover.mapped()->state != expected_candidate)
+      return reject<bool>("owner changed after unknown takeover journal",
+                          "owner_rebuild_takeover_cleanup_unresolved",
+                          ErrorCode::kInvariantViolation);
+    retain_historical_operation_locked(capture);
+    source->pending_motion_takeover = {};
+  }
+  return Result<bool>::Ok(true);
 }
 
 Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(

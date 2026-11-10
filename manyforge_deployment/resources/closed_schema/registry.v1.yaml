@@ -28,7 +28,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: contact_policy
     schema_id: manyforge.contact_policy.v1
-    schema_revision: sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490
+    schema_revision: sha256:f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33
     relative_path: catalog/manyforge.contact_policy.v1.yaml
     qualification: qualified
   - record_kind: control_interface_contract
@@ -83,6 +83,6 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.pose_source.v2.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90
+    schema_revision: sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

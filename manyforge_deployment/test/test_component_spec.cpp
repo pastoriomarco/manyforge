@@ -1,4 +1,4 @@
-// Component build spec (M9 slice 1) over every example Scenario.
+// Component build spec over every example Scenario.
 //
 // - Every execution-host configuration field has a tier.
 // - Properties: a CellContext edit leaves every ComponentSpec byte-identical;
@@ -276,7 +276,7 @@ constexpr std::array<Kind, 10> kKinds{
                         return WithoutMember(component, "default_tcp");
                       return With(component, "default_tcp",
                                   CanonicalValue(Object{{"command_target_id", target},
-                                                        {"frame_role_id", CanonicalValue("m9_parity_tcp")}}));
+                                                        {"frame_role_id", CanonicalValue("parity_tcp")}}));
                     }));
       });
     }
@@ -300,8 +300,8 @@ constexpr std::array<Kind, 10> kKinds{
                     MapArray(At(cell, "component_attachments"), [](const auto &edge) {
                       return With(edge, "collision_exclusions",
                                   CanonicalValue(Array{CanonicalValue(Object{
-                                      {"child_link", CanonicalValue("m9_parity_child_link")},
-                                      {"parent_link", CanonicalValue("m9_parity_parent_link")}})}));
+                                      {"child_link", CanonicalValue("parity_child_link")},
+                                      {"parent_link", CanonicalValue("parity_parent_link")}})}));
                     }));
       });
     }
@@ -322,8 +322,8 @@ constexpr std::array<Kind, 10> kKinds{
                       if (!models.contains(At(model, "model_instance_id").as_string())) return model;
                       return With(model, "custom_tcps",
                                   CanonicalValue(Array{CanonicalValue(Object{
-                                      {"frame_role_id", CanonicalValue("m9_parity_tcp")},
-                                      {"parent_link_name", CanonicalValue("m9_parity_link")},
+                                      {"frame_role_id", CanonicalValue("parity_tcp")},
+                                      {"parent_link_name", CanonicalValue("parity_link")},
                                       {"pose_in_parent_link", Pose(0.01)}})}));
                     }));
       });
@@ -458,8 +458,8 @@ TEST(ComponentSpec, ContextEditsLeaveEverySpecAndSpecEditsOnlyTheirComponent) {
           direct.insert(row.controllable_component_id.value());
         }
       }
-      // A machine owner whose arm member changed is replaced with it (§16:
-      // its process is launched with the arm).
+      // A machine owner whose arm member changed is replaced with it (its
+      // process is launched with the arm).
       std::set<std::string> edited_components = direct;
       for (const auto &id : direct)
         if (owners.contains(id)) edited_components.erase(owners.at(id));
@@ -563,7 +563,7 @@ TEST(ComponentSpec, PlannerSettingsAreTheHostConfiguration) {
   }
 }
 
-// N6 / CLR-2: `collision_check_fresh_plans` is a per-host Deployment field
+// `collision_check_fresh_plans` is a per-host Deployment field
 // (on by default). Turning it off reaches the typed configuration and the
 // planner settings, and like the clearance it is cell context: every
 // component is retained and takes it at Apply.
@@ -597,7 +597,7 @@ TEST(ComponentSpec, TurningTheFreshPlanCheckOffRetainsEveryComponent) {
   }
 }
 
-// N12 / RP-3b: `motion_timing` is a per-host Deployment field (smooth by
+// `motion_timing` is a per-host Deployment field (smooth by
 // default). Setting fast passes the closed schema, reaches the planner
 // settings and, like the planner block, is cell context: every component is
 // retained and takes it at Apply.
@@ -628,7 +628,7 @@ TEST(ComponentSpec, ChangingMotionTimingRetainsEveryComponent) {
   }
 }
 
-// FP-2: the typed facts the host builds a component from are its own rows
+// The typed facts the host builds a component from are its own rows
 // only, with no placement and no planner settings, and say what the hashed
 // sections say.
 TEST(ComponentSpec, TypedFactsAreTheComponentsOwnHashedRows) {
@@ -667,14 +667,14 @@ TEST(ComponentSpec, TypedFactsAreTheComponentsOwnHashedRows) {
       }
       EXPECT_EQ(spec.launch.find_object_member("io_host_simulated") != nullptr,
                 spec.io_host_simulated.has_value());
-      // Q48: exactly an arm launches with operator Stop decelerations.
+      // Exactly an arm launches with operator Stop decelerations.
       for (const auto &profile : host.controller_profiles)
         EXPECT_EQ(profile.max_deceleration_on_cancel_rad_s2.empty(), !IsMotion(bundle, id));
     }
   }
 }
 
-// N17: every controller profile carries what the host launches the
+// Every controller profile carries what the host launches the
 // component with: its description (a URDF) and either an arm's joints and
 // operator Stop decelerations (a motion component) or a tool's gripper joint.
 TEST(ComponentSpec, ControllerProfilesCarryTheirLaunchValues) {
@@ -688,15 +688,15 @@ TEST(ComponentSpec, ControllerProfilesCarryTheirLaunchValues) {
             static_cast<void>(parse_model_documents_for_projection(profile.description, std::nullopt)));
         EXPECT_NE(profile.joint_names.empty(), !profile.gripper_joint_name.has_value());
         EXPECT_EQ(!profile.joint_names.empty(), IsMotion(bundle, profile.controllable_component_id));
-        // Q48: exactly the arm rows carry the operator Stop decelerations.
+        // Exactly the arm rows carry the operator Stop decelerations.
         EXPECT_EQ(profile.max_deceleration_on_cancel_rad_s2.empty(), profile.joint_names.empty());
       }
   }
 }
 
 // The rows an arm's launch edit replaces: the arm (`launch`, and `owner` when
-// its machine owner is replaced with it), its machine owner (CONTRACTS §16:
-// the owner launches with its arm member, reason `launch`), and every member
+// its machine owner is replaced with it), its machine owner (the
+// owner launches with its arm member, reason `launch`), and every member
 // of a replaced component (`owner`); every other component is retained.
 void ExpectLaunchEditReplaces(const ApplyComponentDeltaDTO &delta, const std::string &edited,
                               const std::map<std::string, std::string> &owners) {
@@ -729,7 +729,7 @@ void ExpectLaunchEditReplaces(const ApplyComponentDeltaDTO &delta, const std::st
   }
 }
 
-// N17: a controller profile's description is a launch input of its own
+// A controller profile's description is a launch input of its own
 // component only (and its members', through their owner; an arm member's
 // machine owner's, which launches with it).
 TEST(ComponentSpec, ADescriptionChangeReplacesItsComponentForLaunch) {
@@ -759,8 +759,8 @@ TEST(ComponentSpec, ADescriptionChangeReplacesItsComponentForLaunch) {
   EXPECT_TRUE(exercised);
 }
 
-// Q48: an arm's operator Stop decelerations are a launch input of that arm
-// (and of its machine owner, which launches with it, CONTRACTS §16).
+// An arm's operator Stop decelerations are a launch input of that arm
+// (and of its machine owner, which launches with it).
 // Perturbing one joint's value replaces that arm, with reason `launch`, and the host reads the new value from its spec. (A Deployment edit
 // also moves the arm's control-domain product, reason `controllers`; the
 // example compile checks that the row and the product's Stop row agree.)
@@ -831,7 +831,7 @@ TEST(ComponentSpec, EveryExecutionHostFieldHasATier) {
   EXPECT_GT(fields, 20U);
 }
 
-// N17 R4: only an override a component is constructed with is spec data
+// Only an override a component is constructed with is spec data
 // (construction_stream_overrides). An I/O provider re-reads its input-stream
 // overrides on retain, so their edit stays CellContext: every component is
 // retained and nothing is fenced.

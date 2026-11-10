@@ -19,6 +19,8 @@ from typing import Any, Final
 
 import rfc8785
 
+from .catalog_schema import parse_schema_registry, validate_value
+
 
 # The registered detail keys, in the order they are carried. A key outside
 # this set is not carried: the message already holds the human text.
@@ -26,8 +28,8 @@ FAILURE_DETAIL_KEYS: Final = (
     # An owner's refusal: its precise cause and any failed reference.
     "reason",
     "reference_type",
+    "reference",
     "reference_id",
-    "target_role_id",
     # A node input that could not be resolved (`input_failure_details`).
     "input_problem",
     "path",
@@ -50,6 +52,18 @@ MAX_FAILURE_ORIGIN_TEXT_BYTES: Final = 256
 
 _MAX_SAFE_INTEGER: Final = 9_007_199_254_740_991
 _OMITTED: Final = object()
+_DIRECT_MEMBERS: Final = {
+    "target": "command_target_id", "signal": "signal_name",
+    "frame": "frame_id", "collision_body": "collision_body_id",
+}
+_DIRECT_REFERENCE_SCHEMAS = parse_schema_registry({
+    kind: {
+        "type": "object", "semantic_type": f"{kind}_reference",
+        "required": ["component_id", member], "additional_properties": False,
+        "properties": {"component_id": {"type": "string"}, member: {"type": "string"}},
+    }
+    for kind, member in _DIRECT_MEMBERS.items()
+})
 
 
 def _bounded_text(value: str) -> str | object:
@@ -82,7 +96,7 @@ def bounded_failure_details(details: object) -> Mapping[str, Any] | None:
 
     Only registered keys are carried, in registered order. An entry outside
     its bound is left out, never shortened: a string longer than 256 UTF-8
-    bytes, a nested object or array, a non-finite number, an integer
+    bytes, an unregistered nested object or array, a non-finite number, an integer
     outside the I-JSON range, or an entry that would take the canonical
     JSON past 2,048 bytes. ``None`` when nothing remains (or nothing was
     given).
@@ -96,13 +110,26 @@ def bounded_failure_details(details: object) -> Mapping[str, Any] | None:
             break
         if key not in details:
             continue
-        value = _bounded_value(details[key])
+        if key == "reference":
+            kind = details.get("reference_type")
+            raw = details[key]
+            if (not isinstance(kind, str) or kind not in _DIRECT_MEMBERS
+                    or not isinstance(raw, Mapping)
+                    or any(not isinstance(key, str) for key in raw)):
+                continue
+            value = dict(raw)
+            if validate_value(_DIRECT_REFERENCE_SCHEMAS.types[kind], value, registry=_DIRECT_REFERENCE_SCHEMAS):
+                continue
+        else:
+            value = _bounded_value(details[key])
         if value is _OMITTED:
             continue
         candidate = {**bounded, key: value}
         if len(rfc8785.dumps(candidate)) > MAX_FAILURE_DETAILS_BYTES:
             continue
         bounded = candidate
+    if "reference" in bounded:
+        bounded["reference"] = MappingProxyType(bounded["reference"])
     return MappingProxyType(bounded) if bounded else None
 
 
@@ -227,7 +254,10 @@ def failure_wire_fields(
     """The ``details`` and ``origin`` fields of one run record."""
 
     return {
-        "details": None if details is None else dict(details),
+        "details": None if details is None else {
+            key: dict(value) if key == "reference" and isinstance(value, Mapping) else value
+            for key, value in details.items()
+        },
         "origin": None if origin is None else dict(origin),
     }
 

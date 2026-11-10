@@ -1,7 +1,7 @@
 """The `interrupted` outcome of a cancellable leaf.
 
 A catalog leaf with `execution.cancellable: true` declares the `interrupted`
-outcome; a non-cancellable leaf never does (spec 440 §4.6). A Program Stop,
+outcome; a non-cancellable leaf never does. A Program Stop,
 a Reset, a cancel or a parent that ends the node stops a running attempt of
 a cancellable leaf with that outcome and a reason code, never with
 `failure`. py_trees has no third terminal status: an interrupted attempt

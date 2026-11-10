@@ -1,13 +1,13 @@
 # ManyForge xArm control
 
-`manyforge_xarm_control` is the xArm vendor adapter (CONTRACTS §6, §7, §12):
+`manyforge_xarm_control` is the xArm vendor adapter:
 every xArm-family robot (xArm 5/6/7, Lite 6, UF850) through the driver of
 `vendor/driver.yaml`. Its configuration and behaviour are documented on the
 vendor page, [vendor/README.md](vendor/README.md).
 
 ## Parts
 
-An xArm is one machine of several components (CONTRACTS §16): the owner
+An xArm is one machine of several components: the owner
 (the machine) and its members (the arm, the controller I/O, the tool I/O).
 
 - `XArmOwnerAdapter` (`IComponentAdapter`): the owner. It holds the driver
@@ -34,11 +34,11 @@ An xArm is one machine of several components (CONTRACTS §16): the owner
 - `XArmDriverServices` (`IXArmDriver`): the driver services the adapters call,
   each request once, never retried.
 - `make_xarm_launch_contribution`: the launch contribution of a model's
-  `lanes.real` row from the vendor folder (CONTRACTS §12).
+  `lanes.real` row from the vendor folder.
 - `make_xarm_machine`: one machine's owner adapter and its subscriptions.
 - The adapter family `xarm` (`src/xarm_adapter_family.cpp`), which the
   execution host loads only through the `manyforge_component_adapters`
-  index (CONTRACTS §6): one factory call per component, by role (the owner
+  index: one factory call per component, by role (the owner
   returns the handle its members are made on), the launch contribution, the
   vendor controllers for the model's Mock and Isaac rows (`vendor: xarm`) and
   the arm's tool-context hook; it takes the host's measured joints,

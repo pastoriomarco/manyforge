@@ -827,7 +827,7 @@ deployment::UrdfDocumentIr GripperModel() {
   return urdf;
 }
 
-// C-P4 (G1): a grasp-lost Stop names the holder and every component it is
+// A grasp-lost Stop names the holder and every component it is
 // mounted on, in the Stop selector's id order. On lite6 + lite_gripper a loss
 // at the gripper also stops the arm (before: the gripper alone, so an arm
 // move was not stopped: kAlreadyTerminalNoEffect).
@@ -1197,7 +1197,7 @@ TEST(SceneRuntimePoseProjector, OnGraspLostFlagsDriveSignalStopDetachAndAlarm) {
     EXPECT_EQ(signals.published.front().carried_object_attachment_id,
               core::CarriedObjectAttachmentId("attachment.1"));
     EXPECT_EQ(details.at("signal"), "published");
-    // Contract §10: the loss event id and the stored key reach the host row.
+    // The loss event id and the stored key reach the host row.
     EXPECT_EQ(signals.published.front().loss_event_id, details.at("event_id"));
     EXPECT_EQ(signals.published.front().set_key, response.set_key);
     EXPECT_EQ(details.at("command_target_id"), "arm");
@@ -1225,7 +1225,7 @@ TEST(SceneRuntimePoseProjector, OnGraspLostFlagsDriveSignalStopDetachAndAlarm) {
 }
 
 TEST(SceneRuntimePoseProjector, FailedSignalPublicationFailsClosedOncePerLoss) {
-  // SX-204: a loss whose `true` cannot be published (Manager transport, or
+  // A loss whose `true` cannot be published (Manager transport, or
   // the host refusing it) is a component fault: alarm and Stop whatever
   // `on_grasp_lost` says, the typed error in the details; like any loss it
   // fires once (no retry), and the detach still follows its flag.
@@ -1312,7 +1312,7 @@ TEST(SceneRuntimePoseProjector, TargetWithoutSignalFollowsItsFlags) {
 }
 
 TEST(SceneRuntimePoseProjector, RefusedDetachKeepsTheGraspBaseline) {
-  // DX-2562: a refused detach leaves the attachment and its baseline, so the
+  // A refused detach leaves the attachment and its baseline, so the
   // next sample detects the loss again and retries the detach.
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;

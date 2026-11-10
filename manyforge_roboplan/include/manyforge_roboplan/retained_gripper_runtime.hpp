@@ -21,12 +21,26 @@
 
 namespace manyforge::roboplan_backend {
 
+class PreparedMeasuredStateSources;
+
 /// Prepared leases for the existing runtime's exact measured route association.
 /// The callback enables the actual prepared producer and must not throw.
 struct RetainedPreparedRobotMeasuredSources final {
+  struct RebuildBoundary final {
+    std::shared_ptr<const void> owner;
+    std::uint64_t next_sequence{};
+  };
   core::RobotMeasuredStateSourceView source_view;
   std::function<void()> enable_publication;
+  /// The exact ROS storage behind these readers, absent for non-ROS sources.
+  std::shared_ptr<PreparedMeasuredStateSources> ros_sources{};
+  std::function<bool()> matches_transport_owner{};
+  std::function<std::optional<RebuildBoundary>(std::size_t)> owner_rebuild_boundary{};
 };
+
+/// Bind the exact ROS publication to its locked owner-rebuild boundary read.
+[[nodiscard]] std::function<std::optional<RetainedPreparedRobotMeasuredSources::RebuildBoundary>(std::size_t)>
+MakeOwnerRebuildBoundaryReader(std::shared_ptr<PreparedMeasuredStateSources> publication);
 
 /// Same prepared-source descriptor and route validation used by the arm owner.
 [[nodiscard]] core::Result<void> ValidateRetainedPreparedMeasuredSources(
@@ -101,13 +115,25 @@ class RetainedGripperRuntime final {
   [[nodiscard]] std::optional<RetainedGripperPositionLimits>
   position_limits() const noexcept;
   [[nodiscard]] core::GripperParticipantEngine* participant_engine() const noexcept;
+  [[nodiscard]] std::optional<core::GripperOwnerRecoveryEvidence>
+  GripperOwnerRecoveryEvidence(bool measured_lane, const std::string &target,
+                               const std::shared_ptr<const void> &owner) const;
   [[nodiscard]] core::IGripperCommandBackend* backend() const noexcept;
+  /// Pin the exact backend owner, including any aliasing transport owner.
+  [[nodiscard]] std::shared_ptr<core::IGripperCommandBackend> backend_owner() const noexcept;
   /// Stop-stage port owned by this runtime's backend, if any.
   [[nodiscard]] core::IControlDomainExecutionPort* stop_execution_port() const noexcept;
 
   /// Cell Kernel borrowing remains exact across optional-motion products.
   void BindCellKernel(core::ResourceAddressedExecutionKernel& kernel);
   [[nodiscard]] core::Result<core::RobotMeasuredStateSourceView> PrepareCurrentMeasuredSources();
+  [[nodiscard]] std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+  SnapshotPreparedMeasuredSources() const;
+  [[nodiscard]] bool MatchesPreparedMeasuredSources(
+      const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected) const;
+  [[nodiscard]] bool WithExactPreparedMeasuredSources(
+      const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected,
+      void (*commit)(void *) noexcept, void *context) const;
 
   /// Preserve this owner only across a candidate binding for the same
   /// physical gripper. The candidate channel must already be sealed to the

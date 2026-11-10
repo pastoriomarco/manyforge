@@ -226,7 +226,7 @@ std::vector<ActivationPreparedIoType> prepare_activation_machine_types(
     if (profile.runtime_kind != ActivationRuntimeKind::kMachine)
       continue;
     const auto &component = intent.components[index];
-    // CONTRACTS §16 / BOUNDARY §3: the owner's compiled row.
+    // The owner's compiled row.
     Object row{{"controllable_component_id", Value(component.component_id)},
                {"lane", Value(*profile.lane)}};
     if (profile.lane_row)
@@ -347,6 +347,59 @@ std::vector<ActivationPreparedIoType> prepare_activation_sensor_types(
                {"settings", Value(canonical_json(settings))}};
     result.push_back(derived_type(
         component.component_id, "sensor", Array{}, {},
+        Value(Object{{"sensors", Value(Array{Value(std::move(row))})}})));
+  }
+  return result;
+}
+
+std::vector<ActivationPreparedIoType> prepare_activation_assistant_types(
+    const ActivationDeploymentIntent &intent,
+    std::span<const ActivationComponentProfile> profiles) {
+  if (intent.components.size() != profiles.size())
+    throw std::invalid_argument("assistant component profile join differs");
+  std::vector<ActivationPreparedIoType> result;
+  for (std::size_t index = 0; index != profiles.size(); ++index) {
+    const auto &profile = profiles[index];
+    if (profile.runtime_kind != ActivationRuntimeKind::kAssistant)
+      continue;
+    const auto &component = intent.components[index];
+    const auto &authored = member(component.configuration, "runtime_configuration");
+    const auto *model_id = authored.find_object_member("model_component_id");
+    const auto *profile_id = authored.find_object_member("assistant_profile_id");
+    if (model_id == nullptr || !model_id->is_string() || profile_id == nullptr ||
+        !profile_id->is_string() || authored.as_object().size() != 2U)
+      throw std::invalid_argument(
+          "Activation assistant: " + component.component_id +
+          ".runtime_configuration must be {model_component_id, assistant_profile_id}");
+    // The AI model component it names; its endpoint is part of the
+    // assistant's spec, so a changed URL or token name replaces it.
+    const auto model = std::find_if(
+        intent.components.begin(), intent.components.end(), [&](const auto &row) {
+          return row.component_id == model_id->as_string();
+        });
+    const auto *model_kind =
+        model == intent.components.end()
+            ? nullptr
+            : model->configuration.find_object_member("runtime_kind");
+    if (model_kind == nullptr || !model_kind->is_string() ||
+        model_kind->as_string() != "ai_model")
+      throw std::invalid_argument(
+          "Activation assistant: assistant_model_component_unresolved: " +
+          model_id->as_string() + " is not an AI model component");
+    const auto &model_settings = member(model->configuration, "runtime_configuration");
+    const auto *api_key_env = model_settings.find_object_member("api_key_env");
+    const Value settings(Object{
+        {"assistant_profile_id", *profile_id},
+        {"model_api_key_env", api_key_env == nullptr ? Value(nullptr) : *api_key_env},
+        {"model_base_url", member(model_settings, "base_url")},
+        {"model_component_id", *model_id}});
+    // The model's one adapter row (the assistant has no lane).
+    Object row{{"adapter_row", Value(canonical_json(member(
+                                   profile.model_descriptor, "adapter_row")))},
+               {"controllable_component_id", Value(component.component_id)},
+               {"settings", Value(canonical_json(settings))}};
+    result.push_back(derived_type(
+        component.component_id, "assistant", Array{}, {},
         Value(Object{{"sensors", Value(Array{Value(std::move(row))})}})));
   }
   return result;

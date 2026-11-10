@@ -24,7 +24,7 @@ _UNAVAILABLE_MESSAGE = (
 )
 _BENCHMARK_UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: the addressed native benchmark "
-    "requires the build-qualified N7 process fixture; run its RoboPlan process "
+    "requires the build-qualified process fixture; run its RoboPlan process "
     "test in Docker."
 )
 _COLLISION_LOOKUP_DOCKER_MESSAGE = (
@@ -93,7 +93,7 @@ def test_reduced_aggregate_has_an_explicit_retained_selector() -> None:
     assert "manyforge_program_runner/tests/" in source
     assert "-p no:cacheprovider" in source
     assert "tests/test_public_contract_entrypoint_reconciliation.py" in source
-    assert "tests/test_qualification_wrapper_entrypoints.py" in source
+    assert "tests/test_source_identity.py" in source
     assert "tests/test_grouped_gtest_runner.py" in source
     assert retained_body.count("run_roboplan_tests") == 1
 
@@ -268,15 +268,15 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/headless" ]; then\n'
         "    printf '%s\\n' headless-build >> \"$FAKE_LOG\"\n"
         '    mkdir -p "$root/manager-apply-test-fixture" \\\n'
-        '      "$root/manager-apply-o1-4g-replacement-fixture" \\\n'
+        '      "$root/manager-apply-replacement-fixture" \\\n'
         '      "$root/assistant-native-test-fixture"\n'
         '    : > "$root/manager-apply-test-fixture/metadata.json"\n'
-        '    : > "$root/manager-apply-o1-4g-replacement-fixture/metadata.json"\n'
+        '    : > "$root/manager-apply-replacement-fixture/metadata.json"\n'
         '    : > "$root/assistant-native-test-fixture/metadata.json"\n'
         '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/deployment" ]; then\n'
-        '    package="$root/ui6i-dual-scenario-fixture/retained-package"\n'
+        '    package="$root/dual-robot-scenario-fixture/retained-package"\n'
         '    mkdir -p "$package"\n'
-        '    : > "$package/canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"\n'
+        '    : > "$package/canonical-empty-admission.dual_robot_wall_cell.json"\n'
         "  fi\n"
         "  exit 0\n"
         "fi\n"
@@ -556,7 +556,7 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
 
 
-def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None:
+def test_ros2_control_builder_selects_only_current_runtime_products() -> None:
     source = (_REPO_ROOT / "scripts/ros/build-ros2-control-runtime.sh").read_text(encoding="utf-8")
 
     assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
@@ -585,7 +585,12 @@ def test_ros_images_build_the_selected_picknik_source(name: str) -> None:
     assert "colcon build" in source
     assert source.index("/install/UPSTREAM_COMMIT") > source.index("colcon build")
     assert "COPY topic_based_ros2_control/" not in source
-    if name.endswith("-full"):
+    if name == "Dockerfile.ros-lyrical-full":
+        # Built in the clean ROS workspace stage, before (and apart from) the
+        # venv, so it cannot link the venv's cmeel libraries.
+        clone = source.index('git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}"')
+        assert source.index("AS ros-workspaces") < clone < source.index('python3 -m venv')
+    elif name.endswith("-full"):
         assert source.index('git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}"') > source.index(
             "&& python /tmp/check-roboplan-dependency-stack.py"
         )
@@ -606,7 +611,7 @@ def test_isaac_upstream_source_marker_is_required_before_selection(
     check = check[check.index("if [["):]
     environment = dict(os.environ)
     if relative.endswith("build-ros2-control-runtime.sh"):
-        # The Q9 helper takes its selected install as TOPIC_INSTALL and an
+        # The ROS build helper takes its selected install as TOPIC_INSTALL and an
         # optional data overlay as DATA_OVERLAY instead of a literal path.
         environment.update({"TOPIC_INSTALL": str(tmp_path), "DATA_OVERLAY": ""})
     else:
@@ -651,8 +656,8 @@ def test_isaac_selected_topic_plugin_cannot_be_shadowed(
         assert "actual prefix=" + prefix in completed.stderr
 
 
-def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None:
-    topology = _REPO_ROOT / "config/ros/isaac_i9.env.sh"
+def test_isaac_static_peer_profile_clears_stale_dds_overrides_and_is_role_free() -> None:
+    topology = _REPO_ROOT / "config/ros/isaac_static_peers.env.sh"
     environment = os.environ.copy()
     for variable in (
         "ROS_DOMAIN_ID",
@@ -699,12 +704,7 @@ def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None
 
 @pytest.mark.parametrize(
     "suite",
-    (
-        "integration",
-        "qualification",
-        "qualification-all",
-        "qualification-soak",
-    ),
+    ("integration",),
 )
 def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
     suite: str,
@@ -721,7 +721,7 @@ def test_unavailable_test_suites_fail_instead_of_skipping_or_mocking(
     assert completed.stderr.strip() == _UNAVAILABLE_MESSAGE
 
 
-def test_ros_selector_builds_and_tests_the_q9_integration_graph() -> None:
+def test_ros_selector_builds_and_tests_the_ros_integration_graph() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
     body = source.split("run_ros_tests() {", 1)[1].split("\n}\n", 1)[0]
 
@@ -744,7 +744,7 @@ def test_ros_selector_builds_and_tests_the_q9_integration_graph() -> None:
         assert f'"{suite}"' in body
     assert "ROS_INTEGRATION_TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install" in source
     assert "ROS_INTEGRATION_DATA_OVERLAY=/opt/manyforge/xarm_description/install" in source
-def test_bindings_selector_routes_to_the_real_i2_builder() -> None:
+def test_bindings_selector_routes_to_the_real_core_bindings_builder() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
     body = source.split("run_pybind_tests() {", 1)[1].split("run_python_tests() {", 1)[0]
 

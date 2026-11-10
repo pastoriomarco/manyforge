@@ -14,7 +14,8 @@ namespace manyforge::core {
 ///
 /// These bounds prevent an untrusted transport or adapter from presenting an
 /// unbounded value. They do not prove that a row belongs to the retained graph;
-/// CCLC performs that graph/topology reconciliation before publication.
+/// the execution host performs that graph/topology reconciliation before
+/// publication.
 inline constexpr std::size_t kMaxActiveControlConfigurationBindingRoutes = 4096U;
 inline constexpr std::size_t kMaxActiveControlConfigurationResourceSourceProjections = 4096U;
 
@@ -68,12 +69,13 @@ enum class ActiveControlConfigurationStateDTO : std::uint8_t {
   return false;
 }
 
-/// CCLC-owned complete runtime fact for one exact control-domain revision.
+/// Execution-host-owned complete runtime fact for one exact control-domain
+/// revision.
 ///
 /// `locally_valid()` checks only bounded, canonical, internally consistent
 /// value shape. It deliberately cannot prove completeness against the retained
 /// graph, installed controllers, endpoint inventory, or observed claims; those
-/// are reconciliation postconditions owned by CCLC.
+/// are reconciliation postconditions owned by the execution host.
 struct ActiveControlConfigurationDTO final {
   ActiveControlConfigurationId active_control_configuration_id;
   ControlDomainId control_domain_id;

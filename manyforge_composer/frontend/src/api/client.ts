@@ -6,6 +6,7 @@ import {
   parseCellLatch,
   parseComponentStates,
   parseEffectiveValues,
+  parseRecoveryPreflight,
   parseRunReadiness,
   parseSetOutputResult,
   parseSignalSamples,
@@ -18,6 +19,8 @@ import type {
   ComponentAction,
   ComponentState,
   EffectiveValues,
+  RecoveryConfirmation,
+  RecoveryPreflight,
   RunReadiness,
   SetOutputResult,
   SignalSample,
@@ -85,6 +88,7 @@ import {
   type ComposerSettingsSnapshot,
 } from '../state/composerSettings';
 import {
+  parseAssistantModeDetail,
   parseAssistantModeIndex,
   parseAssistantProviderStatus,
 } from './assistantParsers';
@@ -151,6 +155,7 @@ import type {
 import type { ComponentCatalog } from '../types/componentCatalog';
 import { parseComponentCatalog } from './componentCatalogParser';
 import type {
+  AssistantModeDetail,
   AssistantModeIndex,
   AssistantProviderStatus,
   AssistantRequestInput,
@@ -294,12 +299,12 @@ function runtimeScaleSelectorQuery(selector: RuntimeScaleControlSelector): strin
   const parameters = new URLSearchParams();
   parameters.set('program_binding_id', selector.programBindingId);
   if (selector.kind === 'singular') {
-    parameters.set('component_role_id', selector.componentRoleId);
-    parameters.set('target_role_id', selector.targetRoleId);
+    parameters.set('component_id', selector.componentId);
+    parameters.set('command_target_id', selector.commandTargetId);
   } else {
     parameters.set('group_targets', JSON.stringify(selector.groupTargets.map((target) => ({
-      component_role_id: target.componentRoleId,
-      target_role_id: target.targetRoleId,
+      component_id: target.componentId,
+      command_target_id: target.commandTargetId,
     }))));
   }
   return parameters.toString();
@@ -312,12 +317,12 @@ function sameRuntimeScaleSelector(
   if (requested.kind !== returned.kind
     || requested.programBindingId !== returned.programBindingId) return false;
   if (requested.kind === 'singular' && returned.kind === 'singular') {
-    return requested.componentRoleId === returned.componentRoleId
-      && requested.targetRoleId === returned.targetRoleId;
+    return requested.componentId === returned.componentId
+      && requested.commandTargetId === returned.commandTargetId;
   }
   if (requested.kind !== 'group' || returned.kind !== 'group') return false;
-  const identity = (target: { componentRoleId: string; targetRoleId: string }) => (
-    JSON.stringify([target.componentRoleId, target.targetRoleId])
+  const identity = (target: { componentId: string; commandTargetId: string }) => (
+    JSON.stringify([target.componentId, target.commandTargetId])
   );
   const requestedTargets = new Set(requested.groupTargets.map(identity));
   const returnedTargets = new Set(returned.groupTargets.map(identity));
@@ -531,22 +536,33 @@ function persistentValuesPath(suffix = ''): string {
   return `/api/program/persistent-values${suffix}`;
 }
 
-/** Maintained assistant profile id -> its model endpoint aliases. */
-export type AssistantProfileAliases = Record<string, string[]>;
+/** A maintained assistant profile: whether it has a chat mode, and its runtime model aliases. */
+export interface AssistantProfile {
+  chat: boolean;
+  /** The runtime (`query_model`) aliases; the chat alias is bound by the assistant component. */
+  modelEndpointAliases: string[];
+}
 
-function parseAssistantProfileAliases(value: unknown): AssistantProfileAliases {
+/** Maintained assistant profile id -> its facts. */
+export type AssistantProfiles = Record<string, AssistantProfile>;
+
+function parseAssistantProfiles(value: unknown): AssistantProfiles {
   const root = value as { schemaVersion?: unknown; profiles?: unknown } | null;
-  if (root?.schemaVersion !== 'manyforge.composer_assistant_profile_aliases.v1'
+  if (root?.schemaVersion !== 'manyforge.composer_assistant_profile_aliases.v2'
     || !Array.isArray(root.profiles)) {
     throw new Error('assistantProfiles must be the supported alias listing');
   }
   return Object.fromEntries(root.profiles.map((row: unknown) => {
-    const profile = row as { profileId?: unknown; modelEndpointAliases?: unknown };
-    if (typeof profile.profileId !== 'string' || !Array.isArray(profile.modelEndpointAliases)
+    const profile = row as { profileId?: unknown; chat?: unknown; modelEndpointAliases?: unknown };
+    if (typeof profile.profileId !== 'string' || typeof profile.chat !== 'boolean'
+      || !Array.isArray(profile.modelEndpointAliases)
       || profile.modelEndpointAliases.some((alias) => typeof alias !== 'string')) {
       throw new Error('assistantProfiles.profiles must name aliases per profile');
     }
-    return [profile.profileId, profile.modelEndpointAliases as string[]];
+    return [profile.profileId, {
+      chat: profile.chat,
+      modelEndpointAliases: profile.modelEndpointAliases as string[],
+    }];
   }));
 }
 
@@ -692,7 +708,7 @@ export const api = {
     get: (signal?: AbortSignal): Promise<SourceModelProjection> =>
       requestJson('/api/source-model', parseSourceModelProjection, signal),
   },
-  /** CONTRACTS §1–§2: component states and actions. */
+  /** Component states and actions. */
   components: {
     list: (signal?: AbortSignal): Promise<ComponentState[]> =>
       requestJson('/api/components', parseComponentStates, signal),
@@ -704,13 +720,25 @@ export const api = {
     groupAction: (action: ComponentAction, componentIds: readonly string[]): Promise<{ action: ComponentAction }> =>
       requestJson('/api/components/actions', parseAcceptedAction, undefined,
         { method: 'POST', body: JSON.stringify({ action, component_ids: componentIds }) }),
+    /** What Enable would have to recover first, for the operator to confirm. */
+    recoverEnablePreflight: (componentId: string, signal?: AbortSignal): Promise<RecoveryPreflight> =>
+      requestJson(`/api/components/${encodeURIComponent(componentId)}/recover-enable/preflight`,
+        parseRecoveryPreflight, signal),
+    /** 202: Recover (if confirmed) then Enable; phases arrive in `last_action`. */
+    recoverEnable: (componentId: string, confirmation: RecoveryConfirmation): Promise<{ action: ComponentAction }> =>
+      requestJson(`/api/components/${encodeURIComponent(componentId)}/recover-enable`, parseAcceptedAction,
+        undefined, { method: 'POST', body: JSON.stringify(confirmation) }),
+    /** The same, for several components one at a time in cell order; stops at the first change. */
+    recoverEnableGroup: (
+      targets: readonly { component_id: string; recovery_preflight: RecoveryConfirmation }[],
+    ): Promise<{ action: ComponentAction }> =>
+      requestJson('/api/components/recover-enable', parseAcceptedAction, undefined,
+        { method: 'POST', body: JSON.stringify({ targets }) }),
   },
-  /** CONTRACTS §5. */
   cell: {
     latch: (signal?: AbortSignal): Promise<CellLatch> =>
       requestJson('/api/cell/latch', parseCellLatch, signal),
   },
-  /** CONTRACTS §7. */
   io: {
     list: (signal?: AbortSignal): Promise<SignalSample[]> =>
       requestJson('/api/io', parseSignalSamples, signal),
@@ -718,12 +746,11 @@ export const api = {
       requestJson(`/api/io/${encodeURIComponent(signalId)}/set`, parseSetOutputResult, undefined,
         { method: 'POST', body: JSON.stringify({ value }) }),
   },
-  /** CONTRACTS §10. */
   readiness: {
     get: (signal?: AbortSignal): Promise<RunReadiness> =>
       requestJson('/api/program/readiness', parseRunReadiness, signal),
   },
-  /** CONTRACTS §11: the one server-side Apply path for Apply, Load and New. */
+  /** The one server-side Apply path for Apply, Load and New. */
   cellApply: {
     preview: (): Promise<ApplyPreview> =>
       requestJson('/api/deployment/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
@@ -787,6 +814,10 @@ export const api = {
       ),
   },
   programWorkspace: {
+    validate: (authoring: unknown, signal?: AbortSignal) => requestJson(
+      '/api/program/validate', parseObjectResponse, signal,
+      { method: 'POST', body: JSON.stringify({ authoring }) },
+    ),
     get: (signal?: AbortSignal): Promise<ProgramWorkspaceResponse> =>
       requestJson(
         '/api/program/workspace',
@@ -953,8 +984,8 @@ export const api = {
     ),
   },
   deploymentWorkspace: {
-    assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfileAliases> =>
-      requestJson('/api/deployment/assistant-profiles', parseAssistantProfileAliases, signal),
+    assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfiles> =>
+      requestJson('/api/deployment/assistant-profiles', parseAssistantProfiles, signal),
     get: (signal?: AbortSignal): Promise<DeploymentWorkspaceResponse> =>
       requestJson(
         '/api/deployment/workspace',
@@ -1220,6 +1251,8 @@ export const api = {
   assistant: {
     modes: (signal?: AbortSignal): Promise<AssistantModeIndex> =>
       requestJson('/api/assistant/modes', parseAssistantModeIndex, signal),
+    mode: (mode: string, signal?: AbortSignal): Promise<AssistantModeDetail> =>
+      requestJson(`/api/assistant/modes/${encodeURIComponent(mode)}`, parseAssistantModeDetail, signal),
     submit: (
       body: AssistantRequestInput,
       signal?: AbortSignal,
@@ -1385,6 +1418,10 @@ export const api = {
         const authoredJointNames = participant.payload.motion.kind === 'joint_goal'
           ? participant.payload.motion.joint_names
           : null;
+        if (receipt.resolvedTcp.source === 'joint_flange_fallback'
+          && authoredJointNames === null) {
+          throw new Error('joint flange fallback is only valid for a joint-goal preview');
+        }
         if (
           receipt.requestId !== intent.request_context.request_id
           || receipt.requestOwnerEpoch
@@ -1395,8 +1432,8 @@ export const api = {
           || receipt.programRunId !== intent.program_run_id
           || receipt.graphRevision !== intent.expected_graph_revision
           || receipt.retainedBundleId !== intent.expected_retained_bundle_id
-          || receipt.componentRoleId !== participant.component_role_id
-          || receipt.targetRoleId !== participant.target_role_id
+          || receipt.target.componentId !== participant.target.component_id
+          || receipt.target.commandTargetId !== participant.target.command_target_id
           || receipt.requiredCapabilityId
             !== participant.required_capability_id
           || (authoredJointNames !== null && (
@@ -1436,8 +1473,8 @@ export const api = {
           || receipt.programRunId !== intent.program_run_id
           || receipt.graphRevision !== intent.expected_graph_revision
           || receipt.retainedBundleId !== intent.expected_retained_bundle_id
-          || receipt.componentRoleId !== participant.component_role_id
-          || receipt.targetRoleId !== participant.target_role_id
+          || receipt.target.componentId !== participant.target.component_id
+          || receipt.target.commandTargetId !== participant.target.command_target_id
           || receipt.requiredCapabilityId
             !== participant.required_capability_id
           || receipt.commandSchemaId

@@ -15,7 +15,7 @@ namespace {
 
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
   const auto path =
-      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+      std::filesystem::path(MANYFORGE_CORE_TEST_GOLDEN_DIR) / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
   std::string bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
   if (bytes.ends_with('\n')) {
@@ -36,8 +36,6 @@ namespace {
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
       base.retained_bundle_id,
       base.graph_revision,
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -48,7 +46,7 @@ namespace {
       {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision")}},
       {},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("base")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "robot_base"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
                                  std::string("joint_1"), "joint_1", CoordinateKind::kAngular},

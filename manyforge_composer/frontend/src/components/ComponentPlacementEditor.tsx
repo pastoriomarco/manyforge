@@ -158,7 +158,7 @@ function CollisionExclusionsField({ componentId, pairs, disabled, write }: {
 }
 
 /**
- * The Components page editors (plan, "Authoring and Apply"): base position
+ * The Components page editors: base position
  * and orientation, mount and primary tool, lane, Remove. Each is a Draft edit;
  * Preview shows the per-component impact and Apply sends it through the one
  * server-side path, after which the affected components come back prepared.
@@ -269,7 +269,7 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
           )}
         </fieldset>
       )}
-      {/* A member runs on its owner's lane (CONTRACTS §16): no lane of its own. */}
+      {/* A member runs on its owner's lane: no lane of its own. */}
       {row.owner === null && <label className="deployment-focused-field">
         <span>Lane</span>
         <select aria-label={`${id} lane`} disabled={disabled || lanes === undefined || lanes.length === 0}
@@ -281,7 +281,7 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
         {lanes === undefined && <small>The component catalog does not list this model's lanes.</small>}
       </label>}
       <div className="dactions">
-        {/* A machine member is never removed on its own, only deactivated (AUD-5b revised). */}
+        {/* A machine member is never removed on its own, only deactivated. */}
         {row.owner === null && (
           <button type="button" disabled={disabled} onClick={() => { void remove(); }}>Remove from Draft</button>
         )}

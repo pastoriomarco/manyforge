@@ -200,6 +200,12 @@ class RuntimeCollisionLookaheadSession final {
                                    ResultCallback callback, AuthorityCallback authority_callback);
   ~RuntimeCollisionLookaheadSession();
 
+  // Only the owning ExecutionKernel calls this from a non-worker thread;
+  // it cancels and joins before scheduler teardown.
+  void detach();
+  [[nodiscard]] bool is_worker_thread() const noexcept;
+  [[nodiscard]] static bool in_any_worker_thread() noexcept;
+
   RuntimeCollisionLookaheadSession(const RuntimeCollisionLookaheadSession&) = delete;
   RuntimeCollisionLookaheadSession& operator=(const RuntimeCollisionLookaheadSession&) = delete;
 
@@ -300,6 +306,7 @@ class RuntimeCollisionLookaheadSession final {
   std::vector<std::int64_t> waypoint_times_scratch_;
   std::uint64_t indexed_arm_generation_ = 0;
 
+  std::atomic<bool> closing_{false};
   mutable std::mutex mutex_;
   std::condition_variable_any cv_;
   ArmState arm_;

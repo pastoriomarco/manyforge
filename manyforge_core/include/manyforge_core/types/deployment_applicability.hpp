@@ -265,7 +265,7 @@ struct CommissionedStopInterfaceDTO final {
                          const CommissionedStopInterfaceDTO&) = default;
 };
 
-/// Grouping projection for deployment-level C0.2n input tables.
+/// Grouping projection for deployment-level input tables.
 ///
 /// This is not another artifact envelope or graph kind. The deployment codec
 /// retains the three independently normalized arrays used to rebuild the

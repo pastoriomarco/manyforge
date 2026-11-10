@@ -4,7 +4,7 @@
 
 namespace manyforge::core {
 
-/// Configuration for the trajectory cache (spec 230 §3.1).
+/// Configuration for the trajectory cache.
 struct CacheConfig {
   size_t max_entries = 1000;  // safety bound
 };

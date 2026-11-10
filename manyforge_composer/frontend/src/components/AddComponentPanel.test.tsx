@@ -5,7 +5,6 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { JsonValue } from '../types/api';
 import type { ComponentCatalog, ComponentCatalogEntry } from '../types/componentCatalog';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
-import { roleFeedback, componentManagerRows } from '../utils/componentManager';
 import { AddComponentPanel } from './AddComponentPanel';
 
 const robotRow = {
@@ -84,6 +83,33 @@ const sensor: ComponentCatalogEntry = {
   components: [sensorRow],
 };
 
+const assistantRow = {
+  component_id: 'assistant',
+  component_profile_id: 'manyforge.assistant',
+  target_settings: {},
+  configuration: { runtime_kind: 'assistant', runtime_configuration: {} },
+};
+
+const assistant: ComponentCatalogEntry = {
+  entryId: 'model/manyforge.assistant',
+  kind: 'assistant',
+  componentId: 'assistant',
+  componentProfileId: 'manyforge.assistant',
+  modelFamilyId: null,
+  tags: [],
+  lane: null,
+  description: 'AI assistant (Composer chat bridge)',
+  sources: ['components/assistant/manyforge.assistant/component.yaml'],
+  components: [assistantRow],
+};
+
+const aiModelRow = (componentId: string) => ({
+  component_id: componentId,
+  component_profile_id: 'ai_model_v0',
+  target_settings: {},
+  configuration: { runtime_kind: 'ai_model', runtime_configuration: { base_url: 'http://127.0.0.1:8000/v1', model: 'm' } },
+});
+
 const mountRow = (robotId: string, toolId: string) => ({
   parent: { component_id: robotId, interface: 'flange' },
   child: { component_id: toolId, interface: 'mount' },
@@ -92,7 +118,7 @@ const mountRow = (robotId: string, toolId: string) => ({
 const catalog: ComponentCatalog = {
   schemaVersion: 'manyforge.composer_component_catalog.v1',
   projectRoot: '/projects/cell.scenario',
-  entries: [robot, tool, sensor],
+  entries: [robot, tool, sensor, assistant],
   machines: [{
     modelId: 'ufactory.lite6_machine', title: 'UFactory Lite 6', lanes: ['mock', 'real'],
     defaultOwnerId: 'lite6',
@@ -118,7 +144,6 @@ afterEach(() => vi.unstubAllGlobals());
 
 async function mount(components: JsonValue[], {
   apiVersion = 'manyforge.deployment_intent.v2',
-  assignment = null as Record<string, JsonValue> | null,
   attachments = [] as JsonValue[],
 } = {}) {
   const document = {
@@ -136,17 +161,12 @@ async function mount(components: JsonValue[], {
     busy: false,
     addComponents: vi.fn().mockResolvedValue({}),
   } as unknown as DeploymentWorkspaceController;
-  const rows = componentManagerRows(document, null, catalog.componentProfiles);
-  const feedback = roleFeedback(
-    { robot: { required_component_type_tags: ['articulated-arm'] } },
-    assignment, rows, catalog.componentProfiles,
-  );
   const onAdded = vi.fn();
   const { host, find, all } = reactPropsHost();
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   await act(() => root.render(<AddComponentPanel controller={controller} catalog={catalog}
-    catalogError={null} feedback={feedback} onAdded={onAdded} />));
+    catalogError={null} onAdded={onAdded} />));
   const control = (label: string) => find((props) => props['aria-label'] === label);
   return {
     controller, control, all, find, onAdded,
@@ -227,6 +247,43 @@ describe('Add component', () => {
     } finally { await mounted.unmount(); }
   });
 
+  it('adds the AI assistant with the only AI model and the default chat profile; refuses without an AI model', async () => {
+    const none = await mount([]);
+    try {
+      await none.click('Add component');
+      await none.kind('AI assistant');
+      await none.pick();
+      await none.click('Add to Draft');
+      expect(none.controller.addComponents).not.toHaveBeenCalled();
+      expect(alerts(none.all)).toEqual(['Add an AI model component first.']);
+    } finally { await none.unmount(); }
+    const one = await mount([aiModelRow('assistant_model')]);
+    try {
+      await one.click('Add component');
+      await one.kind('AI assistant');
+      await one.pick();
+      await one.click('Add to Draft');
+      expect(one.controller.addComponents).toHaveBeenCalledExactlyOnceWith([{
+        ...assistantRow,
+        configuration: { runtime_kind: 'assistant', runtime_configuration: {
+          model_component_id: 'assistant_model', assistant_profile_id: 'assistant_scene_authoring' } },
+      }], []);
+    } finally { await one.unmount(); }
+    // Several AI models: the model is chosen on the assistant's page.
+    const two = await mount([aiModelRow('chat_model'), aiModelRow('selection_model')]);
+    try {
+      await two.click('Add component');
+      await two.kind('AI assistant');
+      await two.pick();
+      await two.click('Add to Draft');
+      expect(two.controller.addComponents).toHaveBeenCalledExactlyOnceWith([{
+        ...assistantRow,
+        configuration: { runtime_kind: 'assistant',
+          runtime_configuration: { assistant_profile_id: 'assistant_scene_authoring' } },
+      }], []);
+    } finally { await two.unmount(); }
+  });
+
   it('adds a catalog robot to the Draft with one edit and opens its page', async () => {
     const mounted = await mount([]);
     try {
@@ -256,18 +313,6 @@ describe('Add component', () => {
       const [rows] = vi.mocked(mounted.controller.addComponents).mock.calls[0];
       expect(rows[0].component_id).toBe('lite6_robot_2');
       expect(JSON.stringify(rows[0])).not.toContain('"lite6_robot"');
-    } finally { await mounted.unmount(); }
-  });
-
-  it('proposes the id an open Program role is assigned to', async () => {
-    const mounted = await mount([], {
-      assignment: { component_roles: [{ component_role_id: 'robot', controllable_component_id: 'arm_a' }] },
-    });
-    try {
-      await mounted.click('Add component');
-      expect(String(mounted.find((props) => props.role === 'option').title)).toBe('Mock Lite6');
-      await mounted.pick();
-      expect(mounted.control('Component id for lite6_robot').value).toBe('arm_a');
     } finally { await mounted.unmount(); }
   });
 

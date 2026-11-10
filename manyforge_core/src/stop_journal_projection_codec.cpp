@@ -805,7 +805,7 @@ template <typename T, typename Decode>
                  return V(std::move(rows));
                }),
            structured_value(v.diagnostics)};
-  // Q51 journal layout: twelve fields (jerk activation, jerk limits and the
+  // Journal layout: twelve fields (jerk activation, jerk limits and the
   // per-profile `max_stop_time_s` always present); older layouts are refused.
   if (!v.jerk_limits_enabled && !v.per_joint_max_jerk.empty()) {
     bad("unreviewed Stop profile cannot carry new jerk limits");

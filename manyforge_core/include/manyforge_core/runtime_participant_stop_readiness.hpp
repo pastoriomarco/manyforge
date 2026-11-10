@@ -10,9 +10,10 @@
 namespace manyforge::core {
 
 /// Complete readiness input for preparing Stop products for one exact runtime
-/// participant. CCLC supplies the repository-verified base plan and the
-/// lifecycle generation from the same reconciled component/configuration
-/// closure; the Kernel never discovers either value on the Stop path.
+/// participant. The execution host supplies the repository-verified base
+/// plan and lifecycle generation from the same reconciled component and
+/// configuration closure; the Kernel never discovers either value on the
+/// Stop path.
 struct RuntimeParticipantStopReadinessDTO final {
   ControllableComponentId controllable_component_id;
   ComponentLifecycleGeneration component_lifecycle_generation;
@@ -51,8 +52,8 @@ class RuntimeParticipantStopReadiness final {
                                                        ComponentLifecycleGeneration);
 };
 
-/// Re-issue already verified readiness for a CCLC lifecycle transition. The
-/// verified base plan, participant and controller-domain joins are unchanged:
+/// Re-issue verified readiness after a component lifecycle transition. The
+/// base plan, participant and controller-domain joins stay unchanged:
 /// a Prepare/Enable/Disable advances only the component lifecycle generation,
 /// so engines, route configurations and Stop-plan bytes are reused as-is.
 [[nodiscard]] Result<RuntimeParticipantStopReadiness>
@@ -70,7 +71,7 @@ rebind_runtime_participant_stop_readiness_product(
     const RuntimeParticipantBinding& candidate,
     const ControllerLifecycleExpectedDomain& expected_domain);
 
-/// Verify one CCLC-produced readiness value against a sealed runtime
+/// Verify one execution-host-produced readiness value against a sealed runtime
 /// participant. The verified base-plan bytes remain authoritative; this
 /// function performs no repository read, endpoint lookup, or live mutation.
 [[nodiscard]] Result<RuntimeParticipantStopReadiness> verify_runtime_participant_stop_readiness(

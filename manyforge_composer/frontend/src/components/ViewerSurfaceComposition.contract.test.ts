@@ -7,7 +7,7 @@ function source(path: string): string {
   return readFileSync(new URL(path, import.meta.url), 'utf8');
 }
 
-describe('UI4 application and viewport composition', () => {
+describe('application and viewport composition', () => {
   it('keeps one persistent viewer and moves detailed surfaces into the split inspector', () => {
     const app = source('../App.tsx');
     const viewer = source('./StructuralViewer.tsx');
@@ -64,7 +64,7 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toContain('--inspector-row-padding: 0.34rem;');
     expect(styles).toMatch(/\.central-inspector-section \.program-property \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
     expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-joint \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
-    // Inspector warnings use the shared warning notice (UI6-I-VC VC4).
+    // Inspector warnings use the shared warning notice.
     expect(styles).toContain('.notice.severity-warning');
     // Notifications sit below the floating viewer controls with their insets.
     expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: calc\(1\.9rem \+ 2 \* 0\.45rem\);[\s\S]*?left: 0\.45rem;/);
@@ -112,7 +112,7 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain("'Halting' : 'Halt'");
     expect(transport).toContain('program.fullStop()');
     expect(transport).toContain('program.resumeFullStop()');
-    // Cell Full Stop left the run details (operator decision 2026-09-28).
+    // Cell Full Stop left the run details.
     expect(transport).not.toContain("robot.fullStop()");
     expect(transport).not.toContain('transport-stop-disclosure');
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
@@ -159,7 +159,7 @@ describe('UI4 application and viewport composition', () => {
     // Enable all above the list; the selected component's state and actions on its page.
     expect(components).toContain('<CellComponentsCard states={cellState.components}');
     expect(components).toContain('<ComponentStatePanel state={state}');
-    // App passes the one pushed cell state (CONTRACTS §1); no polling hook.
+    // App passes the one pushed cell state; no polling hook.
     expect(app).toContain('const cellState = useCellState(headlessStateSource);');
     expect(app).not.toContain('useCCLC');
   });

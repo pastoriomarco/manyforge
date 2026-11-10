@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -34,14 +35,14 @@ template <typename T>
                                              {{"reason", std::move(reason)}}});
 }
 
-/// Stable wire name of one ReferenceDTO kind (spec 210 §4.4).
+/// Stable wire name of one ReferenceDTO kind.
 [[nodiscard]] const char *
 reference_type_name(const core::ReferenceDTO::Type type) noexcept {
   switch (type) {
-  case core::ReferenceDTO::Type::kFrameRole:
-    return "frame_role";
-  case core::ReferenceDTO::Type::kComponentBodyRole:
-    return "component_body_role";
+  case core::ReferenceDTO::Type::kComponentFrame:
+    return "component_frame";
+  case core::ReferenceDTO::Type::kComponentBody:
+    return "component_body";
   case core::ReferenceDTO::Type::kSceneResource:
     return "scene_resource";
   case core::ReferenceDTO::Type::kRuntimeObject:
@@ -54,63 +55,46 @@ reference_type_name(const core::ReferenceDTO::Type type) noexcept {
   return "pose";
 }
 
-/// The complete identity of the one reference a failure is about (spec 210
-/// §5.3). `target_role_id` is set only for a robot-qualified frame role.
+/// Complete direct identity for diagnostic attribution.
 struct ReferenceIdentity final {
   std::string reference_type;
   std::string reference_id;
-  std::string target_role_id;
+  std::string component_id;
 };
 
-/// A requested reference. A cell frame is identified by the resolver's cell;
-/// an inline pose has no id.
 [[nodiscard]] ReferenceIdentity
 reference_identity(const core::ReferenceDTO &reference,
                    const core::CellId &cell_id) {
   return {reference_type_name(reference.type),
           reference.type == core::ReferenceDTO::Type::kCellFrame
-              ? cell_id.value()
-              : std::string(core::reference_identity_value(reference)),
-          reference.target.has_value()
-              ? reference.target->target_role_id.value()
-              : std::string{}};
+              ? cell_id.value() : std::string(core::reference_identity_value(reference)),
+          std::visit([](const auto &id) -> std::string {
+            using T = std::decay_t<decltype(id)>;
+            if constexpr (std::is_same_v<T, core::ProgramFrameReferenceDTO> ||
+                          std::is_same_v<T, core::ProgramCollisionBodyReferenceDTO>)
+              return id.component_id.value();
+            return {};
+          }, reference.id)};
 }
 
-/// One resolved or scene frame: the cell frame by its cell, every model frame
-/// by its frame role. `target_role_id` qualifies a frame of a declared
-/// Program target, such as the moving target's own base frame.
 template <typename Frame>
-[[nodiscard]] ReferenceIdentity
-frame_identity(const Frame &frame,
-               const core::TargetRoleId *target_role_id = nullptr) {
-  if constexpr (requires { frame.cell_id; }) {
+[[nodiscard]] ReferenceIdentity frame_identity(const Frame &frame) {
+  if constexpr (requires { frame.cell_id; })
     return {"cell_frame", frame.cell_id.value(), {}};
-  } else if constexpr (requires { frame.controllable_component_id; }) {
-    return {"frame_role", frame.frame_role_id.value(),
-            target_role_id != nullptr ? target_role_id->value()
-                                      : std::string{}};
-  } else {
-    // A passive model frame belongs to no Program target.
+  else if constexpr (requires { frame.controllable_component_id; })
+    return {"component_frame", frame.frame_role_id.value(), frame.controllable_component_id.value()};
+  else
     return {"frame_role", frame.frame_role_id.value(), {}};
-  }
 }
 
 template <typename... Frames>
-[[nodiscard]] ReferenceIdentity
-frame_identity(const std::variant<Frames...> &frame,
-               const core::TargetRoleId *target_role_id = nullptr) {
-  return std::visit(
-      [&](const auto &selected) {
-        return frame_identity(selected, target_role_id);
-      },
-      frame);
+[[nodiscard]] ReferenceIdentity frame_identity(const std::variant<Frames...> &frame) {
+  return std::visit([](const auto &selected) { return frame_identity(selected); }, frame);
 }
 
-/// The moving target's own base frame, named with that target's role so a
-/// base-frame failure is never read as a frame of another robot.
 [[nodiscard]] ReferenceIdentity
 base_frame_identity(const core::ResolvedExecutionBindingDTO &binding) {
-  return frame_identity(binding.base_frame, &binding.target_role_id);
+  return frame_identity(binding.base_frame);
 }
 
 /// One runtime-object binding of a capture, by its runtime-object key.
@@ -121,7 +105,7 @@ runtime_object_identity(const core::RuntimeObjectId &runtime_object_id) {
           {}};
 }
 
-/// Attaches `about` to a failure. Attribution is opt-in (spec 210 §5.3): only
+/// Attaches `about` to a failure. Attribution is opt-in: only
 /// a site that knows which one reference failed passes its identity, so every
 /// other failure, including any new one, names no reference. The identity is
 /// written whole and never mixed with another reference's fields.
@@ -129,10 +113,10 @@ runtime_object_identity(const core::RuntimeObjectId &runtime_object_id) {
                                              const ReferenceIdentity &about) {
   error.details["reference_type"] = about.reference_type;
   error.details["reference_id"] = about.reference_id;
-  if (about.target_role_id.empty()) {
-    error.details.erase("target_role_id");
+  if (about.component_id.empty()) {
+    error.details.erase("component_id");
   } else {
-    error.details["target_role_id"] = about.target_role_id;
+    error.details["component_id"] = about.component_id;
   }
   return error;
 }
@@ -313,17 +297,9 @@ find_attachment(const core::LogicalSceneSnapshotDTO &scene,
 } // namespace
 
 core::ResolvedComponentModelFrameDTO program_binding_frame(
-    const std::vector<RetainedSceneFrameModelOwnerInput> &model_owners,
-    const core::ControllableComponentId &binding_component,
-    const core::ProgramFrameRoleBindingDTO &frame) {
-  const auto found = std::find_if(
-      model_owners.begin(), model_owners.end(), [&](const auto &row) {
-        return row.model_instance_id == frame.model_instance_id;
-      });
-  auto owner = found != model_owners.end() ? found->controllable_component_id
-                                           : binding_component;
+    const core::ProgramFrameBindingDTO &frame) {
   return core::ResolvedComponentModelFrameDTO{
-      std::move(owner), frame.model_instance_id, frame.frame_role_id,
+      frame.reference.component_id, frame.model_instance_id, frame.reference.frame_id,
       frame.compiled_frame_name, frame.model_revision};
 }
 
@@ -396,42 +372,25 @@ public:
   /// target map. A robot hosted elsewhere is refused by name. A failure to
   /// find the frame names `about`; a malformed reference names nothing.
   [[nodiscard]] core::Result<core::ResolvedFrameDTO>
-  RobotFrame(const core::ReferenceTargetDTO &target,
-             const core::FrameRoleId &frame_role_id,
+  RobotFrame(const core::ProgramFrameReferenceDTO &reference,
              const ReferenceIdentity &about) const {
-    if (!target.complete() || frame_role_id.empty()) {
+    if (reference.component_id.empty() || reference.frame_id.empty())
       return resolution_error<core::ResolvedFrameDTO>(
-          "program_reference_shape_invalid",
-          "robot-qualified frame reference is incomplete");
-    }
-    if (!HostsRobot(target.controllable_component_id)) {
-      return resolution_error<core::ResolvedFrameDTO>(
-          "program_reference_robot_not_local",
-          "frame reference names a robot that is not hosted by this cell "
-          "resolver",
-          about);
-    }
-    const RetainedTargetSceneFrameInput *selected = nullptr;
-    for (const auto &candidate : input_.target_frames) {
-      if (candidate.controllable_component_id !=
-              target.controllable_component_id ||
-          candidate.command_target_id != target.command_target_id ||
-          candidate.target_frame_role_id != frame_role_id) {
-        continue;
-      }
-      if (selected != nullptr) {
+          "program_reference_shape_invalid", "component frame reference is incomplete");
+    const core::ResolvedComponentModelFrameDTO *selected = nullptr;
+    for (const auto &path : input_.frame_paths) {
+      const auto *candidate = std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
+      if (!candidate || candidate->controllable_component_id != reference.component_id ||
+          candidate->frame_role_id != reference.frame_id) continue;
+      if (selected != nullptr && *selected != *candidate)
         return ambiguous_resolution_error<core::ResolvedFrameDTO>(
-            "program_reference_robot_frame_ambiguous",
-            "robot frame role maps to multiple retained frames", about);
-      }
-      selected = &candidate;
+            "frame_missing", "component frame maps to multiple retained frames", about);
+      selected = candidate;
     }
-    if (selected == nullptr) {
-      return resolution_error<core::ResolvedFrameDTO>(
-          "program_reference_robot_frame_missing",
-          "robot frame role is absent from the retained target map", about);
-    }
-    return core::Result<core::ResolvedFrameDTO>::Ok(selected->frame);
+    if (!selected)
+      return core::Result<core::ResolvedFrameDTO>::Err(about_reference(
+          core::ErrorDTO{"frame_missing", "component frame is absent from the retained model", {}}, about));
+    return core::Result<core::ResolvedFrameDTO>::Ok(*selected);
   }
 
   [[nodiscard]] core::Result<void>
@@ -1014,12 +973,12 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
     return core::Result<void>::Ok();
   };
 
-  const auto frame_for_role = [&](const core::FrameRoleId &role,
+  const auto frame_for_role = [&](const core::ProgramFrameReferenceDTO &role,
                                   const ReferenceIdentity &about)
       -> core::Result<core::ResolvedFrameDTO> {
-    const core::ProgramFrameRoleBindingDTO *selected = nullptr;
-    for (const auto &candidate : capture.binding.frame_role_bindings) {
-      if (candidate.frame_role_id != role) {
+    const core::ProgramFrameBindingDTO *selected = nullptr;
+    for (const auto &candidate : capture.binding.program_frame_bindings) {
+      if (candidate.reference != role) {
         continue;
       }
       if (selected != nullptr) {
@@ -1034,9 +993,7 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
           "program_frame_role_missing",
           "Program frame role is absent from the exact binding", about);
     }
-    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(
-        impl_->input_.model_owners, capture.binding.controllable_component_id,
-        *selected));
+    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(*selected));
   };
 
   const auto capture_carrier_for_resource =
@@ -1111,17 +1068,15 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
       [&](const core::ReferenceDTO &reference) -> core::Result<void> {
     const auto about = reference_identity(reference, impl_->input_.cell_id);
     switch (reference.type) {
-    case core::ReferenceDTO::Type::kFrameRole: {
-      const auto &role = std::get<core::FrameRoleId>(reference.id);
-      auto frame = reference.target.has_value()
-                       ? impl_->RobotFrame(*reference.target, role, about)
-                       : frame_for_role(role, about);
+    case core::ReferenceDTO::Type::kComponentFrame: {
+      const auto &role = std::get<core::ProgramFrameReferenceDTO>(reference.id);
+      auto frame = frame_for_role(role, about);
       if (!frame.ok()) {
         return core::Result<void>::Err(frame.error());
       }
       return capture_resolved_frame(frame.value(), about);
     }
-    case core::ReferenceDTO::Type::kComponentBodyRole:
+    case core::ReferenceDTO::Type::kComponentBody:
     case core::ReferenceDTO::Type::kPose:
     case core::ReferenceDTO::Type::kCellFrame:
       return core::Result<void>::Ok();
@@ -1222,7 +1177,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
   }
   // Each lookup of the requested reference names it when it fails; the base
   // frame's lookup names the base frame. A context or state failure met on
-  // the way names no reference (spec 210 §4.4).
+  // the way names no reference.
   const auto about = reference_identity(reference, impl_->input_.cell_id);
 
   // Finding a frame's captured view is about `owner`, the reference the
@@ -1281,11 +1236,11 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
     return base_in_cell;
   }
 
-  const auto frame_for_role = [&](const core::FrameRoleId &role)
+  const auto frame_for_role = [&](const core::ProgramFrameReferenceDTO &role)
       -> core::Result<core::ResolvedFrameDTO> {
-    const core::ProgramFrameRoleBindingDTO *selected = nullptr;
-    for (const auto &candidate : context.binding.frame_role_bindings) {
-      if (candidate.frame_role_id != role) {
+    const core::ProgramFrameBindingDTO *selected = nullptr;
+    for (const auto &candidate : context.binding.program_frame_bindings) {
+      if (candidate.reference != role) {
         continue;
       }
       if (selected != nullptr) {
@@ -1300,9 +1255,7 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
           "program_frame_role_missing",
           "Program frame role is absent from the exact binding", about);
     }
-    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(
-        impl_->input_.model_owners, context.binding.controllable_component_id,
-        *selected));
+    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(*selected));
   };
 
   const auto start_coordinates =
@@ -1390,11 +1343,9 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
       resolution_error<core::Pose3DTO>("program_reference_type_invalid",
                                        "Program reference type is invalid");
   switch (reference.type) {
-  case core::ReferenceDTO::Type::kFrameRole: {
-    const auto &role = std::get<core::FrameRoleId>(reference.id);
-    auto frame = reference.target.has_value()
-                     ? impl_->RobotFrame(*reference.target, role, about)
-                     : frame_for_role(role);
+  case core::ReferenceDTO::Type::kComponentFrame: {
+    const auto &role = std::get<core::ProgramFrameReferenceDTO>(reference.id);
+    auto frame = frame_for_role(role);
     if (!frame.ok()) {
       return core::Result<core::Pose3DTO>::Err(frame.error());
     }
@@ -1404,11 +1355,11 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
   case core::ReferenceDTO::Type::kCellFrame:
     target_in_cell = core::Result<core::Pose3DTO>::Ok(core::Pose3DTO{});
     break;
-  case core::ReferenceDTO::Type::kComponentBodyRole: {
-    const auto &role = std::get<core::CollisionBodyRoleId>(reference.id);
-    const core::ProgramCollisionBodyRoleBindingDTO *selected = nullptr;
-    for (const auto &candidate : context.binding.collision_body_role_bindings) {
-      if (candidate.collision_body_role_id != role) {
+  case core::ReferenceDTO::Type::kComponentBody: {
+    const auto &role = std::get<core::ProgramCollisionBodyReferenceDTO>(reference.id);
+    const core::ProgramCollisionBodyBindingDTO *selected = nullptr;
+    for (const auto &candidate : context.binding.program_collision_body_bindings) {
+      if (candidate.reference != role) {
         continue;
       }
       if (selected != nullptr) {
@@ -1734,7 +1685,7 @@ RetainedSceneFrameResolver::ResolveFrameTransform(
         resolved.value().frame_pose_in_cell);
   };
   // Each lookup of a requested frame names that frame when it fails; a
-  // context or state failure met on the way names none (spec 210 §4.4).
+  // context or state failure met on the way names none.
   const auto frame_in_cell =
       [&](const core::ReferenceDTO &reference) -> core::Result<core::Pose3DTO> {
     const auto about = reference_identity(reference, impl_->input_.cell_id);
@@ -1754,12 +1705,9 @@ RetainedSceneFrameResolver::ResolveFrameTransform(
     switch (reference.type) {
     case core::ReferenceDTO::Type::kCellFrame:
       return core::Result<core::Pose3DTO>::Ok(core::Pose3DTO{});
-    case core::ReferenceDTO::Type::kFrameRole: {
-      if (!reference.target.has_value()) {
-        return unsupported();
-      }
+    case core::ReferenceDTO::Type::kComponentFrame: {
       auto frame = impl_->RobotFrame(
-          *reference.target, std::get<core::FrameRoleId>(reference.id), about);
+          std::get<core::ProgramFrameReferenceDTO>(reference.id), about);
       if (!frame.ok()) {
         return core::Result<core::Pose3DTO>::Err(frame.error());
       }
@@ -1813,7 +1761,7 @@ RetainedSceneFrameResolver::ResolveFrameTransform(
       return core::Result<core::Pose3DTO>::Ok(core::multiply_poses(
           carrier.value(), attachment->pose_in_carrier_frame));
     }
-    case core::ReferenceDTO::Type::kComponentBodyRole:
+    case core::ReferenceDTO::Type::kComponentBody:
     case core::ReferenceDTO::Type::kRuntimeObject:
     case core::ReferenceDTO::Type::kPose:
       return unsupported();

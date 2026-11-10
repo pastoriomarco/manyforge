@@ -1,4 +1,4 @@
-"""Parity tests for the immutable C0.2i ComponentType boundary."""
+"""Parity tests for the immutable ComponentType boundary."""
 
 from __future__ import annotations
 

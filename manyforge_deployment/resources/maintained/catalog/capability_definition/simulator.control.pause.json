@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:155d3628cea7b682bd95c1126776aa7314e751fadf9b383e3e3730894fe7c9d3",
+  "capability_id": "simulator.control.pause",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

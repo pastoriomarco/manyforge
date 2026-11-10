@@ -15,10 +15,10 @@ class PickPlaceTemplateError(ValueError):
 
 _COMMON_REQUIRED = frozenset(
     {
-        "target_role",
-        "tool_target_role",
-        "base_frame_role",
-        "carrier_frame_role",
+        "target",
+        "tool_target",
+        "base_frame",
+        "carrier_frame_ref",
         "selected_object_id",
         "tool_position",
     }
@@ -46,11 +46,11 @@ _SPECIFIC = {
 }
 _STATIC_FIELDS = frozenset(
     {
-        "target_role",
-        "tool_target_role",
-        "base_frame_role",
+        "target",
+        "tool_target",
+        "base_frame",
         "tcp_endpoint",
-        "carrier_frame_role",
+        "carrier_frame_ref",
         "contact_policy_id",
         "planner",
     }
@@ -72,7 +72,7 @@ def build_pick_place_subtree(
     parameters: Mapping[str, Any],
     value_sources: Mapping[str, Mapping[str, Any]] | None,
     result_key: str,
-    touch_body_roles: Sequence[str] = (),
+    touch_bodies: Sequence[Mapping[str, str]] = (),
     child_prefix: str | None = None,
     wrapper_fields: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -99,24 +99,29 @@ def build_pick_place_subtree(
             f"{dynamic_static}"
         )
     try:
-        tcp_selection = motion_tcp_selection(values)
+        tcp_selection = motion_tcp_selection(values, direct_references=True)
     except ProgramValidationError as exc:
         raise PickPlaceTemplateError(str(exc)) from exc
     if "motion_options" in sources:
         raise PickPlaceTemplateError(
             "dynamic legacy motion_options cannot be split safely across ordinary nodes"
         )
-    touch_roles = list(touch_body_roles)
-    if kind == "pick" and not touch_roles:
-        raise PickPlaceTemplateError("Pick requires at least one touch body role")
-    if kind == "place" and touch_roles:
-        raise PickPlaceTemplateError("Place does not accept touch body roles")
-    if (
-        any(type(role) is not str or not role for role in touch_roles)
-        or touch_roles != sorted(set(touch_roles))
+    touch_bodies_value = list(touch_bodies)
+    if kind == "pick" and not touch_bodies_value:
+        raise PickPlaceTemplateError("Pick requires at least one touch body")
+    if kind == "place" and touch_bodies_value:
+        raise PickPlaceTemplateError("Place does not accept touch bodies")
+    if any(
+        type(body) is not dict
+        or set(body) != {"component_id", "collision_body_id"}
+        or any(type(value) is not str or not value for value in body.values())
+        for body in touch_bodies_value
     ):
+        raise PickPlaceTemplateError("touch bodies must be direct collision-body references")
+    body_keys = [(body["component_id"], body["collision_body_id"]) for body in touch_bodies_value]
+    if body_keys != sorted(set(body_keys)):
         raise PickPlaceTemplateError(
-            "touch body roles must be a canonical non-empty string set"
+            "touch bodies must be a canonical set"
         )
     wrapper_values = deepcopy(dict(wrapper_fields or {}))
     unknown_wrapper_fields = sorted(set(wrapper_values) - _WRAPPER_FIELDS)
@@ -135,8 +140,8 @@ def build_pick_place_subtree(
     if type(motion_options) is not dict:
         raise PickPlaceTemplateError("motion_options must be one object")
     common_motion = {
-        "target_role": literal("target_role"),
-        "base_frame_role": literal("base_frame_role"),
+        "target": literal("target"),
+        "base_frame": literal("base_frame"),
         **deepcopy(tcp_selection),
         **deepcopy(planner),
     }
@@ -156,10 +161,10 @@ def build_pick_place_subtree(
     plan_parameters = {
         name: literal(name)
         for name in (
-            "target_role",
-            "tool_target_role",
-            "base_frame_role",
-            "carrier_frame_role",
+            "target",
+            "tool_target",
+            "base_frame",
+            "carrier_frame_ref",
         )
     }
     plan_parameters.update(deepcopy(tcp_selection))
@@ -186,9 +191,9 @@ def build_pick_place_subtree(
 
     def motion_parameters(phase: str) -> dict[str, Any]:
         result = deepcopy(common_motion)
-        result["velocity_scale"] = motion_options.get(
-            f"{phase}_velocity_scale", 0.35
-        )
+        # Without a phase speed the move inherits the Program motion default.
+        if f"{phase}_velocity_scale" in motion_options:
+            result["velocity_scale"] = motion_options[f"{phase}_velocity_scale"]
         return result
 
     approach_parameters = motion_parameters("approach")
@@ -197,7 +202,7 @@ def build_pick_place_subtree(
     if kind == "pick":
         descend_parameters["contact_policy_id"] = literal("contact_policy_id")
 
-    gripper_parameters = {"target_role": literal("tool_target_role")}
+    gripper_parameters = {"target": literal("tool_target")}
     gripper_sources: dict[str, dict[str, Any]] = {
         "position": {
             "kind": "blackboard_field",
@@ -283,11 +288,11 @@ def build_pick_place_subtree(
             ),
             "instance_id": f"{generated_prefix}.{scene_suffix}",
             "parameters": {
-                "target_role": literal("tool_target_role"),
+                "target": literal("tool_target"),
                 **(
                     {
-                        "carrier_frame_role": literal("carrier_frame_role"),
-                        "touch_body_roles": deepcopy(touch_roles),
+                        "carrier_frame_ref": literal("carrier_frame_ref"),
+                        "touch_bodies": deepcopy(touch_bodies_value),
                     }
                     if kind == "pick"
                     else {}

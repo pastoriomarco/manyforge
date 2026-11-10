@@ -1,20 +1,18 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Isaac Sim UR10e pick and place with a Robotiq gripper in the light scene, driven through ROS 2 control. Start Isaac, then Load and Execute the Program.",
   "members": {
-    "assignment.yaml": "sha256:69c7b89118188759f118a3c642b33183fbb9ca2942544dc12c7d717b8b1c7b01",
     "deployment.yaml": "sha256:104ae27ee877d7061348072d6d2c1177f3a9fb1e3b8e0dba43404b3ac31aa795",
-    "program.yaml": "sha256:0b184d66b8a6f0c6b3385d8559583ac2e15971e8dedfad762faa2dc363367cd6"
+    "program.yaml": "sha256:2572d418a844cd16bb695c074986a50f8657f94bc1782fd02f8f50d46ee39f60"
   },
   "name": "sim_ur10e_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:ac35754a841641e3c68762f6a1c40175893b866a70253bdc442e2e579d1cbe28",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:2adfea97bab49ba1a20040f3fbf0ad068d67f78bb37dec1b0108619530dcdfb8",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "sim_ur10e_pick_and_place",

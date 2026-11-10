@@ -37,14 +37,16 @@ enum class IoFreshnessMode { kSampleAge, kProviderValidity };
 /// Receipt/liveness evidence is independent of whether a value changes.
 enum class IoSignalLivenessMode { kInProcess, kPeriodic, kChangeOnly };
 
-/// CONTRACTS §7 sample source: `device` = read from the device;
-/// `manyforge_write` = our accepted write, not yet seen differently; `outside`
-/// = changed outside ManyForge; `last_write` = no read-back exists, so this is
-/// the last accepted write. Adapters report it; the core never infers it.
-enum class IoSignalSampleSource { kDevice, kManyforgeWrite, kOutside, kLastWrite };
+/// Sample source: `device` = read from the device; `manyforge_write` = our
+/// accepted write, not yet seen differently; `outside` = changed outside
+/// ManyForge; `not_readable` = an output without read-back (no value is shown,
+/// and the last write is never shown as if it were the device's state). Adapters
+/// report `device`, `manyforge_write` and `outside`; the core derives
+/// `not_readable` from the declared descriptor, never from an adapter report.
+enum class IoSignalSampleSource { kDevice, kManyforgeWrite, kOutside, kNotReadable };
 
 /// The core-held signal of an output with read-back that isn't controller
-/// owned (CONTRACTS §7, plan V2-7) is named `<output name>` + this suffix.
+/// owned is named `<output name>` + this suffix.
 inline constexpr std::string_view kChangedOutsideSignalSuffix = ".changed_outside";
 
 struct IoFreshnessContractDTO final {
@@ -65,7 +67,7 @@ struct IoSignalDescriptorDTO final {
   /// Required for inputs, absent for outputs. Source-kind qualification supplies
   /// this value; periodic inputs use freshness.maximum_age_ns as their sole budget.
   std::optional<IoSignalLivenessMode> liveness{};
-  /// Outputs only (CONTRACTS §7): read-only for ManyForge; writes are refused
+  /// Outputs only: read-only for ManyForge; writes are refused
   /// before sending with `io_output_controller_owned`.
   bool controller_owned{false};
   /// Outputs only: the owning component declares `io_output_readback`. With
@@ -90,6 +92,18 @@ struct IoSignalDescriptorDTO final {
 [[nodiscard]] inline InterruptSourceId ChangedOutsideSourceId(const IoSignalId& output) {
   return InterruptSourceId("core.changed_outside." + output.controllable_component_id.value() +
                            "." + output.name);
+}
+
+/// Descriptor installed for an eligible output's core-held changed-outside
+/// input. Call only when HoldsChangedOutside(output) is true.
+[[nodiscard]] inline IoSignalDescriptorDTO ChangedOutsideDescriptor(
+    const IoSignalDescriptorDTO& output) {
+  const auto& id = output.signal_id;
+  return {ChangedOutsideSignalId(id), ChangedOutsideSourceId(id),
+          IoSignalValueType::kBoolean, IoSignalDirection::kInput,
+          IoSignalUpdateMode::kChangeOnly, IoTransitionCapability::kSampledOnly,
+          {IoFreshnessMode::kProviderValidity, std::nullopt}, std::nullopt,
+          IoSignalLivenessMode::kInProcess};
 }
 
 /// Owner identity and generation come from existing host/activation authority.
@@ -238,7 +252,7 @@ struct IoSignalObservationDTO final {
   TimePoint evaluated_at_ns{};
 };
 
-/// CONTRACTS §7 `SignalSample`, the one published view of a signal. Program
+/// `SignalSample`, the one published view of a signal. Program
 /// conditions and rules use a sample only when `fresh`.
 struct SignalSample final {
   IoSignalId signal_id;
@@ -250,13 +264,16 @@ struct SignalSample final {
 };
 
 [[nodiscard]] inline SignalSample ToSignalSample(const IoSignalObservationDTO& observation) {
-  SignalSample sample{observation.descriptor.signal_id, std::nullopt,
+  const auto& descriptor = observation.descriptor;
+  SignalSample sample{descriptor.signal_id, std::nullopt,
                       IoSignalSampleSource::kDevice, 0,
                       observation.availability == IoSignalAvailability::kFresh};
   if (const auto& latest = observation.latest_sample) {
     if (latest->publication.value) sample.value = *latest->publication.value;
     sample.source = latest->publication.source;
     sample.age_ns = observation.evaluated_at_ns - latest->received_at_ns;
+  } else if (descriptor.direction == IoSignalDirection::kOutput && !descriptor.readback) {
+    sample.source = IoSignalSampleSource::kNotReadable;
   }
   return sample;
 }

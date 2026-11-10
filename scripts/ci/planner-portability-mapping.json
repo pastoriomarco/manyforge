@@ -1,0 +1,254 @@
+{
+  "schema_version": "manyforge.planner_portability.v1",
+  "contract_revision": "2026-08-06",
+  "runtime_availability": {
+    "status": "temporarily_unavailable_composable_cell_rebuild",
+    "available_surface": "retained_planning_product_consumer_qualification_only",
+    "restoration_gate": "qualify a non-empty retained planner product and its target-scene adapter before restoring runtime launch or conformance claims"
+  },
+  "portable_capabilities": [
+    "planning.motion.joint_goal",
+    "planning.motion.pose_goal",
+    "planning.motion.cartesian_path",
+    "planning.ik.single_shot",
+    "planning.cancellation.bounded",
+    "planning.trajectory.time_parameterized",
+    "scene.projection.revision_bound",
+    "planning.failure.structured"
+  ],
+  "authority": {
+    "logical_scene": "manyforge_scene",
+    "candidate_generation": "selected_planner_adapter.IPlannerBackend",
+    "non_collision_validation": "manyforge_core.ITrajectoryValidator",
+    "collision_validation": "manyforge_core.ICollisionQueryEngine",
+    "dispatch": "manyforge_core.ExecutionKernel",
+    "runtime_collision": "manyforge_core.RuntimeCollisionMonitor",
+    "stop_interrupt_recovery": "manyforge_core.ExecutionKernel",
+    "planner_internal_collision": "advisory_candidate_search_only",
+    "planner_internal_cache": "adapter_private_and_never_dispatch_authority"
+  },
+  "adapters": {
+    "deterministic_fake": {
+      "status": "test_only_implemented",
+      "package": "manyforge_core/test",
+      "conformance_target": "test_planner_backend_conformance",
+      "capability_disposition": "supported_and_explicit_rejection_variants"
+    },
+    "roboplan_0_8_0": {
+      "status": "temporarily_unavailable_composable_cell_rebuild",
+      "package": "manyforge_roboplan",
+      "available_surface": "retained_planning_product_consumer_qualification_only",
+      "restoration_gate": "non-empty retained planning product plus target-scene adapter qualification",
+      "source_identity": "RoboPlan 0.8.0 2a6b447e648b1a3337f10cbab995cda0c0a71d55 plus the exact patch manifest",
+      "capability_disposition": {
+        "planning.motion.joint_goal": "temporarily_unavailable",
+        "planning.motion.pose_goal": "temporarily_unavailable",
+        "planning.motion.cartesian_path": "temporarily_unavailable",
+        "planning.ik.single_shot": "temporarily_unavailable",
+        "planning.cancellation.bounded": "temporarily_unavailable",
+        "planning.trajectory.time_parameterized": "temporarily_unavailable",
+        "scene.projection.revision_bound": "temporarily_unavailable",
+        "planning.failure.structured": "temporarily_unavailable"
+      }
+    },
+    "moveit2": {
+      "status": "fully_mapped_not_implemented",
+      "proposed_package": "manyforge_moveit2",
+      "dependency_boundary": "ROS and MoveIt types remain private to manyforge_moveit2; manyforge_core and program artifacts use only neutral DTOs and focused ports",
+      "composition": "A MoveIt2 composition factory supplies planner projection, planner, kinematics, reference resolution, and execution-state sink adapters while reusing manyforge_ros2_control_execution for controller transport",
+      "retained_product_input": {
+        "mapping": "Load only compiler-owned, digest-bound retained planning products and total source-to-compiled symbol maps; implementation-specific configuration is generated offline and verified before runtime use",
+        "required_invariants": [
+          "logical scene remains ManyForge-owned",
+          "no fallback from a missing retained generation to mutable source files",
+          "planner-specific runtime adaptation cannot rewrite the authoritative compiled namespace",
+          "the exact retained bundle, graph, and scene projection revision binds every planning request"
+        ]
+      },
+      "ports": {
+        "IPlannerBackend": {
+          "joint_goal": "Translate canonical joint names and positions to a request-local moveit_msgs MotionPlanRequest/goal constraint and invoke a deployment-selected PlanningPipeline against the retained PlanningScene generation",
+          "pose_goal": "Translate the canonical base/tcp pose and tolerances to MoveIt goal constraints; IK plus joint planning is valid when observable pose tolerance and error contracts hold",
+          "profiles": "The ManyForge planner block (Deployment default plus optional per-motion override) maps to qualified MoveIt pipeline/plugin configurations inside the adapter; backend plugin names never enter the program DTO",
+          "result": "Translate the candidate RobotTrajectory back to canonical TrajectoryDTO names and finite monotonic timing, and stamp the exact retained SceneRevisionDTO",
+          "internal_collision": "MoveIt collision checks are search-local candidate-generation evidence only; the returned trajectory always passes ManyForge ITrajectoryValidator and ICollisionQueryEngine gates"
+        },
+        "IRobotKinematics": {
+          "mapping": "Construct MoveIt RobotState from the Robot Model Authority private view, evaluate FK/joint limits in canonical public names, and reject unknown or duplicate name mappings without leaking SRDF/private aliases"
+        },
+        "IReferencePoseResolver": {
+          "mapping": "Resolve frame, robot-link, object, and inline-pose references from the exact retained projection generation and return neutral Pose3DTO; never read a mutable latest PlanningScene"
+        },
+        "IExecutionStateSink": {
+          "mapping": "Write selected controller-observed state into the MoveIt derived projection only; controller authority and transport remain in manyforge_ros2_control_execution"
+        }
+      },
+      "capability_disposition": {
+        "planning.motion.joint_goal": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "selected PlanningPipeline must return bounded, cancellable, time-parameterized candidates with canonical names"
+        },
+        "planning.motion.pose_goal": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "selected kinematics/planning plugins must satisfy canonical frame mapping and pose tolerances"
+        },
+        "planning.motion.cartesian_path": {
+          "status": "optional_explicit_rejection_until_qualified",
+          "implementation_options": [
+            "a qualified MoveIt CartesianInterpolator pipeline with independent full ordered-path fidelity and time-parameterization checks",
+            "a qualified Pilz/other plugin that consumes the complete neutral path and preserves bounded cancellation"
+          ],
+          "rejection": "Do not advertise planning.motion.cartesian_path and return unsupported_capability naming that capability; endpoint-only IK is not Cartesian-path support"
+        },
+        "planning.ik.single_shot": {
+          "status": "optional_mapping_complete",
+          "implementation_gate": "Use a request-local RobotState setFromIK-style solve with caller timeout and canonical result mapping, or reject planning.ik.single_shot explicitly"
+        },
+        "planning.cancellation.bounded": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "Use a qualified nonblocking PlanningPipeline/planner-context termination surface when available; otherwise contain the opaque phase in a bounded generation-private worker that can be terminated and replaced without publishing late results"
+        },
+        "planning.trajectory.time_parameterized": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "translate RobotTrajectory output to finite canonical TrajectoryDTO samples with zero start time, strict monotonic timing, and dimensionally valid positions, velocities, and accelerations"
+        },
+        "scene.projection.revision_bound": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "retained PlanningScene generation and result acknowledgement must match the exact request binding"
+        },
+        "planning.failure.structured": {
+          "status": "mandatory_mapping_complete",
+          "implementation_gate": "MoveIt and plugin error codes map at the adapter boundary to stable ErrorDTO code, reason, failure_stage, and capability details"
+        }
+      },
+      "adapter_local_gaps": [
+        {
+          "id": "moveit_projection_generation_store",
+          "resolution": "implement inside manyforge_moveit2 without changing logical scene or collision authority"
+        },
+        {
+          "id": "moveit_plugin_cancellation_qualification",
+          "resolution": "qualify cooperative cancellation where available and the bounded worker-containment path for every remaining selectable planning plugin"
+        },
+        {
+          "id": "moveit_profile_configuration",
+          "resolution": "select and qualify three deployment-local policy mappings without adding backend fields to programs"
+        },
+        {
+          "id": "moveit_cartesian_algorithm_selection",
+          "resolution": "implement full path semantics or retain explicit unsupported-capability behavior"
+        },
+        {
+          "id": "moveit_model_private_view",
+          "resolution": "consume Robot Model Authority canonical/private fingerprints and prove mimic, gripper, and frame mapping"
+        }
+      ],
+      "forbidden_shortcuts": [
+        "using PlanningSceneMonitor as logical scene authority",
+        "dispatching a trajectory because MoveIt reported collision-free",
+        "falling forward to the latest scene when a retained revision is missing",
+        "embedding planner ids or plugin options in a program artifact",
+        "duplicating ros2_control execution, stop, interrupt, or recovery semantics"
+      ]
+    },
+    "curobo": {
+      "status": "explicitly_unsupported_deferred",
+      "admission_behavior": "A deployment selecting a cuRobo planning adapter is rejected because no implemented adapter capability manifest exists",
+      "implementation_changes_in_rp5_6": "none"
+    }
+  },
+  "test_references": [
+    {
+      "requirement": "neutral_harness_reference_backend",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::DeterministicReferencePassesPortableMatrixAndControlContracts"
+    },
+    {
+      "requirement": "neutral_harness_detects_invalid_outputs",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::DetectsMonotonicTimeRegression"
+    },
+    {
+      "requirement": "neutral_harness_time_parameterized_output",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::DeterministicReferencePassesPortableMatrixAndControlContracts"
+    },
+    {
+      "requirement": "neutral_harness_detects_private_names",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::DetectsPrivateModelNameLeakage"
+    },
+    {
+      "requirement": "neutral_harness_detects_private_ik_names",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::DetectsPrivateIkModelNameLeakage"
+    },
+    {
+      "requirement": "neutral_harness_contains_noncooperative_cancel",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::NonCooperativeCancellationIsContainedByTheTestProcess"
+    },
+    {
+      "requirement": "explicit_optional_capability_rejection",
+      "reference": "manyforge_core/test/test_planner_backend_conformance.cpp::ExplicitUnsupportedCapabilitiesRemainConformantAndStructured"
+    },
+    {
+      "requirement": "relative_resolution_precedes_planner",
+      "reference": "manyforge_core/test/test_motion_target_resolution.cpp::RelativeCartesianTransformsEveryWaypointAgainstOneReference"
+    },
+    {
+      "requirement": "relative_execution_reaches_planner_as_resolved_pose",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning"
+    },
+    {
+      "requirement": "cache_hit_revalidates",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CacheHit_SkipsPlanning"
+    },
+    {
+      "requirement": "cache_hit_revalidates_against_latest_scene",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CachedTrajectoryRevalidatesAgainstChangedSceneWithoutPlanning"
+    },
+    {
+      "requirement": "failed_revalidation_forces_planning",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_FailedCachedTrajectoryInvalidatesAndReplansOnce"
+    },
+    {
+      "requirement": "intent_change_forces_planning",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CartesianIntermediateWaypointChangeInvalidatesSameEndpointCache"
+    },
+    {
+      "requirement": "planner_participates_in_cache_identity",
+      "reference": "manyforge_core/test/test_cache.cpp::TargetModeReferenceAndPlannerChangeIdentity"
+    },
+    {
+      "requirement": "start_incompatibility_forces_planning",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CacheHitWithStaleStart_InvalidatesAndReplans"
+    },
+    {
+      "requirement": "goal_incompatibility_forces_planning",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CartesianIntermediateWaypointChangeInvalidatesSameEndpointCache"
+    },
+    {
+      "requirement": "model_binding_participates_in_cache_identity",
+      "reference": "manyforge_core/test/test_cache.cpp::CanonicalModelBindingChangesIdentity"
+    },
+    {
+      "requirement": "contact_policy_participates_in_cache_identity",
+      "reference": "manyforge_core/test/test_cache.cpp::ContactPolicyChangesIdentity"
+    },
+    {
+      "requirement": "cache_identity_mismatch_forces_planning",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_PerJointDynamicsLimitsBypassCacheAndReplan"
+    },
+    {
+      "requirement": "planner_candidate_cannot_bypass_non_collision_validation",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_ValidationFails_TransitionsToFailed"
+    },
+    {
+      "requirement": "planner_candidate_cannot_bypass_collision_authority",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_PreCollisionCheck_RefusesACollidingCachedTrajectory"
+    },
+    {
+      "requirement": "authoritative_collision_replans_candidate",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_AuthoritativeCollisionReplansAndDispatchesSecondCandidate"
+    },
+    {
+      "requirement": "cached_candidate_cannot_bypass_validation",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CacheHitValidationFailure_BlocksExecution"
+    }
+  ]
+}

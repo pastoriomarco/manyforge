@@ -25,18 +25,18 @@ describe('viewer presentation draft reducer', () => {
   it('retains independent frame and object-axis visibility edits', () => {
     const frame = viewerPresentationDraftReducer(
       DEFAULT_VIEWER_PRESENTATION_DRAFT,
-      { type: 'set_frame_visibility', frameId: 'tool0', visible: false },
+      { type: 'set_frame_visibility', frame: { component_id: 'robot', frame_id: 'tool0' }, visible: false },
     );
     const object = viewerPresentationDraftReducer(frame, {
-      type: 'set_resource_visibility', resourceRoleId: 'workpiece', visible: true,
+      type: 'set_resource_visibility', sceneResourceId: 'workpiece', visible: true,
     });
     const axes = viewerPresentationDraftReducer(object, {
       type: 'set_scene_resource_axes_visibility',
       sceneResourceId: 'part',
       visible: true,
     });
-    expect(axes.frameRoleVisibility).toEqual({ tool0: false });
-    expect(axes.resourceRoleVisibility).toEqual({ workpiece: true });
+    expect(axes.frameVisibility).toEqual([{ frame: { component_id: 'robot', frame_id: 'tool0' }, visible: false }]);
+    expect(axes.sceneResourceVisibility).toEqual({ workpiece: true });
     expect(axes.sceneResourceAxesVisibility).toEqual({ part: true });
   });
 
@@ -53,20 +53,37 @@ describe('viewer presentation draft reducer', () => {
 
   it('maps exactly to the Program viewer contract', () => {
     const draft = viewerPresentationDraftFromProgram({
-      frame_role_visibility: { tcp: false },
-      resource_role_visibility: { workpiece: true },
+      frame_visibility: [{ frame: { component_id: 'robot', frame_id: 'tcp' }, visible: false }],
+      cell_frame_visible: false,
+      scene_resource_visibility: { workpiece: true },
       scene_resource_axes_visibility: { part: true },
       frame_gizmo_size_m: 0.2,
       object_axes_gizmo_size_m: 0.3,
     });
 
     expect(programViewerMetadata(draft)).toEqual({
-      frame_role_visibility: { tcp: false },
+      frame_visibility: [{ frame: { component_id: 'robot', frame_id: 'tcp' }, visible: false }],
+      cell_frame_visible: false,
       frame_gizmo_size_m: 0.2,
-      resource_role_visibility: { workpiece: true },
+      scene_resource_visibility: { workpiece: true },
       scene_resource_axes_visibility: { part: true },
       object_axes_gizmo_size_m: 0.3,
     });
+  });
+
+  it('keeps equal frame IDs on different components independent and ordered', () => {
+    let draft = viewerPresentationDraftReducer(DEFAULT_VIEWER_PRESENTATION_DRAFT,
+      { type: 'set_frame_visibility', frame: { component_id: 'robot_b', frame_id: 'base' }, visible: false });
+    draft = viewerPresentationDraftReducer(draft,
+      { type: 'set_frame_visibility', frame: { component_id: 'robot_a', frame_id: 'base' }, visible: true });
+    draft = viewerPresentationDraftReducer(draft,
+      { type: 'set_frame_visibility', frame: { component_id: 'robot_b', frame_id: 'base' }, visible: true });
+    expect(programViewerMetadata(draft).frame_visibility).toEqual([
+      { frame: { component_id: 'robot_a', frame_id: 'base' }, visible: true },
+      { frame: { component_id: 'robot_b', frame_id: 'base' }, visible: true },
+    ]);
+    expect(draft.cellFrameVisible).toBe(true);
+    expect(viewerPresentationDraftReducer(draft, { type: 'set_cell_frame_visibility', visible: false }).cellFrameVisible).toBe(false);
   });
 });
 

@@ -28,13 +28,13 @@ from check_maintained_deployment_sources import (
 
 
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
-ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
+ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v2"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90"
+    "sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -48,13 +48,48 @@ MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
 MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
     "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113"
 )
-# R7 D12: the xArm-family arm and gripper lifecycle providers.
+# The xArm-family arm and gripper lifecycle providers.
 XARM_LIFECYCLE_PROVIDER_ID: Final = "xarm_arm_provider"
 XARM_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "xarm_gripper_provider"
 LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover")
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 
 CAPABILITIES: Final = {
+    "simulator.control.step": (
+        "sha256:9fd7cae735d502dc7876c5e176f8dc134691476940c18a487ba04e27cf23cd33",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "execution.interrupt.resource_scoped": (
+        "sha256:ea0a625d949b1287de5b1eb0ed1e9d400d927f86c62c00b63c69898bdc58da36",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "execution.interrupt.contact_policy": (
+        "sha256:91fa92a90ddf807623ae9a42a97c37cd4d9628b1961e572b28a928e0da4dd98d",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.reset": (
+        "sha256:7ed06295945087622e96dcd91e390a402898be91e1f94233f5c93daa35dfe23a",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.pause": (
+        "sha256:155d3628cea7b682bd95c1126776aa7314e751fadf9b383e3e3730894fe7c9d3",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.control.play": (
+        "sha256:345e9790ff50444eb6c26ff685093fccd17fb98c9e631b6a4fc7e70c9ea16405",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "simulator.entity_state.set": (
+        "sha256:cd72b14a50066a268c347d524169ef26d675bf9ec425e6130b84a841b0c6ac79",
+        "cell_global",
+        "capability_provider_binding",
+    ),
     "io.gpio.set_output": (
         "sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8",
         "target_binding",
@@ -77,6 +112,11 @@ CAPABILITIES: Final = {
     ),
     "assistant.model.invoke": (
         "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
+        "cell_global",
+        "capability_provider_binding",
+    ),
+    "assistant.model.query": (
+        "sha256:b136ad03b4ca732ee49c4ec34cfb00bb79f1bd1dcd3961784affa51417e23806",
         "cell_global",
         "capability_provider_binding",
     ),
@@ -127,11 +167,6 @@ CAPABILITIES: Final = {
     ),
     "execution.reset": (
         "sha256:24fa527d5e81814f8a395d1d3eeae3c3236c1249b05d84d2cd48abf3f2a27ebb",
-        "target_binding",
-        "control_binding",
-    ),
-    "execution.runtime_scale.operation_scoped": (
-        "sha256:4ee00df7b3510c1490c83e247d12b73553ab53e4e6673da53ebea475fb756fad",
         "target_binding",
         "control_binding",
     ),
@@ -297,12 +332,6 @@ ARM_CAPABILITIES: Final = tuple(
             "validation.trajectory.non_collision",
         }
     )
-)
-# The historical closure is the original 36 facilities less the removed
-# operation Pause/Resume (maintainer, 2026-10-08). Scaling is an
-# additional native-qualified realization, not an unqualified ROS claim.
-NATIVE_ARM_CAPABILITIES: Final = tuple(
-    sorted((*ARM_CAPABILITIES, "execution.runtime_scale.operation_scoped"))
 )
 GRIPPER_CAPABILITIES: Final = tuple(
     sorted(
@@ -546,12 +575,10 @@ def capability_selector(capability_id: str) -> dict[str, str]:
     }
 
 
-def component_type_document(
-    family: dict[str, Any], *, runtime_scaling: bool = True
-) -> dict[str, Any]:
+def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     """Return a component type of one model family.
 
-    Merge 6: a family without arm joints is a tool (its `gripper` target
+    A family without arm joints is a tool (its `gripper` target
     only, mounted through its root interface `mount`); a robot without
     gripper geometry offers its `flange` to one tool.
     """
@@ -559,14 +586,14 @@ def component_type_document(
     family_id = family["model_family_id"]
     semantics = family["semantics"]
     if not source_joint_names(family, "arm_joints"):
-        return tool_component_type_document(family, runtime_scaling=runtime_scaling)
+        return tool_component_type_document(family)
     collision_roles = {
         row["collision_body_role_id"]
         for row in semantics["collision_body_role_bindings"]
     }
     frame_roles = {row["frame_role_id"] for row in semantics["frame_role_bindings"]}
     # A robot whose model carries no gripper geometry mounts its tool as a
-    # separate component on `flange`; its `tcp` is then the tool's (D1).
+    # separate component on `flange`; its `tcp` is then the tool's.
     offers_flange = "gripper_collision" not in collision_roles
     arm_collision_roles = [
         {
@@ -579,9 +606,7 @@ def component_type_document(
     ]
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": (
-            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component"
-        ),
+        "component_type_id": f"{family_id}.component",
         "tags": ["articulated-arm"],
         "model_roles": [{"model_role_id": "arm_model", "cardinality": "exactly_one"}],
         "component_root": {
@@ -621,9 +646,7 @@ def component_type_document(
                 "collision_body_roles": arm_collision_roles,
                 "capabilities": [
                     capability_selector(capability_id)
-                    for capability_id in (
-                        NATIVE_ARM_CAPABILITIES if runtime_scaling else ARM_CAPABILITIES
-                    )
+                    for capability_id in ARM_CAPABILITIES
                 ],
             },
         ],
@@ -650,10 +673,8 @@ def component_type_document(
     )
 
 
-def tool_component_type_document(
-    family: dict[str, Any], *, runtime_scaling: bool = True
-) -> dict[str, Any]:
-    """Return the component type of a tool family (merge 6).
+def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
+    """Return the component type of a tool family.
 
     One `gripper` target on model role `tool_model`; the component root and
     the `mount` interface are the tool's root frame, the robot flange plane.
@@ -675,9 +696,7 @@ def tool_component_type_document(
     )
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": (
-            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component"
-        ),
+        "component_type_id": f"{family_id}.component",
         "tags": ["gripper", "tool"],
         "model_roles": [{"model_role_id": "tool_model", "cardinality": "exactly_one"}],
         "component_root": {"model_role_id": "tool_model", "frame_role_id": root},
@@ -735,7 +754,7 @@ def tool_component_type_document(
             }
         ],
     }
-    # TCP-A (merge 6): tag the tool's TCPs and its default.
+    # Tag the tool's TCPs and its default.
     with_tcps(value, family)
     return revisioned_document(
         value,
@@ -746,13 +765,13 @@ def tool_component_type_document(
 
 
 def with_tcps(value: dict[str, Any], family: dict[str, Any]) -> None:
-    """Tag the TCPs of one component type (merge 6, TCP-A).
+    """Tag the TCPs of one component type.
 
     The rows are rules over the family's frame roles:
 
     - ``arm`` (the motion target) exposes the asset's ``flange`` and tags it
       and its ``tcp`` (when exposed) as TCPs; the default is ``tcp``, else
-      ``flange``. With a tool mounted, D1 still resolves ``{arm, tcp}`` to the
+      ``flange``. With a tool mounted, ``{arm, tcp}`` still resolves to the
       tool's default TCP.
     - ``gripper`` tags its ``tcp``, its default.
     - An asset offset frame role (``pose_in_source_link``) is a TCP of the
@@ -1176,7 +1195,7 @@ def ros2_control_provider_manifest(
 
 
 def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
-    # DX-755/Q58: command invalidation is logical evidence, not ROS ACK or rest.
+    # Command invalidation is logical evidence, not ROS ACK or rest.
     contract_ref = gripper_logical_cancel_provider_contract_ref()
     value = {
         "api_version": "manyforge.stop_evidence_policy.v2",
@@ -1223,7 +1242,7 @@ def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
 
 
 def gripper_position_cancel_stop_policy() -> dict[str, Any]:
-    # DX-775: stock action cancellation holds; logical evidence claims no rest.
+    # Stock action cancellation holds; logical evidence claims no rest.
     value = gripper_logical_cancel_stop_policy()
     value.pop("stop_evidence_policy_revision")
     value["stop_evidence_policy_id"] = "manyforge.gripper_position_cancellation"
@@ -1527,7 +1546,7 @@ def catalog_sources(
     control_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in set(NATIVE_ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
+            for capability_id in set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES)
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1543,7 +1562,7 @@ def catalog_sources(
     native_arm_capabilities = tuple(
         sorted(
             capability_id
-            for capability_id in NATIVE_ARM_CAPABILITIES
+            for capability_id in ARM_CAPABILITIES
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
@@ -1571,30 +1590,47 @@ def catalog_sources(
         "io_signals": io_signal_manifest,
         "pose_source": pose_source_manifest,
         "ai_model": ai_model_manifest,
+        "simulator": provider_manifest(
+            "manyforge.provider.simulator",
+            ("simulator.control.pause", "simulator.control.play", "simulator.control.reset",
+             "simulator.control.step", "simulator.entity_state.set"),
+            [],
+        ),
+        "execution_core": provider_manifest(
+            "manyforge.provider.execution_core",
+            ("execution.interrupt.contact_policy", "execution.interrupt.resource_scoped"),
+            [],
+        ),
         "logical_scene": provider_manifest(
             "manyforge.provider.logical_scene",
             CELL_CAPABILITIES,
             ["logical_scene_services"],
         ),
+        # The assistant component: its bridge's endpoint is published at
+        # runtime in its component state (role `assistant_request`), not
+        # bound statically.
         "assistant_bridge": provider_manifest(
             "manyforge.provider.assistant_bridge",
-            ("assistant.bridge.request",),
-            ["assistant_request"],
+            ("assistant.bridge.request",
+             *(f"component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS)),
+            [],
         ),
         "model_endpoint": provider_manifest(
             "manyforge.provider.model_endpoint",
             ("assistant.model.invoke",),
             ["model_inference"],
         ),
+        # The compiled fact that a model query is usable (prompt templates
+        # and a model endpoint); it calls no endpoint itself.
+        "assistant_model_query": provider_manifest(
+            "manyforge.provider.assistant_model_query",
+            ("assistant.model.query",),
+            [],
+        ),
         "lite6_arm": native_arm_manifest,
         "lite6_gripper": native_gripper_manifest,
         "ros2_control": ros2_control_provider_manifest(
-            tuple(
-                value
-                for value in control_capabilities
-                if value != "execution.runtime_scale.operation_scoped"
-            ),
-            planner_capabilities,
+            control_capabilities, planner_capabilities
         ),
     }
     for key, document in manifests.items():
@@ -1650,12 +1686,6 @@ def catalog_sources(
     )
 
     component_references: dict[str, dict[str, str]] = {}
-    # Every family with a ROS controller profile (Isaac or offline mock, also
-    # those only composed by generated multi-robot cells) has the fixed-scale
-    # ROS component type. Merge 6: every family has one.
-    fixed_scale_families = {
-        family["model_family_id"] for family in description["model_families"]
-    }
     for family in description["model_families"]:
         document = component_type_document(family)
         family_id = family["model_family_id"]
@@ -1674,24 +1704,6 @@ def catalog_sources(
         )
         sources[f"component:{family_id}"] = source
         component_references[family_id] = source[2]
-        if family_id in fixed_scale_families:
-            # A target declaration is a required capability set, not optional
-            # advertising. Reuse the generator for the fixed-scale profile;
-            # never promise native scaling through an unqualified ROS provider.
-            fixed = component_type_document(family, runtime_scaling=False)
-            sources[f"component:fixed_scale:{family_id}"] = generated_catalog_document(
-                root=root,
-                relative_path=(
-                    "manyforge_deployment/resources/maintained/catalog/"
-                    f"component_type/{fixed['component_type_id']}.json"
-                ),
-                kind="component_type",
-                record_id=fixed["component_type_id"],
-                record_revision=fixed["component_type_revision"],
-                schema_id="manyforge.component_type.v1",
-                schema_revision=schemas["component_type"],
-                value=fixed,
-            )
 
     command_path = (
         root / "manyforge_deployment/resources/catalog/gripper.command_position.v1.yaml"
@@ -1728,7 +1740,7 @@ def catalog_sources(
                 payload=payload,
             ),
         )
-    # R7 package 5 (2026-10-25): the build-owned C++ copy of the supervised
+    # The build-owned C++ copy of the supervised
     # Lite 6 lifecycle catalog was removed with the supervised mode;
     # manyforge_xarm_control mirrors the xArm plans above and tests the digest.
     lifecycle_outputs: list[tuple[Path, bytes, str]] = []
@@ -1774,18 +1786,6 @@ def site_overlay(
                 "value": {
                     "value_kind": "string",
                     "value": endpoint["endpoint_value"],
-                },
-            }
-        provider = profile["provider_alias"]
-        if provider is not None:
-            reference = provider["site_overlay_value_ref"]
-            values[reference] = {
-                "site_overlay_value_ref": reference,
-                "semantic_kind": "external_resource",
-                "resource_kind": "service_endpoint",
-                "value": {
-                    "value_kind": "string",
-                    "value": provider["endpoint_value"],
                 },
             }
     value = revisioned_document(
@@ -1878,10 +1878,10 @@ def generate(args: argparse.Namespace) -> None:
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_arm_position.json",
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_gripper_position.json",
         "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
-        # R7 D12 (2026-10-25): renamed to xarm_arm_provider/xarm_gripper_provider.
+        # Renamed to xarm_arm_provider/xarm_gripper_provider.
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_arm_provider.json",
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_gripper_provider.json",
-        # Merge 6: the Real Lite 6 profile now selects the split `lite6` arm,
+        # The Real Lite 6 profile now selects the split `lite6` arm,
         # which needs no arm-only variant.
         "manyforge_deployment/resources/maintained/catalog/component_type/lite6_lite_gripper.fixed_scale.arm_only.component.json",
     ):

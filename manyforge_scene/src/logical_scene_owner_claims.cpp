@@ -212,47 +212,58 @@ core::Result<void> ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
     Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
           "configure read-only scene-settlement timeout");
     Exec(database, "PRAGMA query_only=ON");
-    Transaction snapshot(database, "BEGIN");
-    if (ScalarInteger(database, "PRAGMA application_id") !=
-            kCanonicalEmptySceneSqliteApplicationId ||
-        ScalarInteger(database, "PRAGMA user_version") !=
-            kLogicalSceneStoreSchemaVersion) {
-      throw LogicalSceneOwnerIntegrityError(
-          "logical-scene settlement reader found a foreign schema");
+    std::optional<core::SceneTransactionRequestDTO> decoded_request;
+    std::string request_digest;
+    bool success = false;
+    std::optional<SceneProjectionCommitStatusDTO> decoded_projection_status;
+    {
+      // The statements are finalized before the close below: sqlite3_close
+      // leaves a connection with live statements open (SQLITE_BUSY), which
+      // leaked two descriptors per settlement in the execution host.
+      Transaction snapshot(database, "BEGIN");
+      if (ScalarInteger(database, "PRAGMA application_id") !=
+              kCanonicalEmptySceneSqliteApplicationId ||
+          ScalarInteger(database, "PRAGMA user_version") !=
+              kLogicalSceneStoreSchemaVersion) {
+        throw LogicalSceneOwnerIntegrityError(
+            "logical-scene settlement reader found a foreign schema");
+      }
+      Statement metadata(
+          database,
+          "SELECT cell_id FROM logical_scene_store_metadata WHERE singleton=1");
+      if (!metadata.Step() || metadata.Text(0) != cell_id.value() ||
+          metadata.Step()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "logical-scene settlement reader found a foreign cell");
+      }
+      Statement row(
+          database,
+          "SELECT i.request_json,i.request_digest,o.success,o.projection_status "
+          "FROM logical_scene_transaction_intents i "
+          "JOIN logical_scene_request_outcomes o "
+          "ON o.request_owner_epoch=i.request_owner_epoch "
+          "AND o.request_id=i.request_id "
+          "WHERE i.request_digest=?");
+      row.Bind(1, claim.intent.request_payload_digest.value());
+      if (!row.Step()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "authored-scene terminal outcome is absent");
+      }
+      decoded_request =
+          logical_scene_codec_internal::DecodeRequest(row.Text(0));
+      request_digest = row.Text(1);
+      success = row.Integer(2) == 1;
+      decoded_projection_status = DecodeProjectionStatus(row.Text(3));
+      if (row.Step()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "authored-scene terminal outcome is not unique");
+      }
+      snapshot.Commit();
     }
-    Statement metadata(
-        database,
-        "SELECT cell_id FROM logical_scene_store_metadata WHERE singleton=1");
-    if (!metadata.Step() || metadata.Text(0) != cell_id.value() ||
-        metadata.Step()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "logical-scene settlement reader found a foreign cell");
-    }
-    Statement row(
-        database,
-        "SELECT i.request_json,i.request_digest,o.success,o.projection_status "
-        "FROM logical_scene_transaction_intents i "
-        "JOIN logical_scene_request_outcomes o "
-        "ON o.request_owner_epoch=i.request_owner_epoch "
-        "AND o.request_id=i.request_id "
-        "WHERE i.request_digest=?");
-    row.Bind(1, claim.intent.request_payload_digest.value());
-    if (!row.Step()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "authored-scene terminal outcome is absent");
-    }
-    const auto request =
-        logical_scene_codec_internal::DecodeRequest(row.Text(0));
-    const auto request_digest = row.Text(1);
-    const bool success = row.Integer(2) == 1;
-    const auto projection_status = DecodeProjectionStatus(row.Text(3));
-    if (row.Step()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "authored-scene terminal outcome is not unique");
-    }
-    snapshot.Commit();
     sqlite3_close(database);
     database = nullptr;
+    const auto &request = *decoded_request;
+    const auto projection_status = *decoded_projection_status;
     const auto expected_kind =
         success ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
                 : core::CellAdmissionSettlementKindDTO::kProvenNoEffect;

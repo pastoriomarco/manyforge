@@ -61,14 +61,15 @@ public:
   MockBooleanOutputProvider &
   operator=(const MockBooleanOutputProvider &) = delete;
 
-  /// CONTRACTS §6, §7: the one write of one alias, behind its
+  /// The one write of one alias, behind its
   /// component's output-writer interface: the model takes the value at once
   /// while the alias's occurrence is enabled, with the same echo.
   [[nodiscard]] SetOutputResult WriteOutput(const core::IoSignalId &signal, bool value);
 
   /// Called only under the existing host delivery/domain lifecycle lock after
   /// full expected-observation checks. These are transport fences, not another
-  /// lifecycle decision. Never derive CCLC generation from this driver counter.
+  /// lifecycle decision. Never derive component lifecycle generation from
+  /// this driver counter.
   core::Result<void>
   Pause(const core::ResolvedLifecycleProviderOccurrenceDTO &provider,
         std::uint64_t driver_observation_generation,

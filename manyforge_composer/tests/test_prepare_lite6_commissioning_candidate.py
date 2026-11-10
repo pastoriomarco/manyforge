@@ -1,10 +1,10 @@
-"""Tests for retained Lite6 commissioning safety logic and the I10 gate.
+"""Tests for retained Lite6 commissioning safety logic and the unavailable client.
 
 The historical implementation blob
 ``1bb14aa35ed0b1c2ab7909dff8be86f016179754`` and test blob
 ``0248ca9da10b5a883126e43ea91b71c4cdf96541`` assigned their removed case
-families as follows: old Composer status/candidate wire behavior to I6-I8,
-preview/evidence client integration to I10/R, and the one-degree/freshness
+families as follows: old Composer status/candidate wire behavior to future status/admission
+contracts, preview/evidence client integration to a future client, and the one-degree/freshness
 safety checks retained below in effect-free form.
 """
 
@@ -35,10 +35,10 @@ _SPEC.loader.exec_module(_MODULE)
 
 HISTORICAL_TEST_BLOB = "0248ca9da10b5a883126e43ea91b71c4cdf96541"
 HISTORICAL_CASE_DISPOSITION = {
-    "preview_without_execute": ("I6", "I7", "I8", "I10", "R"),
-    "closed_lifecycle_before_candidate": ("I7", "I8", "I10", "R"),
-    "stale_observation_before_candidate": ("I5", "H0", "I10", "R"),
-    "zero_out_of_bounds_or_nonfinite_delta": ("I10", "R"),
+    "preview_without_execute": ("status_admission", "client"),
+    "closed_lifecycle_before_candidate": ("status_admission", "client"),
+    "stale_observation_before_candidate": ("observation", "client"),
+    "zero_out_of_bounds_or_nonfinite_delta": ("client",),
 }
 
 
@@ -108,4 +108,4 @@ def test_all_historical_candidate_case_families_remain_assigned() -> None:
         "0248ca9da10b5a883126e43ea91b71c4cdf96541"
     )
     assert len(HISTORICAL_CASE_DISPOSITION) == 4
-    assert all("R" in gates for gates in HISTORICAL_CASE_DISPOSITION.values())
+    assert all("client" in gates for gates in HISTORICAL_CASE_DISPOSITION.values())

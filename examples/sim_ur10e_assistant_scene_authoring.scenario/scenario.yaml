@@ -1,20 +1,18 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Isaac Sim UR10e light scene with the assistant's scene-authoring tools enabled. Ask the assistant to change the scene; every simulator change needs your approval.",
   "members": {
-    "assignment.yaml": "sha256:cfcd510efdc967da88d1854a852efd021a9e7fd211ff5d00cf3f0ff30d69757b",
-    "deployment.yaml": "sha256:e51adf3574c286f1972cddcb0554392012f5bd698886e248a272f4913528604f",
-    "program.yaml": "sha256:0b184d66b8a6f0c6b3385d8559583ac2e15971e8dedfad762faa2dc363367cd6"
+    "deployment.yaml": "sha256:34e3f59af0a0c958e831c3d3a9d79b90ceb10ef122ad583546c6efb6ed22a0c2",
+    "program.yaml": "sha256:ae46973e0814b047f810078365a107563df80c43f884a4b927d2a5f45872ac10"
   },
   "name": "sim_ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:7e078b3ce8710c103fbe3c9563d628b3a8dc772f2ffd1b5e709fbaaa5b183927",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:455c5c6bc34f29b969a2482aac22d06f8bf76c9245a3c00cc02506c4596379fe",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "sim_ur10e_assistant_scene_authoring",

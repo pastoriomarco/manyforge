@@ -426,6 +426,14 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
                                         request.planning_attempt_index,
                                         request.action_span,
                                         request.moving_replacement};
+  candidate.collision_mode = request.collision_mode;
+  candidate.diagnostic_qualified_target = request.diagnostic_qualified_target;
+  if (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+    candidate.planning_timeout_s -= std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - setup_started).count();
+    if (!std::isfinite(candidate.planning_timeout_s) || candidate.planning_timeout_s <= 0.0)
+      return plan_error(error(ErrorCode::kPlanningTimeout, "Diagnostic planning timed out", "planning_timeout"));
+  }
   if (candidate.moving_replacement) {
     const auto setup_elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - setup_started)
@@ -443,9 +451,13 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
     }
   }
   try {
-    auto result = candidate_client_->compute(candidate);
+    std::optional<core::ControlledStateDTO> qualified_target;
+    auto result = candidate_client_->compute_with_target(candidate, &qualified_target);
     if (!result.ok()) {
-      return plan_error(result.error());
+      auto failure = plan_error(result.error());
+      failure.target_qualified = qualified_target.has_value();
+      failure.qualified_target = std::move(qualified_target);
+      return failure;
     }
     if (!trajectory_shape_valid(result.value(), candidate_binding_)) {
       return plan_error(
@@ -473,6 +485,7 @@ void RoboPlanPlannerBackend::request_cancel() {
 
 core::IkResultDTO
 RoboPlanPlannerBackend::solve_ik(const core::IkRequestDTO &request) {
+  const auto setup_started = std::chrono::steady_clock::now();
   std::unique_lock projection_lock(projection_mutex_);
   if (auto invalid =
           validate_ik_binding(request, projection_binding_, candidate_binding_);
@@ -494,13 +507,25 @@ RoboPlanPlannerBackend::solve_ik(const core::IkRequestDTO &request) {
       return ik_error(selected.error());
     }
   }
-  const double timeout = request.timeout_s > 0.0
-                             ? request.timeout_s
-                             : config_.default_single_shot_ik_timeout_s;
+  if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled &&
+      !request.diagnostic_tolerances)
+    return ik_error(error(ErrorCode::kInvalidRequest, "Diagnostic IK tolerances are missing", "native_ik_request_invalid"));
+  if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled &&
+      (!std::isfinite(request.timeout_s) || request.timeout_s <= 0.0))
+    return ik_error(error(ErrorCode::kPlanningTimeout, "Diagnostic IK has no remaining budget", "planning_timeout"));
+  double timeout = request.timeout_s > 0.0
+                       ? request.timeout_s : config_.default_single_shot_ik_timeout_s;
+  if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
+    timeout -= std::chrono::duration<double>(std::chrono::steady_clock::now() - setup_started).count();
+    if (!std::isfinite(timeout) || timeout <= 0.0)
+      return ik_error(error(ErrorCode::kPlanningTimeout, "Diagnostic IK timed out", "planning_timeout"));
+  }
   try {
-    auto result = candidate_client_->solve_ik(
-        request.goal_pose, request.base_frame, request.tcp_frame,
-        request.seed_state, timeout);
+    auto result = request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled
+        ? candidate_client_->solve_ik_diagnostic(request.goal_pose, request.base_frame,
+              request.tcp_frame, request.seed_state, timeout, request.diagnostic_tolerances)
+        : candidate_client_->solve_ik(request.goal_pose, request.base_frame,
+              request.tcp_frame, request.seed_state, timeout);
     if (!result.ok()) {
       return ik_error(result.error());
     }

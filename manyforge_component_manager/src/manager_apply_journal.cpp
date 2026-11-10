@@ -2532,8 +2532,7 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
 // Durable evidence remains valid if the set of failures offered to operators
 // is narrowed in a later version. Scope policy belongs at the attempt boundary.
 // A failed Apply that still holds its accepted fence and published nothing:
-// releasable before effect (acknowledgement) or, whatever it changed, by New
-// (N7, CONTRACTS §15).
+// releasable before effect (acknowledgement) or, whatever it changed, by New.
 static bool HasFailedApplyReleaseEvidence(const PersistedManagerApplyStatus &status) noexcept {
   if (!status.terminal_outcome || !status.affected_scope || !status.fence_attempt ||
       !status.fence_acceptance || status.publication_receipt ||
@@ -2547,8 +2546,7 @@ static bool HasFailedApplyReleaseEvidence(const PersistedManagerApplyStatus &sta
 // Runtime staging is no effect: a host that refused the staged candidate
 // installed and published nothing (its failure is known before-effect).
 bool FailedApplyAcknowledgementEligible(const PersistedManagerApplyStatus &status) noexcept {
-  // The maintainer approved all proven-before-effect component/Scene changes
-  // (DX-2814).
+  // All proven-before-effect component/Scene changes are acknowledgeable.
   if (!HasFailedApplyReleaseEvidence(status) || status.private_materialization) return false;
   const auto &terminal = status.terminal_outcome->terminal_outcome;
   return terminal.state == ManagerApplyTerminalOutcomeState::kFailed &&
@@ -6481,7 +6479,7 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
           "ON t.apply_id=i.apply_id AND "
           "t.apply_generation=i.apply_generation "
           // A completed release (no-effect acknowledgement, or New for any
-          // failure, N7) also settles a held failed Apply. Its recorded
+          // failure) also settles a held failed Apply. Its recorded
           // request and receipt are verified below, not by this existence
           // check alone.
           "AND (t.outcome_state='succeeded' OR "

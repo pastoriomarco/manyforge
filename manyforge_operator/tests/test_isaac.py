@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import replace
 from pathlib import Path
 import shlex
@@ -364,6 +366,7 @@ def test_failed_container_start_recovers_identity_then_remote_stop_is_attempted(
         return launcher._container_status(readback)
 
     monkeypatch.setattr(launcher, "_remote_container_operation", operation)
+    monkeypatch.setattr(launcher, "_remote_native_build", lambda: calls.append("build-native"))
     with pytest.raises(LauncherError, match="partial startup"):
         launcher._remote_native_start()
     assert launcher._remote_status["owned_resources"][0]["container_id"] == "d" * 64
@@ -372,7 +375,34 @@ def test_failed_container_start_recovers_identity_then_remote_stop_is_attempted(
         raise LauncherError("runtime_command_failed", "export failed; retained", exit_code=73)
     monkeypatch.setattr(launcher, "_remote_native_stop", stop)
     assert launcher._cleanup({"native_status": launcher._remote_status}) is False
-    assert calls == ["start", "status", "status", "export_stop"]
+    assert calls == ["build-native", "start", "status", "status", "export_stop"]
+
+
+def test_container_start_runs_the_native_build_as_its_own_call_first(tmp_path, monkeypatch):
+    launcher = IsaacLauncher(_container_config(tmp_path))
+    readback = _container_readback(launcher)
+    calls = []
+    build_fails = False
+
+    def ssh(command, *, timeout=None):
+        operation = shlex.split(command)[-1]
+        calls.append((operation, timeout))
+        if operation == "build-native" and build_fails:
+            raise LauncherError("runtime_host_unavailable", "Native build failed", exit_code=75)
+        return json.dumps(readback) if operation == "start" else "Native build complete.\n"
+
+    monkeypatch.setattr(launcher, "_ssh", ssh)
+    assert launcher._remote_native_start()["state"] == "ready"
+    # The build has its own bound (cold build: about 30-40 min); start's
+    # 930 s then bounds readiness only.
+    assert calls == [("build-native", 2700), ("start", 930)]
+    command = shlex.split(launcher._container_shell("build-native"))
+    assert command[-2:] == [launcher.config.remote.source_root + "/scripts/compose-dev.sh", "build-native"]
+    calls.clear()
+    build_fails = True
+    with pytest.raises(LauncherError, match="Native build failed"):
+        launcher._remote_native_start()
+    assert calls == [("build-native", 2700)]  # A failed build starts nothing.
 
 
 def test_remote_source_check_preserves_existing_g_clean_exact_source_rule(tmp_path, monkeypatch, source_factory):
@@ -381,7 +411,7 @@ def test_remote_source_check_preserves_existing_g_clean_exact_source_rule(tmp_pa
     commands = []
     monkeypatch.setattr(launcher, "_ssh_json", lambda command, **kwargs: (commands.append(command) or actual.model_dump(mode="json")))
     launcher._verify_remote_source(actual)
-    assert "scripts/qualification/source_identity.py --repo-root" in commands[0]
+    assert "scripts/lib/source_identity.py --repo-root" in commands[0]
     assert "source " not in commands[0] and "docker" not in commands[0]
     actual = source_factory(dirty=True)
     with pytest.raises(LauncherError, match="dirty"):
@@ -438,3 +468,18 @@ def test_stop_calls_remote_manager_without_owned_simulator_or_process(
     assert calls == ["status", "manager_stop", "status"]
     assert "isaac_simulator" not in {row.resource_id for row in observed.owned_resources}
     assert launcher._mechanical()["processes"] == {}
+
+
+def test_state_directories_it_creates_are_owner_only_under_a_group_umask(tmp_path: Path):
+    # Ubuntu's user-private-group default (0002) must not make the launcher
+    # refuse a state directory it created itself.
+    previous = os.umask(0o002)
+    try:
+        config = _config(tmp_path)
+        launcher = IsaacLauncher(config)
+        restarted = IsaacLauncher.from_state_root(config.state_root, config.instance_id)
+    finally:
+        os.umask(previous)
+    for directory in (config.state_root, config.instance_root):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert launcher.store.root == restarted.store.root

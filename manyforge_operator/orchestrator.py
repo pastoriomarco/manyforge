@@ -1,10 +1,10 @@
-"""Native O1.3 operator-launch orchestration.
+"""Native operator-launch orchestration.
 
 This module is deliberately a mechanical boundary around the already
 qualified Manager, Headless API, Program runner, and Composer processes.  It
 does not own graph, Apply, execution, scene, alarm, or health truth.  The
-standard profile is the only live profile in O1.3; Isaac is kept behind the
-explicit unavailable gate until its own dependency-ordered slice.
+standard profile is the only live profile; Isaac is kept behind the
+explicit unavailable gate.
 """
 
 from __future__ import annotations
@@ -77,19 +77,14 @@ _PROCESS_COMPONENTS = (
     "manager",
     "headless",
     "program_runner",
-    "assistant_bridge",
     "composer",
 )
-# The assistant bridge is a loopback-only helper of Composer, not a public
-# launch endpoint, so it is not part of the frozen ServiceKind contract.
-ASSISTANT_BRIDGE_HOST = "127.0.0.1"
-ASSISTANT_BRIDGE_PORT = 8100
 
 
 def _safe_unix_timestamp() -> int:
     """Return a current, JSON-safe epoch tick for the frozen timestamp fields.
 
-    The O1.2 contract retains the ``*_unix_ns`` field names but bounds them
+    The contract retains the ``*_unix_ns`` field names but bounds them
     to JavaScript's safe integer range.  Current epoch nanoseconds exceed that
     bound, so the launcher records epoch microseconds as the finest safe tick.
     """
@@ -325,14 +320,6 @@ class NativeLauncherConfig:
     def composer_url(self) -> str:
         return f"http://{self.advertised_host}:{SERVICE_PORTS['composer']}/"
 
-    @property
-    def assistant_bridge_url(self) -> str:
-        return f"http://{ASSISTANT_BRIDGE_HOST}:{ASSISTANT_BRIDGE_PORT}/"
-
-    @property
-    def assistant_bridge_audit_log(self) -> Path:
-        return self.instance_root / "state" / "assistant-bridge" / "audit.jsonl"
-
 
 @dataclass(frozen=True, slots=True)
 class ProcessSpec:
@@ -406,9 +393,11 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         ),
         {
             **package_env,
-            # The execution host and its component processes inherit it: a
-            # point-cloud source sends its clouds to the Composer.
+            # The execution host and its component processes inherit them: a
+            # point-cloud source sends its clouds to the Composer; the
+            # assistant's bridge reads Headless and calls back into Composer.
             "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{SERVICE_PORTS['composer']}",
+            "MANYFORGE_HEADLESS_API_URL": config.headless_url.rstrip("/"),
         },
         config.source_root,
     )
@@ -495,22 +484,6 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         package_env,
         config.source_root,
     )
-    # Always started; it serves only when the active Deployment has an AI
-    # model component (the endpoint comes from that component, not from here).
-    assistant_bridge = ProcessSpec(
-        "assistant_bridge",
-        (sys.executable, "-m", "manyforge_assistant_bridge.bridge"),
-        {
-            "MANYFORGE_HEADLESS_API_URL": config.headless_url.rstrip("/"),
-            "MANYFORGE_COMPOSER_URL": (
-                f"http://127.0.0.1:{SERVICE_PORTS['composer']}"
-            ),
-            "MANYFORGE_ASSISTANT_BRIDGE_HOST": ASSISTANT_BRIDGE_HOST,
-            "MANYFORGE_ASSISTANT_BRIDGE_PORT": str(ASSISTANT_BRIDGE_PORT),
-            "MANYFORGE_ASSISTANT_AUDIT_LOG": str(config.assistant_bridge_audit_log),
-        },
-        config.source_root,
-    )
     composer_argv = (
         sys.executable,
         "-m",
@@ -523,8 +496,6 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         config.headless_url,
         "--headless-api-timeout-s",
         "30",
-        "--assistant-bridge-url",
-        config.assistant_bridge_url.rstrip("/"),
     )
     if config.composer_static_dir is not None:
         composer_argv += ("--static-dir", str(config.composer_static_dir))
@@ -541,7 +512,7 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         },
         config.source_root,
     )
-    return (manager, headless, program_runner, assistant_bridge, composer)
+    return (manager, headless, program_runner, composer)
 
 
 def _boot_id() -> str:
@@ -632,7 +603,7 @@ def _launch_input_digest(config: NativeLauncherConfig) -> str:
 
 
 def _source_identity(source_root: Path) -> SourceIdentityV1:
-    script = source_root / "scripts/qualification/source_identity.py"
+    script = source_root / "scripts/lib/source_identity.py"
     if not script.is_file():
         raise LauncherError("source_identity_unavailable", f"missing source identity collector: {script}", exit_code=71)
     spec = importlib.util.spec_from_file_location("manyforge_operator_source_identity", script)
@@ -1538,7 +1509,6 @@ class NativeLauncher:
                 (SERVICE_BIND_HOSTS["composer"], 9000),
                 ("127.0.0.1", 9010),
                 ("127.0.0.1", 9011),
-                (ASSISTANT_BRIDGE_HOST, ASSISTANT_BRIDGE_PORT),
             )
         listeners: list[socket.socket] = []
         try:
@@ -1588,7 +1558,6 @@ class NativeLauncher:
                 "program_runner",
                 f"{endpoint_urls.get(ServiceKind.PROGRAM_RUNNER, self.config.program_runner_url)}api/program/health",
             ),
-            ("assistant_bridge", f"{self.config.assistant_bridge_url}health"),
             (
                 "composer",
                 f"{endpoint_urls.get(ServiceKind.COMPOSER, self.config.composer_url)}api/health",
@@ -1607,9 +1576,6 @@ class NativeLauncher:
                 elif component == "program_runner":
                     ready = payload.get("started") is True and payload.get("closed") is False
                     schema = "manyforge.program_runner_health.v1"
-                elif component == "assistant_bridge":
-                    ready = payload.get("status") == "ready"
-                    schema = "manyforge.assistant.bridge_health.v1"
                 else:
                     ready = payload.get("status") == "ready"
                     schema = "manyforge.composer_health.v1"
@@ -2148,7 +2114,7 @@ class NativeLauncher:
             except OSError:
                 pass
         deadline = time.monotonic() + min(10.0, self.config.readiness_timeout_seconds)
-        for component in ("composer", "assistant_bridge", "program_runner", "headless", "manager"):
+        for component in ("composer", "program_runner", "headless", "manager"):
             item = processes.get(component)
             if item is None or not _safe_process_is_authenticated(item):
                 continue

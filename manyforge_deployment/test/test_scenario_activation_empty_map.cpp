@@ -19,7 +19,7 @@ namespace detail = manyforge::deployment::detail;
 // Deployment has no component goes through the same activation materializer
 // as prepare_activation. Its candidate must carry the empty model map (so a
 // zero-role Program can bind), while the Manager's startup empty-cell
-// predecessor published beside it keeps none (Q125).
+// predecessor published beside it keeps none.
 TEST(ScenarioActivationEmptyCell,
      CandidateCarriesTheEmptyMapAndSealedPredecessorDoesNot) {
   const CanonicalValue intent_value(CanonicalValue::Object{

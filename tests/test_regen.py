@@ -28,8 +28,7 @@ def _module():
 def test_steps_run_in_dependency_order() -> None:
     names = [step.name for step in _module().STEPS]
     assert names.index("catalog-pin") < names.index("node-catalog")
-    assert names.index("node-catalog") < names.index("assistant-registry")
-    assert names.index("assistant-registry") < names.index("node-environment")
+    assert names.index("node-catalog") < names.index("node-environment")
     assert names.index("program-revisions") < names.index("maintained-occurrences")
     assert names.index("maintained-occurrences") < names.index("scenario-pins")
     assert names[-1] == "rest-contracts"
@@ -86,3 +85,40 @@ def test_update_replaces_copies_but_not_docs_sealed_or_generated_files(
         "pkg/fixture.deployment.yaml",
         "pkg/resources/generated.json",
     ]
+
+
+def test_scenario_pins_refuse_old_project_without_conversion(tmp_path, monkeypatch):
+    regen = _module()
+    monkeypatch.setattr(regen, "ROOT", tmp_path)
+    project = tmp_path / "examples" / "legacy.scenario"
+    project.mkdir(parents=True)
+    manifest = project / "scenario.yaml"
+    original = '{"api_version":"manyforge.scenario.project.v2"}\n'
+    manifest.write_text(original)
+    (project / "assignment.yaml").write_text("{}\n")
+    with pytest.raises(regen.Stale, match="re-author"):
+        regen.step_scenario_pins(regen.Context(update=True, tools={}))
+    assert manifest.read_text() == original
+    assert (project / "assignment.yaml").read_text() == "{}\n"
+
+
+def test_scenario_pins_refresh_v3_and_clear_stale_ready(tmp_path, monkeypatch):
+    import json
+    from manyforge_composer.backend.scenario_artifacts import build_scenario_document, save_scenario_artifact
+
+    regen = _module()
+    monkeypatch.setattr(regen, "ROOT", tmp_path)
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    project = examples / "cell.scenario"
+    document = build_scenario_document(
+        scenario_id="cell", name="cell", description="", program_draft={"name": "before"},
+        deployment_draft=None, manyforge_version="test", last_known_status="ready",
+    )
+    save_scenario_artifact(document, str(project), allowed_roots=[str(examples)], overwrite=False)
+    (project / "program.yaml").write_text('{"name":"after"}\n')
+    regen.step_scenario_pins(regen.Context(update=True, tools={}))
+    manifest = json.loads((project / "scenario.yaml").read_text())
+    assert set(manifest["members"]) == {"program.yaml", "deployment.yaml"}
+    assert manifest["saved_status"]["last_known_status"] == "unknown"
+    assert not (project / "assignment.yaml").exists()

@@ -6,6 +6,7 @@
 #include <functional>
 #include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/command_schema_codec.hpp>
 #include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
@@ -158,10 +159,11 @@ provider_contract_role_id(const CanonicalValue &declaration) {
 }
 
 /// The Lite6 arm target's `flange` frame role, a TCP as on the maintained
-/// Lite6 types (C-P3).
-[[nodiscard]] inline CanonicalValue lite6_arm_flange_frame() {
+/// Lite6 types.
+[[nodiscard]] inline CanonicalValue lite6_arm_flange_frame(
+    std::string_view frame_alias = "flange") {
   return CanonicalValue(CanonicalValue::Object{
-      {"frame_role_id", CanonicalValue("flange")},
+      {"frame_role_id", CanonicalValue(std::string(frame_alias))},
       {"model_role_id", CanonicalValue("arm_model")},
       {"asset_frame_role_id", CanonicalValue("flange")},
       {"tcp", CanonicalValue(true)},
@@ -195,7 +197,7 @@ provider_contract_role_id(const CanonicalValue &declaration) {
   return CanonicalValue(std::move(gripper_configuration));
 }
 
-/// CP9 stream defaults of one ROS component: the Isaac arm's measured joints
+/// Stream defaults of one ROS component: the Isaac arm's measured joints
 /// (or a gripper-only component's, at the gripper feedback budget) and, with a
 /// gripper target, its gripper feedback.
 [[nodiscard]] inline CanonicalValue component_stream_rows(
@@ -231,8 +233,8 @@ fixture_model_urdf(const Lite6StructuralRetentionFixture &structural) {
     std::string_view frame_prefix = {},
     std::optional<double> initial_joint1_position_rad = std::nullopt,
     bool include_gripper = false, bool motion = true) {
-  // N17: an arm's row carries its joints and operator Stop decelerations
-  // (Q48, the fixture's Stop row values), a tool's its gripper joint, and
+  // An arm's row carries its joints and operator Stop decelerations
+  // (the fixture's Stop row values), a tool's its gripper joint, and
   // both their launched description.
   CanonicalValue::Object profile{
       {"controllable_component_id", CanonicalValue(std::string(component_id))},
@@ -394,7 +396,7 @@ catalog_artifact(std::string logical_uri, std::string bytes,
 
 [[nodiscard]] inline std::string catalog_key(std::string_view kind,
                                              std::string_view digest) {
-  return "catalog/i3-lite6/" + std::string(kind) + "/" +
+  return "catalog/lite6-retention/" + std::string(kind) + "/" +
          std::string(digest.substr(std::string_view("sha256:").size()));
 }
 
@@ -469,14 +471,14 @@ struct AssistantOverlayFixture final {
   const std::string bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue("manyforge.site_overlay.v1")},
-          {"site_overlay_id", CanonicalValue("i5_assistant_site")},
+          {"site_overlay_id", CanonicalValue("assistant_site")},
           {"values", CanonicalValue(std::move(values))},
       }),
       "site-overlay-revision", "manyforge.site_overlay.v1",
       "site_overlay_revision");
   return {
       core::SiteOverlayRefDTO{
-          core::SiteOverlayId("i5_assistant_site"),
+          core::SiteOverlayId("assistant_site"),
           core::SiteOverlayRevision(
               revision_from_document(bytes, "site_overlay_revision")),
           core::ContentDigest(sha256_digest(bytes)),
@@ -490,14 +492,14 @@ assistant_source(const bool composer_draft_enabled = false) {
   CanonicalValue::Object modes{
       {"query",
        CanonicalValue(CanonicalValue::Object{
+           {"assistant_component_id", CanonicalValue("assistant")},
            {"catalog",
             CanonicalValue(CanonicalValue::Object{
-                {"nodes", CanonicalValue(CanonicalValue::Array{})},
                 {"skills", CanonicalValue(CanonicalValue::Array{})},
                 {"tools", text_array({"inspect_isaac_scene", "scene_inspect",
                                       "status_read"})},
             })},
-           {"description", CanonicalValue("Read-only H0 query")},
+           {"description", CanonicalValue("Read-only query")},
            {"enabled", CanonicalValue(true)},
            {"grant_policy",
             CanonicalValue(CanonicalValue::Object{
@@ -506,15 +508,15 @@ assistant_source(const bool composer_draft_enabled = false) {
                 {"session_kind", CanonicalValue(nullptr)},
             })},
            {"model_endpoint_alias", CanonicalValue("primary_model")},
-           {"provider_alias", CanonicalValue("direct_local")},
+           {"runs_in", text_array({"no_program_active"})},
        })},
   };
   if (composer_draft_enabled) {
     modes.emplace_back(
         "composer-assistant",
         CanonicalValue(CanonicalValue::Object{
+            {"assistant_component_id", CanonicalValue("assistant")},
             {"catalog", CanonicalValue(CanonicalValue::Object{
-                            {"nodes", CanonicalValue(CanonicalValue::Array{})},
                             {"skills", CanonicalValue(CanonicalValue::Array{})},
                             {"tools", text_array({"program_read",
                                                   "scene_draft_add_object"})},
@@ -527,7 +529,7 @@ assistant_source(const bool composer_draft_enabled = false) {
                                  {"session_kind", CanonicalValue(nullptr)},
                              })},
             {"model_endpoint_alias", CanonicalValue("primary_model")},
-            {"provider_alias", CanonicalValue("direct_local")},
+            {"runs_in", text_array({"no_program_active"})},
         }));
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -541,7 +543,7 @@ assistant_source(const bool composer_draft_enabled = false) {
            {"primary_model",
             CanonicalValue(CanonicalValue::Object{
                 {"external_resource_alias", CanonicalValue("assistant_model")},
-                {"model_id", CanonicalValue("i5-test-model")},
+                {"model_id", CanonicalValue("assistant-test-model")},
                 {"request_contract",
                  CanonicalValue(CanonicalValue::Object{
                      {"default_timeout_s", CanonicalValue(30.0)},
@@ -556,14 +558,6 @@ assistant_source(const bool composer_draft_enabled = false) {
             })},
        })},
       {"modes", CanonicalValue(std::move(modes))},
-      {"provider_aliases",
-       CanonicalValue(CanonicalValue::Object{
-           {"direct_local", CanonicalValue(CanonicalValue::Object{
-                                {"bridge_external_resource_alias",
-                                 CanonicalValue("assistant_bridge")},
-                                {"provider_kind", CanonicalValue("direct")},
-                            })},
-       })},
       {"prompt_templates", CanonicalValue(CanonicalValue::Object{})},
   });
 }
@@ -576,7 +570,10 @@ assistant_source(const bool composer_draft_enabled = false) {
     std::string_view provider_id = "lite6_arm_provider",
     bool include_lifecycle_recover = false, bool include_observed_state = false,
     bool associate_arm_tcp_contact_bodies = false,
-    bool shared_arm_endpoint_bodies = false) {
+    bool shared_arm_endpoint_bodies = false,
+    std::string_view flange_frame_alias = "flange",
+    bool flange_is_default = false, bool multi_contact = false,
+    bool ambiguous_root_alias = false) {
   const std::string_view primary_capability_id = "execution.trajectory.execute";
   const auto *descriptor =
       core::find_builtin_capability_definition(primary_capability_id);
@@ -791,7 +788,7 @@ assistant_source(const bool composer_draft_enabled = false) {
     });
   }
 
-  // C-P3: TCPs are tagged, as on the maintained Lite6 arm target
+  // TCPs are tagged, as on the maintained Lite6 arm target
   // (`lite6_lite_gripper`): `flange` and `tcp`, with `tcp` the default.
   CanonicalValue::Object arm_tcp_frame{
       {"frame_role_id", CanonicalValue("tcp")},
@@ -802,15 +799,16 @@ assistant_source(const bool composer_draft_enabled = false) {
   if (associate_arm_tcp_contact_bodies) {
     arm_tcp_frame.emplace_back(
         "contact_body_role_ids",
-        CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_collision")}));
+        multi_contact ? text_array({"arm_link1", "arm_collision"})
+                      : text_array({"arm_collision"}));
   }
   CanonicalValue::Array arm_frame_roles{
       CanonicalValue(CanonicalValue::Object{
-          {"frame_role_id", CanonicalValue("base")},
+          {"frame_role_id", CanonicalValue(ambiguous_root_alias ? "root" : "base")},
           {"model_role_id", CanonicalValue("arm_model")},
           {"asset_frame_role_id", CanonicalValue("base")},
       }),
-      lite6_arm_flange_frame(),
+      lite6_arm_flange_frame(flange_frame_alias),
       CanonicalValue(std::move(arm_tcp_frame)),
   };
 
@@ -820,7 +818,21 @@ assistant_source(const bool composer_draft_enabled = false) {
     arm_frame_roles.front() = CanonicalValue(std::move(base));
   }
 
-  const std::string component_bytes = revisioned_document(
+  CanonicalValue::Array arm_collision_roles{
+      CanonicalValue(CanonicalValue::Object{
+          {"collision_body_role_id", CanonicalValue("arm_collision")},
+          {"model_role_id", CanonicalValue("arm_model")},
+          {"asset_collision_body_role_id", CanonicalValue("arm_collision")},
+      })};
+  if (multi_contact) {
+    arm_collision_roles.emplace_back(CanonicalValue::Object{
+        {"collision_body_role_id", CanonicalValue("arm_link1")},
+        {"model_role_id", CanonicalValue("arm_model")},
+        {"asset_collision_body_role_id", CanonicalValue("arm_link1")},
+    });
+  }
+
+  std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
            CanonicalValue(std::string(core::kComponentTypeApiVersion))},
@@ -862,21 +874,30 @@ assistant_source(const bool composer_draft_enabled = false) {
                         })})},
                    {"frame_roles",
                     CanonicalValue(std::move(arm_frame_roles))},
-                   {"collision_body_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"collision_body_role_id",
-                             CanonicalValue("arm_collision")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_collision_body_role_id",
-                             CanonicalValue("arm_collision")},
-                        })})},
+                   {"collision_body_roles", CanonicalValue(std::move(arm_collision_roles))},
                    {"capabilities",
                     CanonicalValue(std::move(target_capabilities))},
-                   {"default_tcp_frame_role_id", CanonicalValue("tcp")},
+                   {"default_tcp_frame_role_id", CanonicalValue(
+                        flange_is_default ? std::string(flange_frame_alias) : "tcp")},
                })})},
           {"attachment_interfaces", CanonicalValue(CanonicalValue::Array{})},
       }),
+      "catalog-record-revision/component_type", core::kComponentTypeApiVersion,
+      "component_type_revision");
+  // Frame aliases and contact-role arrays can require schema normalization.
+  // Seal the normalized candidate, as the production catalog path does.
+  const auto *component_schema = build_qualified_closed_schema_registry()
+      .find_catalog_schema_family(core::CatalogRecordKind::kComponentType);
+  if (!component_schema || !component_schema->compiled_schema())
+    throw std::logic_error("Lite6 fixture component schema is unavailable");
+  const auto normalized_component = validate_and_normalize_unqualified_artifact_candidate(
+      *component_schema->compiled_schema(), parse_strict_json_model_yaml(component_bytes));
+  auto normalized_identity = normalized_component.normalized_root().as_object();
+  std::erase_if(normalized_identity, [](const auto &row) {
+    return row.first == "component_type_revision";
+  });
+  component_bytes = revisioned_document(
+      CanonicalValue(std::move(normalized_identity)),
       "catalog-record-revision/component_type", core::kComponentTypeApiVersion,
       "component_type_revision");
   const core::ContentDigest component_digest(sha256_digest(component_bytes));
@@ -1817,7 +1838,7 @@ assistant_source(const bool composer_draft_enabled = false) {
   CanonicalValue::Array gripper_contracts;
   if (stoppable) {
     {
-      // DX768: the genuine A1 logical-cancellation policy is approved.
+      // The genuine logical-cancellation policy is approved.
       gripper_contracts.emplace_back(CanonicalValue::Object{
           {"provider_contract_ref", logical_cancel_contract_ref()},
           {"stop_command_support", CanonicalValue(CanonicalValue::Object{
@@ -1906,7 +1927,7 @@ assistant_source(const bool composer_draft_enabled = false) {
       provider_ref, provider_key, provider_bytes);
 
   if (stoppable) {
-    // DX768: qualify the approved A1 policy through the ordinary catalog path.
+    // Qualify the approved policy through the ordinary catalog path.
     const auto identity = parse_strict_json_model_yaml(R"POLICY({"api_version":"manyforge.stop_evidence_policy.v2","containment_granularity":"resource","disposition":"stoppable","escalation_stages":[{"containment_command":{"command":{"command_kind":"logical_cancel","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}}},"containment_granularity":"resource","evidence_conjunction":"all_of","evidence_requirements":[{"evidence":{"evidence_kind":"logical_cancellation_no_continuing_effect","provider_contract_ref":{"contract_schema_id":"manyforge.value_schema.provider_contract.empty.v1","contract_schema_revision":"sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270","provider_contract_role_id":"gripper_logical_cancel"}},"evidence_item_id":"logical_cancel_fenced","observation_semantics":{"observation_kind":"command_result"},"source_requirement":{"freshness_budget_ns":100000000,"source_kind":"command_target_status"}}],"stage_kind":"nominal","stop_escalation_stage_id":"gripper_logical_cancel"}],"stop_evidence_policy_id":"manyforge.gripper_logical_cancellation"})POLICY");
     const bool position_gripper = ros_gripper_actuation_kind == "position_commanded";
     if (!position_gripper && ros_gripper_actuation_kind != "pneumatic")
@@ -2095,7 +2116,7 @@ assistant_source(const bool composer_draft_enabled = false) {
         {"root_pose_in_cell",
          translated_pose(static_cast<double>(instance) * 2.0)},
     };
-    // B5: the compiled default TCP, as the activation compiler writes it for
+    // The compiled default TCP, as the activation compiler writes it for
     // a type whose one target declares a default.
     std::vector<CanonicalValue> declared_defaults;
     for (const auto &target : component_type.value().command_targets) {
@@ -2336,7 +2357,7 @@ assistant_source(const bool composer_draft_enabled = false) {
               if (key == "lane_row")
                 setting = CanonicalValue(
                     R"({"adapter":"mock","arrival_tolerance_rad":0.01,"controller":"lite6_traj_controller",)"
-                    R"("gripper_result_timeout_s":5,"hard_stop_completion_timeout_s":1.5,)"
+                    R"("hard_stop_completion_timeout_s":1.5,"runtime_scale":"supported",)"
                     R"("vendor":"xarm","vendor_model":"lite6"})");
               if (key == "model_family_id") setting = CanonicalValue("lite6");
             }
@@ -2373,7 +2394,7 @@ assistant_source(const bool composer_draft_enabled = false) {
 
   const std::string selected_cell_id =
       cell_id.empty()
-          ? (gripper_only ? "i6_lite6_gripper_only_cell" : "i6_lite6_motion_cell")
+          ? (gripper_only ? "lite6_gripper_only_cell" : "lite6_motion_cell")
           : std::string(cell_id);
   if (instance_count == 0U) {
     const auto &profile = *catalog.ros2_control_execution_runtime_profile;
@@ -2648,7 +2669,7 @@ make_applicability_inputs(
                 {"allow_natural_completion_on_short_path",
                  CanonicalValue(true)},
             };
-            // Q51: the robot's own explicit maximum Stop time, when authored.
+            // The robot's own explicit maximum Stop time, when authored.
             if (arm_max_stop_time_s.has_value()) {
               arm_parameters.emplace_back("max_stop_time_s",
                                           CanonicalValue(*arm_max_stop_time_s));
@@ -2785,7 +2806,10 @@ make_lite6_controllable_retention_fixture(
     void (*component_input_mapper)(CanonicalValue::Object &) = nullptr,
     const CanonicalValue *interrupt_policy_configuration = nullptr,
     bool associate_arm_tcp_contact_bodies = false,
-    bool shared_arm_endpoint_bodies = false) {
+    bool shared_arm_endpoint_bodies = false,
+    std::string_view flange_frame_alias = "flange",
+    bool flange_is_default = false, bool multi_contact = false,
+    bool ambiguous_root_alias = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   // A gripper-only component is a separate tool with its own model: it
   // always comes with its own structural override and role mapping.
@@ -2804,7 +2828,7 @@ make_lite6_controllable_retention_fixture(
     throw std::logic_error(
         "gripper feedback fixture requires the gripper-only owner");
   }
-  // DX823: the existing chained catalog can qualify retained metadata on a
+  // The existing chained catalog can qualify retained metadata on a
   // genuine ROS source. This fixture does not qualify chained runtime Stop.
   if (chained && stoppable) {
     throw std::logic_error(
@@ -2824,7 +2848,8 @@ make_lite6_controllable_retention_fixture(
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
       direct_provider_id,
       include_lifecycle_recover, include_observed_state,
-      associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies);
+      associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies,
+      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias);
   if (gripper_only) {
     catalog = fixture_detail::add_gripper_only_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest,
@@ -2910,14 +2935,14 @@ make_lite6_controllable_retention_fixture(
   CanonicalValue::Object deployment_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id",
-       CanonicalValue(gripper_only ? "i6_lite6_gripper_only_fixture"
-                                   : "i6_lite6_motion_fixture")},
+       CanonicalValue(gripper_only ? "lite6_gripper_only_fixture"
+                                   : "lite6_motion_fixture")},
       {"deployment_revision",
        CanonicalValue(std::string(fixture_detail::kZeroDigest))},
       {"cell_id", CanonicalValue(graph.graph().cell_id.value())},
       {"name",
-       CanonicalValue(gripper_only ? "I6 Lite6 gripper-only fixture"
-                                   : "I6 Lite6 addressed motion fixture")},
+       CanonicalValue(gripper_only ? "Lite6 gripper-only fixture"
+                                   : "Lite6 addressed motion fixture")},
       {"catalogs", detail::encode_deployment_catalogs(catalog_records)},
       {"graph", CanonicalValue(std::move(deployment_graph))},
       {"desired_control_configurations",
@@ -3107,7 +3132,7 @@ make_lite6_chained_controllable_retention_fixture() {
   return make_lite6_controllable_retention_fixture(true);
 }
 
-/// DX823: genuine ROS source plus existing two-controller catalog/sealer data.
+/// Genuine ROS source plus existing two-controller catalog/sealer data.
 /// No controller launch, chained runtime, or Stop qualification is claimed.
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_ros2_control_chained_catalog_retention_fixture() {
@@ -3178,12 +3203,14 @@ make_lite6_ros2_control_composer_assistant_retention_fixture() {
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_ros2_control_shared_consumer_retention_fixture(
     std::string_view cell_id = {}, std::size_t instance_count = 1U,
-    bool stoppable = false) {
+    bool stoppable = false, bool associate_tcp_contact_bodies = false) {
   return make_lite6_controllable_retention_fixture(
       false, false, instance_count, cell_id, false,
       stoppable, "resource", stoppable, {}, {}, false, false,
       std::nullopt, kLite6ArmTargetId, std::nullopt, std::nullopt,
-      {}, true, {}, "manyforge.provider.ros2_control", false, true);
+      {}, true, {}, "manyforge.provider.ros2_control", false, true,
+      nullptr, nullptr, false, "pneumatic", std::nullopt, "commanded",
+      nullptr, nullptr, associate_tcp_contact_bodies);
 }
 
 /// Genuine ROS execution owner with a distinct retained read-only StateObserved binding.
@@ -3191,14 +3218,22 @@ make_lite6_ros2_control_shared_consumer_retention_fixture(
 [[nodiscard]] inline Lite6ControllableRetentionFixture
 make_lite6_ros2_control_observed_consumer_retention_fixture(
     bool associate_tcp_contact_bodies = false,
-    bool shared_arm_endpoint_bodies = false) {
+    bool shared_arm_endpoint_bodies = false,
+    std::string_view flange_frame_alias = "flange",
+    bool flange_is_default = false, bool multi_contact = false,
+    bool ambiguous_root_alias = false) {
+  std::optional<Lite6StructuralRetentionFixture> structural;
+  if (multi_contact)
+    structural.emplace(make_lite6_structural_retention_fixture("arm_collision", true));
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, {}, false, false, "resource",
       false, {}, {}, false, false, std::nullopt, kLite6ArmTargetId,
       std::nullopt, std::nullopt, {}, true, {},
-      "manyforge.provider.ros2_control", false, true, nullptr, nullptr, true,
+      "manyforge.provider.ros2_control", false, true,
+      structural ? &*structural : nullptr, nullptr, true,
       "pneumatic", std::nullopt, "commanded", nullptr, nullptr,
-      associate_tcp_contact_bodies, shared_arm_endpoint_bodies);
+      associate_tcp_contact_bodies, shared_arm_endpoint_bodies,
+      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias);
 }
 
 /// Same retained observed-state fixture with endpoint-associated contact body

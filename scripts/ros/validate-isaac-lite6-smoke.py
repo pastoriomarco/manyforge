@@ -20,10 +20,8 @@ LITE6_GRIPPER_JOINT = "right_finger_joint"
 RESULT_SCHEMA = "manyforge.isaac_lite6_live_smoke.v1"
 
 UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
-RESTORATION_GATE = "I6/N + I8/P5 + I9/I"
 UNAVAILABLE_MESSAGE = (
-    f"{UNAVAILABLE_REASON_CODE}: live Isaac Lite6 smoke requires the "
-    f"{RESTORATION_GATE} restoration gates"
+    f"{UNAVAILABLE_REASON_CODE}: live Isaac Lite6 smoke is not available yet"
 )
 
 

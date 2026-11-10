@@ -959,48 +959,38 @@ template <typename StrongId>
 }
 
 [[nodiscard]] CanonicalValue ReferenceValue(const std::optional<ReferenceDTO>& reference) {
-  if (!reference.has_value()) {
-    return CanonicalValue(nullptr);
-  }
+  if (!reference.has_value()) return CanonicalValue(nullptr);
   std::string_view type;
+  CanonicalValue id{nullptr};
   switch (reference->type) {
-    case ReferenceDTO::Type::kFrameRole:
-      type = "frame_role";
+    case ReferenceDTO::Type::kComponentFrame: {
+      type = "component_frame";
+      const auto& frame = std::get<ProgramFrameReferenceDTO>(reference->id);
+      id = CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(frame.component_id.value())},
+          {"frame_id", CanonicalValue(frame.frame_id.value())}});
       break;
-    case ReferenceDTO::Type::kComponentBodyRole:
-      type = "component_body_role";
+    }
+    case ReferenceDTO::Type::kComponentBody: {
+      type = "component_body";
+      const auto& body = std::get<ProgramCollisionBodyReferenceDTO>(reference->id);
+      id = CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(body.component_id.value())},
+          {"collision_body_id", CanonicalValue(body.collision_body_id.value())}});
       break;
-    case ReferenceDTO::Type::kSceneResource:
-      type = "scene_resource";
-      break;
-    case ReferenceDTO::Type::kRuntimeObject:
-      type = "runtime_object";
-      break;
-    case ReferenceDTO::Type::kPose:
-      type = "pose";
-      break;
-    case ReferenceDTO::Type::kCellFrame:
-      type = "cell_frame";
-      break;
+    }
+    case ReferenceDTO::Type::kSceneResource: type = "scene_resource"; break;
+    case ReferenceDTO::Type::kRuntimeObject: type = "runtime_object"; break;
+    case ReferenceDTO::Type::kPose: type = "pose"; break;
+    case ReferenceDTO::Type::kCellFrame: type = "cell_frame"; break;
   }
-  CanonicalValue::Object value{
-      {"id", CanonicalValue(std::string(reference_identity_value(*reference)))},
+  if (reference->type == ReferenceDTO::Type::kSceneResource ||
+      reference->type == ReferenceDTO::Type::kRuntimeObject)
+    id = CanonicalValue(std::string(reference_identity_value(*reference)));
+  return CanonicalValue(CanonicalValue::Object{
+      {"id", std::move(id)},
       {"pose", reference->pose.has_value() ? PoseValue(*reference->pose) : CanonicalValue(nullptr)},
-  };
-  // Emitted only for robot-qualified frames so unqualified references keep
-  // their established canonical identity.
-  if (reference->target.has_value()) {
-    value.emplace_back(
-        "target",
-        CanonicalValue(CanonicalValue::Object{
-            {"command_target_id", CanonicalValue(reference->target->command_target_id.value())},
-            {"controllable_component_id",
-             CanonicalValue(reference->target->controllable_component_id.value())},
-            {"target_role_id", CanonicalValue(reference->target->target_role_id.value())},
-        }));
-  }
-  value.emplace_back("type", CanonicalValue(std::string(type)));
-  return CanonicalValue(std::move(value));
+      {"type", CanonicalValue(std::string(type))}});
 }
 
 [[nodiscard]] CanonicalValue ActionSpanValue(const std::optional<ActionSpanDTO>& span) {
@@ -1116,7 +1106,7 @@ template <typename StrongId>
 
 [[nodiscard]] CanonicalValue MotionPayloadValue(const MotionParticipantIntentDTO& motion) {
   Require(motion.motion_interrupt_scopes.empty(), "operation_journal_payload_unsupported",
-          "N4 durable admission does not accept motion-interrupt scopes");
+          "durable admission does not accept motion-interrupt scopes");
   CanonicalValue::Object dynamics;
   dynamics.reserve(motion.per_joint_dynamics_limits.size());
   for (const auto& [joint_name, limit] : motion.per_joint_dynamics_limits) {
@@ -1139,7 +1129,9 @@ template <typename StrongId>
     });
   }
   CanonicalValue::Object value{
-      {"base_frame_role_id", CanonicalValue(motion.base_frame_role_id.value())},
+      {"base_frame", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(motion.base_frame.component_id.value())},
+          {"frame_id", CanonicalValue(motion.base_frame.frame_id.value())}})},
       {"cache_mode", CanonicalValue(cache_mode)},
       {"contact_policy_id", OptionalIdentity(motion.contact_policy_id)},
       {"kind", CanonicalValue("motion")},
@@ -1275,13 +1267,14 @@ void AddExecutionScope(CanonicalValue::Object& row,
   for (const auto& participant : intent.participants) {
     CanonicalValue::Object row{
         {"action_span", ActionSpanValue(participant.action_span)},
-        {"component_role_id", CanonicalValue(participant.component_role_id.value())},
         {"payload",
          std::holds_alternative<MotionParticipantIntentDTO>(participant.payload)
              ? MotionPayloadValue(std::get<MotionParticipantIntentDTO>(participant.payload))
              : CapabilityPayloadValue(std::get<CapabilityCommandIntentDTO>(participant.payload))},
         {"required_capability_id", CanonicalValue(participant.required_capability_id.value())},
-        {"target_role_id", CanonicalValue(participant.target_role_id.value())},
+        {"target", CanonicalValue(CanonicalValue::Object{
+            {"component_id", CanonicalValue(participant.target.component_id.value())},
+            {"command_target_id", CanonicalValue(participant.target.command_target_id.value())}})},
     };
     AddExecutionScope(row, participant.execution_scope);
     participants.emplace_back(std::move(row));
@@ -1979,7 +1972,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
                                          const RuntimeScaleStatusDTO* scale_status,
                                          bool effect_pending) {
   return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.operation_journal_record.v8")},
+      {"api_version", CanonicalValue("manyforge.operation_journal_record.v9")},
       {"effect_pending", CanonicalValue(effect_pending)},
       {"intent", intent},
       {"operation_state", OperationStateValue(state)},
@@ -2214,7 +2207,7 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
             "affected operation state does not match its accepted revision");
 
     // The originating Stop is this acceptance or one of its joined
-    // predecessors (Q51: no per-participant budget rows remain).
+    // predecessors (no per-participant budget rows remain).
     const bool current_origin = state.active_stop_id == accepted.stop_id &&
                                 state.active_stop_generation == accepted.stop_generation;
     const bool predecessor_origin = std::any_of(
@@ -2486,7 +2479,7 @@ std::string ValidateSnapshotCapture(sqlite3* database, const OperationId& operat
   Statement capture_version(database, "SELECT json_extract(?,'$.api_version')");
   capture_version.Bind(1, bytes);
   Require(capture_version.Step() &&
-              (capture_version.Text(0) == "manyforge.operation_journal_record.v8" ||
+              (capture_version.Text(0) == "manyforge.operation_journal_record.v9" ||
                capture_version.Text(0) == "manyforge.stop_acceptance_projection.v8") &&
               !capture_version.Step(),
           "operation_journal_corrupt", "operation capture has an unsupported command identity format");
@@ -3198,6 +3191,36 @@ class SqliteOperationJournal::Impl final {
             "operation journal cell identity or history bound is invalid");
     Require(sqlite3_libversion_number() >= 3037000, "operation_journal_storage_unsupported",
             "operation journal requires SQLite 3.37.0 or newer");
+    // Inspect an existing journal with a read-only connection before opening
+    // the writable owner. Older nonempty formats are refused before SQLite
+    // configuration can change the file or its persisted journal mode.
+    std::error_code preflight_path_error;
+    const bool preflight_exists = std::filesystem::exists(database_path_, preflight_path_error);
+    if (preflight_path_error) {
+      Fail("operation_journal_storage_failure",
+           "inspect operation journal database: " + preflight_path_error.message());
+    }
+    if (preflight_exists) {
+      sqlite3* preflight = nullptr;
+      const auto opened = sqlite3_open_v2(database_path_.string().c_str(), &preflight,
+          SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
+      if (opened != SQLITE_OK) {
+        const auto detail = SqliteDetail(preflight, opened);
+        if (preflight != nullptr) sqlite3_close(preflight);
+        Fail("operation_journal_storage_failure", "open operation journal database: " + detail);
+      }
+      try {
+        if (!SchemaObjectNames(preflight).empty()) {
+          Require(ScalarInteger(preflight, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
+                  "operation_journal_version_unsupported",
+                  "operation journal version is unsupported; settle and Reset using the old version, or clean-start");
+        }
+      } catch (...) {
+        sqlite3_close(preflight);
+        throw;
+      }
+      sqlite3_close(preflight);
+    }
     const auto result = sqlite3_open_v2(
         database_path_.string().c_str(), &database_,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
@@ -3211,6 +3234,14 @@ class SqliteOperationJournal::Impl final {
       Fail("operation_journal_storage_failure", "open operation journal database: " + detail);
     }
     try {
+      // Refuse an old, nonempty journal before journal_mode=WAL or any other
+      // configuration can modify its on-disk representation. A new empty
+      // database still proceeds through normal initialization below.
+      if (!SchemaObjectNames(database_).empty()) {
+        Require(ScalarInteger(database_, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
+                "operation_journal_version_unsupported",
+                "operation journal version is unsupported; settle and Reset using the old version, or clean-start");
+      }
       Configure();
       InitializeOrValidate();
       OpenReader();
@@ -3494,12 +3525,11 @@ class SqliteOperationJournal::Impl final {
       Require(!metadata.Step(), "operation_journal_corrupt",
               "operation journal metadata insert returned an unexpected row");
     }
-    // v19 added the takeover planning cap; v18 dropped the Stop fault latch
-    // and surveillance records. Earlier journals are refused and left
-    // untouched, never converted.
+    // v20 uses direct component references in operation intents. Earlier
+    // journals are refused and left untouched, never converted.
     Require(ScalarInteger(database_, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
-            "operation_journal_format_unsupported",
-            "operation journal predates the v19 takeover record and is not converted");
+            "operation_journal_version_unsupported",
+            "operation journal version is unsupported; settle and Reset using the old version, or clean-start");
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects(),
             "operation_journal_storage_foreign", "operation journal contains an unexpected schema");
     Require(
@@ -5427,15 +5457,15 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
       Require(unresolved.Step() && unresolved.Integer(0) == 0 && !unresolved.Step(),
               "operation_journal_owner_close_blocked",
               "unresolved claims block request-owner epoch rotation");
-      // The CCLC and Composer validators independently prove that their exact
-      // successor journal epoch is active and that no owner-local transaction
-      // or physical effect remains unresolved.  The Program-cycle validator
-      // provides the same proof for an idle or exactly released cycle, and the
-      // Kernel validates its own manual-operation successor against the exact
-      // retained claim inventory.  Those proofs can authorize an empty-claim
-      // rotation after an unclean Kernel-host epoch; every other request-owner
-      // role still requires a clean close or an exact held-claim successor
-      // settlement.
+      // The Manager and Composer validators independently prove that their
+      // exact successor journal epoch is active and that no owner-local
+      // transaction or physical effect remains unresolved. The Program-cycle
+      // validator provides the same proof for an idle or exactly released cycle.
+      // The Kernel validates its own manual-operation successor against the
+      // exact retained claim inventory.
+      // Those proofs can authorize an empty-claim rotation after an unclean
+      // Kernel-host epoch; every other request-owner role still requires a clean
+      // close or an exact held-claim successor settlement.
       const bool empty_validated_rotation =
           (current.owner_role == CellAdmissionOwnerRoleDTO::kAuthoringOwner ||
            current.owner_role == CellAdmissionOwnerRoleDTO::kProgramRunner ||
@@ -5639,22 +5669,22 @@ std::uint64_t SqliteOperationJournal::Impl::RecordInterruptRuleStateChanged(
   return sequence;
 }
 
-// Active TCP (M7, design 4): one confirmed Active TCP change. Sparse and
+// Active TCP: one confirmed Active TCP change. Sparse and
 // owner-epoch scoped like the rule-state rows; current truth is the robot
 // owner's baseline (with this row's sequence), never old rows still kept.
 std::uint64_t SqliteOperationJournal::Impl::RecordActiveTcpChanged(
     const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) {
   Require(!owner_epoch.empty() && !change.component_id.empty() &&
-              (!change.entry || valid_tcp_entry(*change.entry)) &&
-              (!change.previous || valid_tcp_entry(*change.previous)) &&
+              (!change.entry || valid_tcp_entry_reference(*change.entry)) &&
+              (!change.previous || valid_tcp_entry_reference(*change.previous)) &&
               change.registration_generation != 0U &&
               change.occurred_at_ns >= 0,
           "operation_journal_record_invalid", "Active TCP change is invalid");
-  const auto entry_value = [](const std::optional<TcpEntryDTO>& entry) {
-    return entry ? EncodeTcpEntry(*entry) : CanonicalValue(nullptr);
+  const auto entry_value = [](const std::optional<TcpEntryReferenceDTO>& entry) {
+    return entry ? EncodeTcpEntryReference(*entry) : CanonicalValue(nullptr);
   };
   const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.active_tcp_change.v1")},
+      {"api_version", CanonicalValue("manyforge.active_tcp_change.v2")},
       {"owner_epoch", CanonicalValue(owner_epoch.value())},
       {"component_id", CanonicalValue(change.component_id.value())},
       {"previous", entry_value(change.previous)},

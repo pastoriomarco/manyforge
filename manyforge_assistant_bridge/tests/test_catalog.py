@@ -4,6 +4,7 @@ import pytest
 
 from manyforge_assistant_bridge.catalog import (
     AssistantCatalogError,
+    _validate_model_request_contract,
     resolve_catalog,
 )
 from manyforge_composer.backend.assistant_catalog_narrowing import (
@@ -100,3 +101,33 @@ def test_narrowing_rejects_aliases_widening_and_noncanonical_inputs(
 ) -> None:
     with pytest.raises(AssistantCatalogError):
         resolve_catalog(_mode(), requested_tools=requested, field_policy=policy)
+
+
+_CONTRACT = {
+    "default_timeout_s": 30,
+    "max_output_tokens": 512,
+    "supported_image_transports": [],
+    "supports_image_input": False,
+    "supports_json_object": True,
+    "supports_response_tools": True,
+    "tool_call_family": "openai_chat_tools",
+}
+
+
+def test_model_sampling_is_optional_and_kept() -> None:
+    assert "sampling" not in _validate_model_request_contract(dict(_CONTRACT))
+    sampling = {"temperature": 0, "top_k": 20, "top_p": 1}
+    assert _validate_model_request_contract(
+        {**_CONTRACT, "sampling": sampling})["sampling"] == sampling
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [{}, {"min_p": 0.1}, {"temperature": 2.5}, {"temperature": -0.1},
+     {"temperature": True}, {"top_p": 0}, {"top_p": 1.5}, {"top_k": 0},
+     {"top_k": 1.5}, [0.5]],
+)
+def test_model_sampling_out_of_range_is_refused(sampling) -> None:
+    with pytest.raises(AssistantCatalogError) as error:
+        _validate_model_request_contract({**_CONTRACT, "sampling": sampling})
+    assert error.value.code == "assistant_projection_invalid"

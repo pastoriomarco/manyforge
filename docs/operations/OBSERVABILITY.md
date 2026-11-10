@@ -12,8 +12,8 @@ FastAPI app).
 
 ManyForge does **not** ship a unified log file. All workbench processes write
 to the workbench container's console, captured by Docker; runtime and alarm
-events go to the Historian and are read through REST; the assistant bridge
-also writes a JSONL audit file.
+events go to the Historian and are read through REST; the AI assistant
+component's bridge also writes a JSONL audit file.
 
 ### Workbench console
 
@@ -36,12 +36,16 @@ also writes a JSONL audit file.
 
 ### Assistant bridge audit
 
-The workbench writes the assistant audit JSONL to
-`/tmp/manyforge-state/current/assistant-bridge/audit.jsonl` inside the
-container, which is `.manyforge-dev/runtime/<container-name>/current/assistant-bridge/audit.jsonl`
-on the host (`MANYFORGE_ASSISTANT_AUDIT_LOG`). It is rotated at 10 MB, 3 files
-kept. It records every assistant turn, fail-closed rejection and upstream
-error. On the next start, `current/` moves to `previous-sessions/`.
+The AI assistant component's bridge writes its audit JSONL to
+`<execution run root>/controller-launch-artifacts/<component_id>/assistant-audit.jsonl`;
+in the workbench that is
+`/tmp/manyforge-state/current/execution-run/controller-launch-artifacts/<component_id>/assistant-audit.jsonl`
+inside the container, which is
+`.manyforge-dev/runtime/<container-name>/current/execution-run/controller-launch-artifacts/<component_id>/assistant-audit.jsonl`
+on the host. It is rotated at 10 MiB, with the active
+file plus 3 backups kept. It records every assistant request and tool call
+with identities, hashes and outcomes (never prompts, responses or argument
+values), including fail-closed rejections and upstream errors. On the next start, `current/` moves to `previous-sessions/`.
 
 ### Runtime events
 
@@ -81,11 +85,6 @@ The list line reads like `Enable lite6_robot failed: <code>: <message>`; select
 the row for the full payload. Filter with `event_types=component_action_finished`
 or `components=<component id>`. These events share the History's existing
 retention limits.
-
-### What is **not** a runtime log
-
-- `verification/` — qualification fixtures used by the
-  `scripts/qualification/` entrypoints, not runtime output.
 
 ## Observability REST endpoints
 

@@ -37,22 +37,20 @@ def _app(headless: _Headless) -> TestClient:
 
 def _read() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": BINDING,
-        "target_role_id": "station",
         "kind": "io_signal",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "station", "signal_name": "part_present"},
     }
 
 
 def _mock() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.mock_io_input_request.v1",
+        "schema_version": "manyforge.mock_io_input_request.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": BINDING,
-        "target_role_id": "station",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "station", "signal_name": "part_present"},
         "expected_source_epoch": "2",
         "value": False,
     }

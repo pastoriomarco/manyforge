@@ -20,15 +20,15 @@ namespace {
 [[nodiscard]] bool same_registration_key(const RuntimeParticipantBindingDTO& lhs,
                                          const RuntimeParticipantBindingDTO& rhs) noexcept {
   return lhs.program_binding_id == rhs.program_binding_id &&
-         lhs.component_role_id == rhs.component_role_id &&
-         lhs.target_role_id == rhs.target_role_id && lhs.capability_id == rhs.capability_id;
+         lhs.controllable_component_id == rhs.controllable_component_id &&
+         lhs.command_target_id == rhs.command_target_id && lhs.capability_id == rhs.capability_id;
 }
 
-[[nodiscard]] const ProgramFrameRoleBindingDTO* find_frame(
-    const RuntimeParticipantBindingDTO& binding, const FrameRoleId& role) noexcept {
+[[nodiscard]] const ProgramFrameBindingDTO* find_frame(
+    const RuntimeParticipantBindingDTO& binding, const ProgramFrameReferenceDTO& reference) noexcept {
   const auto found = std::find_if(
       binding.frame_bindings.begin(), binding.frame_bindings.end(),
-      [&](const ProgramFrameRoleBindingDTO& candidate) { return candidate.frame_role_id == role; });
+      [&](const ProgramFrameBindingDTO& candidate) { return candidate.reference == reference; });
   return found == binding.frame_bindings.end() ? nullptr : &*found;
 }
 
@@ -41,7 +41,7 @@ namespace {
         if constexpr (std::is_same_v<Payload, MotionParticipantIntentDTO>) {
           if (!runtime.control_path.has_value() || runtime.model_groups.empty() ||
               runtime.resources.empty() ||
-              find_frame(runtime, payload.base_frame_role_id) == nullptr ||
+              find_frame(runtime, payload.base_frame) == nullptr ||
               !runtime.motion_endpoint ||
               !tcp_selector_admits(payload.tcp_endpoint, *runtime.motion_endpoint, std::nullopt)) {
             return reject("motion participant lacks an exact runtime mapping",
@@ -56,7 +56,7 @@ namespace {
           }
           return Result<RuntimeParticipantBinding>::Ok(binding);
         } else if constexpr (std::is_same_v<Payload, SetTcpParticipantIntentDTO>) {
-          // Active TCP (M7): the robot's motion target, its endpoint resolved
+          // Active TCP: the robot's motion target, its endpoint resolved
           // from the selector exactly as a move's.
           if (!runtime.control_path.has_value() || runtime.resources.empty() ||
               !runtime.motion_endpoint ||
@@ -135,8 +135,8 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::resolve(
         value.program_binding_id != operation.program_binding_id ||
         value.retained_bundle_id != operation.expected_retained_bundle_id ||
         value.graph_revision != operation.expected_graph_revision ||
-        value.component_role_id != participant.component_role_id ||
-        value.target_role_id != participant.target_role_id ||
+        value.controllable_component_id != participant.target.component_id ||
+        value.command_target_id != participant.target.command_target_id ||
         value.capability_id != participant.required_capability_id) {
       continue;
     }
@@ -171,8 +171,8 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::validate_resolved(
       value.program_binding_id != operation.program_binding_id ||
       value.retained_bundle_id != operation.expected_retained_bundle_id ||
       value.graph_revision != operation.expected_graph_revision ||
-      value.component_role_id != participant.component_role_id ||
-      value.target_role_id != participant.target_role_id ||
+      value.controllable_component_id != participant.target.component_id ||
+      value.command_target_id != participant.target.command_target_id ||
       value.capability_id != participant.required_capability_id) {
     return reject("resolved participant differs from the exact operation address",
                   "runtime_participant_address_mismatch");

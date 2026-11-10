@@ -39,7 +39,8 @@ struct Occurrence final {
 Reply CreateHostIoOutputChannels(
     std::vector<HostIoOutputAliasInstallation> aliases,
     rclcpp::Node::SharedPtr node, core::IClock &clock,
-    std::span<const HostIoGpioTopicPin> captured_topics) {
+    std::span<const HostIoGpioTopicPin> captured_topics,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner) {
   try {
     // Ephemeral selection of actual provider pins, not a second topic model.
     // Reject conflicting captures before constructing any leaf.
@@ -180,7 +181,7 @@ Reply CreateHostIoOutputChannels(
             node,
             {resource, *channel.ros_address, std::move(installed),
              channel.publication, channel.ack_timeout_ns},
-            std::move(topic));
+            std::move(topic), owner);
         if (!made.ok())
           return Reply::Err(made.error());
         auto provider =

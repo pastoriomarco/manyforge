@@ -1,4 +1,4 @@
-"""Signal-move interrupt nodes over the real wire (SX-2282).
+"""Signal-move interrupt nodes over the real wire.
 
 One Program Run on the ROS Mock lane drives ``motion.move_until_signal``
 through the real Program Runner process and its production Kernel port
@@ -10,7 +10,7 @@ Fixture: ``examples/mock_lite6_signal_moves.scenario`` (shared Deployment
 ``mock_lite6_signal_moves``), narrowed to its two move_until_signal nodes
 and their ``node_outcome`` checks, and to the Lite6 Mock and Mock station_io
 components (the ROS ``plc_io`` peer and the global rule are not part of this
-check). The nodes author their Mock scripts (contract 133): ``search_trip``
+check). The nodes author their Mock scripts: ``search_trip``
 sets ``probe_contact`` false then true after 1000 ms; ``search_no_trip`` sets
 ``edge_sensor`` false with no later change.
 """
@@ -37,7 +37,7 @@ from manyforge_headless_api.process_tests.test_process_stack import (
     _read_only_tree,
     keep_failure_evidence,
 )
-from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
+from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution import (
     _activate_loaded_components,
     _component_states,
     _disable_for_reload,
@@ -113,7 +113,6 @@ def _write_signal_scenario(directory: Path) -> Path:
         description="mock_lite6_signal_moves narrowed to move_until_signal trip/no-trip.",
         program_draft=program,
         deployment_draft=deployment,
-        program_role_assignment=trial["program_role_assignment"],
         manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         last_known_status="unknown",
     )
@@ -215,11 +214,11 @@ def _load(
 
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
         loaded = composer.request("POST", "/api/scenario/load", body={"path": str(project)})
-        # Load waits for the whole Apply (CONTRACTS §11); components end prepared.
+        # Load waits for the whole Apply; components end prepared.
         assert loaded["outcome"] == "succeeded", loaded
         if activate_components:
             component_ids = _activate_loaded_components(stack)
-            # The Lite 6 machine owner `lite6` is a component too (CONTRACTS §16);
+            # The Lite 6 machine owner `lite6` is a component too;
             # its inactive I/O members never reach the compiled cell.
             assert set(component_ids) == {
                 "lite6", "lite6_robot", "lite_gripper", "station_io"
@@ -257,7 +256,6 @@ def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Pa
         description="Changes Lite6 runtime configuration; preserves the Scenario identity.",
         program_draft=source["program_draft"],
         deployment_draft=deployment,
-        program_role_assignment=source["program_role_assignment"],
         manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(
             encoding="utf-8"
         ).strip(),
@@ -436,7 +434,7 @@ def _write_mock_io_scenario(directory: Path) -> Path:
     assert ack_wait["instance_id"] == "wait_operator_ack"
     assert ack_wait["parameters"]["timeout_s"] == 5.0
     assert ack_wait["parameters"]["mock_simulation"] == [{
-        "signal": {"target_role": "station", "resource_role": "operator_ack"},
+        "signal": {"component_id": "station_io", "signal_name": "operator_ack"},
         "start_value": False,
     }]
     checks = {
@@ -454,15 +452,6 @@ def _write_mock_io_scenario(directory: Path) -> Path:
                 "instance_id": name, "node_id": "logic.check_value", "children": [],
                 "parameters": {"key": key, "value": value},
             })
-    program["component_roles"].pop("plc")
-    program["target_roles"].pop("plc")
-    assignment = deepcopy(trial["program_role_assignment"])
-    assignment["component_roles"] = [
-        row for row in assignment["component_roles"] if row["component_role_id"] != "plc"
-    ]
-    assignment["target_roles"] = [
-        row for row in assignment["target_roles"] if row["target_role_id"] != "plc"
-    ]
     deployment = deepcopy(trial["deployment_draft"])
     deployment["components"] = [
         row for row in deployment["components"] if row["component_id"] != "plc_io"
@@ -474,7 +463,6 @@ def _write_mock_io_scenario(directory: Path) -> Path:
         name=IO_SCENARIO_ID,
         description="D-derived Mock script, retained input and authored ACK timeout; excludes external PLC.",
         program_draft=program, deployment_draft=deployment,
-        program_role_assignment=assignment,
         manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         last_known_status="unknown",
     )
@@ -563,7 +551,13 @@ def test_trial_d_mock_script_retains_value_and_operator_ack_times_out_over_real_
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
 def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
-    """Same-Scenario Load replaces disabled Lite6 and retains the exact I/O owner."""
+    """Same-Scenario Load with a changed runtime configuration.
+
+    Load is New, then Apply of the project (DEVELOPMENT_WORKBENCH.md "Load,
+    New, Activate, Execute, Run"): every component, the unchanged I/O one
+    included, comes up fresh and **prepared**, never enabled (CHANGELOG 0.2.0
+    "Load and Apply leave components prepared, never enabled").
+    """
 
     with _signal_stack() as (stack, project):
         before_apply = _load(stack, project)
@@ -587,5 +581,4 @@ def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
         assert selected_after["scenarioId"] == SCENARIO_ID, selected_after
         assert selected_after["deploymentRevision"] != selected_before["deploymentRevision"]
         assert motion_after["lifecycle"] == "prepared", motion_after
-        assert io_after["lifecycle"] == "enabled", io_after
-        assert io_after.get("last_action") == io_before.get("last_action")
+        assert io_after["lifecycle"] == "prepared", io_after

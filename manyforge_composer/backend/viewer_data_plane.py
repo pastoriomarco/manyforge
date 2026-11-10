@@ -1,7 +1,7 @@
 """Payload-neutral viewer demand and bounded fanout primitives.
 
 No versioned viewer schema, manifest/frame encoder, runtime sampler, or route is
-defined here. These mechanics are retained as I9 client-port inputs and cannot
+defined here. These mechanics are retained as client-port inputs and cannot
 make the old Composer WebSocket contract current again.
 """
 from __future__ import annotations
@@ -17,8 +17,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Final, Iterable
 
 from fastapi import WebSocket
-
-VIEWER_TRANSPORT_RESTORATION_GATE: Final = "I9"
 
 _ALLOWED_VISIBILITY: Final = frozenset({"focused", "visible", "collapsed", "hidden"})
 _ACTIVE_VISIBILITY: Final = frozenset({"focused", "visible"})

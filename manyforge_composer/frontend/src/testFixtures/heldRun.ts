@@ -11,14 +11,12 @@ const digest = (fill: string) => `sha256:${fill.repeat(64)}`;
 
 export function heldProgram(): ProgramDocument {
   return {
-    api_version: 'manyforge.program.v2',
+    api_version: 'manyforge.program.v3',
     program_id: 'pick',
     program_revision: digest('a'),
     program_profile: 'composable-cell-v1',
     name: 'Pick',
-    catalog: { api_version: 'manyforge.node_catalog.v2', content_version: 'fixture' },
-    component_roles: {},
-    target_roles: {},
+    catalog: { api_version: 'manyforge.node_catalog.v3', content_version: 'fixture' },
     parameters: [{
       parameter_id: 'approach_height', type: 'float64', default: 0.1,
     }],
@@ -38,7 +36,7 @@ export function heldProgram(): ProgramDocument {
         {
           node_id: 'motion.move_to_pose',
           instance_id: 'move',
-          parameters: { target_role: 'arm', goal: { position_m: [0.3, 0, 0.9] }, speed: 0.2 },
+          parameters: { target: { component_id: 'robot', command_target_id: 'arm' }, goal: { position_m: [0.3, 0, 0.9] }, speed: 0.2 },
           value_sources: {
             approach: { kind: 'program_parameter', reference: 'approach_height' },
             layer: { kind: 'blackboard_key', reference: 'layer' },
@@ -65,7 +63,7 @@ export function heldAuthoring(program = heldProgram()): ProgramAuthoringDocument
   void _revision;
   return {
     ...rest,
-    schema_version: 'manyforge.composer_authoring_forest.v1',
+    schema_version: 'manyforge.composer_authoring_forest.v2',
     forest: [structuredClone(tree)],
     positions: {},
   };
@@ -73,8 +71,8 @@ export function heldAuthoring(program = heldProgram()): ProgramAuthoringDocument
 
 export const heldCatalog: CatalogEntry[] = [{
   id: 'motion.move_to_pose',
-  parameters: ['target_role', 'goal', 'speed', 'approach', 'layer', 'clearance'].map((id) => ({
-    id, required: false, schema: { type: id === 'goal' ? 'object' : 'number' },
+  parameters: ['target', 'goal', 'speed', 'approach', 'layer', 'clearance'].map((id) => ({
+    id, required: false, schema: { type: id === 'goal' || id === 'target' ? 'object' : 'number' },
     schemaHash: 'x', hasDefault: false,
   })),
 } as unknown as CatalogEntry];

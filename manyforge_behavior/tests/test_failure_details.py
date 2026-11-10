@@ -27,8 +27,8 @@ def test_registered_keys_are_the_contract_set() -> None:
     assert FAILURE_DETAIL_KEYS == (
         "reason",
         "reference_type",
+        "reference",
         "reference_id",
-        "target_role_id",
         "input_problem",
         "path",
         "source_kind",
@@ -53,7 +53,7 @@ def test_only_registered_flat_bounded_entries_are_carried() -> None:
             "payload": "raw bytes",
             # Nested objects and arrays are not carried.
             "reference_type": {"kind": "frame"},
-            "target_role_id": ["arm.left"],
+            "component_id": ["arm.left"],
             # Neither are non-finite numbers or integers beyond I-JSON.
             "required_action": float("nan"),
             "source_reference": 2**53,
@@ -87,7 +87,8 @@ def test_the_canonical_json_bound_drops_entries_that_do_not_fit() -> None:
     assert bounded is not None
     assert len(rfc8785.dumps(dict(bounded))) <= 2_048
     # Registered order decides which entries fit; nothing is shortened.
-    assert list(bounded) == list(FAILURE_DETAIL_KEYS[: len(bounded)])
+    scalar_keys = [key for key in FAILURE_DETAIL_KEYS if key != "reference"]
+    assert list(bounded) == scalar_keys[: len(bounded)]
     assert all(value == long for value in bounded.values())
     assert len(bounded) < len(FAILURE_DETAIL_KEYS)
 
@@ -195,3 +196,46 @@ def test_records_accept_only_already_bounded_details() -> None:
     assert dict(record.details) == {"path": "duration_s"}
     with pytest.raises(ValueError):
         FailureRecord("", "message", None, None)
+
+
+def test_typed_direct_reference_preserves_signal_bound_and_rejects_invalid():
+    from manyforge_behavior.failure_details import failure_wire_fields
+
+    reference = {"component_id": "io", "signal_name": "é" * 256}
+    bounded = bounded_failure_details({"reason": "io_signal_unbound", "reference_type": "signal", "reference": reference})
+    assert dict(bounded["reference"]) == reference
+    reference["signal_name"] = "changed"
+    assert bounded["reference"]["signal_name"] == "é" * 256
+    with pytest.raises(TypeError):
+        bounded["reference"]["signal_name"] = "changed"
+    wire = failure_wire_fields(bounded, None)["details"]
+    assert wire["reference"]["signal_name"] == "é" * 256
+    assert len(rfc8785.dumps(wire)) <= 2048
+    for bad in ({"component_id": "io", "signal_name": "é" * 257},
+                {"component_id": "IO", "signal_name": "CI0"},
+                {"component_id": "io", "signal_name": "CI0", "extra": "x"}):
+        result = bounded_failure_details({"reference_type": "signal", "reference": bad})
+        assert "reference" not in result
+
+
+@pytest.mark.parametrize("kind,member", [("target", "command_target_id"), ("frame", "frame_id"),
+                                         ("collision_body", "collision_body_id")])
+def test_typed_direct_reference_requires_exact_kind_pair(kind, member):
+    reference = {"component_id": "robot", member: "FeatureA"}
+    result = bounded_failure_details({"reference_type": kind, "reference": reference})
+    assert dict(result["reference"]) == reference
+    invalid = bounded_failure_details({"reference_type": "signal", "reference": reference})
+    assert "reference" not in invalid
+
+
+def test_direct_reference_requirement_refuses_unregistered_or_truncated_identity():
+    from manyforge_behavior.failure_details import require_failure_details
+
+    valid = {"reference_type": "signal", "reference": {"component_id": "io", "signal_name": "x" * 512}}
+    assert dict(require_failure_details(valid)["reference"]) == valid["reference"]
+    for invalid in (
+        {"reference_type": "signal", "reference": {"component_id": "io", "signal_name": "x" * 513}},
+        {"reference_type": "frame", "reference": {"component_id": "io", "signal_name": "CI0"}},
+    ):
+        with pytest.raises(ValueError, match="outside their bound"):
+            require_failure_details(invalid)

@@ -9,12 +9,11 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     graphRevision: 'sha256:graph',
     retainedBundleId: 'sha256:bundle',
     directControl: {
-      activeTcp: { entry: { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'tcp' }, display: 'robot-a.tcp',
+      activeTcp: { entry: { componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'tcp' }, display: 'robot-a.tcp',
         ownerEpoch, registrationGeneration: 1, sequence: 0 },
       controllableComponentId: 'robot-a',
       commandTargetId: 'arm',
-      componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target',
+      baseFrame: { componentId: 'robot-a', frameId: 'base' },
       baseFrameRoleId: 'base',
       tcpFrameRoleId: 'tcp',
       operationCapabilityId: 'execution.trajectory.execute',
@@ -45,20 +44,18 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
         },
       ],
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
+        schemaVersion: 'manyforge.manual_control_motion_descriptor.v8',
         ordinaryJerk: null,
         controllableComponentId: 'robot-a',
         endEffectorComponentId: null,
         commandTargetId: 'arm',
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
         frames: [
-          { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
-          { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+          { frameComponentId: 'robot-a', frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
+          { frameComponentId: 'robot-a', frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
         ],
         tcps: [{
-          entry: { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'tcp' },
-          targetRoleId: 'command_target', controllableComponentId: 'robot-a', commandTargetId: 'arm',
+          entry: { componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'tcp' },
+          controllableComponentId: 'robot-a', commandTargetId: 'arm',
           frameRoleId: 'tcp', qualifiedName: 'robot-a.tcp', compiledFrameName: 'tool0',
           modelInstanceId: 'robot-model', modelRevision: 'sha256:model', isDefault: true,
           mountedHere: true, mountedElsewhere: false, contactBodyRoleIds: [],
@@ -107,8 +104,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     directControlGripper: {
       controllableComponentId: 'robot-a',
       commandTargetId: 'gripper',
-      componentRoleId: 'controlled_component',
-      targetRoleId: 'command_target',
       operationCapabilityId: 'tool.gripper.command',
       programId: 'manyforge.direct_control.gripper',
       programRevision: 'sha256:direct-gripper-program',
@@ -122,9 +117,8 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       minPosition: 0,
       maxPosition: 0.04,
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v3',
+        schemaVersion: 'manyforge.manual_control_gripper_descriptor.v5',
         controllableComponentId: 'robot-a', commandTargetId: 'gripper',
-        componentRoleId: 'controlled_component', targetRoleId: 'command_target',
         description: 'Test gripper', commandKind: 'gripper_position',
         actuationKind: 'position_commanded', transportKind: 'resolved_binding',
         outputMode: 'commanded',
@@ -146,7 +140,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       },
     },
     observedMotion: {
-      targetRoleId: 'scenario-arm',
       controllableComponentId: 'robot-a',
       commandTargetId: 'arm',
       sequence: 7,
@@ -159,14 +152,13 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
         orientation: { x: 0, y: 0, z: 0, w: 1 },
       },
       tcpPoses: {
-        '["robot-a","arm","tcp"]': {
+        '["robot-a","arm","robot-a","tcp"]': {
           position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
           orientation: { x: 0, y: 0, z: 0, w: 1 },
         },
       },
     },
     observedGripper: {
-      targetRoleId: 'command_target',
       controllableComponentId: 'robot-a',
       commandTargetId: 'gripper',
       sequence: 4,
@@ -191,7 +183,7 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     observedMotions: [],
     observedGrippers: [],
   };
-  // One component owning the arm and gripper targets (H1a-IF.2 inventory).
+  // One component owning the arm and gripper targets.
   const motion = status.directControl!;
   const gripper = status.directControlGripper!;
   status.components = [{
@@ -205,7 +197,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
   status.observedMotions = [status.observedMotion!];
   status.observedGrippers = [{
     ...status.observedGripper!,
-    targetRoleId: gripper.targetRoleId,
     controllableComponentId: gripper.controllableComponentId,
     commandTargetId: gripper.commandTargetId,
   }];
@@ -217,8 +208,16 @@ export function receiptFixture(
   requestId: string,
   positionsRad: number[],
 ): MotionPreviewReceipt {
+  const motion = status.directControl;
+  if (motion === null) throw new Error('receipt fixture requires a selected motion target');
+  const activeTcp = motion.activeTcp;
+  if (activeTcp === null || activeTcp.entry === null) {
+    throw new Error('receipt fixture requires an exact Active TCP entry');
+  }
+  const activeTcpEntry = activeTcp.entry;
   return {
-    schemaVersion: 'manyforge.direct_control_motion_preview.v1',
+    schemaVersion: 'manyforge.direct_control_motion_preview.v4',
+    pathPreview: { sourceJointNames: status.directControl!.joints.map((joint) => joint.sourceJointName), pairs: [], samples: [] },
     receiptDigest: 'sha256:receipt',
     intentDigest: 'sha256:intent',
     requestId,
@@ -230,8 +229,20 @@ export function receiptFixture(
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
     sceneRevision: { scene_id: 'scene-1', revision_id: 3, content_hash: 'sha256:scene' },
-    componentRoleId: status.directControl!.componentRoleId,
-    targetRoleId: status.directControl!.targetRoleId,
+    target: { componentId: motion.controllableComponentId, commandTargetId: motion.commandTargetId },
+    resolvedTcp: {
+      entry: {
+        target: { componentId: motion.controllableComponentId, commandTargetId: motion.commandTargetId },
+        frame: {
+          componentId: activeTcpEntry.frameComponentId,
+          frameId: activeTcpEntry.frameRoleId,
+        },
+      },
+      source: 'active_tcp',
+      ownerEpoch: activeTcp.ownerEpoch,
+      registrationGeneration: activeTcp.registrationGeneration,
+      sequence: activeTcp.sequence,
+    },
     requiredCapabilityId: status.directControl!.operationCapabilityId,
     sourceJointNames: status.directControl!.joints.map(
       (joint) => joint.sourceJointName,
@@ -280,6 +291,8 @@ export function executingState() {
   const status = structuredClone(approving.status!);
   status.manualOperations = [{
     programRunId: status.directControl!.programRunId,
+    controllableComponentId: status.directControl!.controllableComponentId,
+    commandTargetId: status.directControl!.commandTargetId,
     operationId: 'operation-1',
     operationRevision: 1,
     resident: true,
@@ -303,7 +316,7 @@ export function gripperReceiptFixture(
   const gripper = status.directControlGripper;
   if (gripper === null) throw new Error('gripper receipt fixture needs a gripper');
   return {
-    schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
+    schemaVersion: 'manyforge.direct_control_capability_command_preview.v2',
     receiptDigest: 'sha256:gripper-receipt',
     intentDigest: 'sha256:gripper-intent',
     requestId,
@@ -314,8 +327,7 @@ export function gripperReceiptFixture(
     programRunId: gripper.programRunId,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
-    componentRoleId: gripper.componentRoleId,
-    targetRoleId: gripper.targetRoleId,
+    target: { componentId: gripper.controllableComponentId, commandTargetId: gripper.commandTargetId },
     requiredCapabilityId: gripper.operationCapabilityId,
     commandSchemaId: gripper.commandSchemaId,
     commandSchemaRevision: gripper.commandSchemaRevision,

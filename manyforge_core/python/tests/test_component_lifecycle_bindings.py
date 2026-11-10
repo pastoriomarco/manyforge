@@ -1,4 +1,4 @@
-"""L0.2 lifecycle DTO and closed-presence binding parity."""
+"""Lifecycle DTO and closed-presence binding parity."""
 
 from __future__ import annotations
 

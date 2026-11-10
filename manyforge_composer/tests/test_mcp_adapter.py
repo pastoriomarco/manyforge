@@ -96,7 +96,7 @@ def test_all_21_tools_derive_action_schemas_from_real_routes(tmp_path):
 
 
 def test_mcp_has_parity_with_the_component_model_and_apply_routes(tmp_path):
-    """CONTRACTS §11: MCP reaches the same server-side operations as REST."""
+    """MCP reaches the same server-side operations as REST."""
 
     expected = {
         ("manyforge_scenario", "load"): ("POST", "/api/scenario/load"),
@@ -130,17 +130,20 @@ def test_mcp_has_parity_with_the_component_model_and_apply_routes(tmp_path):
 def test_real_mcp_skill_expansion_uses_existing_headless_http_client(tmp_path):
     calls = []
     body = {
-        "schema_version": "manyforge.skill_expansion_request.v1",
+        "schema_version": "manyforge.skill_expansion_request.v2",
         "expected_environment_digest": "sha256:" + "1" * 64,
         "skill_id": "move_to_named_config",
         "instance_prefix": "selected",
-        "arguments": {},
-        "component_roles": {},
-        "target_roles": {},
+        "arguments": {
+            "configuration_name": "home", "goal": [{"joint_name": "joint1", "position_rad": 0.0}],
+            "max_tcp_linear_speed_mps": 0.1,
+            "arm_target": {"component_id": "robot", "command_target_id": "arm"},
+            "base_frame": {"component_id": "robot", "frame_id": "base"},
+        },
         "program_context": {},
     }
     owner_result = {
-        "schema_version": "manyforge.skill_expansion.v1",
+        "schema_version": "manyforge.skill_expansion.v2",
         "tree": {},
         "trace": [],
     }
@@ -219,9 +222,10 @@ def test_real_mcp_initialize_discover_read_and_pure_validation(tmp_path):
                 "body": {"authoring": source},
             },
         ).json()["result"]
-        assert not validated["isError"]
-        result = json.loads(validated["content"][0]["text"])
-        assert result["valid"] is False and result["diagnostics"]
+        # Validation includes the Headless reference check against the
+        # Deployment Draft; without one it is a typed refusal, never a change.
+        assert validated["isError"]
+        assert "deployment_draft_unavailable" in validated["content"][0]["text"]
         assert state.draft_session.snapshot() == before
         bad = _call(
             client,
@@ -256,7 +260,7 @@ def test_closed_routing_cannot_be_used_as_a_generic_http_proxy(tmp_path, argumen
 
 
 def test_mcp_io_set_accepts_member_signals_like_rest(tmp_path):
-    # CONTRACTS §7: a member signal is `<member_id>/<signal>`; REST's
+    # A member signal is `<member_id>/<signal>`; REST's
     # `{signal_id:path}` takes it, so MCP does too, segment by segment.
     calls = []
 
@@ -381,7 +385,10 @@ def test_validation_endpoint_is_also_available_without_mcp(tmp_path):
             "/api/program/validate",
             json={"authoring": empty_authoring(state.node_catalog)},
         )
-        assert response.status_code == 200 and response.json()["diagnostics"]
+        # Reference validation needs a Deployment Draft; without one the
+        # endpoint refuses with its typed code and changes nothing.
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "deployment_draft_unavailable"
         assert client.get("/api/program/draft").json() == before
 
 

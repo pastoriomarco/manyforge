@@ -73,12 +73,13 @@ struct GeometricContactInputProvider::State final
     std::atomic_flag query_active = ATOMIC_FLAG_INIT;
   };
 
-  State(std::shared_ptr<core::IIoSignalIngress> ingress, core::IClock &clock,
+  State(std::shared_ptr<core::IIoSignalIngress> ingress,
+        std::shared_ptr<core::IClock> selected_clock,
         core::IScheduler &scheduler, GeometricContactInputBinding binding,
         std::vector<std::string> joint_names,
         std::optional<std::uint64_t> generation)
-      : clock(clock), scheduler(scheduler),
-        sender(std::move(ingress), clock, binding.source_id,
+      : clock(*selected_clock), scheduler(scheduler),
+        sender(std::move(ingress), std::move(selected_clock), binding.source_id,
                binding.incarnation, generation),
         runtime(std::make_shared<RuntimeBinding>(std::move(binding),
                                                  std::move(joint_names))),
@@ -322,6 +323,8 @@ struct GeometricContactInputProvider::State final
     return runtime->value.sample_period_ns <= 0;
   }
 
+  // `sender` owns the same shared clock and is destroyed first, so callbacks
+  // using this reference stay within its lifetime.
   core::IClock &clock;
   core::IScheduler &scheduler;
   core::IoSourceIngressSender sender;
@@ -337,12 +340,13 @@ struct GeometricContactInputProvider::State final
 
 core::Result<std::unique_ptr<GeometricContactInputProvider>>
 GeometricContactInputProvider::Create(
-    std::shared_ptr<core::IIoSignalIngress> ingress, core::IClock &clock,
+    std::shared_ptr<core::IIoSignalIngress> ingress,
+    std::shared_ptr<core::IClock> clock,
     core::IScheduler &scheduler, GeometricContactInputBinding binding,
     std::optional<std::uint64_t> prepared_driver_generation) {
   using Reply =
       core::Result<std::unique_ptr<GeometricContactInputProvider>>;
-  if (!ingress || binding.source_id.value().empty() ||
+  if (!ingress || !clock || binding.source_id.value().empty() ||
       binding.incarnation.empty() || binding.signals.empty() ||
       !binding.read_contact_bodies || !binding.body_static_wrt_group ||
       binding.target_scene_resource_id.value().empty() ||

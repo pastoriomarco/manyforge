@@ -326,7 +326,8 @@ describe('Composer shell continuity', () => {
   it('classifies robot-control errors by type and hides a failed Apply notice only when nothing is held', () => {
     const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
     // Item 19 extended: no message-text classification of what reaches the warning row.
-    expect(appSource).toContain('robotControl.state.errorLocal ? null : robotControl.state.error');
+    expect(appSource).toContain('robotControl.state.errorLocal || robotPreviewRefusal !== null');
+    expect(appSource).toContain('manualPreviewRefusalNotice(robotControl.state)');
     expect(appSource).not.toMatch(/state\.error\.startsWith\(/);
     // Item 21: hidden only on positive evidence (pre-fence refusal, or no failed Apply).
     const notices = appSource.slice(
@@ -340,7 +341,7 @@ describe('Composer shell continuity', () => {
       appSource.indexOf('const acknowledgeFailedApply = useCallback'),
       appSource.indexOf('const acknowledgingApply ='),
     );
-    expect(handler).toContain('await activation.acknowledgeFailure();');
+    expect(handler).toContain('await acknowledgeFailure();');
     expect(handler).toMatch(/if \(result\.noFailedApply\) \{\s*setDismissedActivationNotice\(`activation\.\$\{acknowledgementKey\}`\);/);
   });
 

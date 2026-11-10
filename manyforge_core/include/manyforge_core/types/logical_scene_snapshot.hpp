@@ -98,7 +98,7 @@ struct PassiveModelSceneFrameRefDTO final {
                          const PassiveModelSceneFrameRefDTO&) = default;
 };
 
-/// Closed portable frame-reference union from spec 210 section 1.2.
+/// Closed portable frame-reference union.
 using SceneFrameRefDTO =
     std::variant<CellSceneFrameRefDTO, ComponentSceneFrameRefDTO,
                  PassiveModelSceneFrameRefDTO>;

@@ -18,7 +18,8 @@ A **signal** is a named value that a component publishes, for example
 `part_present` on an I/O box or `curtain_blocked` on a station. Each signal
 has a source (the component that publishes it) and a freshness budget: the
 time within which a new reading must arrive for the value to count as
-current. Signals that rules read are `true` or `false`.
+current. An available signal read by a rule is `true` or `false`; an
+unavailable reading is not false.
 
 A signal's id is `<component_id>/<signal_name>`. The I/O banks of a machine
 (for example an xArm's control box and tool I/O) are I/O members of the
@@ -32,9 +33,14 @@ You can use a signal in several places:
 - interrupt rules watch it.
 
 **I/O** is the physical part of the signals: the digital inputs and outputs
-of devices. Not every signal is I/O. For example, the geometric contact
-detector publishes a contact signal computed from the Scene, with no
-physical input behind it.
+of devices. Not every signal is I/O. A `geometric_contact` input works this way:
+
+This input is true while the selected robot's contact bodies touch the selected Scene resource, checked against live geometry. If ManyForge can't make the check, the input is unavailable, never false. Contact bodies are the collision shapes on the robot, or on the mounted tool, that owns its Active TCP (the tool center point currently selected for that robot); a Scene resource is a named object in the cell's Scene.
+
+At every sample, ManyForge reads the current Active TCP and collision geometry. A Program may read this signal,
+but it does not store those live values or the contact result. Manual and timed Mock writes do not apply. See
+[Adding a component](ADDING_A_COMPONENT.md#geometric-contact-inputs) for every unavailable reason and the
+sample-age rule.
 
 **Changed outside.** For every output with read-back that isn't
 controller-owned, ManyForge holds the boolean signal

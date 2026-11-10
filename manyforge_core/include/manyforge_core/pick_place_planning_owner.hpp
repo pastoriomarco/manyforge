@@ -62,7 +62,7 @@ struct PickSequencePlanningIntentDTO final {
   std::string sequence_id;
   SceneResourceId selected_object_id{std::string{}};
   RuntimeObjectId selected_runtime_object_id{std::string{}};
-  FrameRoleId carrier_frame_role_id{std::string{}};
+  ProgramFrameReferenceDTO carrier_frame{ControllableComponentId(""), FrameRoleId("")};
   PickCandidateSynthesisIntentDTO synthesis;
   OperationIntentDTO approach_operation;
   OperationIntentDTO descend_operation;
@@ -76,7 +76,7 @@ struct PickSequencePlanningIntentDTO final {
 struct PlaceSequencePlanningIntentDTO final {
   std::string sequence_id;
   SceneResourceId selected_object_id{std::string{}};
-  FrameRoleId carrier_frame_role_id{std::string{}};
+  ProgramFrameReferenceDTO carrier_frame{ControllableComponentId(""), FrameRoleId("")};
   OperationIntentDTO approach_operation;
   OperationIntentDTO descend_operation;
   OperationIntentDTO tool_operation;
@@ -102,7 +102,7 @@ struct PickPlacePlanningResultDTO final {
 
 /// Stateless addressed planning owner. It resolves the exact arm/tool
 /// Program Bindings, current scene projection, authoritative participant
-/// state, carrier frame and grasp body roles before invoking the N5d-2
+/// state, carrier frame and grasp body roles before invoking the pick/place
 /// candidate and sequence owners. No method dispatches, journals, commits a
 /// scene transition, or publishes runtime state.
 class AddressedPickPlacePlanningOwner final {

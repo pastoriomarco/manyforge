@@ -316,7 +316,15 @@ def _with_scene(document: dict[str, Any], *resource_ids: str) -> dict[str, Any]:
     """The same Program declaring other Scene resources."""
 
     changed = deepcopy(document)
-    template = changed["scene"][0]
+    if changed.get("scene"):
+        template = changed["scene"][0]
+    else:
+        example = Program(
+            Path(__file__).resolve().parents[2]
+            / "examples/pick_and_place_minimal.program.yaml",
+            build_node_environment().catalog,
+        )
+        template = example.to_dict()["scene"][0]
     changed["scene"] = [
         {**deepcopy(template), "scene_resource_id": resource_id}
         for resource_id in resource_ids
@@ -325,7 +333,7 @@ def _with_scene(document: dict[str, Any], *resource_ids: str) -> dict[str, Any]:
         changed,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return changed
 

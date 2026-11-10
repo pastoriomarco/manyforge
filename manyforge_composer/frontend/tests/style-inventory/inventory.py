@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UI6-I-VC style inventory for the Composer frontend.
+"""Style inventory for the Composer frontend.
 
 Reads the stylesheets and the TS/TSX sources and writes a JSON summary:
 value histograms, near-duplicate colour groups, selectors defined more than

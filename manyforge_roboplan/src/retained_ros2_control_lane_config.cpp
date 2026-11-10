@@ -165,7 +165,8 @@ make_ros2_control_jtc_config(const std::string &runtime_namespace,
                            const std::vector<std::string> &transport_joints,
                            const ControllerLaneRates &rates,
                            const double stop_completion_timeout_s,
-                           const core::Duration controller_state_max_age_ns) {
+                           const core::Duration controller_state_max_age_ns,
+                           const bool supports_scale) {
   RetainedRos2ControlBackendConfig config;
   config.node_name = "manyforge_ros2_control_execution_backend";
   config.node_namespace = runtime_namespace;
@@ -179,13 +180,15 @@ make_ros2_control_jtc_config(const std::string &runtime_namespace,
   adapter.scale_topic = arm_controller + "/speed_scaling_input";
   auto &lane = adapter.lane_facts;
   lane.joint_names = transport_joints;
-  lane.supports_scale = true;
+  // Only a controller that listens on `speed_scaling_input` can scale; the
+  // participant, the Kernel and the Stop path read this one lane fact.
+  lane.supports_scale = supports_scale;
   lane.has_measured_velocity = true;
   lane.cancel_semantics = core::ExecutionCancelSemantics::kDecelerate;
   lane.feedback_rate_hz = rates.action_monitor_rate_hz;
   lane.state_rate_hz = rates.state_publish_rate_hz;
   lane.controller_update_rate_hz = rates.controller_update_rate_hz;
-  // Arrival (maintainer 2026-10-28): every lane keeps its controller file's
+  // Arrival: every lane keeps its controller file's
   // per-joint `goal` constraint (the profile row's arrival tolerance), so
   // stock JTC succeeds only when the trajectory finished with every joint
   // within it, and otherwise aborts with a goal-tolerance result.
@@ -200,12 +203,12 @@ make_ros2_control_jtc_config(const std::string &runtime_namespace,
   participant.stop.sample_period_s = kStopSamplePeriodS;
   participant.stop.hard_stop_completion_timeout_ns =
       static_cast<core::Duration>(stop_completion_timeout_s * 1e9);
-  // Q59 (`main`'s `joint_state_max_age_s`): stale controller state during a
+  // Stale controller state during a
   // motion or a Stop is a fault on this lane. The age is the component's
   // effective `measured_joints` budget (measured_joints_budget_ns).
   participant.stop.controller_state_max_age_ns = controller_state_max_age_ns;
-  // Q55: decided simulation-lane allowance and two actual CM periods;
-  // live lanes still require measurement. Q54 keeps ROS timing monitor-only.
+  // Decided simulation-lane allowance and two actual CM periods;
+  // live lanes still require measurement. ROS timing stays monitor-only.
   participant.stop.replacement_start_allowance_s = 0.020;
   participant.late_cycle_margin_s = 2.0 / rates.controller_update_rate_hz;
   participant.tracking = core::ExecutionTrackingPolicy{
@@ -248,7 +251,7 @@ retained_component_stream(
 
 namespace {
 
-/// CONTRACTS §7: what a stale stream means is the lane's. A simulated robot's
+/// What a stale stream means is the lane's. A simulated robot's
 /// or tool's stream going stale is simulator state (a warning that clears by
 /// itself); on every other lane it faults the component.
 std::pair<core::StreamSeverityDTO, core::StreamRecoveryDTO> retained_component_stream_meaning(
@@ -469,7 +472,7 @@ void configure_retained_gripper_output_mode(
   config.gripper->output_mode = found->pneumatic_io
                                     ? core::GripperOutputMode::kNone
                                     : found->output_mode;
-  // A lane-free pneumatic tool (D4) and a Real pneumatic gripper declare no
+  // A lane-free pneumatic tool and a Real pneumatic gripper declare no
   // feedback stream: their gripper has no measured feedback.
   const bool streamless_real_pneumatic =
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic &&
@@ -490,8 +493,6 @@ void configure_retained_gripper_output_mode(
   }
   if (config.gripper->actuation_kind ==
       core::GripperActuationKind::kPneumatic) {
-    config.gripper->result_timeout_s =
-        found->delivery_result_timeout_s.value_or(1.0);
     config.gripper->completion_policy =
         config.gripper->output_mode == core::GripperOutputMode::kNone
             ? "no_output"
@@ -525,7 +526,7 @@ void configure_retained_mock_gripper_action(
         "retained mock ROS gripper has no exact model-backed joint");
   }
   ros2_control_execution::Ros2GripperActionConfig gripper_config;
-  // Q74/Q79: the stock GripperActionController's GripperCommand action.
+  // The stock parallel gripper action controller's ParallelGripperCommand action.
   gripper_config.transport_kind = "ros_gripper_command";
   gripper_config.action_name = retained_ros2_control_scoped_name(
       runtime_namespace, *artifacts.gripper_controller_name + "/gripper_cmd");
@@ -546,7 +547,6 @@ void configure_retained_mock_gripper_action(
   // transport; the action transport carries the request's own target.
   gripper_config.publish_nominal_position = false;
   gripper_config.wait_for_action_server_timeout_s = 2.0;
-  gripper_config.result_timeout_s = row_number(row, "gripper_result_timeout_s");
   gripper_config.stop_finish_tolerance =
       row_number(row, "gripper_stop_finish_tolerance");
   config.gripper = std::move(gripper_config);
@@ -562,7 +562,7 @@ make_retained_mock_ros2_control_backend_config(
         &max_deceleration_on_cancel_by_source_joint,
     const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
   const auto &rates = arm_rates(artifacts);
-  // Q66: the host's fixed controller-manager rule, the same on every lane.
+  // The host's fixed controller-manager rule, the same on every lane.
   const auto runtime_namespace = retained_ros2_control_namespace(motion_binding);
   if (!motion_binding.value().control_path.has_value() ||
       motion_binding.value().control_path->state_authority_class !=
@@ -601,7 +601,8 @@ make_retained_mock_ros2_control_backend_config(
       artifacts.hardware_component_name, transport_joints, rates,
       row_number(row, "hard_stop_completion_timeout_s"),
       retained_ros2_control_measured_joints_budget_ns(measured_lane,
-          motion_binding.value().controllable_component_id, stream_overrides));
+          motion_binding.value().controllable_component_id, stream_overrides),
+      row.runtime_scale_supported.value());
   config.arm.measured_joint_state_lane = std::move(measured_lane);
   config.arm.mock_reset_position = artifacts.mock_reset_position;
   // Only the generated Mock controllers enable stock JTC scheduled replacement.
@@ -686,7 +687,7 @@ make_retained_real_ros2_control_backend_config(
         "arm joints");
   }
 
-  // CP9: the measured lane is the component's `measured_joints` stream row,
+  // The measured lane is the component's `measured_joints` stream row,
   // exactly as on Mock and Isaac; for Real it is also the authority's source.
   auto measured_lane = retained_measured_joint_state_lane(
       runtime_configuration, motion_binding.value().controllable_component_id,
@@ -696,7 +697,8 @@ make_retained_real_ros2_control_backend_config(
       artifacts.hardware_component_name, transport_joints, rates,
       row_number(row, "hard_stop_completion_timeout_s"),
       retained_ros2_control_measured_joints_budget_ns(measured_lane,
-          motion_binding.value().controllable_component_id, stream_overrides));
+          motion_binding.value().controllable_component_id, stream_overrides),
+      row.runtime_scale_supported.value());
   config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
   // The component's Deployment setting: the soft Stop lead-in starts at the
   // controller's command position (absent or `commanded`) or at the measured
@@ -712,9 +714,8 @@ make_retained_real_ros2_control_backend_config(
   config.participant.start_tolerance_rad = gates.start_tolerance_rad;
   // The terminal gate reads the row's arrival tolerance, the same value as
   // the controllers' JTC `goal` constraint, so it re-checks what JTC's kept
-  // goal tolerance already enforces. TODO(merge 6 ARRIVE): remove after the
-  // live validation of the kept JTC goal tolerance on Real (maintainer
-  // 2026-10-28: kept until then).
+  // goal tolerance already enforces. TODO: remove after the
+  // live validation of the kept JTC goal tolerance on Real.
   config.participant.final_tolerance_rad = *row.arrival_tolerance_rad;
   config.participant.completion_state_timeout_ns =
       static_cast<core::Duration>(gates.completion_state_timeout_s * 1e9);

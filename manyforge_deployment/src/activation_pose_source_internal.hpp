@@ -5,7 +5,7 @@
 
 namespace manyforge::deployment::detail {
 
-/// CP9: one model-free pose-source component (runtime kind `pose_source`)
+/// One model-free pose-source component (runtime kind `pose_source`)
 /// becomes a derived component type with the single target `poses` offering
 /// `scene.pose.observe`. It reuses the model-free prepared-type record of the
 /// I/O pipeline. The authored component (`pose_source.v2`) is joined with the

@@ -32,6 +32,23 @@ constexpr std::string_view kInvalid = "adapter_configuration_invalid";
   return {std::string(kInvalid), "xArm adapter configuration: " + what, {}};
 }
 
+/// The only command interface the xArm arm controller may claim.
+constexpr std::string_view kArmControllerCommandInterface = "position";
+constexpr std::string_view kArmCommandInterfacesRefused =
+    "xarm_arm_controller_command_interfaces_refused";
+
+/// A generated arm controller that claims anything but `position`.
+class ArmCommandInterfacesRefused final : public std::invalid_argument {
+ public:
+  using std::invalid_argument::invalid_argument;
+};
+
+[[nodiscard]] core::ErrorDTO refused(const ArmCommandInterfacesRefused &error) {
+  auto dto = invalid(error.what());
+  dto.details.emplace("reason", std::string(kArmCommandInterfacesRefused));
+  return dto;
+}
+
 [[nodiscard]] std::string read_file(const std::filesystem::path &path) {
   std::ifstream stream(path);
   if (!stream) throw std::runtime_error("cannot read " + path.string());
@@ -170,8 +187,9 @@ namespace {
 }
 
 /// The vendor base (or the model's own file) with ManyForge's controller
-/// additions, as the generator's template; the arm claims the lane
-/// hardware's command interfaces (`[__command_interfaces__]`).
+/// additions, as the generator's template. The arm claims `position` only
+/// (ManyForge's addition); any other claim is refused, as the pre-0.2.0
+/// adapter did (`EXPECTED_CONTROLLER_COMMAND_INTERFACES`).
 [[nodiscard]] YAML::Node controllers_template(const roboplan_backend::ModelLaneRow &row,
                                               const XArmVendorSettings &vendor,
                                               const YAML::Node &settings,
@@ -204,10 +222,14 @@ namespace {
   joint_list.push_back("__joint__");
   joint_list.SetStyle(YAML::EmitterStyle::Flow);
   parameters["joints"] = joint_list;
-  YAML::Node command_interfaces(YAML::NodeType::Sequence);
-  command_interfaces.push_back("__command_interfaces__");
-  command_interfaces.SetStyle(YAML::EmitterStyle::Flow);
-  parameters["command_interfaces"] = command_interfaces;
+  const auto claimed = parameters["command_interfaces"];
+  if (!claimed || !claimed.IsSequence() || claimed.size() != 1U ||
+      claimed[0].as<std::string>() != kArmControllerCommandInterface)
+    throw ArmCommandInterfacesRefused(
+        "the arm controller " + row.controller +
+        " must claim exactly the [position] command interface; stock JTC accepts "
+        "speed scaling only with a position-only claim");
+  parameters["command_interfaces"].SetStyle(YAML::EmitterStyle::Flow);
   // One joint constraint line: the vendor's per-joint entries without its
   // `goal` (the row's arrival tolerance, set by the generator) and the
   // Deployment's Stop deceleration.
@@ -246,6 +268,8 @@ core::Result<std::string> make_xarm_controllers(const roboplan_backend::ModelLan
     const auto settings = YAML::LoadFile((vendor_dir / "manyforge_settings.yaml").string());
     return Made::Ok(
         emit(controllers_template(row, vendor.value(), settings, driver_share)));
+  } catch (const ArmCommandInterfacesRefused &error) {
+    return Made::Err(refused(error));
   } catch (const std::exception &error) {
     return Made::Err(invalid(error.what()));
   }
@@ -273,7 +297,7 @@ make_xarm_launch_contribution(const roboplan_backend::ModelLaneRow &row,
         settings["hardware"]["joint_command_interfaces"].as<std::vector<std::string>>();
 
     // Controllers: the vendor's, with this hardware's initial state. With
-    // the arm deactivated (CONTRACTS §16) the manager loads no arm
+    // the arm deactivated the manager loads no arm
     // controller: only the manager block, without the arm controller's type.
     auto controllers = controllers_template(row, vendor.value(), settings, driver_share);
     if (!arm) {
@@ -307,6 +331,8 @@ make_xarm_launch_contribution(const roboplan_backend::ModelLaneRow &row,
     for (const auto &remap : settings["remappings"])
       made.remappings.push_back({remap["from"].as<std::string>(), remap["to"].as<std::string>()});
     return Made::Ok(std::move(made));
+  } catch (const ArmCommandInterfacesRefused &error) {
+    return Made::Err(refused(error));
   } catch (const std::exception &error) {
     return Made::Err(invalid(error.what()));
   }

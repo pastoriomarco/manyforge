@@ -97,7 +97,7 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
   std::optional<ErrorDTO> first_error;
   bool effects_unknown{};
   /// Legacy v8 operations were complete after projection initialization.
-  /// UA7S operations are publishable only after Scene has installed the
+  /// Current (v9) operations are publishable only after Scene has installed the
   /// Program baseline and every required projection acknowledges it.
   bool initial_scene_installed{false};
 

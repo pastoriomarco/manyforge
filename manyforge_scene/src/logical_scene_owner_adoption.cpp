@@ -935,7 +935,8 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
   impl_->live_product_adoption_ = request;
   bool commit_reached = false;
   try {
-    Transaction transaction(database, "BEGIN IMMEDIATE");
+    Transaction transaction(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     if (!MakeRoomForMaintenanceInitialization(
             database, impl_->cell_admission_, state)) {
       throw LogicalSceneOwnerConflictError(
@@ -1113,7 +1114,8 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
         request.candidate_retained_bundle.cell_graph.graph_revision,
         provisional_snapshot.revision,
     };
-    Transaction intent(database, "BEGIN IMMEDIATE");
+    Transaction intent(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     if (!MakeRoomForMaintenanceInitialization(
             database, impl_->cell_admission_, state)) {
       throw LogicalSceneOwnerConflictError(
@@ -1335,7 +1337,8 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
         ProjectionMaintenanceInitializationState::kInitializing);
   }
   lock.lock();
-  Transaction result(database, "BEGIN IMMEDIATE");
+  Transaction result(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   InsertMaintenanceResult(
       database, initialization.initialization_sequence,
       failure.has_value()
@@ -1444,7 +1447,8 @@ LogicalSceneOwner::InstallInitialScene(
   const auto sequence = static_cast<std::int64_t>(
       provisional.initialization_sequence);
   if (preflight_error.has_value()) {
-    Transaction failed(database, "BEGIN IMMEDIATE");
+    Transaction failed(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     Statement row(
         database,
         "INSERT INTO logical_scene_initial_baseline_results("
@@ -1465,7 +1469,8 @@ LogicalSceneOwner::InstallInitialScene(
       provisional.target.retained_bundle_id,
       provisional.target.graph_revision, final_snapshot->revision};
   {
-    Transaction accepted(database, "BEGIN IMMEDIATE");
+    Transaction accepted(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     Statement row(
         database,
         "INSERT INTO logical_scene_initial_baseline_intents("
@@ -1525,7 +1530,8 @@ LogicalSceneOwner::InstallInitialScene(
   }
 
   lock.lock();
-  Transaction result(database, "BEGIN IMMEDIATE");
+  Transaction result(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   Statement row(
       database,
       "INSERT INTO logical_scene_initial_baseline_results("
@@ -1748,7 +1754,8 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
     throw LogicalSceneOwnerConflictError(
         "maintenance initialization is no longer ready for completion");
   }
-  Transaction transaction(database, "BEGIN IMMEDIATE");
+  Transaction transaction(database, "BEGIN IMMEDIATE",
+                          &impl_->maintenance_snapshot_cache_);
   Statement insert(
       database,
       "INSERT INTO logical_scene_maintenance_initialization_completions("

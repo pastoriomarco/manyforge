@@ -7,7 +7,7 @@ concurrent Program/Deployment commits. The composed sessions are deterministic
 doubles so the revision and lock semantics are provable without models,
 derivation, disk or network.
 
-Real-session and route integration is covered by the UA2D.5/UA2D.7 route and
+Real-session and route integration is covered by the route and
 control-stream tests.
 """
 
@@ -158,7 +158,6 @@ def _project_document() -> dict[str, Any]:
         "scenario_id": "cell-a",
         "name": "Cell A",
         "description": "assembly",
-        "program_role_assignment": {"roles": ["picker"]},
         "program_draft": {"forest": []},
         "deployment_draft": {"components": []},
     }
@@ -210,7 +209,6 @@ def test_snapshot_shape_is_closed_and_carries_the_composite_identity() -> None:
         "document_description",
         "source_diagnostics",
         "source_document_digest",
-        "program_role_assignment",
         "source_program_digest",
         "source_deployment_digest",
     }
@@ -407,7 +405,6 @@ def test_whole_workspace_replacement_rotates_both_identities_in_one_advance() ->
             "document_description": "",
             "source_diagnostics": [],
             "source_document_digest": "sha256:bb",
-            "program_role_assignment": {"roles": ["placer"]},
             "source_program_digest": "sha256:cc",
             "source_deployment_digest": "sha256:dd",
         },
@@ -593,9 +590,6 @@ def test_project_facts_commit_advances_once_and_a_repeat_does_not() -> None:
     assert captured.workspace_revision == before + 1
     assert captured.project["document_id"] == "cell-a"
     assert captured.project["document_path"] == "/tmp/cell-a"
-    assert captured.as_dict()["project"]["program_role_assignment"] == {
-        "roles": ["picker"]
-    }
     assert captured.project["source_program_digest"].startswith("sha256:")
     assert captured.project["source_deployment_digest"].startswith("sha256:")
 

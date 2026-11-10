@@ -5,6 +5,7 @@
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/component_coordinator.hpp>
 #include <manyforge_core/types/io_blackboard.hpp>
 #include <manyforge_core/types/component_state.hpp>
 #include <manyforge_core/types/program_execution_control.hpp>
@@ -56,16 +57,11 @@ std::vector<double> NumberArray(const CanonicalValue &root,
 
 [[nodiscard]] core::Pose3DTO DecodePose(const CanonicalValue &value);
 
-/// Decode one portable reference. `frame_role` may carry an exact robot
-/// qualifier `target` ({target_role_id, controllable_component_id,
-/// command_target_id}); its Program-Binding agreement is checked at admission
-/// by `VerifyReferenceTargets`, never inferred here.
-[[nodiscard]] core::ReferenceDTO
-DecodeReference(const CanonicalValue &value, const bool allow_robot_target);
+/// Decode a direct component, scene, or inline-pose reference.
+[[nodiscard]] core::ReferenceDTO DecodeReference(const CanonicalValue &value);
 
 [[nodiscard]] std::optional<core::ReferenceDTO>
-DecodeOptionalReference(const CanonicalValue &root, const std::string_view name,
-                        const bool allow_robot_target = false);
+DecodeOptionalReference(const CanonicalValue &root, const std::string_view name);
 
 [[nodiscard]] core::MotionSpecDTO
 DecodeMotionSpec(const CanonicalValue &value);
@@ -197,30 +193,30 @@ enum class CommandKind {
   kReleaseProgramRunStopFence,
   kFullStop,
   kMalformedStop,
-  /// CONTRACTS §1, §5, §7, §8: the published component model (control
+  /// The published component model (control
   /// socket, in-memory).
   kReadComponentModel,
-  /// CONTRACTS §2: one component action (control socket).
+  kComponentRecoveryPreflight,
+  /// One component action (control socket).
   kComponentAction,
-  /// CONTRACTS §8 node `rules.set_active`.
+  /// Node `rules.set_active`.
   kSetRuleActive,
-  /// CONTRACTS §8: every rule back to `active_at_start` (run end).
+  /// Every rule back to `active_at_start` (run end).
   kResetRuleActivation,
-  /// CONTRACTS §7 node `io.clear_outside_change`.
+  /// Node `io.clear_outside_change`.
   kClearOutsideChange,
-  /// CONTRACTS §7: one manual output write (`set_io_output`).
+  /// One manual output write (`set_io_output`).
   kSetIoOutput,
   kSetRuntimeScaleControl,
-  kSetOperationRuntimeScale,
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
-  /// Active TCP (M7): every robot's Active TCP (the Runner's baseline).
+  /// Active TCP: every robot's Active TCP (the Runner's baseline).
   kReadActiveTcp,
   kResolveAttachActiveTcp,
   /// A read queued behind earlier enqueued submissions on this host.
   kReadActiveTcpOrdered,
-  /// Active TCP (M7, T-MQ3, T-MQ9): reset every robot to its End-effector
+  /// Active TCP: reset every robot to its End-effector
   /// TCP (Program Reset with reload, `simulation.reset`, world reload).
   kResetActiveTcp,
 };
@@ -290,11 +286,11 @@ struct FrameTransformQuery final {
 struct TargetObservationQuery final {
   core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
-  core::TargetRoleId target_role_id;
-  std::optional<core::FrameRoleId> frame_role_id;
-  std::optional<core::FrameRoleId> relative_to_frame_role_id;
+  std::optional<core::ProgramTargetReferenceDTO> target;
+  std::optional<core::ProgramFrameReferenceDTO> frame;
+  std::optional<core::ProgramFrameReferenceDTO> relative_to_frame;
   std::optional<FrameTransformQuery> frame_transform{};
-  std::optional<core::ResourceRoleId> io_signal_role{};
+  std::optional<core::ProgramSignalReferenceDTO> signal{};
 };
 
 struct MockIoInputSetRequest final {
@@ -304,7 +300,7 @@ struct MockIoInputSetRequest final {
 };
 
 /// Manager publication of one gripper's `carried_object_lost.<target>`
-/// system signal level (contract §8.4, §10). The ids and the loss event id
+/// system signal level. The ids and the loss event id
 /// are present iff `level`; `set_key` (the attachment's stored
 /// `on_grasp_lost.set_key`) is null with `false`.
 struct CarriedObjectLostSetRequest final {
@@ -321,7 +317,12 @@ struct ProgramOperationQuery final {
   core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
   core::ProgramRunId program_run_id;
-  core::TargetRoleId target_role_id;
+  core::ProgramTargetReferenceDTO target;
+};
+
+struct ComponentRecoveryConfirmation final {
+  std::string snapshot_id;
+  std::vector<core::ComponentRecoveryFact> confirmed;
 };
 
 struct Command final {
@@ -330,7 +331,7 @@ struct Command final {
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
   std::optional<core::ProgramBindingId> attach_binding_id;
-  std::optional<core::TargetRoleId> attach_holder_role;
+  std::optional<core::ProgramTargetReferenceDTO> attach_holder;
   std::optional<MockIoInputSetRequest> mock_io_input_set{};
   std::optional<CarriedObjectLostSetRequest> carried_object_lost_set{};
   std::optional<core::ProgramNodeMockSimulationRequestDTO> mock_node_simulation{};
@@ -363,16 +364,16 @@ struct Command final {
   std::optional<MalformedStopCommand> malformed_stop;
   std::optional<std::string> component_id{};
   std::optional<core::ComponentAction> component_action{};
+  std::optional<ComponentRecoveryConfirmation> recovery_preflight{};
   std::optional<core::InterruptPolicyId> rule_id{};
   bool rule_active{};
   std::optional<core::IoSignalId> outside_change_output{};
   /// `set_io_output`: the output, its value and who writes it (`origin`
-  /// `manual` or `program`; a manual write waits while motion executes, §7).
+  /// `manual` or `program`; a manual write waits while motion executes).
   std::optional<core::IoSignalId> io_output_signal{};
   std::variant<bool, double> io_output_value{false};
   bool io_output_manual{};
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
-  std::optional<core::RuntimeScaleRequestDTO> operation_runtime_scale;
   std::optional<core::RuntimeScaleControlSelectorDTO>
       runtime_scale_control_selector;
   std::optional<core::RequestOwnerEpoch> event_owner_epoch{};

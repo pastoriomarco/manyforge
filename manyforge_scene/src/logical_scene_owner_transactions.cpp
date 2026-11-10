@@ -2383,7 +2383,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                         "kernel_owner_unavailable", error.what());
         }
       }
-      Transaction compaction(database, "BEGIN IMMEDIATE");
+      Transaction compaction(database, "BEGIN IMMEDIATE",
+                              &impl_->maintenance_snapshot_cache_);
       // Commit is the only writer and holds the owner mutex, so another
       // write here is a store integrity failure, not a stale request.
       if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
@@ -2507,7 +2508,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   {
-    Transaction write(database, "BEGIN IMMEDIATE");
+    Transaction write(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     if (!impl_->SceneCommitStateStillCurrent(external_data_version) ||
         NextSceneOwnerEventSequence(database) !=
             observed_transactions->next_owner_event_sequence ||
@@ -2540,7 +2542,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       const auto rejection =
           rejected != nullptr ? rejected->error()
                               : SceneError("authoring_not_ready", error.what());
-      Transaction outcome(database, "BEGIN IMMEDIATE");
+      Transaction outcome(database, "BEGIN IMMEDIATE",
+                              &impl_->maintenance_snapshot_cache_);
       InsertSceneOutcome(
           database, request.request_context.request_owner_epoch.value(),
           request.request_context.request_id, request_digest,
@@ -2554,7 +2557,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     }
   }
   if (!projections.empty()) {
-    Transaction attempt(database, "BEGIN IMMEDIATE");
+    Transaction attempt(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     InsertProjectionAttempt(
         database, scene_transaction.transaction_sequence, 0U,
         projections.front().preflight_health.execution_host_binding);
@@ -2588,7 +2592,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     const bool committed = projection_result.result ==
                            core::ProjectionCommitResultStateDTO::kCommitted;
 
-    Transaction result_write(database, "BEGIN IMMEDIATE");
+    Transaction result_write(database, "BEGIN IMMEDIATE",
+
+                            &impl_->maintenance_snapshot_cache_);
     InsertProjectionResult(database, scene_transaction.transaction_sequence,
                            ordinal, projection_result);
     if (!committed) {
@@ -2652,7 +2658,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   if (projections.empty()) {
-    Transaction outcome(database, "BEGIN IMMEDIATE");
+    Transaction outcome(database, "BEGIN IMMEDIATE",
+                            &impl_->maintenance_snapshot_cache_);
     InsertSceneOutcome(database,
                        request.request_context.request_owner_epoch.value(),
                        request.request_context.request_id, request_digest,

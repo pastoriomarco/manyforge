@@ -3,8 +3,7 @@
 These checks do not parse ``manyforge.deployment.v0``, select a runtime,
 construct a Kernel, or launch a process.  They remain in Python because they
 validate immutable files and the bounded offline provenance tools used to
-produce them.  Runtime admission and lane behavior are separately requalified
-at I6/N, I9/I, and I10/R.
+produce them.  Runtime admission and lane behavior are separately requalified.
 """
 
 from __future__ import annotations
@@ -71,8 +70,8 @@ _ARM_JOINT_DYNAMICS = {
 
 # Narrowed from historical test_deployment.py blob
 # 36ff9b99a5a51f03de84cf4692333cddc246214b, lines 4087-4125.  The old v0
-# deployments and effectful bring-up qualifier remain acceptance input for
-# I3/I6, I9/I, I10/R, and I11/T; this retained check covers only the canonical
+# deployments and effectful bring-up qualifier remain acceptance input
+# elsewhere; this retained check covers only the canonical
 # static artifacts and their offline authoring tool.
 _REJECTED_MODEL_REWRITE_TERMS = (
     "coupled_joints",

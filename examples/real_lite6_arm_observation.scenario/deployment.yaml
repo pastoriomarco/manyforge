@@ -212,7 +212,6 @@
               "command_duration_s": 0.8,
               "command_target_id": "gripper",
               "controllable_component_id": "lite_gripper",
-              "delivery_result_timeout_s": 1.0,
               "description": "UFACTORY lite pneumatic gripper, no output on Real (display only).",
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",

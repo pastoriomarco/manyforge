@@ -13,7 +13,7 @@ import type {
 } from '../store/composerStore';
 import { STATUS_COLORS } from '../styles/tokens';
 
-// Edges share the node border status colours (UI6-I-VC).
+// Edges share the node border status colours.
 const EDGE_STATUS_COLORS: Record<NodePresentationStatus, string> = STATUS_COLORS;
 
 export interface StatusEdgeGeometry {
@@ -55,7 +55,7 @@ interface StatusEdgeProps extends StatusEdgeGeometry {
   style?: CSSProperties;
 }
 
-/** SVG edge presentation; the I6 graph adapter owns interaction and identity. */
+/** SVG edge presentation; the graph adapter owns interaction and identity. */
 export function StatusEdge({
   edgeStyle,
   layoutDirection = 'vertical',

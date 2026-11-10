@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/program_reference.hpp>
+
 #include <cstddef>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -42,9 +44,7 @@ enum class ContactReleaseEvidenceModeDTO {
 };
 
 struct ContactComponentModelBodySelectorDTO final {
-  ComponentRoleId component_role_id;
-  std::optional<ModelRoleId> model_role_id;
-  CollisionBodyRoleId collision_body_role_id;
+  ProgramCollisionBodyReferenceDTO body;
 
   friend bool operator==(const ContactComponentModelBodySelectorDTO&,
                          const ContactComponentModelBodySelectorDTO&) = default;

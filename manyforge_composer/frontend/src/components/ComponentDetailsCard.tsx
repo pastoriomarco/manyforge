@@ -1,7 +1,7 @@
 import type { ComponentState } from '../types/components';
 
 /**
- * The adapter's read-only status lines (CONTRACTS §1 `details`, AUD-2), e.g.
+ * The adapter's read-only status lines (`details`), e.g.
  * an xArm controller's mode, state and error codes, shown as the adapter
  * reports them even without a fault. Display only: nothing reads them for
  * gating. Nothing is shown for a component that reports none.

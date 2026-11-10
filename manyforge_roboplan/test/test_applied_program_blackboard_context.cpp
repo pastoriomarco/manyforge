@@ -38,13 +38,14 @@ V replace(const V &root, std::string_view field, V value) {
 }
 
 std::shared_ptr<const d::ProgramBindingContract>
-ScalarProgram(const d::RetainedBundle &bundle) {
+ScalarProgram(const d::RetainedBundle &bundle,
+              const std::optional<d::VerifiedRetainedModelMap> &map,
+              const d::ICatalogArtifactSource &catalog) {
   auto root = d::parse_strict_json_model_yaml(R"({
-    "api_version":"manyforge.program.v2","program_id":"applied_context_fixture",
+    "api_version":"manyforge.program.v3","program_id":"applied_context_fixture",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "program_profile":"composable-cell-v1","name":"Applied context fixture",
-    "catalog":{"api_version":"manyforge.node_catalog.v2","content_version":"0.0.0"},
-    "component_roles":{},"target_roles":{},
+    "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "blackboard":{"namespaces":[],"keys":[
       {"key":"count","type":"int64","access":"read_write","persistence":"run"},
       {"key":"label","type":"string","access":"read_write","persistence":"run"},
@@ -58,9 +59,9 @@ ScalarProgram(const d::RetainedBundle &bundle) {
               V(bundle.value().catalogs.node_environment.content_version)));
   root = replace(root, "program_revision",
                  V(d::detail::compute_content_identity(
-                     root, {"program-revision", "manyforge.program.v2",
+                     root, {"program-revision", "manyforge.program.v3",
                             "program_revision"})));
-  return d::verify_program_binding_contract(d::canonical_json(root), bundle);
+  return d::verify_program_binding_contract(d::canonical_json(root), bundle, map, catalog);
 }
 
 class AppliedProgramBlackboardContextTest : public ::testing::Test {
@@ -74,7 +75,6 @@ protected:
     ASSERT_TRUE(std::filesystem::create_directories(package));
     ASSERT_TRUE(std::filesystem::create_directory(manager));
     bundle = d::test::materialize_boolean_io_retained_fixture(package).bundle;
-    program = ScalarProgram(*bundle);
     d::FilesystemVerifiedRetainedModelMapSource maps(package);
     const auto map =
         maps.get_verified({bundle->retained_bundle_id(),
@@ -83,15 +83,13 @@ protected:
                                .product_id});
     ASSERT_TRUE(map);
     d::FilesystemCatalogArtifactStore catalog(package);
+    program = ScalarProgram(*bundle, map, catalog);
     d::FilesystemRawArtifactStore raw(package);
-    const auto roles = d::parse_strict_json_model_yaml(
-                           R"({"component_roles":[],"target_roles":[]})")
-                           .root();
     auto prepared = d::assemble_prepared_activation(
         {d::PreparedScenarioOrigin{"context.scenario", kDigestA,
                                    "/fixtures/context.scenario"},
          kDigestB, "optional"},
-        *bundle, *map, *program, roles, catalog, raw);
+        *bundle, *map, *program, catalog, raw);
     d::FilesystemPreparedActivationRepository repository(package);
     static_cast<void>(repository.put_if_absent(prepared));
     selected = repository.get_verified(prepared.prepared_activation_id());
@@ -321,7 +319,8 @@ TEST_F(
   d::FilesystemProgramRepository programs(package);
   d::FilesystemProgramBindingRepository bindings(package);
   static_cast<void>(programs.put_if_absent(program, *bundle));
-  static_cast<void>(bindings.put_if_absent(binding, *bundle, *map));
+  d::FilesystemVerifiedCatalogArtifactSource catalog(package);
+  static_cast<void>(bindings.put_if_absent(binding, *bundle, *map, catalog));
   const auto publication = WriteNamedSelection(false);
   const auto &origin = std::get<c::NamedApplyPublicationTransactionDTO>(
       publication.request.transaction_ref);

@@ -7,6 +7,7 @@
 #include "manager_liveness_rpc_internal.hpp"
 #include <sys/eventfd.h>
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -89,7 +90,7 @@ private:
 
   [[nodiscard]] std::optional<ResolvedObservationOwner>
   ResolveObservationOwner(const core::ProgramBindingId &program_binding_id,
-                          const core::TargetRoleId &target_role_id,
+                          const core::ProgramTargetReferenceDTO &target,
                           const core::CapabilityId &capability_id,
                           const bool motion, Composition &composition,
                           std::map<std::string, std::string> *failures = nullptr) const;
@@ -231,14 +232,15 @@ private:
   ReadStop(const Command &command,
            core::ResourceAddressedExecutionKernel &addressed_kernel) const;
 
-  /// CONTRACTS §1, §5, §7, §8 `read_component_model` (control socket):
+  /// `read_component_model` (control socket):
   /// `component_states`, `cell_latch`, `signal_samples`, `rule_holds` and
   /// `required_signal_ids` (the inputs the Applied Program reads).
   [[nodiscard]] CanonicalValue ReadComponentModelResponse(
       core::ResourceAddressedExecutionKernel &addressed_kernel) const;
-  /// CONTRACTS §2: starts one component action (`component_action`).
+  /// Starts one component action (`component_action`).
   [[nodiscard]] CanonicalValue ComponentActionResponse(const Command &command) const;
-  /// CONTRACTS §7 `set_io_output`: the Kernel admits the write
+  [[nodiscard]] CanonicalValue ComponentRecoveryPreflightResponse(const Command &command) const;
+  /// `set_io_output`: the Kernel admits the write
   /// (`cell_latched`, `rule_holds`), then the component's adapter writes it.
   /// A refusal is an error reply; the write's outcome is `result`.
   [[nodiscard]] CanonicalValue SetIoOutputResponse(
@@ -250,7 +252,7 @@ private:
     kControl,
     /// The `events` reply and the event stream's `state`: the signal samples
     /// without their age, so only a value, source or freshness change makes a
-    /// new state (CONTRACTS §7).
+    /// new state.
     kState,
   };
   [[nodiscard]] CanonicalValue::Object ComponentModelFields(
@@ -258,21 +260,21 @@ private:
 
   [[nodiscard]] CanonicalValue EventsResponse(const Command &command) const;
 
-  /// Active TCP (M7, design 4): each robot's `{component_id, entry | null,
+  /// Active TCP: each robot's `{component_id, entry | null,
   /// owner_epoch, registration_generation, sequence}`, read under its
   /// owner's lock; a reader keeps the greatest triple per robot from
   /// results, reads and `active_tcp_changed` rows.
   [[nodiscard]] CanonicalValue ActiveTcpBaselineValue() const;
   [[nodiscard]] static CanonicalValue ActiveTcpBaselineValue(
       Composition &composition, const core::RequestOwnerEpoch &owner_epoch);
-  /// `read_active_tcp` / `reset_active_tcp` (every robot, T-MQ9b: always
+  /// `read_active_tcp` / `reset_active_tcp` (every robot; a reset always
   /// completes) replies.
-  [[nodiscard]] static CanonicalValue ActiveTcpResponse(Composition *composition,
-                                                        bool reset);
-  /// Robot control's `active_tcp: {entry, display} | null` (design 4).
+  [[nodiscard]] CanonicalValue ActiveTcpResponse(Composition *composition,
+                                                bool reset) const;
+  /// Robot control's `active_tcp: {entry, display} | null`.
   [[nodiscard]] CanonicalValue ActiveTcpStatusValue(Composition &composition) const;
 
-  /// Event stream reads (contract §8.1): the `events` reply facts without
+  /// Event stream reads: the `events` reply facts without
   /// page and progress, and one page of the same journal read.
   [[nodiscard]] std::pair<std::string, CanonicalValue> EventStreamState() const;
   [[nodiscard]] CanonicalValue EventStreamPage(const std::string &owner_epoch,
@@ -402,6 +404,8 @@ private:
   CommandSocket command_socket_;
   CommandSocket control_socket_;
   CommandSocket observation_socket_;
+  // Each command lane is serviced by exactly one thread.
+  std::array<bool, 3> accept_failure_logged_{};
   FileDescriptor lane_wake_{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
   std::atomic<bool> control_socket_failed_{false};
   std::atomic<bool> reconciliation_lane_failed_{false};

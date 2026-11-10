@@ -20,6 +20,7 @@
 #include <manyforge_core/io_source_ingress_sender.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -61,8 +62,8 @@ class RecordingIngress final : public IIoSignalIngress {
 TEST(IoSourceIngressSenderTest, EveryMessageIsAnArrivalAlsoWhilePaused) {
   // IO-1: the device's `inputs` stream sees every message, also while its
   // delivery is paused (a prepared device), never a frame of its own.
-  FakeClock clock;
-  clock.set(1'000'000'000);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(1'000'000'000);
   ManualScheduler scheduler;
   ComponentStreamHealth health(clock, scheduler);
   const ControllableComponentId device("io");
@@ -75,20 +76,20 @@ TEST(IoSourceIngressSenderTest, EveryMessageIsAnArrivalAlsoWhilePaused) {
   IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation, 1U);
   sender.SetArrivalRecorder(arrivals);
   sender.Receive(updates(), sender.CaptureAcquisition(kIncarnation, 1U));
-  scheduler.advance_to(clock.now(), SchedulerPriority::Monitoring);
+  scheduler.advance_to(clock->now(), SchedulerPriority::Monitoring);
   EXPECT_TRUE(ingress->acquisitions.empty());
   ASSERT_EQ(health.Read(device).size(), 1U);
   EXPECT_EQ(health.Read(device)[0].state, StreamLivenessStateDTO::kLive);
   sender.SetArrivalRecorder(nullptr);
-  clock.advance(200'000'000);
+  clock->advance(200'000'000);
   sender.Receive(updates(), sender.CaptureAcquisition(kIncarnation, 1U));
-  scheduler.advance_to(clock.now(), SchedulerPriority::Monitoring);
+  scheduler.advance_to(clock->now(), SchedulerPriority::Monitoring);
   EXPECT_EQ(health.Read(device)[0].state, StreamLivenessStateDTO::kStale);
 }
 
 TEST(IoSourceIngressSenderTest, SelectedIngressAndShutdownSerializeWithoutASecondAcquisition) {
-  FakeClock clock;
-  clock.set(7);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(7);
   auto ingress = std::make_shared<RecordingIngress>();
   IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation);
   std::promise<void> entered, release, closing_started;
@@ -98,7 +99,7 @@ TEST(IoSourceIngressSenderTest, SelectedIngressAndShutdownSerializeWithoutASecon
   // Fault-injection gate only: production ingress may briefly lock, never wait
   // on an external promise. This selects the handoff being raced by shutdown.
   ingress->on_enqueue = [&] {
-    clock.set(100);
+    clock->set(100);
     entered.set_value();
     released.wait();
   };
@@ -126,14 +127,14 @@ TEST(IoSourceIngressSenderTest, SelectedIngressAndShutdownSerializeWithoutASecon
 }
 
 TEST(IoSourceIngressSenderTest, ActualMiddlewareLossStaysDistinctFromSharedCapacityBarrier) {
-  FakeClock clock;
+  auto clock = std::make_shared<FakeClock>();
   auto ingress = std::make_shared<RecordingIngress>();
   IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation);
   ingress->accept = false;
   sender.Receive(updates(), IoSourceIngressAcquisitionReceipt{0, 0, kIncarnation});
   EXPECT_EQ(ingress->capacity_losses, 1U);
   EXPECT_TRUE(ingress->losses.empty());
-  clock.set(4);
+  clock->set(4);
   sender.NotifyLoss(IoIngressLossReason::kMiddlewareMessageLost,
                     sender.CaptureAcquisition(kIncarnation, 0U), 3);
   ASSERT_EQ(ingress->losses.size(), 1U);
@@ -148,7 +149,7 @@ TEST(IoSourceIngressSenderTest, ActualMiddlewareLossStaysDistinctFromSharedCapac
 }
 
 TEST(IoSourceIngressSenderTest, PreparedDriverCannotPublishBeforeActualEnable) {
-  FakeClock clock;
+  auto clock = std::make_shared<FakeClock>();
   auto ingress = std::make_shared<RecordingIngress>();
   IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation, 1U);
   sender.Receive(updates(), sender.CaptureAcquisition(kIncarnation, 1U));
@@ -162,7 +163,7 @@ TEST(IoSourceIngressSenderTest, PreparedDriverCannotPublishBeforeActualEnable) {
 }
 
 TEST(IoSourceIngressSenderTest, DisableEnableRejectsOldCallbacksEvenAtIdenticalClockTime) {
-  FakeClock clock;
+  auto clock = std::make_shared<FakeClock>();
   auto ingress = std::make_shared<RecordingIngress>();
   IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation);
   const auto old_callback = sender.CaptureAcquisition(kIncarnation, 0U);
@@ -172,7 +173,7 @@ TEST(IoSourceIngressSenderTest, DisableEnableRejectsOldCallbacksEvenAtIdenticalC
   sender.NotifyLoss(IoIngressLossReason::kMiddlewareMessageLost, old_callback, 1U);
   // First execution of a buffered OLD subscription callback after Resume
   // keeps its immutable old token even though its receiver timestamp is new.
-  clock.set(10);
+  clock->set(10);
   const auto buffered_old_subscription = sender.CaptureAcquisition(kIncarnation, 0U);
   sender.Receive(updates(), buffered_old_subscription);
   sender.NotifyLoss(IoIngressLossReason::kMiddlewareMessageLost, buffered_old_subscription, 2U);
@@ -190,8 +191,8 @@ TEST(IoSourceIngressSenderTest, DisableEnableRejectsOldCallbacksEvenAtIdenticalC
 }
 
 TEST(IoSourceIngressSenderTest, RetainedDriverRebindRejectsOldBufferedCallbackIncarnation) {
-  FakeClock clock;
-  clock.set(10);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(10);
   auto old = std::make_shared<RecordingIngress>();
   auto next = std::make_shared<RecordingIngress>();
   IoSourceIngressSender sender(old, clock, kSource, kIncarnation);
@@ -211,7 +212,7 @@ TEST(IoSourceIngressSenderTest, RetainedDriverRebindRejectsOldBufferedCallbackIn
   sender.NotifyLoss(IoIngressLossReason::kMiddlewareMessageLost, old_subscription, 3U);
   EXPECT_TRUE(next->acquisitions.empty());
   EXPECT_TRUE(next->losses.empty());
-  clock.set(20);
+  clock->set(20);
   sender.Receive(updates(), sender.CaptureAcquisition(successor, 1U));
   ASSERT_EQ(next->acquisitions.size(), 1U);
   EXPECT_EQ(next->acquisitions[0].incarnation, successor);

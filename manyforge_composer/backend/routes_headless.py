@@ -11,6 +11,12 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.execution import (
+    MOTION_PATH_PREVIEW_MAX_BYTES,
+    _canonical_json,
+    _motion_path_preview_valid,
+)
+from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -23,6 +29,8 @@ from manyforge_headless_api.models import (
     ManagerApplyAcknowledgementRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
+    RecoveryGroupRequest,
+    RecoveryPreflightConfirmation,
     SetOutputRequest,
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -74,6 +82,9 @@ from .authoring_workspace import AuthoringWorkspaceIdentity, AuthoringWorkspaceE
 from .source_model_client import (
     ActiveSourceModelProjectionError,
     read_active_source_model_context,
+)
+from .routes_assistant import (
+    require_no_assistant_turn as _require_no_assistant_turn,
 )
 from .state import ComposerState
 
@@ -260,7 +271,7 @@ def _call_scene(callback, body: SceneTransactionRequest):
             error.status_code is not None
             and isinstance(response, dict)
             and set(response) == _SCENE_RESULT_FIELDS
-            and response.get("api_version") == "manyforge.manager_command_response.v1"
+            and response.get("api_version") == "manyforge.manager_command_response.v2"
             and response.get("ok") is False
             and response.get("request_id") == context.request_id
             and response.get("request_owner_epoch") == context.request_owner_epoch
@@ -323,7 +334,7 @@ def create_headless_router(
     def manager_status() -> dict[str, Any]:
         return _call(client.manager_status)
 
-    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10): pass-through.
+    # Component model v2: pass-through.
 
     @router.get("/api/components")
     def components() -> list[Any]:
@@ -341,6 +352,27 @@ def create_headless_router(
         body: ComponentActionRequest,
     ) -> dict[str, Any]:
         return _call(lambda: client.component_action(component_id, body.action))
+
+    @router.get("/api/components/{component_id}/recover-enable/preflight")
+    def component_recovery_preflight(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.component_recovery_preflight(component_id))
+
+    @router.post("/api/components/{component_id}/recover-enable", status_code=202)
+    def component_recover_enable(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: RecoveryPreflightConfirmation,
+    ) -> dict[str, Any]:
+        return _call(lambda: client.component_recover_enable(
+            component_id, body.model_dump(mode="json")
+        ))
+
+    @router.post("/api/components/recover-enable", status_code=202)
+    def component_recover_enable_group(body: RecoveryGroupRequest) -> dict[str, Any]:
+        return _call(lambda: client.component_recover_enable_group(
+            body.model_dump(mode="json")["targets"]
+        ))
 
     @router.get("/api/cell/latch")
     def cell_latch() -> dict[str, Any]:
@@ -431,6 +463,7 @@ def create_headless_router(
                     },
                 )
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_start(body.model_dump(mode="json"))
 
         assert state.authoring_admission is not None
@@ -544,6 +577,7 @@ def create_headless_router(
         def submit():
             if _resumes_execution("execution_recovery", payload):
                 _require_applied_authoring_drafts(state)
+                _require_no_assistant_turn(state)
             return client.cycle_recovery_action(payload)
 
         assert state.authoring_admission is not None
@@ -614,6 +648,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_motion_start(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -638,6 +673,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_motion_resume(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -683,6 +719,7 @@ def create_headless_router(
             )
         def submit():
             _require_applied_authoring_drafts(state)
+            _require_no_assistant_turn(state)
             return client.program_run_resume_full_stop(
                 program_run_id, body.model_dump(mode="json")
             )
@@ -789,6 +826,7 @@ def create_headless_router(
         def submit():
             if start and _resumes_execution(kind, request.get("payload")):
                 _require_applied_authoring_drafts(state)
+                _require_no_assistant_turn(state)
             return client.submit_control_command(request)
 
         assert state.authoring_admission is not None
@@ -816,7 +854,29 @@ def create_headless_router(
     def execution_preview_motion(
         body: OperationIntentRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.preview_motion(body.model_dump(mode="json")))
+        operation = body.model_dump(mode="json")
+        try:
+            return client.preview_motion(operation)
+        except HeadlessClientError as error:
+            translated = _translate(error)
+            response = error.response
+            if isinstance(response, dict) and response.get("ok") is False:
+                diagnostic = response.get("diagnostic_preview")
+                forbidden = {"preview_receipt", "receipt_digest", "token", "approval_token", "commit_eligible"}
+                motion = operation["participants"][0]["payload"].get("motion")
+                expected = motion.get("joint_names") if isinstance(motion, dict) and motion.get("kind") == "joint_goal" else None
+                try:
+                    valid = (not forbidden.intersection(response)
+                             and _motion_path_preview_valid(diagnostic, expected, diagnostic=True)
+                             and len(_canonical_json(response)) <= MOTION_PATH_PREVIEW_MAX_BYTES
+                             and len(JSONResponse(content={"detail": {
+                                 **translated.detail, "diagnostic_preview": diagnostic,
+                             }}).body) <= MOTION_PATH_PREVIEW_MAX_BYTES)
+                except (ValueError, TypeError, UnicodeError, HeadlessApiError):
+                    valid = False
+                if valid:
+                    translated.detail["diagnostic_preview"] = diagnostic
+            raise translated from error
 
     @router.post("/api/execution/manual-handover")
     def execution_read_manual_handover(
@@ -917,10 +977,10 @@ def create_headless_router(
     def execution_get_runtime_scale_control(
         request: Request,
         program_binding_id: Annotated[str, Query(min_length=1, max_length=256)],
-        component_role_id: Annotated[
+        component_id: Annotated[
             str | None, Query(min_length=1, max_length=256)
         ] = None,
-        target_role_id: Annotated[
+        command_target_id: Annotated[
             str | None, Query(min_length=1, max_length=256)
         ] = None,
         group_targets: Annotated[
@@ -929,8 +989,8 @@ def create_headless_router(
     ) -> dict[str, Any]:
         selector_keys = (
             "program_binding_id",
-            "component_role_id",
-            "target_role_id",
+            "component_id",
+            "command_target_id",
             "group_targets",
         )
         if any(len(request.query_params.getlist(key)) > 1 for key in selector_keys):
@@ -940,11 +1000,11 @@ def create_headless_router(
         if group_targets is None:
             payload = {
                 "program_binding_id": program_binding_id,
-                "component_role_id": component_role_id,
-                "target_role_id": target_role_id,
+                "component_id": component_id,
+                "command_target_id": command_target_id,
             }
         else:
-            if component_role_id is not None or target_role_id is not None:
+            if component_id is not None or command_target_id is not None:
                 raise HTTPException(422, "runtime-scale selector has mixed forms")
             try:
                 payload = {

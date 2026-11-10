@@ -1,4 +1,4 @@
-"""Closed read-only client surface for assistant and MCP adapters at H0."""
+"""Closed read-only client surface for assistant and MCP adapters."""
 
 from __future__ import annotations
 

@@ -104,6 +104,12 @@ void XArmOwnerAdapter::AddMember(XArmMember member) {
     members_.push_back(std::move(member));
 }
 
+void XArmOwnerAdapter::ForgetMemberEstops() noexcept {
+  std::lock_guard lock(mutex_);
+  for (const auto &member : members_)
+    if (const auto arm = member.arm.lock()) arm->ForgetOwnerEstop();
+}
+
 std::vector<XArmMember> XArmOwnerAdapter::Members() const {
   std::lock_guard lock(mutex_);
   return members_;
@@ -149,6 +155,9 @@ core::ComponentState XArmOwnerAdapter::State(const std::int64_t now_ns) const {
   core::ComponentState state;
   state.observed_at_ns = now_ns;
   state.activity = core::ComponentActivity::kIdle;
+  // Serialize status capture and stop projection so an older concurrent State
+  // call cannot reintroduce a stop after a newer report cleared it.
+  std::unique_lock observation_lock(mutex_);
   const auto observed = ports_.status->observe();
   const bool fresh = Fresh(observed, now_ns);
   core::ComponentStream stream{"robot_states", core::StreamFreshness::kNone, std::nullopt};
@@ -162,13 +171,28 @@ core::ComponentState XArmOwnerAdapter::State(const std::int64_t now_ns) const {
   std::optional<XArmGpioModuleStatus> gpio;
   bool prepared = false;
   {
-    std::lock_guard lock(mutex_);
     reason = reason_;
     gpio = gpio_;
     prepared = prepared_;
+    if (fresh) {
+      if (observed.error_code >= 1 && observed.error_code <= 3) {
+        const auto since = stop_ ? stop_->since_ns : now_ns;
+        stop_ = core::ComponentStop{core::StopCode::kEstop,
+            "Emergency stop reported by the robot controller",
+            xarm_vendor_code(observed.error_code),
+            std::string(xarm_error_text(observed.error_code)), since};
+      } else if (observed.error_code >= 0) {
+        stop_.reset();
+      }
+    }
+    state.stop = stop_;
+    if (fresh && observed.error_code >= 1 && observed.error_code <= 3)
+      for (const auto &member : members_)
+        if (const auto arm = member.arm.lock()) arm->ObserveOwnerEstop();
   }
+  observation_lock.unlock();
   if (fresh) {
-    // AUD-2: the controller's report as M7's vendor status, display only.
+    // The controller's report as the vendor status, display only.
     const auto motors = observed.motion_enable_mask < 0
                             ? std::string("unknown")
                             : std::to_string(std::popcount(
@@ -206,7 +230,8 @@ core::ComponentState XArmOwnerAdapter::State(const std::int64_t now_ns) const {
                         std::nullopt,
                         Concerns(XArmFaultScope::kMachine),
                         0};
-  } else if (observed.error_code > 0) {
+  } else if (observed.error_code > 0 &&
+             !(observed.error_code >= 1 && observed.error_code <= 3)) {
     fault = xarm_fault(observed.error_code, 0);
     fault->concerns = Concerns(xarm_fault_scope(observed.error_code));
   } else if (gpio && (gpio->state != 0 || gpio->code != 0)) {
@@ -221,7 +246,7 @@ core::ComponentState XArmOwnerAdapter::State(const std::int64_t now_ns) const {
                         gpio->state == 6 ? "communication failure" : "GPIO module error",
                         Concerns(XArmFaultScope::kControllerIo),
                         0};
-  } else {
+  } else if (!state.stop) {
     for (const auto &member : Members()) {
       const auto arm = member.arm.lock();
       if (!arm || !arm->ExternalControl(observed, now_ns)) continue;
@@ -282,7 +307,7 @@ std::optional<ActionResult> XArmOwnerAdapter::ClearError(const ComponentAction a
       call.outcome == XArmServiceCallOutcome::kSucceeded ||
       (call.vendor_return && (*call.vendor_return == 1 || *call.vendor_return == 2));
   if (!answered) return call_failure(action, call, "clean_error");
-  // As M7: read back at 0, 150 and 300 ms after the answer; the controller
+  // Read back at 0, 150 and 300 ms after the answer; the controller
   // may take a moment to process the clear.
   int error = 0;
   auto at = std::chrono::nanoseconds::zero();
@@ -306,10 +331,13 @@ std::optional<ActionResult> XArmOwnerAdapter::AwaitClearedReport(const Component
                                                                  const std::int64_t deadline_ns) {
   // Live 2026-11-02 (Real Lite 6): the read showed the error cleared while
   // `robot_states` (5 Hz) still carried C2, so the owner's state was still
-  // the fault when its members' Prepare followed. The action ends once the
-  // owner's own state shows no fault (the report's error, its freshness, the
-  // GPIO module's error, external control).
-  const auto cleared = [&] { return State(Now()).lifecycle != ComponentLifecycle::kFault; };
+  // still stopped when its members' Prepare followed. The action ends once
+  // the owner's state shows neither a stop nor a fault (including report
+  // freshness, GPIO module error and external control).
+  const auto cleared = [&] {
+    const auto state = State(Now());
+    return state.lifecycle != ComponentLifecycle::kFault && !state.stop;
+  };
   while (!cleared() && !stop.stop_requested() && Now() < deadline_ns)
     ports_.wait(std::chrono::nanoseconds(kXArmClearedReportPollNs));
   if (cleared()) return std::nullopt;
@@ -327,6 +355,9 @@ std::optional<ActionResult> XArmOwnerAdapter::AwaitClearedReport(const Component
                   xarm_vendor_code(observed.error_code),
                   std::string(xarm_error_text(observed.error_code)));
   const auto state = State(Now());
+  if (state.stop)
+    return failed(action, "xarm_status_unavailable",
+                  "the robot controller has not reported that its emergency stop cleared");
   if (!state.fault) return std::nullopt;
   return failed(action, std::string(core::to_string(state.fault->code)), state.fault->message,
                 state.fault->vendor_code, state.fault->vendor_text);
@@ -381,9 +412,35 @@ std::optional<ActionResult> XArmOwnerAdapter::Connect(const ComponentAction acti
 ActionResult XArmOwnerAdapter::Clear(const ComponentAction action, const std::stop_token stop) {
   const auto deadline = Now() + ports_.lifecycle_command_timeout.count();
   if (auto refused = Connect(action, stop)) return *refused;
+  // Prepare only connects: an e-stop and the error it latches (C1-C3) are
+  // normal and stay as reported (a stop, not a fault). Clearing a controller
+  // error is the operator's explicit Recover, or the arm's Enable (its
+  // activation clears).
+  if (action == ComponentAction::kPrepare) {
+    for (const auto &member : Members())
+      if (const auto arm = member.arm.lock()) arm->ReleaseExternalControl(Now());
+    {
+      std::lock_guard lock(mutex_);
+      prepared_ = true;
+    }
+    // Live 2026-11-08 (Real Lite 6): the driver's first report came about a
+    // second before its controller manager answered, so the owner was still
+    // offline when Prepare ended. Prepare ends once the lane is reachable.
+    while (ports_.lane->State(Now()).lifecycle == ComponentLifecycle::kOffline &&
+           !stop.stop_requested() && Now() < deadline)
+      ports_.wait(std::chrono::nanoseconds(kXArmReportPeriodNs));
+    const auto lane = ports_.lane->State(Now());
+    if (lane.lifecycle != ComponentLifecycle::kOffline)
+      return result(action, ActionOutcome::kSucceeded);
+    if (stop.stop_requested())
+      return failed(action, "component_action_interrupted_by_stop",
+                    "a Stop interrupted the wait for the controller manager");
+    return failed(action, "controller_manager_unavailable",
+                  "the machine's controller manager didn't answer within the lifecycle command time");
+  }
   int warning = 0;
   if (auto refused = ClearError(action, stop, warning)) return *refused;
-  // A warning left after the clear is cleared too (XPW-1: the arm's
+  // A warning left after the clear is cleared too (the arm's
   // hardware, whose activation also clears it, stays off until Enable).
   if (warning > 0) {
     const auto call = ports_.driver->CleanWarn(kXArmServiceResponseTimeout, stop);
@@ -394,14 +451,16 @@ ActionResult XArmOwnerAdapter::Clear(const ComponentAction action, const std::st
   for (const auto &member : Members())
     if (const auto arm = member.arm.lock()) arm->ReleaseExternalControl(Now());
   if (auto refused = AwaitClearedReport(action, stop, deadline)) return *refused;
+  // Recovered: connected and cleared, so prepared too (its members can
+  // prepare after it).
   std::lock_guard lock(mutex_);
-  if (action == ComponentAction::kPrepare) prepared_ = true;
+  prepared_ = true;
   return result(action, ActionOutcome::kSucceeded);
 }
 
 ActionResult XArmOwnerAdapter::PowerAction(const ComponentAction action,
                                            const std::stop_token stop) {
-  // The core disabled the members first (CONTRACTS §2, §16).
+  // The core disabled the members first.
   const bool reboot = action == ComponentAction::kReboot;
   const auto call = ports_.driver->SystemControl(reboot ? kXArmSystemReboot : kXArmSystemShutdown,
                                                  kXArmServiceResponseTimeout, stop);

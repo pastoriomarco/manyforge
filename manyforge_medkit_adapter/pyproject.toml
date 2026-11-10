@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_medkit_adapter"
-version = "0.2.0"
+version = "0.2.1"
 description = "Forward ManyForge core traceability/observability to ros2_medkit"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]

@@ -2,7 +2,7 @@ import type { CatalogCapabilityRequirement } from '../types/api';
 
 /**
  * Filter catalog entries against an already-qualified capability set. Extracting
- * capabilities from a deployment remains I6 work; this helper owns no artifact
+ * capabilities from a deployment remains future work; this helper owns no artifact
  * or runtime schema.
  */
 export function supportsRequiredCapabilities(

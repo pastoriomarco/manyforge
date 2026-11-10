@@ -92,10 +92,7 @@ require_program_root(const deployment::ParsedArtifactCandidate &parsed) {
           root.storage())) {
     throw std::invalid_argument("Program source root must be an object");
   }
-  if (require_string_member(root, "api_version") != "manyforge.program.v2") {
-    throw std::invalid_argument(
-        "Program source api_version must be manyforge.program.v2");
-  }
+  deployment::require_supported_program_format(root);
   const std::string &declared = require_string_member(root, "program_revision");
   if (!deployment::is_sha256_digest(declared)) {
     throw std::invalid_argument(
@@ -155,7 +152,7 @@ compute_program_revision(const deployment::CanonicalValue &root) {
           deployment::normalize_program_authoring(root),
           deployment::detail::ContentIdentitySpec{
               .identity_domain = "program-revision",
-              .api_version = "manyforge.program.v2",
+              .api_version = std::string(manyforge::core::kProgramApiVersion),
               .own_field = "program_revision",
           }),
   };

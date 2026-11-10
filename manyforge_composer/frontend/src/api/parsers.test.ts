@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import actualHeldRun from '../testFixtures/programRunHeld64.fixture.json';
 import isaacSceneOwnerSections from '../testFixtures/isaacSceneOwnerSections.fixture.json';
-import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import { sceneOwnerFacts } from '../state/sceneAuthoring';
 import type { NodeEnvironmentResponse } from '../types/api';
 import {
@@ -64,7 +63,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
   const programSaved = program.saved as Record<string, unknown>;
   const deploymentDraft = deployment.draft as Record<string, unknown>;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 7,
     program: { ...programDraft, saved: programSaved },
@@ -84,7 +83,6 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
       document_description: '',
       source_diagnostics: [],
       source_document_digest: null,
-      program_role_assignment: null,
       source_program_digest: null,
       source_deployment_digest: null,
     },
@@ -92,6 +90,18 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
 }
 
 describe('shared authoring workspace transport', () => {
+  it('rejects the old snapshot version and removed assignment field without repair', () => {
+    const old = authoringWorkspaceFixture();
+    old.schemaVersion = 'manyforge.composer_authoring_workspace_snapshot.v2';
+    const before = structuredClone(old);
+    expect(() => parseAuthoringWorkspaceSnapshot(old)).toThrow(/snapshot\.v3/);
+    expect(old).toEqual(before);
+
+    const extra = authoringWorkspaceFixture();
+    (extra.project as Record<string, unknown>).program_role_assignment = null;
+    expect(() => parseAuthoringWorkspaceSnapshot(extra)).toThrow(/exactly/);
+  });
+
   it('parses both Drafts and project facts as one closed publication', () => {
     const parsed = parseAuthoringWorkspaceSnapshot(authoringWorkspaceFixture());
     expect(parsed.workspaceRevision).toBe(7);
@@ -193,17 +203,15 @@ it('bounds discovery by encoded bytes and requires the exact continuation', () =
 
 function programFixture(): Record<string, unknown> {
   return {
-    api_version: 'manyforge.program.v2',
+    api_version: 'manyforge.program.v3',
     program_id: 'fixture',
     program_revision: `sha256:${'a'.repeat(64)}`,
     program_profile: 'composable-cell-v1',
     name: 'Fixture',
     catalog: {
-      api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.4.0',
+      api_version: 'manyforge.node_catalog.v3',
+      content_version: '3.0.0',
     },
-    component_roles: {},
-    target_roles: {},
     parameters: [{
       parameter_id: 'duration',
       type: 'float64',
@@ -240,7 +248,7 @@ function workspaceFixture(): Record<string, unknown> {
       draftRevision: 2,
       programLoaded: true,
       authoring: {
-        schema_version: 'manyforge.composer_authoring_forest.v1',
+        schema_version: 'manyforge.composer_authoring_forest.v2',
         ...programFields,
         forest: [tree],
         positions: {},
@@ -337,15 +345,45 @@ function programBindingFixture(
   programRevision: string,
   programBindingId: string,
 ): Record<string, unknown> {
-  const binding = structuredClone(nativeBindingFixture) as Record<string, unknown>;
-  binding.program_binding_id = programBindingId;
-  binding.program_id = programId;
-  binding.program_revision = programRevision;
-  binding.retained_bundle_id = `sha256:${'b'.repeat(64)}`;
-  binding.graph_revision = `sha256:${'c'.repeat(64)}`;
-  (binding.node_environment as Record<string, unknown>).environment_digest =
-    `sha256:${'a'.repeat(64)}`;
-  return binding;
+  const digest = `sha256:${'d'.repeat(64)}`;
+  // Minimal synthetic v3 document for workspace-envelope parser tests. The
+  // generated transport suite separately requires the genuine native v3
+  // Binding fixture; this object makes no producer or catalog claim.
+  return {
+    api_version: 'manyforge.program_binding.v3',
+    program_binding_id: programBindingId,
+    program_id: programId,
+    program_revision: programRevision,
+    retained_bundle_id: `sha256:${'b'.repeat(64)}`,
+    graph_revision: `sha256:${'c'.repeat(64)}`,
+    node_environment: {
+      catalog_id: 'fixture_catalog',
+      content_version: '3.0.0',
+      catalog_digest: digest,
+      environment_digest: `sha256:${'a'.repeat(64)}`,
+    },
+    component_bindings: [{
+      component_id: 'fixture_robot',
+      component_type_id: 'fixture_robot_type',
+      component_type_revision: digest,
+      model_bindings: [{
+        model_role_id: 'arm_model',
+        model_instance_id: 'fixture_robot_model',
+        model_revision: digest,
+      }],
+    }],
+    target_bindings: [],
+    frame_bindings: [],
+    collision_body_bindings: [],
+    signal_bindings: [],
+    node_policies: [],
+    contact_grasp_bindings: [],
+    provenance: {
+      binding_compiler_contract_digest: digest,
+      source_records: [],
+      resolved_output_records: [],
+    },
+  };
 }
 
 function sourceSectionFixture(): Record<string, unknown> {
@@ -531,7 +569,7 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     phase: 'fence_held',
     scene_initialization: 'preserve',
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v6',
+      schema_version: 'manyforge.prepared_activation_input.v7',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
       origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}`, project_path: '/projects/fixture.scenario' },
       captured_input_digest: `sha256:${'c'.repeat(64)}`,
@@ -742,7 +780,7 @@ describe('Program product projections', () => {
 
   function runStatus(state = 'running'): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_run_status.v3',
+      schema_version: 'manyforge.program_run_status.v4',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       run_revision: 3,
@@ -877,8 +915,8 @@ describe('Program product projections', () => {
           resume_unavailable_reason: 'selection_not_held',
           runtime_scale_selector: {
             program_binding_id: digestC,
-            component_role_id: 'robot',
-            target_role_id: 'arm',
+            component_id: 'robot',
+            command_target_id: 'arm',
           },
           runtime_scale_unavailable_reason: null,
           resource_ids: ['robot.joint_1', 'robot.joint_2'] }],
@@ -904,6 +942,15 @@ describe('Program product projections', () => {
       preparation_digest: digestB,
       program: programFixture(),
       program_binding: programBindingFixture('fixture', digestA, digestC),
+      program_frame_facts: {
+        applied_record_digest: digestC,
+        program_binding_id: digestC,
+        program_revision: digestA,
+        retained_bundle_id: digestB,
+        graph_revision: digestC,
+        components: ['fixture_robot'],
+        frames: [{ reference: { component_id: 'fixture_robot', frame_id: 'base' }, match_count: 1 }],
+      },
       program_binding_id: digestC,
       program_id: 'fixture',
       program_revision: digestA,
@@ -911,7 +958,7 @@ describe('Program product projections', () => {
       source_document_digest: digestA,
       scenario_id: 'cell-pick',
       project_path: '/projects/cell-pick.scenario',
-      schema_version: 'manyforge.applied_program_selection.v3',
+      schema_version: 'manyforge.applied_program_selection.v4',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
@@ -949,15 +996,43 @@ describe('Program product projections', () => {
     expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
     expect(applied.program.program_id).toBe('fixture');
     expect(applied.programBinding.program_binding_id).toBe(digestC);
-    expect(
-      applied.programBinding.component_role_bindings[0].component_role_id,
-    ).toBeTypeOf('string');
+    expect(applied.programBinding.component_bindings[0].component_id).toBe('fixture_robot');
+    expect(applied.programFrameFacts.frames[0]).toEqual({
+      reference: { componentId: 'fixture_robot', frameId: 'base' }, matchCount: 1,
+    });
+    expect(() => parseAppliedProgramSelection({ ...appliedInput, schema_version: 'manyforge.applied_program_selection.v3' }))
+      .toThrow(/applied_program_selection\.v4/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_frame_facts: { ...appliedInput.program_frame_facts, program_binding_id: digestB },
+    })).toThrow(/captured Applied identity/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_frame_facts: { ...appliedInput.program_frame_facts, frames: [
+        { reference: { component_id: 'fixture_robot', frame_id: 'base' }, match_count: 1 },
+        { reference: { component_id: 'fixture_robot', frame_id: 'base' }, match_count: 2 },
+      ] },
+    })).toThrow(/sorted unique frame references/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_frame_facts: { ...appliedInput.program_frame_facts, frames: [
+        { reference: { component_id: 'other_robot', frame_id: 'base' }, match_count: 1 },
+      ] },
+    })).toThrow(/declared component/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_frame_facts: { ...appliedInput.program_frame_facts, frames: [
+        { reference: { component_id: 'fixture_robot', frame_id: 'base' }, match_count: 0 },
+      ] },
+    })).toThrow(/match count 1 or 2/);
+    expect(() => parseAppliedProgramSelection({
+      ...appliedInput,
+      program_frame_facts: { ...appliedInput.program_frame_facts, unexpected: true },
+    })).toThrow(/exactly/);
     const nestedMalformed = programBindingFixture('fixture', digestA, digestC);
-    (
-      (
-        nestedMalformed.target_role_bindings as Record<string, unknown>[]
-      )[0].frame_role_bindings as Record<string, unknown>[]
-    )[0].unknown = true;
+    (nestedMalformed.component_bindings as Record<string, unknown>[])[0]
+      .model_bindings = [{ model_role_id: 'arm_model', model_instance_id: 'fixture_robot_model',
+        model_revision: digestA, unknown: true }];
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_binding: nestedMalformed,
@@ -1010,7 +1085,7 @@ describe('Program product projections', () => {
       recovery_class: 'failed_validation', terminal_facts: [{ kind: 'local_failure', effect: 'no_effect' }] };
   }
 
-  it('accepts the actual held R5a Run with its required empty operation failures', () => {
+  it('accepts an actual held Run with its required empty operation failures', () => {
     const run = parseProgramRunStatus(actualHeldRun);
     expect(run.capture.programRunId).toBe('program-cycle.1');
     expect(run.state).toBe('running');
@@ -1082,7 +1157,7 @@ describe('Program product projections', () => {
     expect(status.capture.programRunId).toBe('program-run.1');
   });
 
-  it('carries the run end reason (CONTRACTS §9) once the run has ended', () => {
+  it('carries the run end reason once the run has ended', () => {
     expect(parseProgramRunStatus(runStatus()).runEnd).toBeNull();
     expect(parseProgramRunStatus({ ...runStatus(), run_end: null }).runEnd).toBeNull();
     expect(parseProgramRunStatus({ ...runStatus(), run_end: {
@@ -1099,10 +1174,10 @@ describe('Program product projections', () => {
 
   it('carries a run failure as one structured error', () => {
     const status = parseProgramRunStatus(failedRunStatus({
-      reason: 'frame_role_unresolved',
-      reference_type: 'frame_role',
+      reason: 'frame_unresolved',
+      reference_type: 'component_frame',
       reference_id: 'tool0',
-      target_role_id: 'arm',
+      component_id: 'arm',
       retryable: false,
     }));
 
@@ -1110,10 +1185,10 @@ describe('Program product projections', () => {
       code: 'owner_request_failed',
       message: 'frame role tool0 is not available',
       details: {
-        reason: 'frame_role_unresolved',
-        reference_type: 'frame_role',
+        reason: 'frame_unresolved',
+        reference_type: 'component_frame',
         reference_id: 'tool0',
-        target_role_id: 'arm',
+        component_id: 'arm',
         retryable: false,
       },
       origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'scene.frames' },
@@ -1152,7 +1227,7 @@ describe('Program product projections', () => {
       .reason?.details?.reason).toBe('é'.repeat(128));
     expect(() => parseProgramRunStatus(failedRunStatus([]))).toThrow(/an object/);
     const keys = [
-      'reason', 'reference_type', 'reference_id', 'target_role_id', 'input_problem',
+      'reason', 'reference_type', 'reference_id', 'input_problem',
       'path', 'source_kind', 'source_reference', 'rule_id', 'component_id', 'retryable', 'required_action',
     ];
     const large = Object.fromEntries(keys.map((key) => [key, 'x'.repeat(200)]));
@@ -1166,6 +1241,16 @@ describe('Program product projections', () => {
       ...runStatus(),
       origin: { kind: 'program_runner', node_instance_id: null, owner_api: null },
     })).toThrow(/null when the run names no reason/);
+  });
+
+  it('preserves a qualified signal in failure details and enforces its byte bound', () => {
+    const details = { reference_type: 'signal', reference: {
+      component_id: 'robot', signal_name: 'é'.repeat(256),
+    } };
+    expect(parseProgramRunStatus(failedRunStatus(details)).reason?.details).toEqual(details);
+    expect(() => parseProgramRunStatus(failedRunStatus({
+      ...details, reference: { ...details.reference, signal_name: `${details.reference.signal_name}x` },
+    }))).toThrow(/bounded qualified reference/);
   });
 
   it('refuses failure origins outside their kinds', () => {
@@ -1834,7 +1919,7 @@ describe('Program product projections', () => {
       status: 'accepted',
       confirmation_token: null,
       prepared_activation: {
-        schema_version: 'manyforge.prepared_activation_input.v6',
+        schema_version: 'manyforge.prepared_activation_input.v7',
         prepared_activation_id: digestC,
         origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
         captured_input_digest: digestB,
@@ -1850,7 +1935,7 @@ describe('Program product projections', () => {
       },
       candidate_preview: null,
       manager_apply: {
-        api_version: 'manyforge.manager_command_response.v1',
+        api_version: 'manyforge.manager_command_response.v2',
         apply_generation: 1, apply_id: 'apply-1',
         candidate_projection_revision: null,
         error: null, ok: true, replay_status: 'accepted_new',
@@ -1941,24 +2026,41 @@ describe('Applied Program status parser', () => {
       non_executable: {
         affected_execution_groups: ['grasp'],
         affected_nodes: ['close_gripper'],
-        unresolved_roles: [{
-          command_target_id: 'jaw',
-          component_role_id: 'gripper',
-          controllable_component_id: 'gripper-1',
-          detail: 'target role depends on an unresolved component role',
-          reason: 'component_role_unresolved',
-          target_role_id: 'jaw',
+        unresolved_targets: [{
+          target: { component_id: 'gripper-1', command_target_id: 'jaw' },
+          detail: 'component is absent',
+          reason: 'component_missing',
         }],
       },
     });
     expect(parsed.executable).toBe(false);
-    expect(parsed.unresolvedReferences[0].target_role_id).toBe('jaw');
+    expect(parsed.unresolvedReferences[0].target).toEqual({ component_id: 'gripper-1', command_target_id: 'jaw' });
     expect(parsed.affectedNodes).toEqual(['close_gripper']);
+    expect(() => parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      program_binding_id: null,
+      non_executable: {
+        affected_execution_groups: [], affected_nodes: [],
+        unresolved_roles: [{ component_role_id: 'gripper', target_role_id: 'jaw' }],
+      },
+    })).toThrow(/unresolved_targets/);
+    expect(() => parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      program_binding_id: null,
+      non_executable: {
+        affected_execution_groups: [], affected_nodes: [],
+        unresolved_targets: [{
+          target: { component_id: 'gripper-1' }, reason: 'target_missing', detail: '',
+        }],
+      },
+    })).toThrow(/command_target_id/);
     // A binding alongside named references is contradictory.
     expect(() => parseAppliedProgramStatus({
       ...executable,
       executable: false,
-      non_executable: { affected_execution_groups: [], affected_nodes: [], unresolved_roles: [] },
+      non_executable: { affected_execution_groups: [], affected_nodes: [], unresolved_targets: [] },
     })).toThrow(/binding exactly when executable/);
   });
 });
@@ -1991,7 +2093,7 @@ describe('Deployment workspace parser', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
     const preview = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       candidate_receipt: {
         schema_version: 'manyforge.manager_deployment_candidate_receipt.v2',
         deployment_artifact_id: 'deployment.fixture',
@@ -2032,19 +2134,15 @@ describe('Deployment workspace parser', () => {
           non_executable: {
             affected_execution_groups: ['grasp'],
             affected_nodes: ['close_gripper'],
-            api_version: 'manyforge.program-binding-outcome.v1',
+            api_version: 'manyforge.program-binding-outcome.v2',
             graph_revision: digestA,
             program_id: 'fixture-program',
             program_revision: digestB,
             retained_bundle_id: digestA,
-            role_assignment_digest: digestB,
-            unresolved_roles: [{
-              command_target_id: null,
-              component_role_id: 'gripper',
-              controllable_component_id: 'gripper',
-              detail: 'component role selects a missing or ambiguous retained component',
+            unresolved_targets: [{
+              target: { component_id: 'gripper', command_target_id: 'jaw' },
+              detail: 'component is absent',
               reason: 'component_missing',
-              target_role_id: null,
             }],
           },
           program_id: 'fixture-program',
@@ -2082,7 +2180,7 @@ describe('Deployment workspace parser', () => {
     const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
     expect(parsed.draft.document?.graph).not.toHaveProperty('graph_revision');
     expect(parsed.draft.graphRevision).toBe(`sha256:${'c'.repeat(64)}`);
-    expect(parsed.binding?.component_role_bindings.length).toBeGreaterThan(0);
+    expect(parsed.binding?.component_bindings[0].component_id).toBe('fixture_robot');
     expect(parsed.scenarioCandidates.map((row) => row.scenarioId)).toEqual(['fixture']);
     expect(parsed.runAdmission.ready).toBe(true);
   });
@@ -2211,9 +2309,9 @@ describe('Deployment workspace parser', () => {
 });
 
 describe('parseCatalogResponse', () => {
-  it('accepts the v2 compiler-product identity and entry shape', () => {
+  it('accepts the v3 compiler-product identity and entry shape', () => {
     const parsed = parseCatalogResponse({
-      apiVersion: 'manyforge.node_catalog.v2',
+      apiVersion: 'manyforge.node_catalog.v3',
       contentVersion: '1.0.0',
       catalogId: 'manyforge_builtin',
       catalogDigest: 'sha256:catalog',
@@ -2246,7 +2344,7 @@ describe('parseCatalogResponse', () => {
       ],
     });
 
-    expect(parsed.apiVersion).toBe('manyforge.node_catalog.v2');
+    expect(parsed.apiVersion).toBe('manyforge.node_catalog.v3');
     expect(parsed.entries[0]?.execution.ownerApi).toBe(
       'orchestration.control_flow',
     );
@@ -2255,7 +2353,7 @@ describe('parseCatalogResponse', () => {
 
   it('does not accept a historical catalog version', () => {
     expect(() => parseCatalogResponse({ apiVersion: 'v1' })).toThrow(
-      'catalog.apiVersion must be the literal "manyforge.node_catalog.v2"',
+      'catalog.apiVersion must be the literal "manyforge.node_catalog.v3"',
     );
   });
 
@@ -2277,7 +2375,7 @@ describe('parseCatalogResponse', () => {
       ['planning.plan_pick_sequence', 'tool_position'],
       ['planning.plan_place_sequence', 'tool_position'],
     ];
-    const wire = { apiVersion: 'manyforge.node_catalog.v2', contentVersion: '1.0.0',
+    const wire = { apiVersion: 'manyforge.node_catalog.v3', contentVersion: '1.0.0',
       catalogId: 'manyforge_builtin', catalogDigest: 'sha256:catalog', environmentDigest: 'sha256:environment',
       entries: fields.map(([id, field]) => ({
         id, name: id, category: 'gripper', description: '', stability: 'stable', kind: 'leaf',
@@ -2374,7 +2472,7 @@ describe('Program workspace parsers', () => {
     delete program.execution_groups;
     delete authoring.execution_groups;
     program.api_version = 'manyforge.program.v1';
-    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v2');
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v3');
   });
 
   it('keeps Draft, Saved, and unavailable Applied identities distinct', () => {
@@ -2402,9 +2500,7 @@ describe('Program workspace parsers', () => {
       },
     }];
     program.viewer = {
-      frame_role_visibility: {},
       frame_gizmo_size_m: 0.1,
-      resource_role_visibility: {},
       scene_resource_axes_visibility: { part: true },
       object_axes_gizmo_size_m: 0.15,
     };
@@ -2720,27 +2816,6 @@ describe('Program workspace parsers', () => {
         code: 'capability_not_offered',
         message: 'No component offers assistant.model.invoke',
         details: { capability: 'assistant.model.invoke' },
-      }]);
-    const modelPayload = {
-      ...capabilityPayload,
-      availability: {
-        ...capabilityPayload.availability,
-        implementations: capabilityPayload.availability.implementations.map((row) => ({
-          ...row,
-          reason_codes: ['model_not_configured'],
-          reasons: [{
-            code: 'model_not_configured',
-            message: 'No model is configured',
-            details: {},
-          }],
-        })),
-      },
-    };
-    expect(parseNodeEnvironmentResponse(modelPayload).implementations[0]?.reasons)
-      .toEqual([{
-        code: 'model_not_configured',
-        message: 'No model is configured',
-        details: {},
       }]);
     const malformedCapability = {
       ...capabilityPayload,
@@ -3480,7 +3555,7 @@ describe('headless projection parsers', () => {
 
   it('accepts only an exact successful scene transaction receipt', () => {
     const parsed = parseSceneTransactionResponse({
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       committed_projection_revision: projectionRevisionFixture(2),
       error: null,
       ok: true,
@@ -3496,7 +3571,7 @@ describe('headless projection parsers', () => {
 
   it('parses exact pending and succeeded Manager Apply receipts', () => {
     const pending = parseManagerApplyResponse({
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 1,
       apply_id: 'apply-1',
       candidate_projection_revision: null,
@@ -3511,7 +3586,7 @@ describe('headless projection parsers', () => {
     expect(pending.candidateProjectionRevision).toBeNull();
 
     const succeeded = parseManagerApplyResponse({
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 1,
       apply_id: 'apply-1',
       candidate_projection_revision: projectionRevisionFixture(2),
@@ -3533,7 +3608,7 @@ describe('headless projection parsers', () => {
 
   it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {
     const obsolete = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       error: null,
       ok: true,
       request_id: 'request-1',
@@ -3542,7 +3617,7 @@ describe('headless projection parsers', () => {
     expect(() => parseManagerApplyResponse(obsolete)).toThrow(/exactly/);
 
     const extra = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 1,
       apply_id: 'apply-1',
       candidate_projection_revision: null,
@@ -3589,7 +3664,7 @@ describe('headless projection parsers', () => {
 
   it('parses durable Manager Apply progress and terminal failure exactly', () => {
     const base = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 4,
       apply_id: 'apply-4',
       candidate_projection_revision: null,
@@ -4174,12 +4249,12 @@ describe('addressed Robot Control parsers', () => {
 
   it('parses the persistent runtime-scale control without making its operation evidence routable', () => {
     const selector = {
-      component_role_id: 'robot',
+      component_id: 'robot',
       program_binding_id: 'binding-program-1',
-      target_role_id: 'arm',
+      command_target_id: 'arm',
     };
     const status = parseRuntimeScaleControlStatus({
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
       command: 'get_runtime_scale_control',
       ok: true,
       runtime_scale_control: {
@@ -4205,9 +4280,9 @@ describe('addressed Robot Control parsers', () => {
     });
     expect(status).toMatchObject({
       selector: {
-        componentRoleId: 'robot',
+        componentId: 'robot',
         programBindingId: 'binding-program-1',
-        targetRoleId: 'arm',
+        commandTargetId: 'arm',
       },
       controlGeneration: 3,
       requestedScale: 0.5,
@@ -4227,7 +4302,7 @@ describe('addressed Robot Control parsers', () => {
         requested_scale: 0.25,
         selector,
       },
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
       command: 'set_runtime_scale_control',
       ok: true,
     });
@@ -4243,25 +4318,25 @@ describe('addressed Robot Control parsers', () => {
     const selector = {
       program_binding_id: 'binding-program-1',
       group_targets: [
-        { component_role_id: 'robot', target_role_id: 'arm' },
-        { component_role_id: 'robot', target_role_id: 'gripper' },
+        { component_id: 'robot', command_target_id: 'arm' },
+        { component_id: 'robot', command_target_id: 'gripper' },
       ],
     };
-    const member = (target_role_id: string) => ({
+    const member = (command_target_id: string) => ({
       active_control_configuration_generation: 1,
-      active_control_configuration_id: `active-${target_role_id}`,
-      control_binding_id: `binding-${target_role_id}`,
+      active_control_configuration_id: `active-${command_target_id}`,
+      control_binding_id: `binding-${command_target_id}`,
       control_binding_revision: 'revision-1',
-      control_domain_id: `domain-${target_role_id}`,
+      control_domain_id: `domain-${command_target_id}`,
       control_domain_revision: 'revision-1',
-      scaling_domain_id: `scale-${target_role_id}`,
-      component_role_id: 'robot', target_role_id,
+      scaling_domain_id: `scale-${command_target_id}`,
+      component_id: 'robot', command_target_id,
     });
-    const memberFor = (component_role_id: string, target_role_id: string) => ({
-      ...member(target_role_id), component_role_id, target_role_id,
+    const memberFor = (component_id: string, command_target_id: string) => ({
+      ...member(command_target_id), component_id, command_target_id,
     });
     const response = {
-      api_version: 'manyforge.execution_command_response.v1', command: 'get_runtime_scale_control', ok: true,
+      api_version: 'manyforge.execution_command_response.v4', command: 'get_runtime_scale_control', ok: true,
       runtime_scale_control: {
         active_control_configuration_generation: null, active_control_configuration_id: null,
         active_operation_id: null, active_operation_revision: null, active_operation_scale_generation: null,
@@ -4277,8 +4352,8 @@ describe('addressed Robot Control parsers', () => {
     expect(parseRuntimeScaleControlStatus(response).selector).toEqual({
       kind: 'group', programBindingId: 'binding-program-1',
       groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     });
     expect(parseRuntimeScaleControlAccepted({
@@ -4288,7 +4363,7 @@ describe('addressed Robot Control parsers', () => {
         replay_status: 'accepted_new', request_id: 'request-group-1', requested_scale: 0.25,
         selector,
       },
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
       command: 'set_runtime_scale_control', ok: true,
     }).selector).toMatchObject({ kind: 'group', programBindingId: 'binding-program-1' });
     expect(() => parseRuntimeScaleControlStatus({
@@ -4312,12 +4387,12 @@ describe('addressed Robot Control parsers', () => {
         selector: {
           program_binding_id: 'binding-program-1',
           group_targets: [
-            { component_role_id: 'a', target_role_id: 'b\u0000c' },
-            { component_role_id: 'a\u0000b', target_role_id: 'c' },
+            { component_id: 'a', command_target_id: 'bc' },
+            { component_id: 'ab', command_target_id: 'c' },
           ],
         },
         group_members: [
-          memberFor('a', 'b\u0000c'), memberFor('a\u0000b', 'c'),
+          memberFor('a', 'bc'), memberFor('ab', 'c'),
         ],
       },
     })).not.toThrow();
@@ -4353,6 +4428,15 @@ describe('addressed Robot Control parsers', () => {
 
   it('accepts source-local limits and exactly one matching observation', () => {
     const exactRevision = `sha256:${'a'.repeat(64)}`;
+    // This parser fixture uses direct identities throughout; it does not assert
+    // that either direct frame ID corresponds to a legacy frame role.
+    const directFrame = (frameId: string) => ({ component_id: 'robot-a', frame_id: frameId });
+    const directTarget = (commandTargetId: string, componentId = 'robot-a') => ({
+      component_id: componentId, command_target_id: commandTargetId,
+    });
+    const directEntry = (commandTargetId: string, frameId: string) => ({
+      target: directTarget(commandTargetId), frame: directFrame(frameId),
+    });
     const contracts = {
       command_schema: null,
       control_path: {
@@ -4394,15 +4478,14 @@ describe('addressed Robot Control parsers', () => {
         direct_control: {
           controllable_component_id: 'robot-a',
           command_target_id: 'arm',
-          component_role_id: 'controlled_component',
-          target_role_id: 'command_target',
-          base_frame_role_id: 'base',
-          tcp_frame_role_id: 'tcp',
-          active_tcp: { entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' }, display: 'robot-a.tcp',
+          base_frame: directFrame('direct.base-frame'),
+          frames: [directFrame('direct.base-frame'), directFrame('direct.tcp-frame')],
+          target: directTarget('arm'),
+          tcp_frame: directFrame('direct.tcp-frame'),
+          active_tcp: { entry: directEntry('arm', 'direct.tcp-frame'), display: 'robot-a.tcp',
             owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
           operation_capability_id: 'execution.trajectory.execute',
           planning_capability_ids: ['planning.motion.joint_goal'],
-          frame_role_ids: ['base', 'tcp'],
           program_id: 'manyforge.direct_control.motion',
           program_revision: 'sha256:program',
           program_binding_id: 'sha256:binding',
@@ -4418,7 +4501,7 @@ describe('addressed Robot Control parsers', () => {
             source_epoch: 'source-1',
             source_joint_names: ['joint1'],
             tcp_poses: [{
-              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
+              entry: directEntry('arm', 'direct.tcp-frame'),
               pose: {
                 position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
                 orientation: { x: 0, y: 0, z: 0, w: 1 },
@@ -4433,24 +4516,23 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_motion_descriptor.v6',
+            schema_version: 'manyforge.manual_control_motion_descriptor.v8',
             ordinary_jerk: null,
             controllable_component_id: 'robot-a',
             end_effector_component_id: null,
             command_target_id: 'arm',
-            component_role_id: 'controlled_component',
-            target_role_id: 'command_target',
+            target: directTarget('arm'),
             frames: [
-              { frame_role_id: 'base', compiled_frame_name: 'base_link', model_instance_id: 'robot-model', model_revision: exactRevision },
-              { frame_role_id: 'tcp', compiled_frame_name: 'tool0', model_instance_id: 'robot-model', model_revision: exactRevision },
+              { reference: directFrame('direct.base-frame'), compiled_frame_name: 'base_link', model_instance_id: 'robot-model', model_revision: exactRevision },
+              { reference: directFrame('direct.tcp-frame'), compiled_frame_name: 'tool0', model_instance_id: 'robot-model', model_revision: exactRevision },
             ],
             tcps: [{
-              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
-              display: 'robot-a.tcp', target_role_id: 'command_target', default: true,
+              entry: directEntry('arm', 'direct.tcp-frame'),
+              display: 'robot-a.tcp', default: true,
               mounted_here: true, mounted_elsewhere: false,
-              frame: { frame_role_id: 'tcp', compiled_frame_name: 'tool0',
-                model_instance_id: 'robot-model', model_revision: exactRevision,
-                contact_body_role_ids: [] },
+              frame: { reference: directFrame('direct.tcp-frame'), compiled_frame_name: 'tool0',
+                model_instance_id: 'robot-model', model_revision: exactRevision },
+              contact_body_role_ids: [],
             }],
             joints: [{
               compiled_joint_name: 'robot-a__joint1',
@@ -4480,8 +4562,8 @@ describe('addressed Robot Control parsers', () => {
           command_schema_id: 'gripper.command_position',
           command_schema_revision: exactRevision,
           command_target_id: 'gripper',
-          component_role_id: 'controlled_component',
           controllable_component_id: 'robot-a',
+          target: directTarget('gripper'),
           observed_state: {
             complete: true,
             position: { kind: 'linear_m', value_m: 0.02 },
@@ -4501,13 +4583,11 @@ describe('addressed Robot Control parsers', () => {
             source_coordinate_name: 'finger_joint',
             source_kind: 'model_role',
           },
-          target_role_id: 'command_target',
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_gripper_descriptor.v3',
+            schema_version: 'manyforge.manual_control_gripper_descriptor.v5',
             controllable_component_id: 'robot-a',
             command_target_id: 'gripper',
-            component_role_id: 'controlled_component',
-            target_role_id: 'command_target',
+            target: directTarget('gripper'),
             description: 'Test gripper',
             command_kind: 'gripper_position',
             actuation_kind: 'position_commanded',
@@ -4557,7 +4637,7 @@ describe('addressed Robot Control parsers', () => {
         observed_targets: [],
       },
     };
-    // execution_identity.v2: runtime identity only (H1a-IF.2).
+    // execution_identity.v2: runtime identity only.
     const identity = {
       active_publication_generation: 1,
       cell_id: 'cell-1',
@@ -4569,7 +4649,7 @@ describe('addressed Robot Control parsers', () => {
     };
     const parsedIdentity = parseExecutionIdentity({
       command: 'identity', identity, ok: true,
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
     });
     expect(parsedIdentity.ownerEpoch).toBe('owner-1');
     expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
@@ -4580,13 +4660,13 @@ describe('addressed Robot Control parsers', () => {
       command: 'identity',
       identity: { ...identity, motion_target_role_id: 'command_target' },
       ok: true,
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
     })).toThrow(/exactly/);
     expect(() => parseExecutionIdentity({
       command: 'identity',
       identity: { ...identity, schema_version: 'manyforge.execution_identity.v1' },
       ok: true,
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
     })).toThrow(/execution_identity.v2/);
 
     const {
@@ -4630,12 +4710,12 @@ describe('addressed Robot Control parsers', () => {
       JSON.stringify([left.command_target_id, left.operation_capability_id])
         < JSON.stringify([right.command_target_id, right.operation_capability_id]) ? -1 : 1));
     const eligible = { command_eligible: true, reason: null };
-    const targetsV3 = (components: unknown[]) => ({
-      api_version: 'manyforge.execution_command_response.v1',
+    const targetsV4 = (components: unknown[]) => ({
+      api_version: 'manyforge.execution_command_response.v4',
       command: 'targets',
       identity,
       ok: true,
-      targets: { components, schema_version: 'manyforge.execution_targets.v3' },
+      targets: { components, schema_version: 'manyforge.execution_targets.v4' },
     });
     const observedRow = (
       target: Record<string, unknown>,
@@ -4666,31 +4746,31 @@ describe('addressed Robot Control parsers', () => {
       requested_scale: 1,
       scaling_domain_id: 'scale-1',
       selector: {
-        component_role_id: 'controlled_component',
+        component_id: 'robot-a',
         program_binding_id: 'sha256:binding',
-        target_role_id: 'command_target',
+        command_target_id: 'arm',
       },
       supported: true,
     };
-    const controlV6 = (
+    const controlV7 = (
       observedTargets: unknown[],
       runtimeScaleControl: unknown = runtimeScale,
     ): { control_state: Record<string, unknown> } & Record<string, unknown> => ({
-      api_version: 'manyforge.execution_command_response.v1',
+      api_version: 'manyforge.execution_command_response.v4',
       command: 'control_state',
       control_state: {
         cell_stop_action: response.status.cell_stop_action,
         manual_operations: [] as unknown[],
         observed_targets: observedTargets,
         runtime_scale_control: runtimeScaleControl,
-        schema_version: 'manyforge.execution_control_state.v6',
+        schema_version: 'manyforge.execution_control_state.v7',
       },
       identity,
       ok: true,
     });
     type WireRow = Record<string, unknown>;
-    // The execution_status.v2 wire composition (identity.v2, targets.v3,
-    // control_state.v6 of one owner snapshot) of a fixture that lists its
+    // The execution_status.v3 wire composition (identity.v2, targets.v4,
+    // control_state.v7 of one owner snapshot) of a fixture that lists its
     // addressed targets in the internal layout.
     const composed = (fixture: { status: WireRow }) => {
       const source = fixture.status;
@@ -4710,7 +4790,7 @@ describe('addressed Robot Control parsers', () => {
       const componentIds = [...new Set([...motions, ...grippers]
         .map((row) => row.controllable_component_id as string))].sort();
       return {
-        api_version: 'manyforge.execution_command_response.v1',
+        api_version: 'manyforge.execution_command_response.v4',
         command: 'status',
         ok: true,
         status: {
@@ -4722,10 +4802,10 @@ describe('addressed Robot Control parsers', () => {
               ...grippers.map((row) => observedRow(row, 'coordinate', row.observed_state)),
             ],
             runtime_scale_control: motions.length === 0 ? null : runtimeScale,
-            schema_version: 'manyforge.execution_control_state.v6',
+            schema_version: 'manyforge.execution_control_state.v7',
           },
           identity,
-          schema_version: 'manyforge.execution_status.v2',
+          schema_version: 'manyforge.execution_status.v3',
           targets: {
             components: componentIds.map((componentId) => ({
               availability: eligible,
@@ -4739,17 +4819,17 @@ describe('addressed Robot Control parsers', () => {
                   .map((row) => wireTarget(withoutObservation(row), 'gripper')),
               ]),
             })),
-            schema_version: 'manyforge.execution_targets.v3',
+            schema_version: 'manyforge.execution_targets.v4',
           },
         },
       };
     };
     const status = parseExecutionOwnerStatus(composed(response));
-    expect(status.directControl!.baseFrameRoleId).toBe('base');
+    expect(status.directControl!.baseFrameRoleId).toBe('direct.base-frame');
     expect(status.directControl!.targetDescriptor.endEffectorComponentId).toBeNull();
     const selectedTool = structuredClone(response);
     Object.assign(selectedTool.status.direct_control, {
-      tcp_frame_role_id: null,
+      tcp_frame: null,
       active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
     });
     Object.assign(selectedTool.status.direct_control.observed_state, { current_tcp_pose: null });
@@ -4775,10 +4855,10 @@ describe('addressed Robot Control parsers', () => {
     const unavailableTcp = structuredClone(response);
     Object.assign(unavailableTcp.status.direct_control, { active_tcp: null });
     expect(parseExecutionOwnerStatus(composed(unavailableTcp)).directControl!.activeTcp).toBeNull();
-    // B1: a robot without an end-effector TCP has null TCP fields and no
+    // A robot without an end-effector TCP has null TCP fields and no
     // default row; joint jog still works.
     const noTcp = structuredClone(response);
-    Object.assign(noTcp.status.direct_control, { tcp_frame_role_id: null,
+    Object.assign(noTcp.status.direct_control, { tcp_frame: null,
       active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 } });
     Object.assign(noTcp.status.direct_control.observed_state, { current_tcp_pose: null });
     noTcp.status.direct_control.target_descriptor.tcps[0].default = false;
@@ -4792,11 +4872,12 @@ describe('addressed Robot Control parsers', () => {
     const trailingDefault = structuredClone(noTcp);
     const trailingTcps = trailingDefault.status.direct_control.target_descriptor.tcps;
     trailingTcps.push({ ...trailingTcps[0],
-      entry: { ...trailingTcps[0].entry, frame_role_id: 'base' }, display: 'robot-a.base',
-      frame: { ...trailingTcps[0].frame, frame_role_id: 'base', compiled_frame_name: 'base_link' },
+      entry: directEntry('arm', 'direct.base-frame'), display: 'robot-a.base',
+      frame: { ...trailingTcps[0].frame,
+        reference: directFrame('direct.base-frame'), compiled_frame_name: 'base_link' },
       default: true });
     trailingDefault.status.direct_control.observed_state.tcp_poses.push({
-      entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'base' },
+      entry: directEntry('arm', 'direct.base-frame'),
       pose: trailingDefault.status.direct_control.observed_state.tcp_poses[0].pose,
     });
     expect(() => parseExecutionOwnerStatus(composed(trailingDefault))).toThrow(/tcps/);
@@ -4805,16 +4886,19 @@ describe('addressed Robot Control parsers', () => {
     // Unmounted rows have no pose entry, while the carried row still does.
     const fullDeploymentList = structuredClone(response);
     const baseRow = fullDeploymentList.status.direct_control.target_descriptor.tcps[0];
-    const { target_role_id: _legacyTargetRole, ...unmountedTemplate } = baseRow;
+    const unmountedTemplate = baseRow;
     for (let index = 0; index < 256; index += 1) {
       const componentId = `tool_component_${index}`;
-      const entry = { component_id: componentId, target_id: 'tool', frame_role_id: 'tcp' };
-      // The wire row omits the optional legacy target_role_id; the fixture's
-      // inferred row type still lists it.
+      const entry = {
+        target: { component_id: componentId, command_target_id: 'tool' },
+        frame: { component_id: componentId, frame_id: 'direct.tool-frame' },
+      };
       fullDeploymentList.status.direct_control.target_descriptor.tcps.push({
         ...unmountedTemplate,
         entry,
         display: `${componentId}.tcp`,
+        frame: { ...unmountedTemplate.frame,
+          reference: { component_id: componentId, frame_id: 'direct.tool-frame' } },
         default: false,
         mounted_here: false,
         mounted_elsewhere: true,
@@ -4843,10 +4927,10 @@ describe('addressed Robot Control parsers', () => {
     expect(() => parseExecutionOwnerStatus(aliased)).toThrow(/exactly/);
     const oldStatus = composed(response) as { status: WireRow };
     oldStatus.status.schema_version = 'manyforge.execution_status.v1';
-    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v2/);
+    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v3/);
     const tornStatus = composed(response) as { status: WireRow };
     tornStatus.status.targets = { components: [], schema_version: 'manyforge.execution_targets.v2' };
-    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v3/);
+    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v4/);
 
     const armRow = wireTarget(motionTarget, 'motion');
     const gripperRow = wireTarget(gripperTarget, 'gripper');
@@ -4854,12 +4938,12 @@ describe('addressed Robot Control parsers', () => {
     const gripperObserved = observedRow(gripperTarget, 'coordinate', observedGripper);
 
     // Arm and gripper owned by one component (the fixture's layout).
-    const targetsResponse = targetsV3([{
+    const targetsResponse = targetsV4([{
       availability: eligible,
       controllable_component_id: motionTarget.controllable_component_id,
       targets: byTargetKey([armRow, gripperRow]),
     }]);
-    const controlResponse = controlV6([armObserved, gripperObserved]);
+    const controlResponse = controlV7([armObserved, gripperObserved]);
     const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
     expect(scoped.directControlTargets).toHaveLength(1);
     expect(scoped.directControlGripperTargets).toHaveLength(1);
@@ -4873,7 +4957,7 @@ describe('addressed Robot Control parsers', () => {
     expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
     expect(scoped.directControlTargets[0].stopResponse).toBeUndefined();
 
-    // SX-2167: the optional qualified Stop chain of a motion target.
+    // The optional qualified Stop chain of a motion target.
     const stopResponse = {
       control_binding_id: 'arm.control',
       control_binding_revision: 'r1',
@@ -5081,12 +5165,12 @@ describe('addressed Robot Control parsers', () => {
 
     // Arm-only: one motion row, no gripper row and no null gripper fields.
     const armOnly = parseExecutionControlStatus(
-      targetsV3([{
+      targetsV4([{
         availability: eligible,
         controllable_component_id: motionTarget.controllable_component_id,
         targets: [armRow],
       }]),
-      controlV6([armObserved]),
+      controlV7([armObserved]),
     );
     expect(armOnly.directControlGripper).toBeNull();
     expect(armOnly.directControlGripperTargets).toEqual([]);
@@ -5097,13 +5181,15 @@ describe('addressed Robot Control parsers', () => {
     const independentGripper = {
       ...gripperTarget,
       controllable_component_id: 'gripper-1',
+      target: directTarget('gripper', 'gripper-1'),
       target_descriptor: {
         ...(gripperTarget.target_descriptor as Record<string, unknown>),
         controllable_component_id: 'gripper-1',
+        target: directTarget('gripper', 'gripper-1'),
       },
     };
     const independent = parseExecutionControlStatus(
-      targetsV3([
+      targetsV4([
         {
           availability: { command_eligible: false, reason: 'component_disabled' },
           controllable_component_id: 'gripper-1',
@@ -5116,7 +5202,7 @@ describe('addressed Robot Control parsers', () => {
         },
       ].sort((left, right) => (
         left.controllable_component_id < right.controllable_component_id ? -1 : 1))),
-      controlV6([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
+      controlV7([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
     );
     expect(independent.directControlGripperTargets[0].controllableComponentId).toBe('gripper-1');
     expect(independent.components.find((row) => row.controllableComponentId === 'gripper-1'))
@@ -5124,12 +5210,12 @@ describe('addressed Robot Control parsers', () => {
 
     // Gripper-only: no motion identity anywhere and no runtime scaling.
     const gripperOnly = parseExecutionControlStatus(
-      targetsV3([{
+      targetsV4([{
         availability: eligible,
         controllable_component_id: 'gripper-1',
         targets: [wireTarget(independentGripper, 'gripper')],
       }]),
-      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+      controlV7([observedRow(independentGripper, 'coordinate', observedGripper)], null),
     );
     expect(gripperOnly.directControl).toBeNull();
     expect(gripperOnly.observedMotion).toBeNull();
@@ -5139,7 +5225,7 @@ describe('addressed Robot Control parsers', () => {
 
     // An unsupported capability is listed, never commandable or observed.
     const withUnsupported = parseExecutionControlStatus(
-      targetsV3([{
+      targetsV4([{
         availability: eligible,
         controllable_component_id: 'gripper-1',
         targets: byTargetKey([
@@ -5152,13 +5238,13 @@ describe('addressed Robot Control parsers', () => {
           },
         ]),
       }]),
-      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+      controlV7([observedRow(independentGripper, 'coordinate', observedGripper)], null),
     );
     expect(withUnsupported.components[0].unsupportedTargets).toEqual([
       { commandTargetId: 'vacuum', operationCapabilityId: 'tool.vacuum.command' },
     ]);
     expect(() => parseExecutionControlStatus(
-      targetsV3([{
+      targetsV4([{
         availability: eligible,
         controllable_component_id: 'gripper-1',
         targets: [{
@@ -5168,29 +5254,29 @@ describe('addressed Robot Control parsers', () => {
           presentation: 'unsupported',
         }],
       }]),
-      controlV6([{
+      controlV7([{
         command_target_id: 'vacuum', controllable_component_id: 'gripper-1',
         observed: null, operation_capability_id: 'tool.vacuum.command',
       }], null),
     )).toThrow(/observations only for commandable addressed targets/);
 
     // An observation without its target, or a missing observation, is refused.
-    expect(() => parseExecutionControlStatus(targetsResponse, controlV6([armObserved])))
+    expect(() => parseExecutionControlStatus(targetsResponse, controlV7([armObserved])))
       .toThrow(/one observation row for the exact addressed target/);
     // Ineligibility needs an existing refusal reason, and vice versa.
     expect(() => parseExecutionControlStatus(
-      targetsV3([{
+      targetsV4([{
         availability: { command_eligible: false, reason: null },
         controllable_component_id: motionTarget.controllable_component_id,
         targets: [armRow],
       }]),
-      controlV6([armObserved]),
+      controlV7([armObserved]),
     )).toThrow(/refusal reason exactly when ineligible/);
     // Old wire versions are not accepted (one clean cutover).
     const legacyTargets = structuredClone(targetsResponse) as { targets: Record<string, unknown> };
     legacyTargets.targets.schema_version = 'manyforge.execution_targets.v2';
     expect(() => parseExecutionControlStatus(legacyTargets, controlResponse))
-      .toThrow(/execution_targets.v3/);
+      .toThrow(/execution_targets.v4/);
     const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
     groupedControlResponse.control_state.runtime_scale_control = {
       ...runtimeScale,
@@ -5204,8 +5290,8 @@ describe('addressed Robot Control parsers', () => {
       selector: {
         program_binding_id: 'sha256:binding',
         group_targets: [
-          { component_role_id: 'controlled_component', target_role_id: 'command_target' },
-          { component_role_id: 'controlled_component', target_role_id: 'gripper_target' },
+          { component_id: 'robot-a', command_target_id: 'arm' },
+          { component_id: 'robot-a', command_target_id: 'gripper' },
         ],
       },
       group_members: [
@@ -5214,16 +5300,16 @@ describe('addressed Robot Control parsers', () => {
           active_control_configuration_id: 'active-motion',
           control_binding_id: 'binding-motion', control_binding_revision: exactRevision,
           control_domain_id: 'domain-motion', control_domain_revision: exactRevision,
-          scaling_domain_id: 'scale-motion', component_role_id: 'controlled_component',
-          target_role_id: 'command_target',
+          scaling_domain_id: 'scale-motion', component_id: 'robot-a',
+          command_target_id: 'arm',
         },
         {
           active_control_configuration_generation: 1,
           active_control_configuration_id: 'active-gripper',
           control_binding_id: 'binding-gripper', control_binding_revision: exactRevision,
           control_domain_id: 'domain-gripper', control_domain_revision: exactRevision,
-          scaling_domain_id: 'scale-gripper', component_role_id: 'controlled_component',
-          target_role_id: 'gripper_target',
+          scaling_domain_id: 'scale-gripper', component_id: 'robot-a',
+          command_target_id: 'gripper',
         },
       ],
     };
@@ -5236,6 +5322,8 @@ describe('addressed Robot Control parsers', () => {
         program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,
         state: 'completed', participants: [{
           progress: 1, terminal_error: null,
+          controllable_component_id: motionTarget.controllable_component_id,
+          command_target_id: motionTarget.command_target_id,
           control_binding_id: 'binding-arm', control_binding_revision: exactRevision,
         }],
         active_stop_id: null, active_stop_generation: null,
@@ -5287,7 +5375,7 @@ describe('addressed Robot Control parsers', () => {
       .toBe('stop.4');
     expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
       .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
-    // CONTRACTS §5: the stop-fault latch is gone; a `fault` field is refused.
+    // The stop-fault latch is gone; a `fault` field is refused.
     const latched = structuredClone(stopped);
     Object.assign(latched.status.cell_stop_action, { fault: null });
     expect(() => parseExecutionOwnerStatus(composed(latched))).toThrow(/cell_stop_action/);
@@ -5358,7 +5446,7 @@ describe('addressed Robot Control parsers', () => {
     expect(localStatus.directControlGripper?.minPosition).toBeNull();
     expect(localStatus.observedGripper).toBeNull();
 
-    // An arm-only native component publishes no gripper at all (H1a-B).
+    // An arm-only native component publishes no gripper at all.
     const armOnlyStatus = structuredClone(response) as { status: Record<string, unknown> };
     armOnlyStatus.status.direct_control_gripper = null;
     const armOnlyComposed = parseExecutionOwnerStatus(composed(armOnlyStatus));
@@ -5380,15 +5468,23 @@ describe('addressed Robot Control parsers', () => {
       direct_control_gripper_targets: [response.status.direct_control_gripper],
     });
     expect(parseExecutionOwnerStatus(composed(paired)).directControlGripperTargets).toHaveLength(1);
-    // H1a-IF.2: a gripper need not share a motion component; targets nest
+    // A gripper need not share a motion component; targets nest
     // in their component on the wire, and keys are unique.
     const independentStatus = structuredClone(paired);
     const independentGripperTarget = {
       ...response.status.direct_control_gripper,
       controllable_component_id: 'gripper-without-motion',
+      target: {
+        component_id: 'gripper-without-motion',
+        command_target_id: 'gripper',
+      },
       target_descriptor: {
         ...response.status.direct_control_gripper.target_descriptor,
         controllable_component_id: 'gripper-without-motion',
+        target: {
+          component_id: 'gripper-without-motion',
+          command_target_id: 'gripper',
+        },
       },
     };
     independentStatus.status.direct_control_gripper_targets = [{
@@ -5438,7 +5534,7 @@ describe('addressed Robot Control parsers', () => {
     });
     expect(parseExecutionOwnerStatus(composed(ordinary)).directControl!.targetDescriptor.ordinaryJerk)
       .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'override' }] });
-    // V2-9: the imported jerk source is gone.
+    // The imported jerk source is gone.
     jerkRow.source = 'imported';
     expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/known jerk-limit source/);
     jerkRow.source = 'preset';
@@ -5456,7 +5552,7 @@ describe('addressed Robot Control parsers', () => {
       ok: true,
       command: 'preview_motion',
       preview_receipt: {
-        schema_version: 'manyforge.direct_control_motion_preview.v1',
+        schema_version: 'manyforge.direct_control_motion_preview.v4',
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
         request_id: 'request-1',
@@ -5468,8 +5564,17 @@ describe('addressed Robot Control parsers', () => {
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
         scene_revision: sceneRevision,
-        component_role_id: 'controlled_component',
-        target_role_id: 'command_target',
+        target: { component_id: 'robot', command_target_id: 'arm' },
+        resolved_tcp: {
+          entry: {
+            target: { component_id: 'robot', command_target_id: 'arm' },
+            frame: { component_id: 'tool', frame_id: 'tool-tip' },
+          },
+          source: 'active_tcp',
+          owner_epoch: 'owner-1',
+          registration_generation: 2,
+          sequence: 0,
+        },
         required_capability_id: 'execution.trajectory.execute',
         source_joint_names: ['joint1'],
         start_positions_rad: [0],
@@ -5482,6 +5587,9 @@ describe('addressed Robot Control parsers', () => {
           revision_id: 2,
           content_hash: 'collision-2',
         },
+        path_preview: { source_joint_names: ['joint1'], pairs: [], samples: [
+          { time_from_start_s: 0, positions_rad: [0], contacts: [], status: 'checked' },
+        ] },
         commit_eligible: true,
       },
     };
@@ -5489,6 +5597,69 @@ describe('addressed Robot Control parsers', () => {
 
     expect(receipt.finalPositionsRad).toEqual([0.4]);
     expect(receipt.commitEligible).toBe(true);
+    expect(receipt.pathPreview.samples).toHaveLength(1);
+    expect(receipt.resolvedTcp).toEqual({
+      entry: {
+        target: { componentId: 'robot', commandTargetId: 'arm' },
+        frame: { componentId: 'tool', frameId: 'tool-tip' },
+      },
+      source: 'active_tcp',
+      ownerEpoch: 'owner-1',
+      registrationGeneration: 2,
+      sequence: 0,
+    });
+
+    const flangeFallback = structuredClone(response);
+    flangeFallback.preview_receipt.resolved_tcp.source = 'joint_flange_fallback';
+    flangeFallback.preview_receipt.resolved_tcp.entry.frame = {
+      component_id: 'robot', frame_id: 'flange',
+    };
+    expect(parseMotionPreviewResponse(flangeFallback).resolvedTcp).toMatchObject({
+      source: 'joint_flange_fallback',
+      entry: { frame: { componentId: 'robot', frameId: 'flange' } },
+    });
+
+    const explicitEntry = structuredClone(response);
+    explicitEntry.preview_receipt.resolved_tcp.source = 'explicit_entry';
+    expect(parseMotionPreviewResponse(explicitEntry).resolvedTcp.source).toBe('explicit_entry');
+
+    const badJoint = structuredClone(response);
+    badJoint.preview_receipt.path_preview.source_joint_names = ['other'];
+    expect(() => parseMotionPreviewResponse(badJoint)).toThrow();
+
+    const oldReceipt = structuredClone(response);
+    oldReceipt.preview_receipt.schema_version = 'manyforge.direct_control_motion_preview.v3';
+    expect(() => parseMotionPreviewResponse(oldReceipt)).toThrow(/v4 motion preview/);
+
+    const missingResolution = structuredClone(response);
+    delete (missingResolution.preview_receipt as Record<string, unknown>).resolved_tcp;
+    expect(() => parseMotionPreviewResponse(missingResolution)).toThrow(/exactly/);
+
+    const undeclaredResolutionField = structuredClone(response);
+    Object.assign(undeclaredResolutionField.preview_receipt.resolved_tcp, { active: true });
+    expect(() => parseMotionPreviewResponse(undeclaredResolutionField)).toThrow(/exactly/);
+
+    const unknownResolutionSource = structuredClone(response);
+    unknownResolutionSource.preview_receipt.resolved_tcp.source = 'deployment_default';
+    expect(() => parseMotionPreviewResponse(unknownResolutionSource)).toThrow(
+      /active_tcp, joint_flange_fallback, or explicit_entry/,
+    );
+
+    const missingOwner = structuredClone(response);
+    missingOwner.preview_receipt.resolved_tcp.owner_epoch = '';
+    expect(() => parseMotionPreviewResponse(missingOwner)).toThrow(/non-empty string/);
+
+    const crossedOwner = structuredClone(response);
+    crossedOwner.preview_receipt.resolved_tcp.owner_epoch = 'owner-2';
+    expect(() => parseMotionPreviewResponse(crossedOwner)).toThrow(/same owner epoch/);
+
+    const zeroRegistration = structuredClone(response);
+    zeroRegistration.preview_receipt.resolved_tcp.registration_generation = 0;
+    expect(() => parseMotionPreviewResponse(zeroRegistration)).toThrow(/positive safe integer/);
+
+    const negativeSequence = structuredClone(response);
+    negativeSequence.preview_receipt.resolved_tcp.sequence = -1;
+    expect(() => parseMotionPreviewResponse(negativeSequence)).toThrow(/non-negative safe integer/);
 
     const undeclared = structuredClone(response);
     Object.assign(undeclared.preview_receipt, { trajectory: [] });
@@ -5503,7 +5674,7 @@ describe('addressed Robot Control parsers', () => {
       command: 'preview_capability_command',
       preview_receipt: {
         schema_version:
-          'manyforge.direct_control_capability_command_preview.v1',
+          'manyforge.direct_control_capability_command_preview.v2',
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
         request_id: 'request-gripper-1',
@@ -5514,8 +5685,7 @@ describe('addressed Robot Control parsers', () => {
         program_run_id: 'direct-control-gripper-owner-1',
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
-        component_role_id: 'controlled_component',
-        target_role_id: 'command_target',
+        target: { component_id: 'robot', command_target_id: 'gripper' },
         required_capability_id: 'tool.gripper.command',
         command_schema_id: 'gripper.command_position',
         command_schema_revision: 'sha256:gripper-schema',
@@ -5755,7 +5925,7 @@ describe('expression check parser', () => {
 
 describe('typed prepared activation origin v6', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
-  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v6',
+  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v7',
     origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest,
       project_path: '/projects/cell_a' },
     prepared_activation_id: digest, captured_input_digest: digest, deployment_artifact_id: 'deployment_a',
@@ -5834,5 +6004,83 @@ describe('closed known Program Run outcomes', () => {
     if (caseName === 'nested-native') details.actual_native_comparison = { changed: true };
     if (caseName === 'foreign-stop-field') details.stopped_by_operator = true;
     expect(() => parseKnownProgramRunOutcome(value, caseName === 'wrong-status' ? 409 : 422)).toThrow();
+  });
+});
+
+describe('motion path preview', () => {
+  const path = () => ({
+    source_joint_names: ['joint-a'],
+    pairs: [{ body_a: 'component/arm/model/model/body/arm/collision/0', body_b: 'scene/part/shape/0' }],
+    samples: [{ time_from_start_s: 0, positions_rad: [0], contacts: [{ pair_index: 0, disposition: 'allowed' }], status: 'checked' }],
+  });
+  it('parses bounded data and rejects tokens, invalid indices and nonfinite values', async () => {
+    const { parseMotionPreviewPath } = await import('./parsers/execution');
+    expect(parseMotionPreviewPath(path()).samples[0].contacts[0].disposition).toBe('allowed');
+    const token = { ...path(), token: 'not-allowed' };
+    expect(() => parseMotionPreviewPath(token)).toThrow();
+    const invalidIndex = path(); invalidIndex.samples[0].contacts[0].pair_index = 1;
+    expect(() => parseMotionPreviewPath(invalidIndex)).toThrow();
+    const invalidNumber = path(); invalidNumber.samples[0].positions_rad[0] = Number.NaN;
+    expect(() => parseMotionPreviewPath(invalidNumber)).toThrow();
+    const excessiveSamples = path(); excessiveSamples.samples = Array.from({ length: 33 }, (_, i) => ({
+      time_from_start_s: i, positions_rad: [0], contacts: [], status: 'checked',
+    }));
+    expect(() => parseMotionPreviewPath(excessiveSamples)).toThrow();
+    const excessivePairs = path(); excessivePairs.pairs = Array.from({ length: 65 }, (_, i) => ({
+      body_a: `component/${i}`, body_b: 'scene/part',
+    }));
+    expect(() => parseMotionPreviewPath(excessivePairs)).toThrow();
+    const rawIdentity = path(); rawIdentity.pairs = [{ body_a: 'custom body', body_b: 'scene/part/shape/0' }];
+    expect(parseMotionPreviewPath(rawIdentity).pairs[0].bodyA).toBe('custom body');
+  });
+  it('keeps the single IK pose shape and accepts only 2 to 32 IK path samples', async () => {
+    const { parseMotionPreviewPath } = await import('./parsers/execution');
+    const diagnosticSample = (time_from_start_s: number) => ({
+      time_from_start_s, positions_rad: [0], contacts: [], status: 'unknown', clearance_violations: [],
+    });
+    const ikPose = {
+      ...path(), schema_version: 'manyforge.motion_preview_diagnostic.v2',
+      kind: 'collision_disabled_ik_pose', reason: 'ik_pose_collision',
+      samples: [diagnosticSample(0)],
+    };
+    expect(parseMotionPreviewPath(ikPose, true).kind).toBe('collision_disabled_ik_pose');
+    expect(() => parseMotionPreviewPath({ ...ikPose, samples: [diagnosticSample(0), diagnosticSample(1)] }, true)).toThrow();
+
+    const ikPath = {
+      ...ikPose, kind: 'collision_disabled_ik_path',
+      samples: [diagnosticSample(0), diagnosticSample(1)],
+    };
+    expect(parseMotionPreviewPath(ikPath, true).kind).toBe('collision_disabled_ik_path');
+    expect(() => parseMotionPreviewPath({ ...ikPath, samples: [diagnosticSample(0)] }, true)).toThrow();
+    const maxIkPath = { ...ikPath, samples: Array.from({ length: 32 }, (_, index) => diagnosticSample(index)) };
+    expect(parseMotionPreviewPath(maxIkPath, true).samples).toHaveLength(32);
+    expect(() => parseMotionPreviewPath({ ...maxIkPath, samples: [...maxIkPath.samples, diagnosticSample(32)] }, true)).toThrow();
+  });
+});
+
+describe('failure diagnostic boundary', () => {
+  it('drops malformed or authority-bearing evidence without altering the refusal', async () => {
+    const { parseMotionPreviewDiagnostic } = await import('./parsers/execution');
+    const diagnostic = { schema_version: 'manyforge.motion_preview_diagnostic.v2', kind: 'validated_path', reason: 'collision', source_joint_names: ['joint'], pairs: [], samples: [
+      { time_from_start_s: 0, positions_rad: [0], contacts: [], status: 'unknown', clearance_violations: [] },
+    ] };
+    const envelope = { detail: { code: 'collision', message: 'refused', details: {}, diagnostic_preview: diagnostic } };
+    expect(parseMotionPreviewDiagnostic(envelope)?.sourceJointNames).toEqual(['joint']);
+    const ikPath = { ...diagnostic, kind: 'collision_disabled_ik_path', samples: [
+      { ...diagnostic.samples[0], time_from_start_s: 0 },
+      { ...diagnostic.samples[0], time_from_start_s: 1 },
+    ] };
+    const ikPathEnvelope = { detail: { ...envelope.detail, diagnostic_preview: ikPath } };
+    expect(parseMotionPreviewDiagnostic(ikPathEnvelope)?.kind).toBe('collision_disabled_ik_path');
+    expect(parseMotionPreviewDiagnostic({ detail: { ...ikPathEnvelope.detail,
+      diagnostic_preview: { ...ikPath, samples: [ikPath.samples[0]] },
+    } })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, diagnostic_preview: { ...diagnostic, schema_version: 'v3' } } })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, diagnostic_preview: { ...diagnostic, kind: 'unknown' } } })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, diagnostic_preview: { ...diagnostic, samples: [{ ...diagnostic.samples[0], clearance_violations: [{ pair_index: 0, distance_m: 0.001, required_clearance_m: 0.002 }] }] } } })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ ...envelope, receipt: {} })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, token: 'x' } })).toBeNull();
+    expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, diagnostic_preview: { ...diagnostic, receipt_digest: 'x' } } })).toBeNull();
+    expect(envelope.detail.message).toBe('refused');
   });
 });

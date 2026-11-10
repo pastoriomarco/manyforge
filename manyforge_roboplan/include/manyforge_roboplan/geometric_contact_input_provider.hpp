@@ -57,7 +57,8 @@ struct GeometricContactInputBaseline final {
 class GeometricContactInputProvider final {
 public:
   static core::Result<std::unique_ptr<GeometricContactInputProvider>> Create(
-      std::shared_ptr<core::IIoSignalIngress> ingress, core::IClock &clock,
+      std::shared_ptr<core::IIoSignalIngress> ingress,
+      std::shared_ptr<core::IClock> clock,
       core::IScheduler &scheduler, GeometricContactInputBinding binding,
       std::optional<std::uint64_t> prepared_driver_generation = std::nullopt);
   ~GeometricContactInputProvider();

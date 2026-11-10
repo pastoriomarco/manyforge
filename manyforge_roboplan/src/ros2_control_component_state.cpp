@@ -29,6 +29,13 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
       observation.streams.begin(), observation.streams.end(),
       [](const auto &stream) { return stream.freshness == core::StreamFreshness::kStale; });
 
+  if (observation.owner_stalled) {
+    state.fault = fault(core::FaultCode::kOwnerStalled, *observation.owner_stalled,
+                        Action::kRecover, now_ns);
+    state.lifecycle = Lifecycle::kFault;
+    state.activity = core::ComponentActivity::kUnknown;
+    return state;
+  }
   if (observation.process_fault) {
     state.fault = fault(core::FaultCode::kProcessExited, *observation.process_fault,
                         Action::kRecover, now_ns);
@@ -60,7 +67,7 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
   } else {
     state.lifecycle = Lifecycle::kNotPrepared;
   }
-  // CONTRACTS §7, §14 (SIM-1): a simulator that is not playing stops the
+  // A simulator that is not playing stops the
   // streams; the component keeps its controller's lifecycle and shows why.
   if (!state.fault && reachable && observation.simulated && stale != observation.streams.end())
     state.reason = core::ComponentStateReason{
@@ -72,8 +79,8 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
   const bool result_overdue = observation.goal_past_end_ns &&
                               observation.goal_result_bound_ns &&
                               *observation.goal_past_end_ns > *observation.goal_result_bound_ns;
-  if (observation.goal_running &&
-      (!reachable || observation.process_fault || result_overdue)) {
+  if (observation.goal_outcome_unknown || (observation.goal_running &&
+      (!reachable || observation.process_fault || result_overdue))) {
     state.activity = core::ComponentActivity::kUnknown;
   } else if (observation.goal_running || observation.decelerating ||
              observation.reset_in_progress) {

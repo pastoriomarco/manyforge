@@ -43,7 +43,7 @@ def _client_binding() -> dict[str, object]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v2",
+        api_version="manyforge.program_binding.v3",
     )
     return binding
 
@@ -76,8 +76,17 @@ def _client_applied() -> dict[str, object]:
         "source_document_digest": "sha256:" + "1" * 64,
         "scenario_id": "cell-pick",
         "project_path": "/projects/cell-pick.scenario",
-        "schema_version": "manyforge.applied_program_selection.v3",
+        "schema_version": "manyforge.applied_program_selection.v4",
         "simulation_scene": None,
+        "program_frame_facts": {
+            "applied_record_digest": "sha256:" + "2" * 64,
+            "program_binding_id": binding["program_binding_id"],
+            "program_revision": "sha256:" + "a" * 64,
+            "retained_bundle_id": binding["retained_bundle_id"],
+            "graph_revision": binding["graph_revision"],
+            "components": [],
+            "frames": [],
+        },
         "source": {
             "record_digest": "sha256:" + "2" * 64,
             "semantic_content_digest": "sha256:" + "3" * 64,
@@ -231,8 +240,8 @@ def test_client_sends_runtime_scale_selector_as_query_parameters() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     selector = {
         "program_binding_id": "sha256:" + "a" * 64,
-        "component_role_id": "robot",
-        "target_role_id": "arm",
+        "component_id": "robot",
+        "command_target_id": "arm",
     }
     try:
         assert client.runtime_scale_control(selector)["ok"] is True
@@ -259,8 +268,8 @@ def test_client_sends_group_runtime_scale_selector_as_one_json_query_parameter()
     selector = {
         "program_binding_id": "binding-1",
         "group_targets": [
-            {"component_role_id": "robot-a", "target_role_id": "arm"},
-            {"component_role_id": "robot-b", "target_role_id": "arm"},
+            {"component_id": "robot-a", "command_target_id": "arm"},
+            {"component_id": "robot-b", "command_target_id": "arm"},
         ],
     }
     try:
@@ -597,7 +606,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_projection.v1"},
+            json={"schema_version": "manyforge.assistant_mode_projection.v2"},
             request=request,
         )
 
@@ -608,7 +617,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         assert client.assistant_mode("composer-assistant")["schema_version"].endswith(
-            "projection.v1"
+            "projection.v2"
         )
         with pytest.raises(ValueError, match="assistant mode ID is invalid"):
             client.assistant_mode("../runtime")
@@ -626,7 +635,7 @@ def test_client_uses_the_owner_issued_assistant_mode_index() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_index.v1", "modes": []},
+            json={"schema_version": "manyforge.assistant_mode_index.v2", "modes": []},
             request=request,
         )
 
@@ -776,7 +785,7 @@ def test_http_refusal_keeps_the_reported_producer() -> None:
     assert forwarded.code == "stale_generation"
     assert forwarded.producer == "kernel"
     raw_manager = HeadlessHttpClient._error_from_response(
-        {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+        {"api_version": "manyforge.manager_command_response.v2", "ok": False,
          "error": {"code": "apply_busy", "message": "busy", "details": {},
                    "producer": "component_manager"}},
         409,

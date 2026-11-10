@@ -213,7 +213,7 @@ inline void map_lite_gripper_only_graph(CanonicalValue::Object &members) {
         else if (key == "lane_row")
           item = CanonicalValue(
               R"({"adapter":"mock","controller":"lite_gripper_controller",)"
-              R"("controllers_file":"mock_controllers.yaml","gripper_result_timeout_s":5,)"
+              R"("controllers_file":"mock_controllers.yaml",)"
               R"("gripper_stop_finish_tolerance":0.0004,)"
               R"("hard_stop_completion_timeout_s":1.5})");
         else if (key == "mount_frame")

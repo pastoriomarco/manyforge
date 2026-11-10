@@ -144,7 +144,7 @@ def _held_owner(behavior: ModuleType):
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = behavior.Program.from_dict(document, admission.environment.catalog)
     rows = [row.to_dict() for row in behavior.program_node_policies(program)]

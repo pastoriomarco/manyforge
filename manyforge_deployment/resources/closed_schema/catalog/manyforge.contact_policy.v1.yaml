@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.contact_policy.v1
-schema_revision: sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490
+schema_revision: sha256:f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33
 schema_purpose: artifact_document
 root_definition_id: contact_policy
 definitions:
@@ -649,33 +649,30 @@ definitions:
             constraints:
               - kind: enum
                 values: [component_model_body]
-        - field_id: component_role_id
+        - field_id: body
           presence: required
           default: {kind: absent}
           value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: model_role_id
-          presence: optional
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: collision_body_role_id
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
+            kind: object
+            fields:
+              - field_id: component_id
+                presence: required
+                default: {kind: absent}
+                value_schema:
+                  kind: scalar
+                  scalar_type: string
+                  constraints:
+                    - kind: string_format
+                      value: portable_id
+              - field_id: collision_body_id
+                presence: required
+                default: {kind: absent}
+                value_schema:
+                  kind: scalar
+                  scalar_type: string
+                  constraints:
+                    - kind: string_format
+                      value: portable_id
   - definition_id: scene_resource_selector
     value_schema:
       kind: object

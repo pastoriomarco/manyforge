@@ -172,7 +172,61 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 build | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 build | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+}
+
+# The native build container's image, image-keyed cache, identity, build and
+# ROS settings, and source/cache mounts; the serve container uses the same.
+prepare_native_build() {
+  image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
+    echo "Development image is unavailable: $image" >&2
+    echo "Build it once with: ./scripts/compose-dev.sh build" >&2
+    return 69
+  }
+  image_key=${image_id#sha256:}
+  cache_root="$cache_base/images/$image_key"
+  # The full ROS image has its own development UID. Keep all bind-mounted
+  # writes with the launching user's ownership, including npm/ROS caches.
+  mkdir -p "$cache_root/build" "$cache_root/home" "$cache_root/node_modules"
+  local directory variable
+  for directory in "$repo_root" "$cache_root" "$cache_root/build" "$cache_root/home"; do
+    if [[ ! -w "$directory" ]]; then
+      echo "ROS workbench requires a writable host-owned directory: $directory" >&2
+      return 69
+    fi
+  done
+  # Fast DDS talks over UDP loopback, not shared memory: a process killed
+  # after a hang leaves its SHM port behind; long-lived participants (the
+  # execution host) keep writing into the unlinked old port, so a
+  # replacement that reuses its participant id never receives their
+  # requests (Fast DDS 3.6.2). An explicit value is kept. rmw_fastrtps
+  # always adds SHM under ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.
+  export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS-UDPv4}"
+  native_container=(--network host --init
+    -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}"
+    --user "$(id -u):$(id -g)" --env HOME=/runner/home --env MANYFORGE_BUILD_DIR=/runner/build)
+  # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
+  # ROS/venv setup; this launcher neither sources a topology nor picks peers.
+  for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
+      ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
+      FASTDDS_BUILTIN_TRANSPORTS \
+      ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
+      MANYFORGE_ROS2_CONTROL_BUILD_TESTING MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS; do
+    if [[ -v "$variable" ]]; then
+      native_container+=(--env "$variable")
+    fi
+  done
+  native_container+=(-v "$repo_root:/workspace" -v "$cache_root:/runner" -w /workspace)
+}
+
+# The native build step (python3 scripts/dev-workbench.py build). It runs
+# before any readiness deadline; serve only checks the built artifacts. Build
+# output streams to stderr, keeping stdout for the command result.
+run_native_build() {
+  docker run --rm "${native_container[@]}" "$image_id" python3 scripts/dev-workbench.py build >&2 || {
+    echo "Native build failed; the development workbench was not started." >&2
+    return 69
+  }
 }
 
 stop_with_evidence() {
@@ -232,19 +286,16 @@ capture_stopped_container() {
     echo "Container $container_ref is not confirmed stopped; capture/removal refused" >&2; return 69;
   }
   mounted_root=$(container_state_mount) || return 69
-  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
-  evidence_root=${MANYFORGE_DEV_EVIDENCE_ROOT:-"$cache_base/evidence"}
-  kind=legacy_state
-  if [[ -n "$mounted_root" ]]; then
-    mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
-    evidence_root="$mounted_root/evidence"
-    prepare_options=(--state-root "$mounted_root")
-    kind=console_tail
-  fi
   if [[ -z "$mounted_root" ]]; then
-    evidence_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$evidence_root") || return 69
-    prepare_options=(--legacy)
+    echo "Cannot capture stopped container without its /tmp/manyforge-state mount." >&2
+    echo "Container is stopped and retained: $container_ref; manually export or explicitly remove after investigation." >&2
+    return 69
   fi
+  mounted_root=$(python3 -c 'import pathlib,sys;print(pathlib.Path(sys.argv[1]).resolve())' "$mounted_root") || return 69
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ.%N)
+  evidence_root="$mounted_root/evidence"
+  prepare_options=(--state-root "$mounted_root")
+  kind=console_tail
   evidence_path="$evidence_root/$timestamp"
   if [[ -e "$evidence_path" ]]; then
     echo "Container is stopped, capture failed, container retained: $container_ref; destination exists: $evidence_path" >&2
@@ -272,27 +323,13 @@ print(json.dumps(row,separators=(",",":")))
     echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
   fi
-  if [[ -z "$mounted_root" ]]; then
-    # Transitional unmounted containers may hold the only durable evidence.
-    if ! docker cp "$container_ref:/tmp/manyforge-state" - |
-        tar --extract --no-same-owner --directory "$partial_path" \
-          --exclude='manyforge-state/installed-targets' \
-          --exclude='manyforge-state/artifacts/raw-artifacts' \
-          --exclude='manyforge-state/artifacts/prepared-activations' \
-          --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
-      echo "Could not copy legacy runtime evidence. Partial evidence: $partial_path" >&2
-      echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
-      return 69
-    fi
-  fi
-  tail_path="$partial_path/docker.log"
-  [[ -z "$mounted_root" ]] || tail_path="$partial_path/.docker.log.next"
+  tail_path="$partial_path/.docker.log.next"
   if ! docker logs "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
     echo "Could not copy container logs. Partial evidence: $partial_path" >&2
     echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
   fi
-  if [[ -n "$mounted_root" ]] && ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
+  if ! mv --no-target-directory "$tail_path" "$partial_path/docker.log"; then
     echo "Could not replace bounded console tail. Partial evidence: $partial_path" >&2
     echo "Container is stopped, capture failed, container retained: $container_ref; prior tail preserved" >&2
     return 69
@@ -349,8 +386,9 @@ fi
 case "$command" in
   build)
     (($# == 0)) || { usage; exit 64; }
-    # The full ROS Lyrical image: ManyForge toolchain, pinned controller
-    # overlay and xArm driver. Jetson hosts use NVIDIA's JetPack suite.
+    # The full ROS Lyrical image: ManyForge toolchain, ROS base (built from
+    # source by default; MANYFORGE_ROS_BASE=apt uses NVIDIA's mirror)
+    # and xArm driver. With the apt base, Jetson hosts use NVIDIA's JetPack suite.
     suite=noble
     [[ ! -e /etc/nv_tegra_release ]] || suite=noble-jetpack
     "$repo_root/scripts/setup-docker.sh" --prepare-only
@@ -358,6 +396,12 @@ case "$command" in
       NVIDIA_ISAAC_ROS_RELEASE_SUITE="${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-$suite}" \
       docker compose -f "$repo_root/docker-compose.yaml" --profile ros-full build ros-jazzy-full
     echo "Built $image. Start the workbench with: $0 start"
+    ;;
+  build-native)
+    (($# == 0)) || { usage; exit 64; }
+    prepare_native_build || exit $?
+    run_native_build || exit $?
+    echo "Native build complete."
     ;;
   start)
     while (($#)); do
@@ -416,14 +460,7 @@ case "$command" in
       fi
       stop_with_evidence
     fi
-    image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
-      echo "Development image is unavailable: $image" >&2
-      echo "Build it once with: ./scripts/compose-dev.sh build" >&2
-      exit 69
-    }
-    image_key=${image_id#sha256:}
-    cache_root="$cache_base/images/$image_key"
-    mkdir -p "$cache_root/build" "$cache_root/node_modules"
+    prepare_native_build || exit $?
     # Installation Composer settings and the Program runner's persistent
     # blackboard values survive stop/start (values are checked against the
     # applied Program; see DEVELOPMENT_WORKBENCH.md).
@@ -513,46 +550,20 @@ case "$command" in
       project_mappings=$(python3 -c 'import json,sys; print(json.dumps([{"hostPath": a, "containerPath": b} for a,b in zip(sys.argv[1::2],sys.argv[2::2])], separators=(",", ":")))' "${project_mapping_arguments[@]}")
       project_environment+=(-e "MANYFORGE_PROJECT_ROOT_MAPPINGS=$project_mappings")
     fi
-    ros_environment=()
-    ros_identity=()
-    if [[ "$ros2_control" == true ]]; then
-      # The full ROS image has its own development UID. Keep all bind-mounted
-      # writes with the launching user's ownership, including npm/ROS caches.
-      mkdir -p "$cache_root/home"
-      for directory in "$repo_root" "$runtime_root" "$cache_root" "$cache_root/build" \
-          "$cache_root/home" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
-        if [[ ! -w "$directory" ]]; then
-          echo "ROS workbench requires a writable host-owned directory: $directory" >&2
-          exit 69
-        fi
-      done
-      ros_identity=(--user "$(id -u):$(id -g)" --env HOME=/runner/home \
-        --env MANYFORGE_BUILD_DIR=/runner/build)
-      # Fast DDS talks over UDP loopback, not shared memory: a process killed
-      # after a hang leaves its SHM port behind; long-lived participants (the
-      # execution host) keep writing into the unlinked old port, so a
-      # replacement that reuses its participant id never receives their
-      # requests (Fast DDS 3.6.2). An explicit value is kept. rmw_fastrtps
-      # always adds SHM under ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.
-      export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS-UDPv4}"
-      # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
-      # ROS/venv setup; this launcher neither sources a topology nor picks peers.
-      for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
-          ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
-          FASTDDS_BUILTIN_TRANSPORTS \
-          ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
-          MANYFORGE_ROS2_CONTROL_BUILD_TESTING MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS; do
-        if [[ -v "$variable" ]]; then
-          ros_environment+=(--env "$variable")
-        fi
-      done
-    fi
+    for directory in "$runtime_root" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
+      if [[ ! -w "$directory" ]]; then
+        echo "ROS workbench requires a writable host-owned directory: $directory" >&2
+        exit 69
+      fi
+    done
     if [[ -n "$project" ]]; then
       serve_args+=(--project "$project")
     fi
     if [[ -n "$bootstrap_project" ]]; then
       serve_args+=(--bootstrap-project "$bootstrap_project")
     fi
+    # The readiness deadline below starts only after this build step.
+    run_native_build || exit $?
     rotate_quiescent_root "$runtime_root"
     # Same inode lock as the child launcher: hold it across the final old-
     # process proof, durable session switch and creation of the new container.
@@ -585,24 +596,18 @@ case "$command" in
       --label "manyforge.dev.ros2-control=$ros2_control" \
       --label "manyforge.workbench-session=$session_id" \
       "${operator_labels[@]}" \
-      --network host \
-      --init \
+      "${native_container[@]}" \
+      "${startup_mounts[@]}" \
+      --ulimit memlock=-1:-1 \
       --log-opt max-size=50m \
       --log-opt max-file=3 \
-      -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \
       -e MANYFORGE_STATE_DIR=/var/lib/manyforge \
       "${session_environment[@]}" \
-      "${ros_identity[@]}" \
-      "${ros_environment[@]}" \
-      "${startup_mounts[@]}" \
       "${project_environment[@]}" \
-      -v "$repo_root:/workspace" \
       -v "$runtime_root:/tmp/manyforge-state" \
-      -v "$cache_root:/runner" \
       -v "$composer_state:/var/lib/manyforge/composer" \
       -v "$runner_state:/var/lib/manyforge/program-runner" \
       -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
-      -w /workspace \
       "$image_id" \
       python3 scripts/dev-workbench.py "${serve_args[@]}")
     started_container=true

@@ -99,36 +99,35 @@ struct RuntimeCapabilityProviderPathDTO final {
 /// Exact selected endpoint. Body IDs follow the existing semantic-to-physical
 /// alias projection; this record does not grant motion ownership to the tool.
 struct RuntimeMotionEndpointBindingDTO final {
-  TargetRoleId target_role_id;
-  CommandTargetId command_target_id;
-  ProgramFrameRoleBindingDTO frame;
+  ProgramTargetReferenceDTO target;
+  ProgramFrameBindingDTO frame;
   std::vector<ProgramContactGraspBodyBindingDTO> contact_body_bindings;
+  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
   friend bool operator==(const RuntimeMotionEndpointBindingDTO&,
                          const RuntimeMotionEndpointBindingDTO&) = default;
 };
 
-/// Active TCP (M7): the TCP entry of a resolved endpoint. `owner` is the
-/// component owning the endpoint's frame (B7: the registration's
+/// Active TCP: the TCP entry of a resolved endpoint. `owner` is the
+/// component owning the endpoint's frame (the registration's
 /// `motion_endpoint_owner`, else the motion component itself).
-[[nodiscard]] inline TcpEntryDTO tcp_entry_of(const RuntimeMotionEndpointBindingDTO& endpoint,
-                                              const ControllableComponentId& owner) {
-  return TcpEntryDTO{owner, endpoint.command_target_id, endpoint.frame.frame_role_id};
+[[nodiscard]] inline TcpEntryReferenceDTO tcp_entry_of(const RuntimeMotionEndpointBindingDTO& endpoint,
+                                                       const ControllableComponentId& owner) {
+  return TcpEntryReferenceDTO{endpoint.target, {owner, endpoint.frame.reference.frame_id}};
 }
 
-/// Active TCP (M7): whether a move's or a Set TCP's selector admits the
+/// Active TCP: whether a move's or a Set TCP's selector admits the
 /// resolved endpoint. Current and form 2 are resolved by the owner's resolver
 /// (from the robot's Active TCP and the Program binding). An entry must name
 /// the endpoint's target and frame and, where the owner is known (the Kernel,
 /// from its registration), its owner; the sealed binding alone does not carry
-/// the owner (B7), so the registry passes none.
+/// the owner, so the registry passes none.
 [[nodiscard]] inline bool tcp_selector_admits(const TcpSelectorDTO& selector,
                                               const RuntimeMotionEndpointBindingDTO& endpoint,
                                               const std::optional<ControllableComponentId>& owner) {
-  const auto* entry = std::get_if<TcpEntryDTO>(&selector);
+  const auto* entry = std::get_if<TcpEntryReferenceDTO>(&selector);
   return entry == nullptr ||
-         (entry->target_id == endpoint.command_target_id &&
-          entry->frame_role_id == endpoint.frame.frame_role_id &&
-          (!owner || entry->component_id == *owner));
+         (entry->target == endpoint.target && entry->frame == endpoint.frame.reference &&
+          (!owner || entry->frame.component_id == *owner));
 }
 
 /// Complete owner-to-owner value before sealing. Public operation callers
@@ -139,8 +138,6 @@ struct RuntimeParticipantBindingDTO final {
   ProgramBindingId program_binding_id;
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
-  ComponentRoleId component_role_id;
-  TargetRoleId target_role_id;
   ControllableComponentId controllable_component_id;
   ComponentTypeId component_type_id;
   ComponentTypeRevision component_type_revision;
@@ -150,9 +147,9 @@ struct RuntimeParticipantBindingDTO final {
   std::optional<ProgramCommandSchemaRefDTO> command_schema;
   std::vector<ProgramModelRoleBindingDTO> model_bindings;
   std::vector<RuntimeModelGroupBindingDTO> model_groups;
-  std::vector<ProgramFrameRoleBindingDTO> frame_bindings;
+  std::vector<ProgramFrameBindingDTO> frame_bindings;
   std::vector<RuntimeResourceBindingDTO> resources;
-  std::vector<ProgramCollisionBodyRoleBindingDTO> collision_body_bindings;
+  std::vector<ProgramCollisionBodyBindingDTO> collision_body_bindings;
   std::optional<RuntimeControlPathDTO> control_path;
   std::optional<RuntimeCapabilityProviderPathDTO> capability_provider_path;
   /// Additional exact capability providers required to realize the selected
@@ -165,6 +162,11 @@ struct RuntimeParticipantBindingDTO final {
   /// Runtime object selection remains unresolved until operation admission.
   std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
   std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
+  /// Program-wide references used for motion reference projection only.
+  /// They do not grant participant, target or endpoint authority.
+  std::vector<ProgramFrameBindingDTO> program_frame_bindings{};
+  std::vector<ProgramCollisionBodyBindingDTO> program_collision_body_bindings{};
+  std::vector<ProgramTargetFrameAssociationDTO> frame_associations{};
 
   friend bool operator==(const RuntimeParticipantBindingDTO&,
                          const RuntimeParticipantBindingDTO&) = default;

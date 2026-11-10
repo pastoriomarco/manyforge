@@ -22,7 +22,7 @@ inline constexpr std::string_view kComposedModelSymbolRoleMapMediaType =
     "application/vnd.manyforge.composed-model-symbol-role-map.v2+json";
 
 // This first qualified map product deliberately uses the common strict
-// artifact-codec ceiling. I2 accepts a larger semantic universe, while I3
+// artifact-codec ceiling. The compiler accepts a larger semantic universe, while retention
 // rejects a map that cannot be independently parsed and reverified by every
 // current retained-artifact reader.
 inline constexpr std::size_t kMaxComposedModelSymbolRoleMapBytes =
@@ -30,7 +30,7 @@ inline constexpr std::size_t kMaxComposedModelSymbolRoleMapBytes =
 
 /// Emits the closed compiler-owned model namespace and generic semantic maps.
 ///
-/// The input is the non-caller-constructible final I2 value. No source XML is
+/// The input is the non-caller-constructible final compiler value. No source XML is
 /// reparsed and no consumer-specific name or type is introduced.
 [[nodiscard]] std::string emit_composed_model_symbol_role_map(
     const CompilerQualifiedCellIr& compiler_ir,
@@ -47,7 +47,7 @@ inline constexpr std::size_t kMaxComposedModelSymbolRoleMapBytes =
     std::string_view canonical_bytes, bool allow_empty_model_map = false);
 
 /// Requires exact agreement with the map mechanically derived from the same
-/// final I2 value. This is used before retention and after raw-CAS read-back.
+/// final compiler value. This is used before retention and after raw-CAS read-back.
 void require_composed_model_symbol_role_map_matches(
     std::string_view canonical_bytes,
     const CompilerQualifiedCellIr& compiler_ir,

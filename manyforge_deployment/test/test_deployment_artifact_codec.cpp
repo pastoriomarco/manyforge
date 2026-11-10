@@ -964,7 +964,7 @@ TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
         {"stream_id", CanonicalValue(std::string(stream))},
     });
   };
-  // CONTRACTS §7: a stream row has no severity or recovery any more.
+  // A stream row has no severity or recovery any more.
   const auto with_field = [](CanonicalValue value, std::string name,
                              std::string text) {
     auto fields = value.as_object();
@@ -1068,7 +1068,7 @@ TEST(DeploymentArtifactCodec, ControllerProfileStopLeadInAnchorDecodesBothValues
 }
 
 TEST(DeploymentArtifactCodec, ControllerProfileTcpOffsetSyncIsOnUnlessFalse) {
-  // M6b: absent is on (TCP updates are sent to the robot's controller).
+  // Absent is on (TCP updates are sent to the robot's controller).
   EXPECT_TRUE(detail::decode_ros2_control_tcp_offset_sync(nullptr));
   const core::JsonValueDTO on{true};
   const core::JsonValueDTO off{false};

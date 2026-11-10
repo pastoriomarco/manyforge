@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/program_contact_envelope.hpp>
+#include <manyforge_core/types/program_reference.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +16,7 @@ namespace manyforge::core {
 
 struct ProgramBindingDTO;
 
-inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v2";
+inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v3";
 inline constexpr std::string_view kComposableCellProgramProfile = "composable-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
 inline constexpr std::size_t kMaxProgramRoleRequirements = 4096U;
@@ -42,9 +43,9 @@ struct ProgramNodeInstanceIdTag final {};
 using ProgramNodeInstanceId = StrongString<ProgramNodeInstanceIdTag>;
 
 /// A target/capability association derived from the qualified node catalog,
-/// its parameter defaults/conditions and this exact Program's literal roles.
+/// its parameter defaults/conditions and this exact Program's direct references.
 struct ProgramNodeTargetEffectDTO final {
-  TargetRoleId target_role_id;
+  ProgramTargetReferenceDTO target;
   CapabilityId capability_id;
   /// Qualified catalog fact: this requirement may issue a physical command
   /// against the bound target, rather than only read/plan/validate it.
@@ -86,6 +87,8 @@ struct ProgramExecutionNodeDTO final {
   /// Literal priority sealed from the qualified plain-motion node catalog.
   /// Kernel uses this only for competing motions in the same Program Run.
   std::uint8_t preemption_priority{0U};
+  /// Direct signal references derived from this exact captured node.
+  std::vector<ProgramSignalReferenceDTO> signal_references{};
 
   friend bool operator==(const ProgramExecutionNodeDTO&, const ProgramExecutionNodeDTO&) = default;
 };
@@ -115,8 +118,8 @@ struct ProgramExecutionSelectionDTO final {
   std::string group_id;
   // Sorted indices into ProgramExecutionTableDTO::nodes; names are stored once.
   std::vector<std::uint32_t> node_indices;
-  /// One authored execution policy. UI6-I qualifies kIndependent; later
-  /// synchronized policies remain explicit and fail before effects until F2.
+  /// One authored execution policy. Only kIndependent is qualified;
+  /// synchronized policies remain explicit and fail before effects.
   ProgramExecutionPolicy execution_policy{ProgramExecutionPolicy::kIndependent};
 
   friend bool operator==(const ProgramExecutionSelectionDTO&,
@@ -254,16 +257,6 @@ enum class ProgramCapabilityDisposition : std::uint8_t {
   return {};
 }
 
-struct ProgramComponentRoleRequirementDTO final {
-  ComponentRoleId component_role_id;
-  std::vector<std::string> required_component_type_tags;
-  std::vector<ModelRoleId> required_model_roles;
-  std::vector<AttachmentInterfaceId> required_attachment_interfaces;
-
-  friend bool operator==(const ProgramComponentRoleRequirementDTO&,
-                         const ProgramComponentRoleRequirementDTO&) = default;
-};
-
 struct ProgramCapabilityRequirementDTO final {
   CapabilityId capability_id;
   CapabilityDefinitionRevision capability_definition_revision;
@@ -273,26 +266,32 @@ struct ProgramCapabilityRequirementDTO final {
                          const ProgramCapabilityRequirementDTO&) = default;
 };
 
-struct ProgramTargetRoleRequirementDTO final {
-  TargetRoleId target_role_id;
-  ComponentRoleId component_role_id;
-  std::vector<ProgramCapabilityRequirementDTO> required_capabilities;
-  std::vector<FrameRoleId> required_frame_roles;
-  std::vector<ResourceRoleId> required_resource_roles;
-  std::vector<CollisionBodyRoleId> required_collision_body_roles;
-  std::vector<ModelRoleId> required_model_roles;
+/// Internal source provenance for the existing system-input read exemption.
+struct ProgramInputSignalUseDTO final {
+  CapabilityId capability_id;
+  std::vector<ProgramSignalReferenceDTO> signals;
+  bool all_uses_are_signal_reads{};
 
-  friend bool operator==(const ProgramTargetRoleRequirementDTO&,
-                         const ProgramTargetRoleRequirementDTO&) = default;
+  friend bool operator==(const ProgramInputSignalUseDTO&,
+                         const ProgramInputSignalUseDTO&) = default;
 };
 
-/// Portable component-model side of one Program-owned contact-grasp pair.
-/// The selected object remains a typed runtime-object binding until operation
-/// admission; generated collision-body names are never authored here.
+struct ProgramTargetRequirementDTO final {
+  ProgramTargetReferenceDTO target;
+  std::vector<ProgramCapabilityRequirementDTO> required_capabilities;
+  std::vector<ProgramFrameReferenceDTO> frame_references;
+  std::vector<ProgramCollisionBodyReferenceDTO> collision_body_references;
+  std::vector<ProgramSignalReferenceDTO> signal_references;
+  std::vector<ProgramInputSignalUseDTO> input_signal_uses{};
+  bool default_tcp_required{};
+
+  friend bool operator==(const ProgramTargetRequirementDTO&,
+                         const ProgramTargetRequirementDTO&) = default;
+};
+
+/// A component-local body selected directly by the Program.
 struct ProgramContactGraspBodySelectorDTO final {
-  ComponentRoleId component_role_id;
-  std::optional<ModelRoleId> model_role_id;
-  CollisionBodyRoleId collision_body_role_id;
+  ProgramCollisionBodyReferenceDTO body;
 
   friend bool operator==(const ProgramContactGraspBodySelectorDTO&,
                          const ProgramContactGraspBodySelectorDTO&) = default;
@@ -326,37 +325,15 @@ struct ProgramBindingContractDTO final {
   ProgramId program_id;
   ProgramRevision program_revision;
   RetainedNodeEnvironmentDTO node_environment;
-  std::vector<ProgramComponentRoleRequirementDTO> component_roles;
-  std::vector<ProgramTargetRoleRequirementDTO> target_roles;
+  std::vector<ProgramTargetRequirementDTO> target_requirements;
+  std::vector<ProgramFrameReferenceDTO> frame_requirements;
+  std::vector<ProgramSignalReferenceDTO> signal_requirements;
+  std::vector<ProgramCollisionBodyReferenceDTO> collision_body_requirements;
   std::vector<ProgramContactGraspTemplateDTO> contact_grasp_templates{};
   std::vector<ProgramNodePolicyDTO> node_policies{};
 
   friend bool operator==(const ProgramBindingContractDTO&,
                          const ProgramBindingContractDTO&) = default;
-};
-
-struct ProgramComponentRoleAssignmentDTO final {
-  ComponentRoleId component_role_id;
-  ControllableComponentId controllable_component_id;
-
-  friend bool operator==(const ProgramComponentRoleAssignmentDTO&,
-                         const ProgramComponentRoleAssignmentDTO&) = default;
-};
-
-struct ProgramTargetRoleAssignmentDTO final {
-  TargetRoleId target_role_id;
-  CommandTargetId command_target_id;
-
-  friend bool operator==(const ProgramTargetRoleAssignmentDTO&,
-                         const ProgramTargetRoleAssignmentDTO&) = default;
-};
-
-struct ProgramRoleAssignmentDTO final {
-  std::vector<ProgramComponentRoleAssignmentDTO> component_roles;
-  std::vector<ProgramTargetRoleAssignmentDTO> target_roles;
-
-  friend bool operator==(const ProgramRoleAssignmentDTO&,
-                         const ProgramRoleAssignmentDTO&) = default;
 };
 
 }  // namespace manyforge::core

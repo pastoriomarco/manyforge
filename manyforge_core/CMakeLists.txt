@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_core VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_core VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -249,11 +249,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_execution_port
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_composable_cell_contracts
-    test/test_composable_cell_contracts.cpp)
-  target_link_libraries(test_composable_cell_contracts PRIVATE
+  add_executable(test_core_type_contracts
+    test/test_core_type_contracts.cpp)
+  target_link_libraries(test_core_type_contracts PRIVATE
     manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_composable_cell_contracts
+  gtest_discover_tests(test_core_type_contracts
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_active_control_configuration
@@ -547,6 +547,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_component_coordinator PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_component_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_stop test/test_component_stop.cpp)
+  target_link_libraries(test_component_stop PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_stop
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_participant_binding
@@ -872,7 +877,7 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   # Test-support exporter of Core's exact Stop replacement trajectories for
-  # Track 2's pinned-JTC characterization. Built with the tests, never
+  # the pinned-JTC characterization. Built with the tests, never
   # installed. The smoke test runs it on a fixed input.
   add_executable(stop_replacement_export
     test_support/src/stop_replacement_export.cpp)
@@ -885,7 +890,7 @@ if(BUILD_TESTING)
   set_tests_properties(stop_replacement_export_smoke PROPERTIES
     TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  # Phase 4.5G qualification probe. This executable is intentionally not a
+  # Soft on-path planner qualification probe. This executable is intentionally not a
   # ctest case: unit tests prove correctness invariants, while
   # scripts/run-soft-on-path-planner-qualification.sh runs this probe in a
   # release build and emits archival JSON latency evidence.
@@ -897,9 +902,39 @@ if(BUILD_TESTING)
     test/perf/perf_kernel_event_pipeline.cpp)
   target_link_libraries(perf_kernel_event_pipeline PRIVATE manyforge_core)
 
+  # Compile only this isolated test executable with the approved timing latches;
+  # the normal manyforge_core product target remains uninstrumented.
+  add_executable(test_execution_kernel_timing
+    test/test_execution_kernel_timing.cpp src/execution_kernel.cpp)
+  target_compile_definitions(test_execution_kernel_timing PRIVATE
+    MANYFORGE_CORE_LOOKAHEAD_TIMING
+    MANYFORGE_CORE_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
+  target_link_libraries(test_execution_kernel_timing PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_kernel_timing PROPERTIES TIMEOUT 30)
+
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)
   target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_execution_kernel
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # Golden files by absolute source path. Deriving them from __FILE__ breaks
+  # under ccache base_dir, which makes __FILE__ relative to the build directory,
+  # so the test then works only from that directory.
+  foreach(_golden_test IN ITEMS
+      test_execution_kernel
+      test_participant_stop_stage
+      test_prepared_operation_participant_codec
+      test_resolved_stop_base_plan_codec
+      test_resource_addressed_execution_kernel
+      test_runtime_participant_stop_readiness
+      test_sqlite_operation_journal
+      test_stop_journal_projection_codec
+      test_stop_record_size
+      test_stop_terminal_reducer)
+    if(TARGET ${_golden_test})
+      target_compile_definitions(${_golden_test} PRIVATE
+        MANYFORGE_CORE_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
+    endif()
+  endforeach()
 
 endif()

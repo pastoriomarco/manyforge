@@ -33,7 +33,7 @@ def test_retained_environment_manifest_is_fresh_and_build_owned() -> None:
     assert retained.environment_digest.startswith("sha256:")
     assert retained.catalog_digest == environment.catalog.catalog_digest
     assert retained.executable_registry == environment.registry.rows
-    assert len(retained.executable_registry) == 52  # + rules.set_active, io.clear_outside_change
+    assert len(retained.executable_registry) == 51  # + rules.set_active, io.clear_outside_change
     assert len(retained.executable_packages) == 2
     assert retained.source_coverage
     assert any(
@@ -189,7 +189,7 @@ def test_environment_digest_changes_when_covered_source_changes(
 def test_source_package_version_comes_from_project_metadata() -> None:
     assert (
         generate_builtin_node_environment_manifest().executable_packages[0].package_version
-        == "0.2.0"
+        == "0.2.1"
     )
 
 

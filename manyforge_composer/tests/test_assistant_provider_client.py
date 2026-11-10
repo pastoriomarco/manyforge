@@ -44,20 +44,24 @@ def _status() -> dict:
     }
 
 
+_URL = "http://127.0.0.1:43017"
+
+
 def _client(handler) -> tuple[AssistantProviderHttpClient, httpx.Client]:
     transport = httpx.MockTransport(handler)
     raw = httpx.Client(transport=transport)
-    return AssistantProviderHttpClient("http://bridge.test", client=raw), raw
+    return AssistantProviderHttpClient(client=raw), raw
 
 
 def test_provider_client_accepts_only_a_closed_attributed_terminal_status() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/manyforge/assistant/request.1"
+        # The endpoint the caller resolved for this call.
+        assert str(request.url) == f"{_URL}/v1/manyforge/assistant/request.1"
         return httpx.Response(200, json=_status(), request=request)
 
     client, raw = _client(handler)
     try:
-        assert client.status("request.1")["response"]["message"] == "Draft checked."
+        assert client.status(_URL, "request.1")["response"]["message"] == "Draft checked."
     finally:
         raw.close()
 
@@ -85,7 +89,7 @@ def test_provider_client_rejects_changed_identity_or_runtime_mutation(
     client, raw = _client(handler)
     try:
         with pytest.raises(AssistantProviderClientError) as raised:
-            client.status("request.1")
+            client.status(_URL, "request.1")
         assert raised.value.code == "assistant_provider_response_invalid"
     finally:
         raw.close()
@@ -102,7 +106,7 @@ def test_provider_client_rejects_invalid_request_id_before_transport() -> None:
     client, raw = _client(handler)
     try:
         with pytest.raises(AssistantProviderClientError) as invalid:
-            client.status(" request.1 ")
+            client.status(_URL, " request.1 ")
         assert invalid.value.code == "assistant_request_invalid"
         assert invalid.value.status_code == 400
         assert calls == 0
@@ -136,10 +140,10 @@ def test_provider_client_rejects_nonfinite_json_and_preserves_typed_http_error()
     client, raw = _client(handler)
     try:
         with pytest.raises(AssistantProviderClientError) as invalid:
-            client.status("request.1")
+            client.status(_URL, "request.1")
         assert invalid.value.code == "assistant_provider_response_invalid"
         with pytest.raises(AssistantProviderClientError) as conflict:
-            client.status("request.1")
+            client.status(_URL, "request.1")
         assert conflict.value.code == "assistant_request_id_conflict"
         assert conflict.value.status_code == 409
     finally:

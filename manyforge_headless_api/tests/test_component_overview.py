@@ -124,7 +124,7 @@ def _facts() -> dict[str, Any]:
     targets = {
         "ok": True,
         "targets": {
-            "schema_version": "manyforge.execution_targets.v3",
+            "schema_version": "manyforge.execution_targets.v4",
             "components": [{
                 "controllable_component_id": "robot-a",
                 "availability": {"command_eligible": True, "reason": None},
@@ -172,6 +172,19 @@ def _facts() -> dict[str, Any]:
 
 def _by_id(overview: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {component["id"]: component for component in overview["components"]}
+
+
+def test_stopped_prepared_owner_is_not_projected_as_healthy() -> None:
+    facts = _facts()
+    stop = {"code": "estop", "message": "E-stop (C2)", "since_ns": 1, "vendor_code": "C2"}
+    facts["component_model"] = _model(
+        _component("machine", "prepared", stop=stop),
+        _component("robot", "prepared", owner_id="machine"),
+    )
+    tile = _by_id(build_component_overview(**facts))["component:machine"]
+    assert tile["status"] == "waiting"
+    assert tile["reason_code"] == "estop"
+    assert tile["detail"] == "E-stop (C2)"
 
 
 def test_ready_overview_keeps_normal_terminal_cycle_out_of_health() -> None:
@@ -429,12 +442,12 @@ def _warm_empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
     facts["execution_identity_response"] = {"ok": True, "identity": identity}
     facts["execution_targets_response"] = {
         "ok": True, "identity": copy.deepcopy(identity),
-        "targets": {"schema_version": "manyforge.execution_targets.v3", "components": []},
+        "targets": {"schema_version": "manyforge.execution_targets.v4", "components": []},
     }
     facts["execution_control_response"] = {
         "ok": True, "identity": copy.deepcopy(identity),
         "control_state": {
-            "schema_version": "manyforge.execution_control_state.v6",
+            "schema_version": "manyforge.execution_control_state.v7",
             "observed_targets": [], "manual_operations": [], "runtime_scale_control": None,
             "cell_stop_action": {"available": True, "expected_stop_generation": 0,
                                  "latest_terminal": None,

@@ -21,7 +21,6 @@ from manyforge_headless_api.models import (
     MAX_OPERATION_PARTICIPANTS,
     StrictRequest,
     OperationControlRequest,
-    OperationRuntimeScaleRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
     OperationRecoveryActionRequest,
@@ -169,6 +168,22 @@ class _ProgramPlace(PlaceSequencePlanningRequest):
     retreat_operation: _ProgramOperation
 
 
+class _SignalReference(StrictRequest):
+    component_id: _Identity
+    signal_name: Annotated[str, Field(min_length=1, max_length=512)]
+
+    @field_validator("signal_name")
+    @classmethod
+    def signal_name_is_bounded(cls, value: str) -> str:
+        try:
+            encoded_length = len(value.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise ValueError("signal_name is invalid") from error
+        if "\x00" in value or encoded_length > 512:
+            raise ValueError("signal_name is invalid")
+        return value
+
+
 class _IoWatchCondition(StrictRequest):
     # Edge and compound conditions are refused before this boundary.
     kind: Literal["level"]
@@ -176,9 +191,9 @@ class _IoWatchCondition(StrictRequest):
 
 
 class _IoWatchRequest(StrictRequest):
-    """`manyforge.io_watch_request.v1`: one node attempt's level watch."""
+    """`manyforge.io_watch_request.v2`: one node attempt's level watch."""
 
-    schema_version: Literal["manyforge.io_watch_request.v1"]
+    schema_version: Literal["manyforge.io_watch_request.v2"]
     owner_epoch: _Identity
     program_binding_id: _Digest
     program_runner_owner_epoch: _Identity
@@ -186,8 +201,7 @@ class _IoWatchRequest(StrictRequest):
     program_run_id: _Identity
     node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
     node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
-    target_role_id: _Identity
-    resource_role_id: _Identity
+    signal: _SignalReference
     condition: _IoWatchCondition
 
 
@@ -228,16 +242,11 @@ class _IoWatchRegistration(StrictRequest):
 _UnsignedDecimal = Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,19})$")]
 
 
-# Decision 133 (interface freeze01): `start_mock_io_node_simulation`.
+# Node Mock simulation start: `start_mock_io_node_simulation`.
 _MOCK_SIMULATION_COMMAND: Literal["start_mock_io_node_simulation"] = (
     "start_mock_io_node_simulation"
 )
 _PositiveDecimal = Annotated[str, Field(pattern=r"^[1-9][0-9]{0,19}$")]
-
-
-class _MockSimulationSignal(StrictRequest):
-    target_role: _Identity
-    resource_role: _Identity
 
 
 class _MockSimulationChange(StrictRequest):
@@ -246,19 +255,19 @@ class _MockSimulationChange(StrictRequest):
 
 
 class _MockSimulationRow(StrictRequest):
-    signal: _MockSimulationSignal
+    signal: _SignalReference
     start_value: bool
     # Required and explicit: an authoring omission is normalized to null.
     change: _MockSimulationChange | None
 
 
 class _MockSimulationReceipt(StrictRequest):
-    signal: _MockSimulationSignal
+    signal: _SignalReference
     status: Literal["applied", "inactive"]
 
 
 def _selectors(rows) -> list[tuple[str, str]]:
-    return [(row.signal.target_role, row.signal.resource_role) for row in rows]
+    return [(row.signal.component_id, row.signal.signal_name) for row in rows]
 
 
 class _MockSimulationOccurrence(StrictRequest):
@@ -281,7 +290,7 @@ class _MockSimulationOccurrence(StrictRequest):
 
 
 class _MockSimulationEnd(_MockSimulationOccurrence):
-    """`manyforge.mock_io_node_end.v1` (decision 135): the start's exact
+    """`manyforge.mock_io_node_end.v1`: the start's exact
     occurrence; its still-pending change is cancelled."""
 
     schema_version: Literal["manyforge.mock_io_node_end.v1"]
@@ -302,7 +311,7 @@ class _MockRunPauseOccurrence(StrictRequest):
     # The Runner's existing run_revision: positive full uint64 decimal text.
     run_revision: _PositiveDecimal
     paused: bool
-    # Decision 138 (snapshot138 interface01): nodes whose nearest Hold
+    # Nodes whose nearest Hold
     # wrapper is wholly held, sorted unique; mandatory, possibly empty.
     held_node_instance_ids: list[Annotated[str, Field(min_length=1, max_length=128)]]
 
@@ -322,7 +331,7 @@ class _MockRunPauseOccurrence(StrictRequest):
 
 
 class _MockRunPause(_MockRunPauseOccurrence):
-    """`manyforge.mock_io_run_pause.v1` (SX-2411, decision 138): the Run's
+    """`manyforge.mock_io_run_pause.v1`: the Run's
     Halt state and held-node mask under one run_revision."""
 
     schema_version: Literal["manyforge.mock_io_run_pause.v1"]
@@ -335,9 +344,9 @@ class _MockRunPauseAck(_MockRunPauseOccurrence):
 
 
 class _MockSimulationRequest(_MockSimulationOccurrence):
-    """`manyforge.mock_io_node_start.v1`: one node start's literal rows."""
+    """`manyforge.mock_io_node_start.v2`: one node start's literal rows."""
 
-    schema_version: Literal["manyforge.mock_io_node_start.v1"]
+    schema_version: Literal["manyforge.mock_io_node_start.v2"]
     signals: Annotated[list[_MockSimulationRow], Field(min_length=1)]
 
     @model_validator(mode="after")
@@ -404,7 +413,7 @@ class _ProgramBlackboardPublication(StrictRequest):
     claim_generation: _Revision | None
     program_run_id: _Identity | None
     program_binding_id: _Digest
-    # bb-wire-shapes03: the host's existing Applied publication counter.
+    # The host's existing Applied publication counter.
     active_publication_generation: _Revision
     cycle_generation: _Revision
     kind: Literal["baseline", "update"]
@@ -429,7 +438,7 @@ class _ProgramBlackboardPublication(StrictRequest):
 
 
 class _ProgramBlackboardPublicationAck(StrictRequest):
-    """The actual Core admission reply (bb-wire-shapes03), closed.
+    """The actual Core admission reply, closed.
 
     `accepted`: this frame was admitted (no ACK for enqueue). `superseded`:
     the frame's occurrence was retired by an authoritative Reset/new Run/
@@ -467,17 +476,22 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             attribution_transport="internal",
         )
 
-    def resolve_attach_active_tcp(self, binding_id: str, target_role: str) -> str:
+    def resolve_attach_active_tcp(
+        self, binding_id: str, target: Mapping[str, str]
+    ) -> dict[str, str]:
         response = self.require_success(self._exchange({
             "api_version": EXECUTION_COMMAND_VERSION,
             "command": "resolve_attach_active_tcp",
             "program_binding_id": binding_id,
-            "target_role_id": target_role,
+            "target": dict(target),
         }))
-        frame = response.get("frame_role_id")
-        if response.get("command") != "resolve_attach_active_tcp" or not isinstance(frame, str) or not frame:
+        frame = response.get("frame")
+        if (response.get("command") != "resolve_attach_active_tcp"
+                or not isinstance(frame, Mapping)
+                or set(frame) != {"component_id", "frame_id"}
+                or any(not isinstance(value, str) or not value for value in frame.values())):
             raise HeadlessApiError("execution_command_response_invalid", "Invalid Active TCP holder response")
-        return frame
+        return dict(frame)
 
     @staticmethod
     def _request(model: type[_Request], body: Mapping[str, Any]) -> _Request:
@@ -569,7 +583,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "program_selection_recovery_required",
                 "program_children_unsettled",
                 "program_run_admission_in_flight",
-                # Operator-alarm motion attention (spec 450 §5.2).
+                # Operator-alarm motion attention.
                 "operator_alarm_interlock_active",
                 "operator_alarm_state_unavailable",
             }:
@@ -758,14 +772,14 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         return ack.model_dump(mode="json")
 
     def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 135: end one node attempt's Mock simulation (idempotent)."""
+        """End one node attempt's Mock simulation (idempotent)."""
 
         return self._mock_exchange(
             "end_mock_io_node_simulation", _MockSimulationEnd, _MockSimulationEndAck, body
         )
 
     def set_mock_io_run_paused(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 135 / SX-2411: the Run's Halt state for Mock timers."""
+        """The Run's Halt state for Mock timers."""
 
         return self._mock_exchange(
             "set_mock_io_run_paused", _MockRunPause, _MockRunPauseAck, body
@@ -799,7 +813,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         self, owner_epoch: str, after_sequence: int
     ) -> dict[str, Any]:
         """One page of the existing ``events`` command, returned whole for the
-        global-rule state mirror (contract 64): its outer
+        global-rule state mirror: its outer
         ``interrupt_rule_state_baseline`` and its sparse
         ``interrupt_rule_state_changed`` rows, read strictly by the mirror."""
 
@@ -888,11 +902,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             self._request(FullStopIntentRequest, body), trusted_principal_id=None
         )
 
-    def set_operation_runtime_scale(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return super().set_operation_runtime_scale(
-            self._request(OperationRuntimeScaleRequest, body), trusted_principal_id=None
-        )
-
     def apply_operation_recovery(
         self,
         operation_id: str,
@@ -942,7 +951,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         )
 
     def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
-        """Kernel `set_rule_active` (node `rules.set_active`, CONTRACTS §8)."""
+        """Kernel `set_rule_active` (node `rules.set_active`)."""
 
         return self._exchange(
             {

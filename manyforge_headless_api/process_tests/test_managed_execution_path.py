@@ -79,7 +79,7 @@ def _component_states(run_root: Path) -> list[dict[str, Any]]:
 
 
 def _run_component_action(run_root: Path, component_id: str, action: str) -> dict[str, Any]:
-    """CONTRACTS §2: one component action; returns the state carrying its result."""
+    """One component action; returns the state carrying its result."""
 
     def state() -> dict[str, Any]:
         (row,) = [row for row in _component_states(run_root) if row["component_id"] == component_id]
@@ -100,8 +100,7 @@ def _run_component_action(run_root: Path, component_id: str, action: str) -> dic
 
 
 def _prepare_and_enable_all(run_root: Path) -> None:
-    """Prepare owners before members, then enable everything but owners
-    (CONTRACTS §2, §16)."""
+    """Prepare owners before members, then enable everything but owners."""
 
     states = _component_states(run_root)
     owners = {row["owner_id"] for row in states if row.get("owner_id")}
@@ -152,9 +151,9 @@ def _program_binding(stack: ProcessStack) -> dict[str, Any]:
     return binding
 
 
-def _arm_role(binding: Mapping[str, Any]) -> dict[str, Any]:
-    (arm,) = [row for row in binding["target_role_bindings"]
-              if len(row["frame_role_bindings"]) >= 2]
+def _arm_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    # The motion target: the one that carries the robot's TCPs.
+    (arm,) = [row for row in binding["target_bindings"] if "robot_tcps" in row]
     return arm
 
 
@@ -214,7 +213,7 @@ def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
 
 
 def _wait_cell_latch_cleared(headless: HeadlessHttpClient) -> dict[str, Any]:
-    """CONTRACTS §5: the latch is derived; it clears by itself once every
+    """The latch is derived; it clears by itself once every
     component is healthy and idle. Nothing recovers or acknowledges it."""
 
     deadline = time.monotonic() + 10.0
@@ -239,16 +238,14 @@ def _translation_error_m(left: Mapping[str, Any], right: Mapping[str, Any]) -> f
     )
 
 
-def _planning_motion(move_id: str, motion: dict[str, Any]) -> dict[str, Any]:
+def _planning_motion(
+    move_id: str, motion: dict[str, Any], base_frame: dict[str, str]
+) -> dict[str, Any]:
     return {
         "kind": "motion",
         "move_id": move_id,
-        "base_frame_role_id": "frame-role:base",
-        "tcp_endpoint": {
-            "kind": "entry", "entry": {"component_id": "component:test",
-                                      "target_id": "target:test",
-                                      "frame_role_id": "frame-role:tcp"},
-        },
+        "base_frame": base_frame,
+        "tcp_endpoint": {"kind": "current"},
         "tolerances": {
             "joint_position_tol_rad": 0.01,
             "translation_tol_m": 0.001,
@@ -339,8 +336,7 @@ def _direct_control_joint_operation(
         "expected_scene_revision": None,
         "participants": [
             {
-                "component_role_id": command["component_role_id"],
-                "target_role_id": command["target_role_id"],
+                "target": command["target"],
                 "required_capability_id": target["operation_capability_id"],
                 "action_span": None,
                 "payload": _planning_motion(
@@ -350,9 +346,9 @@ def _direct_control_joint_operation(
                         "joint_names": joint_names,
                         "positions_rad": positions_rad,
                     },
+                    command["base_frame"],
                 )
                 | {
-                    "base_frame_role_id": command["base_frame_role_id"],
                     "tcp_endpoint": {"kind": "current"},
                     "speed_profile": {
                         "velocity_scale": 1.0,
@@ -398,8 +394,7 @@ def _direct_control_gripper_operation(
         "expected_scene_revision": None,
         "participants": [
             {
-                "component_role_id": direct["component_role_id"],
-                "target_role_id": direct["target_role_id"],
+                "target": direct["target"],
                 "required_capability_id": direct_target["operation_capability_id"],
                 "action_span": None,
                 "payload": {
@@ -635,23 +630,22 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             raw_api.close()
 
 
-def test_frame_transform_query_uses_cell_resolver_and_verified_target_roles(
+def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _managed_cell(monkeypatch) as stack:
         binding = _program_binding(stack)
-        arm = _arm_role(binding)
-        frame_roles = sorted(row["frame_role_id"] for row in arm["frame_role_bindings"])
+        arm = _arm_binding(binding)
+        # Direct references to two of the arm's compiled frames.
+        frames = sorted((row["reference"] for row in binding["frame_bindings"]
+                         if row["reference"]["component_id"] == arm["target"]["component_id"]),
+                        key=lambda frame: frame["frame_id"])
+        assert len(frames) >= 2, frames
         client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=10.0)
         identity = client.identity()["identity"]
-        robot = {
-            "target_role_id": arm["target_role_id"],
-            "controllable_component_id": arm["controllable_component_id"],
-            "command_target_id": arm["command_target_id"],
-        }
         probe = _pose(0.05, -0.02, 0.03)
         query = {
-            "schema_version": "manyforge.target_observation_query.v1",
+            "schema_version": "manyforge.target_observation_query.v2",
             "owner_epoch": identity["owner_epoch"],
             "program_binding_id": binding["program_binding_id"],
             "kind": "frame_transform",
@@ -671,7 +665,7 @@ def test_frame_transform_query_uses_cell_resolver_and_verified_target_roles(
         assert typed["target_observation"]["value"] == (
             identity_transform["target_observation"]["value"])
         observation = identity_transform["target_observation"]
-        assert observation["schema_version"] == "manyforge.target_observation.v1"
+        assert observation["schema_version"] == "manyforge.target_observation.v2"
         for key, value in query.items():
             if key != "schema_version":
                 assert observation[key] == value
@@ -680,8 +674,8 @@ def test_frame_transform_query_uses_cell_resolver_and_verified_target_roles(
         assert _translation_error_m(observation["value"]["position_m"],
                                     probe["position_m"]) < 1e-12
 
-        source = {"type": "frame_role", "frame_role_id": frame_roles[0], "target": robot}
-        target = {"type": "frame_role", "frame_role_id": frame_roles[1], "target": robot}
+        source = {"type": "component_frame", "frame": frames[0]}
+        target = {"type": "component_frame", "frame": frames[1]}
         forward = exchange({"source_frame": source, "target_frame": target})
         assert forward["ok"] is True, forward
         assert len(forward["target_observation"]["resolution_evidence_digests"]) == 2
@@ -691,27 +685,26 @@ def test_frame_transform_query_uses_cell_resolver_and_verified_target_roles(
         assert _translation_error_m(backward["target_observation"]["value"]["position_m"],
                                     probe["position_m"]) < 1e-9
 
-        # Every refusal names the failed reference (spec 210 §5.3); the host
-        # passes the owner's details through unchanged.
-        for change, reason, named in [
-            ({"source_frame": {**source, "target": {**robot, "command_target_id": "other"}}},
-             "program_reference_target_role_mismatch",
-             {"reference_type": "frame_role", "reference_id": frame_roles[0],
-              "target_role_id": robot["target_role_id"]}),
-            ({"source_frame": {**source, "target": {**robot, "target_role_id": "absent"}}},
-             "program_reference_target_role_unbound",
-             {"reference_type": "frame_role", "reference_id": frame_roles[0],
-              "target_role_id": "absent"}),
-            ({"source_frame": {"type": "scene_resource", "scene_resource_id": "absent"}},
-             "program_scene_resource_missing",
-             {"reference_type": "scene_resource", "reference_id": "absent"}),
-            ({"source_frame": {"type": "frame_role", "frame_role_id": frame_roles[0]}},
-             "frame_transform_reference_unsupported",
-             {"reference_type": "frame_role", "reference_id": frame_roles[0]}),
-        ]:
-            rejected = exchange(change)
+        # Both a missing component and a missing frame identify the exact
+        # direct reference that failed resolution.
+        for frame in ({**frames[0], "component_id": "absent"},
+                      {**frames[0], "frame_id": "absent"}):
+            rejected = exchange({"source_frame": {"type": "component_frame", "frame": frame}})
             assert rejected["ok"] is False, rejected
-            assert rejected["error"]["details"] == {"reason": reason, **named}
+            assert rejected["error"]["code"] == "frame_missing"
+            assert rejected["error"]["details"] == {
+                "reference_type": "component_frame", "reference_id": frame["frame_id"],
+                "component_id": frame["component_id"],
+            }
+        rejected = exchange({"source_frame": {"type": "scene_resource", "scene_resource_id": "absent"}})
+        assert rejected["ok"] is False, rejected
+        assert rejected["error"]["details"] == {
+            "reason": "program_scene_resource_missing", "reference_type": "scene_resource",
+            "reference_id": "absent",
+        }
+        malformed = exchange({"source_frame": {"type": "component_frame", "frame": {"frame_id": frames[0]["frame_id"]}}})
+        assert malformed["ok"] is False
+        assert malformed["error"]["code"] == "execution_command_invalid"
         assert exchange({"owner_epoch": "old.owner"})["error"]["code"] == (
             "execution_target_owner_stale")
         assert client.events(identity["owner_epoch"], 0) == before
@@ -727,17 +720,18 @@ def test_program_operation_query_rejects_wrong_or_missing_context(
         client = ProgramRunnerExecutionTransport(stack.execution_run_root, timeout_seconds=2.0)
         identity = client.identity()["identity"]
         query = {
-            "schema_version": "manyforge.program_operation_query.v1",
+            "schema_version": "manyforge.program_operation_query.v2",
             "owner_epoch": identity["owner_epoch"],
             "program_binding_id": binding["program_binding_id"],
             "program_run_id": "n3-program-run-1",
-            "target_role_id": _arm_role(binding)["target_role_id"],
+            "target": _arm_binding(binding)["target"],
         }
         before = client.events(identity["owner_epoch"], 0)
         for change, code in [
             ({}, "execution_operation_context_unavailable"),
             ({"owner_epoch": "old"}, "stale_request_owner_epoch"),
-            ({"target_role_id": "foreign"}, "execution_operation_target_unavailable"),
+            ({"target": {**query["target"], "command_target_id": "foreign"}},
+             "execution_operation_target_unavailable"),
         ]:
             with pytest.raises(HeadlessApiError) as error:
                 client.query_operation({**query, **change})
@@ -751,7 +745,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
     with _managed_cell(monkeypatch) as stack:
         run_root = stack.execution_run_root
         client = ExecutionCommandClient(run_root, timeout_seconds=5.0)
-        get = {"api_version": "manyforge.execution_command.v1", "command": "cell_admission_get"}
+        get = {"api_version": "manyforge.execution_command.v3", "command": "cell_admission_get"}
         first = client._exchange(get)
         assert client._exchange(get) == first
         _assert_delayed_first_packet(run_root, get, first)
@@ -799,7 +793,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         assert malformed["error"]["code"] == "execution_command_invalid"
 
         assert client._exchange_on(get, run_root / "execution-control.sock") == {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "cell_admission_get",
             "error": {
                 "code": "execution_control_command_unsupported",
@@ -811,7 +805,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "ok": False,
         }
         assert client._exchange_on(get, run_root / "execution-observation.sock") == {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "command": "cell_admission_get",
             "error": {
                 "code": "execution_observation_command_unsupported",
@@ -822,7 +816,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "ok": False,
         }
         wrong_observation_command = client._exchange_on(
-            {"api_version": "manyforge.execution_command.v1", "command": "identity"},
+            {"api_version": "manyforge.execution_command.v3", "command": "identity"},
             run_root / "execution-observation.sock")
         assert wrong_observation_command["ok"] is False
         assert wrong_observation_command["error"]["code"] == (
@@ -838,7 +832,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
 
         def observed_motion_state() -> dict[str, Any]:
             control = client.control_state()["control_state"]
-            assert control["schema_version"] == "manyforge.execution_control_state.v6"
+            assert control["schema_version"] == "manyforge.execution_control_state.v7"
             matching = [row["observed"] for row in control["observed_targets"]
                         if (row["controllable_component_id"], row["command_target_id"],
                             row["operation_capability_id"]) == motion_target_key]
@@ -867,8 +861,11 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
                     <= after_motion["sequence"])
             assert (motion["positions_si"] == before_motion["positions_rad"]
                     == after_motion["positions_rad"])
-        assert ({key: value for key, value in repeated_frame.items() if key != "targets"}
-                == {key: value for key, value in first_frame.items() if key != "targets"})
+        # Per-target rows are live snapshots (commanded and measured alike);
+        # the frame identity around them repeats exactly.
+        per_target = {"targets", "measured_targets"}
+        assert ({key: value for key, value in repeated_frame.items() if key not in per_target}
+                == {key: value for key, value in first_frame.items() if key not in per_target})
 
 
 def test_execution_host_scale_selector_codec_preserves_singular_scope(
@@ -878,12 +875,11 @@ def test_execution_host_scale_selector_codec_preserves_singular_scope(
 
     with _managed_cell(monkeypatch) as stack:
         binding = _program_binding(stack)
-        arm_role = _arm_role(binding)["target_role_id"]
+        target = _arm_binding(binding)["target"]
         client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
         singular_selector = {
             "program_binding_id": binding["program_binding_id"],
-            "component_role_id": "robot",
-            "target_role_id": arm_role,
+            **target,
         }
 
         def get(selector: dict[str, Any]) -> dict[str, Any]:
@@ -894,7 +890,7 @@ def test_execution_host_scale_selector_codec_preserves_singular_scope(
         singular_before = get(singular_selector)
         assert singular_before["ok"] is True, singular_before
         assert singular_before["runtime_scale_control"]["selector"] == singular_selector
-        group = [{"component_role_id": "robot", "target_role_id": arm_role}] * 2
+        group = [target] * 2
         for selector in (
             {**singular_selector, "group_targets": group},
             {"program_binding_id": binding["program_binding_id"], "group_targets": group},
@@ -1058,7 +1054,7 @@ def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
                                                       request_id="tcp-barrier-set",
                                                       positions_rad=positions)
             set_tcp["participants"][0]["payload"] = {
-                "kind": "set_tcp", "tcp": {"kind": "entry", "entry": chosen_entry}}
+                "kind": "set_tcp", "tcp": {"kind": "entry", **chosen_entry}}
             for packet in (
                 {"api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
                  "attribution": {"transport": "http", "assurance": "unverified",

@@ -1,4 +1,4 @@
-"""System-owned node outcome keys (contract items 42, 43)."""
+"""System-owned node outcome keys."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _program(document: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -57,7 +57,7 @@ def test_every_motion_node_has_an_implicit_read_only_run_outcome_key() -> None:
         "read",
         "run",
     )
-    # The system defines the start value `none` (contract 105).
+    # The system defines the start value `none`.
     assert (declaration.has_initial, declaration.initial) == (True, "none")
     assert declaration.expression is None
     # Only motion nodes get one, and the authored document stays unchanged.
@@ -126,7 +126,7 @@ def test_draft_declarations_include_the_forest_motion_nodes() -> None:
 def test_only_the_system_writer_sets_an_outcome_and_reset_clears_it() -> None:
     program = _program(_document())
     store = ProgramValueStore(program)
-    assert store.read(_KEY) == "none"  # No result yet in this Run (contract 105).
+    assert store.read(_KEY) == "none"  # No result yet in this Run.
     with pytest.raises(ProgramValueError, match="not writable"):
         store.write(_KEY, "completed")
     for refused in ("aborted", "none"):  # `none` is the start value, never an ending.

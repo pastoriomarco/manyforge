@@ -35,7 +35,7 @@ if [[ "${UBSAN_OPTIONS}" != *"exitcode="* ]]; then
 fi
 export UBSAN_OPTIONS
 
-sanitizer_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g -Wno-error=maybe-uninitialized -Wno-error=array-bounds"
+sanitizer_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
 
 cmake \
   -S "${REPO_ROOT}/manyforge_component_manager" \

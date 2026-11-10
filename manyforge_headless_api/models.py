@@ -1,9 +1,8 @@
-"""Strict public request DTOs for the H0 HTTP projection."""
+"""Strict public request DTOs for the headless HTTP projection."""
 
 from __future__ import annotations
 
 import json
-import math
 import re
 import unicodedata
 from typing import Annotated, Any, Literal
@@ -22,12 +21,10 @@ from pydantic import (
 )
 
 from manyforge_behavior.failure_details import (
-    FAILURE_DETAIL_KEYS,
     FAILURE_ORIGIN_KINDS,
-    MAX_FAILURE_DETAIL_ENTRIES,
-    MAX_FAILURE_DETAIL_TEXT_BYTES,
     MAX_FAILURE_DETAILS_BYTES,
     MAX_FAILURE_ORIGIN_TEXT_BYTES,
+    require_failure_details,
 )
 from manyforge_behavior.json_scalars import (
     MAXIMUM_INT64,
@@ -64,24 +61,7 @@ def validate_failure_details_and_origin(details: Any, origin: Any) -> None:
     Values pass through unchanged; nothing here derives or selects recovery.
     """
     if details is not None:
-        if (
-            not isinstance(details, dict)
-            or not 1 <= len(details) <= MAX_FAILURE_DETAIL_ENTRIES
-        ):
-            raise ValueError("failure details must be a non-empty bounded flat object")
-        for key, value in details.items():
-            if key not in FAILURE_DETAIL_KEYS:
-                raise ValueError("failure detail key is not registered")
-            if not (
-                value is None
-                or isinstance(value, (bool, int))
-                or (isinstance(value, float) and math.isfinite(value))
-                or (
-                    isinstance(value, str)
-                    and len(value.encode("utf-8")) <= MAX_FAILURE_DETAIL_TEXT_BYTES
-                )
-            ):
-                raise ValueError("failure detail value is not a bounded scalar")
+        require_failure_details(details)
         try:
             encoded = rfc8785.dumps(details)
         except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
@@ -160,33 +140,68 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+class ProgramTargetReferenceRequest(StrictRequest):
+    component_id: str
+    command_target_id: str
+
+    @field_validator("component_id", "command_target_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class ProgramFrameReferenceRequest(StrictRequest):
+    component_id: str
+    frame_id: str
+
+    @field_validator("component_id", "frame_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class ProgramCollisionBodyReferenceRequest(StrictRequest):
+    component_id: str
+    collision_body_id: str
+
+    @field_validator("component_id", "collision_body_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class ProgramSignalReferenceRequest(StrictRequest):
+    component_id: str
+    signal_name: str
+
+    @field_validator("component_id", "signal_name")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
 class TargetObservationQuery(StrictRequest):
     """One exact, effect-free read of a captured Program target.
 
     `frame_transform` names no target: it expresses `pose`, given in
     `source_frame`, in `target_frame` through the cell frame resolver.
-    `io_signal` reads the boolean signal bound to the target's
-    `resource_role_id` (Program Binding `signal_role_bindings`).
+    `io_signal` reads one component-owned boolean signal.
     """
 
-    schema_version: Literal["manyforge.target_observation_query.v1"]
+    schema_version: Literal["manyforge.target_observation_query.v2"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    target_role_id: str | None = None
+    target: ProgramTargetReferenceRequest | None = None
     kind: Literal["frame_pose", "gripper_status", "frame_transform", "io_signal"]
-    frame_role_id: str | None = None
-    resource_role_id: str | None = None
-    relative_to_frame_role_id: str | None = None
+    frame: ProgramFrameReferenceRequest | None = None
+    signal: ProgramSignalReferenceRequest | None = None
+    relative_to_frame: ProgramFrameReferenceRequest | None = None
     pose: Pose3Request | None = None
     source_frame: FrameReferenceRequest | None = None
     target_frame: FrameReferenceRequest | None = None
 
     @field_validator(
         "owner_epoch",
-        "target_role_id",
-        "frame_role_id",
-        "relative_to_frame_role_id",
-        "resource_role_id",
     )
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
@@ -204,33 +219,27 @@ class TargetObservationQuery(StrictRequest):
             for frame in (self.source_frame, self.target_frame)
         ):
             raise ValueError("only a frame-transform query names a pose and two frames")
-        if transform == (self.target_role_id is not None):
-            raise ValueError("a frame-transform query names no target; every other kind does")
-        if transform and any(
-            isinstance(frame, FrameRoleReferenceRequest) and frame.target is None
-            for frame in (self.source_frame, self.target_frame)
-        ):
-            raise ValueError("a frame-transform frame role names its robot")
+        needs_target = self.kind in ("frame_pose", "gripper_status")
+        if needs_target != (self.target is not None):
+            raise ValueError("only frame-pose and gripper-status queries name a target")
         frame_query = self.kind == "frame_pose"
-        if frame_query != (self.frame_role_id is not None):
-            raise ValueError("only a frame-pose query names a frame role")
-        if not frame_query and self.relative_to_frame_role_id is not None:
-            raise ValueError("only a frame-pose query names a relative frame role")
-        if (self.kind == "io_signal") != (self.resource_role_id is not None):
-            raise ValueError("only an I/O signal query names a resource role")
+        if frame_query != (self.frame is not None):
+            raise ValueError("only a frame-pose query names a frame")
+        if not frame_query and self.relative_to_frame is not None:
+            raise ValueError("only a frame-pose query names a relative frame")
+        if (self.kind == "io_signal") != (self.signal is not None):
+            raise ValueError("only an I/O signal query names a signal")
         return self
 
 
 class SkillExpansionRequest(StrictRequest):
     """Effect-free authoring expansion against one selected build environment."""
 
-    schema_version: Literal["manyforge.skill_expansion_request.v1"]
+    schema_version: Literal["manyforge.skill_expansion_request.v2"]
     expected_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     skill_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     instance_prefix: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     arguments: dict[str, Any] = Field(max_length=32)
-    component_roles: dict[str, str] = Field(max_length=32)
-    target_roles: dict[str, str] = Field(max_length=32)
     program_context: dict[str, Any] = Field(
         description="Portable Program declarations without tree/revision or Composer forest/layout fields."
     )
@@ -239,13 +248,13 @@ class SkillExpansionRequest(StrictRequest):
 class ProgramOperationQuery(StrictRequest):
     """Select one resident operation from exact backend-owned Program scope."""
 
-    schema_version: Literal["manyforge.program_operation_query.v1"]
+    schema_version: Literal["manyforge.program_operation_query.v2"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_run_id: str
-    target_role_id: str
+    target: ProgramTargetReferenceRequest
 
-    @field_validator("owner_epoch", "program_run_id", "target_role_id")
+    @field_validator("owner_epoch", "program_run_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -494,7 +503,7 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
     expected_current: ExpectedCurrentRequest
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     manager_owner_epoch: str
-    # Digest of the Manager's authoritative preview impact (H1a); a
+    # Digest of the Manager's authoritative preview impact; a
     # destructive impact must be accepted via ``accepted_impact_digest``.
     impact_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     destructive_impact: bool
@@ -540,6 +549,55 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
         )
 
 
+class ReferenceValidationGeneration(StrictRequest):
+    workspace_epoch: str
+    workspace_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+    program_draft_id: str
+    program_draft_revision: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+    deployment_draft_id: str
+    deployment_draft_revision: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+
+    @field_validator("workspace_epoch", "program_draft_id", "deployment_draft_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class ProgramReferenceValidationRequest(StrictRequest):
+    schema_version: Literal["manyforge.program_reference_validation_request.v3"]
+    workspace_generation: ReferenceValidationGeneration
+    program_content_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program: dict[str, Any]
+    draft: bool
+    deployment: dict[str, Any]
+    # Exactly one: the full closure, or the sha256 of its RFC 8785 bytes when
+    # Headless already holds the prepared candidate for it.
+    model_source_closure: dict[str, Any] | None = None
+    model_source_closure_digest: Annotated[str, Field(pattern=SHA256_PATTERN)] | None = None
+
+    @model_validator(mode="after")
+    def require_one_model_source_form(self) -> "ProgramReferenceValidationRequest":
+        if (self.model_source_closure is None) == (self.model_source_closure_digest is None):
+            raise ValueError("exactly one of model_source_closure and model_source_closure_digest is required")
+        return self
+
+
+class ComponentFrameLookupRequest(StrictRequest):
+    schema_version: Literal["manyforge.component_frame_lookup.v1"]
+    retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    frame: ProgramFrameReferenceRequest
+
+    @model_validator(mode="after")
+    def validate_frame_ids(self) -> "ComponentFrameLookupRequest":
+        if (len(self.frame.component_id.encode("utf-8")) > 128
+                or re.fullmatch(r"[a-z][a-z0-9_.-]*", self.frame.component_id) is None
+                or len(self.frame.frame_id.encode("utf-8")) > 128
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.frame.frame_id) is None):
+            raise ValueError("frame must be an exact bounded component/frame reference")
+        return self
+
+
 class ActivationPreparationRequest(StrictRequest):
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     scenario_id: str
@@ -548,7 +606,6 @@ class ActivationPreparationRequest(StrictRequest):
     deployment: dict[str, Any]
     model_source_closure: dict[str, Any]
     program: dict[str, Any] | None
-    program_role_assignment: dict[str, Any]
     expected_admission_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
@@ -576,16 +633,11 @@ class ActivationPreparationRequest(StrictRequest):
             not self.deployment
             or not self.model_source_closure
             or (self.program is not None and not self.program)
-            or not self.program_role_assignment
         ):
             raise ValueError(
-                "deployment, model_source_closure, and program_role_assignment "
-                "must be non-empty objects; program must be null or a non-empty object"
+                "deployment and model_source_closure must be non-empty objects; "
+                "program must be null or a non-empty object"
             )
-        if self.program is None and (
-            self.program_role_assignment != {"component_roles": [], "target_roles": []}
-        ):
-            raise ValueError("no Program requires an empty role assignment")
         return self
 
 
@@ -609,7 +661,7 @@ PreparedActivationOrigin = Annotated[
 
 
 class ManagerApplyPreparedActivation(StrictRequest):
-    """Exact UA2A prepared activation accepted by one named Apply.
+    """Exact prepared activation accepted by one named Apply.
 
     Every member is captured once before acceptance. The Manager records these
     facts in its durable Apply intent and never reopens a mutable
@@ -620,7 +672,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v6"]
+    schema_version: Literal["manyforge.prepared_activation_input.v7"]
     origin: PreparedActivationOrigin
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -628,7 +680,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_id: str | None
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)] | None
-    # Exactly one typed outcome (H1a): {"kind": "bound", "program_binding_id"}
+    # Exactly one typed outcome: {"kind": "bound", "program_binding_id"}
     # or {"kind": "non_executable", "outcome"}, or {"kind": "no_program"}.
     # The Manager verifies it against the immutable stored activation.
     program_outcome: dict[str, Any]
@@ -655,8 +707,8 @@ class ManagerApplyPreparedActivation(StrictRequest):
                 set(value) != {"kind", "outcome"}
                 or not isinstance(outcome, dict)
                 or outcome.get("api_version")
-                != "manyforge.program-binding-outcome.v1"
-                or not outcome.get("unresolved_roles")
+                != "manyforge.program-binding-outcome.v2"
+                or not outcome.get("unresolved_targets")
             ):
                 raise ValueError(
                     "non-executable Program outcome must name its references"
@@ -1036,7 +1088,7 @@ class ProgramModelAuditPolicy(StrictRequest):
 class ProgramDiagnosticRequest(StrictRequest):
     """Asynchronous attributed evidence; never a command or recovered state."""
 
-    schema_version: Literal["manyforge.program_diagnostic.v3"]
+    schema_version: Literal["manyforge.program_diagnostic.v4"]
     program_run_id: str
     owner_epoch: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -1363,7 +1415,7 @@ class ManagerApplyStatusPreparedActivation(StrictRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     # Null exactly when the preserved Program is non-executable in the
-    # candidate (H1a); a succeeded Apply may still report null here.
+    # candidate; a succeeded Apply may still report null here.
     program_binding_id: Annotated[str | None, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
@@ -1381,7 +1433,7 @@ class ManagerApplyStatus(StrictRequest):
     Shared by Apply, Revert and activating a loaded Scenario, because all three
     submit the same operation owner. Every member is a durable fact: the
     operation identity (Apply ID/generation plus the caller request owner/id),
-    the accepted UA2A prepared activation, the deepest durably reached phase
+    the accepted prepared activation, the deepest durably reached phase
     with its evidence digest, and exactly one terminal outcome: pending while
     the operation remains resumable, otherwise succeeded, failed or
     unknown_effect.
@@ -2353,7 +2405,7 @@ def _uint64_text(value: Any, *, label: str, minimum: int) -> str:
 
 
 class IoSignalLiveness(StrictRequest):
-    """An input's declared liveness from its canonical descriptor (SX-2194).
+    """An input's declared liveness from its canonical descriptor.
 
     `liveness_unproven` is the warning exactly of a change-only source.
     """
@@ -2391,7 +2443,7 @@ class IoSignalObservation(StrictRequest):
     @field_validator("signal_name", "source_id", "source_epoch")
     @classmethod
     def bounded_identity(cls, value: str | None, info) -> str | None:
-        # `source_epoch` is the opaque source incarnation (spec 260 §2.3).
+        # `source_epoch` is the opaque source incarnation.
         if value is None:
             return None
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
@@ -2467,19 +2519,18 @@ class MockIoPublicationError(BaseModel):
 class IoSignalReadRequest(StrictRequest):
     """One effect-free GUI read of one bound boolean signal.
 
-    Exactly the `io_signal` kind of `manyforge.target_observation_query.v1`:
+    Exactly the `io_signal` kind of `manyforge.target_observation_query.v2`:
     the host resolves it through the current Program Binding and installed
     descriptor before reading.
     """
 
-    schema_version: Literal["manyforge.target_observation_query.v1"]
+    schema_version: Literal["manyforge.target_observation_query.v2"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    target_role_id: str
     kind: Literal["io_signal"]
-    resource_role_id: str
+    signal: ProgramSignalReferenceRequest
 
-    @field_validator("owner_epoch", "target_role_id", "resource_role_id")
+    @field_validator("owner_epoch")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -2496,15 +2547,14 @@ class MockIoInputRequest(StrictRequest):
     requested value is explicit, never an implicit inversion.
     """
 
-    schema_version: Literal["manyforge.mock_io_input_request.v1"]
+    schema_version: Literal["manyforge.mock_io_input_request.v2"]
     owner_epoch: str
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    target_role_id: str
-    resource_role_id: str
+    signal: ProgramSignalReferenceRequest
     expected_source_epoch: str
     value: bool
 
-    @field_validator("owner_epoch", "target_role_id", "resource_role_id")
+    @field_validator("owner_epoch")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -2656,63 +2706,18 @@ class CapabilityCommandParticipantRequest(StrictRequest):
         return self
 
 
-class ReferenceTargetRequest(StrictRequest):
-    """The robot owning a robot-qualified frame, from the exact Program Binding."""
-
-    target_role_id: str
-    controllable_component_id: str
-    command_target_id: str
-
-    @field_validator("target_role_id", "controllable_component_id", "command_target_id")
-    @classmethod
-    def validate_target_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class FrameRoleReferenceRequest(StrictRequest):
-    """A frame role of the moving robot, or of `target` when it is named."""
-
-    type: Literal["frame_role"]
-    frame_role_id: str
-    target: ReferenceTargetRequest | None = None
-
-    @field_validator("frame_role_id")
-    @classmethod
-    def validate_frame_role_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="frame_role_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @model_serializer(mode="wrap")
-    def serialize_reference(self, handler) -> dict[str, Any]:
-        result = handler(self)
-        if self.target is None:
-            result.pop("target", None)
-        return result
+class ComponentFrameReferenceRequest(StrictRequest):
+    type: Literal["component_frame"]
+    frame: ProgramFrameReferenceRequest
 
 
 class CellFrameReferenceRequest(StrictRequest):
     type: Literal["cell_frame"]
 
 
-class ComponentBodyRoleReferenceRequest(StrictRequest):
-    type: Literal["component_body_role"]
-    collision_body_role_id: str
-
-    @field_validator("collision_body_role_id")
-    @classmethod
-    def validate_collision_body_role_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="collision_body_role_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
+class ComponentBodyReferenceRequest(StrictRequest):
+    type: Literal["component_body"]
+    body: ProgramCollisionBodyReferenceRequest
 
 
 class SceneResourceReferenceRequest(StrictRequest):
@@ -2750,8 +2755,8 @@ class InlinePoseReferenceRequest(StrictRequest):
 
 MotionReferenceRequest = Annotated[
     CellFrameReferenceRequest
-    | FrameRoleReferenceRequest
-    | ComponentBodyRoleReferenceRequest
+    | ComponentFrameReferenceRequest
+    | ComponentBodyReferenceRequest
     | SceneResourceReferenceRequest
     | RuntimeObjectReferenceRequest
     | InlinePoseReferenceRequest,
@@ -2760,7 +2765,7 @@ MotionReferenceRequest = Annotated[
 
 # A named frame an absolute goal or a frame transform is expressed in.
 FrameReferenceRequest = Annotated[
-    CellFrameReferenceRequest | FrameRoleReferenceRequest | SceneResourceReferenceRequest,
+    CellFrameReferenceRequest | ComponentFrameReferenceRequest | SceneResourceReferenceRequest,
     Field(discriminator="type"),
 ]
 
@@ -2781,42 +2786,40 @@ class RuntimeObjectReferenceBindingRequest(StrictRequest):
 
 class TcpEntryRequest(StrictRequest):
     """One owner-qualified TCP in the retained Deployment."""
+    target: ProgramTargetReferenceRequest
+    frame: ProgramFrameReferenceRequest
 
-    component_id: str
-    target_id: str
-    frame_role_id: str
 
-    @field_validator("component_id", "target_id", "frame_role_id")
+class ResolvedPreviewTcp(StrictRequest):
+    entry: TcpEntryRequest
+    source: Literal["active_tcp", "explicit_entry", "joint_flange_fallback"]
+    owner_epoch: str
+    registration_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    sequence: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+
+    @field_validator("owner_epoch")
     @classmethod
-    def validate_endpoint_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
+    def validate_owner_epoch(cls, value: str) -> str:
+        return _bounded_nfc(value, label="owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES)
 
 
 class CurrentTcpSelectorRequest(StrictRequest):
     kind: Literal["current"]
 
 
-class DefaultTcpOfRoleSelectorRequest(StrictRequest):
-    kind: Literal["default_of_role"]
-    role: str
-
-    @field_validator("role")
-    @classmethod
-    def validate_role(cls, value: str) -> str:
-        return _bounded_nfc(value, label="role", maximum_bytes=MAX_IDENTITY_BYTES)
+class DefaultTcpOfTargetSelectorRequest(StrictRequest):
+    kind: Literal["default_of_target"]
+    target: ProgramTargetReferenceRequest
 
 
 class TcpEntrySelectorRequest(StrictRequest):
     kind: Literal["entry"]
-    entry: TcpEntryRequest
+    target: ProgramTargetReferenceRequest
+    frame: ProgramFrameReferenceRequest
 
 
 TcpSelectorRequest = Annotated[
-    CurrentTcpSelectorRequest | DefaultTcpOfRoleSelectorRequest | TcpEntrySelectorRequest,
+    CurrentTcpSelectorRequest | DefaultTcpOfTargetSelectorRequest | TcpEntrySelectorRequest,
     Field(discriminator="kind"),
 ]
 
@@ -2829,7 +2832,7 @@ class SetTcpParticipantRequest(StrictRequest):
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
-    base_frame_role_id: str
+    base_frame: ProgramFrameReferenceRequest
     tcp_endpoint: TcpSelectorRequest
     tolerances: MotionTolerancesRequest
     speed_profile: MotionSpeedProfileRequest
@@ -2865,7 +2868,7 @@ class MotionParticipantRequest(StrictRequest):
         return result
 
     @field_validator(
-        "move_id", "base_frame_role_id", "contact_policy_id"
+        "move_id", "contact_policy_id"
     )
     @classmethod
     def validate_motion_identity(cls, value: str | None, info) -> str | None:
@@ -2938,8 +2941,7 @@ class MotionParticipantRequest(StrictRequest):
 
 
 class OperationParticipantRequest(StrictRequest):
-    component_role_id: str
-    target_role_id: str
+    target: ProgramTargetReferenceRequest
     required_capability_id: str
     action_span: ActionSpanRequest | None
     payload: Annotated[
@@ -2947,7 +2949,7 @@ class OperationParticipantRequest(StrictRequest):
         Field(discriminator="kind"),
     ]
 
-    @field_validator("component_role_id", "target_role_id", "required_capability_id")
+    @field_validator("required_capability_id")
     @classmethod
     def validate_participant_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3186,8 +3188,8 @@ class PickOffsetEnvelopeRequest(StrictRequest):
         return self
 
 
-PickFrameRoleReferenceRequest = FrameRoleReferenceRequest
-PickComponentBodyRoleReferenceRequest = ComponentBodyRoleReferenceRequest
+PickComponentFrameReferenceRequest = ComponentFrameReferenceRequest
+PickComponentBodyReferenceRequest = ComponentBodyReferenceRequest
 PickSceneResourceReferenceRequest = SceneResourceReferenceRequest
 PickRuntimeObjectReferenceRequest = RuntimeObjectReferenceRequest
 PickInlinePoseReferenceRequest = InlinePoseReferenceRequest
@@ -3268,10 +3270,10 @@ def _validate_pick_place_operations(
     )
     motion_targets = {
         (
-            participant.component_role_id,
-            participant.target_role_id,
+            participant.target.component_id,
+            participant.target.command_target_id,
             participant.required_capability_id,
-            participant.payload.base_frame_role_id,
+            participant.payload.base_frame.model_dump_json(),
             participant.payload.tcp_endpoint.model_dump_json(),
         )
         for participant in motion_participants
@@ -3285,7 +3287,7 @@ class PickSequencePlanningRequest(StrictRequest):
     sequence_id: str
     selected_object_id: str
     selected_runtime_object_id: str
-    carrier_frame_role_id: str
+    carrier_frame: ProgramFrameReferenceRequest
     synthesis: PickCandidateSynthesisRequest = Field(
         default_factory=PickCandidateSynthesisRequest
     )
@@ -3300,7 +3302,7 @@ class PickSequencePlanningRequest(StrictRequest):
         return _bounded_nfc(value, label="sequence_id", maximum_bytes=96)
 
     @field_validator(
-        "selected_object_id", "selected_runtime_object_id", "carrier_frame_role_id"
+        "selected_object_id", "selected_runtime_object_id"
     )
     @classmethod
     def validate_pick_identity(cls, value: str, info) -> str:
@@ -3347,7 +3349,7 @@ class PickSequencePlanningRequest(StrictRequest):
 class PlaceSequencePlanningRequest(StrictRequest):
     sequence_id: str
     selected_object_id: str
-    carrier_frame_role_id: str
+    carrier_frame: ProgramFrameReferenceRequest
     approach_operation: OperationIntentRequest
     descend_operation: OperationIntentRequest
     tool_operation: OperationIntentRequest
@@ -3358,7 +3360,7 @@ class PlaceSequencePlanningRequest(StrictRequest):
     def validate_sequence_id(cls, value: str) -> str:
         return _bounded_nfc(value, label="sequence_id", maximum_bytes=96)
 
-    @field_validator("selected_object_id", "carrier_frame_role_id")
+    @field_validator("selected_object_id")
     @classmethod
     def validate_place_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3414,7 +3416,7 @@ class OperationControlRequest(StrictRequest):
 
 
 class OperationResetRequest(OperationControlRequest):
-    """Targeted operation Reset (contract 66)."""
+    """Targeted operation Reset."""
 
 
 class OperationRecoveryActionRequest(StrictRequest):
@@ -3647,10 +3649,10 @@ class FullStopIntentRequest(StrictRequest):
 
 
 class RuntimeScaleControlTargetRequest(StrictRequest):
-    component_role_id: str
-    target_role_id: str
+    component_id: str
+    command_target_id: str
 
-    @field_validator("component_role_id", "target_role_id")
+    @field_validator("component_id", "command_target_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3660,8 +3662,8 @@ class RuntimeScaleControlTargetRequest(StrictRequest):
 
 class RuntimeScaleControlSelectorRequest(StrictRequest):
     program_binding_id: str
-    component_role_id: str | None = None
-    target_role_id: str | None = None
+    component_id: str | None = None
+    command_target_id: str | None = None
     group_targets: Annotated[
         list[RuntimeScaleControlTargetRequest] | None,
         Field(min_length=2, max_length=MAX_OPERATION_PARTICIPANTS),
@@ -3669,8 +3671,8 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
 
     @field_validator(
         "program_binding_id",
-        "component_role_id",
-        "target_role_id",
+        "component_id",
+        "command_target_id",
     )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
@@ -3682,17 +3684,17 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_form(self) -> "RuntimeScaleControlSelectorRequest":
-        singular = self.component_role_id is not None or self.target_role_id is not None
+        singular = self.component_id is not None or self.command_target_id is not None
         group = self.group_targets is not None
         if singular == group or (
-            singular and (self.component_role_id is None or self.target_role_id is None)
+            singular and (self.component_id is None or self.command_target_id is None)
         ):
             raise ValueError(
                 "runtime-scale selector must contain exactly one selector form"
             )
         if group:
             targets = [
-                (x.component_role_id, x.target_role_id)
+                (x.component_id, x.command_target_id)
                 for x in self.group_targets or []
             ]
             if len(set(targets)) != len(targets):
@@ -3705,30 +3707,13 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
         if self.group_targets is None:
             result.pop("group_targets", None)
         else:
-            result.pop("component_role_id", None)
-            result.pop("target_role_id", None)
-        if self.component_role_id is None:
-            result.pop("component_role_id", None)
-        if self.target_role_id is None:
-            result.pop("target_role_id", None)
+            result.pop("component_id", None)
+            result.pop("command_target_id", None)
+        if self.component_id is None:
+            result.pop("component_id", None)
+        if self.command_target_id is None:
+            result.pop("command_target_id", None)
         return result
-
-
-class OperationRuntimeScaleRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    operation_id: str
-    expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_runtime_scale_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_990)
-    ]
-    scale: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)]
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_identity(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="operation_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
 
 class RuntimeScaleControlRequest(StrictRequest):
@@ -3751,15 +3736,106 @@ ComponentActionName = Literal[
 
 
 class ComponentActionRequest(StrictRequest):
-    """CONTRACTS §2 `POST /api/components/{component_id}/actions`."""
+    """`POST /api/components/{component_id}/actions` body."""
 
     action: ComponentActionName
 
 
+class ConfirmedRecoveryComponent(StrictRequest):
+    component_id: Annotated[str, Field(min_length=1, max_length=256)]
+    cause_code: str | None
+    vendor_code: str | None
+    stop_code: str | None
+    stop_vendor_code: str | None
+    eligibility: Literal["ready", "recover", "blocked", "unknown", "excluded"]
+
+
+class RecoveryPreflightConfirmation(StrictRequest):
+    snapshot_id: Annotated[str, Field(min_length=1, max_length=2048)]
+    confirmed: Annotated[list[ConfirmedRecoveryComponent], Field(min_length=1, max_length=2)]
+
+    @model_validator(mode="after")
+    def validate_confirmation(self) -> "RecoveryPreflightConfirmation":
+        if len({row.component_id for row in self.confirmed}) != len(self.confirmed):
+            raise ValueError("confirmed components must be unique")
+        if any(row.eligibility in ("blocked", "excluded") for row in self.confirmed):
+            raise ValueError("blocked or excluded components cannot be enabled")
+        if any(row.eligibility == "unknown" for row in self.confirmed):
+            if not (len(self.confirmed) == 2 and self.confirmed[0].eligibility == "recover"
+                    and self.confirmed[1].eligibility == "unknown"):
+                raise ValueError("an unknown member requires a recoverable owner")
+        return self
+
+
+class RecoveryCause(StrictRequest):
+    code: str
+    message: str
+    vendor_code: str | None = None
+    vendor_text: str | None = None
+    clearable: bool
+    operator_action: Literal["enable", "recover", "none"]
+    concerns: list[str]
+
+
+class RecoveryStop(StrictRequest):
+    code: Literal["estop"]
+    message: str
+    since_ns: Annotated[int, Field(ge=0)]
+    vendor_code: str | None = None
+    vendor_text: str | None = None
+
+
+class RecoveryComponent(StrictRequest):
+    component_id: Annotated[str, Field(min_length=1, max_length=256)]
+    owner_id: str | None = None
+    cause: RecoveryCause | None
+    stop: RecoveryStop | None = None
+    eligibility: Literal["ready", "recover", "blocked", "unknown", "excluded"]
+
+    @model_validator(mode="after")
+    def stop_cause_has_stop_evidence(self) -> "RecoveryComponent":
+        if self.cause is not None and self.cause.code == "estop":
+            if self.stop is None or self.stop.vendor_code != self.cause.vendor_code:
+                raise ValueError("stop cause must include matching stop evidence")
+        return self
+
+
+class RecoveryPreflightProjection(StrictRequest):
+    snapshot_id: Annotated[str, Field(min_length=1, max_length=2048)]
+    components: Annotated[list[RecoveryComponent], Field(min_length=1, max_length=2)]
+
+    @model_validator(mode="after")
+    def unique_components(self) -> "RecoveryPreflightProjection":
+        if len({row.component_id for row in self.components}) != len(self.components):
+            raise ValueError("preflight components must be unique")
+        return self
+
+
+class RecoveryGroupTarget(StrictRequest):
+    component_id: Annotated[str, Field(min_length=1, max_length=256)]
+    recovery_preflight: RecoveryPreflightConfirmation
+
+    @model_validator(mode="after")
+    def matches_target(self) -> "RecoveryGroupTarget":
+        if self.recovery_preflight.confirmed[-1].component_id != self.component_id:
+            raise ValueError("confirmation must end with the selected component")
+        return self
+
+
+class RecoveryGroupRequest(StrictRequest):
+    targets: Annotated[list[RecoveryGroupTarget], Field(min_length=1, max_length=256)]
+
+    @model_validator(mode="after")
+    def unique_targets(self) -> "RecoveryGroupRequest":
+        if len({target.component_id for target in self.targets}) != len(self.targets):
+            raise ValueError("recovery targets must be unique")
+        return self
+
+
 class ComponentGroupActionRequest(StrictRequest):
-    """CONTRACTS §2 `POST /api/components/actions` (Enable all and groups):
+    """`POST /api/components/actions` body (Enable all and groups):
     the caller names the components (Enable all = every `prepared` member and
-    owner-less component; owners have no Enable, §16)."""
+    owner-less component; owners have no Enable)."""
 
     action: ComponentActionName
     component_ids: list[Annotated[str, Field(min_length=1, max_length=256)]] = Field(
@@ -3781,7 +3857,7 @@ class ActivityErrorRequest(StrictRequest):
 
 
 class ApplyOutcomeComponentRequest(StrictRequest):
-    """One ApplyResult component row (CONTRACTS §11)."""
+    """One ApplyResult component row."""
 
     component_id: Annotated[str, Field(min_length=1, max_length=256)]
     disposition: Annotated[str, Field(min_length=1, max_length=256)] | None = None
@@ -3805,6 +3881,6 @@ class ApplyOutcomeRequest(StrictRequest):
 
 
 class SetOutputRequest(StrictRequest):
-    """CONTRACTS §7 `POST /api/io/{signal_id}/set` body."""
+    """`POST /api/io/{signal_id}/set` body."""
 
     value: bool | int | float

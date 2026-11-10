@@ -30,6 +30,8 @@ from manyforge_behavior.program_runtime import ProgramRunAttemptSource
 
 # The Runner's execution transport timeout handed to owner task nodes.
 _TRANSPORT_TIMEOUT_S = 30.0
+_TARGET = {"component_id": "lite6_robot", "command_target_id": "arm"}
+_FRAME = {"component_id": "lite_gripper", "frame_id": "tcp"}
 
 
 def _adapter(port, *, minimum=0.0, maximum=1.0):
@@ -39,21 +41,9 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
         / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
         environment.catalog,
     ).to_dict()
-    document["target_roles"]["arm"]["required_capabilities"].extend(
-        [
-            {
-                "capability_id": "model.kinematics.fk",
-                "parameters": {},
-                "disposition": "required",
-            },
-        ]
-    )
-    document["target_roles"]["arm"]["required_capabilities"].sort(
-        key=lambda row: row["capability_id"]
-    )
     parameters = {
-        "target_role": "arm",
-        "frame_role": "tcp",
+        "target": _TARGET,
+        "frame": _FRAME,
         "minimum_height_m": minimum,
         "maximum_height_m": maximum,
     }
@@ -67,7 +57,7 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, environment.catalog)
     context = NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
@@ -107,7 +97,7 @@ def test_actual_package_uses_one_current_owner_query(height, expected):
     status = py_trees.common.Status.SUCCESS if expected else py_trees.common.Status.FAILURE
     assert adapter.update() is status and adapter.update() is status
     assert len(calls) == 1 and calls[0][0] == "model.get_frame_pose"
-    assert dict(calls[0][2].parameters) == {"target_role": "arm", "frame_role": "tcp"}
+    assert dict(calls[0][2].parameters) == {"target": _TARGET, "frame": _FRAME}
 
 
 def test_owner_unavailable_and_invalid_input_do_not_acquire_another_authority():

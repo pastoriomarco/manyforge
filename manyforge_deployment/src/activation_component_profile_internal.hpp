@@ -16,22 +16,26 @@ enum class ActivationRuntimeKind {
   kIoProvider = 2,
   kPoseSource = 3,
   kAiModel = 4,
-  /// CONTRACTS §16: a machine's owner component (no targets, no model).
+  /// A machine's owner component (no targets, no model).
   kMachine = 5,
   /// A sensor component (`kind: sensor` model, e.g. a point-cloud source):
   /// no targets, no model asset; its runtime row is `sensors`.
-  kSensor = 6
+  kSensor = 6,
+  /// The AI assistant (`kind: assistant` model): like a sensor, a lane-free
+  /// adapter component with its runtime row in `sensors`.
+  kAssistant = 7
 };
 
-/// I/O devices, pose sources, AI models, machine owners and sensors select
-/// no model and no physical type.
+/// I/O devices, pose sources, AI models, machine owners, sensors and the
+/// assistant select no model and no physical type.
 [[nodiscard]] constexpr bool
 is_model_free_runtime_kind(ActivationRuntimeKind kind) noexcept {
   return kind == ActivationRuntimeKind::kIoProvider ||
          kind == ActivationRuntimeKind::kPoseSource ||
          kind == ActivationRuntimeKind::kAiModel ||
          kind == ActivationRuntimeKind::kMachine ||
-         kind == ActivationRuntimeKind::kSensor;
+         kind == ActivationRuntimeKind::kSensor ||
+         kind == ActivationRuntimeKind::kAssistant;
 }
 
 /// Exact repository-owned semantics selected by one authored component.
@@ -43,7 +47,7 @@ struct ActivationComponentProfile final {
   std::string component_id;
   std::string component_profile_id;
   // Model identity fields are empty and model_family is null for model-free
-  // kinds (kIoProvider, kPoseSource, kAiModel, kMachine, kSensor); they never select a model or physical
+  // kinds (kIoProvider, kPoseSource, kAiModel, kMachine, kSensor, kAssistant); they never select a model or physical
   // component type.
   std::string model_family_id;
   std::string model_asset_id;
@@ -56,17 +60,17 @@ struct ActivationComponentProfile final {
   /// The authored lane (a key of the model's `lanes`); none for model-free
   /// kinds and for a lane-free (pneumatic) tool.
   std::optional<std::string> lane;
-  /// The model's `lanes.<lane>` row (CONTRACTS §12 ModelLaneRow), verbatim.
+  /// The model's `lanes.<lane>` row, verbatim.
   /// A machine owner's is its machine model's row (absent on a lane it has
   /// none for: the host's passive owner).
   std::optional<CanonicalValue> lane_row;
-  /// CONTRACTS §16: a member's owner and role (absent otherwise), and the
+  /// A member's owner and role (absent otherwise), and the
   /// owner's site address reference, which the arm member's controller
   /// profile takes on the real lane.
   std::optional<std::string> owner_component_id{};
   std::optional<std::string> member_role{};
   std::optional<CanonicalValue> owner_device_address_ref{};
-  /// CONTRACTS §16: a machine owner whose arm member is deactivated on a
+  /// A machine owner whose arm member is deactivated on a
   /// lane where the machine has a process (its model has a lane row): the
   /// arm model's `lanes.<lane>` row and family, the arm's description (URDF)
   /// and its joints (`arm_joints`), which the owner's process runs with the
@@ -90,12 +94,11 @@ struct ActivationComponentProfile final {
 /// its lane; it has no lane row (its model's one `adapter_row` serves every
 /// lane).
 ///
-/// Machines (CONTRACTS §16): an owner selects a `kind: machine` model and
+/// Machines: an owner selects a `kind: machine` model and
 /// names the lane its members run on; each member's role is a slot of that
 /// model, at most once per owner; every slot has a member, active or
-/// deactivated (members are never removed; any may be deactivated; AUD-5b
-/// revised). A machine's member model is never placed without an owner
-/// (AUD-5). Typed failures: `deployment_member_role_unknown`,
+/// deactivated (members are never removed; any may be deactivated). A
+/// machine's member model is never placed without an owner. Typed failures: `deployment_member_role_unknown`,
 /// `deployment_member_role_repeated`, `deployment_member_missing`,
 /// `deployment_machine_part_without_machine`. The authored lane must be a key of the
 /// model's `lanes`; only a pneumatic tool may name none (lane-free).
@@ -110,7 +113,7 @@ resolve_activation_component_profiles(
     const std::filesystem::path &capability_root,
     const ActivationDeploymentIntent &intent);
 
-/// CONTRACTS §16: rewrite each I/O member (a model-form `io_device` member)
+/// Rewrite each I/O member (a model-form `io_device` member)
 /// into an ordinary I/O device row: `runtime_kind: io_provider` with one
 /// `io_provider_devices` row (carrying `owner_component_id` and
 /// `member_role`) and one `io_signals` row per model signal on target `io`.
@@ -120,18 +123,35 @@ void expand_activation_machine_members(
     ActivationDeploymentIntent &intent,
     const std::vector<ActivationComponentProfile> &profiles);
 
-/// The repository-owned assistant profile row the intent selects by
-/// `assistant_profile_id` (`maintained_assistant_profiles.v1.json`), with the
-/// shared `mode_profiles` its `mode_profile_id` names; none without an
-/// assistant profile. Unknown profiles fail.
+/// One repository-owned assistant profile row
+/// (`maintained_assistant_profiles.v2.json`), with the shared `mode_profiles`
+/// its `mode_profile_id` names.
 struct ActivationAssistantProfile final {
   CanonicalValue profile;
   /// The selected mode profile (mode id -> mode), or an empty object.
   CanonicalValue modes;
 };
-[[nodiscard]] std::optional<ActivationAssistantProfile>
-resolve_activation_assistant_profile(
+
+/// The chat: the Deployment's one assistant component, the AI model
+/// component it names and its profile (which has a chat mode).
+struct ActivationAssistantChat final {
+  std::string component_id;
+  std::string model_component_id;
+  ActivationAssistantProfile profile;
+};
+
+/// The assistant profiles a Deployment selects: the Deployment-level
+/// `assistant_profile_id` (runtime prompt templates and model aliases) and
+/// the assistant component's chat. Unknown profiles fail; typed refusals
+/// `assistant_component_duplicate` (a second assistant component) and
+/// `assistant_profile_has_no_chat_mode` (its profile has no chat mode).
+struct ActivationAssistantProfiles final {
+  std::optional<ActivationAssistantProfile> runtime;
+  std::optional<ActivationAssistantChat> chat;
+};
+[[nodiscard]] ActivationAssistantProfiles resolve_activation_assistant_profiles(
     const std::filesystem::path &capability_root,
-    const ActivationDeploymentIntent &intent);
+    const ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &profiles);
 
 } // namespace manyforge::deployment::detail

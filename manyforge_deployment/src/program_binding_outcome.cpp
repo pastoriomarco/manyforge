@@ -15,7 +15,7 @@ using Array = CanonicalValue::Array;
 using Object = CanonicalValue::Object;
 
 constexpr std::string_view kOutcomeApiVersion =
-    "manyforge.program-binding-outcome.v1";
+    "manyforge.program-binding-outcome.v2";
 constexpr std::string_view kOutcomeIdentityDomain =
     "manyforge.program-binding-outcome";
 
@@ -29,7 +29,6 @@ constexpr ProgramBindingUnresolvedReason kReasons[] = {
     ProgramBindingUnresolvedReason::kTargetMissing,
     ProgramBindingUnresolvedReason::kTargetIncompatible,
     ProgramBindingUnresolvedReason::kCapabilityUnavailable,
-    ProgramBindingUnresolvedReason::kComponentRoleUnresolved,
 };
 
 template <typename Value>
@@ -40,41 +39,27 @@ template <typename Value>
                             }) == values.end();
 }
 
-[[nodiscard]] auto RowKey(const ProgramBindingUnresolvedRoleDTO &row) {
-  return std::make_tuple(row.component_role_id.value(),
-                         row.target_role_id.has_value(),
-                         row.target_role_id.has_value()
-                             ? row.target_role_id->value()
-                             : std::string{});
+[[nodiscard]] auto RowKey(const ProgramBindingUnresolvedTargetDTO &row) {
+  return row.target;
 }
-
-[[nodiscard]] CanonicalValue OptionalText(const std::optional<std::string> &value) {
-  return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
-}
-
-[[nodiscard]] CanonicalValue OutcomeValue(const ProgramNonExecutableOutcomeDTO &value) {
+[[nodiscard]] CanonicalValue
+OutcomeValue(const ProgramNonExecutableOutcomeDTO &value) {
   Array rows;
-  for (const auto &row : value.unresolved_roles) {
+  for (const auto &row : value.unresolved_targets)
     rows.emplace_back(Object{
-        {"command_target_id",
-         OptionalText(row.command_target_id.has_value()
-                          ? std::optional(row.command_target_id->value())
-                          : std::nullopt)},
-        {"component_role_id", CanonicalValue(row.component_role_id.value())},
-        {"controllable_component_id",
-         CanonicalValue(row.controllable_component_id.value())},
+        {"target",
+         CanonicalValue(Object{
+             {"component_id", CanonicalValue(row.target.component_id.value())},
+             {"command_target_id",
+              CanonicalValue(row.target.command_target_id.value())}})},
         {"detail", CanonicalValue(row.detail)},
-        {"reason", CanonicalValue(std::string(to_string(row.reason)))},
-        {"target_role_id",
-         OptionalText(row.target_role_id.has_value()
-                          ? std::optional(row.target_role_id->value())
-                          : std::nullopt)},
-    });
-  }
+        {"reason", CanonicalValue(std::string(to_string(row.reason)))}});
   Array nodes;
-  for (const auto &node : value.affected_nodes) nodes.emplace_back(node.value());
+  for (const auto &node : value.affected_nodes)
+    nodes.emplace_back(node.value());
   Array groups;
-  for (const auto &group : value.affected_execution_groups) groups.emplace_back(group);
+  for (const auto &group : value.affected_execution_groups)
+    groups.emplace_back(group);
   return CanonicalValue(Object{
       {"affected_execution_groups", CanonicalValue(std::move(groups))},
       {"affected_nodes", CanonicalValue(std::move(nodes))},
@@ -83,28 +68,20 @@ template <typename Value>
       {"program_id", CanonicalValue(value.program_id.value())},
       {"program_revision", CanonicalValue(value.program_revision.value())},
       {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
-      {"role_assignment_digest", CanonicalValue(value.role_assignment_digest.value())},
-      {"unresolved_roles", CanonicalValue(std::move(rows))},
-  });
+      {"unresolved_targets", CanonicalValue(std::move(rows))}});
 }
 
 [[nodiscard]] const CanonicalValue &Required(const CanonicalValue &object,
                                              std::string_view name) {
-  const auto *member = object.is_object() ? object.find_object_member(name) : nullptr;
-  if (member == nullptr) Fail("Program outcome lacks member " + std::string(name));
+  const auto *member =
+      object.is_object() ? object.find_object_member(name) : nullptr;
+  if (member == nullptr)
+    Fail("Program outcome lacks member " + std::string(name));
   return *member;
 }
 
 [[nodiscard]] std::string Text(const CanonicalValue &object, std::string_view name) {
   const auto &value = Required(object, name);
-  if (!value.is_string()) Fail("Program outcome member " + std::string(name) + " is not text");
-  return value.as_string();
-}
-
-[[nodiscard]] std::optional<std::string> OptionalTextMember(const CanonicalValue &object,
-                                                            std::string_view name) {
-  const auto &value = Required(object, name);
-  if (value.is_null()) return std::nullopt;
   if (!value.is_string()) Fail("Program outcome member " + std::string(name) + " is not text");
   return value.as_string();
 }
@@ -137,24 +114,13 @@ std::string_view to_string(const ProgramBindingUnresolvedReason reason) noexcept
       return "target_incompatible";
     case ProgramBindingUnresolvedReason::kCapabilityUnavailable:
       return "capability_unavailable";
-    case ProgramBindingUnresolvedReason::kComponentRoleUnresolved:
-      return "component_role_unresolved";
   }
   return "";
 }
 
-bool ProgramBindingUnresolvedRoleDTO::valid() const noexcept {
-  const bool target_row = target_role_id.has_value();
-  const bool target_reason =
-      reason == ProgramBindingUnresolvedReason::kTargetMissing ||
-      reason == ProgramBindingUnresolvedReason::kTargetIncompatible ||
-      reason == ProgramBindingUnresolvedReason::kCapabilityUnavailable ||
-      reason == ProgramBindingUnresolvedReason::kComponentRoleUnresolved;
-  return !component_role_id.empty() && !controllable_component_id.empty() &&
-         (!target_row || !target_role_id->empty()) &&
-         target_row == command_target_id.has_value() &&
-         (!command_target_id.has_value() || !command_target_id->empty()) &&
-         target_row == target_reason && !to_string(reason).empty() &&
+bool ProgramBindingUnresolvedTargetDTO::valid() const noexcept {
+  return !target.component_id.empty() && !target.command_target_id.empty() &&
+         !to_string(reason).empty() &&
          detail.size() <= kMaximumProgramBindingUnresolvedDetailBytes &&
          detail.find('\0') == std::string::npos;
 }
@@ -162,22 +128,23 @@ bool ProgramBindingUnresolvedRoleDTO::valid() const noexcept {
 bool ProgramNonExecutableOutcomeDTO::valid() const noexcept {
   return !program_id.empty() && !program_revision.empty() &&
          !retained_bundle_id.empty() && !graph_revision.empty() &&
-         content_identity::is_sha256_digest(role_assignment_digest.value()) &&
-         !unresolved_roles.empty() &&
-         unresolved_roles.size() <= kMaximumProgramBindingUnresolvedRows &&
-         std::all_of(unresolved_roles.begin(), unresolved_roles.end(),
+         !unresolved_targets.empty() &&
+         unresolved_targets.size() <= kMaximumProgramBindingUnresolvedRows &&
+         std::all_of(unresolved_targets.begin(), unresolved_targets.end(),
                      [](const auto &row) { return row.valid(); }) &&
-         std::adjacent_find(unresolved_roles.begin(), unresolved_roles.end(),
+         std::adjacent_find(unresolved_targets.begin(),
+                            unresolved_targets.end(),
                             [](const auto &lhs, const auto &rhs) {
                               return !(RowKey(lhs) < RowKey(rhs));
-                            }) == unresolved_roles.end() &&
+                            }) == unresolved_targets.end() &&
          affected_nodes.size() <= kMaximumProgramBindingAffectedNodes &&
          SortedUnique(affected_nodes) &&
-         affected_execution_groups.size() <= kMaximumProgramBindingAffectedGroups &&
+         affected_execution_groups.size() <=
+             kMaximumProgramBindingAffectedGroups &&
          SortedUnique(affected_execution_groups) &&
-         std::none_of(affected_execution_groups.begin(),
-                      affected_execution_groups.end(),
-                      [](const auto &group) { return group.empty() || group == "all"; });
+         std::none_of(
+             affected_execution_groups.begin(), affected_execution_groups.end(),
+             [](const auto &group) { return group.empty() || group == "all"; });
 }
 
 std::string EncodeProgramNonExecutableOutcome(const ProgramNonExecutableOutcomeDTO &value) {
@@ -185,10 +152,11 @@ std::string EncodeProgramNonExecutableOutcome(const ProgramNonExecutableOutcomeD
   return canonical_json(OutcomeValue(value));
 }
 
-ProgramNonExecutableOutcomeDTO DecodeProgramNonExecutableOutcome(const std::string_view encoded) {
+ProgramNonExecutableOutcomeDTO
+DecodeProgramNonExecutableOutcome(const std::string_view encoded) {
   try {
     const auto root = content_identity::parse_canonical_json(encoded);
-    if (!root.is_object() || root.as_object().size() != 9U ||
+    if (!root.is_object() || root.as_object().size() != 8U ||
         Text(root, "api_version") != kOutcomeApiVersion) {
       Fail("Program outcome envelope is not exact");
     }
@@ -197,35 +165,29 @@ ProgramNonExecutableOutcomeDTO DecodeProgramNonExecutableOutcome(const std::stri
         core::ProgramRevision(Text(root, "program_revision")),
         core::RetainedBundleId(Text(root, "retained_bundle_id")),
         core::GraphRevision(Text(root, "graph_revision")),
-        core::ContentDigest(Text(root, "role_assignment_digest")),
-        {}, {}, {}};
-    for (const auto &row : ArrayMember(root, "unresolved_roles")) {
-      if (!row.is_object() || row.as_object().size() != 6U) {
+        {},
+        {},
+        {}};
+    for (const auto &row : ArrayMember(root, "unresolved_targets")) {
+      if (!row.is_object() || row.as_object().size() != 3U)
         Fail("Program outcome row is not exact");
-      }
-      ProgramBindingUnresolvedRoleDTO decoded{
-          core::ComponentRoleId(Text(row, "component_role_id")),
-          std::nullopt,
-          core::ControllableComponentId(Text(row, "controllable_component_id")),
-          std::nullopt,
-          ProgramBindingUnresolvedReason::kComponentMissing,
-          {}};
-      if (auto target = OptionalTextMember(row, "target_role_id")) {
-        decoded.target_role_id = core::TargetRoleId(std::move(*target));
-      }
-      if (auto target = OptionalTextMember(row, "command_target_id")) {
-        decoded.command_target_id = core::CommandTargetId(std::move(*target));
-      }
-      decoded.reason = DecodeReason(Text(row, "reason"));
-      decoded.detail = Text(row, "detail");
-      value.unresolved_roles.push_back(std::move(decoded));
+      const auto &target = Required(row, "target");
+      if (!target.is_object() || target.as_object().size() != 2U)
+        Fail("Program outcome target is not exact");
+      value.unresolved_targets.push_back(
+          {{core::ControllableComponentId(Text(target, "component_id")),
+            core::CommandTargetId(Text(target, "command_target_id"))},
+           DecodeReason(Text(row, "reason")),
+           Text(row, "detail")});
     }
     for (const auto &node : ArrayMember(root, "affected_nodes")) {
-      if (!node.is_string()) Fail("Program outcome node is not text");
+      if (!node.is_string())
+        Fail("Program outcome node is not text");
       value.affected_nodes.emplace_back(node.as_string());
     }
     for (const auto &group : ArrayMember(root, "affected_execution_groups")) {
-      if (!group.is_string()) Fail("Program outcome group is not text");
+      if (!group.is_string())
+        Fail("Program outcome group is not text");
       value.affected_execution_groups.push_back(group.as_string());
     }
     if (!value.valid() || canonical_json(OutcomeValue(value)) != encoded) {
@@ -246,55 +208,16 @@ core::ContentDigest DigestProgramNonExecutableOutcome(
       kOutcomeIdentityDomain, kOutcomeApiVersion, OutcomeValue(value)));
 }
 
-core::ProgramRoleAssignmentDTO parse_program_role_assignment(
-    const CanonicalValue &value) {
-  const auto exact = [](const CanonicalValue &object,
-                        const std::set<std::string> &names,
-                        std::string_view label) {
-    if (!object.is_object() || object.as_object().size() != names.size()) {
-      Fail(std::string(label) + " is not an exact object");
-    }
-    for (const auto &[name, member] : object.as_object()) {
-      if (!names.contains(name)) Fail(std::string(label) + " has an unknown field");
-    }
-  };
-  exact(value, {"component_roles", "target_roles"}, "program_role_assignment");
-  core::ProgramRoleAssignmentDTO result;
-  std::set<std::string> component_roles;
-  for (const auto &row : ArrayMember(value, "component_roles")) {
-    exact(row, {"component_role_id", "controllable_component_id"},
-          "component role assignment");
-    const auto role = Text(row, "component_role_id");
-    if (!component_roles.insert(role).second) {
-      Fail("duplicate component role assignment");
-    }
-    result.component_roles.push_back(
-        {core::ComponentRoleId(role),
-         core::ControllableComponentId(Text(row, "controllable_component_id"))});
-  }
-  std::set<std::string> target_roles;
-  for (const auto &row : ArrayMember(value, "target_roles")) {
-    exact(row, {"target_role_id", "command_target_id"}, "target role assignment");
-    const auto role = Text(row, "target_role_id");
-    if (!target_roles.insert(role).second) {
-      Fail("duplicate target role assignment");
-    }
-    result.target_roles.push_back(
-        {core::TargetRoleId(role), core::CommandTargetId(Text(row, "command_target_id"))});
-  }
-  return result;
-}
-
 ProgramBindingAffectedScope program_binding_affected_scope(
     const core::ProgramExecutionTableDTO &execution_table,
-    const std::vector<core::TargetRoleId> &target_roles) {
-  const std::set<core::TargetRoleId> roles(target_roles.begin(), target_roles.end());
+    const std::vector<core::ProgramTargetReferenceDTO> &targets) {
+  const std::set<core::ProgramTargetReferenceDTO> wanted(targets.begin(), targets.end());
   std::set<std::uint32_t> indices;
   std::set<core::ProgramNodeInstanceId> nodes;
   for (std::uint32_t index = 0U; index < execution_table.nodes.size(); ++index) {
     const auto &node = execution_table.nodes[index];
     if (std::any_of(node.target_effects.begin(), node.target_effects.end(),
-                    [&](const auto &effect) { return roles.contains(effect.target_role_id); })) {
+                    [&](const auto &effect) { return wanted.contains(effect.target); })) {
       indices.insert(index);
       nodes.insert(node.instance_id);
     }

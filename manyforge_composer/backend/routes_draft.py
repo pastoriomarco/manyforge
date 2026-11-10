@@ -16,7 +16,7 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
     StrictArtifactError,
 )
-from manyforge_behavior.model_source_capture import capture_deployment_model_sources
+from manyforge_behavior.model_source_capture import ModelSourceCaptureError, capture_deployment_model_sources
 from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
@@ -85,7 +85,9 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_remove_namespaces",
         "blackboard_draft_upsert_keys",
         "blackboard_draft_upsert_namespaces",
+        "program_draft_remove_contact_policies",
         "program_draft_remove_parameters",
+        "program_draft_upsert_contact_policies",
         "program_draft_upsert_parameters",
         "program_draft_update_motion_defaults",
         "scene_draft_add_object",
@@ -232,9 +234,12 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
     if isinstance(error, ScenarioArtifactError):
         raise scenario_artifact_http_exception(error) from error
     if isinstance(error, ProgramArtifactError):
+        detail = {"code": error.code, "message": str(error)}
+        if error.details is not None:
+            detail["context"] = error.details
         raise HTTPException(
             status_code=error.status_code,
-            detail={"code": error.code, "message": str(error)},
+            detail=detail,
         ) from error
     if isinstance(error, AuthoringWorkspaceError):
         detail = {"code": error.code, "message": str(error)}
@@ -332,7 +337,7 @@ def _applied_context(
         applied = state.headless_client.program_applied()
     except HeadlessClientError as error:
         if error.code == "program_applied_non_executable":
-            # H1a: the preserved Program stays the authoring base so the
+            # The preserved Program stays the authoring base so the
             # operator can edit and re-Apply it; it has no current binding.
             return _non_executable_applied_context(state)
         return None, {
@@ -532,14 +537,13 @@ def _observed_move_arguments(
         ) from error
     targets = targets_projection.get("targets")
     control = control_projection.get("control_state")
-    # execution_targets.v3 / execution_control_state.v6 (H1a-IF.2): motion
+    # execution_targets.v3 / execution_control_state.v6: motion
     # targets are component-owned rows; observations join by the full key.
     direct_rows = [
         {
             "controllable_component_id": component.get("controllable_component_id"),
             "command_target_id": target.get("command_target_id"),
             "operation_capability_id": target.get("operation_capability_id"),
-            "target_role_id": target["command"].get("target_role_id"),
             "command": target["command"],
         }
         for component in (targets.get("components", []) if isinstance(targets, dict) else [])
@@ -577,32 +581,33 @@ def _observed_move_arguments(
     parameters = node.get("parameters", {})
     if not isinstance(parameters, dict):
         parameters = {}
-    node_target_role = parameters.get("target_role")
-    if type(node_target_role) is not str:
+    def valid_reference(value: Any, member: str) -> bool:
+        return (isinstance(value, dict) and set(value) == {"component_id", member}
+                and all(isinstance(value[key], str) and value[key] for key in value))
+
+    node_target = parameters.get("target")
+    if not valid_reference(node_target, "command_target_id"):
         raise DraftSessionError(
             "observed_move_role_missing",
-            "the selected move has no target role; choose the robot target role first",
+            "the selected move has no robot target; choose the robot target first",
             status_code=409,
         )
-    frame_fields = (("base_frame_role", "base"),) if observed_kind == "tcp_pose" else ()
-    for field, label in frame_fields:
-        if type(parameters.get(field)) is not str:
-            raise DraftSessionError(
-                "observed_move_role_missing",
-                f"the selected move has no {label} frame role; choose it before "
-                "capturing the current robot pose",
-                status_code=409,
-            )
+    base_frame = parameters.get("base_frame")
+    if observed_kind == "tcp_pose" and not valid_reference(base_frame, "frame_id"):
+        raise DraftSessionError(
+            "observed_move_role_missing",
+            "the selected move has no base frame; choose it before capturing the current robot pose",
+            status_code=409,
+        )
     tcp_selector = parameters.get("tcp_endpoint", {"kind": "current"})
     if observed_kind == "tcp_pose":
         kind = tcp_selector.get("kind") if isinstance(tcp_selector, dict) else None
-        fields = ({"current": {"kind"}, "default_of_role": {"kind", "role"},
-                   "entry": {"kind", "target_role", "frame_role"}}.get(kind)
+        fields = ({"current": {"kind"}, "default_of_target": {"kind", "target"},
+                   "entry": {"kind", "target", "frame"}}.get(kind)
                   if type(kind) is str else None)
-        if (fields is None or set(tcp_selector) != fields or any(
-            type(tcp_selector.get(field)) is not str or not tcp_selector[field]
-            for field in fields - {"kind"}
-        )):
+        if (fields is None or set(tcp_selector) != fields
+            or ("target" in fields and not valid_reference(tcp_selector.get("target"), "command_target_id"))
+            or ("frame" in fields and not valid_reference(tcp_selector.get("frame"), "frame_id"))):
             raise DraftSessionError(
                 "observed_move_role_missing",
                 "the selected move has no valid TCP selector; choose a TCP before "
@@ -630,7 +635,7 @@ def _observed_move_arguments(
             status_code=409,
         )
     # The Applied binding is only meaningful for the configuration it was
-    # compiled against, so check that before trusting any of its roles.
+    # compiled against, so check that before trusting its references.
     if any(applied.binding_document.get(key) != identity.get(key)
            for key in ("graph_revision", "retained_bundle_id")):
         raise DraftSessionError(
@@ -639,19 +644,19 @@ def _observed_move_arguments(
             "different configuration than the current execution owner; Apply the Program again",
             status_code=409,
         )
-    bound_targets = [row for row in applied.binding_document["target_role_bindings"]
-                     if row["target_role_id"] == node_target_role]
+    bound_targets = [row for row in applied.binding_document["target_bindings"]
+                     if row["target"] == node_target]
     if len(bound_targets) != 1:
         raise DraftSessionError(
             "observed_move_target_unbound",
-            f"target role {node_target_role!r} is not bound in the Applied Program",
+            f"target {node_target!r} is not bound in the Applied Program",
             status_code=409,
         )
     bound = bound_targets[0]
     matching_direct = [
         row for row in direct_rows
-        if row["controllable_component_id"] == bound["controllable_component_id"]
-        and row["command_target_id"] == bound["command_target_id"]
+        if row["controllable_component_id"] == node_target["component_id"]
+        and row["command_target_id"] == node_target["command_target_id"]
         and row["operation_capability_id"] == "execution.trajectory.execute"
     ]
     if len(matching_direct) != 1:
@@ -678,15 +683,15 @@ def _observed_move_arguments(
     if observed_kind == "tcp_pose":
         command = direct["command"]
         base_row = next(
-            (row for row in bound["frame_role_bindings"]
-             if row["frame_role_id"] == parameters["base_frame_role"]),
+            (row for row in applied.binding_document["frame_bindings"]
+             if row["reference"] == base_frame and base_frame in bound["frame_references"]),
             None,
         )
         if base_row is None:
             raise DraftSessionError(
                 "observed_move_target_unbound",
-                f"base frame role {parameters['base_frame_role']!r} is not bound for "
-                f"target role {node_target_role!r} in the Applied Program",
+                f"base frame {base_frame!r} is not bound for target {node_target!r} "
+                "in the Applied Program",
                 status_code=409,
             )
         kind = tcp_selector["kind"]
@@ -701,60 +706,53 @@ def _observed_move_arguments(
                     status_code=409,
                 )
         else:
-            role = tcp_selector["role"] if kind == "default_of_role" else tcp_selector["target_role"]
+            endpoint_ref = tcp_selector["target"]
             endpoint_targets = [
-                row for row in applied.binding_document["target_role_bindings"]
-                if row["target_role_id"] == role
+                row for row in applied.binding_document["target_bindings"]
+                if row["target"] == endpoint_ref
             ]
             if len(endpoint_targets) != 1:
                 raise DraftSessionError(
                     "observed_move_target_unbound",
-                    f"TCP target role {role!r} is not bound in the Applied Program",
+                    f"TCP target {endpoint_ref!r} is not bound in the Applied Program",
                     status_code=409,
                 )
             endpoint_target = endpoint_targets[0]
-            if kind == "default_of_role":
+            if kind == "default_of_target":
                 requested_entry = endpoint_target.get("default_tcp")
                 if not isinstance(requested_entry, dict):
                     raise DraftSessionError(
                         "observed_move_target_unbound",
-                        f"TCP target role {role!r} has no default TCP in the Applied Program",
+                        f"TCP target {endpoint_ref!r} has no default TCP in the Applied Program",
                         status_code=409,
                     )
             else:
-                frame_role = tcp_selector["frame_role"]
+                frame = tcp_selector["frame"]
                 tcp_frame_row = next(
-                    (row for row in endpoint_target["frame_role_bindings"]
-                     if row["frame_role_id"] == frame_role), None,
+                    (row for row in applied.binding_document["frame_bindings"]
+                     if row["reference"] == frame and frame in endpoint_target["frame_references"]), None,
                 )
                 if tcp_frame_row is None:
                     raise DraftSessionError(
                         "observed_move_target_unbound",
-                        f"TCP endpoint target role {role!r} frame role {frame_role!r} "
+                        f"TCP endpoint target {endpoint_ref!r} frame {frame!r} "
                         "is not bound in the Applied Program", status_code=409,
                     )
-                requested_entry = {
-                    "component_id": endpoint_target.get("controllable_component_id"),
-                    "target_id": endpoint_target.get("command_target_id"),
-                    "frame_role_id": frame_role,
-                }
+                requested_entry = {"target": endpoint_ref, "frame": frame}
         # The Applied robot list carries the retained frame identity even when
-        # Current or a component default has no separately authored frame role.
+        # Current or a component default has no separately authored frame.
         binding_tcp = next(
             (row for row in bound.get("robot_tcps", [])
              if isinstance(row, dict) and row.get("entry") == requested_entry), None,
         )
         if tcp_frame_row is None and binding_tcp is not None:
             tcp_frame_row = binding_tcp.get("frame")
-        entry_display = " · ".join(
-            str(requested_entry.get(field, ""))
-            for field in ("component_id", "target_id", "frame_role_id")
-        )
+        entry_display = str(requested_entry)
         descriptor_frames = command["target_descriptor"]["frames"]
-        direct_base_role = command.get("base_frame_role_id")
+        direct_base = command.get("base_frame")
         direct_base_row = next(
             (row for row in descriptor_frames
-             if row["frame_role_id"] == direct_base_role),
+             if row["reference"] == direct_base),
             None,
         )
         requested_base = base_row.get("compiled_frame_name")
@@ -765,9 +763,9 @@ def _observed_move_arguments(
         if requested_base is None or requested_base != observed_base:
             raise DraftSessionError(
                 "observed_move_frame_mismatch",
-                (f"base frame role {parameters['base_frame_role']!r} resolves to "
+                (f"base frame {base_frame!r} resolves to "
                  f"{requested_base!r}, but the robot reports its current pose with base "
-                 f"frame {observed_base!r}; choose the robot's base frame role to capture "
+                 f"frame {observed_base!r}; choose the robot's base frame to capture "
                  "its current pose"
                  if observed_base is not None else
                  "the robot target does not report a base frame for its current pose"),
@@ -832,8 +830,7 @@ def _observed_move_arguments(
                 status_code=409,
             )
         observed_tcp_entry = requested_entry
-        frame_ref = {"kind": "target_frame", "target_role": node_target_role,
-                     "frame_role": parameters["base_frame_role"]}
+        frame_ref = {"kind": "target_frame", "frame": deepcopy(base_frame)}
     if (
         targets_projection.get("ok") is not True
         or control_projection.get("ok") is not True
@@ -843,7 +840,6 @@ def _observed_move_arguments(
         or observed.get("complete") is not True
         or type(observed.get("source_epoch")) is not str
         or type(observed.get("sequence")) is not int
-        or type(direct.get("target_role_id")) is not str
         or type(direct.get("controllable_component_id")) is not str
         or type(direct.get("command_target_id")) is not str
     ):
@@ -911,7 +907,6 @@ def _observed_move_arguments(
     source_identity = {
         "source_epoch": observed["source_epoch"],
         "sequence": observed["sequence"],
-        "target_role_id": direct["target_role_id"],
         "controllable_component_id": direct["controllable_component_id"],
         "command_target_id": direct["command_target_id"],
     }
@@ -1200,6 +1195,106 @@ def discard_program_draft(state: ComposerState, body: Any) -> None:
     )
 
 
+def validate_captured_program_source(
+    state: ComposerState, authoring_input: dict[str, Any], *,
+    expected_identity: AuthoringWorkspaceIdentity | None = None,
+) -> dict[str, Any]:
+    # Capture one composite generation and exact Deployment source closure.
+    try:
+        snapshot = state.authoring_workspace.snapshot()
+        identity = snapshot.identity
+        if expected_identity is not None and identity != expected_identity:
+            raise DraftSessionError("composer_workspace_stale", "Draft changed before reference validation", status_code=409)
+        deployment = snapshot.as_dict()["deployment"]["document"]
+        source_root = state.deployment_source_project_path
+        if not isinstance(deployment, dict) or not isinstance(source_root, str):
+            raise DraftSessionError("deployment_draft_unavailable", "A complete Deployment Draft and source root are required for reference validation", status_code=409)
+        if state.headless_client is None:
+            raise DraftSessionError("activation_preparer_unavailable", "Reference validation is unavailable", status_code=503)
+        authoring = deepcopy(authoring_input)
+        program_digest = raw_sha256_digest(canonical_json_bytes(authoring))
+        source_closure = capture_deployment_model_sources(deployment, project_root=Path(source_root))
+        if state.authoring_workspace.identity() != identity or state.deployment_source_project_path != source_root:
+            raise DraftSessionError("composer_workspace_stale", "Draft changed during reference capture", status_code=409)
+        candidate, diagnostics = derive_candidate(authoring, state.node_catalog)
+        generation = {
+            "workspace_epoch": identity.workspace_epoch,
+            "workspace_revision": identity.workspace_revision,
+            "program_draft_id": identity.program_draft_id,
+            "program_draft_revision": identity.program_draft_revision,
+            "deployment_draft_id": identity.deployment_draft_id,
+            "deployment_draft_revision": identity.deployment_draft_revision,
+        }
+        body = {
+            "schema_version": "manyforge.program_reference_validation_request.v3",
+            "workspace_generation": generation, "program_content_digest": program_digest,
+            "program": authoring, "draft": True, "deployment": deployment,
+            "model_source_closure_digest": raw_sha256_digest(canonical_json_bytes(source_closure)),
+        }
+        # Headless usually holds the prepared candidate for these model sources;
+        # the full closure (megabytes with meshes) goes only when it does not.
+        try:
+            reference = state.headless_client.request("POST", "/api/program/reference-validation", body=body)
+        except HeadlessClientError as error:
+            if error.code != "model_sources_unknown":
+                raise
+            del body["model_source_closure_digest"]
+            body["model_source_closure"] = source_closure
+            reference = state.headless_client.request("POST", "/api/program/reference-validation", body=body)
+        if (not isinstance(reference, dict)
+                or set(reference) != {"schema_version", "workspace_generation", "program_content_digest", "diagnostics", "total_count", "truncated", "selector_facts"}
+                or reference.get("schema_version") != "manyforge.program_reference_validation_response.v2"
+                or reference.get("workspace_generation") != generation
+                or reference.get("program_content_digest") != program_digest
+                or not isinstance(reference.get("selector_facts"), dict)
+                or set(reference["selector_facts"]) != {"components", "targets", "signals", "frames", "bodies", "rules"}
+                or any(not isinstance(rows, list) for rows in reference["selector_facts"].values())
+                or not isinstance(reference.get("diagnostics"), list)
+                or type(reference.get("total_count")) is not int
+                or reference["total_count"] < len(reference["diagnostics"])
+                or type(reference.get("truncated")) is not bool
+                or reference["truncated"] != (reference["total_count"] > len(reference["diagnostics"]))):
+            raise DraftSessionError("activation_preparer_response_invalid", "Reference validation returned a mismatched capture", status_code=502)
+        if (state.authoring_workspace.identity() != identity
+                or state.deployment_source_project_path != source_root
+                or capture_deployment_model_sources(deployment, project_root=Path(source_root)) != source_closure):
+            raise DraftSessionError("composer_workspace_stale", "Draft changed during reference validation", status_code=409)
+    except AuthoringForestError as error:
+        raise HTTPException(status_code=422, detail={
+            "code": error.code, "message": str(error), "context": error.detail,
+        }) from error
+    except ModelSourceCaptureError as error:
+        raise HTTPException(status_code=409, detail={
+            "code": "activation_model_source_invalid", "message": str(error),
+        }) from error
+    except Exception as error:
+        _raise_workspace_error(error)
+    return {
+        "valid": candidate is not None and not diagnostics and reference["total_count"] == 0,
+        "diagnostics": diagnostics,
+        "candidate": candidate.to_dict() if candidate is not None else None,
+        "reference_validation": reference,
+    }
+
+
+def assistant_reference_validation(
+    state: ComposerState, authoring: dict[str, Any], identity: AuthoringWorkspaceIdentity,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The assistant's one reference validation: (selector facts, reference diagnostics).
+
+    A refused validation (for example ``activation_preparer_unavailable``) is
+    one typed diagnostic row with its error code, and no selector facts.
+    """
+
+    try:
+        reference = validate_captured_program_source(state, authoring, expected_identity=identity)["reference_validation"]
+    except HTTPException as error:
+        return None, [{"code": error.detail["code"],
+                       "location": {"document": "program", "path": "", "node_instance_id": None, "parameter": None},
+                       "payload": {"message": error.detail["message"]}}]
+    return reference["selector_facts"], reference["diagnostics"]
+
+
 def create_draft_router(state: ComposerState) -> APIRouter:
     """Expose revision-fenced authoring and thin authoritative Apply/Load."""
 
@@ -1231,7 +1326,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             else None
         )
         deployment = context.get("deployment") if context is not None else None
-        assignment = context.get("program_role_assignment") if context is not None else None
         source_digest = context.get("source_document_digest") if context is not None else None
         scenario_id = context.get("scenario_id") if context is not None else None
         project_path = context.get("project_path") if context is not None else None
@@ -1241,7 +1335,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         )
         if (
             not isinstance(deployment, dict)
-            or not isinstance(assignment, dict)
             or not isinstance(source_digest, str)
             or not isinstance(scenario_id, str)
             or not isinstance(project_path, str)
@@ -1264,8 +1357,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 "An active Deployment model source changed since Apply",
                 status_code=409,
             )
-        if program_document is None:
-            assignment = {"component_roles": [], "target_roles": []}
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1275,7 +1366,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": deployment,
                     "model_source_closure": source_closure,
                     "program": program_document,
-                    "program_role_assignment": assignment,
                 }
             )
         )
@@ -1291,7 +1381,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             "deployment": deepcopy(deployment),
             "model_source_closure": source_closure,
             "program": deepcopy(program_document),
-            "program_role_assignment": assignment,
             "expected_manager_current": {
                 "retained_bundle_id": bundle,
                 "graph_revision": graph,
@@ -1325,19 +1414,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/program/validate")
     def validate_program_source(body: ValidateProgramSourceRequest) -> dict[str, Any]:
-        # Pure derivation with the same build-qualified authoring catalog.
-        # No Draft replacement, Apply, file write, lease, or runtime read.
-        try:
-            candidate, diagnostics = derive_candidate(body.authoring, state.node_catalog)
-        except AuthoringForestError as error:
-            raise HTTPException(status_code=422, detail={
-                "code": error.code, "message": str(error), "context": error.detail,
-            }) from error
-        return {
-            "valid": candidate is not None and not diagnostics,
-            "diagnostics": diagnostics,
-            "candidate": candidate.to_dict() if candidate is not None else None,
-        }
+        return validate_captured_program_source(state, body.authoring)
 
     @router.get("/api/program/workspace")
     def read_workspace() -> dict[str, Any]:
@@ -1430,21 +1507,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 expected_revision=body.expected_draft_revision,
                 discard_changes=body.confirm_discard,
             )
-            def legacy_attach_context() -> tuple[Any, Any]:
-                # An external Apply may change these facts before Open installs
-                # the Draft; attach still checks the selected TCP at run time.
-                publication = state.published_scenario().get("published_scenario")
-                context = (state.applied_activation_for_publication(publication)
-                           if isinstance(publication, dict) else None)
-                if not isinstance(context, dict):
-                    return None, None
-                return context.get("deployment"), context.get("program_role_assignment")
-
             program, source_path = load_program_artifact(
                 body.path,
                 allowed_roots=state.allowed_fs_roots,
                 catalog=_active_catalog(state),
-                legacy_attach_context=legacy_attach_context,
             )
             prepared = state.draft_session.prepare_open_replacement(
                 program, source_path=source_path
@@ -1708,7 +1774,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 )
                 if state.draft_session.retained_state() != retained:
                     raise DraftSessionError(
-                        "composer_draft_stale",
+                        "composer_draft_revision_stale",
                         "Program Draft changed before activation submission",
                         status_code=409,
                     )
@@ -1831,7 +1897,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 body.require_workspace_fence(state.authoring_workspace.identity())
                 if state.draft_session.retained_state() != retained:
                     raise DraftSessionError(
-                        "composer_draft_stale",
+                        "composer_draft_revision_stale",
                         "Program Draft changed before Revert submission",
                         status_code=409,
                     )

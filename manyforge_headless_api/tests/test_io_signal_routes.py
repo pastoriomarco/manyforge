@@ -25,22 +25,20 @@ HOST_EPOCH = "sha256:" + "5c" * 32
 
 def _read() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.target_observation_query.v1",
+        "schema_version": "manyforge.target_observation_query.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": BINDING,
-        "target_role_id": "station",
         "kind": "io_signal",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "station", "signal_name": "part_present"},
     }
 
 
 def _mock(value: bool = True) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.mock_io_input_request.v1",
+        "schema_version": "manyforge.mock_io_input_request.v2",
         "owner_epoch": "owner.1",
         "program_binding_id": BINDING,
-        "target_role_id": "station",
-        "resource_role_id": "part_present",
+        "signal": {"component_id": "station", "signal_name": "part_present"},
         "expected_source_epoch": "3",
         "value": value,
     }
@@ -66,12 +64,12 @@ def _value(value: bool | None = True, quality: str = "fresh") -> dict[str, Any]:
 def _observation(command: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
     echo = {key: item for key, item in _read().items() if key != "schema_version"}
     return {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "ok": True,
         "command": command,
         "target_observation": {
             **echo,
-            "schema_version": "manyforge.target_observation.v1",
+            "schema_version": "manyforge.target_observation.v2",
             "evaluated_at_ns": 1_000,
             "value": value or _value(),
         },
@@ -126,13 +124,13 @@ def test_read_request_is_exactly_the_io_signal_target_query() -> None:
         {"kind": "gripper_status"},
         {"program_binding_id": "binding.1"},
         {"frame_role_id": "tcp"},
-        {"resource_role_id": ""},
-        {"target_role_id": None},
+        {"signal": {"component_id": "station", "signal_name": ""}},
+        {"signal": {"component_id": "", "signal_name": "part_present"}},
     ):
         with pytest.raises(ValidationError):
             IoSignalReadRequest.model_validate({**_read(), **change})
     without = _read()
-    del without["resource_role_id"]
+    del without["signal"]
     with pytest.raises(ValidationError):
         IoSignalReadRequest.model_validate(without)
 
@@ -147,7 +145,7 @@ def test_read_request_is_exactly_the_io_signal_target_query() -> None:
         {"expected_source_epoch": ""},
         {"expected_source_epoch": "s" * 257},
         {"expected_source_epoch": "e\u0301"},
-        {"schema_version": "manyforge.mock_io_input_request.v2"},
+        {"schema_version": "manyforge.mock_io_input_request.v1"},
         {"program_binding_id": "binding.1"},
         {"invert": True},
     ],
@@ -157,7 +155,7 @@ def test_mock_input_request_is_closed_and_strict(change) -> None:
         MockIoInputRequest.model_validate({**_mock(), **change})
 
 
-def test_mock_input_request_has_exactly_seven_fields() -> None:
+def test_mock_input_request_has_exact_fields() -> None:
     assert set(MockIoInputRequest.model_validate(_mock(False)).model_dump()) == set(_mock())
 
 
@@ -169,7 +167,7 @@ def test_mock_input_wire_uses_internal_attribution_and_checks_the_echo() -> None
     assert response["published_cursor"]["record_sequence"] == "10"
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "set_mock_io_input",
             "attribution": {
                 "transport": "internal",
@@ -254,7 +252,7 @@ def test_mock_receipt_is_exact(reply) -> None:
 def test_mock_input_refusal_keeps_the_host_error_code() -> None:
     client, _sent = _client(
         {
-            "api_version": "manyforge.execution_command_response.v1",
+            "api_version": "manyforge.execution_command_response.v4",
             "ok": False,
             "command": "set_mock_io_input",
             "error": {
@@ -310,7 +308,7 @@ def test_routes_forward_one_typed_request_each() -> None:
 def test_mock_route_refusal_is_the_existing_error_envelope() -> None:
     execution = _IoExecution()
     execution.mock_reply = {
-        "api_version": "manyforge.execution_command_response.v1",
+        "api_version": "manyforge.execution_command_response.v4",
         "ok": False,
         "command": "set_mock_io_input",
         "error": {"code": "io_signal_catalog_stale", "message": "stale", "details": {}},
@@ -342,8 +340,8 @@ def test_observation_liveness_is_the_closed_sx2194_projection() -> None:
 
 
 def test_real_host_source_epoch_is_opaque_and_the_sequence_stays_a_counter() -> None:
-    """SX-2518: the host's `source_epoch` is an opaque incarnation (spec 260
-    §2.3), here its real `sha256:` spelling; only the sequence is uint64."""
+    """The host's `source_epoch` is an opaque incarnation, here its real
+    `sha256:` spelling; only the sequence is uint64."""
 
     value = {**_value(False), "source_epoch": HOST_EPOCH}
     client, _ = _client(_observation("query_target", value))

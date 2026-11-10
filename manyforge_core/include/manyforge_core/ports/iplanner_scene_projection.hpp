@@ -13,9 +13,9 @@ namespace manyforge::core {
 
 /// Focused native participant in the logical-scene commit protocol.
 ///
-/// N5b establishes transaction acknowledgement and health. Revision-bound
+/// Covers transaction acknowledgement and health. Revision-bound
 /// leases, rebuild, structural stage/activation, and native query projection
-/// are added through this same focused boundary in N5c.
+/// are added through this same focused boundary.
 class IPlannerSceneProjection : public ISceneCandidateProjection {
 public:
   virtual ~IPlannerSceneProjection() = default;

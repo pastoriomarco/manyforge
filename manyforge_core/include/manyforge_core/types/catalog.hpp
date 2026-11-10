@@ -11,7 +11,7 @@
 
 namespace manyforge::core {
 
-/// Closed v1 catalog-record kind set (spec 430 §3).
+/// Closed v1 catalog-record kind set.
 enum class CatalogRecordKind : std::uint8_t {
   kModelAsset = 0,
   kRuntimeProfile,

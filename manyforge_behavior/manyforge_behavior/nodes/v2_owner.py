@@ -107,7 +107,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
         self._held_before_admission: int | None = None
         self._held_after_operator_stop = False
         self._audit_sink = audit_sink
-        # Decision 133. The index orders this node's starts within the Run:
+        # The index orders this node's starts within the Run:
         # +1 per attempt on its first send, kept across re-entries.
         self._mock_simulation = mock_simulation
         self._mock_start_index = 0
@@ -161,7 +161,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
             )
         except (KeyError, ProgramValueError, TypeError, ValueError) as exc:
             # The inputs fail before any owner request, whatever outcomes the
-            # catalog entry declares (spec 440 §4.6).
+            # catalog entry declares.
             self._input_error = str(exc)
             self._record_node_failure(
                 input_failure_reason(exc), str(exc), exception_failure_details(exc)
@@ -277,7 +277,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
         self._record_failure(reason_code, message, _NODE_FAILURE, details)
 
     def _mock_simulation_ready(self) -> py_trees.common.Status | None:
-        """Decision 133: this attempt's literal Mock simulation is
+        """This attempt's literal Mock simulation is
         acknowledged before the node's action or read.
 
         None: acknowledged, or nothing authored; act now (an instant read
@@ -340,7 +340,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
         return None
 
     def _mock_simulation_end(self) -> None:
-        """Decision 135: the attempt that sent its Mock simulation start
+        """The attempt that sent its Mock simulation start
         ended, so its still-pending change is cancelled. Once per attempt;
         a Halt is no end (the tree is not stopped)."""
 
@@ -479,7 +479,7 @@ def _settled_assessment(task: OwnerTaskSnapshot) -> bool:
 
 
 def _close_eligible(task: OwnerTaskSnapshot) -> bool:
-    """The Kernel's own close permission (DX-1169, SX-1972..1974) on the exact
+    """The Kernel's own close permission on the exact
     current assessment of this terminal execution.
 
     It is read first and alone: retry eligibility, the legacy assessment
@@ -495,7 +495,7 @@ def _close_eligible(task: OwnerTaskSnapshot) -> bool:
 def _needs_intervention(task: OwnerTaskSnapshot) -> bool:
     """Without close permission, the operation shows uncertain effects or an
     unresolved intervention: its identity is retained for the existing
-    intervention/containment handling, never waited on (SX-1972/1973)."""
+    intervention/containment handling, never waited on."""
 
     if task.metadata.get("operation_state") == "intervention_required":
         return True
@@ -514,7 +514,7 @@ def _needs_intervention(task: OwnerTaskSnapshot) -> bool:
 
 def _retired(task: OwnerTaskSnapshot) -> bool:
     """An exact successful read shows the operation no longer resident: its
-    retirement already completed (SX-1974). A failed read is not this proof."""
+    retirement already completed. A failed read is not this proof."""
 
     return task.metadata.get("resident") is False
 
@@ -533,9 +533,9 @@ def _close_decidable(task: OwnerTaskSnapshot) -> bool:
 
 # Exact rereads (one per tick) of a normal failed resident whose current
 # assessment stays unavailable, before its identity is retained for the
-# existing intervention handling instead (SX-1972..1974). A stopped operation
+# existing intervention handling instead. A stopped operation
 # is reread without this bound: its result waits for the component's activity
-# to leave `unknown` (R2, CONTRACTS §9).
+# to leave `unknown`.
 _ASSESSMENT_REREAD_LIMIT: Final = 100
 # A stopped operation whose state reads keep failing fails after the Runner's
 # execution transport timeout (`transport_timeout_s`) instead of waiting
@@ -611,14 +611,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._holds_failure = False
         # The failed operation's own facts when its failure reached the tree.
         self._operation_failure: Mapping[str, Any] | None = None
-        # SIM-1: refused with `simulation_not_playing`; the run owner's
+        # Refused with `simulation_not_playing`; the run owner's
         # operator Stop for it is still to be sent (`simulation_stop_sent`).
         self.simulation_stop_pending = False
-        # SIM-1: the attempt that hold holds, until the next attempt ends it.
+        # The attempt that hold holds, until the next attempt ends it.
         self._simulation_hold_attempt: str | None = None
 
     def _hold_for_simulation(self, error: KernelOperationAdmissionRejectedError) -> None:
-        """SIM-1 (N4b): the command was refused because its simulation isn't
+        """The command was refused because its simulation isn't
         playing. Nothing started; the node holds before admission exactly as
         under the operator's Stop (shown "waiting for Run") and the run owner
         sends that Stop on its groups. The operator's Run releases it and the
@@ -1128,7 +1128,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 isinstance(exc, KernelOperationAdmissionRejectedError)
                 and exc.code == "simulation_not_playing"
             ):
-                # SIM-1 (N4b): never a node failure; the run owner handles
+                # Never a node failure; the run owner handles
                 # it as the operator's Stop and the node waits for Run.
                 self._task = None
                 self._phase = _TaskPhase.SUBMIT
@@ -1139,7 +1139,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             ):
                 # A rule holding its scope refuses the motion: the node fails
                 # at once with `rule_holds` (its `rule_id` in the details) and
-                # the tree handles it (CONTRACTS §8).
+                # the tree handles it.
                 self._record_owner_error(exc.code, exc)
             else:
                 self._record_owner_error("owner_request_failed", exc)
@@ -1345,7 +1345,7 @@ _PREEMPTION_OUTCOMES: Final = {"preempted": "preempted", "superseded_unsent": "s
 
 
 class MotionTaskAdapter(OwnerTaskAdapter):
-    """A motion node retries its own eligible failed attempt (spec 400 §7).
+    """A motion node retries its own eligible failed attempt.
 
     The Kernel alone decides eligibility. On a failure this adapter decides
     first: an eligible attempt with budget left is closed, waits on the
@@ -1354,7 +1354,7 @@ class MotionTaskAdapter(OwnerTaskAdapter):
     task. Any operator release of a hold over the node restarts the budget.
     A logically preempted (or priority-refused) node ends with its literal
     `preempted_result`; every end writes the outcome to the node's
-    system-owned key `node_outcome.<instance_id>` (contract item 42).
+    system-owned key `node_outcome.<instance_id>`.
     """
 
     def __init__(
@@ -1533,7 +1533,7 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         return py_trees.common.Status.RUNNING
 
     def _retry_limit(self) -> int:
-        """This attempt's automatic retry budget (spec 400 §7, spec 410 §4.1).
+        """This attempt's automatic retry budget.
 
         The item-7 grammar applies to the attempt's resolved parameters: a
         relative joint move, or a relative pose/path without a target
@@ -1682,7 +1682,7 @@ class MotionTaskAdapter(OwnerTaskAdapter):
 
 
 class InterruptMotionTaskAdapter(MotionTaskAdapter):
-    """`motion.move_until_signal` / `motion.probe_search` (P5, I5).
+    """`motion.move_until_signal` / `motion.probe_search`.
 
     The terminal operation's typed rule result (`metadata["interrupt_operation"]`,
     the operation projection with its participants' `io_rule_outcomes`) is
@@ -1710,14 +1710,14 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
         self._stop_terminal_waiting = False
 
     def _retry_limit(self) -> int:
-        # Search and contact moves have no automatic retry (spec 410 §4.1);
-        # a source loss (D2) is never retried either (contract 46c).
+        # Search and contact moves have no automatic retry;
+        # a source loss is never retried either.
         return 0
 
     def _await_stop_terminal(
         self, task: OwnerTaskSnapshot
     ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        """SX-2222/2226: the Stop terminal record may follow the operation's
+        """The Stop terminal record may follow the operation's
         terminal state. While the port reports it pending, the node stays
         RUNNING and re-observes the terminal task once per later tick (one
         read_stop each); the wait ends with the record or unproven evidence
@@ -1961,7 +1961,7 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         return self._update_pneumatic_inputs()
 
     def _write_pneumatic_outputs(self) -> py_trees.common.Status:
-        """Each valve output once through the one write path (CONTRACTS §7),
+        """Each valve output once through the one write path,
         then the dwell. A failed, unknown or refused write fails the node
         with its code; nothing is resent."""
 
@@ -2320,7 +2320,7 @@ class GripperStatusWaitAdapter(_OwnerAdapter):
 
 
 def _io_reason(error: BaseException) -> str:
-    """An owner refusal's stable `io_*` reason (spec 210 §5.2), if it has one."""
+    """An owner refusal's stable `io_*` reason, if it has one."""
 
     details = getattr(error, "details", None)
     for candidate in (
@@ -2338,7 +2338,7 @@ class IoInputWaitAdapter(_OwnerAdapter):
     Each attempt registers its own watch and reads it once per tree tick,
     the Runner's normal task-observation cadence; the host latches a match
     on its own, so the cadence only affects notification latency. While the
-    source is not fresh the wait stays RUNNING and visibly unavailable (D3).
+    source is not fresh the wait stays RUNNING and visibly unavailable.
     The optional `timeout_s` counts the attempt's Program time (it stands
     still during a Halt and, like gripper waits, while an operator Stop
     holds the node); expiry fails the node. The node's end, a Program Stop,

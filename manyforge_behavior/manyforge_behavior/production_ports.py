@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import logging
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from hashlib import sha256
 from heapq import heapify, heappop, heappush
 import json
@@ -41,8 +41,8 @@ from manyforge_behavior.kernel_client import (
 from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS as _INTERRUPT_MOTION_NODE_IDS
 from manyforge_behavior.program import MOTION_NODE_IDS as _MOTION_NODE_IDS
 from manyforge_behavior.program import (
-    CHANGED_OUTSIDE_SUFFIX,
     ProgramValidationError,
+    active_tcp_key,
     motion_tcp_selection,
 )
 from manyforge_behavior.orchestration_ports import (
@@ -157,7 +157,7 @@ _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
     }
 )
 _SCENE_RUNTIME_COMMAND_VERSION: Final = "manyforge.manager_command.v1"
-_SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v1"
+_SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v2"
 _SCENE_RUNTIME_IDENTITY_FIELDS: Final = frozenset(
     {
         "retained_bundle_id",
@@ -304,7 +304,7 @@ _SUCCESSOR_FIELDS: Final = ("operation_id", "node_instance_id", "node_attempt_id
 
 
 def _preemption_fact(value: object) -> dict[str, Any]:
-    """The Kernel's logical preemption of this operation (DX-1168), exactly."""
+    """The Kernel's logical preemption of this operation, exactly."""
     by = value.get("by") if isinstance(value, Mapping) else None
     if (
         not isinstance(value, Mapping)
@@ -415,7 +415,7 @@ def _operation_failure_fact(
 
 def _require_participant_binding(participant: Mapping[str, Any]) -> None:
     """Strictly read one operation participant's binding identity: its
-    controller's paired control binding (SX-2119)."""
+    controller's paired control binding."""
 
     def text(name: str) -> bool:
         value = participant.get(name)
@@ -439,23 +439,21 @@ def _base_framed_pose3(
     value: object,
     *,
     field: str,
-    target_role_id: str,
-    base_frame_role_id: str,
+    base_frame: Mapping[str, Any],
 ) -> dict[str, Any]:
     """A wire pose that must be stated in the moving robot's base frame."""
 
     if not _is_base_frame(
         _mapping(value, field=field).get("frame_ref"),
         field=f"{field}.frame_ref",
-        target_role_id=target_role_id,
-        base_frame_role_id=base_frame_role_id,
+        base_frame=base_frame,
     ):
         raise ProductionPortError(f"{field}.frame_ref is not the selected target base frame")
     return _pose3(value, field=field)
 
 
 def _is_base_frame(
-    frame: object, *, field: str, target_role_id: str, base_frame_role_id: str
+    frame: object, *, field: str, base_frame: Mapping[str, Any]
 ) -> bool:
     """True for an absent frame (the base by contract) or the move's base frame."""
 
@@ -464,8 +462,7 @@ def _is_base_frame(
     frame_value = _mapping(frame, field=field)
     return (
         frame_value.get("kind") == "target_frame"
-        and frame_value.get("target_role") == target_role_id
-        and frame_value.get("frame_role") == base_frame_role_id
+        and frame_value.get("frame") == base_frame
     )
 
 
@@ -622,29 +619,23 @@ def _scene_support_contacts(value: object, *, field: str) -> list[dict[str, Any]
     ]
 
 
-def _robot_target(
-    targets: Mapping[str, "_TargetBinding"], target_role_id: str, *, field: str
-) -> dict[str, str]:
-    """The exact robot of one target role, from the captured Program Binding."""
-
-    try:
-        target = targets[target_role_id]
-    except KeyError as exc:
-        raise ProductionPortError(
-            f"{field} names target role {target_role_id!r} absent from the Program Binding"
-        ) from exc
-    return {
-        "target_role_id": target.target_role_id,
-        "controllable_component_id": target.controllable_component_id,
-        "command_target_id": target.command_target_id,
-    }
+def _require_captured_reference(
+    binding: Mapping[str, Any], collection: str, reference: Mapping[str, Any], *, field: str,
+) -> None:
+    rows = _sequence(binding.get(collection, ()), field=collection)
+    matches = sum(_mapping(row, field=collection).get("reference") == reference for row in rows)
+    if not matches:
+        raise ProductionPortError(f"{field} is absent from the Program Binding")
+    if matches != 1:
+        raise ProductionPortError(f"{field} is ambiguous in the Program Binding")
 
 
 def _frame_reference(
     frame: object,
     *,
     field: str,
-    targets: Mapping[str, "_TargetBinding"],
+    targets: Mapping[tuple[str, str], "_TargetBinding"],
+    binding: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Map one authored pose frame to its native frame reference.
 
@@ -662,12 +653,17 @@ def _frame_reference(
                 frame_value["scene_resource_id"], field=f"{field}.scene_resource_id"
             ),
         }
-    if kind == "target_frame" and set(frame_value) == {"kind", "target_role", "frame_role"}:
-        target_role_id = _text(frame_value["target_role"], field=f"{field}.target_role")
+    if kind == "target_frame" and set(frame_value) == {"kind", "frame"}:
+        reference = _mapping(frame_value["frame"], field=f"{field}.frame")
+        if set(reference) != {"component_id", "frame_id"}:
+            raise ProductionPortError(f"{field} has a malformed frame")
+        _require_captured_reference(binding, "frame_bindings", reference, field=field)
         return {
-            "type": "frame_role",
-            "frame_role_id": _text(frame_value["frame_role"], field=f"{field}.frame_role"),
-            "target": _robot_target(targets, target_role_id, field=f"{field}.target_role"),
+            "type": "component_frame",
+            "frame": {
+                "component_id": _text(reference.get("component_id"), field=f"{field}.frame.component_id"),
+                "frame_id": _text(reference.get("frame_id"), field=f"{field}.frame.frame_id"),
+            },
         }
     raise ProductionPortError(f"{field} has an unsupported frame form")
 
@@ -676,14 +672,13 @@ def _reference(
     value: object,
     *,
     field: str,
-    target_role_id: str,
-    base_frame_role_id: str,
-    targets: Mapping[str, "_TargetBinding"],
+    base_frame: Mapping[str, Any],
+    targets: Mapping[tuple[str, str], "_TargetBinding"],
+    binding: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Map one authored motion or pick-offset reference to its native form.
 
-    A robot-qualified frame role must name a target role of the captured
-    Program Binding (``targets``); the native owner resolves every form.
+    Exact component-owned references are forwarded to the native owner.
     """
 
     if value is None:
@@ -691,24 +686,27 @@ def _reference(
     reference = dict(_mapping(value, field=field))
     reference_type = reference.get("type")
     identity_fields = {
-        "frame_role": "frame_role_id",
-        "component_body_role": "collision_body_role_id",
         "scene_resource": "scene_resource_id",
         "runtime_object": "runtime_object_id",
     }
     if reference_type == "cell_frame" and set(reference) == {"type"}:
         return {"type": "cell_frame"}
-    if reference_type == "frame_role" and set(reference) == {
-        "type",
-        "frame_role_id",
-        "target_role",
-    }:
-        robot = _text(reference["target_role"], field=f"{field}.target_role")
-        return {
-            "type": "frame_role",
-            "frame_role_id": _text(reference["frame_role_id"], field=f"{field}.frame_role_id"),
-            "target": _robot_target(targets, robot, field=f"{field}.target_role"),
-        }
+    if reference_type in {"component_frame", "component_body"}:
+        member = "frame" if reference_type == "component_frame" else "body"
+        local = "frame_id" if member == "frame" else "collision_body_id"
+        if set(reference) != {"type", member}:
+            raise ProductionPortError(f"{field} has a malformed reference")
+        item = _mapping(reference[member], field=f"{field}.{member}")
+        if set(item) != {"component_id", local}:
+            raise ProductionPortError(f"{field} has a malformed {member}")
+        _require_captured_reference(
+            binding, "frame_bindings" if member == "frame" else "collision_body_bindings",
+            item, field=field,
+        )
+        return {"type": reference_type, member: {
+            "component_id": _text(item["component_id"], field=f"{field}.{member}.component_id"),
+            local: _text(item[local], field=f"{field}.{member}.{local}"),
+        }}
     if reference_type in identity_fields:
         identity_field = identity_fields[reference_type]
         if set(reference) != {"type", identity_field}:
@@ -723,8 +721,7 @@ def _reference(
             "pose": _base_framed_pose3(
                 reference["pose"],
                 field=f"{field}.pose",
-                target_role_id=target_role_id,
-                base_frame_role_id=base_frame_role_id,
+                base_frame=base_frame,
             ),
         }
     raise ProductionPortError(f"{field} has an unsupported reference form")
@@ -738,26 +735,19 @@ _MAX_IO_WATCHES: Final = 4_096
 
 
 class IoSignalRefusedError(ProductionPortError):
-    """An `io.*` node's signal reference cannot be served; ``code`` is the
-    stable refusal (spec 210 §5.2), raised at Run preparation where literal."""
+    """A captured signal cannot serve the requested ordinary I/O operation."""
 
-    def __init__(
-        self, code: str, message: str, *, target_role_id: str, resource_role_id: str
-    ) -> None:
+    def __init__(self, code: str, message: str, *, reference: Mapping[str, Any]) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
-        self.details = {
-            "reason": code,
-            "reference_type": "resource_role",
-            "reference_id": resource_role_id,
-            "target_role_id": target_role_id,
-        }
+        self.details = {"reason": code, "reference_type": "signal", "reference": dict(reference)}
 
 
 @dataclass(frozen=True, slots=True)
 class _SignalBinding:
-    resource_role_id: str
+    component_id: str
     signal_name: str
+    target: Mapping[str, Any]
     value_type: str
     direction: str
     transition_capability: str
@@ -766,172 +756,81 @@ class _SignalBinding:
 
 @dataclass(frozen=True, slots=True)
 class _TargetBinding:
-    target_role_id: str
-    component_role_id: str
     controllable_component_id: str
     command_target_id: str
     capabilities: Mapping[str, Mapping[str, Any]]
-    # Resource roles bound to one boolean signal, and those bound more than
-    # once (signal and coordinate rows, or repeated signal rows).
-    signals: Mapping[str, _SignalBinding] = field(default_factory=dict)
-    ambiguous_signal_roles: frozenset[str] = frozenset()
     pneumatic_io: Mapping[str, Any] | None = None
 
-
-def _signal_role_bindings(
-    row: Mapping[str, Any],
-) -> tuple[dict[str, _SignalBinding], frozenset[str]]:
-    """One target row's optional `signal_role_bindings` (handshake01).
-
-    The rows arrive already decoded by the generated Program Binding transport
-    (`validate_program_binding`: closed fields, sorted unique roles, no
-    coordinate overlap). Values are checked where they are used (`_io_signal`)
-    so each refusal keeps its own reason; a role bound more than once is
-    reported ambiguous rather than resolved by row order.
-    """
-
-    signals: dict[str, _SignalBinding] = {}
-    repeated: set[str] = set()
-    for signal in row.get("signal_role_bindings", ()):
-        binding = _SignalBinding(**signal)
-        if binding.resource_role_id in signals:
-            repeated.add(binding.resource_role_id)
-        signals[binding.resource_role_id] = binding
-    coordinate_roles = {
-        resource["resource_role_id"] for resource in row.get("resource_role_bindings", ())
-    }
-    return signals, frozenset(repeated | (coordinate_roles & set(signals)))
+    def reference(self) -> dict[str, str]:
+        return {"component_id": self.controllable_component_id, "command_target_id": self.command_target_id}
 
 
-def _io_signal(
-    targets: Mapping[str, _TargetBinding],
-    target_role_id: str,
-    resource_role_id: str,
-    *,
-    output: bool = False,
-) -> _SignalBinding:
-    """The one boolean input (or, for ``output``, output) bound to this
-    target's resource role."""
+def _target_key(reference: Mapping[str, Any]) -> tuple[str, str]:
+    return (_text(reference.get("component_id"), field="target.component_id"),
+            _text(reference.get("command_target_id"), field="target.command_target_id"))
 
+
+def _signal_key(reference: Mapping[str, Any]) -> tuple[str, str]:
+    return (_text(reference.get("component_id"), field="signal.component_id"),
+            _text(reference.get("signal_name"), field="signal.signal_name"))
+
+
+def _io_signal(signals: Mapping[tuple[str, str], _SignalBinding],
+               reference: Mapping[str, Any], *, output: bool = False) -> _SignalBinding:
+    """Resolve the exact sealed signal, including any derived changed-outside row."""
+    key = _signal_key(reference)
+    signal = signals.get(key)
+    if not output and key[1].endswith(".changed_outside"):
+        # Resolve the exact sealed base as an output first, preserving its
+        # typed refusal before asking the runtime owner for the derived input.
+        base = _io_signal(signals, {"component_id": key[0],
+                                   "signal_name": key[1][:-len(".changed_outside")]},
+                          output=True)
+        signal = _SignalBinding(base.component_id, key[1], base.target,
+                                "bool", "input", "sampled_only",
+                                base.signal_descriptor_digest)
     def refuse(code: str, message: str) -> IoSignalRefusedError:
-        return IoSignalRefusedError(
-            code,
-            message,
-            target_role_id=target_role_id,
-            resource_role_id=resource_role_id,
-        )
-
-    target = targets.get(target_role_id)
-    if not output and resource_role_id.endswith(CHANGED_OUTSIDE_SUFFIX):
-        # The core-held boolean input of an output (CONTRACTS §7); the host
-        # resolves it from the output's binding.
-        bound = _io_signal(
-            targets,
-            target_role_id,
-            resource_role_id[: -len(CHANGED_OUTSIDE_SUFFIX)],
-            output=True,
-        )
-        return replace(
-            bound,
-            resource_role_id=resource_role_id,
-            signal_name=bound.signal_name + CHANGED_OUTSIDE_SUFFIX,
-            direction="input",
-            transition_capability="sampled_only",
-        )
-    if target is None or resource_role_id not in target.signals:
-        raise refuse(
-            "io_signal_unbound",
-            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
-            "is not bound to a signal",
-        )
-    if resource_role_id in target.ambiguous_signal_roles:
-        raise refuse(
-            "io_signal_unbound",
-            f"resource role {resource_role_id!r} of target role {target_role_id!r} "
-            "is bound more than once",
-        )
-    signal = target.signals[resource_role_id]
+        return IoSignalRefusedError(code, message, reference=reference)
+    if signal is None:
+        raise refuse("io_signal_unbound", f"signal {key!r} is not bound")
     if signal.value_type != "bool":
-        raise refuse(
-            "io_signal_type_mismatch",
-            f"signal {signal.signal_name!r} is {signal.value_type!r}, not bool",
-        )
-    if output:
-        if signal.direction != "output":
-            raise refuse(
-                "io_signal_direction_mismatch",
-                f"signal {signal.signal_name!r} is an {signal.direction!r}, not an output",
-            )
-        return signal
-    if signal.direction != "input":
-        # An output's reported state is read only through its separately
-        # declared readback input, which this binding does not carry yet.
-        raise refuse(
-            "io_signal_direction_mismatch",
-            f"signal {signal.signal_name!r} is an {signal.direction!r} without a "
-            "declared readback input",
-        )
-    if signal.transition_capability not in {"sampled_only", "captured"}:
-        raise refuse(
-            "io_signal_transition_unsupported",
-            f"signal {signal.signal_name!r} declares an unsupported transition "
-            f"capability {signal.transition_capability!r}",
-        )
+        raise refuse("io_signal_type_mismatch", f"signal {key!r} is not bool")
+    if output and signal.direction != "output":
+        raise refuse("io_signal_direction_mismatch", f"signal {key!r} is not an output")
+    if not output and signal.direction != "input":
+        raise refuse("io_signal_direction_mismatch", f"signal {key!r} is not an input")
+    if not output and signal.transition_capability not in {"sampled_only", "captured"}:
+        raise refuse("io_signal_transition_unsupported", f"signal {key!r} has unsupported transition capability")
     return signal
 
 
-def _validate_io_signal_nodes(
-    program: Mapping[str, Any], targets: Mapping[str, _TargetBinding]
-) -> None:
-    """Refuse literal `io.*` signal references at Run preparation."""
-
+def _validate_io_signal_nodes(program: Mapping[str, Any],
+                              signals: Mapping[tuple[str, str], _SignalBinding]) -> None:
     pending = [program.get("tree")] if program.get("tree") is not None else []
     while pending:
         node = _mapping(pending.pop(), field="Program tree node")
         pending.extend(node.get("children") or ())
-        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {
-            _IO_OUTPUT_NODE_ID,
-            _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID,
-        }:
+        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {_IO_OUTPUT_NODE_ID, _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID}:
             continue
         parameters = node.get("parameters")
         if not isinstance(parameters, Mapping):
             continue
-        target_role_id = parameters.get("target_role")
-        resource_role_id = parameters.get("resource_role")
-        if isinstance(target_role_id, str) and isinstance(resource_role_id, str):
-            _io_signal(
-                targets,
-                target_role_id,
-                resource_role_id,
-                output=node["node_id"]
-                in {_IO_OUTPUT_NODE_ID, _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID},
-            )
+        reference = parameters.get("signal")
+        if isinstance(reference, Mapping):
+            _io_signal(signals, reference, output=node["node_id"] in {_IO_OUTPUT_NODE_ID, _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID})
         if node["node_id"] == "io.wait_for_input":
-            _io_watch_edge(parameters, target_role_id, resource_role_id)
+            _io_watch_edge(parameters, reference if isinstance(reference, Mapping) else {})
 
 
-def _io_watch_edge(
-    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
-) -> None:
-    """This slice watches levels only; an edge is refused, never run."""
-
+def _io_watch_edge(parameters: Mapping[str, Any], reference: Mapping[str, Any]) -> None:
     edge = parameters.get("edge", "level")
     if edge != "level":
-        raise IoSignalRefusedError(
-            "io_watch_condition_unsupported",
-            f"wait_for_input edge {edge!r} is not supported; only level waits are",
-            target_role_id=str(target_role_id),
-            resource_role_id=str(resource_role_id),
-        )
+        raise IoSignalRefusedError("io_watch_condition_unsupported",
+            f"wait_for_input edge {edge!r} is not supported; only level waits are", reference=reference)
 
 
-def _io_watch_condition(
-    parameters: Mapping[str, Any], target_role_id: Any, resource_role_id: Any
-) -> dict[str, Any]:
-    """The one level condition of a node attempt's resolved parameters."""
-
-    _io_watch_edge(parameters, target_role_id, resource_role_id)
+def _io_watch_condition(parameters: Mapping[str, Any], reference: Mapping[str, Any]) -> dict[str, Any]:
+    _io_watch_edge(parameters, reference)
     expected = parameters.get("expected_value")
     if type(expected) is not bool:
         raise ProductionPortError("wait_for_input expected_value must be boolean")
@@ -966,7 +865,8 @@ class _ContactGraspBinding:
 @dataclass(frozen=True, slots=True)
 class _BoundContext:
     capture: ProgramRunPortContext
-    targets: Mapping[str, _TargetBinding]
+    targets: Mapping[tuple[str, str], _TargetBinding]
+    signals: Mapping[tuple[str, str], _SignalBinding]
     contact_grasps: Mapping[str, _ContactGraspBinding]
     request_owner_epoch: str
 
@@ -981,8 +881,6 @@ class _SceneProgramTransport(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _SceneTargetBinding:
-    target_role_id: str
-    component_role_id: str
     controllable_component_id: str
     command_target_id: str
     frames: Mapping[str, tuple[str, str]]
@@ -999,8 +897,8 @@ class _SceneApplyCapture:
 class _SceneBoundContext:
     capture: ProgramRunPortContext | _SceneApplyCapture
     component_models: Mapping[tuple[str, str], tuple[str, str]]
-    component_frames: Mapping[tuple[str, str, str], dict[str, str]]
-    targets: Mapping[str, _SceneTargetBinding]
+    component_frames: Mapping[tuple[str, str], dict[str, str]]
+    targets: Mapping[tuple[str, str], _SceneTargetBinding]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1053,7 +951,7 @@ class _OperationTask:
     acceptance: Mapping[str, Any] | None = None
     held_preparation: _HeldPreparation | None = None
     # Interrupt motion: per participant, the qualified Stop stage order read
-    # once at its terminal observation (SX-2211).
+    # once at its terminal observation.
     interrupt_stop_chain: Mapping[str, tuple[str, ...]] | None = None
     tcp_robot_id: str | None = None
 
@@ -1112,9 +1010,9 @@ def _goal_frame_reference(
     *,
     field: str,
     target_mode: str,
-    target_role_id: str,
-    base_frame_role_id: str,
-    targets: Mapping[str, _TargetBinding],
+    base_frame: Mapping[str, Any],
+    targets: Mapping[tuple[str, str], _TargetBinding],
+    binding: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """The one frame an absolute pose/Cartesian goal is stated in.
 
@@ -1132,8 +1030,7 @@ def _goal_frame_reference(
             if _is_base_frame(
                 frame,
                 field=f"{label}.frame_ref",
-                target_role_id=target_role_id,
-                base_frame_role_id=base_frame_role_id,
+                base_frame=base_frame,
             )
             else _mapping(frame, field=f"{label}.frame_ref")
         )
@@ -1146,7 +1043,7 @@ def _goal_frame_reference(
             f"{field}.frame_ref must be the moving robot's base frame for a "
             "relative goal; its reference is target_reference"
         )
-    return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets)
+    return _frame_reference(frames[0], field=f"{field}.frame_ref", targets=targets, binding=binding)
 
 
 def _motion_spec(
@@ -1212,52 +1109,56 @@ def _motion_spec(
 def _tcp_selector_payload(
     selector: Mapping[str, Any],
     *,
-    targets: Mapping[str, _TargetBinding],
+    targets: Mapping[tuple[str, str], _TargetBinding],
     active_tcp: Any = None,
     active_tcp_key: str = "active_tcp",
 ) -> dict[str, Any]:
-    if set(selector) == {"component_id", "target_id", "frame_role_id"}:
-        return {"kind": "entry", "entry": {
-            name: _text(selector.get(name), field=f"tcp.{name}")
-            for name in ("component_id", "target_id", "frame_role_id")
-        }}
     kind = selector.get("kind")
     if kind == "current":
         if active_tcp is None:
             raise ProductionPortError(f"blackboard key {active_tcp_key!r} has no value")
         entry = _mapping(active_tcp, field=active_tcp_key)
-        return {"kind": "entry", "entry": {
-            name: _text(entry.get(name), field=f"{active_tcp_key}.{name}")
-            for name in ("component_id", "target_id", "frame_role_id")
-        }}
-    if kind == "default_of_role":
-        return {"kind": "default_of_role", "role": _text(selector.get("role"), field="tcp.role")}
-    if kind == "entry":
-        role = _text(selector.get("target_role"), field="tcp.target_role")
-        try:
-            target = targets[role]
-        except KeyError as exc:
-            raise ProductionPortError(f"Program Binding has no target role {role!r}") from exc
-        return {"kind": "entry", "entry": {
-            "component_id": target.controllable_component_id,
-            "target_id": target.command_target_id,
-            "frame_role_id": _text(selector.get("frame_role"), field="tcp.frame_role"),
-        }}
+        if set(entry) != {"target", "frame"}:
+            raise ProductionPortError("active TCP has invalid entry shape")
+        return {"kind": "entry", "target": dict(_mapping(entry["target"], field="tcp.target")),
+                "frame": dict(_mapping(entry["frame"], field="tcp.frame"))}
+    if kind == "default_of_target" and set(selector) == {"kind", "target"}:
+        return {"kind": kind, "target": dict(_mapping(selector["target"], field="tcp.target"))}
+    if kind == "entry" and set(selector) == {"kind", "target", "frame"}:
+        return {"kind": kind, "target": dict(_mapping(selector["target"], field="tcp.target")),
+                "frame": dict(_mapping(selector["frame"], field="tcp.frame"))}
     raise ProductionPortError("unsupported TCP selector kind")
 
 
+def _active_tcp_input_key(parameters: Mapping[str, Any]) -> str:
+    target = _mapping(parameters.get("target"), field="target")
+    return active_tcp_key(_text(target.get("component_id"), field="target.component_id"),
+                          _text(target.get("command_target_id"), field="target.command_target_id"))
+
+
 def _motion_tcp_payload(
-    parameters: Mapping[str, Any], *, targets: Mapping[str, _TargetBinding],
+    parameters: Mapping[str, Any], *, targets: Mapping[tuple[str, str], _TargetBinding],
     active_tcp: Any = None,
 ) -> dict[str, Any]:
+    # OwnerNodeInputs freezes nested mappings. Copy only the authored direct
+    # references before the strict Program selector validator, which expects
+    # ordinary JSON objects; preserve all fields for its closed-shape checks.
+    selector_parameters = dict(parameters)
+    raw_selector = selector_parameters.get("tcp_endpoint")
+    if isinstance(raw_selector, Mapping):
+        selector = dict(raw_selector)
+        for field in ("target", "frame"):
+            if isinstance(selector.get(field), Mapping):
+                selector[field] = dict(selector[field])
+        selector_parameters["tcp_endpoint"] = selector
     try:
-        selection = motion_tcp_selection(parameters)
+        selection = motion_tcp_selection(selector_parameters, direct_references=True)
     except ProgramValidationError as exc:
         raise ProductionPortError(str(exc)) from exc
-    role = _text(parameters.get("target_role"), field="target_role")
+    key = _active_tcp_input_key(parameters)
     return {"tcp_endpoint": _tcp_selector_payload(
         selection["tcp_endpoint"], targets=targets, active_tcp=active_tcp,
-        active_tcp_key=f"active_tcp.{role}",
+        active_tcp_key=key,
     )}
 
 
@@ -1275,10 +1176,11 @@ def program_motion_participant(
     node_id: str,
     parameters: Mapping[str, Any],
     *,
-    targets: Mapping[str, _TargetBinding],
+    targets: Mapping[tuple[str, str], _TargetBinding],
     contact_grasps: Mapping[str, _ContactGraspBinding],
     move_id: str,
     active_tcp: Any = None,
+    binding: Mapping[str, Any] | None = None,
 ) -> ProgramMotionParticipant:
     """Translate resolved motion-node inputs into the native motion payload.
 
@@ -1287,18 +1189,15 @@ def program_motion_participant(
     robot and capability come from the capture, never from the inputs.
     """
 
-    target_role_id = _text(parameters.get("target_role"), field="target_role")
+    target_ref = _mapping(parameters.get("target"), field="target")
     try:
-        target = targets[target_role_id]
+        target = targets[_target_key(target_ref)]
     except KeyError as exc:
-        raise ProductionPortError(
-            f"Program Binding has no target role {target_role_id!r}"
-        ) from exc
+        raise ProductionPortError("Program Binding has no exact target") from exc
     if "execution.trajectory.execute" not in target.capabilities:
-        raise ProductionPortError(
-            f"target role {target_role_id!r} lacks 'execution.trajectory.execute'"
-        )
-    base_frame_role_id = _text(parameters.get("base_frame_role"), field="base_frame_role")
+        raise ProductionPortError("target lacks 'execution.trajectory.execute'")
+    base_frame = _mapping(parameters.get("base_frame"), field="base_frame")
+    _require_captured_reference(binding or {}, "frame_bindings", base_frame, field="base_frame")
     tcp_payload = _motion_tcp_payload(parameters, targets=targets, active_tcp=active_tcp)
     target_mode = parameters.get("target_mode", "absolute")
     if target_mode not in {"absolute", "relative"}:
@@ -1306,16 +1205,16 @@ def program_motion_participant(
     target_reference = _reference(
         parameters.get("target_reference"),
         field="target_reference",
-        target_role_id=target_role_id,
-        base_frame_role_id=base_frame_role_id,
+        base_frame=base_frame,
         targets=targets,
+        binding=binding or {},
     )
     offset_reference = _reference(
         parameters.get("offset_reference"),
         field="offset_reference",
-        target_role_id=target_role_id,
-        base_frame_role_id=base_frame_role_id,
+        base_frame=base_frame,
         targets=targets,
+        binding=binding or {},
     )
     pose_goal = node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS
     goal_poses: Sequence[object] = (
@@ -1334,9 +1233,9 @@ def program_motion_participant(
             goal_poses,
             field="goal" if pose_goal else "path",
             target_mode=target_mode,
-            target_role_id=target_role_id,
-            base_frame_role_id=base_frame_role_id,
+            base_frame=base_frame,
             targets=targets,
+            binding=binding or {},
         )
     )
     runtime_object_ids = {
@@ -1346,7 +1245,7 @@ def program_motion_participant(
     }
     if runtime_object_ids:
         raise ProductionPortError(
-            "runtime-object motion references require the N7-a5.3b " "scene-binding join"
+            "runtime-object motion references require a scene-binding join"
         )
     contact_policy_id = parameters.get("contact_policy_id")
     contact_scene_resource_id = parameters.get("contact_scene_resource_id")
@@ -1375,7 +1274,7 @@ def program_motion_participant(
     payload = {
         "kind": "motion",
         "move_id": _text(move_id, field="move_id"),
-        "base_frame_role_id": base_frame_role_id,
+        "base_frame": dict(base_frame),
         **tcp_payload,
         "tolerances": {
             "joint_position_tol_rad": parameters["joint_position_tol_rad"],
@@ -1446,7 +1345,7 @@ class NativeKernelProgramPort:
         self._current_owner_epoch = current_owner_epoch
         self._scene_pose_source_latch = scene_pose_source_latch
         # The Runner's existing events reader: the Stop terminal projection
-        # of exactly (stop_id, stop_generation), or None (SX-2215); with
+        # of exactly (stop_id, stop_generation), or None; with
         # read_to_end=True it first reads the events to that record.
         self._stop_terminal = stop_terminal
         self._contexts: dict[str, _BoundContext] = {}
@@ -1489,57 +1388,40 @@ class NativeKernelProgramPort:
         request_owner_epoch: str,
     ) -> _BoundContext:
         binding = context.program_binding
-        rows = binding.get("target_role_bindings")
-        # A logical (zero-component) cell's Program binds no target role.
+        rows = binding.get("target_bindings")
         if not isinstance(rows, (list, tuple)):
-            raise ProductionPortError("Program Binding has no target-role bindings")
-        targets: dict[str, _TargetBinding] = {}
-        for index, raw_row in enumerate(rows):
-            row = _mapping(raw_row, field=f"target_role_bindings[{index}]")
-            target_role_id = _text(
-                row.get("target_role_id"),
-                field=f"target_role_bindings[{index}].target_role_id",
-            )
-            component_role_id = _text(
-                row.get("component_role_id"),
-                field=f"target_role_bindings[{index}].component_role_id",
-            )
-            raw_capabilities = row.get("capability_bindings")
-            if not isinstance(raw_capabilities, (list, tuple)):
-                raise ProductionPortError(
-                    f"target role {target_role_id!r} has no capability bindings"
-                )
+            raise ProductionPortError("Program Binding has no target bindings")
+        targets: dict[tuple[str, str], _TargetBinding] = {}
+        for raw_row in rows:
+            row = _mapping(raw_row, field="target_binding")
+            ref = _mapping(row.get("target"), field="target_binding.target")
+            key = (_text(ref.get("component_id"), field="target.component_id"),
+                   _text(ref.get("command_target_id"), field="target.command_target_id"))
+            if key in targets:
+                raise ProductionPortError("Program Binding repeats a target")
             capabilities: dict[str, Mapping[str, Any]] = {}
-            for raw_capability in raw_capabilities:
-                capability = _mapping(
-                    raw_capability,
-                    field=f"target role {target_role_id!r} capability",
-                )
-                capability_id = _text(capability.get("capability_id"), field="capability_id")
-                if capability_id in capabilities:
-                    raise ProductionPortError(
-                        f"target role {target_role_id!r} repeats a capability"
-                    )
-                capabilities[capability_id] = capability
-            if target_role_id in targets:
-                raise ProductionPortError("Program Binding repeats a target role")
-            signals, ambiguous_signal_roles = _signal_role_bindings(row)
-            targets[target_role_id] = _TargetBinding(
-                target_role_id,
-                component_role_id,
-                _text(
-                    row.get("controllable_component_id"),
-                    field=f"target_role_bindings[{index}].controllable_component_id",
-                ),
-                _text(
-                    row.get("command_target_id"),
-                    field=f"target_role_bindings[{index}].command_target_id",
-                ),
-                capabilities,
-                signals,
-                ambiguous_signal_roles,
-                row.get("pneumatic_io"),
-            )
+            for raw_capability in _sequence(row.get("capability_bindings"), field="capability_bindings"):
+                capability = _mapping(raw_capability, field="capability_binding")
+                identity = _text(capability.get("capability_id"), field="capability_id")
+                if identity in capabilities:
+                    raise ProductionPortError("Program Binding repeats a target capability")
+                capabilities[identity] = capability
+            targets[key] = _TargetBinding(key[0], key[1], capabilities, row.get("pneumatic_io"))
+        signals: dict[tuple[str, str], _SignalBinding] = {}
+        for raw_row in _sequence(binding.get("signal_bindings"), field="signal_bindings"):
+            row = _mapping(raw_row, field="signal_binding")
+            reference = _mapping(row.get("reference"), field="signal_binding.reference")
+            key = _signal_key(reference)
+            target = _mapping(row.get("target"), field="signal_binding.target")
+            target_key = (_text(target.get("component_id"), field="target.component_id"),
+                          _text(target.get("command_target_id"), field="target.command_target_id"))
+            if key in signals or target_key not in targets or key[0] != target_key[0]:
+                raise ProductionPortError("signal binding repeats or has an invalid target")
+            signals[key] = _SignalBinding(key[0], key[1], dict(target),
+                _text(row.get("value_type"), field="value_type"),
+                _text(row.get("direction"), field="direction"),
+                _text(row.get("transition_capability"), field="transition_capability"),
+                _text(row.get("signal_descriptor_digest"), field="signal_descriptor_digest"))
         contact_grasps: dict[str, _ContactGraspBinding] = {}
         raw_contact_grasps = binding.get("contact_grasp_bindings", ())
         if not isinstance(raw_contact_grasps, (list, tuple)):
@@ -1568,10 +1450,11 @@ class NativeKernelProgramPort:
                 mode,
             )
         NativeKernelProgramPort._validate_execution_group_policies(context.program)
-        _validate_io_signal_nodes(context.program, targets)
+        _validate_io_signal_nodes(context.program, signals)
         return _BoundContext(
             context,
             targets,
+            signals,
             contact_grasps,
             _text(request_owner_epoch, field="request_owner_epoch"),
         )
@@ -1597,7 +1480,7 @@ class NativeKernelProgramPort:
     def unbind(self, program_run_id: str) -> None:
         # Run teardown releases every watch its nodes still hold.
         self.io_watches.release_run(program_run_id)
-        # SX-2433: settle ENDs while the Run is still current. An END not yet
+        # Settle ENDs while the Run is still current. An END not yet
         # OK-ACKed fails this unbind like an unresolved operation; the context
         # stays bound and the next (finalizing) unbind resends it unchanged.
         if self.mock_simulation.resend_unknown_ends(program_run_id):
@@ -1700,19 +1583,15 @@ class NativeKernelProgramPort:
                 raise ProductionPortError("Program-run scope is stopped; fresh work is unavailable")
 
     @staticmethod
-    def _target(
-        context: _BoundContext,
-        target_role_id: str,
-        capability_id: str | None,
-    ) -> _TargetBinding:
+    def _target(context: _BoundContext, reference: Mapping[str, Any],
+                capability_id: str | None) -> _TargetBinding:
+        key = _target_key(reference)
         try:
-            target = context.targets[target_role_id]
+            target = context.targets[key]
         except KeyError as exc:
-            raise ProductionPortError(
-                f"Program Binding has no target role {target_role_id!r}"
-            ) from exc
+            raise ProductionPortError(f"Program Binding has no target {key!r}") from exc
         if capability_id is not None and capability_id not in target.capabilities:
-            raise ProductionPortError(f"target role {target_role_id!r} lacks {capability_id!r}")
+            raise ProductionPortError(f"target {key!r} lacks {capability_id!r}")
         return target
 
     def _owner_status_for_capture(
@@ -1747,6 +1626,7 @@ class NativeKernelProgramPort:
             parameters,
             targets=context.targets,
             contact_grasps=context.contact_grasps,
+            binding=context.capture.program_binding,
             active_tcp=active_tcp,
             move_id=_request_identity(
                 "move", identity.program_run_id, identity.node_attempt_id
@@ -1818,6 +1698,7 @@ class NativeKernelProgramPort:
             parameters,
             targets=context.targets,
             contact_grasps=context.contact_grasps,
+            binding=context.capture.program_binding,
             active_tcp=active_tcp,
             move_id=_request_identity(
                 "preview-move",
@@ -1849,8 +1730,7 @@ class NativeKernelProgramPort:
                 "execution_owner_unavailable", _owner_failure_message(error)
             ) from error
         previewed: dict[str, Any] = {
-            "component_role_id": participant.target.component_role_id,
-            "target_role_id": participant.target.target_role_id,
+            "target": participant.target.reference(),
             "required_capability_id": "execution.trajectory.execute",
             # Preview is not node work: no span.
             "action_span": None,
@@ -1891,7 +1771,7 @@ class NativeKernelProgramPort:
         ):
             raise ProductionPortError("gripper preset owner and captured deployment disagree")
         inventory = _mapping(envelope.get("targets"), field="execution targets")
-        if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+        if inventory.get("schema_version") != "manyforge.execution_targets.v4":
             raise ProductionPortError("gripper preset target inventory is unsupported")
         components = [
             _mapping(row, field="preset component")
@@ -1916,9 +1796,13 @@ class NativeKernelProgramPort:
                           field="captured gripper command schema")
         contracts = _mapping(descriptor.get("contracts"), field="preset contracts")
         if (
-            descriptor.get("schema_version") != "manyforge.manual_control_gripper_descriptor.v3"
+            descriptor.get("schema_version") != "manyforge.manual_control_gripper_descriptor.v5"
             or descriptor.get("controllable_component_id") != target.controllable_component_id
             or descriptor.get("command_target_id") != target.command_target_id
+            or descriptor.get("target") != {
+                "component_id": target.controllable_component_id,
+                "command_target_id": target.command_target_id,
+            }
             or descriptor.get("source_kind") != "model_role"
             or command.get("command_schema_id") != schema.get("command_schema_id")
             or command.get("command_schema_revision") != schema.get("command_schema_revision")
@@ -1996,8 +1880,8 @@ class NativeKernelProgramPort:
     ) -> tuple[_BoundContext, _TargetBinding, dict[str, Any],
                tuple[str | None, float | None, Mapping[str, Any] | None]]:
         context = self._context(identity.program_run_id)
-        target_role_id = _text(parameters.get("target_role"), field="target_role")
-        target = self._target(context, target_role_id, "tool.gripper.command")
+        target_ref = _mapping(parameters.get("target"), field="target")
+        target = self._target(context, target_ref, "tool.gripper.command")
         capability = target.capabilities["tool.gripper.command"]
         command_schema = _mapping(capability.get("command_schema"), field="gripper command_schema")
         schema_id = _text(command_schema.get("command_schema_id"), field="command_schema_id")
@@ -2047,7 +1931,7 @@ class NativeKernelProgramPort:
                         "option_id": "command_duration_s",
                         "value_s": parameters.get("command_duration_s", 0.0),
                     },
-                    # GRP-2: absent means false (complete on the controller's result).
+                    # Absent means false (complete on the controller's result).
                     *(
                         [{"option_id": "wait_for_duration", "value_bool": True}]
                         if parameters.get("wait_for_duration", False) is True
@@ -2079,19 +1963,18 @@ class NativeKernelProgramPort:
             if len(rows) != 1:
                 raise ProductionPortError("grasp confirmation has no workpiece_grasped input")
             return {"node_id": "io.check_input", "parameters": {
-                "target_role": _text(rows[0].get("target_role_id"), field="pneumatic input target"),
-                "resource_role": _text(rows[0].get("resource_role_id"), field="pneumatic input resource"),
+                "signal": dict(_mapping(rows[0].get("signal"), field="pneumatic input signal")),
                 "expected_value": True}}
         return {"node_id": "gripper.check_status", "parameters": {
-            "target_role": target.target_role_id, "expected_state": "reached"}}
+            "target": target.reference(), "expected_state": "reached"}}
 
     @staticmethod
     def _pick_synthesis(
         parameters: Mapping[str, Any],
         *,
-        target_role_id: str,
-        base_frame_role_id: str,
-        targets: Mapping[str, _TargetBinding],
+        base_frame: Mapping[str, Any],
+        targets: Mapping[tuple[str, str], _TargetBinding],
+        binding: Mapping[str, Any],
     ) -> dict[str, Any]:
         synthesis = _mapping(parameters.get("synthesis"), field="synthesis")
 
@@ -2122,9 +2005,9 @@ class NativeKernelProgramPort:
             return _reference(
                 synthesis.get(name),
                 field=f"synthesis.{name}",
-                target_role_id=target_role_id,
-                base_frame_role_id=base_frame_role_id,
+                base_frame=base_frame,
                 targets=targets,
+                binding=binding,
             )
 
         base_orientation = synthesis.get("base_tool_orientation_rpy_deg", (180.0, 0.0, 0.0))
@@ -2193,7 +2076,7 @@ class NativeKernelProgramPort:
                 identity.node_attempt_id,
                 phase,
             ),
-            "base_frame_role_id": _text(parameters.get("base_frame_role"), field="base_frame_role"),
+            "base_frame": dict(_mapping(parameters.get("base_frame"), field="base_frame")),
             "tcp_endpoint": dict(tcp_endpoint),
             "tolerances": {
                 "joint_position_tol_rad": options.get("joint_position_tol_rad", 0.05),
@@ -2282,8 +2165,7 @@ class NativeKernelProgramPort:
             "expected_scene_revision": None,
             "participants": [
                 {
-                    "component_role_id": target.component_role_id,
-                    "target_role_id": target.target_role_id,
+                    "target": target.reference(),
                     "required_capability_id": capability_id,
                     "action_span": span.as_request(),
                     "execution_scope": {
@@ -2304,14 +2186,10 @@ class NativeKernelProgramPort:
         active_tcp: Any = None,
     ) -> tuple[str, str, dict[str, Any]]:
         context = self._context(identity.program_run_id)
-        target_role_id = _text(parameters.get("target_role"), field="target_role")
-        arm = self._target(
-            context,
-            target_role_id,
-            "execution.trajectory.execute",
-        )
-        tool_role_id = _text(parameters.get("tool_target_role"), field="tool_target_role")
-        tool = self._target(context, tool_role_id, "tool.gripper.command")
+        arm = self._target(context, _mapping(parameters.get("target"), field="target"),
+                           "execution.trajectory.execute")
+        tool = self._target(context, _mapping(parameters.get("tool_target"), field="tool_target"),
+                            "tool.gripper.command")
         owner_epoch = self._owner_status(context)
         selected_object_id = _text(parameters.get("selected_object_id"), field="selected_object_id")
         kind = "place" if node_id == "planning.plan_place_sequence" else "pick"
@@ -2345,11 +2223,9 @@ class NativeKernelProgramPort:
             retreat_motion = self._cartesian_motion((identity_pose, identity_pose))
             synthesis = self._pick_synthesis(
                 parameters,
-                target_role_id=target_role_id,
-                base_frame_role_id=_text(
-                    parameters.get("base_frame_role"), field="base_frame_role"
-                ),
+                base_frame=_mapping(parameters.get("base_frame"), field="base_frame"),
                 targets=context.targets,
+                binding=context.capture.program_binding,
             )
         else:
             contact_policy_id = None
@@ -2357,10 +2233,7 @@ class NativeKernelProgramPort:
             place_pose = _base_framed_pose3(
                 parameters.get("place_pose"),
                 field="place_pose",
-                target_role_id=target_role_id,
-                base_frame_role_id=_text(
-                    parameters.get("base_frame_role"), field="base_frame_role"
-                ),
+                base_frame=_mapping(parameters.get("base_frame"), field="base_frame"),
             )
             offset = [
                 _number(value, field=f"approach_offset_m[{index}]")
@@ -2415,11 +2288,11 @@ class NativeKernelProgramPort:
         }
         _tool_context, _tool_target, tool_payload, _tool_timing = self._gripper_payload(
             {
-                "target_role": tool_role_id,
+                "target": tool.reference(),
                 "position": parameters.get("tool_position"),
                 "max_effort": parameters.get("tool_max_effort"),
                 "command_duration_s": parameters.get("tool_command_duration_s", 0.0),
-                "completion_timeout_s": parameters.get("tool_completion_timeout_s", 30.0),
+                "completion_timeout_s": parameters.get("tool_completion_timeout_s", 5.0),
             },
             identity,
             expected_owner_epoch=owner_epoch,
@@ -2441,10 +2314,8 @@ class NativeKernelProgramPort:
         intent = {
             "sequence_id": sequence_id,
             "selected_object_id": selected_object_id,
-            "carrier_frame_role_id": _text(
-                parameters.get("carrier_frame_role"),
-                field="carrier_frame_role",
-            ),
+            "carrier_frame": dict(_mapping(parameters.get("carrier_frame_ref"),
+                                           field="carrier_frame_ref")),
             "approach_operation": operations["approach"],
             "descend_operation": operations["descend"],
             "tool_operation": operations["tool"],
@@ -2524,8 +2395,7 @@ class NativeKernelProgramPort:
     def _portable_pick_place_planning_output(
         planning: Mapping[str, Any],
         *,
-        target_role_id: str,
-        base_frame_role_id: str,
+        base_frame: Mapping[str, Any],
         tool_position: object,
     ) -> dict[str, Any]:
         """Expose the validated geometry to ordinary subtree children."""
@@ -2542,8 +2412,7 @@ class NativeKernelProgramPort:
             return {
                 "frame_ref": {
                     "kind": "target_frame",
-                    "target_role": target_role_id,
-                    "frame_role": base_frame_role_id,
+                    "frame": dict(base_frame),
                 },
                 "position_m": [
                     _number(position.get(axis), field=f"{field}.position_m.{axis}")
@@ -2611,7 +2480,7 @@ class NativeKernelProgramPort:
             node_id,
             identity,
             inputs.parameters,
-            inputs.blackboard.get("active_tcp"),
+            inputs.blackboard.get(_active_tcp_input_key(inputs.parameters)),
         )
         self._require_scope_open(identity.program_run_id)
         if kind == "pick" and self._scene_pose_source_latch is not None:
@@ -2673,13 +2542,7 @@ class NativeKernelProgramPort:
                 state=OwnerTaskState.SUCCEEDED,
                 output=self._portable_pick_place_planning_output(
                     planning,
-                    target_role_id=_text(
-                        inputs.parameters.get("target_role"), field="target_role"
-                    ),
-                    base_frame_role_id=_text(
-                        inputs.parameters.get("base_frame_role"),
-                        field="base_frame_role",
-                    ),
+                    base_frame=_mapping(inputs.parameters.get("base_frame"), field="base_frame"),
                     tool_position=intent["tool_operation"]["participants"][0]["payload"][
                         "command_value"
                     ]["position"],
@@ -2721,18 +2584,20 @@ class NativeKernelProgramPort:
         preset_owner_status: str | None = None
         gripper_timing = None
         if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
-            context, target, payload = self._motion_payload(node_id, inputs.parameters, identity, inputs.blackboard.get("active_tcp"))
+            context, target, payload = self._motion_payload(
+                node_id, inputs.parameters, identity,
+                inputs.blackboard.get(_active_tcp_input_key(inputs.parameters)),
+            )
             capability_id = "execution.trajectory.execute"
         elif node_id == "motion.set_tcp":
             context = self._context(identity.program_run_id)
-            role = _text(inputs.parameters.get("target_role"), field="target_role")
-            target = self._target(context, role,
+            target = self._target(context, _mapping(inputs.parameters.get("target"), field="target"),
                                   "execution.trajectory.execute")
             selector = _mapping(inputs.parameters.get("tcp"), field="tcp")
             tcp = _tcp_selector_payload(
                 selector, targets=context.targets,
-                active_tcp=inputs.blackboard.get("active_tcp"),
-                active_tcp_key=f"active_tcp.{role}",
+                active_tcp=inputs.blackboard.get(_active_tcp_input_key(inputs.parameters)),
+                active_tcp_key=_active_tcp_input_key(inputs.parameters),
             )
             payload = {"kind": "set_tcp", "tcp": tcp}
             capability_id = "execution.trajectory.execute"
@@ -2755,8 +2620,7 @@ class NativeKernelProgramPort:
             parent_node_attempt_id=identity.parent_node_attempt_id,
         )
         participant = {
-            "component_role_id": target.component_role_id,
-            "target_role_id": target.target_role_id,
+            "target": target.reference(),
             "required_capability_id": capability_id,
             "action_span": span.as_request(),
             "execution_scope": {
@@ -3087,7 +2951,7 @@ class NativeKernelProgramPort:
             raise ProductionPortError("held preparation has no complete no-effect participants")
         row, assignment = _mapping(rows[0], field="held participant"), _mapping(assignments[0], field="accepted participant")
         original = intent["participants"][0]
-        target = self._target(context, original["target_role_id"], "tool.gripper.command")
+        target = self._target(context, _mapping(original["target"], field="target"), "tool.gripper.command")
         if (assignment.get("input_index") != 0
             or not isinstance(assignment.get("participant_id"), str) or not assignment["participant_id"]
             or row.get("participant_id") != assignment["participant_id"]
@@ -3130,7 +2994,7 @@ class NativeKernelProgramPort:
 
         Only an escalated trip needs the containing stage. When the events
         reader lacks the record, one existing ``read_stop`` (``stop_status``)
-        tells its ``terminal_projection`` (SX-2226): ``pending`` waits (the
+        tells its ``terminal_projection``: ``pending`` waits (the
         node re-observes on its next tick), ``recorded`` reads the events to
         the record after that observation, and ``failed``, a missing or an
         unknown value stays unproven. The interrupt mapper still matches the
@@ -3162,7 +3026,7 @@ class NativeKernelProgramPort:
             return None, False
         terminal = self._stop_terminal(stop_id, stop_generation)
         if terminal is None:
-            # SX-2222/2226: the record may follow the operation's terminal
+            # The record may follow the operation's terminal
             # state; the existing read_stop tells whether it is recorded.
             try:
                 status = self._kernel.stop_status(stop_id).get("stop_status")
@@ -3182,8 +3046,8 @@ class NativeKernelProgramPort:
         self, task: _OperationTask, operation: Mapping[str, Any]
     ) -> dict[str, tuple[str, ...]]:
         """Per operation participant, the qualified Stop stage order of the
-        exact Targets motion row it used (``command.stop_response``,
-        SX-2211/2224): same component, command target and operation
+        exact Targets motion row it used (``command.stop_response``):
+        same component, command target and operation
         capability, the participant's actual control binding id and revision,
         and a Targets identity of the Run's Applied bundle and graph. A null
         stop_response (with ``stop_response_error``), an unreadable reply or
@@ -3200,7 +3064,7 @@ class NativeKernelProgramPort:
             ):
                 return {}
             inventory = _mapping(envelope.get("targets"), field="execution targets")
-            if inventory.get("schema_version") != "manyforge.execution_targets.v3":
+            if inventory.get("schema_version") != "manyforge.execution_targets.v4":
                 return {}
             rows: dict[tuple[Any, Any, Any], list[Mapping[str, Any]]] = {}
             for component in _sequence(inventory.get("components"), field="target components"):
@@ -3286,7 +3150,7 @@ class NativeKernelProgramPort:
         for row in operation.get("participants") or ():
             _require_participant_binding(_mapping(row, field="operation participant"))
         if task.node_id in _INTERRUPT_MOTION_NODE_IDS:
-            # The typed rule result the interrupt adapter maps (P5, I5).
+            # The typed rule result the interrupt adapter maps.
             metadata["interrupt_operation"] = {
                 "operation_id": shared.operation_id,
                 "participants": deepcopy(list(operation.get("participants") or ())),
@@ -3509,7 +3373,7 @@ class NativeKernelProgramPort:
         *,
         request_id: str,
     ) -> bool:
-        """Close one settled terminal operation (`close_operation`, DX-1169).
+        """Close one settled terminal operation (`close_operation`).
 
         True once the Kernel retired it (or nothing is retained any more);
         False when refused, which leaves the operation retained for Reset.
@@ -4136,7 +4000,7 @@ class NativeKernelProgramPort:
             if resident:
                 # Existing Kernel reset owns the permanent no-effect proof and
                 # refuses active/unknown borrows. It must never fall through to
-                # provider Reset for this exact class (DX843 private guard).
+                # provider Reset for this exact class.
                 # Retries of explicit Resume use this same deterministic body.
                 pending.reset_submitted = True
                 result = self._kernel.reset(shared.operation_id, pending.reset_request)
@@ -4326,8 +4190,8 @@ class NativeKernelProgramPort:
                     raise ProductionPortError("Active TCP result consumer is unavailable")
                 try:
                     # FIFO is host enqueue order, not proof that a prior send on
-                    # another connection was accepted. DX-3074 accepts this
-                    # residual when retiring an unknown immediate step.
+                    # another connection was accepted. That residual is
+                    # accepted when retiring an unknown immediate step.
                     status = self._kernel.read_active_tcp(ordered=True)
                     rows = status.get("robots")
                     robot = immediate_tasks[0].tcp_robot_id
@@ -4523,7 +4387,6 @@ class _NativeKernelControlTaskPort:
     _CAPABILITIES = {
         "kernel.reset_operation": "execution.reset",
         "kernel.stop_operation": "execution.stop.soft",
-        "kernel.set_runtime_scale": "execution.runtime_scale.operation_scoped",
         # Recovery authority is the exact current offer, not a capability.
         "recovery.apply_offered_action": None,
     }
@@ -4566,21 +4429,21 @@ class _NativeKernelControlTaskPort:
             else:
                 target = self._owner._target(
                     context,
-                    _text(inputs.parameters.get("target_role"), field="target_role"),
+                    _mapping(inputs.parameters.get("target"), field="target"),
                     self._CAPABILITIES[node_id],
                 )
                 task.query = {
-                    "schema_version": "manyforge.program_operation_query.v1",
+                    "schema_version": "manyforge.program_operation_query.v2",
                     "owner_epoch": context.request_owner_epoch,
                     "program_binding_id": context.capture.program_binding_id,
                     "program_run_id": identity.program_run_id,
-                    "target_role_id": target.target_role_id,
+                    "target": target.reference(),
                 }
                 selected = kernel.query_operation(task.query)
                 operation = dict(_mapping(selected.get("operation"), field="operation"))
                 if (
                     selected.get("owner_epoch") != context.request_owner_epoch
-                    or selected.get("target_role_id") != target.target_role_id
+                    or selected.get("target") != target.reference()
                     or operation.get("program_binding_id") != context.capture.program_binding_id
                     or operation.get("program_run_id") != identity.program_run_id
                 ):
@@ -4635,16 +4498,6 @@ class _NativeKernelControlTaskPort:
                                 }
                             ],
                             "reason": "Program Stop node",
-                        }
-                    )
-                elif node_id == "kernel.set_runtime_scale":
-                    response = kernel.set_operation_runtime_scale(
-                        {
-                            **request,
-                            "expected_runtime_scale_generation": operation.get(
-                                "runtime_scale_generation"
-                            ),
-                            "scale": _number(inputs.parameters.get("scale"), field="scale"),
                         }
                     )
                 else:
@@ -4752,18 +4605,6 @@ class _NativeKernelControlTaskPort:
                 state = OwnerTaskState.SUCCEEDED
             elif stop.get("state") not in {"accepted", "stopping", "certifying"}:
                 state, reason = OwnerTaskState.FAILED, "stop_not_certified"
-        elif task.node_id == "kernel.set_runtime_scale":
-            response = kernel.query_operation(task.query)
-            operation = _mapping(response.get("operation"), field="operation")
-            scale = _mapping(response.get("runtime_scale"), field="runtime scale")
-            if operation.get("operation_id") != task.operation["operation_id"] or scale.get(
-                "generation"
-            ) != task.accepted.get("runtime_scale_generation"):
-                state, reason = OwnerTaskState.FAILED, "runtime_scale_superseded"
-            elif scale.get("state") == "applied":
-                state = OwnerTaskState.SUCCEEDED
-            elif scale.get("state") != "pending":
-                state, reason = OwnerTaskState.FAILED, "runtime_scale_not_applied"
         else:
             envelope = kernel.operation(task.operation["operation_id"])
             operation = _mapping(envelope.get("operation"), field="operation")
@@ -4834,23 +4675,25 @@ class _NativeTargetQueryPort:
             context = self._owner._context(identity.program_run_id)
             stored = _mapping(pose, field="pose")
             query = {
-                "schema_version": "manyforge.target_observation_query.v1",
+                "schema_version": "manyforge.target_observation_query.v2",
                 "owner_epoch": context.request_owner_epoch,
                 "program_binding_id": context.capture.program_binding_id,
                 "kind": "frame_transform",
                 "pose": _pose3(stored, field="pose"),
                 "source_frame": _frame_reference(
-                    stored.get("frame_ref"), field="pose.frame_ref", targets=context.targets
+                    stored.get("frame_ref"), field="pose.frame_ref", targets=context.targets,
+                    binding=context.capture.program_binding,
                 ),
                 "target_frame": _frame_reference(
-                    target_frame, field="target_frame", targets=context.targets
+                    target_frame, field="target_frame", targets=context.targets,
+                    binding=context.capture.program_binding,
                 ),
             }
             response = self._owner._kernel.query_target(query)
             observation = _mapping(
                 response.get("target_observation"), field="target_observation"
             )
-            expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+            expected = {**query, "schema_version": "manyforge.target_observation.v2"}
             if any(observation.get(key) != value for key, value in expected.items()):
                 raise ProductionPortError("native frame transform crossed the captured query")
             value = _mapping(observation.get("value"), field="frame transform value")
@@ -4897,23 +4740,19 @@ class _NativeTargetQueryPort:
         """Read one bound boolean input once; only `fresh` authorizes it."""
 
         context = self._owner._context(identity.program_run_id)
-        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
-        resource_role_id = _text(
-            inputs.parameters.get("resource_role"), field="resource_role"
-        )
+        signal_ref = _mapping(inputs.parameters.get("signal"), field="signal")
         try:
-            _io_signal(context.targets, target_role_id, resource_role_id)
+            _io_signal(context.signals, signal_ref)
         except IoSignalRefusedError as error:
             return OwnerInvocationResult(
                 False, reason_code=error.code, message=str(error), details=error.details
             )
         query = {
-            "schema_version": "manyforge.target_observation_query.v1",
+            "schema_version": "manyforge.target_observation_query.v2",
             "owner_epoch": context.request_owner_epoch,
             "program_binding_id": context.capture.program_binding_id,
-            "target_role_id": target_role_id,
             "kind": "io_signal",
-            "resource_role_id": resource_role_id,
+            "signal": dict(signal_ref),
         }
         try:
             response = self._owner._kernel.query_target(query)
@@ -4929,7 +4768,7 @@ class _NativeTargetQueryPort:
                 details=details,
             )
         observation = _mapping(response.get("target_observation"), field="target_observation")
-        expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+        expected = {**query, "schema_version": "manyforge.target_observation.v2"}
         if any(observation.get(key) != value for key, value in expected.items()):
             raise ProductionPortError("native I/O observation crossed the captured query")
         value = _mapping(observation.get("value"), field="I/O observation value")
@@ -4943,14 +4782,13 @@ class _NativeTargetQueryPort:
                 metadata=metadata,
                 reason_code="io_input_unavailable",
                 message=(
-                    f"input {resource_role_id!r} of target role {target_role_id!r} "
+                    f"input {dict(signal_ref)!r} "
                     f"is {value.get('quality')!r}; only a fresh value can be read"
                 ),
                 details={
                     "reason": "io_input_unavailable",
-                    "reference_type": "resource_role",
-                    "reference_id": resource_role_id,
-                    "target_role_id": target_role_id,
+                    "reference_type": "signal",
+                    "reference": dict(signal_ref),
                 },
             )
         if node_id == "io.get_input":
@@ -4964,7 +4802,7 @@ class _NativeTargetQueryPort:
             metadata=metadata,
             reason_code=None if matched else "io_input_not_matched",
             message="" if matched else (
-                f"input {resource_role_id!r} is {value['value']}, expected {expected_value}"
+                f"input {dict(signal_ref)!r} is {value['value']}, expected {expected_value}"
             ),
         )
 
@@ -4997,15 +4835,14 @@ class _NativeTargetQueryPort:
         self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
     ) -> OwnerInvocationResult:
         context = self._owner._context(identity.program_run_id)
-        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
-        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        signal_ref = _mapping(inputs.parameters.get("signal"), field="signal")
         try:
-            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+            signal = _io_signal(context.signals, signal_ref, output=True)
         except IoSignalRefusedError as error:
             return OwnerInvocationResult(
                 False, reason_code=error.code, message=str(error), details=error.details
             )
-        component_id = context.targets[target_role_id].controllable_component_id
+        component_id = signal.component_id
         return self._kernel_call(
             lambda: self._owner._kernel.clear_outside_change(component_id, signal.signal_name)
         )
@@ -5013,23 +4850,22 @@ class _NativeTargetQueryPort:
     def _set_io_output(
         self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
     ) -> OwnerInvocationResult:
-        """One output write through the one write path (CONTRACTS §7): the
+        """One output write through the one write path: the
         same host call as a manual write, made once and never resent. The
         pneumatic gripper's valve steps come here too."""
 
         context = self._owner._context(identity.program_run_id)
-        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
-        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        signal_ref = _mapping(inputs.parameters.get("signal"), field="signal")
         value = inputs.parameters.get("value")
         if type(value) is not bool:
             raise ProductionPortError("io.set_output value must be a boolean")
         try:
-            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+            signal = _io_signal(context.signals, signal_ref, output=True)
         except IoSignalRefusedError as error:
             return OwnerInvocationResult(
                 False, reason_code=error.code, message=str(error), details=error.details
             )
-        component_id = context.targets[target_role_id].controllable_component_id
+        component_id = signal.component_id
         self._owner._require_scope_open(identity.program_run_id)
         return self._kernel_call(
             lambda: self._owner._kernel.set_io_output(component_id, signal.signal_name, value)
@@ -5056,21 +4892,21 @@ class _NativeTargetQueryPort:
         frame_query = node_id == "model.get_frame_pose"
         target = self._owner._target(
             context,
-            _text(inputs.parameters.get("target_role"), field="target_role"),
+            _mapping(inputs.parameters.get("target"), field="target"),
             "model.kinematics.fk" if frame_query else "tool.gripper.feedback",
         )
         query = {
-            "schema_version": "manyforge.target_observation_query.v1",
+            "schema_version": "manyforge.target_observation_query.v2",
             "owner_epoch": context.request_owner_epoch,
             "program_binding_id": context.capture.program_binding_id,
-            "target_role_id": target.target_role_id,
+            "target": target.reference(),
             "kind": "frame_pose" if frame_query else "gripper_status",
         }
         if frame_query:
-            query["frame_role_id"] = _text(inputs.parameters.get("frame_role"), field="frame_role")
+            query["frame"] = dict(_mapping(inputs.parameters.get("frame"), field="frame"))
         response = self._owner._kernel.query_target(query)
         observation = _mapping(response.get("target_observation"), field="target_observation")
-        expected = {**query, "schema_version": "manyforge.target_observation.v1"}
+        expected = {**query, "schema_version": "manyforge.target_observation.v2"}
         if any(observation.get(key) != value for key, value in expected.items()):
             raise ProductionPortError("native target observation crossed the captured query")
         metadata = {key: observation[key] for key in ("source_epoch", "source_sequence")}
@@ -5152,12 +4988,9 @@ class _NativeIoWatchTaskPort:
         owner = self._owner
         context = owner._context(identity.program_run_id)
         owner._require_scope_open(identity.program_run_id)
-        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
-        resource_role_id = _text(
-            inputs.parameters.get("resource_role"), field="resource_role"
-        )
-        condition = _io_watch_condition(inputs.parameters, target_role_id, resource_role_id)
-        _io_signal(context.targets, target_role_id, resource_role_id)
+        signal_ref = _mapping(inputs.parameters.get("signal"), field="signal")
+        condition = _io_watch_condition(inputs.parameters, signal_ref)
+        _io_signal(context.signals, signal_ref)
         attempt = owner._node_attribution(identity)
         task_id = _request_identity(
             "program-io-watch", identity.program_run_id, identity.node_attempt_id
@@ -5170,10 +5003,9 @@ class _NativeIoWatchTaskPort:
         try:
             response = owner._kernel.register_io_watch(
                 {
-                    "schema_version": "manyforge.io_watch_request.v1",
+                    "schema_version": "manyforge.io_watch_request.v2",
                     **attempt,
-                    "target_role_id": target_role_id,
-                    "resource_role_id": resource_role_id,
+                    "signal": dict(signal_ref),
                     "condition": condition,
                 }
             )
@@ -5312,8 +5144,8 @@ def _mock_simulation_row(row: Any) -> dict[str, Any]:
     change = row.get("change")
     return {
         "signal": {
-            "target_role": _text(signal.get("target_role"), field="target_role"),
-            "resource_role": _text(signal.get("resource_role"), field="resource_role"),
+            "component_id": _text(signal.get("component_id"), field="signal.component_id"),
+            "signal_name": _text(signal.get("signal_name"), field="signal.signal_name"),
         },
         "start_value": row.get("start_value"),
         "change": None if change is None else {
@@ -5324,7 +5156,7 @@ def _mock_simulation_row(row: Any) -> dict[str, Any]:
 
 
 class _NativeMockSimulationPort:
-    """Decision 133: `start_mock_io_node_simulation` for one node attempt.
+    """`start_mock_io_node_simulation` for one node attempt.
 
     The request carries the attempt's existing io-watch attribution, the
     Runner's node start index (decimal text) and the node's literal rows in
@@ -5356,10 +5188,10 @@ class _NativeMockSimulationPort:
         self._owner._require_scope_open(identity.program_run_id)
         rows = sorted(
             (_mock_simulation_row(row) for row in signals),
-            key=lambda row: (row["signal"]["target_role"], row["signal"]["resource_role"]),
+            key=lambda row: (row["signal"]["component_id"], row["signal"]["signal_name"]),
         )
         return {
-            "schema_version": "manyforge.mock_io_node_start.v1",
+            "schema_version": "manyforge.mock_io_node_start.v2",
             **self._owner._node_attribution(identity),
             "node_start_index": str(node_start_index),
             "signals": rows,
@@ -5372,7 +5204,7 @@ class _NativeMockSimulationPort:
         paused: bool,
         held_node_instance_ids: Sequence[str] = (),
     ) -> None:
-        """Decision 135 / SX-2411/2416: record the Run's Halt state at the
+        """Record the Run's Halt state at the
         Runner's run_revision. Nothing is sent until the Run's first START
         establishes its Mock context (then exactly once, the current state,
         just before that START); afterwards each change is sent. Never
@@ -5529,7 +5361,7 @@ class _NativeMockSimulationPort:
 
     @staticmethod
     def end_request(start_request: Mapping[str, Any]) -> dict[str, Any]:
-        """Decision 135: the end of the attempt that sent ``start_request``."""
+        """The end of the attempt that sent ``start_request``."""
 
         return {
             "schema_version": "manyforge.mock_io_node_end.v1",
@@ -5544,7 +5376,7 @@ class _NativeMockSimulationPort:
     def _send_end(self, request: dict[str, Any]) -> bool:
         """Send one exact END; only its exact OK ACK settles it (True).
 
-        A lost reply and every refusal (SX-2427: no refusal proves the entry
+        A lost reply and every refusal (no refusal proves the entry
         absent) keep that END pending, resent unchanged; a refusal is logged
         once per END at warning level. The Run reports an END still pending
         when it ends, and its unbind fails until every END is OK-ACKed.
@@ -5624,7 +5456,7 @@ class _NativeKernelOperationTaskPort:
         context = owner._context(identity.program_run_id)
         owner._require_scope_open(identity.program_run_id)
         target = owner._target(
-            context, _text(inputs.parameters.get("target_role"), field="target_role"),
+            context, _mapping(inputs.parameters.get("target"), field="target"),
             "tool.gripper.command",
         )
         if target.pneumatic_io is None:
@@ -5653,14 +5485,13 @@ class _NativeKernelOperationTaskPort:
         outputs = []
         for raw in _sequence(route.get("outputs"), field="pneumatic outputs"):
             row = _mapping(raw, field="pneumatic output")
-            target_role = _text(row.get("target_role_id"), field="pneumatic output target")
-            resource_role = _text(row.get("resource_role_id"), field="pneumatic output resource")
-            signal = _io_signal(context.targets, target_role, resource_role, output=True)
+            signal_ref = _mapping(row.get("signal"), field="pneumatic output signal")
+            signal = _io_signal(context.signals, signal_ref, output=True)
             level = row.get("open_value" if is_open else "close_value")
             if type(level) is not bool:
                 raise ProductionPortError("pneumatic output value must be boolean")
-            outputs.append((level, context.targets[target_role].controllable_component_id, signal.signal_name,
-                            {"target_role": target_role, "resource_role": resource_role, "value": level}))
+            outputs.append((level, signal.component_id, signal.signal_name,
+                            {"signal": dict(signal_ref), "value": level}))
         outputs.sort(key=lambda row: row[:3])
         declared = {row["input"]: row for row in route.get("inputs", ())}
         required = []
@@ -5669,11 +5500,9 @@ class _NativeKernelOperationTaskPort:
             row = declared.get(item.get("input"))
             if row is None or type(item.get("value")) is not bool:
                 raise ProductionPortError("pneumatic required input is not declared")
-            target_role = _text(row.get("target_role_id"), field="pneumatic input target")
-            resource_role = _text(row.get("resource_role_id"), field="pneumatic input resource")
-            _io_signal(context.targets, target_role, resource_role)
-            required.append({"target_role": target_role, "resource_role": resource_role,
-                             "expected_value": item["value"]})
+            signal_ref = _mapping(row.get("signal"), field="pneumatic input signal")
+            _io_signal(context.signals, signal_ref)
+            required.append({"signal": dict(signal_ref), "expected_value": item["value"]})
         return {"outputs": [row[3] for row in outputs], "inputs": required,
                 "logical": OwnerNodeInputs(logical, inputs.blackboard), "dwell_s": dwell}
 
@@ -5790,7 +5619,7 @@ class _NativeKernelProgramScopePort:
 
 
 class HeadlessSceneProgramPort:
-    """Stateless scene intents plus captured Program-role translation.
+    """Stateless scene intents plus captured Program-reference translation.
 
     The native logical-scene owner remains the only scene authority. This port
     keeps only immutable Program Binding context and reads fresh owner truth for
@@ -5802,7 +5631,7 @@ class HeadlessSceneProgramPort:
         transport: _SceneProgramTransport,
         *,
         manager_command: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-        resolve_attach_active_tcp: Callable[[str, str], str] | None = None,
+        resolve_attach_active_tcp: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         program_node_evidence: (
             Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
         ) = None,
@@ -6062,146 +5891,96 @@ class HeadlessSceneProgramPort:
         if not isinstance(context, ProgramRunPortContext):
             raise TypeError("scene context must be one Program-run port context")
         binding = context.program_binding
-        component_rows = _sequence(
-            binding.get("component_role_bindings"),
-            field="component_role_bindings",
-        )
         component_models: dict[tuple[str, str], tuple[str, str]] = {}
-        component_ids: dict[str, str] = {}
-        for index, raw_row in enumerate(component_rows):
-            row = _mapping(raw_row, field=f"component_role_bindings[{index}]")
-            role = _text(
-                row.get("component_role_id"),
-                field=f"component_role_bindings[{index}].component_role_id",
-            )
-            component_id = _text(
-                row.get("controllable_component_id"),
-                field=(f"component_role_bindings[{index}].controllable_component_id"),
-            )
-            if role in component_ids:
-                raise ProductionPortError("Program Binding repeats a component role")
-            component_ids[role] = component_id
-            models = _sequence(
-                row.get("model_role_bindings"),
-                field=f"component_role_bindings[{index}].model_role_bindings",
-            )
-            for model_index, raw_model in enumerate(models):
-                model = _mapping(
-                    raw_model,
-                    field=(
-                        f"component_role_bindings[{index}]." f"model_role_bindings[{model_index}]"
-                    ),
-                )
-                model_role = _text(model.get("model_role_id"), field="model_role_id")
-                key = (role, model_role)
-                value = (
+        components: set[str] = set()
+        for index, raw in enumerate(_sequence(binding.get("component_bindings"), field="component_bindings")):
+            row = _mapping(raw, field=f"component_bindings[{index}]")
+            component = _text(row.get("component_id"), field="component_id")
+            if component in components:
+                raise ProductionPortError("Program Binding repeats a component")
+            components.add(component)
+            for raw_model in _sequence(row.get("model_bindings"), field="model_bindings"):
+                model = _mapping(raw_model, field="model_binding")
+                role = _text(model.get("model_role_id"), field="model_role_id")
+                key = (component, role)
+                if key in component_models:
+                    raise ProductionPortError("Program Binding repeats a component/model role")
+                component_models[key] = (
                     _text(model.get("model_instance_id"), field="model_instance_id"),
                     _text(model.get("model_revision"), field="model_revision"),
                 )
-                if key in component_models:
-                    raise ProductionPortError("Program Binding repeats a component/model role")
-                component_models[key] = value
-
-        target_rows = _sequence(binding.get("target_role_bindings"), field="target_role_bindings")
-        targets: dict[str, _SceneTargetBinding] = {}
-        for index, raw_row in enumerate(target_rows):
-            row = _mapping(raw_row, field=f"target_role_bindings[{index}]")
-            target_role = _text(
-                row.get("target_role_id"),
-                field=f"target_role_bindings[{index}].target_role_id",
-            )
-            component_role = _text(
-                row.get("component_role_id"),
-                field=f"target_role_bindings[{index}].component_role_id",
-            )
-            component_id = _text(
-                row.get("controllable_component_id"),
-                field=f"target_role_bindings[{index}].controllable_component_id",
-            )
-            if component_ids.get(component_role) != component_id:
-                raise ProductionPortError("target and component role bindings disagree")
+        component_frames: dict[tuple[str, str], dict[str, str]] = {}
+        for raw in _sequence(binding.get("frame_bindings"), field="frame_bindings"):
+            row = _mapping(raw, field="frame_binding")
+            reference = _mapping(row.get("reference"), field="frame_binding.reference")
+            component = _text(reference.get("component_id"), field="frame.component_id")
+            frame_id = _text(reference.get("frame_id"), field="frame.frame_id")
+            model = _text(row.get("model_instance_id"), field="model_instance_id")
+            revision = _text(row.get("model_revision"), field="model_revision")
+            if (model, revision) not in {value for (owner, _), value in component_models.items() if owner == component}:
+                raise ProductionPortError("frame binding does not belong to its component model")
+            key = (component, frame_id)
+            if key in component_frames:
+                raise ProductionPortError("Program Binding repeats a component frame")
+            component_frames[key] = {
+                "kind": "component_frame", "controllable_component_id": component,
+                "model_instance_id": model, "frame_role_id": frame_id,
+            }
+        component_bodies: dict[str, set[str]] = {}
+        for raw in _sequence(binding.get("collision_body_bindings"), field="collision_body_bindings"):
+            row = _mapping(raw, field="collision_body_binding")
+            reference = _mapping(row.get("reference"), field="collision_body_binding.reference")
+            component = _text(reference.get("component_id"), field="body.component_id")
+            body = _text(reference.get("collision_body_id"), field="body.collision_body_id")
+            model = _text(row.get("model_instance_id"), field="model_instance_id")
+            revision = _text(row.get("model_revision"), field="model_revision")
+            if (model, revision) not in {value for (owner, _), value in component_models.items() if owner == component}:
+                raise ProductionPortError("collision body binding does not belong to its component model")
+            bodies = component_bodies.setdefault(component, set())
+            if body in bodies:
+                raise ProductionPortError("Program Binding repeats a component collision body")
+            bodies.add(body)
+        targets: dict[tuple[str, str], _SceneTargetBinding] = {}
+        for raw in _sequence(binding.get("target_bindings"), field="target_bindings"):
+            row = _mapping(raw, field="target_binding")
+            target = _mapping(row.get("target"), field="target_binding.target")
+            component = _text(target.get("component_id"), field="target.component_id")
+            command = _text(target.get("command_target_id"), field="target.command_target_id")
+            key = (component, command)
+            if component not in components or key in targets:
+                raise ProductionPortError("Program Binding target component is absent or repeated")
             frames: dict[str, tuple[str, str]] = {}
-            for raw_frame in _sequence(row.get("frame_role_bindings"), field="frame_role_bindings"):
-                frame = _mapping(raw_frame, field="frame_role_binding")
-                frame_role = _text(frame.get("frame_role_id"), field="frame_role_id")
-                value = (
-                    _text(frame.get("model_instance_id"), field="model_instance_id"),
-                    _text(frame.get("model_revision"), field="model_revision"),
-                )
-                if frame_role in frames:
-                    raise ProductionPortError(f"target role {target_role!r} repeats a frame role")
-                frames[frame_role] = value
-            body_roles: list[str] = []
-            for raw_body in _sequence(
-                row.get("collision_body_role_bindings"),
-                field="collision_body_role_bindings",
-            ):
-                body = _mapping(raw_body, field="collision_body_role_binding")
-                body_roles.append(
-                    _text(
-                        body.get("collision_body_role_id"),
-                        field="collision_body_role_id",
-                    )
-                )
-            if len(body_roles) != len(set(body_roles)):
-                raise ProductionPortError(
-                    f"target role {target_role!r} repeats a collision-body role"
-                )
-            if target_role in targets:
-                raise ProductionPortError("Program Binding repeats a target role")
-            targets[target_role] = _SceneTargetBinding(
-                target_role_id=target_role,
-                component_role_id=component_role,
-                controllable_component_id=component_id,
-                command_target_id=_text(row.get("command_target_id"), field="command_target_id"),
-                frames=frames,
-                collision_body_roles=frozenset(body_roles),
-            )
-
-        component_frames: dict[tuple[str, str, str], dict[str, str]] = {}
-        for (component_role, model_role), (
-            model_instance_id,
-            model_revision,
-        ) in component_models.items():
-            component_id = component_ids[component_role]
-            for target in targets.values():
-                if target.controllable_component_id != component_id:
+            for raw_frame in _sequence(row.get("frame_references"), field="frame_references"):
+                ref = _mapping(raw_frame, field="target.frame_reference")
+                owner = _text(ref.get("component_id"), field="frame.component_id")
+                frame_id = _text(ref.get("frame_id"), field="frame.frame_id")
+                if owner != component:
                     continue
-                for frame_role, frame_binding in target.frames.items():
-                    if frame_binding[0] != model_instance_id:
-                        continue
-                    if frame_binding[1] != model_revision:
-                        raise ProductionPortError(
-                            "component and target frame model revisions disagree"
-                        )
-                    key = (component_role, model_role, frame_role)
-                    frame = {
-                        "kind": "component_frame",
-                        "controllable_component_id": component_id,
-                        "model_instance_id": model_instance_id,
-                        "frame_role_id": frame_role,
-                    }
-                    previous = component_frames.get(key)
-                    if previous is not None and previous != frame:
-                        raise ProductionPortError(
-                            "Program Binding gives an ambiguous component frame"
-                        )
-                    component_frames[key] = frame
-        return _SceneBoundContext(
-            capture=context,
-            component_models=component_models,
-            component_frames=component_frames,
-            targets=targets,
-        )
+                frame_row = component_frames.get((owner, frame_id))
+                if frame_row is not None:
+                    model_id = frame_row["model_instance_id"]
+                    revision = next(rev for (candidate, _), (model, rev) in component_models.items()
+                                    if candidate == owner and model == model_id)
+                    frames[frame_id] = (model_id, revision)
+            bodies: set[str] = set()
+            for raw_body in _sequence(row.get("collision_body_references"), field="collision_body_references"):
+                ref = _mapping(raw_body, field="target.collision_body_reference")
+                owner = _text(ref.get("component_id"), field="body.component_id")
+                body = _text(ref.get("collision_body_id"), field="body.collision_body_id")
+                if owner == component and body in component_bodies.get(component, set()):
+                    bodies.add(body)
+            targets[key] = _SceneTargetBinding(component, command, frames, frozenset(bodies))
+        return _SceneBoundContext(context, component_models, component_frames, targets)
 
     @staticmethod
-    def _target(context: _SceneBoundContext, target_role_id: str) -> _SceneTargetBinding:
+    def _target(context: _SceneBoundContext, reference: Mapping[str, Any]) -> _SceneTargetBinding:
+        target = _mapping(reference, field="target")
+        key = (_text(target.get("component_id"), field="target.component_id"),
+               _text(target.get("command_target_id"), field="target.command_target_id"))
         try:
-            return context.targets[target_role_id]
+            return context.targets[key]
         except KeyError as exc:
-            raise ProductionPortError(
-                f"Program Binding has no target role {target_role_id!r}"
-            ) from exc
+            raise ProductionPortError("Program Binding has no exact target") from exc
 
     def _context(self, program_run_id: str) -> _SceneBoundContext:
         with self._lock:
@@ -6511,17 +6290,10 @@ class HeadlessSceneProgramPort:
         kind = frame.get("kind")
         if kind == "cell_frame" and set(frame) == {"kind"}:
             frame_ref = {"kind": "cell_frame", "cell_id": cell_id}
-        elif kind == "component_frame" and set(frame) == {
-            "kind",
-            "component_role",
-            "model_role",
-            "frame_role",
-        }:
-            key = (
-                _text(frame["component_role"], field="component_role"),
-                _text(frame["model_role"], field="model_role"),
-                _text(frame["frame_role"], field="frame_role"),
-            )
+        elif kind == "component_frame" and set(frame) == {"kind", "frame"}:
+            reference = _mapping(frame["frame"], field="frame")
+            key = (_text(reference.get("component_id"), field="frame.component_id"),
+                   _text(reference.get("frame_id"), field="frame.frame_id"))
             try:
                 frame_ref = dict(context.component_frames[key])
             except KeyError as exc:
@@ -6546,25 +6318,14 @@ class HeadlessSceneProgramPort:
         kind = frame.get("kind")
         if kind == "cell_frame" and set(frame) == {"kind"}:
             return converted, {"kind": "cell_frame", "cell_id": view.cell_id}
-        if kind == "target_frame" and set(frame) == {
-            "kind",
-            "target_role",
-            "frame_role",
-        }:
-            target = self._target(context, _text(frame["target_role"], field="target_role"))
-            frame_role = _text(frame["frame_role"], field="frame_role")
+        if kind == "target_frame" and set(frame) == {"kind", "frame"}:
+            reference = _mapping(frame["frame"], field="frame")
+            key = (_text(reference.get("component_id"), field="frame.component_id"),
+                   _text(reference.get("frame_id"), field="frame.frame_id"))
             try:
-                model_instance_id, _model_revision = target.frames[frame_role]
+                return converted, dict(context.component_frames[key])
             except KeyError as exc:
-                raise ProductionPortError("Program Binding has no exact target frame") from exc
-            # B7: a frame's component is its owner. A target's frames belong to
-            # its own component (one name per frame, no alias rows).
-            return converted, {
-                "kind": "component_frame",
-                "controllable_component_id": target.controllable_component_id,
-                "model_instance_id": model_instance_id,
-                "frame_role_id": frame_role,
-            }
+                raise ProductionPortError("Program Binding has no exact component frame") from exc
         if kind == "scene_resource" and set(frame) == {
             "kind",
             "scene_resource_id",
@@ -6862,9 +6623,17 @@ class HeadlessSceneProgramPort:
                         "reason": error.code, "message": str(error), "owner_refused": True,
                         "last_observed_remaining": sorted(view.objects)}
             except Exception as error:
-                return {"state": "unknown", "resource_id": resource_id,
-                        "reason": "scene_outcome_unknown", "message": str(error),
-                        "last_observed_remaining": sorted(view.objects)}
+                unknown = {"state": "unknown", "resource_id": resource_id,
+                           "reason": "scene_outcome_unknown", "message": str(error),
+                           "last_observed_remaining": sorted(view.objects)}
+                if isinstance(error, SceneOutcomeUnknownError):
+                    cause_code = getattr(error, "cause_code", None)
+                    cause_details = getattr(error, "cause_details", None)
+                    if isinstance(cause_code, str) and cause_code:
+                        unknown["cause_code"] = cause_code
+                        if isinstance(cause_details, Mapping):
+                            unknown["cause_details"] = dict(cause_details)
+                return unknown
             return None
 
         for attachment in view.attachments:
@@ -7213,9 +6982,9 @@ class HeadlessSceneProgramPort:
                     "expected_attached": None,
                 }
             elif node_id == "scene.attach_carried_object":
-                target_role = _text(parameters.get("target_role"), field="target_role")
-                target = self._target(context, target_role)
-                if ("carrier_frame" in parameters) == ("carrier_frame_role" in parameters):
+                target_ref = _mapping(parameters.get("target"), field="target")
+                target = self._target(context, target_ref)
+                if ("carrier_frame" in parameters) == ("carrier_frame_ref" in parameters):
                     raise ProductionPortError("requires exactly one carrier frame selector")
                 if "carrier_frame" in parameters:
                     selector = _mapping(parameters["carrier_frame"], field="carrier_frame")
@@ -7223,21 +6992,22 @@ class HeadlessSceneProgramPort:
                         raise ProductionPortError("invalid carrier frame selector")
                     if self._resolve_attach_active_tcp is None:
                         raise ProductionPortError("Active TCP holder resolution is unavailable")
-                    frame_role = _text(
-                        self._resolve_attach_active_tcp(context.capture.program_binding_id, target_role),
-                        field="resolved carrier frame",
-                    )
+                    frame = _mapping(self._resolve_attach_active_tcp(
+                        context.capture.program_binding_id, target_ref), field="resolved carrier frame")
                 else:
-                    frame_role = _text(parameters.get("carrier_frame_role"), field="carrier_frame_role")
-                    if frame_role not in target.frames:
+                    frame = _mapping(parameters.get("carrier_frame_ref"), field="carrier_frame_ref")
+                    if (frame.get("component_id") != target.controllable_component_id
+                            or frame.get("frame_id") not in target.frames):
                         raise ProductionPortError("Program Binding has no exact carrier frame")
-                touch_body_roles = [
-                    _text(value, field="touch_body_role")
-                    for value in _sequence(
-                        parameters.get("touch_body_roles"),
-                        field="touch_body_roles",
-                    )
-                ]
+                if frame.get("component_id") != target.controllable_component_id:
+                    raise ProductionPortError("carrier frame belongs to another component")
+                frame_role = _text(frame.get("frame_id"), field="carrier_frame_ref.frame_id")
+                touch_body_roles = []
+                for value in _sequence(parameters.get("touch_bodies"), field="touch_bodies"):
+                    body = _mapping(value, field="touch_body")
+                    if body.get("component_id") != target.controllable_component_id:
+                        raise ProductionPortError("touch body belongs to another component")
+                    touch_body_roles.append(_text(body.get("collision_body_id"), field="touch_body.collision_body_id"))
                 if len(touch_body_roles) != len(set(touch_body_roles)) or any(
                     role not in target.collision_body_roles for role in touch_body_roles
                 ):
@@ -7254,7 +7024,8 @@ class HeadlessSceneProgramPort:
                         "carried-object",
                         identity.program_run_id,
                         scene_resource_id,
-                        target_role,
+                        target.controllable_component_id,
+                        target.command_target_id,
                     ),
                     "scene_resource_id": scene_resource_id,
                     "controllable_component_id": target.controllable_component_id,
@@ -7291,7 +7062,7 @@ class HeadlessSceneProgramPort:
                 )
                 target = self._target(
                     context,
-                    _text(parameters.get("target_role"), field="target_role"),
+                    _mapping(parameters.get("target"), field="target"),
                 )
                 matches = [
                     attachment

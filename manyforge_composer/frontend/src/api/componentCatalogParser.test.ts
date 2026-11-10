@@ -64,7 +64,7 @@ describe('component catalog parser', () => {
     expect(() => parseComponentCatalog({ ...catalog, entries: [{ ...machine, members: [{ role: 'arm' }] }] }))
       .toThrow('members[0]');
     expect(() => parseComponentCatalog({ ...catalog, entries: [{ ...machine, extra: 1 }] })).toThrow('entries[0]');
-    // AUD-5b revised: no member is required; a `required_on_lanes` key is refused.
+    // No member is required; a `required_on_lanes` key is refused.
     const [arm, io] = machine.members;
     expect(() => parseComponentCatalog({ ...catalog, entries: [{ ...machine,
       members: [{ ...arm, required_on_lanes: ['real'] }, io] }] })).toThrow('members[0]');

@@ -1,5 +1,5 @@
 // Parsers for the component model v2 wire types (types/components.ts).
-// They check shape only; every value is the backend's (R4).
+// They check shape only; every value is the backend's.
 import {
   ACTION_OUTCOMES,
   APPLY_DISPOSITIONS,
@@ -7,19 +7,24 @@ import {
   COMPONENT_LIFECYCLES,
   FAULT_OPERATOR_ACTIONS,
   LATCH_CAUSE_KINDS,
+  RECOVERY_ELIGIBILITIES,
   RUN_END_REASONS,
   SIGNAL_SOURCES,
   STREAM_FRESHNESS,
   type ActionError,
+  type ActionPhase,
   type ActionResult,
   type ApplyPreview,
   type ApplyResult,
   type CellLatch,
   type CodedError,
   type ComponentState,
+  type ComponentStop,
   type EffectiveValues,
   type Fault,
   type ProgramRunEnd,
+  type RecoveryCause,
+  type RecoveryPreflight,
   type RunBlockedReason,
   type RunReadiness,
   type SetOutputResult,
@@ -28,6 +33,7 @@ import {
 import {
   arrayAt,
   booleanAt,
+  exactKeysAt,
   fail,
   numberAt,
   objectAt,
@@ -81,9 +87,34 @@ export function parseFault(value: unknown, path: string): Fault {
   });
 }
 
+export function parseComponentStop(value: unknown, path: string): ComponentStop {
+  const record = objectAt(value, path);
+  return withVendor(record, path, {
+    code: oneOf(['estop'] as const, record.code, `${path}.code`),
+    message: stringAt(record.message, `${path}.message`),
+    since_ns: numberAt(record.since_ns, `${path}.since_ns`),
+  });
+}
+
+function optionalStop(record: JsonObject, key: string, path: string): ComponentStop | undefined {
+  return record[key] === undefined || record[key] === null
+    ? undefined : parseComponentStop(record[key], `${path}.${key}`);
+}
+
 function parseActionError(value: unknown, path: string): ActionError {
   const record = objectAt(value, path);
   return withVendor(record, path, parseCodedError(record, path));
+}
+
+function parseActionPhase(value: unknown, path: string): ActionPhase {
+  const record = objectAt(value, path);
+  return {
+    component_id: stringAt(record.component_id, `${path}.component_id`),
+    action: oneOf(['recover', 'enable'] as const, record.action, `${path}.action`),
+    outcome: oneOf(ACTION_OUTCOMES, record.outcome, `${path}.outcome`),
+    ...(record.error === undefined || record.error === null
+      ? {} : { error: parseActionError(record.error, `${path}.error`) }),
+  };
 }
 
 export function parseActionResult(value: unknown, path: string): ActionResult {
@@ -95,6 +126,10 @@ export function parseActionResult(value: unknown, path: string): ActionResult {
       ? {} : { error: parseActionError(record.error, `${path}.error`) }),
     started_at_ns: numberAt(record.started_at_ns, `${path}.started_at_ns`),
     finished_at_ns: numberAt(record.finished_at_ns, `${path}.finished_at_ns`),
+    ...(record.phases === undefined || record.phases === null ? {} : {
+      phases: arrayAt(record.phases, `${path}.phases`)
+        .map((item, index) => parseActionPhase(item, `${path}.phases[${index}]`)),
+    }),
   };
 }
 
@@ -103,6 +138,7 @@ export function parseComponentState(value: unknown, path: string): ComponentStat
   const lifecycle = oneOf(COMPONENT_LIFECYCLES, record.lifecycle, `${path}.lifecycle`);
   const fault = record.fault === undefined || record.fault === null
     ? undefined : parseFault(record.fault, `${path}.fault`);
+  const stop = optionalStop(record, 'stop', path);
   const reason = optionalCodedError(record, 'reason', path);
   const action = record.action === undefined || record.action === null ? undefined : (() => {
     const row = objectAt(record.action, `${path}.action`);
@@ -119,6 +155,7 @@ export function parseComponentState(value: unknown, path: string): ComponentStat
     ...(role === undefined ? {} : { role }),
     lifecycle,
     ...(fault === undefined ? {} : { fault }),
+    ...(stop === undefined ? {} : { stop }),
     ...(reason === undefined ? {} : { reason }),
     activity: oneOf(COMPONENT_ACTIVITIES, record.activity, `${path}.activity`),
     streams: arrayAt(record.streams, `${path}.streams`).map((item, index) => {
@@ -143,6 +180,15 @@ export function parseComponentState(value: unknown, path: string): ComponentStat
         };
       }),
     }),
+    ...(record.endpoints === undefined || record.endpoints === null ? {} : {
+      endpoints: arrayAt(record.endpoints, `${path}.endpoints`).map((item, index) => {
+        const row = objectAt(item, `${path}.endpoints[${index}]`);
+        return {
+          role_id: stringAt(row.role_id, `${path}.endpoints[${index}].role_id`),
+          url: stringAt(row.url, `${path}.endpoints[${index}].url`),
+        };
+      }),
+    }),
     observed_at_ns: numberAt(record.observed_at_ns, `${path}.observed_at_ns`),
   };
 }
@@ -157,14 +203,50 @@ export function parseCellLatch(value: unknown, path = 'cell_latch'): CellLatch {
     latched: booleanAt(record.latched, `${path}.latched`),
     causes: arrayAt(record.causes, `${path}.causes`).map((item, index) => {
       const row = objectAt(item, `${path}.causes[${index}]`);
+      const stop = optionalStop(row, 'stop', `${path}.causes[${index}]`);
       return {
         component_id: stringAt(row.component_id, `${path}.causes[${index}].component_id`),
         kind: oneOf(LATCH_CAUSE_KINDS, row.kind, `${path}.causes[${index}].kind`),
         ...(row.fault === undefined || row.fault === null
           ? {} : { fault: parseFault(row.fault, `${path}.causes[${index}].fault`) }),
+        ...(stop === undefined ? {} : { stop }),
       };
     }),
   };
+}
+
+function nullableVendor(record: JsonObject, key: string, path: string): string | null {
+  return record[key] === undefined || record[key] === null ? null : stringAt(record[key], `${path}.${key}`);
+}
+
+function parseRecoveryCause(value: unknown, path: string): RecoveryCause {
+  const record = objectAt(value, path);
+  return {
+    code: stringAt(record.code, `${path}.code`),
+    message: stringAt(record.message, `${path}.message`),
+    vendor_code: nullableVendor(record, 'vendor_code', path),
+    vendor_text: nullableVendor(record, 'vendor_text', path),
+    clearable: booleanAt(record.clearable, `${path}.clearable`),
+    operator_action: oneOf(FAULT_OPERATOR_ACTIONS, record.operator_action, `${path}.operator_action`),
+    concerns: stringArrayAt(record.concerns, `${path}.concerns`),
+  };
+}
+
+export function parseRecoveryPreflight(value: unknown, path = 'recovery_preflight'): RecoveryPreflight {
+  const record = objectAt(value, path);
+  const components = arrayAt(record.components, `${path}.components`).map((item, index) => {
+    const at = `${path}.components[${index}]`;
+    const row = objectAt(item, at);
+    return {
+      component_id: stringAt(row.component_id, `${at}.component_id`),
+      owner_id: nullableVendor(row, 'owner_id', at),
+      cause: row.cause === null || row.cause === undefined ? null : parseRecoveryCause(row.cause, `${at}.cause`),
+      stop: optionalStop(row, 'stop', at) ?? null,
+      eligibility: oneOf(RECOVERY_ELIGIBILITIES, row.eligibility, `${at}.eligibility`),
+    };
+  });
+  if (components.length < 1 || components.length > 2) fail(`${path}.components`, 'one or two components');
+  return { snapshot_id: stringAt(record.snapshot_id, `${path}.snapshot_id`), components };
 }
 
 function signalValue(value: unknown, path: string): boolean | number | null {
@@ -266,12 +348,16 @@ export function parseApplyPreview(value: unknown, path = 'apply_preview'): Apply
         .map((item, index) => {
           const at = `${path}.program.unresolved_references[${index}]`;
           const row = objectAt(item, at);
+          exactKeysAt(row, ['target', 'reason', 'detail'], at);
+          const target = objectAt(row.target, `${at}.target`);
+          exactKeysAt(target, ['component_id', 'command_target_id'], `${at}.target`);
           return {
-            component_role_id: stringAt(row.component_role_id, `${at}.component_role_id`),
-            target_role_id: nullableString(row.target_role_id, `${at}.target_role_id`),
-            controllable_component_id: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
-            command_target_id: nullableString(row.command_target_id, `${at}.command_target_id`),
-            reason: stringAt(row.reason, `${at}.reason`),
+            target: {
+              component_id: stringAt(target.component_id, `${at}.target.component_id`),
+              command_target_id: stringAt(target.command_target_id, `${at}.target.command_target_id`),
+            },
+            reason: oneOf(['component_missing', 'component_incompatible', 'target_missing',
+              'target_incompatible', 'capability_unavailable'] as const, row.reason, `${at}.reason`),
             detail: stringAt(row.detail, `${at}.detail`),
           };
         }),

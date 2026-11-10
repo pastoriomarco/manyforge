@@ -1,4 +1,4 @@
-"""Thin bounded HTTP client for the independently running assistant bridge."""
+"""Thin bounded HTTP client for the assistant component's bridge."""
 
 from __future__ import annotations
 
@@ -58,49 +58,45 @@ class AssistantProviderClientError(RuntimeError):
 
 
 class AssistantProviderHttpClient:
-    """Submit and reconcile requests without owning a provider registry."""
+    """Submit and reconcile requests without owning a provider registry.
+
+    The bridge URL is the assistant component's published endpoint, resolved
+    by the caller per request; one HTTP client serves every endpoint.
+    """
 
     def __init__(
         self,
-        endpoint_url: str,
         *,
         timeout_seconds: float = 10.0,
         client: httpx.Client | None = None,
     ) -> None:
-        endpoint = endpoint_url.strip().rstrip("/")
-        if not endpoint or len(endpoint) > 4_096:
-            raise ValueError("assistant bridge endpoint URL is invalid")
         if not 0 < timeout_seconds <= 60:
             raise ValueError("assistant bridge timeout must be in (0, 60]")
-        if endpoint.endswith("/v1/manyforge/assistant"):
-            self._endpoint = endpoint
-        else:
-            self._endpoint = endpoint + "/v1/manyforge/assistant"
         self._client = client or httpx.Client(timeout=timeout_seconds)
         self._owns_client = client is None
 
-    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(self, endpoint_url: str, body: Mapping[str, Any]) -> dict[str, Any]:
         request_id = body.get("requestId")
         return self._request(
             "POST",
-            self._endpoint,
+            _requests_url(endpoint_url),
             body=body,
             expected_request_id=_request_id(request_id),
         )
 
-    def status(self, request_id: str) -> dict[str, Any]:
+    def status(self, endpoint_url: str, request_id: str) -> dict[str, Any]:
         request_id = _request_id(request_id)
         return self._request(
             "GET",
-            f"{self._endpoint}/{quote(request_id, safe='')}",
+            f"{_requests_url(endpoint_url)}/{quote(request_id, safe='')}",
             expected_request_id=request_id,
         )
 
-    def cancel(self, request_id: str) -> dict[str, Any]:
+    def cancel(self, endpoint_url: str, request_id: str) -> dict[str, Any]:
         request_id = _request_id(request_id)
         return self._request(
             "POST",
-            f"{self._endpoint}/{quote(request_id, safe='')}/cancel",
+            f"{_requests_url(endpoint_url)}/{quote(request_id, safe='')}/cancel",
             expected_request_id=request_id,
         )
 
@@ -162,6 +158,10 @@ class AssistantProviderHttpClient:
                 response.status_code,
             )
         return _status(payload, expected_request_id=expected_request_id)
+
+
+def _requests_url(endpoint_url: str) -> str:
+    return endpoint_url.rstrip("/") + "/v1/manyforge/assistant"
 
 
 def _request_id(value: Any) -> str:

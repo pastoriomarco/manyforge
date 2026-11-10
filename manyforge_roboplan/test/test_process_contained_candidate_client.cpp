@@ -489,6 +489,53 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_EQ(ik.value().size(), fixture.binding.resources.size());
 }
 
+TEST(ProcessContainedCandidateClientTest, DiagnosticDeadlineAndQualifiedTargetCrossProcess) {
+  auto fixture = make_fixture();
+  fixture.model.native_scene_name = "inspect-preview-diagnostic";
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding, {0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = request(fixture);
+  auto target = state(fixture);
+  target.positions.clear();
+  for (double position : values(fixture.goal))
+    target.positions.emplace_back(AngularPositionDTO{position});
+  input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  input.diagnostic_qualified_target = target;
+  input.planning_timeout_s = 2.0;
+  std::optional<ControlledStateDTO> returned;
+  const auto result = client.compute_with_target(input, &returned);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "test_failure");
+  ASSERT_TRUE(returned);
+  EXPECT_EQ(*returned, target);
+}
+
+TEST(ProcessContainedCandidateClientTest, CartesianDiagnosticWithoutJointTargetCrossesProcess) {
+  auto fixture = make_fixture();
+  fixture.model.native_scene_name = "inspect-preview-diagnostic";
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding, {0x1234U, 65'536U, 0.01},
+      config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH));
+  auto input = request(fixture);
+  CartesianPathDTO path;
+  path.waypoints = {pose(fixture.reference_scene->forwardKinematics(
+                        fixture.start, "tool0", "base")),
+                    pose(fixture.reference_scene->forwardKinematics(
+                        fixture.goal, "tool0", "base"))};
+  path.max_translation_step_m = 0.005;
+  path.max_rotation_step_rad = 0.05;
+  input.motion = path;
+  input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  input.diagnostic_qualified_target.reset();
+  input.planning_timeout_s = 2.0;
+  std::optional<ControlledStateDTO> returned;
+  const auto result = client.compute_with_target(input, &returned);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "test_failure");
+  EXPECT_FALSE(returned);
+}
+
 // Planner settings are cell context: a retained planner takes new ones at
 // Apply, and the next request plans in a worker started with them.
 TEST(ProcessContainedCandidateClientTest,
@@ -1021,6 +1068,39 @@ TEST(ProcessContainedCandidateClientTest,
             std::string::npos);
   EXPECT_NE(planned.error().message.find("manyforge_scene_"),
             std::string::npos);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     DiagnosticPlanAndIkDoNotChangeSharedWorldCollisionPolicy) {
+  auto fixture = make_fixture();
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding, {0x1234U, 65'536U, 0.01}, process_config);
+  ASSERT_TRUE(client.select_retained_projection(frame_relative_collision_projection(fixture)).ok());
+  auto input = request(fixture);
+  const auto before = client.compute(input);
+  ASSERT_FALSE(before.ok());
+  ASSERT_EQ(before.error().details.at("reason"), "native_start_state_collision");
+  auto target = state(fixture);
+  target.positions.clear();
+  for (double position : values(fixture.goal))
+    target.positions.emplace_back(AngularPositionDTO{position});
+  input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  input.diagnostic_qualified_target = target;
+  input.planning_timeout_s = 10.0;
+  const auto diagnostic = client.compute(input);
+  ASSERT_TRUE(diagnostic.ok()) << diagnostic.error().message;
+  EXPECT_EQ(diagnostic.value().waypoints.back().positions_rad, values(fixture.goal));
+  const auto goal_pose = pose(fixture.reference_scene->forwardKinematics(fixture.goal, "tool0", "base"));
+  const auto ik = client.solve_ik_diagnostic(goal_pose, fixture.binding.permitted_frames[0],
+      fixture.binding.permitted_frames[1], state(fixture), 10.0, TolerancesDTO{1e-4, 5e-3, 1e-2});
+  ASSERT_TRUE(ik.ok()) << ik.error().message;
+  const auto after = client.compute(request(fixture));
+  ASSERT_FALSE(after.ok());
+  EXPECT_EQ(after.error().details.at("reason"), before.error().details.at("reason"));
+  EXPECT_EQ(after.error().details.at("collision_body_a"), before.error().details.at("collision_body_a"));
+  EXPECT_EQ(after.error().details.at("collision_body_b"), before.error().details.at("collision_body_b"));
 }
 
 // A retained planner keeps its worker client across an Apply whose candidate

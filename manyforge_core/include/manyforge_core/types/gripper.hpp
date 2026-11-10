@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/capability_command_receipt.hpp>
@@ -80,13 +82,18 @@ enum class GripperInvalidationReason {
 /// uses it to reject a stale goal before cancelling a newer command.
 using AddressedGripperCommandIdentityDTO = AddressedCommandIdentityDTO;
 
+/// Process-local pin to the exact prepared session; never serialized.
+struct GripperPreparedSessionPin {
+  virtual ~GripperPreparedSessionPin() = default;
+};
+
 struct GripperCommandRequestDTO {
   std::string gripper_id;
   std::string group_id;
   std::string joint_name;
   double target_position = 0.0;
   double duration_s = 0.0;
-  /// GRP-2: complete only when the controller reports done and duration_s has
+  /// Complete only when the controller reports done and duration_s has
   /// elapsed since the command started (else on the controller's report).
   bool wait_for_duration = false;
   std::optional<double> max_effort;
@@ -103,9 +110,14 @@ struct GripperCommandRequestDTO {
   /// fixed-duration mechanism rejects a duration that cannot fit this bound.
   double completion_timeout_s = 1.0;
   std::optional<AddressedGripperCommandIdentityDTO> addressed_identity = std::nullopt;
-  /// PRIVATE process-local proof supplied only by the genuine prepared owner.
-  /// Never serialized or retained by a provider. It checks the same resident
-  /// committed session without locks or a second admission handshake.
+  /// PRIVATE process-local proof of the exact resident prepared session.
+  /// The backend compares one atomic load with the captured value at leaf
+  /// admission; it is not serialized or retained by a provider.
+  std::shared_ptr<const std::atomic<std::uint64_t>> admission_token{};
+  std::uint64_t admission_token_expected{};
+  std::shared_ptr<GripperLateCancelSlot> late_cancel_slot{};
+  std::shared_ptr<GripperPreparedSessionPin> prepared_session_pin{};
+  /// Temporary pre-leaf validation while producer/consumer migration lands.
   std::function<bool(const AddressedGripperCommandIdentityDTO&)> committed_owner_is_current;
   std::optional<std::uint64_t> owner_lifecycle_generation;
 };
@@ -192,7 +204,7 @@ struct GripperCommandStatusDTO {
   /// does not retire it. Reset/replacement/shutdown still do.
   std::uint64_t lifecycle_generation{};
   /// A Stop/Reset cancel was sent and the controller has not yet reported
-  /// that goal's terminal (Q58: the Stop does not wait for it).
+  /// that goal's terminal (the Stop does not wait for it).
   bool cancellation_pending{};
 };
 

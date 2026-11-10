@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RT-6 realtime architecture qualification evidence wrapper.
+# Realtime architecture qualification evidence wrapper.
 #
 # This source-level probe records collision-resource policy, scheduler role
 # expectations, and OS realtime acceptance visible to the current process. It

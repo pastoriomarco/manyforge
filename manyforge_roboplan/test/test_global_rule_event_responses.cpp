@@ -10,9 +10,10 @@ std::shared_ptr<core::IoActivationRuleCatalogDTO> Catalog() {
   core::IoConditionDefinitionDTO definition;
   definition.inputs.push_back({core::IoConditionBlackboardKeyDTO{"permit"},
                                core::IoConditionValueKind::kBoolean});
-  definition.nodes.push_back(core::IoConditionCompareDTO{
+  definition.nodes.emplace_back(std::in_place_type<core::IoConditionCompareDTO>,
       core::IoConditionComparison::kEqual,
-      core::IoConditionInputReferenceDTO{0U}, core::IoConditionValueDTO{true}});
+      core::IoConditionOperandDTO{core::IoConditionInputReferenceDTO{0U}},
+      core::IoConditionOperandDTO{core::IoConditionValueDTO{true}});
   const auto checked = core::CheckIoCondition(std::move(definition),
                                               {8U, 8U, 8U, 8U, 128U, 1024U});
   if (!checked.ok())
@@ -316,9 +317,10 @@ TEST(GlobalRuleEventResponseTest,
   signal.inputs.push_back(
       {core::IoSignalId{core::ControllableComponentId("device.io"), "ready"},
        core::IoConditionValueKind::kBoolean});
-  signal.nodes.push_back(core::IoConditionCompareDTO{
+  signal.nodes.emplace_back(std::in_place_type<core::IoConditionCompareDTO>,
       core::IoConditionComparison::kEqual,
-      core::IoConditionInputReferenceDTO{0U}, core::IoConditionValueDTO{false}});
+      core::IoConditionOperandDTO{core::IoConditionInputReferenceDTO{0U}},
+      core::IoConditionOperandDTO{core::IoConditionValueDTO{false}});
   const auto checked = core::CheckIoCondition(
       std::move(signal), {8U, 8U, 8U, 8U, 128U, 1024U});
   ASSERT_TRUE(checked.ok()) << checked.error().message;
@@ -390,7 +392,7 @@ TEST(GlobalRuleEventResponseTest, NotifyUnknownIncludesTypedReasonAndCatalogIden
   EXPECT_EQ(reason.find_object_member("details")->find_object_member("limit")->as_string(), "4");
 }
 
-// CONTRACTS §1, §4, §16: a member's state names its owner and role; an
+// A member's state names its owner and role; an
 // owner's fault lists the members it concerns; both are absent otherwise.
 TEST(ComponentStateResponseTest, CarriesOwnerRoleAndFaultConcerns) {
   core::ComponentState member;
@@ -424,6 +426,46 @@ TEST(ComponentStateResponseTest, CarriesOwnerRoleAndFaultConcerns) {
             nullptr);
 }
 
+TEST(ComponentStateResponseTest, CarriesTypedStopOnOwnerAndLatchCause) {
+  core::ComponentState owner;
+  owner.component_id = "lite6";
+  owner.lifecycle = core::ComponentLifecycle::kPrepared;
+  owner.activity = core::ComponentActivity::kIdle;
+  owner.stop = core::ComponentStop{core::StopCode::kEstop, "E-stop not cleared",
+                                    "C2", "Emergency stop", 42};
+  const auto state = ComponentStateValue(owner);
+  const auto *stop = state.find_object_member("stop");
+  ASSERT_NE(stop, nullptr);
+  ASSERT_NE(stop->find_object_member("code"), nullptr);
+  EXPECT_EQ(stop->find_object_member("code")->as_string(), "estop");
+  EXPECT_EQ(stop->find_object_member("message")->as_string(), "E-stop not cleared");
+  EXPECT_EQ(stop->find_object_member("vendor_code")->as_string(), "C2");
+  EXPECT_EQ(stop->find_object_member("vendor_text")->as_string(), "Emergency stop");
+  EXPECT_NE(stop->find_object_member("since_ns"), nullptr);
+  EXPECT_EQ(state.find_object_member("fault"), nullptr);
+
+  const core::CellLatch latch{true, core::cell_latch_causes({owner})};
+  const auto wire = CellLatchValue(latch);
+  const auto *causes = wire.find_object_member("causes");
+  ASSERT_NE(causes, nullptr);
+  ASSERT_EQ(causes->as_array().size(), 1U);
+  const auto &cause = causes->as_array().front();
+  EXPECT_EQ(cause.find_object_member("kind")->as_string(), "stop");
+  EXPECT_EQ(cause.find_object_member("component_id")->as_string(), "lite6");
+  ASSERT_NE(cause.find_object_member("stop"), nullptr);
+  EXPECT_EQ(cause.find_object_member("stop")->find_object_member("code")->as_string(), "estop");
+  EXPECT_EQ(cause.find_object_member("fault"), nullptr);
+
+  owner.stop->vendor_code.reset();
+  owner.stop->vendor_text.reset();
+  const auto without_vendor = ComponentStateValue(owner);
+  ASSERT_NE(without_vendor.find_object_member("stop"), nullptr);
+  EXPECT_EQ(without_vendor.find_object_member("stop")->find_object_member("vendor_code"), nullptr);
+  EXPECT_EQ(without_vendor.find_object_member("stop")->find_object_member("vendor_text"), nullptr);
+  owner.stop.reset();
+  EXPECT_EQ(ComponentStateValue(owner).find_object_member("stop"), nullptr);
+}
+
 TEST(ComponentStateResponseTest, CarriesAdapterDetailsInOrderOnlyWhenPresent) {
   core::ComponentState state;
   state.component_id = "lite6";
@@ -439,6 +481,24 @@ TEST(ComponentStateResponseTest, CarriesAdapterDetailsInOrderOnlyWhenPresent) {
   EXPECT_EQ(details->as_array()[0].find_object_member("value")->as_string(), "position");
   EXPECT_EQ(details->as_array()[1].find_object_member("name")->as_string(), "state");
   EXPECT_EQ(details->as_array()[1].find_object_member("value")->as_string(), "ready");
+}
+
+TEST(ComponentStateResponseTest, CarriesEndpointsOnlyWhenPresent) {
+  core::ComponentState state;
+  state.component_id = "assistant";
+  state.lifecycle = core::ComponentLifecycle::kPrepared;
+  EXPECT_EQ(ComponentStateValue(state).find_object_member("endpoints"), nullptr);
+
+  state.lifecycle = core::ComponentLifecycle::kEnabled;
+  state.endpoints = {{"assistant_request", "http://127.0.0.1:40123"}};
+  const auto value = ComponentStateValue(state);
+  const auto *endpoints = value.find_object_member("endpoints");
+  ASSERT_NE(endpoints, nullptr);
+  ASSERT_EQ(endpoints->as_array().size(), 1U);
+  EXPECT_EQ(endpoints->as_array()[0].find_object_member("role_id")->as_string(),
+            "assistant_request");
+  EXPECT_EQ(endpoints->as_array()[0].find_object_member("url")->as_string(),
+            "http://127.0.0.1:40123");
 }
 
 } // namespace

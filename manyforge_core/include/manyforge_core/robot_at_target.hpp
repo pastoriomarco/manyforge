@@ -15,7 +15,7 @@ struct RobotAtTargetDTO final {
   std::size_t joint_index{0U};
 };
 
-/// The one "robot at target" rule (maintainer 2026-10-28): arrived only when
+/// The one "robot at target" rule: arrived only when
 /// the controller reports the motion finished (its goal succeeded) AND every
 /// joint lies within the lane's arrival tolerance of the target. Either alone
 /// is not arrival: a robot within tolerance may still be moving under its

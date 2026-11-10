@@ -1,4 +1,4 @@
-/* Composer stylesheet entry point (UI6-I-VC). Import order is the cascade
+/* Composer stylesheet entry point. Import order is the cascade
    order: later files win ties. See README.md before adding files. */
 @import './tokens.css';
 @import './base.css';
@@ -19,3 +19,4 @@
 @import './surfaces/observability.css';
 @import './surfaces/assistant.css';
 @import './surfaces/reference.css';
+@import './components/motion-preview-dots.css';

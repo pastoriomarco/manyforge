@@ -154,7 +154,7 @@ void verify_scenario_program_admission(
     Fail("scenario Program does not use composable-cell-v1");
   const auto &catalog = Member(program, "catalog", "Program");
   if (Text(Member(catalog, "api_version", "Program.catalog"),
-           "Program.catalog.api_version") != "manyforge.node_catalog.v2" ||
+           "Program.catalog.api_version") != "manyforge.node_catalog.v3" ||
       Text(Member(catalog, "content_version", "Program.catalog"),
            "Program.catalog.content_version") !=
           bundle.catalogs.node_environment.content_version)

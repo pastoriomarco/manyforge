@@ -1,4 +1,4 @@
-"""Headless GUI projection of the Kernel's global rule states (contract 64)."""
+"""Headless GUI projection of the Kernel's global rule states."""
 
 from __future__ import annotations
 

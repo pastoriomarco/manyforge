@@ -9,7 +9,7 @@
 
 namespace manyforge::core {
 
-/// CONTRACTS §8 state key `interrupt_state.<rule_id>`: `inactive | clear |
+/// State key `interrupt_state.<rule_id>`: `inactive | clear |
 /// tripped`. `kUnknown` is an active rule that can't watch its signals: the
 /// key is withdrawn (absent) and the rule gates its scope.
 enum class IoGlobalRuleState { kInactive, kClear, kTripped, kUnknown };

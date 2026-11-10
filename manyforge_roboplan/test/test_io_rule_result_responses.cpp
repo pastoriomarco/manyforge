@@ -8,6 +8,29 @@
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
+TEST(ComponentActionResponseTest, CompositePhasesPreserveOrderAndUnknownCause) {
+  core::ActionResult result;
+  result.action = core::ComponentAction::kEnable;
+  result.outcome = core::ActionOutcome::kUnknown;
+  result.phases = {
+      {"machine", core::ComponentAction::kRecover, core::ActionOutcome::kSucceeded, std::nullopt},
+      {"arm", core::ComponentAction::kRecover, core::ActionOutcome::kUnknown,
+       core::ActionError{"recovery_unknown", "answer missing", std::nullopt, std::nullopt}}};
+  const auto value = ActionResultValue(result);
+  const auto *phases = value.find_object_member("phases");
+  ASSERT_NE(phases, nullptr);
+  ASSERT_TRUE(phases->is_array());
+  ASSERT_EQ(phases->as_array().size(), 2U);
+  EXPECT_EQ(phases->as_array()[0].find_object_member("component_id")->as_string(), "machine");
+  EXPECT_EQ(phases->as_array()[0].find_object_member("action")->as_string(), "recover");
+  EXPECT_EQ(phases->as_array()[1].find_object_member("outcome")->as_string(), "unknown");
+  ASSERT_NE(phases->as_array()[1].find_object_member("error"), nullptr);
+  EXPECT_EQ(phases->as_array()[1].find_object_member("error")->find_object_member("code")->as_string(),
+            "recovery_unknown");
+  result.phases.clear();
+  EXPECT_EQ(ActionResultValue(result).find_object_member("phases"), nullptr);
+}
+
 TEST(TypedErrorResponseTest, ProducerIsOnTopLevelRpcErrorOnly) {
   const core::ErrorDTO error{"stale_generation", "stale",
                              {{"reason", "expected_generation_stale"}}};
@@ -212,7 +235,7 @@ TEST(IoRuleResultResponseTest,
   using Value = content_identity::CanonicalValue;
   const auto command = DecodeCommand(content_identity::canonical_json(
       Value(Value::Object{
-          {"api_version", Value("manyforge.execution_command.v1")},
+          {"api_version", Value("manyforge.execution_command.v3")},
           {"command", Value("read_stop")},
           {"stop_id", Value("stop.actual")},
           {"attribution", Value(Value::Object{

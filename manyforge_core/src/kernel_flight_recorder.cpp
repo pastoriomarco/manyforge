@@ -12,7 +12,7 @@ namespace {
 
 // Line-atomic write helper: one snprintf into a stack buffer, one fwrite.
 // Keeps the output structurally valid even if the process dies mid-dump
-// (spec 520 §4.2: a torn staging tail is acceptable, corrupt records are
+// (a torn staging tail is acceptable, corrupt records are
 // not).
 void write_line(std::FILE* out, const char* buffer, int length) noexcept {
   if (length <= 0) {

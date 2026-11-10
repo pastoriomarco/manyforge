@@ -12,7 +12,7 @@ title: UFACTORY Lite 6 tool I/O
 license: BSD-3-Clause
 provenance:
   source: https://github.com/pastoriomarco/xarm_ros2
-  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+  notes: recorded UFACTORY controller facts
 signals:
   - {signal_name: TI0, direction: input, value_type: bool}
   - {signal_name: TI1, direction: input, value_type: bool}

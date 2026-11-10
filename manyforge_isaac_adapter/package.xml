@@ -2,8 +2,8 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>manyforge_isaac_adapter</name>
-  <version>0.2.0</version>
-  <description>Isaac Sim lane adapter (CONTRACTS §12/§14): lane folder, launch contribution, ros2_control configuration and adapter family.</description>
+  <version>0.2.1</version>
+  <description>Isaac Sim lane adapter: lane folder, launch contribution, ros2_control configuration and adapter family.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 

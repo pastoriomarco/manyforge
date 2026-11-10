@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { parseApplyResult, parseCellLatch, parseComponentState, parseRunReadiness, parseSignalSample } from '../api/parsers/components';
 import { applyImpactSummary, applyResultText } from '../components/ApplyImpact';
 import { applyPreviewFixture } from '../test/applyPreview';
+import { COMPONENT_CAPABILITIES } from '../types/components';
 import {
   ageText,
+  actionResultText,
   blockedReasonText,
   ruleHoldMeeting,
   codedErrorText,
@@ -48,11 +50,19 @@ describe('component model v2 wire parsing', () => {
     expect(() => parseComponentState({ ...robot, lifecycle: 'active' }, 'state')).toThrow();
   });
 
-  it('parses the optional read-only details (CONTRACTS §1)', () => {
+  it('parses the optional read-only details', () => {
     expect(parseComponentState(robot, 'state')).not.toHaveProperty('details');
     const details = [{ name: 'Mode', value: '1' }, { name: 'Error code', value: 'C2' }];
     expect(parseComponentState({ ...robot, details }, 'state').details).toEqual(details);
     expect(() => parseComponentState({ ...robot, details: [{ name: 'Mode', value: 1 }] }, 'state')).toThrow();
+  });
+
+  it('parses the optional endpoints', () => {
+    expect(parseComponentState(robot, 'state')).not.toHaveProperty('endpoints');
+    const endpoints = [{ role_id: 'assistant_request', url: 'http://127.0.0.1:41234' }];
+    expect(parseComponentState({ ...robot, endpoints }, 'state').endpoints).toEqual(endpoints);
+    expect(() => parseComponentState({ ...robot, endpoints: [{ role_id: 'assistant_request' }] }, 'state'))
+      .toThrow();
   });
 
   it('parses latch, readiness, samples and Apply results', () => {
@@ -89,6 +99,52 @@ describe('component model v2 presentation', () => {
     expect(fault.operatorAction).toBe('Enable');
     expect(fault.vendor).toBe('Vendor: C2 · emergency IO');
     expect(componentSummary(state)).toBe('Fault · Emergency stop active');
+  });
+
+  it('declares sim_reset as a component capability and offers it as an action', () => {
+    expect(COMPONENT_CAPABILITIES).toContain('sim_reset');
+    const simulator = parseComponentState({
+      component_id: 'isaac_sim', lifecycle: 'enabled', activity: 'idle',
+      streams: [], capabilities: ['sim_reset'], observed_at_ns: 10,
+    }, 'simulator');
+    expect(offeredActions(simulator)).toContain('sim_reset');
+  });
+
+  it('shows a simulator fault as a warning while preserving its reported state and reason', () => {
+    const fault = parseComponentState({
+      component_id: 'isaac_sim', lifecycle: 'fault', activity: 'idle',
+      fault: {
+        code: 'fault_process_exited', message: 'The simulator process exited.',
+        clearable: true, operator_action: 'recover', since_ns: 5,
+      },
+      streams: [], capabilities: ['sim_reset'], observed_at_ns: 10,
+    }, 'simulator');
+    expect(componentTone(fault)).toBe('warning');
+    expect(fault.lifecycle).toBe('fault');
+    expect(fault.fault?.message).toBe('The simulator process exited.');
+  });
+
+  it('keeps an unreachable simulator offline and presents it as a warning', () => {
+    const simulator = parseComponentState({
+      component_id: 'isaac_sim', lifecycle: 'offline', activity: 'idle',
+      reason: { code: 'simulator_unreachable', message: "The simulator doesn't answer." },
+      streams: [], capabilities: ['sim_reset'], observed_at_ns: 10,
+    }, 'simulator');
+    expect(componentTone(simulator)).toBe('warning');
+    expect(simulator.lifecycle).toBe('offline');
+    expect(simulator.reason?.code).toBe('simulator_unreachable');
+  });
+
+  it('shows an unknown simulator action as a warning and preserves its action result', () => {
+    const simulator = parseComponentState({
+      component_id: 'isaac_sim', lifecycle: 'enabled', activity: 'idle',
+      last_action: { action: 'sim_reset', outcome: 'unknown', started_at_ns: 1, finished_at_ns: 2 },
+      streams: [], capabilities: ['sim_reset'], observed_at_ns: 10,
+    }, 'simulator');
+    expect(componentTone(simulator)).toBe('warning');
+    expect(actionResultText(simulator.last_action!)).toBe(
+      'Reset simulation: outcome unknown (not resent)',
+    );
   });
 
   it('shows a simulated component that stays enabled while the simulation is not playing (SIM-1)', () => {
@@ -131,7 +187,7 @@ describe('component model v2 presentation', () => {
       { component_id: 'old_arm', disposition: 'remove' },
       { component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' },
     ] })).toBe('Applied: old_arm removed, arm prepared.');
-    // AUD-8: the Apply continues past a failed step; each failure is named.
+    // The Apply continues past a failed step; each failure is named.
     const gripperError = { code: 'component_action_outcome_unknown', message: 'no reply' };
     const memberError = { code: 'owner_not_prepared', message: 'owner' };
     expect(applyResultText(parseApplyResult({ outcome: 'failed', error: gripperError, components: [
@@ -167,7 +223,7 @@ describe('component model v2 presentation', () => {
   });
 });
 
-describe('machines: owners and members (CONTRACTS §16)', () => {
+describe('machines: owners and members', () => {
   const owner = parseComponentState({
     component_id: 'lite6', lifecycle: 'fault',
     fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'recover',
@@ -216,6 +272,20 @@ describe('machines: owners and members (CONTRACTS §16)', () => {
     expect(reasonText(plc)).toBeNull();
   });
 
+  it('omits the simulator from Prepare and Enable targets while retaining ordinary targets', () => {
+    const offlineSimulator = parseComponentState({
+      component_id: 'isaac_sim', lifecycle: 'offline', activity: 'idle',
+      streams: [], capabilities: ['sim_reset'], observed_at_ns: 10,
+    }, 'simulator');
+    const pausedSimulator = { ...offlineSimulator, lifecycle: 'prepared' as const };
+    const unpreparedSimulator = { ...offlineSimulator, lifecycle: 'not_prepared' as const };
+    const offlineRobot = { ...plc, component_id: 'offline_robot', lifecycle: 'offline' as const };
+    const preparedRobot = { ...plc, component_id: 'prepared_robot', lifecycle: 'prepared' as const };
+
+    expect(prepareAllTargets([offlineSimulator, unpreparedSimulator, offlineRobot])).toEqual(['offline_robot']);
+    expect(enableAllTargets([pausedSimulator, preparedRobot])).toEqual(['prepared_robot']);
+  });
+
   it('lists one tree (members under their machine, a mounted tool under its parent) and names the members an owner fault concerns', () => {
     const gripper = { ...plc, component_id: 'lite_gripper' };
     const tree = (states: Parameters<typeof componentStateTree>[0], mounts?: Record<string, string>) => (
@@ -227,9 +297,11 @@ describe('machines: owners and members (CONTRACTS §16)', () => {
     expect(tree([gripper, arm], { lite_gripper: 'other' })).toEqual([['lite_gripper', 0], ['lite6_robot', 0]]);
     expect(componentStateDetail(arm, [owner, arm])).toBe('through lite6: Emergency stop active');
     expect(componentStateDetail(plc)).toBeNull();
-    // Prepare all: not prepared or offline; Enable all: prepared, never an owner.
+    // Prepare all: not prepared or offline; Enable all: not yet enabled (the
+    // backend prepares an unprepared one first), never an owner.
     expect(prepareAllTargets([owner, arm, io, plc])).toEqual(['lite6_robot']);
-    expect(enableAllTargets([{ ...owner, lifecycle: 'prepared' }, arm, io, plc])).toEqual(['lite6_robot_controller_io']);
+    expect(enableAllTargets([{ ...owner, lifecycle: 'prepared' }, arm, io, plc]))
+      .toEqual(['lite6_robot', 'lite6_robot_controller_io']);
     expect(latchCauseText({ component_id: 'lite6', kind: 'fault', fault: owner.fault }))
       .toBe('lite6: Emergency stop active (concerns lite6_robot, lite6_robot_controller_io)');
   });
@@ -251,7 +323,7 @@ describe('stream labels and unavailable states', () => {
   });
 });
 
-describe('ruleHoldMeeting (§8, as the backend rule_hold_meets_program)', () => {
+describe('ruleHoldMeeting (as the backend rule_hold_meets_program)', () => {
   const hold = (scope: string, component_ids?: string[]) => ({
     code: 'rule_holds', message: 'held', rule_id: 'door', scope,
     ...(component_ids === undefined ? {} : { component_ids }),

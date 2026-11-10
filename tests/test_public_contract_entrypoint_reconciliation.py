@@ -255,9 +255,9 @@ def test_explicit_freshness_selector_routes_to_the_bounded_generator(
 
 
 def test_removed_contact_release_clearance_field_stays_out_of_the_repository() -> None:
-    # Moved from the retired Step 18 release-gate removed-field hygiene check
-    # (decision 120): the field may survive only in tests that prove its
-    # rejection. The historical baseline patches were retired (decision 121).
+    # Moved from the retired release-gate removed-field hygiene check: the
+    # field may survive only in tests that prove its rejection. The historical
+    # baseline patches were retired.
     removed_field = "min_separation_" + "clearance_m"
     removed_bytes = removed_field.encode("ascii")
     listed = subprocess.run(

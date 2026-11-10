@@ -274,8 +274,12 @@ class HeadlessHttpClient:
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
         timeout_seconds: float | None = None,
-    ) -> tuple[bytes, int, int]:
-        """Read one bounded response without imposing projection semantics."""
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[bytes, int, int, str | None]:
+        """Read one bounded response without imposing projection semantics.
+
+        Returns the body, status, byte bound and the response ETag.
+        """
 
         if not path.startswith("/api/") or ".." in path:
             raise ValueError("headless API path is invalid")
@@ -296,6 +300,7 @@ class HeadlessHttpClient:
                 path,
                 params=params,
                 json=dict(body) if body is not None else None,
+                headers=headers,
                 **timeout_override,
             ) as response:
                 chunks: list[bytes] = []
@@ -310,6 +315,7 @@ class HeadlessHttpClient:
                         )
                     chunks.append(chunk)
                 status_code = response.status_code
+                etag = response.headers.get("etag")
         except HeadlessClientError:
             raise
         except httpx.TimeoutException as exc:
@@ -322,7 +328,7 @@ class HeadlessHttpClient:
                 "headless_http_unavailable",
                 f"headless API request failed: {exc}",
             ) from exc
-        return b"".join(chunks), status_code, maximum_response_bytes
+        return b"".join(chunks), status_code, maximum_response_bytes, etag
 
     @staticmethod
     def _decode_response(
@@ -376,7 +382,7 @@ class HeadlessHttpClient:
         body: Mapping[str, Any] | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        payload, status_code, maximum = self._request_payload(
+        payload, status_code, maximum, _etag = self._request_payload(
             method,
             path,
             params=params,
@@ -392,10 +398,35 @@ class HeadlessHttpClient:
             raise self._error_from_response(value, status_code)
         return value
 
+    def request_if_changed(
+        self, path: str, etag: str | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Conditional GET: ``(None, etag)`` when the owner answers 304.
+
+        Otherwise the decoded object and its ETag (``None`` when untagged).
+        The caller owns whatever it keeps for the tag; this stays transport.
+        """
+
+        payload, status_code, maximum, response_etag = self._request_payload(
+            "GET",
+            path,
+            headers={"If-None-Match": etag} if etag is not None else None,
+        )
+        if status_code == 304:
+            return None, etag
+        value = self._decode_response(
+            payload,
+            status_code=status_code,
+            maximum_response_bytes=maximum,
+        )
+        if status_code >= 400:
+            raise self._error_from_response(value, status_code)
+        return value, response_etag
+
     def request_array(self, path: str) -> list[Any]:
         """GET of an endpoint whose body is a plain JSON array."""
 
-        payload, status_code, maximum = self._request_payload("GET", path)
+        payload, status_code, maximum, _etag = self._request_payload("GET", path)
         value = self._decode_response(
             payload,
             status_code=status_code,
@@ -419,7 +450,7 @@ class HeadlessHttpClient:
         decoded here so Composer preserves the normal typed HTTP failure.
         """
 
-        payload, status_code, maximum = self._request_payload(
+        payload, status_code, maximum, _etag = self._request_payload(
             "GET", path, params=params
         )
         if status_code >= 400:
@@ -621,7 +652,7 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10).
+    # Component model v2.
 
     @staticmethod
     def _path_identity(prefix: str, identity: str, suffix: str = "") -> str:
@@ -648,6 +679,26 @@ class HeadlessHttpClient:
             body={"action": action, "component_ids": list(component_ids)},
         )
 
+    def component_recovery_preflight(self, component_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._path_identity("/api/components", component_id, "/recover-enable/preflight"),
+        )
+
+    def component_recover_enable(
+        self, component_id: str, confirmation: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            self._path_identity("/api/components", component_id, "/recover-enable"),
+            body=confirmation,
+        )
+
+    def component_recover_enable_group(self, targets: Sequence[Any]) -> dict[str, Any]:
+        return self.request(
+            "POST", "/api/components/recover-enable", body={"targets": list(targets)}
+        )
+
     def cell_latch(self) -> dict[str, Any]:
         return self.request("GET", "/api/cell/latch")
 
@@ -655,7 +706,7 @@ class HeadlessHttpClient:
         return self.request_array("/api/io")
 
     def set_io_output(self, signal_id: str, value: bool | float) -> dict[str, Any]:
-        # CONTRACTS §7: `signal_id` is `<component_id>/<signal_name>`.
+        # `signal_id` is `<component_id>/<signal_name>`.
         component_id, _, signal_name = signal_id.partition("/")
         return self.request(
             "POST",
@@ -682,6 +733,11 @@ class HeadlessHttpClient:
 
     def node_environment(self) -> dict[str, Any]:
         return self.request("GET", "/api/node-environment")
+
+    def node_environment_if_changed(
+        self, etag: str | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        return self.request_if_changed("/api/node-environment", etag)
 
     def source_model(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model")
@@ -755,6 +811,9 @@ class HeadlessHttpClient:
 
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/diagnostics", body=record)
+
+    def lookup_component_frame(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/component-frame-lookup", body=body)
 
     @staticmethod
     def _program_run_path(program_run_id: str) -> str:
@@ -956,23 +1015,43 @@ class HeadlessHttpClient:
     def assistant_modes(self) -> dict[str, Any]:
         return self.request("GET", "/api/assistant/modes")
 
-    def assistant_mode(self, mode_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _assistant_mode_path(mode_id: str) -> str:
         if (
             not isinstance(mode_id, str)
             or len(mode_id.encode("utf-8")) > 256
             or _ASSISTANT_MODE_PATTERN.fullmatch(mode_id) is None
         ):
             raise ValueError("assistant mode ID is invalid")
-        return self.request("GET", f"/api/assistant/modes/{mode_id}")
+        return f"/api/assistant/modes/{mode_id}"
 
-    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _assistant_mode_context_path(mode_id: str) -> str:
         if (
             not isinstance(mode_id, str)
             or re.fullmatch(r"[a-z][a-z0-9.-]*", mode_id) is None
             or len(mode_id.encode("utf-8")) > 256
         ):
             raise ValueError("assistant mode identity is invalid")
-        return self.request("GET", f"/api/assistant/modes/{mode_id}/context")
+        return f"/api/assistant/modes/{mode_id}/context"
+
+    def assistant_mode(self, mode_id: str) -> dict[str, Any]:
+        return self.request("GET", self._assistant_mode_path(mode_id))
+
+    def assistant_mode_if_changed(
+        self, mode_id: str, etag: str | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        return self.request_if_changed(self._assistant_mode_path(mode_id), etag)
+
+    def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
+        return self.request("GET", self._assistant_mode_context_path(mode_id))
+
+    def assistant_mode_context_if_changed(
+        self, mode_id: str, etag: str | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        return self.request_if_changed(
+            self._assistant_mode_context_path(mode_id), etag
+        )
 
     def manager_deployment_candidate_preview(
         self, body: Mapping[str, Any]
@@ -1180,7 +1259,7 @@ class HeadlessHttpClient:
         else:
             params = tuple(
                 (key, normalized[key])
-                for key in ("component_role_id", "program_binding_id", "target_role_id")
+                for key in ("component_id", "program_binding_id", "command_target_id")
             )
         return self.request(
             "GET",

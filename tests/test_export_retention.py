@@ -79,6 +79,23 @@ def test_pressure_deletes_only_superseded_closed_units_oldest_first(tmp_path):
     assert 'only protected material remains' in result.warning and 'latest controller-launch' in result.warning
 
 
+def test_pressure_removes_old_launch_log_with_its_controller_epoch(tmp_path):
+    root = tmp_path / 'runtime'
+    old_epoch, latest_epoch = epoch(root, 3), epoch(root, 4)
+    old_launch_log = old_epoch / 'arm/ros/launch.log'
+    latest_launch_log = latest_epoch / 'arm/ros/launch.log'
+    old_launch_log.parent.mkdir(parents=True)
+    latest_launch_log.parent.mkdir(parents=True)
+    old_launch_log.write_text('superseded launch output')
+    latest_launch_log.write_text('current launch output')
+
+    result = pressure(root)
+
+    assert str(old_epoch.relative_to(root)) in result.deleted
+    assert not old_launch_log.exists()
+    assert latest_launch_log.read_text() == 'current launch output'
+
+
 def test_partial_foreign_and_unproved_symlink_material_stays(tmp_path):
     root=tmp_path/'runtime'
     partial=capture(root,3)
@@ -131,7 +148,7 @@ def test_previous_session_journals_are_accounted_but_never_pruned_without_histor
         'schema_version': 'manyforge.workbench_session.v1', 'session_id': 'a' * 32,
         'disposition': 'stopped', 'shutdown': 'clean', 'effects': effects,
     }))
-    # Real allocated bytes, not sparse logical length, must count toward Q99.
+    # Real allocated bytes, not sparse logical length, must count toward the retention bound.
     protected = archive / 'execution-state/operation-journal.sqlite3-wal'
     protected.parent.mkdir()
     protected.write_bytes(b'original safety evidence' * 4096)
@@ -561,18 +578,6 @@ def test_binary_tail_handles_arbitrary_read_chunking(tmp_path):
     assert target.read_bytes()==data[-10000:]
 
 
-def test_legacy_partial_replacement_respects_unknown_receipts(tmp_path):
-    evidence=tmp_path/'evidence'
-    mounts=[{'Type':'bind','Source':'/workspace-owner','Destination':'/workspace'}]
-    summary={'container_id':'a'*64,'image':'sha256:'+'b'*64,'mounts':mounts,'state':{'running':False}}
-    partial=retention.prepare_capture(evidence,'20261013T000000Z',summary,legacy=True)
-    (partial/'copied-journal').write_bytes(b'only evidence')
-    (partial/'docker-inspect.json').write_text('{}')
-    with pytest.raises(ValueError,match='unknown or changed'):
-        retention.prepare_capture(evidence,'20261013T000002Z',summary,legacy=True)
-    assert (partial/'copied-journal').read_bytes()==b'only evidence'
-
-
 @pytest.mark.parametrize('active_flag',['Paused','Restarting'])
 def test_active_occurrence_never_qualifies_for_failed_capture_retry(tmp_path,active_flag):
     workspace=tmp_path/'source'
@@ -585,18 +590,6 @@ def test_active_occurrence_never_qualifies_for_failed_capture_retry(tmp_path,act
     (partial/'docker-inspect.json').write_text(json.dumps({'container_id':identity,'image':'image','mounts':mounts,'state':{'running':False}}))
     rows=[{'Id':identity,'Image':'image','Mounts':mounts,'State':{'Running':False,active_flag:True}}]
     assert retention.retained_candidates(rows,workspace,'b'*64,tmp_path/'legacy')==[]
-
-
-def test_oversized_encoded_summary_cannot_replace_previous_legacy_copy(tmp_path):
-    evidence=tmp_path/'evidence'
-    summary={'container_id':'a'*64,'image':'sha256:'+'b'*64,'mounts':[], 'state':{'running':False}}
-    partial=retention.prepare_capture(evidence,'20261013T000000Z',summary,legacy=True)
-    (partial/'copied-journal').write_bytes(b'only evidence')
-    oversized={**summary,'detail':'é'*12000}
-    with pytest.raises(ValueError,match='exceeds 64KB'):
-        retention.prepare_capture(evidence,'20261013T000001Z',oversized,legacy=True)
-    assert (partial/'copied-journal').read_bytes()==b'only evidence'
-    assert list(evidence.iterdir())==[partial]
 
 
 def test_epoch_component_overflow_is_named_incomplete_and_protected(tmp_path):
@@ -656,10 +649,10 @@ def test_mounted_partial_is_reused_and_preserves_prior_tail_and_receipt_identity
     root = tmp_path/'runtime'
     root.mkdir()
     summary = mounted_summary(root)
-    first = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, legacy=False, state_root=root)
+    first = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, state_root=root)
     (first/'docker.log').write_bytes(b'prior good tail')
     (first/'.docker.log.next').write_bytes(b'failed next attempt')
-    second = retention.prepare_capture(root/'evidence', '20261013T000001Z', summary, legacy=False, state_root=root)
+    second = retention.prepare_capture(root/'evidence', '20261013T000001Z', summary, state_root=root)
     assert first == second and second.name == '.mounted-'+'a'*64+'.partial'
     assert (second/'docker.log').read_bytes() == b'prior good tail'
     assert not (second/'.docker.log.next').exists()
@@ -676,7 +669,7 @@ def test_single_historical_mounted_partial_reuses_owned_folder_without_losing_ta
     partial.rename(partial.with_name(partial.name+'.partial'))
     partial = partial.with_name(partial.name+'.partial')
     before = (partial/'docker.log').read_bytes()
-    result = retention.prepare_capture(root/'evidence', '20261013T000002Z', mounted_summary(root), legacy=False, state_root=root)
+    result = retention.prepare_capture(root/'evidence', '20261013T000002Z', mounted_summary(root), state_root=root)
     assert not partial.exists() and result.name == '.mounted-'+'a'*64+'.partial'
     assert (result/'docker.log').read_bytes() == before
     assert list(result.parent.iterdir()) == [result]
@@ -687,7 +680,7 @@ def test_mounted_partial_ambiguity_preserves_material_without_new_partial(tmp_pa
     root = tmp_path/'runtime'
     root.mkdir()
     summary = mounted_summary(root)
-    partial = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, legacy=False, state_root=root)
+    partial = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, state_root=root)
     (partial/'docker.log').write_bytes(b'investigation tail')
     if exception == 'multiple':
         historical = partial.parent/'20261013T000001Z.partial'
@@ -706,7 +699,7 @@ def test_mounted_partial_ambiguity_preserves_material_without_new_partial(tmp_pa
     before = {str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
     folders = set(partial.parent.iterdir())
     with pytest.raises(ValueError, match='multiple historical|unknown contents|unknown or changed'):
-        retention.prepare_capture(root/'evidence', '20261013T000002Z', summary, legacy=False, state_root=root)
+        retention.prepare_capture(root/'evidence', '20261013T000002Z', summary, state_root=root)
     assert folders == set(partial.parent.iterdir())
     assert before == {str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
 
@@ -748,7 +741,7 @@ def test_owned_capture_cleanup_refuses_same_filesystem_mount_before_any_mutation
     root = tmp_path/'runtime'
     root.mkdir()
     summary = mounted_summary(root)
-    partial = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, legacy=False, state_root=root)
+    partial = retention.prepare_capture(root/'evidence', '20261013T000000Z', summary, state_root=root)
     mounted = partial/'user-directory'
     mounted.mkdir()
     (mounted/'file').write_bytes(b'mounted material')
@@ -758,7 +751,7 @@ def test_owned_capture_cleanup_refuses_same_filesystem_mount_before_any_mutation
     before = {str(p):p.read_bytes() for p in partial.rglob('*') if p.is_file()}
     monkeypatch.setattr(retention, '_mounted_children', lambda _: {mounted})
     with pytest.raises(ValueError, match='mounted child'):
-        retention.prepare_capture(root/'evidence', '20261013T000001Z', summary, legacy=False, state_root=root)
+        retention.prepare_capture(root/'evidence', '20261013T000001Z', summary, state_root=root)
     assert before == {str(p):p.read_bytes() for p in partial.rglob('*') if p.is_file()}
     assert list(partial.parent.iterdir()) == [partial]
 

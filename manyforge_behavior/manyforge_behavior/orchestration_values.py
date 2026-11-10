@@ -24,6 +24,7 @@ from manyforge_behavior.program import (
     NODE_OUTCOME_NONE,
     Program,
     ProgramValidationError,
+    ProgramFrameReferenceError,
     active_tcp_key,
     interrupt_state_key,
     is_active_tcp_key,
@@ -134,6 +135,18 @@ class NodeInputError(ProgramValueError):
         self.details = details
 
 
+# A velocity or acceleration scale read from a value source is above the
+# Program parameter of the same name, its ceiling (decision Q1.2-b).
+MOTION_VALUE_ABOVE_PROGRAM_LIMIT = "motion_value_above_program_limit"
+_PROGRAM_MOTION_CEILINGS = frozenset({"velocity_scale", "acceleration_scale"})
+
+
+class MotionLimitInputError(NodeInputError):
+    """A dynamic speed scale exceeds its Program ceiling; never clamped."""
+
+    reason_code = MOTION_VALUE_ABOVE_PROGRAM_LIMIT
+
+
 class ExpressionEvaluationError(ProgramValueError):
     """An expression could not be evaluated from the attempt's snapshot."""
 
@@ -193,8 +206,8 @@ RESTORED_VALUE_INVALID = "value_invalid"
 def input_failure_reason(error: Exception) -> str:
     """The node failure reason for an input that could not be resolved."""
 
-    if isinstance(error, ExpressionEvaluationError):
-        return ExpressionEvaluationError.reason_code
+    if isinstance(error, (ExpressionEvaluationError, NodeInputError)):
+        return error.reason_code
     return NODE_INPUT_UNAVAILABLE
 
 
@@ -247,7 +260,7 @@ class ProgramValueRecord:
         }
 
 
-# Key types a Run may publish to its host BB source (contract 52).
+# Key types a Run may publish to its host BB source.
 PUBLISHED_KEY_TYPES = frozenset({"bool", "int64", "float64", "string"})
 
 
@@ -465,10 +478,12 @@ class ProgramValueStore:
                 self._load(declaration, declaration.initial, "initial")
 
     def _load(
-        self, declaration: BlackboardKeyDeclaration, value: Any, source: str
+        self, declaration: BlackboardKeyDeclaration, value: Any, source: str,
+        *, check_frame_facts: bool = True,
     ) -> None:
+        program = self._program if check_frame_facts else self._program.without_program_frame_facts()
         validate_blackboard_value(
-            self._program,
+            program,
             declaration,
             value,
             label=f"blackboard key {declaration.key!r} ({source})",
@@ -613,7 +628,7 @@ class ProgramValueStore:
         section, so no commit falls between them. A computed key is recomputed
         by the existing evaluator whenever a stored key it reads commits, and
         is reported only when its value actually changes. Both callbacks run
-        under the store lock and forward synchronously (BBK-1): every writer
+        under the store lock and forward synchronously: every writer
         commits through this store, so the forwards keep commit order and a
         write returns only after its forward.
         """
@@ -626,7 +641,7 @@ class ProgramValueStore:
         computed_inputs: dict[str, frozenset[str]] = {}
         for key in keys:
             # Any declared key may be published, whatever its access mode
-            # (schema03 Δ2): a rule reads it, not a node.
+            # a rule reads it, not a node.
             declaration = self._declarations.get(key)
             if declaration is None:
                 raise ProgramValueError(f"blackboard key {key!r} is undeclared")
@@ -667,7 +682,7 @@ class ProgramValueStore:
     ) -> None:
         """Hand ``baseline`` every subscribed key's current value, under the
         store lock: a source the Kernel installs later starts from the values
-        committed meanwhile (BBK-1 (a))."""
+        committed meanwhile."""
 
         with self._lock:
             if self._published is None:
@@ -761,7 +776,7 @@ class ProgramValueStore:
                     # System-owned and always current across a Run reset.
                     continue
                 if is_node_outcome_key(key):
-                    # System start value `none` (contract 105).
+                    # System start value `none`.
                     previous = self._values[key]
                     if previous.value == NODE_OUTCOME_NONE:
                         continue
@@ -845,11 +860,11 @@ class ProgramValueStore:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Store a motion node's outcome in its system-owned key (item 42).
+        """Store a motion node's outcome in its system-owned key.
 
         The one writer of the reserved namespace: the key is read-only for
         nodes and the operator, and it keeps this value until the node ends
-        again. A Run starts at `none` (the declared start value, contract 105).
+        again. A Run starts at `none` (the declared start value).
         """
 
         key = node_outcome_key(node_instance_id)
@@ -867,7 +882,7 @@ class ProgramValueStore:
     def write_interrupt_state(self, rule_id: str, state: str | None) -> bool:
         """Mirror one global rule's Kernel state into its reserved key.
 
-        The one writer of the namespace (contract 64): read-only for nodes and
+        The one writer of the namespace: read-only for nodes and
         the operator. ``None`` makes the key unavailable (not clear). Only the
         Applied global rules are declared; another rule id is ignored (False).
         """
@@ -892,14 +907,16 @@ class ProgramValueStore:
             self._publish_locked(key, current)
         return True
 
-    def write_active_tcp(self, target_role: str, entry: Mapping[str, Any] | None) -> bool:
-        """Mirror the robot's confirmed TCP into its read-only role key.
+    def write_active_tcp(
+        self, component_id: str, command_target_id: str, entry: Mapping[str, Any] | None
+    ) -> bool:
+        """Mirror the robot's confirmed TCP into its read-only target key.
 
-        ``None`` makes the value unavailable. A role not declared in this
+        ``None`` makes the value unavailable. A target not declared in this
         Program is ignored, as with the interrupt-state mirror.
         """
 
-        key = active_tcp_key(target_role)
+        key = active_tcp_key(component_id, command_target_id)
         declaration = self._declarations.get(key)
         if declaration is None:
             return False
@@ -957,7 +974,7 @@ class ProgramValueStore:
                 ) from error
             current = self._values.get(key)
             if declaration.has_initial:
-                self._load(declaration, declaration.initial, "initial")
+                self._load(declaration, declaration.initial, "initial", check_frame_facts=False)
             else:
                 self._values.pop(key, None)
             self._publish_locked(key, current)
@@ -1188,16 +1205,18 @@ class NodeAttemptInputResolver:
             path: str | None,
             kind: str,
             reference: str | None = None,
+            *,
+            frame_error: ProgramFrameReferenceError | None = None,
         ) -> NodeInputError:
-            return NodeInputError(
-                cause,
-                details=input_failure_details(
-                    input_problem=problem,
-                    path=path,
-                    source_kind=kind,
-                    source_reference=reference,
-                ),
-            )
+            details = dict(input_failure_details(
+                input_problem=problem,
+                path=path,
+                source_kind=kind,
+                source_reference=reference,
+            ))
+            if frame_error is not None:
+                details.update(frame_error.details)
+            return NodeInputError(cause, details=details)
 
         def source_reference(path: str, source: Mapping[str, Any]) -> tuple[str, str]:
             kind = source.get("kind")
@@ -1486,16 +1505,38 @@ class NodeAttemptInputResolver:
                     )
                 except ValueError as exc:
                     raise failure(
-                        str(exc), INPUT_INVALID, parameter_id, *origin(parameter_id)
+                        str(exc), INPUT_INVALID, parameter_id, *origin(parameter_id),
+                        frame_error=exc if isinstance(exc, ProgramFrameReferenceError) else None,
                     ) from exc
+        # A sourced speed scale (in range, checked above) may not exceed the
+        # Program parameter of the same name: refused, never clamped.
+        for parameter_id in sorted(_PROGRAM_MOTION_CEILINGS & set(value_sources)):
+            ceiling = program_parameters.get(parameter_id)
+            if ceiling is not None and float(resolved[parameter_id]) > float(ceiling):
+                kind, reference = origin(parameter_id)
+                raise MotionLimitInputError(
+                    f"{parameter_id}={float(resolved[parameter_id]):g} exceeds "
+                    f"Program {parameter_id}={float(ceiling):g}",
+                    details=input_failure_details(
+                        input_problem=INPUT_INVALID,
+                        path=parameter_id,
+                        source_kind=kind,
+                        source_reference=reference,
+                    ),
+                )
         declared_blackboard = {
             parameter_id: _copy_runtime_value(blackboard_snapshot[resolved[parameter_id]])
             for parameter_id in blackboard_read_parameters
         }
         if derived_active_tcp_key is not None:
-            declared_blackboard["active_tcp"] = _copy_runtime_value(
+            active_tcp = _copy_runtime_value(
                 blackboard_snapshot[derived_active_tcp_key]
             )
+            # Keep the exact component/target key in the snapshot passed to
+            # production ports. The compatibility alias is still consumed by
+            # the node-preview path, which only handles one bound target.
+            declared_blackboard[derived_active_tcp_key] = active_tcp
+            declared_blackboard["active_tcp"] = active_tcp
         return NodeAttemptInputSnapshot(
             parameters=MappingProxyType(_copy_runtime_value(resolved)),
             blackboard=MappingProxyType(declared_blackboard),
@@ -1506,6 +1547,8 @@ __all__ = [
     "ExpressionEvaluationError",
     "INPUT_INVALID",
     "INPUT_MISSING",
+    "MOTION_VALUE_ABOVE_PROGRAM_LIMIT",
+    "MotionLimitInputError",
     "NODE_INPUT_UNAVAILABLE",
     "ProgramValueUncertainError",
     "NodeAttemptInputResolver",

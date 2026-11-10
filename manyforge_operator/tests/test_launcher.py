@@ -59,14 +59,13 @@ def _config(tmp_path: Path) -> NativeLauncherConfig:
     )
 
 
-def test_native_commands_retain_five_owner_entrypoints(tmp_path: Path):
+def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     config = _config(tmp_path)
     specs = native_commands(config)
     assert [spec.component_id for spec in specs] == [
         "manager",
         "headless",
         "program_runner",
-        "assistant_bridge",
         "composer",
     ]
     commands = [" ".join(spec.argv) for spec in specs]
@@ -111,29 +110,19 @@ def test_native_commands_retain_five_owner_entrypoints(tmp_path: Path):
         == expected_liveness
     )
     assert specs[2].argv[specs[2].argv.index("--cell-id") + 1] == config.cell_id
-    assert specs[3].argv[1:] == ("-m", "manyforge_assistant_bridge.bridge")
-    assert specs[3].environment == {
-        "MANYFORGE_HEADLESS_API_URL": "http://127.0.0.1:9010",
-        "MANYFORGE_COMPOSER_URL": "http://127.0.0.1:9000",
-        "MANYFORGE_ASSISTANT_BRIDGE_HOST": "127.0.0.1",
-        "MANYFORGE_ASSISTANT_BRIDGE_PORT": "8100",
-        "MANYFORGE_ASSISTANT_AUDIT_LOG": str(
-            config.instance_root / "state" / "assistant-bridge" / "audit.jsonl"
-        ),
-    }
-    assert "--port 9000" in commands[4]
-    assert specs[4].argv[
-        specs[4].argv.index("--assistant-bridge-url") + 1
-    ] == "http://127.0.0.1:8100"
+    assert "--port 9000" in commands[3]
+    assert "--assistant-bridge-url" not in specs[3].argv
+    assert not any("manyforge_assistant_bridge" in part for spec in specs for part in spec.argv)
     assert all("--apply" not in spec.argv and "--run" not in spec.argv for spec in specs)
     assert all(
         spec.environment["MANYFORGE_FS_ROOTS"] == str(config.install_root)
         for spec in specs[:3]
     )
     # The Manager's execution host and its component processes (a point-cloud
-    # source) inherit the Composer's URL.
+    # source, the assistant's host and bridge) inherit both URLs.
     assert specs[0].environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
-    assert specs[4].environment == {
+    assert specs[0].environment["MANYFORGE_HEADLESS_API_URL"] == "http://127.0.0.1:9010"
+    assert specs[3].environment == {
         "MANYFORGE_FS_ROOTS": (
             f"{config.source_root / 'examples'},"
             f"{config.install_root},{config.program_workspace}"
@@ -378,7 +367,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
         observation.presence is ResourcePresence.PRESENT
         for observation in first.resource_observations
     )
-    assert spawn_count == 5
+    assert spawn_count == 4
     saved = config.program_workspace / "saved.program.yaml"
     saved.write_text("schema_version: manyforge.program.v2\n", encoding="utf-8")
     record = launcher.store.read()
@@ -390,7 +379,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
     idempotent = launcher.start()
     assert launcher.last_start_idempotent is True
     assert idempotent.state is LaunchInstanceState.READY
-    assert spawn_count == 5
+    assert spawn_count == 4
     assert saved.is_file()
 
     stopped = launcher.stop()
@@ -408,7 +397,7 @@ def test_start_records_and_preserves_the_instance_program_workspace(
         observation.presence is ResourcePresence.PRESENT
         for observation in restarted.resource_observations
     )
-    assert spawn_count == 10
+    assert spawn_count == 8
     assert saved.read_text(encoding="utf-8") == (
         "schema_version: manyforge.program.v2\n"
     )
@@ -732,11 +721,11 @@ def test_readiness_uses_local_bind_addresses_for_publicly_advertised_stack(
 
     assert ready is True
     assert reason is None
-    assert [row.state.value for row in rows] == ["ready", "ready", "ready", "ready"]
+    assert [row.state.value for row in rows] == ["ready", "ready", "ready"]
+    assert [row.component_id for row in rows] == ["headless", "program_runner", "composer"]
     assert urls == [
         "http://127.0.0.1:9010/api/health",
         "http://127.0.0.1:9011/api/program/health",
-        "http://127.0.0.1:8100/health",
         "http://127.0.0.1:9000/api/health",
     ]
 

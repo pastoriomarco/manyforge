@@ -225,7 +225,7 @@ struct StopEvidenceRequirementDTO {
 /// One fixed member of the policy's ordered escalation chain. This is
 /// configuration, not a runtime list of candidates: Kernel alone advances
 /// through the retained order; each robot is bounded by its own Stop-time
-/// deadlines (Q51), never by a shared policy budget.
+/// deadlines, never by a shared policy budget.
 struct StopEscalationStageDTO {
   StopEscalationStageId stop_escalation_stage_id;
   StopEscalationStageKind stage_kind;

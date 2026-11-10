@@ -3,7 +3,7 @@
 One small JSON file per installation holds the current settings and any named
 profiles. It is presentation only: nothing here reaches the Program, the
 Deployment or execution. A setting that names things a Program defines
-(execution groups, frame roles) belongs to the Program instead.
+(execution groups and authored references) belongs to the Program instead.
 
 Persistence rules:
 

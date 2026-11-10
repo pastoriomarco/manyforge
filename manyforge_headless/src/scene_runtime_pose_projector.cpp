@@ -1093,7 +1093,7 @@ SceneRuntimePoseProjector::CarriedObjectLost(
   //    A target without that signal (not a gripper target of the committed
   //    composition: the host answers `io_signal_unbound`) is not applicable:
   //    the flags apply as configured. A failed publication of an existing
-  //    signal fails closed (SX-204, component fault): the loss raises the
+  //    signal fails closed (component fault): the loss raises the
   //    alarm and stops the motion whatever `on_grasp_lost` says and carries
   //    the typed publication error; like any loss it fires once.
   if (signal_publisher_) {
@@ -1136,7 +1136,7 @@ SceneRuntimePoseProjector::CarriedObjectLost(
     } catch (const std::exception &) {
       details.emplace("detach_result", "scene_runtime_pose_scene_unavailable");
     }
-    // DX-2562: only a successful detach ends this attachment's check; after a
+    // Only a successful detach ends this attachment's check; after a
     // refused detach the next sample detects the loss again and retries.
     if (detached_ok) {
       ForgetGraspBaseline(attachment.scene_resource_id.value());

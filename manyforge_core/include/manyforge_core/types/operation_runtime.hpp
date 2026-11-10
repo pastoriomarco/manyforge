@@ -465,7 +465,7 @@ struct StopAcceptedDTO final {
   ContentDigest captured_scope_digest;
   std::vector<StopPredecessorAcceptanceRefDTO> joined_predecessor_stops;
   std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions;
-  /// Q51: no shared Stop budget is accepted; each robot's own deadlines are
+  /// No shared Stop budget is accepted; each robot's own deadlines are
   /// computed at stage dispatch from its own profile and lane.
   std::int64_t accepted_at_ns{};
 

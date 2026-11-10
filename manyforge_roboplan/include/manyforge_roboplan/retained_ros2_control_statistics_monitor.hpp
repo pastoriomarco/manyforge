@@ -13,7 +13,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// Q54 (monitor only, DX-136): the controller manager's per-controller
+/// Monitor only: the controller manager's per-controller
 /// statistics for one trajectory controller, observed by the host. The
 /// controller manager resets these statistics immediately before the
 /// controller's activation, so its values are the extrema since activation,
@@ -26,7 +26,7 @@ struct RetainedControllerStatisticsConfig final {
   /// `<controller_manager>/statistics/full`.
   std::string controller_manager;
   std::string controller_name;
-  /// The controller's nominal update rate; Q55 warning margin: a worst
+  /// The controller's nominal update rate; warning margin: a worst
   /// observed period beyond two controller periods.
   double controller_update_rate_hz{0.0};
   /// Warning throttle (as the controller manager's own overrun warnings).
@@ -49,7 +49,7 @@ struct RetainedControllerStatisticsSnapshot final {
   std::uint64_t observed_statistics_updates{0U};
   /// Observed updates whose worst period was beyond the warning margin.
   std::uint64_t observed_updates_beyond_margin{0U};
-  /// Two controller periods (Q55).
+  /// Two controller periods.
   double warning_margin_period_s{0.0};
 };
 
@@ -59,7 +59,8 @@ public:
 
   /// Throws on an unusable configuration (no names or update rate).
   RetainedControllerStatisticsMonitor(RetainedControllerStatisticsConfig config,
-                                      const core::IClock &clock, Warning warning);
+                                      std::shared_ptr<core::IClock> clock,
+                                      Warning warning);
 
   /// One statistics update, received at local time `receipt_ns`.
   void Observe(const pal_statistics_msgs::msg::Statistics &message,
@@ -79,7 +80,7 @@ public:
 
 private:
   const RetainedControllerStatisticsConfig config_;
-  const core::IClock &clock_;
+  std::shared_ptr<core::IClock> clock_;
   const Warning warning_;
   const std::string min_name_;
   const std::string sample_count_name_;

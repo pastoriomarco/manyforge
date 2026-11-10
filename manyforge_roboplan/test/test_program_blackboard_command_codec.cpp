@@ -17,6 +17,19 @@
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
+TEST(ComponentRecoveryCommandCodec, AcceptsExactFactsAndRejectsIncompleteConfirmation) {
+  const auto preflight = DecodeCommand(
+      R"({"api_version":"manyforge.execution_command.v3","command":"component_recovery_preflight","request":{"component_id":"arm"}})");
+  EXPECT_EQ(preflight.kind, CommandKind::kComponentRecoveryPreflight);
+  EXPECT_EQ(preflight.component_id, std::optional<std::string>("arm"));
+  const auto confirmed = DecodeCommand(
+      R"({"api_version":"manyforge.execution_command.v3","command":"component_action","request":{"action":"enable","component_id":"arm","recovery_preflight":{"confirmed":[{"cause_code":"fault_vendor","component_id":"arm","eligibility":"recover","stop_code":null,"stop_vendor_code":null,"vendor_code":"C31"}],"snapshot_id":"snapshot"}}})");
+  ASSERT_TRUE(confirmed.recovery_preflight);
+  ASSERT_EQ(confirmed.recovery_preflight->confirmed.size(), 1U);
+  EXPECT_EQ(confirmed.recovery_preflight->confirmed[0].vendor_code, std::optional<std::string>("C31"));
+  EXPECT_THROW(DecodeCommand(
+      R"({"api_version":"manyforge.execution_command.v3","command":"component_action","request":{"action":"enable","component_id":"arm","recovery_preflight":{"confirmed":[{"cause_code":null,"component_id":"arm","eligibility":"ready","vendor_code":null}],"snapshot_id":"snapshot"}}})"), std::exception);
+}
 using Value = content_identity::CanonicalValue;
 
 TEST(ToolPayloadCommandCodec, RemovedBridgeCommandIsRejected) {
@@ -34,7 +47,7 @@ Command DecodeSetIoOutput(Value request) {
 }
 
 TEST(SetIoOutputCommandCodec, DecodesTheContractShape) {
-  // CONTRACTS §7, as manyforge_headless_api/execution.py sends it.
+  // As manyforge_headless_api/execution.py sends it.
   const auto command = DecodeSetIoOutput(Value(Value::Object{
       {"origin", Value("manual")}, {"signal_id", Value("lite6_robot_controller_io/CO1")}, {"value", Value(true)}}));
   EXPECT_EQ(command.kind, CommandKind::kSetIoOutput);
@@ -227,7 +240,7 @@ TEST(ProgramBlackboardCommandCodecTest,
   EXPECT_TRUE(lost.carried_object_lost_set->level);
   EXPECT_EQ(lost.carried_object_lost_set->carried_object_attachment_id,
             std::optional<std::string>("attachment.1"));
-  // Contract §10: the loss event id and the stored key travel with `true`.
+  // The loss event id and the stored key travel with `true`.
   EXPECT_EQ(lost.carried_object_lost_set->loss_event_id,
             std::optional<std::string>("loss.7"));
   EXPECT_EQ(lost.carried_object_lost_set->set_key,
@@ -270,13 +283,13 @@ namespace {
 Value MockStartRow(std::string target, std::string resource,
                    Value change = Value(nullptr)) {
   return Value(Value::Object{
-      {"signal", Value(Value::Object{{"target_role", Value(std::move(target))},
-                                      {"resource_role", Value(std::move(resource))}})},
+      {"signal", Value(Value::Object{{"component_id", Value(std::move(target))},
+                                      {"signal_name", Value(std::move(resource))}})},
       {"start_value", Value(false)}, {"change", std::move(change)}});
 }
 Value MockStartRequest(Value::Array rows = {MockStartRow("arm", "ready")}) {
   return Value(Value::Object{
-      {"schema_version", Value("manyforge.mock_io_node_start.v1")},
+      {"schema_version", Value("manyforge.mock_io_node_start.v2")},
       {"owner_epoch", Value("kernel.epoch.1")},
       {"program_binding_id", Value("binding.1")},
       {"program_runner_owner_epoch", Value("runner.epoch.1")},
@@ -352,7 +365,7 @@ TEST(ProgramMockNodeStartCodecTest, RejectsCoercionNoncanonicalIndexAndUntrusted
 }
 TEST(ProgramMockNodeStartCodecTest, RejectsOpenShapesPhysicalAuthorityAndSelectorConflicts) {
   for (const auto& request : {
-           Replace(MockStartRequest(), "schema_version", Value("manyforge.mock_io_node_start.v2")),
+           Replace(MockStartRequest(), "schema_version", Value("manyforge.mock_io_node_start.v1")),
            Replace(MockStartRequest(), "previous_node_attempt_id", Value("old.attempt")),
            Replace(MockStartRequest(), "source_incarnation", Value("caller-authority")),
            Replace(MockStartRequest(), "node_attempt_id", Value("")),
@@ -361,7 +374,7 @@ TEST(ProgramMockNodeStartCodecTest, RejectsOpenShapesPhysicalAuthorityAndSelecto
            MockStartRequest({MockStartRow("z", "ready"), MockStartRow("a", "ready")}),
            MockStartRequest({Replace(MockStartRow("arm", "ready"), "catalog_generation", Value(1.0))}),
            MockStartRequest({Replace(MockStartRow("arm", "ready"), "signal",
-               Value(Value::Object{{"target_role", Value("arm")}, {"resource_role", Value("ready")},
+               Value(Value::Object{{"component_id", Value("arm")}, {"signal_name", Value("ready")},
                                    {"controllable_component_id", Value("caller")}}))}),
            MockStartRequest({MockStartRow("arm", "ready", Value(Value::Object{
                {"after_ms", Value(0.0)}, {"value", Value(true)}, {"repeat", Value(true)}}))})}) {
@@ -408,7 +421,7 @@ TEST(ProgramMockNodeEndCodecTest, RejectsRowsAuthorityCoercionAndOpenOrIncomplet
       Replace(MockEndRequest(), "signals", Value(Value::Array{MockStartRow("arm", "ready")})),
       Replace(MockEndRequest(), "started_at_ns", Value("123")),
       Replace(MockEndRequest(), "source_incarnation", Value("caller")),
-      Replace(MockEndRequest(), "schema_version", Value("manyforge.mock_io_node_start.v1")),
+      Replace(MockEndRequest(), "schema_version", Value("manyforge.mock_io_node_start.v2")),
       Replace(MockEndRequest(), "node_attempt_id", Value(""))})
     EXPECT_THROW(DecodeMockEnd(request), std::exception);
   auto missing = MockEndRequest().as_object();
@@ -512,7 +525,7 @@ TEST(ProgramMockRunPauseCodecTest, RequiresExplicitCanonicalHeldNodeMaskInExisti
 TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControlLaneEffects) {
   const auto request = [](double allowance) {
     return content_identity::canonical_json(Value(Value::Object{
-        {"api_version", Value("manyforge.execution_command.v1")},
+        {"api_version", Value("manyforge.execution_command.v3")},
         {"command", Value("read_volatile_motion_trace")},
         {"allowance_bytes", Value(allowance)},
         {"attribution", Value(Value::Object{
@@ -578,14 +591,14 @@ TEST(VolatileMotionTraceCommandTest, AcceptedClientCarriesItsAtomicResponseCapac
 }
 }  // namespace
 
-// Active TCP (M7, T-MQ17): the motion's TCP is the three-form selector; the
-// pre-M7 `{target_role_id, frame_role_id}` endpoint is refused.
+// Active TCP: the motion's TCP is the three-form selector; the
+// older `{target_role_id, frame_role_id}` endpoint is refused.
 TEST(MotionEndpointCommandCodecTest,
      DecodesOnlyTheRequiredTcpSelector) {
   const auto payload = Value(Value::Object{
       {"kind", Value("motion")},
       {"move_id", Value("move.endpoint")},
-      {"base_frame_role_id", Value("base")},
+      {"base_frame", Value(Value::Object{{"component_id", Value("robot")}, {"frame_id", Value("base")}})},
       {"tcp_endpoint", Value(Value::Object{{"kind", Value("current")}})},
       {"tolerances",
        Value(Value::Object{{"joint_position_tol_rad", Value(0.01)},
@@ -625,8 +638,7 @@ TEST(MotionEndpointCommandCodecTest,
             {"expected_scene_revision", Value(nullptr)},
             {"coordination_policy", Value("independent")},
             {"participants", Value(Value::Array{Value(Value::Object{
-                                 {"component_role_id", Value("robot")},
-                                 {"target_role_id", Value("arm")},
+                                 {"target", Value(Value::Object{{"component_id", Value("robot")}, {"command_target_id", Value("arm")}})},
                                  {"required_capability_id",
                                   Value("planning.motion.joint_goal")},
                                  {"action_span", Value(nullptr)},
@@ -638,25 +650,24 @@ TEST(MotionEndpointCommandCodecTest,
       std::get<core::MotionParticipantIntentDTO>(own.participants.front().payload)
           .tcp_endpoint));
   auto fields = payload.as_object();
-  const Value entry(Value::Object{{"component_id", Value("gripper")},
-                                  {"target_id", Value("tool")},
-                                  {"frame_role_id", Value("tip")}});
-  const Value endpoint(Value::Object{{"kind", Value("entry")}, {"entry", entry}});
+  const Value target(Value::Object{{"component_id", Value("gripper")}, {"command_target_id", Value("tool")}});
+  const Value frame(Value::Object{{"component_id", Value("gripper")}, {"frame_id", Value("tip")}});
+  const Value endpoint(Value::Object{{"kind", Value("entry")}, {"target", target}, {"frame", frame}});
   const auto qualified =
       decode(Replace(Value(fields), "tcp_endpoint", endpoint));
   const auto &motion = std::get<core::MotionParticipantIntentDTO>(
       qualified.participants.front().payload);
   EXPECT_EQ(motion.tcp_endpoint,
-            core::TcpSelectorDTO(core::TcpEntryDTO{core::ControllableComponentId("gripper"),
-                                                   core::CommandTargetId("tool"),
-                                                   core::FrameRoleId("tip")}));
+            core::TcpSelectorDTO(core::TcpEntryReferenceDTO{{core::ControllableComponentId("gripper"),
+                                                   core::CommandTargetId("tool")},
+                                                  {core::ControllableComponentId("gripper"), core::FrameRoleId("tip")}}));
   const auto form2 = decode(Replace(
       Value(fields), "tcp_endpoint",
-      Value(Value::Object{{"kind", Value("default_of_role")}, {"role", Value("tool")}})));
+      Value(Value::Object{{"kind", Value("default_of_target")}, {"target", target}})));
   EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(form2.participants.front().payload)
                 .tcp_endpoint,
-            core::TcpSelectorDTO(core::DefaultTcpOfRoleDTO{core::TargetRoleId("tool")}));
-  // The pre-M7 endpoint shape is refused.
+            core::TcpSelectorDTO(core::DefaultTcpOfTargetDTO{{core::ControllableComponentId("gripper"), core::CommandTargetId("tool")}}));
+  // The older endpoint shape is refused.
   EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
                               Value(Value::Object{{"target_role_id", Value("arm")},
                                                   {"frame_role_id", Value("tcp")}}))),
@@ -700,8 +711,8 @@ TEST(MotionEndpointCommandCodecTest,
                               Replace(endpoint, "extra", Value(true)))),
                std::exception);
   EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
-                              Replace(endpoint, "entry",
-                                      Replace(entry, "frame_role_id", Value(""))))),
+                              Replace(endpoint, "frame",
+                                      Replace(frame, "frame_id", Value(""))))),
                std::exception);
   // The planner block: absent or null keeps the Deployment's; set members
   // override; unknown members and out-of-range values are refused.
@@ -734,7 +745,7 @@ TEST(MotionEndpointCommandCodecTest,
   EXPECT_THROW(decode(Value(fields)), std::exception);
 }
 
-// Active TCP (M7, T-MQ15): the Set TCP payload carries a selector only.
+// Active TCP: the Set TCP payload carries a selector only.
 TEST(MotionEndpointCommandCodecTest, DecodesTheSetTcpPayload) {
   const auto decode = [](Value payload) {
     return DecodeOperation(
@@ -753,23 +764,21 @@ TEST(MotionEndpointCommandCodecTest, DecodesTheSetTcpPayload) {
             {"expected_scene_revision", Value(nullptr)},
             {"coordination_policy", Value("independent")},
             {"participants", Value(Value::Array{Value(Value::Object{
-                                 {"component_role_id", Value("robot")},
-                                 {"target_role_id", Value("arm")},
+                                 {"target", Value(Value::Object{{"component_id", Value("robot")}, {"command_target_id", Value("arm")}})},
                                  {"required_capability_id",
                                   Value("execution.trajectory.execute")},
                                  {"action_span", Value(nullptr)},
                                  {"payload", std::move(payload)}})})}}),
         core::RequestAttributionDTO{});
   };
-  const Value entry(Value::Object{{"component_id", Value("gripper")},
-                                  {"target_id", Value("tool")},
-                                  {"frame_role_id", Value("tip")}});
+  const Value target(Value::Object{{"component_id", Value("gripper")}, {"command_target_id", Value("tool")}});
+  const Value frame(Value::Object{{"component_id", Value("gripper")}, {"frame_id", Value("tip")}});
   const auto decoded = decode(Value(Value::Object{
       {"kind", Value("set_tcp")},
-      {"tcp", Value(Value::Object{{"kind", Value("entry")}, {"entry", entry}})}}));
+      {"tcp", Value(Value::Object{{"kind", Value("entry")}, {"target", target}, {"frame", frame}})}}));
   const auto &set = std::get<core::SetTcpParticipantIntentDTO>(
       decoded.participants.front().payload);
-  EXPECT_TRUE(std::holds_alternative<core::TcpEntryDTO>(set.tcp));
+  EXPECT_TRUE(std::holds_alternative<core::TcpEntryReferenceDTO>(set.tcp));
   EXPECT_THROW(decode(Value(Value::Object{{"kind", Value("set_tcp")}})), std::exception);
   EXPECT_THROW(decode(Value(Value::Object{
                    {"kind", Value("set_tcp")},
@@ -783,11 +792,11 @@ TEST(MockIoInputCommandCodecTest,
   const std::string owner =
       "kernel-owner-execution-host-096bf5ba514b8728699ff5c290ccd23f";
   const Value request(Value::Object{
-      {"schema_version", Value("manyforge.mock_io_input_request.v1")},
+      {"schema_version", Value("manyforge.mock_io_input_request.v2")},
       {"owner_epoch", Value(owner)},
       {"program_binding_id", Value("binding.io-wire")},
-      {"target_role_id", Value("io_target")},
-      {"resource_role_id", Value("ready_input")},
+      {"signal", Value(Value::Object{{"component_id", Value("io_component")},
+                                    {"signal_name", Value("ready_input")}})},
       {"expected_source_epoch", Value("installation.io-wire")},
       {"value", Value("false")}});
   const auto decode = [](Value input) {
@@ -816,11 +825,11 @@ TEST(MockIoInputCommandCodecTest,
     EXPECT_EQ(input.query.owner_epoch, core::RequestOwnerEpoch(owner));
     EXPECT_EQ(input.query.program_binding_id,
               core::ProgramBindingId("binding.io-wire"));
-    EXPECT_EQ(input.query.target_role_id, core::TargetRoleId("io_target"));
-    ASSERT_TRUE(input.query.io_signal_role);
-    EXPECT_EQ(*input.query.io_signal_role, core::ResourceRoleId("ready_input"));
-    EXPECT_FALSE(input.query.frame_role_id);
-    EXPECT_FALSE(input.query.relative_to_frame_role_id);
+    ASSERT_TRUE(input.query.signal);
+    EXPECT_EQ(input.query.signal->component_id, core::ControllableComponentId("io_component"));
+    EXPECT_EQ(input.query.signal->signal_name, "ready_input");
+    EXPECT_FALSE(input.query.frame);
+    EXPECT_FALSE(input.query.relative_to_frame);
     EXPECT_FALSE(input.query.frame_transform);
     EXPECT_EQ(input.expected_source_epoch,
               core::IoSourceIncarnation("installation.io-wire"));

@@ -72,7 +72,7 @@ RetainedCellRuntime::RetainedCellRuntime(
 
   addressed_kernel_ =
       std::make_unique<core::ResourceAddressedExecutionKernel>(
-          participant_registrations_, *clock_, *scheduler_,
+          participant_registrations_, *clock_,
           *operation_journal_, std::move(input.kernel_config));
   // A callback that throws on this scheduler's Stop/safety path, including a
   // lookahead session of an engine sharing it, contains the cell.

@@ -14,6 +14,9 @@ services:
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     security_opt:
       # ThreadSanitizer needs personality(ADDR_NO_RANDOMIZE), which Docker's
       # default seccomp profile blocks on this platform. Phase-4 release
@@ -37,6 +40,9 @@ services:
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     restart: unless-stopped
     ports:
       - "9000:9000"
@@ -65,6 +71,9 @@ services:
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     ports:
       - "9000:9000"
     volumes:
@@ -80,6 +89,9 @@ services:
   composer-ui:
     image: node:22-slim
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     ports:
       - "3000:3000"
     volumes:
@@ -95,6 +107,9 @@ services:
   ros-jazzy:
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     network_mode: host
     ipc: host
     volumes:
@@ -125,10 +140,16 @@ services:
       dockerfile: Dockerfile.ros-lyrical-full
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
-        # noble on x86_64, noble-jetpack on Jetson (compose-dev.sh build selects it).
+        # ROS base: apt (NVIDIA Isaac ROS mirror plus overlays, default) or
+        # source (ROS Lyrical built from source).
+        ROS_BASE: ${MANYFORGE_ROS_BASE:-source}
+        # apt base only: noble on x86_64, noble-jetpack on Jetson (compose-dev.sh build selects it).
         NVIDIA_ISAAC_ROS_RELEASE_SUITE: ${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-noble}
         CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-4}
     logging: *default-logging
+    # OD-59: the strict real-time profile locks memory (mlockall).
+    ulimits:
+      memlock: -1
     network_mode: host
     ipc: host
     volumes:

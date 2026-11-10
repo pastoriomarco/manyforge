@@ -2,8 +2,6 @@ import { readFileSync } from 'node:fs';
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
-import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
-import { parseProgramBindingTransport } from '../api/programBindingTransport.generated';
 import { statusFixture } from '../testFixtures/robotControl';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -14,12 +12,11 @@ import type {
   CatalogEntry,
   NodeEnvironmentResponse,
   ProgramAuthoringDocument,
-  ProgramBindingDocument,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramWorkspaceResponse,
 } from '../types/api';
-import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { DocumentControls } from './DocumentControls';
@@ -41,6 +38,7 @@ import {
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
 import { ProgramWorkspace } from './ProgramWorkspace';
 import { ProgramSchemaValueEditor } from './property/ProgramSchemaValueEditor';
+import { ProgramManualFillPreviewProvider } from './property/ProgramSpecializedEditors';
 import { catalogParameterSourceable } from '../utils/programAuthoring';
 
 const sequence: CatalogEntry = {
@@ -130,21 +128,55 @@ function authoringProgram(
   keys: BlackboardKeyDeclaration[] = [],
 ): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v2',
+    api_version: 'manyforge.program.v3',
     program_id: 'test_program',
     program_profile: 'composable-cell-v1',
     name: 'Test Program',
     catalog: {
-      api_version: 'manyforge.node_catalog.v2',
+      api_version: 'manyforge.node_catalog.v3',
       content_version: '2.4.0',
     },
-    component_roles: { robot: {} },
-    target_roles: {},
     parameters,
     blackboard: { namespaces: [], keys },
-    schema_version: 'manyforge.composer_authoring_forest.v1',
+    schema_version: 'manyforge.composer_authoring_forest.v2',
     forest: roots,
     positions: {},
+  };
+}
+
+type TargetFact = ReferenceSelectorFacts['targets'][number];
+type SignalFact = ReferenceSelectorFacts['signals'][number];
+
+/** The qualified Draft candidate facts the direct-reference pickers read. */
+function selectorFacts(facts: Partial<ReferenceSelectorFacts> = {}): ReferenceSelectorFacts {
+  return { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [], ...facts };
+}
+
+function targetFact(
+  componentId: string,
+  commandTargetId: string,
+  capabilityIds: string[] = [],
+  extra: Partial<TargetFact> = {},
+): TargetFact {
+  return {
+    target: { component_id: componentId, command_target_id: commandTargetId },
+    capabilities: capabilityIds.map((capability_id) => ({ capability_id, available: true, reason: null })),
+    source_joint_names: [], tcp_entries: [], default_tcp: null, stop_routes: [],
+    ...extra,
+  };
+}
+
+function signalFact(
+  componentId: string,
+  signalName: string,
+  direction: 'input' | 'output',
+  target: { component_id: string; command_target_id: string },
+  providerProfile = 'mock',
+): SignalFact {
+  return {
+    reference: { component_id: componentId, signal_name: signalName }, ambiguous: false, target,
+    value_type: 'bool', direction, transition_capability: 'sampled_only', update_mode: null,
+    liveness: null, provider_profile: providerProfile,
   };
 }
 
@@ -299,11 +331,11 @@ describe('Program authoring panels', () => {
       <NodePaletteItem
         entry={sequence}
         executionAvailable={false}
-        executionNote="Authorable · unavailable until N7"
+        executionNote="Authorable · unavailable in this version"
         allowDrag
       />,
     );
-    expect(unavailableItem).not.toContain('Authorable · unavailable until N7');
+    expect(unavailableItem).not.toContain('Authorable · unavailable in this version');
     expect(unavailableItem).toContain('node-info-button execution-unavailable');
     expect(unavailableItem).toContain('execution unavailable');
     expect(unavailableItem).toContain('draggable="true"');
@@ -370,9 +402,9 @@ describe('Program authoring panels', () => {
       category: sequence.category,
     };
     const modelReason = {
-      code: 'model_not_configured',
-      message: 'No model is configured',
-      details: {},
+      code: 'capability_not_offered',
+      message: 'No component offers assistant.model.query',
+      details: { capability: 'assistant.model.query' },
     };
     const missingCapability = {
       code: 'capability_not_offered',
@@ -391,7 +423,7 @@ describe('Program authoring panels', () => {
           authoringAvailable: true,
           executionAvailable: false,
           reasons: [modelReason],
-          reasonCodes: ['model_not_configured'],
+          reasonCodes: ['capability_not_offered'],
           restorationGates: [],
         },
       ],
@@ -424,9 +456,14 @@ describe('Program authoring panels', () => {
       ],
     };
 
+    // Restoration gate codes never reach the operator.
+    expect(executionAvailability(sequence, environment)).toEqual({
+      available: false,
+      note: 'Authorable · unavailable in this version · native program product unavailable',
+    });
     expect(executionAvailability(modelQuery, modelEnvironment)).toEqual({
       available: false,
-      note: 'Authorable · unavailable · No model configured',
+      note: 'Authorable · unavailable · Required capability unavailable (assistant.model.query)',
     });
     expect(executionAvailability(gripperNode, gripperEnvironment)).toEqual({
       available: false,
@@ -473,34 +510,31 @@ describe('Program authoring panels', () => {
           orientation: { xyzw: [0, 0, 0, 1] },
         },
       }],
-      target_roles: {
-        arm: {
-          component_role: 'robot',
-          required_capabilities: [{
-            capability_id: 'planning.motion.pose_goal',
-            parameters: {},
-            disposition: 'required',
-          }],
-          required_frame_roles: ['base', 'tcp'],
-          required_collision_body_roles: ['arm_collision'],
-        },
-        gripper: {
-          component_role: 'tool',
-          required_capabilities: [{
-            capability_id: 'tool.gripper.command',
-            parameters: {},
-            disposition: 'required',
-          }],
-          required_frame_roles: ['tcp'],
-          required_collision_body_roles: ['gripper_collision'],
-        },
-      },
       contact_policies: [],
     };
+    // The arm and its gripper as direct references of the qualified Draft candidate.
+    const arm = { component_id: 'robot', command_target_id: 'arm' };
+    const gripper = { component_id: 'tool', command_target_id: 'gripper' };
+    const facts = selectorFacts({
+      targets: [
+        targetFact('robot', 'arm', ['planning.motion.pose_goal']),
+        targetFact('tool', 'gripper', ['tool.gripper.command']),
+      ],
+      frames: [
+        { reference: { component_id: 'robot', frame_id: 'base' }, ambiguous: false, moving_targets: [arm] },
+        { reference: { component_id: 'robot', frame_id: 'tcp' }, ambiguous: false, moving_targets: [arm] },
+        { reference: { component_id: 'tool', frame_id: 'tcp' }, ambiguous: false, moving_targets: [arm, gripper] },
+      ],
+      bodies: [
+        { reference: { component_id: 'robot', collision_body_id: 'arm_collision' }, ambiguous: false, moving_targets: [arm] },
+        { reference: { component_id: 'tool', collision_body_id: 'gripper_collision' }, ambiguous: false, moving_targets: [arm, gripper] },
+      ],
+    });
     const markup = renderToStaticMarkup(<div>
       <ProgramNodePalette
         roots={[tree]}
         program={program}
+        selectorFacts={facts}
         catalogEntries={[sequence, timer]}
         catalogIdentity={null}
         environment={environment}
@@ -509,6 +543,7 @@ describe('Program authoring panels', () => {
       />
       <ProgramContactPolicyEditor
         program={program}
+        selectorFacts={facts}
         draftRevision={1}
         busy={false}
         mutate={vi.fn() as ProgramWorkspaceController['mutate']}
@@ -529,55 +564,70 @@ describe('Program authoring panels', () => {
       ...timer,
       id: 'motion.move_to_pose',
       parameters: [
-        { id: 'target_role', required: true, hasDefault: false,
-          schema: { type: 'string' }, schemaHash: 'sha256:target-role' },
-        { id: 'base_frame_role', required: true, hasDefault: false,
-          schema: { type: 'string' }, schemaHash: 'sha256:base-role' },
+        { id: 'target', required: true, hasDefault: false,
+          schema: { type: 'object', 'x-manyforge-semantic-type': 'target_reference' }, schemaHash: 'sha256:target' },
+        { id: 'base_frame', required: true, hasDefault: false,
+          schema: { type: 'object', 'x-manyforge-semantic-type': 'frame_reference' }, schemaHash: 'sha256:base-frame' },
         { id: 'tcp_endpoint', required: true, hasDefault: false,
           schema: {
             type: 'object', additionalProperties: false,
-            required: ['kind', 'target_role', 'frame_role'],
-            properties: { kind: { type: 'string' }, target_role: { type: 'string' }, frame_role: { type: 'string' } },
+            required: ['kind', 'target', 'frame'],
+            properties: { kind: { type: 'string' }, target: { type: 'object' }, frame: { type: 'object' } },
           }, schemaHash: 'sha256:tcp-endpoint' },
       ],
     };
+    const arm = { component_id: 'robot', command_target_id: 'arm' };
+    const tool = { component_id: 'robot', command_target_id: 'tool' };
+    const armTcp = { target: arm, frame: { component_id: 'robot', frame_id: 'tcp' } };
+    const toolJaw = { target: tool, frame: { component_id: 'robot', frame_id: 'jaw_contact' } };
     const node: ProgramTreeNode = {
       node_id: entry.id,
       instance_id: 'move',
       parameters: {
-        target_role: 'arm', base_frame_role: 'base',
-        tcp_endpoint: { kind: 'entry', target_role: 'arm', frame_role: 'tcp' },
+        target: arm, base_frame: { component_id: 'robot', frame_id: 'base' },
+        tcp_endpoint: { kind: 'entry', target: arm, frame: { component_id: 'robot', frame_id: 'tcp' } },
       },
       children: [],
     };
-    const program: ProgramAuthoringDocument = {
-      ...authoringProgram([node]),
-      target_roles: {
-        arm: { component_role: 'robot', required_frame_roles: ['base', 'tcp'] },
-        tool: { component_role: 'robot', required_frame_roles: ['tcp', 'jaw_contact'] },
-      },
-    };
+    const before = structuredClone(node.parameters);
+    // The arm's qualified TCPs: its own and the tool's, each the default of its target.
+    const entryFact = (tcp: typeof armTcp, componentDefault: boolean) => ({
+      entry: tcp, end_effector: true, component_default: componentDefault,
+      mounted_here: true, mounted_elsewhere: false, available: true, reason: null,
+    });
+    const facts = selectorFacts({
+      targets: [
+        targetFact('robot', 'arm', [], { default_tcp: armTcp,
+          tcp_entries: [entryFact(armTcp, true), entryFact(toolJaw, false)] }),
+        targetFact('robot', 'tool', [], { default_tcp: toolJaw, tcp_entries: [entryFact(toolJaw, true)] }),
+      ],
+      frames: [
+        { reference: { component_id: 'robot', frame_id: 'base' }, ambiguous: false, moving_targets: [arm] },
+        { reference: { component_id: 'robot', frame_id: 'tcp' }, ambiguous: false, moving_targets: [arm] },
+        { reference: { component_id: 'robot', frame_id: 'jaw_contact' }, ambiguous: false, moving_targets: [arm, tool] },
+      ],
+    });
     const markup = renderToStaticMarkup(<ProgramPropertyEditor
       roots={[node]}
       selectedId="move"
       catalogEntries={[entry]}
-      program={program}
+      program={authoringProgram([node])}
+      selectorFacts={facts}
       busy={false}
       onMutate={vi.fn()}
       onUpdateNodePolicies={vi.fn()}
     />);
 
     expect(markup).toContain('aria-label="Motion TCP endpoint"');
-    expect(markup).toContain('Moves: arm');
-    expect(markup).toContain('Current');
-    expect(markup).toContain('Default TCP of tool');
+    expect(markup).toContain('Moves: robot · arm');
+    expect(markup).toContain('Current: Active TCP at run time');
+    expect(markup).toContain('Own default TCP of robot · arm, ignores mounted tools (robot / tcp)');
+    expect(markup).toContain('Default TCP of robot · tool (robot / jaw_contact)');
     expect(markup).toContain('Show TCPs of tools mounted on other robots');
-    expect(markup).toContain('arm · tcp');
-    expect(markup).toContain('tool · jaw_contact');
-    expect(node.parameters).toEqual({
-      target_role: 'arm', base_frame_role: 'base',
-      tcp_endpoint: { kind: 'entry', target_role: 'arm', frame_role: 'tcp' },
-    });
+    // The stored entry selector is the selected option.
+    expect(markup).toMatch(/<option[^>]*selected=""[^>]*>robot · arm \/ robot · tcp \(default\)<\/option>/);
+    expect(markup).toContain('robot · tool / robot · jaw_contact');
+    expect(node.parameters).toEqual(before);
   });
 
   it('renders one deterministic selected tree and exact v1 value source', () => {
@@ -661,7 +711,7 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('it also waits until command_duration_s has passed since the command started');
   });
 
-  it('disables automatic retry fields by contract item 7, with the reason', () => {
+  it('disables automatic retry fields for a literal relative move, with the reason', () => {
     // Fixture entries declare the retry parameters ahead of the catalog 2.6.0 bump.
     const retryParameters: CatalogEntry['parameters'] = [
       { id: 'target_mode', required: false, hasDefault: true, default: 'absolute',
@@ -830,11 +880,13 @@ describe('Program authoring panels', () => {
 
   it('offers the current robot pose or joints for a move goal', () => {
     const poseEntry: CatalogEntry = { ...timer, id: 'motion.move_to_pose', parameters: [
-      { id: 'target_role', required: true, schema: { type: 'string' },
-        schemaHash: 'sha256:role', hasDefault: false },
+      { id: 'target', required: true, schema: { type: 'object', 'x-manyforge-semantic-type': 'target_reference' },
+        schemaHash: 'sha256:target', hasDefault: false },
       { id: 'goal', required: true, schema: { type: 'object', properties: {
         position_m: { type: 'array' }, orientation: { type: 'object' } } },
         schemaHash: 'sha256:goal', hasDefault: false },
+      { id: 'clearance_m', required: false, hasDefault: true, default: 0.001,
+        schema: { type: 'number' }, schemaHash: 'sha256:clearance' },
     ] };
     const render = (parameters: ProgramTreeNode['parameters']) => renderToStaticMarkup(
       <ProgramPropertyEditor
@@ -846,18 +898,54 @@ describe('Program authoring panels', () => {
     );
     const goal = { frame_ref: { kind: 'cell_frame' }, position_m: [0, 0, 0],
       orientation: { xyzw: [0, 0, 0, 1] } };
-    const bound = render({ target_role: 'lite6_arm', target_mode: 'relative', goal });
-    expect(bound).toContain('Use current robot pose');
-    expect(bound).toContain('This switches the move to absolute.');
+    const bound = render({ target: { component_id: 'lite6_robot', command_target_id: 'arm' }, target_mode: 'relative', goal, clearance_m: 0.004 });
+    expect(bound).toContain('FILL FROM');
+    expect(bound).toContain('Robot pose');
+    expect(bound).toContain('Move preview');
+    expect(bound).toContain('data-testid="fill-from-move-preview"');
+    expect(bound.indexOf('Robot pose')).toBeLessThan(bound.indexOf('Move preview'));
+    const robotButtonStart = bound.lastIndexOf('<button', bound.indexOf('Robot pose'));
+    const robotButtonEnd = bound.indexOf('</button>', robotButtonStart);
+    expect(bound.slice(robotButtonStart, robotButtonEnd)).not.toContain('disabled=""');
+    expect(bound).toContain('Show a successful motion preview first.');
+    expect(bound).toContain('aria-label="Use catalog default / omit"');
+    expect(bound).not.toContain('class="text-button">Use catalog default / omit');
+    expect(bound).not.toContain('Use in node');
+    expect(bound).not.toContain('program-manual-fill-changed');
     const unbound = render({ goal });
-    expect(unbound).toMatch(/disabled=""[^>]*title="Choose the target role first\."/);
+    expect(unbound).toMatch(/disabled=""[^>]*title="Choose the target first\."/);
+  });
+
+  it('labels the first fill action Robot joints for a joint target node', () => {
+    const jointEntry: CatalogEntry = {
+      ...timer,
+      id: 'motion.move_to_joint_target',
+      parameters: [
+        { id: 'target_role', required: true, schema: { type: 'string' },
+          schemaHash: 'sha256:role', hasDefault: false },
+        { id: 'goal', required: true, schema: { type: 'array', items: { type: 'object' } },
+          schemaHash: 'sha256:goal', hasDefault: false },
+      ],
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor
+        roots={[{ node_id: jointEntry.id, instance_id: 'move', children: [],
+          parameters: { target_role: 'lite6_arm', goal: [] } }]}
+        selectedId="move" catalogEntries={[jointEntry]}
+        program={authoringProgram([], [])}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      />,
+    );
+    expect(markup).toContain('Robot joints');
+    expect(markup).not.toContain('Robot pose</button>');
+    expect(markup).toContain('Move preview');
   });
 
   it('explains backend TCP capping without rewriting literals or parameter references', () => {
-    const binding = parseProgramBindingTransport(nativeBindingFixture, 'binding');
-    const target = binding.target_role_bindings.find((row) => row.target_role_id === 'arm')!;
+    // The node's direct target names the robot whose applied descriptor caps the speed.
+    const target = { component_id: 'lite6_arm', command_target_id: 'arm' };
     const descriptor = { ...statusFixture().directControl!.targetDescriptor,
-      controllableComponentId: target.controllable_component_id,
+      controllableComponentId: target.component_id,
       commandTargetId: target.command_target_id,
       operationalLimit: { maximumTcpLinearSpeedMps: 0.15 },
     };
@@ -872,7 +960,7 @@ describe('Program authoring panels', () => {
       saved: { path: null, deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: false, reason: 'not_applied' },
-      binding, scenarioCandidates: [], savedScenarioCandidates: [], unavailableReasons: [],
+      binding: null, scenarioCandidates: [], savedScenarioCandidates: [], unavailableReasons: [],
     };
     const catalog: CatalogEntry = { ...timer, parameters: [{
       id: 'max_tcp_linear_speed_mps', required: false,
@@ -882,8 +970,8 @@ describe('Program authoring panels', () => {
     for (const referenced of [false, true]) {
       const node: ProgramTreeNode = {
         node_id: 'timer', instance_id: 'motion', children: [],
-        parameters: referenced ? { target_role: 'arm' }
-          : { target_role: 'arm', max_tcp_linear_speed_mps: 0.25 },
+        parameters: referenced ? { target }
+          : { target, max_tcp_linear_speed_mps: 0.25 },
         ...(referenced ? { value_sources: {
           max_tcp_linear_speed_mps: { kind: 'program_parameter' as const, reference: 'speed' },
         } } : {}),
@@ -904,145 +992,120 @@ describe('Program authoring panels', () => {
     }
   });
 
-  it('authors io input nodes from the bound input signals, with timeout and level-only edge', () => {
-    const parsed = parseProgramBindingTransport(nativeBindingFixture, 'binding');
-    const digest = `sha256:${'a'.repeat(64)}`;
-    const binding = { ...parsed, target_role_bindings: parsed.target_role_bindings.map((row) => (
-      row.target_role_id === 'arm' ? { ...row, signal_role_bindings: [
-        { resource_role_id: 'part_present', signal_name: 'DI0', value_type: 'bool' as const,
-          direction: 'input' as const, transition_capability: 'sampled_only' as const,
-          signal_descriptor_digest: digest },
-        { resource_role_id: 'lamp', signal_name: 'DO1', value_type: 'bool' as const,
-          direction: 'output' as const, transition_capability: 'sampled_only' as const,
-          signal_descriptor_digest: digest },
-      ] } : row)) };
-    const deployment = { binding } as unknown as DeploymentWorkspaceResponse;
+  it('authors io input nodes from the qualified input signals, with timeout and level-only edge', () => {
+    const io = { component_id: 'robot', command_target_id: 'io' };
+    const facts = selectorFacts({
+      targets: [targetFact('robot', 'io', ['io.gpio.wait_for_input', 'io.gpio.set_output'])],
+      signals: [signalFact('robot', 'DI0', 'input', io), signalFact('robot', 'DO1', 'output', io)],
+    });
     const wait: CatalogEntry = { ...timer, id: 'io.wait_for_input', parameters: [
-      { id: 'target_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
-        schemaHash: 'sha256:t', hasDefault: false },
-      { id: 'resource_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
-        schemaHash: 'sha256:r', hasDefault: false },
+      { id: 'signal', required: true,
+        schema: { type: 'object', 'x-manyforge-semantic-type': 'signal_reference' },
+        schemaHash: 'sha256:g', hasDefault: false },
       { id: 'edge', required: false, schema: { enum: ['level', 'rising', 'falling'], default: 'level' },
         schemaHash: 'sha256:e', hasDefault: true, default: 'level' },
       { id: 'timeout_s', required: false,
         schema: { type: 'number', minimum: 0.01, maximum: 3600 },
         schemaHash: 'sha256:s', hasDefault: false },
-    ] };
+    ], requiredCapabilities: [{ capabilityId: 'io.gpio.wait_for_input', scope: 'target_binding',
+      effectful: false, targetParameter: 'signal' }] };
     const node: ProgramTreeNode = {
       node_id: 'io.wait_for_input', instance_id: 'wait_part', children: [],
-      parameters: { target_role: 'arm', resource_role: 'part_present' },
+      parameters: { signal: { component_id: 'robot', signal_name: 'DI0' } },
     };
-    const program = { ...authoringProgram([node]), target_roles: {
-      arm: { required_resource_roles: ['part_present', 'lamp', 'tray_pose'] },
-    } };
-    const render = (workspace: DeploymentWorkspaceResponse | null) => renderToStaticMarkup(
+    const render = (facts: ReferenceSelectorFacts | null) => renderToStaticMarkup(
       <ProgramPropertyEditor roots={[node]} selectedId="wait_part" catalogEntries={[wait]}
-        deploymentWorkspace={workspace} program={program}
+        program={authoringProgram([node])} selectorFacts={facts}
         busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
     );
-    const bound = render(deployment);
-    expect(bound).toContain('part_present · DI0 (input)');
-    expect(bound).toContain('arm input signals');
-    expect(bound).not.toContain('DO1');
-    expect(bound).not.toContain('>lamp<');
-    expect(bound).not.toContain('tray_pose');
+    const bound = render(facts);
+    expect(bound).toMatch(/<option[^>]*selected=""[^>]*>robot · DI0<\/option>/);
+    // An output is listed but not selectable for an input node.
+    expect(bound).toMatch(/<option[^>]*disabled=""[^>]*>robot · DO1 · This node requires an input signal\.<\/option>/);
+    expect(bound).not.toMatch(/<option[^>]*>robot · DO1<\/option>/);
     expect(bound).toMatch(/<option[^>]*disabled=""[^>]*>rising \(not supported yet\)</);
     expect(bound).toMatch(/<option[^>]*disabled=""[^>]*>falling \(not supported yet\)</);
     expect(bound).not.toMatch(/disabled=""[^>]*>level</);
     expect(bound).toContain('Edge waits are not supported yet; only level waits run.');
     expect(bound).toContain('placeholder="Wait forever"');
     expect(bound).toContain('Empty waits forever. Otherwise the wait fails after 0.01–3600 s');
-    // Without binding info the ordinary resource-role picker applies.
+    // Without qualified Draft facts no signal is offered; the stored one is kept as unavailable.
     const unbound = render(null);
-    expect(unbound).toContain('>tray_pose<');
-    expect(unbound).not.toContain('(input)');
+    expect(unbound).toContain('unavailable in the current Draft candidate');
+    expect(unbound).not.toContain('robot · DO1');
   });
 
-  it('authors io.set_output from the bound output signals with a literal or key value', () => {
-    const parsed = parseProgramBindingTransport(nativeBindingFixture, 'binding');
-    const digest = `sha256:${'a'.repeat(64)}`;
-    const binding = { ...parsed, target_role_bindings: parsed.target_role_bindings.map((row) => (
-      row.target_role_id === 'arm' ? { ...row, signal_role_bindings: [
-        { resource_role_id: 'part_present', signal_name: 'DI0', value_type: 'bool' as const,
-          direction: 'input' as const, transition_capability: 'sampled_only' as const,
-          signal_descriptor_digest: digest },
-        { resource_role_id: 'lamp', signal_name: 'DO1', value_type: 'bool' as const,
-          direction: 'output' as const, transition_capability: 'sampled_only' as const,
-          signal_descriptor_digest: digest },
-      ] } : row)) };
+  it('authors io.set_output from the qualified output signals with a literal or key value', () => {
+    const io = { component_id: 'robot', command_target_id: 'io' };
+    const facts = selectorFacts({
+      targets: [targetFact('robot', 'io', ['io.gpio.wait_for_input', 'io.gpio.set_output'])],
+      signals: [signalFact('robot', 'DI0', 'input', io), signalFact('robot', 'DO1', 'output', io)],
+    });
     const setOutput: CatalogEntry = { ...timer, id: 'io.set_output', parameters: [
-      { id: 'target_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
-        schemaHash: 'sha256:t', hasDefault: false },
-      { id: 'resource_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
-        schemaHash: 'sha256:r', hasDefault: false },
+      { id: 'signal', required: true,
+        schema: { type: 'object', 'x-manyforge-semantic-type': 'signal_reference' },
+        schemaHash: 'sha256:g', hasDefault: false },
       { id: 'value', required: true, schema: { type: 'boolean' }, schemaHash: 'sha256:v', hasDefault: false },
-    ] };
+    ], requiredCapabilities: [{ capabilityId: 'io.gpio.set_output', scope: 'target_binding',
+      effectful: true, targetParameter: 'signal' }] };
     const node: ProgramTreeNode = {
       node_id: 'io.set_output', instance_id: 'lamp_on', children: [],
-      parameters: { target_role: 'arm', resource_role: 'lamp', value: true },
+      parameters: { signal: { component_id: 'robot', signal_name: 'DO1' }, value: true },
     };
-    const program = { ...authoringProgram([node]), target_roles: {
-      arm: { required_resource_roles: ['part_present', 'lamp'] },
-    } };
     const markup = renderToStaticMarkup(
       <ProgramPropertyEditor roots={[node]} selectedId="lamp_on" catalogEntries={[setOutput]}
-        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
+        program={authoringProgram([node])} selectorFacts={facts}
         busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
     );
-    expect(markup).toContain('lamp · DO1 (output)');
-    expect(markup).toContain('arm output signals');
-    expect(markup).not.toContain('DI0');
+    expect(markup).toMatch(/<option[^>]*selected=""[^>]*>robot · DO1<\/option>/);
+    expect(markup).toMatch(/<option[^>]*disabled=""[^>]*>robot · DI0 · This node requires an output signal\.<\/option>/);
+    expect(markup).not.toMatch(/<option[^>]*>robot · DI0<\/option>/);
     // The value may be a literal or bound to a key ("Use key").
     expect(catalogParameterSourceable(setOutput, 'value')).toBe(true);
   });
 
-  it('shows the generated carried-object-lost input in an I/O node role picker', () => {
+  it('shows the generated carried-object-lost input in an I/O node signal picker', () => {
     const wait: CatalogEntry = { ...timer, id: 'io.wait_for_input', parameters: [
-      { id: 'target_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
-        schemaHash: 'sha256:t', hasDefault: false },
-      { id: 'resource_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
-        schemaHash: 'sha256:r', hasDefault: false },
-    ] };
+      { id: 'signal', required: true,
+        schema: { type: 'object', 'x-manyforge-semantic-type': 'signal_reference' },
+        schemaHash: 'sha256:g', hasDefault: false },
+    ], requiredCapabilities: [{ capabilityId: 'io.gpio.wait_for_input', scope: 'target_binding',
+      effectful: false, targetParameter: 'signal' }] };
     const node: ProgramTreeNode = {
       node_id: 'io.wait_for_input', instance_id: 'wait_lost', children: [],
-      parameters: { target_role: 'gripper', resource_role: 'carried_object_lost' },
+      parameters: { signal: { component_id: 'robot', signal_name: 'carried_object_lost.gripper' } },
     };
-    const binding = { target_role_bindings: [{ target_role_id: 'gripper',
-      controllable_component_id: 'robot', command_target_id: 'gripper', signal_role_bindings: [] }] } as unknown as ProgramBindingDocument;
-    const systemSignal: CarriedObjectLostSignalChoice = {
-      controllableComponentId: 'robot', commandTargetId: 'gripper',
-      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
-      direction: 'input', valueType: 'bool', provenance: 'last_apply',
-    };
-    const program = { ...authoringProgram([node]), target_roles: {
-      gripper: { required_resource_roles: ['carried_object_lost'] },
-    } };
-    const markup = renderToStaticMarkup(
+    // The gripper target has no GPIO wait capability: only the generated system input is selectable.
+    const gripper = { component_id: 'robot', command_target_id: 'gripper' };
+    const facts = selectorFacts({
+      targets: [targetFact('robot', 'gripper', ['tool.gripper.command'])],
+      signals: [
+        signalFact('robot', 'carried_object_lost.gripper', 'input', gripper, 'system_carried_object'),
+        signalFact('robot', 'jaw_closed', 'input', gripper),
+      ],
+    });
+    const render = (selectorFacts: ReferenceSelectorFacts | null) => renderToStaticMarkup(
       <ProgramPropertyEditor roots={[node]} selectedId="wait_lost" catalogEntries={[wait]}
-        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
-        systemSignalChoices={[systemSignal]} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+        program={authoringProgram([node])} selectorFacts={selectorFacts}
+        systemSignalsNeedApply={selectorFacts === null}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
     );
+    const markup = render(facts);
 
-    expect(markup).toContain('carried_object_lost · carried_object_lost.gripper (input) · from last Apply');
-    expect(markup).toContain('gripper input signals');
-    const unavailableMarkup = renderToStaticMarkup(
-      <ProgramPropertyEditor roots={[node]} selectedId="wait_lost" catalogEntries={[wait]}
-        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
-        systemSignalsNeedApply busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
-    );
-    expect(unavailableMarkup).toContain('Apply to list system signals.');
+    expect(markup).toMatch(/<option[^>]*selected=""[^>]*>robot · carried_object_lost\.gripper<\/option>/);
+    expect(markup).toMatch(/<option[^>]*disabled=""[^>]*>robot · jaw_closed · Missing io\.gpio\.wait_for_input<\/option>/);
+    expect(markup).not.toContain('aria-invalid="true"');
+    expect(markup).not.toContain('Qualified Draft system signals are unavailable.');
+    const unavailableMarkup = render(null);
+    expect(unavailableMarkup).toContain('Qualified Draft system signals are unavailable.');
+    expect(unavailableMarkup).toContain('unavailable in the current Draft candidate');
+    expect(unavailableMarkup).toContain('aria-invalid="true"');
   });
 
-  it('edits the interrupt node rule: structured condition, stage labels after Apply, literal-only fields', () => {
+  it('edits the interrupt node rule: structured condition, stage labels until qualified, literal-only fields', () => {
     const until: CatalogEntry = { ...timer, id: 'motion.move_until_signal', parameters: [
-      { id: 'target_role', required: true,
-        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+      { id: 'target', required: true,
+        schema: { type: 'object', 'x-manyforge-semantic-type': 'target_reference' },
         schemaHash: 'sha256:t', hasDefault: false },
       { id: 'interrupt_condition', required: true, schema: { type: 'object', 'x-manyforge-condition-grammar': 'interrupt_condition' },
         schemaHash: 'sha256:c', hasDefault: false },
@@ -1053,19 +1116,19 @@ describe('Program authoring panels', () => {
     ] };
     const node: ProgramTreeNode = {
       node_id: 'motion.move_until_signal', instance_id: 'seek', children: [],
-      parameters: { target_role: 'arm', interrupt_condition: {
+      parameters: { target: { component_id: 'lite6_robot', command_target_id: 'arm' }, interrupt_condition: {
         compare: { operand: { key: 'node_outcome.seek' }, op: '==', value: 'completed' } } },
     };
-    const program = { ...authoringProgram([node]), target_roles: { arm: {} } };
     const markup = renderToStaticMarkup(
       <ProgramPropertyEditor roots={[node]} selectedId="seek" catalogEntries={[until]}
-        program={program} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+        program={authoringProgram([node])} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
     );
     expect(markup).toContain('aria-label="condition operand"');
     expect(markup).toContain('seek (node outcome)');
     expect(markup).toContain('>signal_trip<');
     expect(markup).toContain('Controller goal cancel');
-    expect(markup).toContain('available after Apply');
+    // Without a qualified Draft candidate the stage labels show, not selectable.
+    expect(markup).toContain('Qualified Stop stages are unavailable for this selection; until then the first stage applies.');
     expect(markup).toContain('containment at a later stage fails the node');
     for (const id of ['interrupt_condition', 'priority', 'stop_entry_stage_id', 'success_through_stage_id']) {
       expect(catalogParameterSourceable(until, id)).toBe(false);
@@ -1199,7 +1262,7 @@ describe('Program authoring panels', () => {
           program: authoringProgram([tree]),
           sourceJointInventory: {
             jointNames: ['joint1', 'joint2', 'joint3'],
-            targetRole: 'arm',
+            target: { component_id: 'robot', command_target_id: 'arm' },
             unavailableReason: null,
           },
         }}
@@ -1216,6 +1279,41 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('Add joint');
     expect(markup).not.toContain('Remove joint');
     expect(markup).not.toContain('Joint name');
+  });
+
+  it('shows exact preview values for newly added map entries and optional object fields', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramManualFillPreviewProvider values={new Map([
+        ['per_joint_dynamics_limits.joint1.max_velocity_rad_s', '0.5'],
+        ['per_joint_dynamics_limits.joint2.max_velocity_rad_s', '0.8'],
+      ])}>
+        <ProgramSchemaValueEditor
+          schema={{
+            type: 'object',
+            additionalProperties: {
+              type: 'object',
+              properties: { max_velocity_rad_s: { type: 'number' } },
+            },
+          }}
+          value={{ joint1: {} }}
+          disabled={false}
+          context={{
+            entry: timer,
+            node: tree.children[0]!,
+            parameterId: 'per_joint_dynamics_limits',
+            program: authoringProgram([tree]),
+          }}
+          path="per_joint_dynamics_limits"
+          onCommit={vi.fn()}
+        />
+      </ProgramManualFillPreviewProvider>,
+    );
+
+    expect(markup).toContain('Add max velocity rad s');
+    expect(markup).toContain('→ 0.5');
+    expect(markup).toContain('joint2');
+    expect(markup).toContain('max_velocity_rad_s');
+    expect(markup).toContain('→ 0.8');
   });
 
   it('returns to typed values only with a valid literal to restore', () => {
@@ -1473,6 +1571,8 @@ describe('Program authoring panels', () => {
         transitionStatus: null,
         error: null,
       },
+      programDraftInputResetEpoch: 0,
+      scenarioDraftInputResetEpoch: 0,
       refresh: vi.fn(),
       mutate: vi.fn(),
       newScenarioDocument: vi.fn(),
@@ -1516,11 +1616,11 @@ describe('Program authoring panels', () => {
       active: false,
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
-      draftUnappliedReason: null,
+      composerRefusalReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
-      activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
+      activation: { available: false, flow: null, recoveryReady: true, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
       stopMotion: vi.fn(),
       startMotion: vi.fn(),
       resumeMotion: vi.fn(),
@@ -1544,7 +1644,7 @@ describe('Program authoring panels', () => {
         catalog={{
           status: 'ready',
           data: {
-            apiVersion: 'manyforge.node_catalog.v2',
+            apiVersion: 'manyforge.node_catalog.v3',
             contentVersion: 'v2',
             catalogId: 'test-catalog',
             entries: [sequence, timer],
@@ -1589,34 +1689,30 @@ describe('Program authoring panels', () => {
         draftRevision: 2,
         programLoaded: true,
         authoring: {
-          schema_version: 'manyforge.composer_authoring_forest.v1',
-          api_version: 'manyforge.program.v2',
+          schema_version: 'manyforge.composer_authoring_forest.v2',
+          api_version: 'manyforge.program.v3',
           program_id: 'program-blocked',
           program_profile: 'composable-cell-v1',
           name: 'Blocked',
           catalog: {
-            api_version: 'manyforge.node_catalog.v2',
+            api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
           },
-          component_roles: {},
-          target_roles: {},
           forest: [blockedTree],
           positions: {},
         },
         candidateAvailable: true,
         programRevision: `sha256:${'a'.repeat(64)}`,
         program: {
-          api_version: 'manyforge.program.v2',
+          api_version: 'manyforge.program.v3',
           program_id: 'program-blocked',
           program_revision: `sha256:${'a'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
           name: 'Blocked',
           catalog: {
-            api_version: 'manyforge.node_catalog.v2',
+            api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
           },
-          component_roles: {},
-          target_roles: {},
           tree: blockedTree,
         },
         diagnostics: [],
@@ -1663,6 +1759,8 @@ describe('Program authoring panels', () => {
         transitionStatus: null,
         error: null,
       },
+      programDraftInputResetEpoch: 0,
+      scenarioDraftInputResetEpoch: 0,
       refresh: vi.fn(),
       mutate: vi.fn(),
       newScenarioDocument: vi.fn(),
@@ -1706,11 +1804,11 @@ describe('Program authoring panels', () => {
       active: false,
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
-      draftUnappliedReason: null,
+      composerRefusalReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
-      activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
+      activation: { available: false, flow: null, recoveryReady: true, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
       stopMotion: vi.fn(),
       startMotion: vi.fn(),
       resumeMotion: vi.fn(),
@@ -1747,7 +1845,7 @@ describe('Program authoring panels', () => {
           catalog={{
             status: 'ready',
             data: {
-              apiVersion: 'manyforge.node_catalog.v2',
+              apiVersion: 'manyforge.node_catalog.v3',
               contentVersion: 'fixture',
               catalogId: 'catalog',
               entries: [sequence, timer],
@@ -1792,7 +1890,7 @@ describe('Program authoring panels', () => {
 describe('Set TCP source transition', () => {
   it('restores Current after a key-only selector with no saved literal', () => {
     const node: ProgramTreeNode = {
-      node_id: 'motion.set_tcp', instance_id: 'set', parameters: { target_role: 'arm' },
+      node_id: 'motion.set_tcp', instance_id: 'set', parameters: { target: { component_id: 'robot', command_target_id: 'arm' } },
       value_sources: { tcp: { kind: 'blackboard_key', reference: 'active_tcp.arm' } },
       children: [],
     };
@@ -1804,7 +1902,9 @@ describe('Set TCP source transition', () => {
     expect(restored).toEqual({ transition: { kind: 'type_values', literal: { kind: 'current' } } });
     if ('transition' in restored) {
       const mutation = buildProgramParameterMutation(node, 'tcp', restored.transition);
-      expect(mutation.args.parameters).toEqual({ target_role: 'arm', tcp: { kind: 'current' } });
+      expect(mutation.args.parameters).toEqual({
+        target: { component_id: 'robot', command_target_id: 'arm' }, tcp: { kind: 'current' },
+      });
       expect(mutation.args.value_sources).toEqual({});
     }
   });
@@ -1819,19 +1919,14 @@ describe('Set TCP source control', () => {
       requiredCapabilities: [],
     };
     const node: ProgramTreeNode = {
-      node_id: entry.id, instance_id: 'set', parameters: { target_role: 'arm' },
+      node_id: entry.id, instance_id: 'set', parameters: { target: { component_id: 'robot', command_target_id: 'arm' } },
       value_sources: { tcp: { kind: 'blackboard_key', reference: 'active_tcp.arm' } },
       children: [],
     };
-    const program: ProgramAuthoringDocument = {
-      ...authoringProgram([node]),
-      target_roles: { arm: { component_role: 'robot', required_capabilities: [
-        { capability_id: 'execution.trajectory.execute', parameters: {}, disposition: 'required' },
-      ] } },
-    };
+    const facts = selectorFacts({ targets: [targetFact('robot', 'arm', ['execution.trajectory.execute'])] });
     const markup = renderToStaticMarkup(<ProgramPropertyEditor
-      roots={[node]} selectedId="set" catalogEntries={[entry]} program={program}
-      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
+      roots={[node]} selectedId="set" catalogEntries={[entry]} program={authoringProgram([node])}
+      selectorFacts={facts} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
     expect(markup).toContain('key.active_tcp.arm');
     expect(markup).not.toContain('must be a literal selection');
   });

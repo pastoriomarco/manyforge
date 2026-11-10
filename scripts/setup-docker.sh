@@ -36,7 +36,7 @@ TOPPRA_PINNED_REF="8121e9af72f5aa589b515aa15e0dc408344c3220"
 NANOFLANN_URL="https://github.com/jlblancoc/nanoflann.git"
 NANOFLANN_PINNED_REF="18f4edf753e813644a7a12711a86139777a8ef00"
 
-ROBOPLAN_SOURCE_LEDGER="$REPO_DIR/verification/composable_cell_e1/external_delta_ledger.v1.json"
+ROBOPLAN_SOURCE_LEDGER="$REPO_DIR/third_party/external_delta_ledger.v1.json"
 ROBOPLAN_SOURCE_VERIFIER="$REPO_DIR/scripts/ci/verify-external-source-closure.py"
 
 info() { echo -e "\033[0;32m>>>\033[0m $1"; }

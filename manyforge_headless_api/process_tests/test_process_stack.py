@@ -1,4 +1,4 @@
-"""Process-boundary H0 qualification for Manager, API, CLI, and Composer."""
+"""Process-boundary qualification for Manager, API, CLI, and Composer."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import time
 from typing import Callable, Iterator
 
 import pytest
-from scripts.qualification.control_client_fixture import composer_snapshot_stream
+from manyforge_headless_api.process_tests.control_client_fixture import composer_snapshot_stream
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.manager import ManagerCommandClient
@@ -661,7 +661,10 @@ def _assistant_stack(
         # whereas Headless owns Program and binding repositories under its
         # separate artifact root. Install those immutable fixture values into
         # that repository before any owner starts.
-        for repository in ("programs", "program-bindings", "prepared-activations"):
+        # The activation root holds each prepared value's complete closure,
+        # as the native preparer publishes it.
+        for repository in ("programs", "program-bindings", "prepared-activations",
+                           "catalog-artifacts", "raw-artifacts", "retained-bundles"):
             source = selected_package_root / repository
             if source.is_dir():
                 shutil.copytree(source, stack.artifact_root / repository)
@@ -745,7 +748,13 @@ def _assistant_stack(
                 break
             time.sleep(0.02)
         else:
-            raise RuntimeError("assistant-native physical Apply did not converge")
+            stack.log.flush()
+            recent = (stack.root / "process-stack.log").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()[-20:]
+            raise RuntimeError(
+                "assistant-native physical Apply did not converge: " + " | ".join(recent)
+            )
         admission = stack.wait_authoring_admission(expected_allowed=True)
         assert admission["authoring_allowed"] is True
         assert admission["admission_generation"] > 0
@@ -960,12 +969,12 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             active_graph = stack.fixture_metadata["physical_graph_revision"]
 
             # The UR10e + Robotiq 2F-140 example cell: one model per physical
-            # component; the assistant's AI model has its model-free endpoint.
+            # component; the cell I/O and the assistant's AI model are model-free.
             assert {row["model_instance_id"] for row in source_model["occurrences"]} == {
                 "ur10e_robot.model", "robotiq_2f_140.model"
             }
             assert {row["component_id"] for row in source_model["targets"]} == {
-                "ur10e_robot", "robotiq_2f_140", "assistant_model"
+                "ur10e_robot", "robotiq_2f_140", "cell_io", "assistant_model"
             }
             assert node_environment["retained_bundle_id"] == active_bundle
             assert node_environment["graph_revision"] == active_graph
@@ -1174,9 +1183,11 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 for row in replacement_draft["program"].get("scene", [])
             }
 
+            # The bridge's callback timeout: a committed edit also runs the
+            # reference validation, which a fresh Composer prepares cold.
             def invoke(body: dict) -> tuple[str, str]:
                 try:
-                    with HeadlessHttpClient(stack.composer_url) as client:
+                    with HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as client:
                         result = client.request(
                             "POST",
                             "/api/assistant/bridge/tools/scene_draft_add_object",
@@ -1533,8 +1544,12 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         path = descriptor["contracts"]["control_path"]
         assert all(path[key] == command_binding[key] for key in path)
         assert descriptor["schema_version"] == (
-            "manyforge.manual_control_gripper_descriptor.v3"
+            "manyforge.manual_control_gripper_descriptor.v5"
         )
+        assert descriptor["target"] == {
+            "component_id": component["controllable_component_id"],
+            "command_target_id": target["command_target_id"],
+        }
         assert descriptor["actuation_kind"] == "position_commanded"
         assert descriptor["output_mode"] == "commanded"
         assert descriptor["completion_policy"] == "goal_fenced_target_reached"
@@ -1714,7 +1729,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         return state
 
     def lifecycle(action: str, _request_id: str) -> dict[str, Any]:
-        """One component action (CONTRACTS §2); its result is `last_action`."""
+        """One component action; its result is `last_action`."""
         previous = component_state().get("last_action")
         accepted = ExecutionCommandClient(run_root).component_action(component_id, action)
         assert accepted["ok"] is True, accepted
@@ -1952,7 +1967,6 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
                 "name": "Logical process Deployment",
                 "attachments": [], "components": [], "policies": {},
             },
-            program_role_assignment={"component_roles": [], "target_roles": []},
             manyforge_version="0.1.0", last_known_status="ready",
         ),
         str(scenario), allowed_roots=[str(tmp_path)], overwrite=False,
@@ -1982,7 +1996,7 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
             HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
         ):
-            # Load waits for the whole Apply (CONTRACTS §11).
+            # Load waits for the whole Apply.
             loaded = composer.request("POST", "/api/scenario/load", body={"path": str(scenario)})
             assert loaded["outcome"] == "succeeded", loaded
             assert loaded["components"] == [], loaded
@@ -1996,16 +2010,18 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             assert selected["program_id"] == applied["program_id"], selected
             assert selected["program_binding_id"] == applied["program_binding_id"], selected
             assert selected["program"] is None, selected
-            assert applied["program"]["component_roles"] == {}, applied
-            assert applied["program"]["target_roles"] == {}, applied
+            assert applied["program"]["api_version"] == "manyforge.program.v3", applied
+            assert "component_roles" not in applied["program"], applied
+            assert "target_roles" not in applied["program"], applied
             graph = headless.manager_graph()["cell_graph"]
             for field in ("controllable_components", "control_domains", "control_bindings", "model_instances"):
                 assert graph[field] == [], graph
             binding = applied["program_binding"]
             assert binding["program_binding_id"] == applied["program_binding_id"], binding
             assert binding["program_revision"] == applied["program_revision"], binding
-            assert binding["component_role_bindings"] == [], binding
-            assert binding["target_role_bindings"] == [], binding
+            assert binding["api_version"] == "manyforge.program_binding.v3", binding
+            assert binding["component_bindings"] == [], binding
+            assert binding["target_bindings"] == [], binding
             stack.wait_authoring_admission(expected_allowed=True)
             draft = composer.request("GET", "/api/program/draft")["program"]
             started = headless.program_run_start({

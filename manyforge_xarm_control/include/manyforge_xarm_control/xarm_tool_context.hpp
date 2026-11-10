@@ -29,7 +29,7 @@
 
 namespace manyforge::xarm_control {
 
-/// M6 ADAPTERM: one TCP offset send including the re-arm it needs (the
+/// One TCP offset send including the re-arm it needs (the
 /// controller answers `set_tcp_offset` by leaving the ready state, live
 /// 2026-10-28): confirmed, or the typed error and whether a sent step may
 /// still take effect.
@@ -39,7 +39,7 @@ struct XArmTcpOffsetSent final {
   std::optional<std::array<double, 6>> ready_offset{};
 };
 
-/// M6b (SX-727): what bounds one tool-context step's calls. At Enable the
+/// What bounds one tool-context step's calls. At Enable the
 /// sends are part of the lifecycle step: each call is allowed min(the call
 /// cap, the step's remaining time) and follows the step's cancellation.
 /// Outside Enable (not a lifecycle step): no deadline, the fixed call cap.
@@ -48,30 +48,30 @@ struct XArmToolContextBound final {
   std::stop_token cancellation;
 };
 
-/// M6 ADAPTERM (item 44, maintainer 2026-10-28): the controller's TCP offset
+/// The controller's TCP offset
 /// matches the wanted one within these (as sent: mm, then radians).
 inline constexpr double kXArmTcpOffsetToleranceMm = 0.01;
 inline constexpr double kXArmTcpOffsetToleranceRad = 1e-4;
 
-/// M7 Active TCP (T-MQ16, T-MQ16b): the xArm side of the event-driven tool
+/// Active TCP: the xArm side of the event-driven tool
 /// context. It keeps no copy of what the controller has; each step sends what
 /// its event changed, and calls are serialized.
 /// - A TCP change or reset: `set_tcp_offset`, its re-arm (`set_state(0)`, a
 ///   fresh ready report: the controller drops to state 5 after the offset),
 ///   then the post-send
-///   check (T-C2d): the fresh report after the re-arm must show the sent
+///   check: the fresh report after the re-arm must show the sent
 ///   offset within the tolerances, otherwise `tcp_offset_not_applied`.
 ///   No report is read before the send.
 /// - A payload change: `set_tcp_load` only, no offset and no re-arm (the
-///   controller stays ready), at once, also while moving (T-MQ16b, to verify
+///   controller stays ready), at once, also while moving (to verify
 ///   live). No readback.
-/// - Enable (the re-sync, T-MQ3, B-run-1): the fresh reported offset is read
+/// - Enable (the re-sync): the fresh reported offset is read
 ///   once; the Active TCP's offset (zero without one) is sent only when the
 ///   report differs, with the post-send check; then the payload, always. No
 ///   fresh report: `xarm_status_unavailable`, nothing sent.
 /// - The host selects Keep for changes with sync off and Zero at Enable.
 /// A failure after a send carries `effect` (`possible`: a sent call may still
-/// act; `observed`: the robot was re-armed): T-N1, the component fault.
+/// act; `observed`: the robot was re-armed): the component fault.
 class XArmToolContextSender final {
 public:
   using SendTcpOffset =
@@ -97,7 +97,9 @@ private:
   const SendTcpOffset send_offset_;
   const SendTcpLoad send_load_;
   const ReportedTcpOffset reported_offset_;
-  std::mutex mutex_;
+  // No lock: the sender holds no mutable state, and every Apply comes from
+  // the arm's tool-context hook, which the runtime handle calls only under
+  // its `switch_mutex_` (one apply at a time per arm).
 };
 
 } // namespace manyforge::xarm_control

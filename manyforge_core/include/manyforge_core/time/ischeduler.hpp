@@ -95,7 +95,7 @@ inline constexpr std::string_view scheduler_priority_name(
 }
 
 /// Abstract scheduler interface for deferred callbacks.
-/// ADR-0004: no std::this_thread::sleep_for in core.
+/// No std::this_thread::sleep_for in core.
 /// Production: backed by rclcpp timers or a timer thread.
 /// Tests: use ManualScheduler for deterministic advancement.
 class IScheduler {

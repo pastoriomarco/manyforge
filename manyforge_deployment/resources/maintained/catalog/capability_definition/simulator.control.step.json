@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:9fd7cae735d502dc7876c5e176f8dc134691476940c18a487ba04e27cf23cd33",
+  "capability_id": "simulator.control.step",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

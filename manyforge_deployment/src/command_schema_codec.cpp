@@ -106,7 +106,7 @@ decode_normalized(const CanonicalValue &normalized) {
   const auto &command_value = require_member(normalized, "command_value");
   if (require_string(require_member(command_value, "value_kind"),
                      "value_kind") != "gripper_position") {
-    fail("command schema value kind is outside the qualified I6 family");
+    fail("command schema value kind is outside the qualified family");
   }
   std::vector<core::CoordinateKind> position_kinds;
   for (const auto &item :
@@ -248,7 +248,7 @@ QualifiedCommandSchema resolve_and_qualify_command_schema(
     fail("command-schema typed ID/revision selector does not match referent");
   }
   if (decoded != core::builtin_gripper_position_command_schema()) {
-    fail("command schema does not match the build-owned qualified I6 family");
+    fail("command schema does not match the build-owned qualified family");
   }
   return QualifiedCommandSchema(reference, std::move(decoded),
                                 normalized.normalized_root());

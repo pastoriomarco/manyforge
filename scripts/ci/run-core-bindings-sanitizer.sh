@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and, unless requested otherwise, exercise one sanitized I2 Python module.
+# Build and, unless requested otherwise, exercise one sanitized core Python module (manyforge_core_py).
 set -euo pipefail
 umask 022
 export GIT_OPTIONAL_LOCKS=0
@@ -169,9 +169,9 @@ prepare_cmake_metadata() {
   printf '{}\n' > "${build}/.cmake/api/v1/query/codemodel-v2"
   printf '{}\n' > "${build}/.cmake/api/v1/query/cmakeFiles-v1"
   printf '%s\n' \
-    'set(GRAPHVIZ_GRAPH_NAME "manyforge_i2")' \
+    'set(GRAPHVIZ_GRAPH_NAME "manyforge_core_bindings")' \
     'set(GRAPHVIZ_GRAPH_HEADER "node [ fontsize = \"12\" ];")' \
-    'set(GRAPHVIZ_NODE_PREFIX "i2node")' \
+    'set(GRAPHVIZ_NODE_PREFIX "bindings_node")' \
     'set(GRAPHVIZ_EXECUTABLES TRUE)' \
     'set(GRAPHVIZ_STATIC_LIBS TRUE)' \
     'set(GRAPHVIZ_SHARED_LIBS TRUE)' \
@@ -197,7 +197,7 @@ prepare_cmake_metadata "${CORE_BUILD}"
   -DCMAKE_CXX_FLAGS="${SANITIZER_FLAGS}" \
   -DCMAKE_EXE_LINKER_FLAGS="${LINKER_FLAGS}" \
   -DCMAKE_SHARED_LINKER_FLAGS="${LINKER_FLAGS}" \
-  --graphviz="${CORE_BUILD}/manyforge-i2-target-graph.dot" \
+  --graphviz="${CORE_BUILD}/manyforge-core-bindings-target-graph.dot" \
   -S "${REPO_ROOT}/manyforge_core" \
   -B "${CORE_BUILD}"
 /usr/bin/ninja -C "${CORE_BUILD}" -j "${PARALLEL}" -d keeprsp \
@@ -213,7 +213,7 @@ prepare_cmake_metadata "${DEPLOYMENT_BUILD}"
   -DCMAKE_CXX_FLAGS="${SANITIZER_FLAGS}" \
   -DCMAKE_EXE_LINKER_FLAGS="${LINKER_FLAGS}" \
   -DCMAKE_SHARED_LINKER_FLAGS="${LINKER_FLAGS}" \
-  --graphviz="${DEPLOYMENT_BUILD}/manyforge-i2-target-graph.dot" \
+  --graphviz="${DEPLOYMENT_BUILD}/manyforge-core-bindings-target-graph.dot" \
   -DMANYFORGE_CORE_INCLUDE_DIR="${REPO_ROOT}/manyforge_core/include" \
   -S "${REPO_ROOT}/manyforge_deployment" \
   -B "${DEPLOYMENT_BUILD}"
@@ -236,7 +236,7 @@ prepare_cmake_metadata "${MODULE_BUILD}"
   -DCMAKE_EXE_LINKER_FLAGS="${LINKER_FLAGS}" \
   -DCMAKE_SHARED_LINKER_FLAGS="${LINKER_FLAGS}" \
   -DCMAKE_MODULE_LINKER_FLAGS="${LINKER_FLAGS}" \
-  --graphviz="${MODULE_BUILD}/manyforge-i2-target-graph.dot" \
+  --graphviz="${MODULE_BUILD}/manyforge-core-bindings-target-graph.dot" \
   -DPython_EXECUTABLE=/usr/local/bin/python3 \
   -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11 \
   -DMANYFORGE_CORE_DIR="${CORE_BUILD}" \
@@ -252,7 +252,7 @@ prepare_cmake_metadata "${MODULE_BUILD}"
 EXTENSION_SUFFIX="$("${PYTHON_EXECUTABLE}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 case "${EXTENSION_SUFFIX}" in
   .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
-  *) echo "active CPython extension suffix differs from the supported I2 ABI" >&2; exit 2 ;;
+  *) echo "active CPython extension suffix differs from the supported core binding ABI" >&2; exit 2 ;;
 esac
 EXTENSION_NAME="manyforge_core_py${EXTENSION_SUFFIX}"
 BUILT_EXTENSION="${MODULE_BUILD}/${EXTENSION_NAME}"
@@ -286,12 +286,12 @@ export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 export PYTHONPATH="${STAGE_ROOT}"
-export MANYFORGE_I2_BINDING_EXTENSION="${STAGE_ROOT}/${EXTENSION_NAME}"
-export MANYFORGE_I2_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
-export MANYFORGE_I2_BINDING_STAGED_ROOT="${STAGE_ROOT}"
-export MANYFORGE_I2_BINDING_GENERATED_ROOT="${TEST_ROOT}/generated"
-export MANYFORGE_I2_BINDING_SOURCE_ROOT="${REPO_ROOT}"
-export MANYFORGE_I2_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
+export MANYFORGE_CORE_BINDING_EXTENSION="${STAGE_ROOT}/${EXTENSION_NAME}"
+export MANYFORGE_CORE_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
+export MANYFORGE_CORE_BINDING_STAGED_ROOT="${STAGE_ROOT}"
+export MANYFORGE_CORE_BINDING_GENERATED_ROOT="${TEST_ROOT}/generated"
+export MANYFORGE_CORE_BINDING_SOURCE_ROOT="${REPO_ROOT}"
+export MANYFORGE_CORE_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 if [[ "${SANITIZER}" == "thread" ]]; then
   export TSAN_SUPPRESSIONS="${SCRIPT_DIR}/tsan.supp"
@@ -299,13 +299,13 @@ if [[ "${SANITIZER}" == "thread" ]]; then
   [[ "${TSAN_LIBRARY}" == /* && -f "${TSAN_LIBRARY}" ]] || { echo "TSan runtime is unavailable" >&2; exit 2; }
   export LD_PRELOAD="${TSAN_LIBRARY}"
   TEST_CASES=(
-    verification/composable_cell_i2/binding_contract_tests.py::test_concurrent_pure_compiles_are_deterministic
+    manyforge_core/python/tests/binding_contract_tests.py::test_concurrent_pure_compiles_are_deterministic
   )
 else
   TEST_CASES=(
-    verification/composable_cell_i2/binding_contract_tests.py::test_detached_predecessor_and_final_value_lifetime
-    verification/composable_cell_i2/binding_contract_tests.py::test_exception_translation_after_released_gil
-    verification/composable_cell_i2/binding_contract_tests.py::test_repeated_fresh_interpreter_import_use_and_clean_shutdown
+    manyforge_core/python/tests/binding_contract_tests.py::test_detached_predecessor_and_final_value_lifetime
+    manyforge_core/python/tests/binding_contract_tests.py::test_exception_translation_after_released_gil
+    manyforge_core/python/tests/binding_contract_tests.py::test_repeated_fresh_interpreter_import_use_and_clean_shutdown
   )
 fi
 cd "${REPO_ROOT}"

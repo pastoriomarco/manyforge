@@ -49,7 +49,7 @@ struct PreparedRuntimeUnitArtifact final {
   const BuildQualifiedProductContract *contract;
 };
 
-/// Exact read-only input-artifact source used before I3 creates any retained
+/// Exact read-only input-artifact source used before retention creates any retained
 /// output.
 ///
 /// This is deliberately distinct from IRawArtifactStore: source/catalog bytes
@@ -104,7 +104,7 @@ class RejectingCatalogArtifactStore final : public ICatalogArtifactStore {
   }
 };
 
-/// Exact build/environment metadata accepted by the current I3
+/// Exact build/environment metadata accepted by the current retention
 /// retained-bundle materializer.
 ///
 /// The sole production producer is BuildQualifiedRetentionAuthority. It
@@ -161,7 +161,7 @@ class BuildQualifiedRetentionContext final {
 
 /// Sole private producer of a semantic RetainedBundle in the current slice.
 ///
-/// The method accepts only the complete I2/deployment equality proof and the
+/// The method accepts only the complete compiler/deployment equality proof and the
 /// separately sealed build/environment context. The currently qualified
 /// subset is canonical-empty; all unsupported retained tables reject before
 /// the first raw-CAS effect. URDF and SRDF are nevertheless emitted through
@@ -190,7 +190,7 @@ class RetainedBundleMaterializer final {
       bool retain_empty_model_map = false);
 
   /// Private, explicitly non-authoritative fixture path retained only for the
-  /// bounded mechanical tests that preceded C1.0.
+  /// bounded mechanical tests that preceded build-qualified retention.
   [[nodiscard]] static std::shared_ptr<const RetainedBundle> materialize(
       const RetentionQualifiedDeployment& qualified,
       const BuildQualifiedRetentionContext& context,
@@ -220,9 +220,9 @@ class RetainedBundleMaterializer final {
       IRawArtifactStore& artifact_store);
 };
 
-/// Current I3 planning/collision import profile.
+/// Current planning/collision import profile.
 ///
-/// Generic I2 source/composition accepts and preserves valid transitive mimic
+/// Generic source/composition accepts and preserves valid transitive mimic
 /// chains. The current retained planning/collision product is consumed by the
 /// Pinocchio family, whose mimic import is qualified only for one-level
 /// master/follower relations. This prepublication guard rejects a

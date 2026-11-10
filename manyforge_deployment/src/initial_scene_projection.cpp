@@ -115,61 +115,34 @@ core::CollisionShapeDTO Shape(const CanonicalValue &value) {
   Fail("shape.type");
 }
 
-const core::ProgramComponentRoleBindingDTO &Component(
-    const std::vector<core::ProgramComponentRoleBindingDTO> &components,
-    const std::string &role) {
-  const auto it = std::find_if(components.begin(), components.end(),
-                               [&](const auto &row) {
-                                 return row.component_role_id.value() == role;
-                               });
-  if (it == components.end())
-    Fail("pose.frame_ref.component_role");
-  return *it;
-}
-
 core::SceneTransactionFrameRefDTO Frame(
     const CanonicalValue &value,
-    const std::vector<core::ProgramComponentRoleBindingDTO> &components,
-    const std::vector<core::ProgramTargetRoleBindingDTO> &targets,
+    const std::vector<core::ProgramFrameBindingDTO> &frames,
     const core::CellId &cell_id) {
   const auto kind = Text(Member(value, "kind"), "pose.frame_ref.kind");
   if (kind == "cell_frame" && value.as_object().size() == 1U)
     return core::CellSceneFrameRefDTO{cell_id};
-  if (kind != "component_frame" || value.as_object().size() != 4U)
+  if (kind != "component_frame" || value.as_object().size() != 2U)
     Fail("pose.frame_ref.kind");
-  const auto role = Text(Member(value, "component_role"),
-                         "pose.frame_ref.component_role");
-  const auto model_role = Text(Member(value, "model_role"),
-                               "pose.frame_ref.model_role");
-  const auto frame_role = Text(Member(value, "frame_role"),
-                               "pose.frame_ref.frame_role");
-  const auto &component = Component(components, role);
-  const auto model = std::find_if(component.model_role_bindings.begin(),
-                                  component.model_role_bindings.end(),
-                                  [&](const auto &row) {
-                                    return row.model_role_id.value() == model_role;
-                                  });
-  if (model == component.model_role_bindings.end())
-    Fail("pose.frame_ref.model_role");
-  const auto frame_exists = std::any_of(
-      targets.begin(), targets.end(),
-      [&](const auto &target) {
-        return target.controllable_component_id ==
-                   component.controllable_component_id &&
-               std::any_of(target.frame_role_bindings.begin(),
-                           target.frame_role_bindings.end(),
-                           [&](const auto &frame) {
-                             return frame.frame_role_id.value() == frame_role &&
-                                    frame.model_instance_id ==
-                                        model->model_instance_id &&
-                                    frame.model_revision == model->model_revision;
-                           });
-      });
-  if (!frame_exists)
-    Fail("pose.frame_ref.frame_role");
+  const auto &reference = Member(value, "frame");
+  if (!reference.is_object() || reference.as_object().size() != 2U)
+    Fail("pose.frame_ref.frame");
+  const auto component = Text(Member(reference, "component_id"), "pose.frame_ref.frame.component_id");
+  const auto frame_id = Text(Member(reference, "frame_id"), "pose.frame_ref.frame.frame_id");
+  const core::ProgramFrameBindingDTO *match = nullptr;
+  for (const auto &row : frames) {
+    if (row.reference.component_id.value() != component ||
+        row.reference.frame_id.value() != frame_id)
+      continue;
+    if (match != nullptr)
+      Fail("pose.frame_ref.frame is ambiguous");
+    match = &row;
+  }
+  if (match == nullptr)
+    Fail("pose.frame_ref.frame is missing");
   return core::ComponentSceneFrameRefDTO{
-      component.controllable_component_id, model->model_instance_id,
-      core::FrameRoleId(frame_role)};
+      match->reference.component_id, match->model_instance_id,
+      match->reference.frame_id};
 }
 
 std::vector<core::SupportContactDTO>
@@ -254,10 +227,9 @@ double MassKg(const CanonicalValue &row) {
 
 namespace detail {
 std::vector<core::AddObjectRequestDTO>
-project_initial_scene_roles_value(
+project_initial_scene_references_value(
     const CanonicalValue &normalized_program,
-    const std::vector<core::ProgramComponentRoleBindingDTO> &components,
-    const std::vector<core::ProgramTargetRoleBindingDTO> &targets,
+    const std::vector<core::ProgramFrameBindingDTO> &frames,
     const core::CellId &cell_id) {
   if (cell_id.empty())
     Fail("cell identity");
@@ -278,7 +250,7 @@ project_initial_scene_roles_value(
         core::SceneResourceId(id), Shape(Member(row, "shape")),
         core::Pose3DTO{Vector(Member(pose, "position_m"), "pose.position_m"),
                        Orientation(Member(pose, "orientation"))},
-        Frame(Member(pose, "frame_ref"), components, targets, cell_id),
+        Frame(Member(pose, "frame_ref"), frames, cell_id),
         SupportContacts(row), MassKg(row)});
   }
   return result;
@@ -288,9 +260,8 @@ std::vector<core::AddObjectRequestDTO>
 project_bound_initial_scene_value(const CanonicalValue &normalized_program,
                                   const core::ProgramBindingDTO &binding,
                                   const core::CellId &cell_id) {
-  return project_initial_scene_roles_value(
-      normalized_program, binding.component_role_bindings,
-      binding.target_role_bindings, cell_id);
+  return project_initial_scene_references_value(
+      normalized_program, binding.frame_bindings, cell_id);
 }
 } // namespace detail
 
@@ -308,9 +279,9 @@ project_bound_initial_scene(const ProgramBindingContract &program,
 
 std::vector<core::AddObjectRequestDTO>
 project_resolved_initial_scene(const ProgramBindingContract &program,
-                               const ProgramResolvedRolesDTO &resolved_roles,
+                               const ProgramResolvedReferencesDTO &resolved_references,
                                const core::CellId &cell_id) {
-  // The partial role resolution is a Scene placement view, never a fabricated
+  // The partial reference resolution is a Scene placement view, never a fabricated
   // Program binding that could be mistaken for execution authority.
   const auto &scene = Member(program.normalized_program_root(), "scene");
   if (!scene.is_array())
@@ -320,8 +291,7 @@ project_resolved_initial_scene(const ProgramBindingContract &program,
     if (Text(Member(frame, "kind"), "pose.frame_ref.kind") == "cell_frame")
       continue;
     try {
-      static_cast<void>(Frame(frame, resolved_roles.component_roles,
-                              resolved_roles.target_roles, cell_id));
+      static_cast<void>(Frame(frame, resolved_references.frame_bindings, cell_id));
     } catch (const ProgramBindingError &) {
       throw ProgramBindingError(
           "Program Scene object '" +
@@ -331,9 +301,8 @@ project_resolved_initial_scene(const ProgramBindingContract &program,
           "non-executable");
     }
   }
-  return detail::project_initial_scene_roles_value(
-      program.normalized_program_root(), resolved_roles.component_roles,
-      resolved_roles.target_roles, cell_id);
+  return detail::project_initial_scene_references_value(
+      program.normalized_program_root(), resolved_references.frame_bindings, cell_id);
 }
 
 } // namespace manyforge::deployment

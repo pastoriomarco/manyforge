@@ -207,6 +207,21 @@ TEST(PreparedPlanningCodecTest, RoundTripsCompletePlanRequestWithoutPrivateHandl
   EXPECT_FALSE(DecodePreparedPlanRequest(overflow).ok());
 }
 
+TEST(PreparedPlanningCodecTest, RejectsDiagnosticPlanRequests) {
+  auto request = testing::make_test_plan_request(
+      "diagnostic", ResolvedJointGoalDTO{{ResourceId("resource:joint1"), ResourceId("resource:joint2")},
+                                         {"joint1", "joint2"}, {0.5, -0.5}});
+  request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  auto result = EncodePreparedPlanRequest(request);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "diagnostic_planning_not_preparable");
+  request.collision_mode = PlannerCollisionMode::kEnforced;
+  request.diagnostic_qualified_target = request.start_state;
+  result = EncodePreparedPlanRequest(request);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "diagnostic_planning_not_preparable");
+}
+
 TEST(PreparedPlanningCodecTest, MovingPlanningBudgetIsOptionalClosedAndRoundTrips) {
   auto request = MovingRequest();
   const auto legacy = EncodePreparedPlanRequest(request);

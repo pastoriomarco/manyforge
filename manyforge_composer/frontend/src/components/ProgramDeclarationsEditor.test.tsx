@@ -19,7 +19,7 @@ const form: BlackboardKeyForm = {
 };
 
 describe('Program declarations editor', () => {
-  it('refuses a key in a system namespace (contract 105(c))', () => {
+  it('refuses a key in a system namespace', () => {
     for (const key of ['node_outcome.pick', 'interrupt_state', 'interrupt_state.guard']) {
       expect(() => buildBlackboardKeyDeclaration({ ...form, key })).toThrow('reserved for the system-owned');
     }

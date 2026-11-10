@@ -203,6 +203,43 @@ moving_request(CandidateFixture &fixture) {
   return input;
 }
 
+[[nodiscard]] roboplan::JointTrajectory native_trajectory(
+    const TrajectoryDTO &trajectory);
+
+TEST(RoboPlanCandidateComputerTest, QualifiedTargetEvidenceRequiresFiniteInLimitGoal) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding, {0x1234U, 65536U, 0.01});
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  int checks = 0;
+  RoboPlanCandidateControl control;
+  control.deadline_expired = [&checks] { return ++checks >= 3; };
+  std::optional<ControlledStateDTO> target;
+  const auto result = computer.compute(input, control, &target);
+  ASSERT_FALSE(result.ok());
+  ASSERT_TRUE(target);
+  ASSERT_EQ(target->resources, fixture.binding.resources);
+  EXPECT_EQ(target->joint_names, fixture.binding.compiled_joint_names);
+  const auto projected = angular_position_projection(*target);
+  ASSERT_TRUE(projected.ok());
+  EXPECT_EQ(projected.value(), values(fixture.goal));
+  EXPECT_FALSE(target->velocities);
+
+  auto invalid = joint_goal(fixture);
+  invalid.positions_rad[0] = 1e9;
+  input.motion = invalid;
+  checks = 0;
+  target.reset();
+  static_cast<void>(computer.compute(input, control, &target));
+  EXPECT_FALSE(target);
+  auto invalid_target = controlled_state(fixture.binding, fixture.goal);
+  invalid_target.positions[0] = AngularPositionDTO{1e9};
+  input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  input.diagnostic_qualified_target = invalid_target;
+  const auto rejected = computer.compute(input);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "native_diagnostic_target_invalid");
+}
+
 TEST(
     RoboPlanCandidateComputerTest,
     MovingCandidatePreservesPrefixAndEntersAMovingSuffixWithoutGlobalRetiming) {
@@ -255,6 +292,17 @@ TEST(
   EXPECT_GT(curve.runtime_scale_bounds->max_rate_per_s, 0.0);
   EXPECT_GT(curve.runtime_scale_bounds->max_rate_change_per_s2, 0.0);
   EXPECT_GE(curve.runtime_scale_bounds->max_stop_path_rate, 1.0);
+  // Measure only the new connector and its seam with the retained prefix.
+  // The prefix is checked against its own source TCP above and is never retimed.
+  auto suffix = curve;
+  suffix.waypoints.erase(suffix.waypoints.begin(),
+                         suffix.waypoints.begin() + prefix.waypoints.size() - 1);
+  const detail::CartesianTrajectoryContractInput tcp_contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto chord = detail::measure_tcp_chord_speed_ratio(
+      tcp_contract, fixture.scene, native_trajectory(suffix), {});
+  ASSERT_TRUE(chord.ok()) << chord.error().message;
+  EXPECT_LE(chord.value(), 1.0 + 1e-9);
   // Independently measure the delivered connector alone. Its fixed P/V/A
   // must retain ordinary planning's nominal acceleration and enabled jerk
   // reserve, rather than merely remaining infinitesimally below physical caps.
@@ -837,7 +885,7 @@ TEST(RoboPlanCandidateComputerTest,
   EXPECT_LE(*nominal, 1.0 + 1e-9);
 }
 
-// RP-3: the TCP bound inside TOPP-RA holds the 0.98 target at the samples and
+// The TCP bound inside TOPP-RA holds the 0.98 target at the samples and
 // slows only where the cap binds, so without jerk it is never slower than
 // timing within the joint limits and stretching uniformly to the same target.
 TEST(RoboPlanCandidateComputerTest,
@@ -924,6 +972,80 @@ TEST(RoboPlanCandidateComputerTest,
   return native;
 }
 
+TEST(RoboPlanCandidateComputerTest, TcpChordFindsMotionBetweenZeroVelocitySamples) {
+  auto fixture = make_fixture();
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  const detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto tcp_position = [&](const Eigen::VectorXd &q) {
+    return fixture.scene->forwardKinematics(
+        fixture.scene->toFullJointPositions("arm", q), "tool0", "base")
+        .block<3, 1>(0, 3).eval();
+  };
+  const auto start = tcp_position(fixture.start);
+  Eigen::VectorXd end = fixture.start;
+  double displacement = 0.0;
+  for (Eigen::Index joint = 0; joint < end.size(); ++joint) {
+    auto candidate = fixture.start;
+    candidate[joint] += 0.01;
+    const double distance = (tcp_position(candidate) - start).norm();
+    if (distance > displacement) {
+      end = candidate;
+      displacement = distance;
+    }
+  }
+  ASSERT_GT(displacement, 1e-6);
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = fixture.binding.compiled_joint_names;
+  trajectory.times = {0.0, 0.001};
+  trajectory.positions = {fixture.start, end};
+  trajectory.velocities = {Eigen::VectorXd::Zero(end.size()), Eigen::VectorXd::Zero(end.size())};
+  trajectory.accelerations = {Eigen::VectorXd::Zero(end.size()), Eigen::VectorXd::Zero(end.size())};
+  const auto sampled = detail::measure_tcp_sample_speed_ratio(contract, nullptr, fixture.scene, trajectory);
+  const auto chord = detail::measure_tcp_chord_speed_ratio(contract, fixture.scene, trajectory, {});
+  ASSERT_TRUE(sampled);
+  ASSERT_TRUE(chord.ok()) << chord.error().message;
+  EXPECT_NEAR(*sampled, 0.0, 1e-12);
+  const double cap = *input.speed_profile.max_tcp_linear_speed_mps * input.speed_profile.velocity_scale;
+  EXPECT_NEAR(chord.value(), displacement / (0.001 * cap), 1e-8);
+  ASSERT_GT(chord.value(), 1.0);
+  auto tcp_as_base = contract;
+  tcp_as_base.compiled_base_frame = "tool0";
+  const auto relative_to_itself = detail::measure_tcp_chord_speed_ratio(
+      tcp_as_base, fixture.scene, trajectory, {});
+  ASSERT_TRUE(relative_to_itself.ok()) << relative_to_itself.error().message;
+  EXPECT_NEAR(relative_to_itself.value(), 0.0, 1e-9);
+
+  // The validator compares absolute m/s to its admitted cap with 1e-8
+  // tolerance; the preparation helper must report that absolute speed even
+  // when the request's velocity scale is fractional.
+  const double validator_cap = *input.speed_profile.max_tcp_linear_speed_mps;
+  for (const double delta : {-2e-8, 0.5e-8, 2e-8}) {
+    auto at_threshold = trajectory;
+    at_threshold.times = {0.0, displacement / (validator_cap + delta)};
+    const auto speed = detail::measure_tcp_chord_speed_mps(
+        contract, fixture.scene, at_threshold, {}, 1.0);
+    ASSERT_TRUE(speed.ok()) << speed.error().message;
+    EXPECT_NEAR(speed.value(), validator_cap + delta, 1e-12);
+    EXPECT_EQ(speed.value() > validator_cap + 1e-8, delta > 1e-8);
+  }
+  auto late = trajectory;
+  late.times = {100000000.0, 100000000.25};
+  constexpr double multiplier = 1.3;
+  const auto rounded = detail::measure_tcp_chord_speed_mps(
+      contract, fixture.scene, late, {}, multiplier);
+  ASSERT_TRUE(rounded.ok()) << rounded.error().message;
+  const volatile double later_time = late.times[1] * multiplier;
+  const volatile double earlier_time = late.times[0] * multiplier;
+  EXPECT_DOUBLE_EQ(rounded.value(), displacement / (later_time - earlier_time));
+
+  // A single stretch by the stricter peak yields the approved 0.98 target.
+  trajectory.times.back() *= std::max(*sampled, chord.value()) / detail::kTcpSpeedTargetFraction;
+  const auto stretched = detail::measure_tcp_chord_speed_ratio(contract, fixture.scene, trajectory, {});
+  ASSERT_TRUE(stretched.ok()) << stretched.error().message;
+  EXPECT_NEAR(stretched.value(), detail::kTcpSpeedTargetFraction, 1e-9);
+}
+
 // Peak joint jerk between consecutive samples (finite difference).
 [[nodiscard]] double peak_sample_jerk(const TrajectoryDTO &trajectory) {
   double peak = 0.0;
@@ -938,7 +1060,7 @@ TEST(RoboPlanCandidateComputerTest,
   return peak;
 }
 
-// N12 / RP-3b: the Deployment default is smooth (robot_defaults.tsv).
+// The Deployment default is smooth (robot_defaults.tsv).
 TEST(RoboPlanCandidateComputerTest, MotionTimingDefaultsToSmooth) {
   EXPECT_EQ(kDefaultMotionTimingName, "smooth");
   EXPECT_EQ(kDefaultMotionTiming, MotionTimingDTO::kSmooth);
@@ -948,10 +1070,10 @@ TEST(RoboPlanCandidateComputerTest, MotionTimingDefaultsToSmooth) {
   EXPECT_FALSE(parse_motion_timing("rp3"));
 }
 
-// Smooth (M8): TOPP-RA within the full joint limits, then one uniform
+// Smooth: TOPP-RA within the full joint limits, then one uniform
 // stretch until the TCP is at its 0.98 target at the samples. Undoing the
 // stretch gives back a trajectory at the full acceleration limit. Fast
-// (RP-3) on the same path is quicker with far larger jerk; the TCP holds in
+// on the same path is quicker with far larger jerk; the TCP holds in
 // both.
 TEST(RoboPlanCandidateComputerTest,
      SmoothStretchesUniformlyToTheTcpTargetAndFastHoldsItInsideToppra) {
@@ -974,11 +1096,15 @@ TEST(RoboPlanCandidateComputerTest,
     const auto tcp = detail::measure_tcp_sample_speed_ratio(
         contract, nullptr, fixture.scene, native_trajectory(result.value()));
     ASSERT_TRUE(tcp.has_value());
+    const auto chord = detail::measure_tcp_chord_speed_ratio(
+        contract, fixture.scene, native_trajectory(result.value()), {});
+    ASSERT_TRUE(chord.ok()) << chord.error().message;
     EXPECT_LE(*tcp, 1.0 + 1e-9);
+    EXPECT_LE(chord.value(), 1.0 + 1e-9);
     const double multiplier =
         *result.value().runtime_scale_bounds->nominal_time_multiplier;
     if (timing == MotionTimingDTO::kSmooth) {
-      EXPECT_NEAR(*tcp, detail::kTcpSpeedTargetFraction, 1e-6);
+      EXPECT_NEAR(std::max(*tcp, chord.value()), detail::kTcpSpeedTargetFraction, 1e-6);
       EXPECT_GT(multiplier, 1.5);  // the TCP target binds the stretch
       double acceleration = 0.0;
       for (const auto &waypoint : result.value().waypoints)
@@ -1009,7 +1135,7 @@ TEST(RoboPlanCandidateComputerTest,
   RecordProperty("fast_peak_jerk", std::to_string(peak_sample_jerk(fast)));
 }
 
-// V2-9 jerk limits stay one more condition of the final stretch in both
+// Jerk limits stay one more condition of the final stretch in both
 // motion timings, on top of the TCP limit.
 TEST(RoboPlanCandidateComputerTest, JerkLimitsStackOnBothMotionTimings) {
   auto fixture = make_fixture();
@@ -1617,7 +1743,7 @@ TEST(RoboPlanCandidateComputerTest, MovingPlanningBudgetRejectsInvalidOrAlreadyC
 }
 
 
-// -- RP-2 corner blend radius (densification geometry) ----------------------
+// -- Corner blend radius (densification geometry) ---------------------------
 
 [[nodiscard]] Pose3DTO planar_pose(double x, double y, double yaw = 0.0) {
   const Eigen::Quaterniond orientation(
@@ -1705,7 +1831,7 @@ TEST(CartesianCornerBlendTest, ClampsRadiusToHalfOfEachAdjacentSegment) {
   EXPECT_TRUE(contains_position(dense.value().poses, {0.1, 0.04, 0.0}));
 }
 
-// N18: a 10 mm corner is resolved at least every 1 mm (r/20 = 0.5 mm), on the
+// A 10 mm corner is resolved at least every 1 mm (r/20 = 0.5 mm), on the
 // arc and in the tolerances RoboPlan's Bounded resolution steps by (half of
 // each).
 TEST(CartesianCornerBlendTest, TenMillimetreCornerIsResolvedWithinAMillimetre) {
@@ -1821,7 +1947,7 @@ TEST(CartesianCornerBlendTest, RejectsBlendRadiiThatDoNotMatchTheWaypoints) {
   }
 }
 
-// -- CT-1 Cartesian timing ---------------------------------------------------
+// -- Cartesian timing --------------------------------------------------------
 
 TEST(RoboPlanCandidateComputerTest,
      TimeOptimalCartesianTimingFromMoveOrDeploymentDefault) {
@@ -1900,6 +2026,12 @@ TEST(RoboPlanCandidateComputerTest,
             1.5);
   const double limit = *input.speed_profile.max_tcp_linear_speed_mps *
                        input.speed_profile.velocity_scale;
+  const detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto chord = detail::measure_tcp_chord_speed_ratio(
+      contract, fixture.scene, native_trajectory(result.value()), {});
+  ASSERT_TRUE(chord.ok()) << chord.error().message;
+  EXPECT_LE(chord.value(), 1.0 + 1e-9);
   double peak = 0.0;
   for (const auto &waypoint : result.value().waypoints) {
     const Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(

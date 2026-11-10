@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-// CONTRACTS §12: what a vendor or lane adapter hands the generic, vendor-free
+// What a vendor or lane adapter hands the generic, vendor-free
 // launch generator (`controller_launch_artifacts`). Plain data and the
 // standard library only, so a vendor adapter package includes it without
 // linking the generator.
@@ -32,7 +32,7 @@ struct LaunchHardware final {
   /// `<hardware><param>` entries, written verbatim after substitution.
   std::map<std::string, std::string, std::less<>> parameters;
   /// Each joint's command interfaces (every joint has position and velocity
-  /// state interfaces). Not in CONTRACTS §12's list; the plugin's exported
+  /// state interfaces). Not in the generic list; the plugin's exported
   /// interfaces must be declared, and only the adapter knows them.
   std::vector<std::string> joint_command_interfaces{"position"};
 
@@ -46,7 +46,7 @@ struct LaunchRemapping final {
   friend bool operator==(const LaunchRemapping &, const LaunchRemapping &) = default;
 };
 
-/// CONTRACTS §12 `LaunchContribution`.
+/// `LaunchContribution`.
 ///
 /// `controllers_yaml` is a controllers template the generator expands:
 /// - `/**/controller_manager:` (exactly once) becomes the component's manager;
@@ -68,7 +68,7 @@ struct LaunchContribution final {
   std::vector<LaunchRemapping> remappings;
   /// The frame the component's `<frame_prefix>world` hangs from, published by
   /// the launch as an identity static transform (Isaac: `universe`); absent
-  /// publishes none. Not in CONTRACTS §12's list: a lane fact the generic
+  /// publishes none. Not in the generic list: a lane fact the generic
   /// launch must carry, and only the adapter knows it.
   std::optional<std::string> world_parent_frame;
   /// The topic on which the hardware publishes its commanded joint positions
@@ -81,7 +81,7 @@ struct LaunchContribution final {
   friend bool operator==(const LaunchContribution &, const LaunchContribution &) = default;
 };
 
-/// CONTRACTS §12 `ModelLaneRow`: a model's `component.yaml` `lanes.<lane>`.
+/// `ModelLaneRow`: a model's `component.yaml` `lanes.<lane>`.
 struct ModelLaneRow final {
   /// The adapter that runs the component on this lane (`mock`, `isaac`, `xarm`).
   std::string adapter;
@@ -100,8 +100,13 @@ struct ModelLaneRow final {
   /// model): that vendor family's controllers for this row (its base plus
   /// ManyForge's additions), filled by `ComponentAdapterRegistry` before the
   /// lane family makes its contribution, so every lane runs the vendor's
-  /// controller configuration (plan, "Vendor driver configuration").
+  /// controller configuration.
   std::optional<std::string> vendor_controllers_yaml;
+  /// `runtime_scale` (robots only; a tool row has none): the adapter's
+  /// declaration that the arm's controller accepts runtime speed scaling
+  /// (`supported`) or not (`unsupported`). The written launch must match it
+  /// (`write_launch_artifacts`); the arm's lane fact `supports_scale` is it.
+  std::optional<bool> runtime_scale_supported;
 
   friend bool operator==(const ModelLaneRow &, const ModelLaneRow &) = default;
 };

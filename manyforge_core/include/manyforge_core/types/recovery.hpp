@@ -10,8 +10,8 @@
 
 namespace manyforge::core {
 
-/// Backend-neutral, ROS-free recovery authority records (spec/210 §3.12,
-/// spec/230 §3.7.1). All types here are immutable value objects: once
+/// Backend-neutral, ROS-free recovery authority records. All types here are
+/// immutable value objects: once
 /// published they never change; a fact change publishes a new revision.
 /// The kernel owns every field; no other layer may synthesize these.
 
@@ -58,8 +58,7 @@ enum class RecoveryClass {
 /// Shared recovery and motion-free closure action identifiers. `reset_cycle`
 /// is offer-only: assessments may advertise it
 /// and untrusted wire input may contain it, but ApplyRecoveryAction always
-/// rejects it because the existing cycle Reset route owns execution
-/// (spec/230 §3.7.1).
+/// rejects it because the existing cycle Reset route owns execution.
 enum class RecoveryAction {
   kRetryMotionFromCurrentState,
   kAcknowledgeAndContinue,
@@ -128,7 +127,7 @@ struct MotionRetryEligibilityDTO final {
 /// Immutable record that a stop authority reached a definitive result.
 /// Keyed by (execution_id, stop_owner kind+generation); a late
 /// completion from an older owner generation can never overwrite or become
-/// authoritative for a newer generation (spec/230 §3.7.1).
+/// authoritative for a newer generation.
 struct KernelStopCertificateDTO {
   std::string schema_version = "manyforge.kernel_stop_certificate.v1";
   std::string certificate_id;
@@ -157,12 +156,11 @@ struct KernelStopCertificateDTO {
   std::optional<ErrorDTO> terminal_error;
 };
 
-/// Minimal observed-state evidence consumed by recovery assessment. RT-8C's
+/// Minimal observed-state evidence consumed by recovery assessment. The
 /// dedicated `ObservedRobotStateSnapshotDTO` publication is the production
 /// source; until it exists no provider is wired and every observation-
 /// dependent assessment publishes unavailable and rejects fail-closed.
-/// Lifecycle `ExecutionSnapshotDTO` freshness MUST NOT be used here
-/// (spec/230 §3.7.1).
+/// Lifecycle `ExecutionSnapshotDTO` freshness MUST NOT be used here.
 struct ObservedStateEvidenceDTO {
   std::uint64_t sequence = 0;
   std::int64_t sampled_at_ns = 0;
@@ -180,8 +178,8 @@ struct ObservedStateEvidenceDTO {
   bool measured_authority = false;
 };
 
-/// The only kernel statement of whether recovery is currently admissible
-/// (spec/230 §3.7.1). Built from one coherent authority capture under
+/// The only kernel statement of whether recovery is currently admissible.
+/// Built from one coherent authority capture under
 /// lifecycle ordering; published as an immutable copy under a leaf lock.
 struct KernelRecoveryAssessmentDTO {
   std::string schema_version = "manyforge.kernel_recovery_assessment.v1";
@@ -203,7 +201,7 @@ struct KernelRecoveryAssessmentDTO {
   bool backend_stop_confirmed = false;
   std::string stop_certificate_id;
   std::uint64_t stop_certificate_revision = 0;
-  /// Observation facts. `observed_state_available=false` until RT-8C wires
+  /// Observation facts. `observed_state_available=false` until a provider wires
   /// the dedicated publication; freshness/at-rest are then fail-closed.
   bool observed_state_available = false;
   bool observed_state_fresh = false;
@@ -219,7 +217,7 @@ struct KernelRecoveryAssessmentDTO {
   /// Stable machine-readable reason for the current status.
   std::string reason_code;
   /// Bounded references to native events / certificate ids backing this
-  /// assessment (spec/500 correlation spine).
+  /// assessment.
   std::vector<std::string> evidence_refs;
 
   MotionRetryEligibilityDTO retry_eligibility;

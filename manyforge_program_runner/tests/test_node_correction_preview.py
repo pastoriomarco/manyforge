@@ -36,7 +36,7 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeState,
 )
 from manyforge_behavior.production_ports import NativeKernelProgramPort
-from manyforge_behavior.program import Program
+from manyforge_behavior.program import Program, program_node_policies
 from manyforge_behavior.program_run_owner import (
     ProgramRunAdmission,
     ProgramRunOwner,
@@ -281,22 +281,42 @@ def _held_run():
             "program_revision": program.program_revision,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
-            "node_policies": [],
-            "target_role_bindings": [
+            "node_policies": [row.to_dict() for row in program_node_policies(program)],
+            "target_bindings": [
                 {
-                    "target_role_id": "arm",
-                    "component_role_id": "robot",
-                    "controllable_component_id": "ur5.1",
-                    "command_target_id": "arm.command",
-                    "robot_tcps": [{"entry": {"component_id": "ur5.1",
-                                              "target_id": "arm.command",
-                                              "frame_role_id": "tcp"},
-                                    "end_effector": True}],
+                    "target": {
+                        "component_id": "ur5_robot",
+                        "command_target_id": "arm",
+                    },
                     "capability_bindings": [
-                        {"capability_id": "execution.trajectory.execute"},
+                        {
+                            "capability_id": "execution.trajectory.execute",
+                            "command_schema": None,
+                        },
+                    ],
+                    "robot_tcps": [
+                        {
+                            "entry": {
+                                "target": {
+                                    "component_id": "ur5_robot",
+                                    "command_target_id": "arm",
+                                },
+                                "frame": {
+                                    "component_id": "ur5_robot",
+                                    "frame_id": "tcp",
+                                },
+                            },
+                            "end_effector": True,
+                        },
                     ],
                 }
             ],
+            "frame_bindings": [
+                {"reference": {"component_id": "ur5_robot", "frame_id": "base"}},
+                {"reference": {"component_id": "ur5_robot", "frame_id": "tcp"}},
+            ],
+            "collision_body_bindings": [],
+            "signal_bindings": [],
             "contact_grasp_bindings": [],
         },
         readiness=readiness,
@@ -318,7 +338,12 @@ def _held_run():
     run_id = owner.start(admission).capture.program_run_id
     # Mirror the ordered Active TCP baseline that the Runner registers at start.
     owner.value_store(run_id).write_active_tcp(
-        "arm", {"component_id": "ur5.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+        "ur5_robot",
+        "arm",
+        {
+            "target": {"component_id": "ur5_robot", "command_target_id": "arm"},
+            "frame": {"component_id": "ur5_robot", "frame_id": "tcp"},
+        },
     )
     paused = owner.advance_once(run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -410,10 +435,8 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
         assert result["node_attempt_id"] == held.identity.node_attempt_id
         assert result["program_runner_owner_epoch"] == _RUN_OWNER_EPOCH
         assert result["target"] == {
-            "target_role_id": "arm",
-            "component_role_id": "robot",
-            "controllable_component_id": "ur5.1",
-            "command_target_id": "arm.command",
+            "component_id": "ur5_robot",
+            "command_target_id": "arm",
         }
         operation = result["operation"]
         # The Headless manual-preview wire accepts the intent unchanged.

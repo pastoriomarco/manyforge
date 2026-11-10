@@ -7,6 +7,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <map>
 #include <set>
@@ -195,7 +196,7 @@ TEST(IoSignalCatalogTest, CompiledCatalogDeclaresOneLostSignalPerGripperTarget) 
   const auto conflict = ResolveCompiledIoSignalCatalog(graph);
   ASSERT_FALSE(conflict.ok());
   EXPECT_EQ(conflict.error().details.at("reason"), "io_system_signal_conflict");
-  // An authored row on the reserved system source is refused too (SX-205: the
+  // An authored row on the reserved system source is refused too (the
   // generated rows share that source with each other, never with authored).
   const auto reserved = input_row("authored_name", "system.carried_object_lost");
   graph.runtime_units.front().configuration["io_signals"] =
@@ -207,8 +208,8 @@ TEST(IoSignalCatalogTest, CompiledCatalogDeclaresOneLostSignalPerGripperTarget) 
             "io_system_signal_conflict");
 }
 
-// CONTRACTS §7: `controller_owned` is authored per output (default false);
-// Mock outputs report the written value back (D2), so they have read-back.
+// `controller_owned` is authored per output (default false);
+// Mock outputs report the written value back, so they have read-back.
 TEST(IoSignalCatalogTest, OutputControllerOwnedIsAuthoredAndMockOutputsReadBack) {
   auto valve = input_row("valve", "source.valve");
   valve["direction"] = JsonValueDTO{std::string("output")};
@@ -239,6 +240,44 @@ TEST(IoSignalCatalogTest, OutputControllerOwnedIsAuthoredAndMockOutputsReadBack)
       "valve.changed_outside");
   ASSERT_NE(found, nullptr);
   EXPECT_EQ(found->descriptor.signal_id.name, "valve");
+  const auto derived = manyforge::deployment::FindProgramSignalMatches(
+      result.value(), {ControllableComponentId("device.io"), "valve.changed_outside"});
+  ASSERT_EQ(derived.size(), 1U);
+  EXPECT_EQ(derived.front().retained, found);
+  EXPECT_TRUE(derived.front().changed_outside);
+  EXPECT_EQ(derived.front().descriptor, ChangedOutsideDescriptor(found->descriptor));
+  const auto derived_binding = manyforge::deployment::resolve_program_signal_binding(
+      {ControllableComponentId("device.io"), "valve.changed_outside"}, result.value());
+  EXPECT_EQ(derived_binding.target.component_id, found->descriptor.signal_id.controllable_component_id);
+  EXPECT_EQ(derived_binding.target.command_target_id, found->command_target_id);
+  EXPECT_EQ(derived_binding.runtime_unit_id, found->runtime_unit_id);
+  const auto derived_digest = ComputeIoSignalDescriptorDigest(derived.front().descriptor);
+  ASSERT_TRUE(derived_digest.ok());
+  EXPECT_EQ(derived_binding.signal_descriptor_digest, derived_digest.value());
+  const auto ordinary = manyforge::deployment::FindProgramSignalMatches(
+      result.value(), {ControllableComponentId("device.io"), "valve"});
+  ASSERT_EQ(ordinary.size(), 1U);
+  EXPECT_FALSE(ordinary.front().changed_outside);
+  EXPECT_EQ(ordinary.front().descriptor, found->descriptor);
+  EXPECT_TRUE(manyforge::deployment::FindProgramSignalMatches(
+      result.value(), {ControllableComponentId("device.io"), "owned.changed_outside"}).empty());
+  // Static derived references require readback as well as an unowned output.
+  // Model a retained output without readback independently of the Mock provider.
+  auto without_readback = result.value();
+  for (auto &row : without_readback) {
+    if (row.descriptor.signal_id.name == "valve")
+      row.descriptor.readback = false;
+  }
+  EXPECT_TRUE(manyforge::deployment::FindProgramSignalMatches(
+      without_readback,
+      {ControllableComponentId("device.io"), "valve.changed_outside"}).empty());
+  auto ambiguous = result.value();
+  ambiguous.push_back(*found);
+  EXPECT_EQ(manyforge::deployment::FindProgramSignalMatches(
+      ambiguous, {ControllableComponentId("device.io"), "valve.changed_outside"}).size(), 2U);
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::resolve_program_signal_binding(
+                   {ControllableComponentId("device.io"), "valve.changed_outside"}, ambiguous)),
+               manyforge::deployment::ProgramBindingCompilerError);
   EXPECT_EQ(manyforge::deployment::FindChangedOutsideOutput(
                 result.value(), ControllableComponentId("device.io"), "valve"),
             nullptr);
@@ -1408,7 +1447,7 @@ TEST(IoSignalCatalogTest, PoseStreamIdsAreObjectLinksOrOverlays) {
             "poses/robot/viewer.measured_tcp");
 }
 
-// CONTRACTS §16: a machine's I/O bank on the real lane (the rows the
+// A machine's I/O bank on the real lane (the rows the
 // compiler writes for an I/O member): periodic inputs with a sample-age
 // budget, outputs with read-back, one channel per output, no
 // source-acknowledgement budget.
@@ -1470,7 +1509,7 @@ TEST(IoSignalCatalogTest, MachineIoBankRowsReadBackWithOneChannelPerOutput) {
   EXPECT_FALSE(devices.value().front().output_source_ack_timeout_ns);
 }
 
-// CONTRACTS §16: an I/O member's device row names its owner and role.
+// An I/O member's device row names its owner and role.
 TEST(IoSignalCatalogTest, MemberDeviceRowsCarryOwnerAndRole) {
   using namespace manyforge::deployment;
   auto graph = io_graph();

@@ -73,8 +73,6 @@ retained_product_reseal_physical_owner_difference(
   after.program_binding_id = before.program_binding_id;
   after.retained_bundle_id = before.retained_bundle_id;
   after.graph_revision = before.graph_revision;
-  after.component_role_id = before.component_role_id;
-  after.target_role_id = before.target_role_id;
   after.contact_grasp_bindings = before.contact_grasp_bindings;
 
   if (after.controllable_component_id != before.controllable_component_id)
@@ -315,10 +313,11 @@ bool RetainedObservationWake::wait_after(
 RetainedObservedStateChannel::RetainedObservedStateChannel(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<RetainedKinematicStateProjector> projector,
-    RetainedObservedStateChannelConfig config, core::IClock *clock,
+    RetainedObservedStateChannelConfig config,
+    std::shared_ptr<core::IClock> clock,
     std::shared_ptr<RetainedObservationWake> render_wake)
     : current_binding_(std::move(binding)),
-      config_(std::move(config)), clock_(clock),
+      config_(std::move(config)), clock_(std::move(clock)),
       publication_(publication_config(current_binding_, config_)),
       projection_context_(publication_.query_context()),
       render_wake_(render_wake ? std::move(render_wake)
@@ -436,7 +435,7 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
     current_binding_ = std::move(binding);
     if (publication_.query_context().state_authority_class ==
         core::StateAuthorityClass::kMeasured) {
-      // CP8 step 1: a measurement is never re-stamped. The new route has no
+      // A measurement is never re-stamped. The new route has no
       // state until the measured source publishes again, so the freshness
       // gate stays closed for recovery readers.
       notify_render_change();
@@ -790,7 +789,7 @@ void RetainedObservedStateChannel::set_display_input_leads(const bool leads) {
 
 bool RetainedObservedStateChannel::live_display_leads_locked(
     const std::int64_t now_ns) const {
-  // M6 items 23/34: poses follow the live controller stream. The display
+  // Poses follow the live controller stream. The display
   // input already passed the display's rules (names, finite, not all-zero).
   if (!follows_display_input_ || !render_display_only_ || !render_positions_valid_)
     return false;
@@ -976,7 +975,7 @@ bool RetainedObservedStateChannel::wait_for_render_change(
 void RetainedObservedStateChannel::record_render_positions(
     const std::span<const std::string> source_joint_names,
     const std::span<const double> positions_si, const bool display_only) {
-  // M6: once display input arrived, it alone moves a display-led channel.
+  // Once display input arrived, it alone moves a display-led channel.
   if (follows_display_input_ && render_display_only_ && !display_only) return;
   const auto &canonical_names = projection_context_.joint_names;
   if (source_joint_names.size() != positions_si.size() ||

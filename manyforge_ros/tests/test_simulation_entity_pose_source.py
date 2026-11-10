@@ -1,4 +1,4 @@
-"""Entity poses are a generic pose source keyed by entity name (CONTRACTS §14).
+"""Entity poses are a generic pose source keyed by entity name.
 
 The per-scene mappings are Scenario data: each Isaac Scenario's
 ``policies.scene_pose_sources[].source_key.simulation_entity`` names a simulator entity
@@ -16,7 +16,7 @@ import pytest
 from manyforge_ros.isaac_pose_observer import load_isaac_pose_observer_site_config
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SCENARIOS = sorted((_ROOT / "examples").glob("isaac-*.scenario"))
+_SCENARIOS = sorted((_ROOT / "examples").glob("sim_*.scenario"))
 
 
 def _site_document(entities: list[dict]) -> dict:
@@ -59,7 +59,7 @@ def test_scenario_entity_rows_name_an_entity_of_a_simulation_pose_source(
     sources = {
         component["component_id"]: component["configuration"]
         for component in deployment["components"]
-        if component["configuration"].get("runtime_kind") == "pose_source"
+        if component.get("configuration", {}).get("runtime_kind") == "pose_source"
     }
     assert sources, "an Isaac Scenario carries its pose source component"
     for row in deployment["policies"].get("scene_pose_sources", []):

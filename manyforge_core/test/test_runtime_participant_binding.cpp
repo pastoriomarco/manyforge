@@ -17,8 +17,6 @@ using namespace manyforge::core;
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
       GraphRevision("graph"),
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("ur5"),
       ComponentTypeRevision("ur5-revision"),
@@ -32,7 +30,7 @@ using namespace manyforge::core;
                                    ModelInstanceId("robot.model"),
                                    "mf2_robot_arm",
                                    {"mf2_robot_joint_1", "mf2_robot_joint_2"}}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model-revision"), "mf2_robot_tcp"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint_1"), ResourceId("robot.joint.1"), "joint_1",
                                  "mf2_robot_joint_1", CoordinateKind::kAngular},
@@ -70,7 +68,6 @@ using namespace manyforge::core;
 
 [[nodiscard]] RuntimeParticipantBindingDTO gripper_binding() {
   auto value = valid_binding();
-  value.target_role_id = TargetRoleId("gripper");
   value.command_target_id = CommandTargetId("gripper");
   value.capability_id = CapabilityId("tool.gripper.command");
   value.model_groups.clear();
@@ -121,7 +118,6 @@ TEST(RuntimeParticipantBindingTest,
 TEST(RuntimeParticipantBindingTest,
      SealsNoSourceComponentLocalResourceWithoutInventingAModelGroup) {
   auto value = valid_binding();
-  value.target_role_id = TargetRoleId("gripper");
   value.command_target_id = CommandTargetId("gripper");
   value.capability_id = CapabilityId("tool.gripper.command");
   value.model_groups.clear();
@@ -224,8 +220,6 @@ TEST(RuntimeParticipantBindingTest,
   alias_value.program_id = ProgramId("program.place");
   alias_value.program_revision = ProgramRevision("program-place-revision");
   alias_value.program_binding_id = ProgramBindingId("program-place-binding");
-  alias_value.component_role_id = ComponentRoleId("place_robot");
-  alias_value.target_role_id = TargetRoleId("place_arm");
   alias_value.resources.pop_back();
   auto alias = verify_runtime_participant_binding(std::move(alias_value));
   ASSERT_TRUE(alias.ok()) << alias.error().message;
@@ -259,7 +253,7 @@ TEST(RuntimeParticipantBindingTest,
 TEST(RuntimeParticipantBindingTest, PhysicalContainmentKeepsRolesThatShareOneFrame) {
   auto value = valid_binding();
   const auto frame = [&](const char *role, const char *compiled) {
-    return ProgramFrameRoleBindingDTO{FrameRoleId(role), ModelInstanceId("robot.model"),
+    return ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId(role)}, ModelInstanceId("robot.model"),
                                       ModelRevision("model-revision"), compiled};
   };
   value.frame_bindings = {frame("base", "mf2_base"), frame("flange", "mf2_tool0"),
@@ -272,27 +266,26 @@ TEST(RuntimeParticipantBindingTest, PhysicalContainmentKeepsRolesThatShareOneFra
   EXPECT_TRUE(runtime_participant_binding_physically_contains(physical.value(), selected.value()));
 
   auto foreign = selected.value().value();
-  foreign.frame_bindings.back().frame_role_id = FrameRoleId("camera");
+  foreign.frame_bindings.back().reference.frame_id = FrameRoleId("camera");
   auto crossed = verify_runtime_participant_binding(std::move(foreign));
   ASSERT_TRUE(crossed.ok()) << crossed.error().message;
   EXPECT_FALSE(runtime_participant_binding_physically_contains(physical.value(), crossed.value()));
 }
 
-// M7 U3: the one Program frame identity used by the LOADFIX5/10/11 sites.
-// Role, model, revision and compiled name all count; contact bodies do not.
+// The one Program frame identity (`same_program_frame`).
+// Frame ID, model, revision and compiled name count; contact sets are separate.
 TEST(SameProgramFrameTest, ComparesRoleModelRevisionAndCompiledNameOnly) {
-  const ProgramFrameRoleBindingDTO tcp{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
-                                       ModelRevision("model-revision"), "mf2_tool0", {}};
+  const ProgramFrameBindingDTO tcp{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
+                                       ModelRevision("model-revision"), "mf2_tool0"};
   EXPECT_TRUE(same_program_frame(tcp, tcp));
-  auto with_contacts = tcp;
-  with_contacts.contact_body_role_ids = {CollisionBodyRoleId("fingers")};
-  EXPECT_TRUE(same_program_frame(tcp, with_contacts));
-  EXPECT_TRUE(same_program_frame(with_contacts, tcp));
 
   // A UR5's `flange` and `tcp` share one compiled frame and stay distinct.
   auto flange = tcp;
-  flange.frame_role_id = FrameRoleId("flange");
+  flange.reference.frame_id = FrameRoleId("flange");
   EXPECT_FALSE(same_program_frame(tcp, flange));
+  auto other_component = tcp;
+  other_component.reference.component_id = ControllableComponentId("robot.2");
+  EXPECT_TRUE(same_program_frame(tcp, other_component));
   auto other_model = tcp;
   other_model.model_instance_id = ModelInstanceId("gripper.model");
   EXPECT_FALSE(same_program_frame(tcp, other_model));
@@ -313,7 +306,7 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
       value.controllable_component_id, ModelInstanceId("robot.model"),
       CollisionBodyRoleId("gripper_collision"), 0U);
   value.collision_body_bindings = {
-      ProgramCollisionBodyRoleBindingDTO{CollisionBodyRoleId("tool_collision"),
+      ProgramCollisionBodyBindingDTO{{ControllableComponentId("robot.1"), CollisionBodyRoleId("tool_collision")},
                                          ModelInstanceId("robot.model"),
                                          ModelRevision("model-revision"),
                                          {"mf2_robot_tool"}}};
@@ -321,12 +314,8 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
       ContactPolicyId("grasp.tool"),
       ContactPolicyRevision("grasp-revision"),
       RuntimeObjectId("selected_object"),
-      {ProgramContactGraspBodyBindingDTO{value.component_role_id,
-                                         value.target_role_id,
-                                         value.controllable_component_id,
-                                         value.command_target_id,
+      {ProgramContactGraspBodyBindingDTO{{value.controllable_component_id, CollisionBodyRoleId("tool_collision")},
                                          ModelRoleId("body"),
-                                         CollisionBodyRoleId("tool_collision"),
                                          ModelInstanceId("robot.model"),
                                          ModelRevision("model-revision"),
                                          {semantic}}},
@@ -344,7 +333,7 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   const auto& body =
       resolved.value().value().contact_grasp_bindings.front().allowed_body_bindings.front();
-  EXPECT_EQ(body.collision_body_role_id.value(), "tool_collision");
+  EXPECT_EQ(body.body.collision_body_id.value(), "tool_collision");
   EXPECT_EQ(body.collision_body_ids, (std::vector<std::string>{physical}));
 }
 
@@ -361,28 +350,34 @@ TEST(RuntimeParticipantBindingTest, RejectsCollisionBodyAliasWithoutPhysicalFixe
   EXPECT_EQ(resolved.error().details.at("reason"), "runtime_collision_body_alias_table_invalid");
 }
 
+TEST(RuntimeParticipantBindingTest, FrameAssociationsMustNameUniqueTargetLocalFrames) {
+  auto value = valid_binding();
+  value.frame_associations = {{value.frame_bindings.front().reference, {}}};
+  ASSERT_TRUE(verify_runtime_participant_binding(value).ok());
+  auto duplicate = value;
+  duplicate.frame_associations.push_back(duplicate.frame_associations.front());
+  EXPECT_FALSE(verify_runtime_participant_binding(std::move(duplicate)).ok());
+  value.frame_associations.front().frame.frame_id = FrameRoleId("not_bound");
+  EXPECT_FALSE(verify_runtime_participant_binding(std::move(value)).ok());
+}
+
 TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAssociation) {
   auto value = valid_binding();
   const auto endpoint = [&](std::string role, std::string body_role) {
     return RuntimeMotionEndpointBindingDTO{
-        TargetRoleId("tool"),
-        CommandTargetId("gripper"),
-        {FrameRoleId(role),
+        {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+        {{ControllableComponentId("robot.1"), FrameRoleId(role)},
          ModelInstanceId("robot.model"),
          ModelRevision("model-revision"),
-         "mf2_robot_" + role,
-         {CollisionBodyRoleId(body_role)}},
-        {{ComponentRoleId("robot"),
-          TargetRoleId("tool"),
-          ControllableComponentId("robot.1"),
-          CommandTargetId("gripper"),
+         "mf2_robot_" + role},
+        {{{ControllableComponentId("robot.1"), CollisionBodyRoleId(body_role)},
           std::nullopt,
-          CollisionBodyRoleId(body_role),
           ModelInstanceId("robot.model"),
           ModelRevision("model-revision"),
           {make_component_collision_body_id(ControllableComponentId("robot.1"),
                                             ModelInstanceId("robot.model"),
-                                            CollisionBodyRoleId(body_role), 0U)}}}};
+                                            CollisionBodyRoleId(body_role), 0U)}}},
+        {CollisionBodyRoleId(body_role)}};
   };
   value.motion_endpoint = endpoint("left_tip", "left_finger");
   const auto left = verify_runtime_participant_binding(value);
@@ -393,6 +388,17 @@ TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAss
   EXPECT_NE(left.value().value().motion_endpoint, right.value().value().motion_endpoint);
   EXPECT_EQ(left.value().value().resources, right.value().value().resources);
   EXPECT_EQ(left.value().value().command_target_id, CommandTargetId("arm"));
+  // The same physical frame can have different contact sets for two targets.
+  auto first_target = endpoint("shared_tip", "left_finger");
+  auto second_target = endpoint("shared_tip", "right_finger");
+  second_target.target.command_target_id = CommandTargetId("other_arm");
+  EXPECT_EQ(first_target.frame, second_target.frame);
+  EXPECT_NE(first_target.contact_body_role_ids, second_target.contact_body_role_ids);
+  value.motion_endpoint = first_target;
+  ASSERT_TRUE(verify_runtime_participant_binding(value).ok());
+  value.motion_endpoint = second_target;
+  ASSERT_TRUE(verify_runtime_participant_binding(value).ok());
+  value.motion_endpoint = endpoint("right_tip", "right_finger");
   for (int invalid = 0; invalid < 6; ++invalid) {
     SCOPED_TRACE(invalid);
     auto wrong = value;
@@ -405,14 +411,14 @@ TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAss
         selected.frame.model_revision = ModelRevision("other-revision");
         break;
       case 2:
-        selected.contact_body_bindings.front().controllable_component_id =
+        selected.contact_body_bindings.front().body.component_id =
             ControllableComponentId("other.robot");
         break;
       case 3:
-        selected.contact_body_bindings.front().target_role_id = TargetRoleId("other.tool");
+        selected.target.component_id = ControllableComponentId("");
         break;
       case 4:
-        selected.contact_body_bindings.front().collision_body_role_id =
+        selected.contact_body_bindings.front().body.collision_body_id =
             CollisionBodyRoleId("other");
         break;
       case 5:
@@ -422,7 +428,7 @@ TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAss
     EXPECT_FALSE(verify_runtime_participant_binding(std::move(wrong)).ok());
   }
   // Endpoints without contact bodies remain valid for ordinary motion.
-  value.motion_endpoint->frame.contact_body_role_ids.clear();
+  value.motion_endpoint->contact_body_role_ids.clear();
   value.motion_endpoint->contact_body_bindings.clear();
   EXPECT_TRUE(verify_runtime_participant_binding(value).ok());
 }
@@ -438,31 +444,25 @@ TEST(RuntimeParticipantBindingTest, MotionEndpointMayUseAMountedToolModel) {
                                             CollisionBodyRoleId("gripper_fingers"), 0U);
   };
   value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
-      TargetRoleId("tool"),
-      CommandTargetId("gripper"),
-      {FrameRoleId("tcp"),
+      {ControllableComponentId("robot.1"), CommandTargetId("arm")},
+      {{ControllableComponentId("lite_gripper"), FrameRoleId("tcp")},
        ModelInstanceId("lite_gripper.model"),
        ModelRevision("tool-model-revision"),
-       "mf2_lite_gripper_link_tcp",
-       {CollisionBodyRoleId("gripper_fingers")}},
-      {{ComponentRoleId("tool"),
-        TargetRoleId("tool"),
-        ControllableComponentId("lite_gripper"),
-        CommandTargetId("gripper"),
+       "mf2_lite_gripper_link_tcp"},
+      {{{ControllableComponentId("lite_gripper"), CollisionBodyRoleId("gripper_fingers")},
         std::nullopt,
-        CollisionBodyRoleId("gripper_fingers"),
         ModelInstanceId("lite_gripper.model"),
         ModelRevision("tool-model-revision"),
-        {body_id("lite_gripper")}}}};
+        {body_id("lite_gripper")}}},
+      {CollisionBodyRoleId("gripper_fingers")}};
   const auto accepted = verify_runtime_participant_binding(value);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   // Body ids keyed by the motion component instead of the body owner fail.
   value.motion_endpoint->contact_body_bindings.front().collision_body_ids.front() =
       body_id("robot.1");
   EXPECT_FALSE(verify_runtime_participant_binding(value).ok());
-  // D1's default robot `tcp` on the tool carries no contact bodies.
-  value.motion_endpoint->target_role_id = TargetRoleId("arm");
-  value.motion_endpoint->frame.contact_body_role_ids.clear();
+  // The default robot `tcp` on the tool carries no contact bodies.
+  value.motion_endpoint->contact_body_role_ids.clear();
   value.motion_endpoint->contact_body_bindings.clear();
   EXPECT_TRUE(verify_runtime_participant_binding(value).ok());
 }

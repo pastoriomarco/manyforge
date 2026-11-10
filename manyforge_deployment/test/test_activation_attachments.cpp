@@ -12,7 +12,7 @@
 #include "activation_deployment_compiler_internal.hpp"
 #include "activation_deployment_intent_internal.hpp"
 
-// Merge 6 slice B: the authored `attachments` rows of a Deployment intent.
+// The authored `attachments` rows of a Deployment intent.
 // The full compile of a mounted tool is PrepareActivationToolSplit.
 namespace {
 namespace d = manyforge::deployment;
@@ -128,8 +128,8 @@ TEST(ActivationAttachments, RefusesMalformedRows) {
 
 } // namespace
 
-// TCP-A: a component row's `custom_tcps` (the GUI-authored custom TCPs):
-// `{tcp_id, parent_frame, pose}` rows, uniquely sorted, with the spec 210
+// A component row's `custom_tcps` (the GUI-authored custom TCPs):
+// `{tcp_id, parent_frame, pose}` rows, uniquely sorted, with the
 // authoring pose `{position_m, orientation: {rpy_deg} | {xyzw}}`.
 namespace {
 
@@ -189,7 +189,7 @@ TEST(ActivationCustomTcps, RefusesUnsortedDuplicateOrMalformedRows) {
 
 }  // namespace
 
-// M7 B5 [C-P1]: a mount's `primary` and a component's `default_tcp`, then
+// A mount's `primary` and a component's `default_tcp`, then
 // the default TCP each component's graph row carries (`compiled_default_tcp`).
 namespace {
 
@@ -357,7 +357,7 @@ TEST(ActivationB5, AnUnknownOrUntaggedPairIsRefused) {
 }
 
 TEST(ActivationB5, AComponentWithoutTcpsHasNoDefault) {
-  // C-P3: an untagged `tcp` is no TCP; a target with no declared default
+  // An untagged `tcp` is no TCP; a target with no declared default
   // exposes no custom TCP either.
   const auto type = Type({Target("gripper", {Frame("tcp", false)}, std::nullopt)});
   EXPECT_FALSE(detail::compiled_default_tcp(Row(), type).has_value());

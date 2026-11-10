@@ -67,7 +67,7 @@ interface SnapshotResponderProps {
 }
 
 /**
- * Reusable offscreen R3F capture client. I5/I9 own the exact snapshot request,
+ * Reusable offscreen R3F capture client. Future clients own the exact snapshot request,
  * freshness, and upload adapters; no deleted WebSocket or route is embedded.
  */
 export function SnapshotResponder({

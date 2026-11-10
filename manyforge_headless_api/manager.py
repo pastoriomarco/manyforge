@@ -25,6 +25,7 @@ from .native import (
     MAX_MANAGER_COMMAND_TIMEOUT_SECONDS,
     strict_json_object,
 )
+from manyforge_behavior.reference_validation import validate_reference_refusal
 from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
@@ -33,7 +34,7 @@ from .private_transport import (
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
 MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v1"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v2"
 MAX_MANAGER_PACKET_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -102,7 +103,7 @@ def _transaction_body(request: SceneTransactionRequest) -> dict[str, Any]:
 
 
 _MANAGER_PRODUCER = "component_manager"
-_MANAGER_ERROR_KEYS = frozenset({"code", "details", "message", "producer"})
+_MANAGER_ERROR_KEYS = frozenset({"code", "details", "message", "producer", "reference_validation"})
 
 
 def _manager_error(error: object) -> HeadlessApiError | None:
@@ -134,6 +135,13 @@ def _manager_error(error: object) -> HeadlessApiError | None:
         or not producer
     ):
         return None
+    if "reference_validation" in error:
+        if error["code"] != "program_reference_validation_failed":
+            return None
+        reference = validate_reference_refusal(error["reference_validation"])
+        if reference is None or set(details) & set(reference):
+            return None
+        details = {**details, **reference}
     return HeadlessApiError(
         error["code"], error["message"], details=details, producer=producer
     )
@@ -309,6 +317,14 @@ class ManagerCommandClient:
                 ),
             }
         )
+        error = response.get("error")
+        if response.get("ok") is False and isinstance(error, dict) and "reference_validation" in error:
+            typed = _manager_error(error)
+            if typed is None:
+                raise HeadlessApiError(
+                    "manager_command_response_invalid", "Manager Apply rejection is malformed"
+                )
+            raise typed
         return response
 
     def _apply_status_command(
@@ -394,7 +410,7 @@ class ManagerCommandClient:
     def release_failed_apply_for_new(
         self, request_context: ManagerApplyAcknowledgementContext
     ) -> dict[str, Any]:
-        """New (R3, N7): release whatever failed Apply still holds the cell.
+        """New: release whatever failed Apply still holds the cell.
 
         ``released`` names that Apply, or is ``None`` when none holds it.
         """

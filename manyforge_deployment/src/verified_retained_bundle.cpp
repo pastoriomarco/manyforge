@@ -503,21 +503,24 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
     }
   }
   const bool has_execution_runtime = !execution_runtime_units.empty();
-  // CONTRACTS §16: a machine owner is model-free; its execution unit lists it
-  // under `machines`.
+  // A machine owner and a lane-free adapter component (a sensor, the
+  // assistant) are model-free; their execution unit lists them under
+  // `machines` and `sensors`.
   std::set<std::string> machine_owners;
   for (const auto &unit : graph.runtime_units) {
-    const auto machines = unit.configuration.find("machines");
-    if (machines == unit.configuration.end()) continue;
-    const auto *rows = std::get_if<core::JsonValueDTO::Array>(&machines->second.value);
-    if (rows == nullptr) continue;
-    for (const auto &row : *rows) {
-      const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
-      if (object == nullptr) continue;
-      const auto id = object->find("controllable_component_id");
-      if (id == object->end()) continue;
-      if (const auto *text = std::get_if<std::string>(&id->second.value))
-        machine_owners.insert(*text);
+    for (const char *name : {"machines", "sensors"}) {
+      const auto listed = unit.configuration.find(std::string(name));
+      if (listed == unit.configuration.end()) continue;
+      const auto *rows = std::get_if<core::JsonValueDTO::Array>(&listed->second.value);
+      if (rows == nullptr) continue;
+      for (const auto &row : *rows) {
+        const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+        if (object == nullptr) continue;
+        const auto id = object->find("controllable_component_id");
+        if (id == object->end()) continue;
+        if (const auto *text = std::get_if<std::string>(&id->second.value))
+          machine_owners.insert(*text);
+      }
     }
   }
 
@@ -1345,7 +1348,7 @@ verify_structural_applicability_projection(
   return verified;
 }
 
-// CP9 stream parameter overrides: the exact normalized, non-empty Deployment
+// Stream parameter overrides: the exact normalized, non-empty Deployment
 // table whose rows name retained controllable components.
 void verify_retained_component_streams(const CanonicalValue &value,
                                        const core::CellGraphDTO &graph) {

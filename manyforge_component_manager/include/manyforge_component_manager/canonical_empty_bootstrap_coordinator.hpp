@@ -19,7 +19,7 @@ class CanonicalEmptyBootstrapCoordinatorError final
 
 /// Bounded canonical-empty bootstrap and recovery coordinator.
 ///
-/// This operation admits only the sealed I3 canonical-empty package already
+/// This operation admits only the sealed canonical-empty package already
 /// used to open the durable stores. Begin observes the scene owner's
 /// command-fenced prerequisites before minting the first identity, durably
 /// records the exact intent, reconciles Begin through Status, and records the

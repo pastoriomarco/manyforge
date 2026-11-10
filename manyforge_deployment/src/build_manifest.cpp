@@ -62,9 +62,9 @@ constexpr std::string_view kExecutablePackageApiVersion =
 constexpr std::string_view kExecutablePackageIdentityDomain =
     "executable-package-content";
 constexpr std::string_view kBuiltinCatalogApiVersion =
-    "manyforge.node_catalog.v2";
+    "manyforge.node_catalog.v3";
 constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
-constexpr std::string_view kBuiltinCatalogContentVersion = "2.9.0";
+constexpr std::string_view kBuiltinCatalogContentVersion = "3.0.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 constexpr std::string_view kCompositionNamingScheme =
@@ -1053,7 +1053,7 @@ void require_node_environment_shape(const CanonicalValue &candidate) {
                                   "node_environment_manifest.catalog"),
                    "node_environment_manifest.catalog.content_version") !=
           kBuiltinCatalogContentVersion) {
-    fail("node-environment manifest does not select the frozen v2 catalog");
+    fail("node-environment manifest does not select the frozen v3 catalog");
   }
   (void)require_digest(require_member(catalog, "catalog_digest",
                                       "node_environment_manifest.catalog"),

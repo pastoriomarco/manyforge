@@ -72,7 +72,7 @@ ArmBinding(const deployment::RetainedBundle &bundle,
     model_groups.push_back({group.model_group_role_id, group.model_instance_id,
                             group.compiled_group_name,
                             group.expanded_compiled_joint_names});
-  std::vector<core::ProgramFrameRoleBindingDTO> frames;
+  std::vector<core::ProgramFrameBindingDTO> frames;
   for (const auto &resolution : target->frames) {
     const auto *frame = std::get_if<deployment::CompositionComponentModelFrame>(
         &resolution.frame);
@@ -81,7 +81,7 @@ ArmBinding(const deployment::RetainedBundle &bundle,
             component.controllable_component_id ||
         frame->frame_role_id != resolution.frame_role_id)
       throw std::runtime_error("product fixture frame ownership differs");
-    frames.push_back({resolution.frame_role_id, frame->model_instance_id,
+    frames.push_back({{frame->controllable_component_id, frame->frame_role_id}, frame->model_instance_id,
                       frame->model_revision, frame->compiled_frame_name});
   }
   const core::RuntimeEpoch epoch("product.test.epoch");
@@ -110,8 +110,6 @@ ArmBinding(const deployment::RetainedBundle &bundle,
        core::ProgramBindingId("product.test.binding"),
        bundle.retained_bundle_id(),
        graph.graph_revision,
-       core::ComponentRoleId("robot"),
-       core::TargetRoleId("arm"),
        component.controllable_component_id,
        component.component_type_id,
        component.component_type_revision,

@@ -55,7 +55,7 @@ constexpr WireNames<ActionOutcome, 3U> kOutcomeNames{{
     {ActionOutcome::kUnknown, "unknown"},
 }};
 
-constexpr WireNames<FaultCode, 12U> kFaultCodeNames{{
+constexpr WireNames<FaultCode, 13U> kFaultCodeNames{{
     {FaultCode::kEstop, "fault_estop"},
     {FaultCode::kProtectiveStop, "fault_protective_stop"},
     {FaultCode::kSafeguardStop, "fault_safeguard_stop"},
@@ -68,6 +68,7 @@ constexpr WireNames<FaultCode, 12U> kFaultCodeNames{{
     {FaultCode::kStreamStale, "fault_stream_stale"},
     {FaultCode::kProcessExited, "fault_process_exited"},
     {FaultCode::kVendorFault, "fault_vendor"},
+    {FaultCode::kOwnerStalled, "component_owner_stalled"},
 }};
 
 constexpr WireNames<FaultOperatorAction, 3U> kOperatorActionNames{{
@@ -76,10 +77,15 @@ constexpr WireNames<FaultOperatorAction, 3U> kOperatorActionNames{{
     {FaultOperatorAction::kNone, "none"},
 }};
 
-constexpr WireNames<CellLatchCauseKind, 3U> kCauseKindNames{{
+constexpr WireNames<StopCode, 1U> kStopCodeNames{{
+    {StopCode::kEstop, "estop"},
+}};
+
+constexpr WireNames<CellLatchCauseKind, 4U> kCauseKindNames{{
     {CellLatchCauseKind::kFault, "fault"},
     {CellLatchCauseKind::kOffline, "offline"},
     {CellLatchCauseKind::kActivityUnknown, "activity_unknown"},
+    {CellLatchCauseKind::kStop, "stop"},
 }};
 
 template <typename Enum, std::size_t Size>
@@ -102,15 +108,25 @@ template <typename Enum, std::size_t Size>
 
 bool component_healthy(const ComponentState& state) noexcept {
   return state.lifecycle != ComponentLifecycle::kFault &&
-         state.lifecycle != ComponentLifecycle::kOffline;
+         state.lifecycle != ComponentLifecycle::kOffline && !state.stop;
 }
 
 bool owner_usable(const ComponentState& owner) noexcept {
-  return owner.lifecycle == ComponentLifecycle::kPrepared ||
-         owner.lifecycle == ComponentLifecycle::kEnabled;
+  return !owner.stop && (owner.lifecycle == ComponentLifecycle::kPrepared ||
+                         owner.lifecycle == ComponentLifecycle::kEnabled);
 }
 
 ComponentState presented_member_state(ComponentState member, const ComponentState& owner) {
+  if (owner.stop && (member.lifecycle == ComponentLifecycle::kFault ||
+                     member.lifecycle == ComponentLifecycle::kOffline))
+    return member;  // Preserve independent member failures alongside the stop.
+  if (owner.stop && owner.lifecycle != ComponentLifecycle::kFault &&
+      owner.lifecycle != ComponentLifecycle::kOffline) {
+    member.lifecycle = ComponentLifecycle::kPrepared;
+    member.reason = ComponentStateReason{std::string(kStoppedByEstopReason),
+                                         "Stopped by e-stop"};
+    return member;
+  }
   if (owner_usable(owner)) return member;
   const auto why = owner.reason   ? owner.reason->message
                    : owner.fault  ? owner.fault->message
@@ -145,6 +161,9 @@ namespace {
 }  // namespace
 
 bool latch_exempt(const ComponentState& state, const std::vector<ComponentState>& states) {
+  if (std::find(state.capabilities.begin(), state.capabilities.end(), Capability::kSimReset) !=
+      state.capabilities.end()) return true;
+  if (state.stop) return false;
   if (offline_by_operator(state)) return true;
   if (!through_owner(state)) return false;
   const auto* owner = owner_of(state, states);
@@ -156,14 +175,21 @@ std::vector<CellLatchCause> cell_latch_causes(const std::vector<ComponentState>&
   std::vector<CellLatchCause> causes;
   const auto listed = [&](const std::string& id) {
     return std::any_of(causes.begin(), causes.end(),
-                       [&](const auto& cause) { return cause.component_id == id; });
+                       [&](const auto& cause) {
+                         return cause.component_id == id && cause.kind != CellLatchCauseKind::kStop;
+                       });
   };
   for (const auto& state : states) {
     if (latch_exempt(state, states)) continue;
+    if (state.stop && std::none_of(causes.begin(), causes.end(), [&](const auto& cause) {
+          return cause.component_id == state.component_id && cause.kind == CellLatchCauseKind::kStop;
+        }))
+      causes.push_back({state.component_id, CellLatchCauseKind::kStop, std::nullopt, state.stop});
     if (through_owner(state)) {
-      // One cause, one entry: the owner, not its members (CONTRACTS §5, §16).
+      // One cause, one entry: the owner, not its members.
       if (listed(*state.owner_id)) continue;
       const auto* owner = owner_of(state, states);
+      if (owner != nullptr && owner->stop) continue;
       if (owner != nullptr && owner->lifecycle == ComponentLifecycle::kFault)
         causes.push_back({owner->component_id, CellLatchCauseKind::kFault, owner->fault});
       else
@@ -203,6 +229,9 @@ std::string_view to_string(const ActionOutcome value) noexcept {
 std::string_view to_string(const FaultCode value) noexcept {
   return name_of(kFaultCodeNames, value);
 }
+std::string_view to_string(const StopCode value) noexcept {
+  return name_of(kStopCodeNames, value);
+}
 std::string_view to_string(const FaultOperatorAction value) noexcept {
   return name_of(kOperatorActionNames, value);
 }
@@ -230,6 +259,9 @@ std::optional<ActionOutcome> parse_action_outcome(const std::string_view wire) n
 }
 std::optional<FaultCode> parse_fault_code(const std::string_view wire) noexcept {
   return parse(kFaultCodeNames, wire);
+}
+std::optional<StopCode> parse_stop_code(const std::string_view wire) noexcept {
+  return parse(kStopCodeNames, wire);
 }
 std::optional<FaultOperatorAction> parse_fault_operator_action(
     const std::string_view wire) noexcept {

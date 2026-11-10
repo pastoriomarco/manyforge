@@ -59,14 +59,15 @@ using RetainedMotionBackendRouteRebinder = std::function<core::Result<void>(
 struct RetainedRuntimeBackendSet final {
   std::shared_ptr<core::IExecutionBackend> execution;
   RetainedMotionBackendRouteRebinder rebind_motion_route;
-  /// Active TCP (M7): the robot's Set TCP step; absent: Set TCP is refused
+  /// Active TCP: the robot's Set TCP step; absent: Set TCP is refused
   /// (`set_tcp_unavailable`).
   std::optional<core::SetTcpStep> set_tcp{};
 };
 
 using RetainedRuntimeBackendFactory = std::function<RetainedRuntimeBackendSet(
     const core::RuntimeParticipantBinding &,
-    const std::shared_ptr<RetainedObservedStateChannel> &, core::IClock &,
+    const std::shared_ptr<RetainedObservedStateChannel> &,
+    std::shared_ptr<core::IClock>,
     core::IScheduler &)>;
 
 using RetainedReferenceResolverFactory =
@@ -85,9 +86,10 @@ using RetainedRobotMeasuredSourcePreparer = std::function<
 struct RetainedResolvedParticipant final {
   core::RuntimeParticipantBinding binding;
   bool intrinsic_direct_control{};
-  /// B7: the owner of the motion endpoint's frame (the index's owner of its
+  /// The owner of the motion endpoint's frame (the index's owner of its
   /// model); the Kernel stamps the request's TCP frame with it.
   std::optional<core::ControllableComponentId> motion_endpoint_owner{};
+  std::optional<core::PreviewTcpCapture> preview_tcp_capture{};
 };
 
 using RetainedRuntimeParticipantResolver =
@@ -178,14 +180,14 @@ private:
 /// Existing retained model-map exposures, restricted to the exact motion
 /// component/model or the models of components mounted on it (a tool's
 /// TCPs), form the planner's frame inventory: each frame once, stamped with
-/// its owner (B7). Without a map the focused-runtime legacy inventory remains
+/// its owner. Without a map the focused-runtime legacy inventory remains
 /// exactly the participant's frames.
 [[nodiscard]] std::vector<core::ResolvedFrameDTO>
 retained_motion_planner_frames(
     const core::RuntimeParticipantBinding &runtime,
     const deployment::VerifiedRetainedModelMap *model_map = nullptr);
 
-/// LOADFIX9: the compiled names of `retained_motion_planner_frames`, in the
+/// The compiled names of `retained_motion_planner_frames`, in the
 /// same order. The motion model generation computes FK for each of them.
 [[nodiscard]] std::vector<std::string> retained_motion_planner_frame_names(
     const core::RuntimeParticipantBinding &runtime,
@@ -249,7 +251,7 @@ struct RetainedExecutionHostInput final {
       ordinary_motion_jerk{};
   /// Cell-wide render wake shared by independently owned robot channels.
   std::shared_ptr<RetainedObservationWake> observation_wake{};
-  /// Q37 (as `main`): when set, the Deployment-authored fault Stop profile
+  /// When set, the Deployment-authored fault Stop profile
   /// below is the motion target's fault profile, read directly (absent means
   /// no fault profile); nothing is derived from the operator profile. Unset
   /// keeps the native lane's derivation from the retained Stop plan.
@@ -344,7 +346,7 @@ struct RetainedExecutionHost final {
   std::optional<core::MotionInterruptStopProfileDTO>
       motion_operator_stop_profile;
   std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
-  /// The fault profile above is Deployment-authored (Q37), not derived.
+  /// The fault profile above is Deployment-authored, not derived.
   bool motion_fault_stop_profile_from_deployment{false};
   std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
   std::optional<core::CellId> addressed_cell_id;
@@ -352,8 +354,8 @@ struct RetainedExecutionHost final {
 
   std::shared_ptr<WallClock> clock;
   std::shared_ptr<SimpleScheduler> scheduler;
-  std::unique_ptr<core::TrajectoryCache> cache;
-  std::unique_ptr<RoboPlanPlannerBackend> planner;
+  std::shared_ptr<core::TrajectoryCache> cache;
+  std::shared_ptr<RoboPlanPlannerBackend> planner;
   /// Publication-specific resolver retained for owner-side inspection and
   /// dynamic dispatch (for example, route/configuration rebinding).
   std::shared_ptr<core::IReferencePoseResolver> reference_resolver;
@@ -361,7 +363,7 @@ struct RetainedExecutionHost final {
   /// does not invalidate the Kernel's resolver reference.
   std::shared_ptr<RetainedReferencePoseResolverProxy>
       reference_resolver_proxy;
-  std::unique_ptr<core::AddressedAngularObservedRobotStateAdapter>
+  std::shared_ptr<core::AddressedAngularObservedRobotStateAdapter>
       angular_observed_state;
   /// Stable kinematics, non-collision validator and collision-state
   /// projector installed into the Kernel and used by direct host queries.
@@ -373,7 +375,7 @@ struct RetainedExecutionHost final {
   std::shared_ptr<RetainedPlanningSceneSynchronizer>
       planning_scene_synchronizer;
   RetainedMotionBackendRouteRebinder rebind_motion_route;
-  /// Active TCP (M7): from the backend set; on every registration of the
+  /// Active TCP: from the backend set; on every registration of the
   /// motion engine (physical, representatives, aliases).
   std::optional<core::SetTcpStep> set_tcp;
   /// Exact non-speed motion policy sealed against this motion target. It
@@ -458,6 +460,13 @@ struct RetainedExecutionHost final {
 
   [[nodiscard]] core::Result<core::RobotMeasuredStateSourceView>
   PrepareCurrentMeasuredSources();
+  [[nodiscard]] std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+  SnapshotPreparedMeasuredSources() const;
+  [[nodiscard]] bool MatchesPreparedMeasuredSources(
+      const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected) const;
+  [[nodiscard]] bool WithExactPreparedMeasuredSources(
+      const std::shared_ptr<const RetainedPreparedRobotMeasuredSources> &expected,
+      void (*commit)(void *) noexcept, void *context) const;
 
   /// Render-only viewer input: the enabled measured source currently prepared
   /// for this runtime's motion target, or empty. Never waits on the route

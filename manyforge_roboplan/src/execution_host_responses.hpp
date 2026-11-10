@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/io_activation_rule.hpp>
+#include <manyforge_core/types/motion_preview.hpp>
 
 #include <exception>
 
@@ -29,12 +30,18 @@ ExecutionCommandExceptionError(const std::exception &error);
 [[nodiscard]] CanonicalValue
 SceneRevisionValue(const core::SceneRevision &value);
 
+[[nodiscard]] CanonicalValue MotionPathPreviewValue(
+    const core::MotionPathPreview &path,
+    const core::RuntimeParticipantBindingDTO &direct_control_binding,
+    const std::string *diagnostic_reason = nullptr);
+
 [[nodiscard]] CanonicalValue MotionPreviewReceiptValue(
     const core::MotionPreviewResultDTO &preview,
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
     const core::RuntimeParticipantBindingDTO &direct_control_binding,
-    const core::RequestOwnerEpoch &owner_epoch);
+    const core::RequestOwnerEpoch &owner_epoch,
+    const CanonicalValue &path_preview);
 
 [[nodiscard]] CanonicalValue CapabilityCommandPreviewReceiptValue(
     const core::CapabilityCommandPreviewResultDTO &preview,
@@ -206,9 +213,10 @@ IoSourceCursorValue(const core::IoSourceCursorDTO &value);
 [[nodiscard]] CanonicalValue IoSignalObservationValue(
     const core::IoSignalObservationDTO& value);
 
-/// CONTRACTS §1-§5, §7, §8 wire values (JSON, snake_case, `*_ns`).
+/// Wire values (JSON, snake_case, `*_ns`).
 [[nodiscard]] CanonicalValue FaultValue(const core::Fault& fault);
 [[nodiscard]] CanonicalValue ActionResultValue(const core::ActionResult& result);
+[[nodiscard]] CanonicalValue ComponentStopValue(const core::ComponentStop& stop);
 [[nodiscard]] CanonicalValue ComponentStateValue(const core::ComponentState& state);
 [[nodiscard]] CanonicalValue CellLatchValue(const core::CellLatch& latch);
 /// The Kernel's `ReadRuleHolds()` rows as errors: `{code, message,
@@ -217,7 +225,7 @@ IoSourceCursorValue(const core::IoSourceCursorDTO &value);
 /// A signal's wire id: `<controllable_component_id>/<signal_name>`.
 [[nodiscard]] std::string SignalIdText(const core::IoSignalId& signal);
 [[nodiscard]] std::optional<core::IoSignalId> ParseSignalIdText(std::string_view text);
-/// `controller_owned` is present on outputs only (CONTRACTS §7); `age_ns`
+/// `controller_owned` is present on outputs only; `age_ns`
 /// only with `age` (the event stream's state compares samples without it).
 [[nodiscard]] CanonicalValue SignalSampleValue(const core::SignalSample& sample,
                                                const core::IoSignalDescriptorDTO& descriptor,

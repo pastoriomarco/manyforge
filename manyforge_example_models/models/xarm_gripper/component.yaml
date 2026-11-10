@@ -1,6 +1,6 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/xarm_gripper`.
-# Mounts on a robot's `flange` interface as its own component (merge 6).
+# Mounts on a robot's `flange` interface as its own component.
 api_version: manyforge.component_package.v1
 kind: tool
 id: ufactory.xarm_gripper
@@ -30,5 +30,4 @@ lanes:
     controller: xarm_gripper_controller
     controllers_file: mock_controllers.yaml
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
     gripper_stop_finish_tolerance: 0.04   # rad of drive travel (5% of the 0.85 stroke): a Stop this close lets the command finish

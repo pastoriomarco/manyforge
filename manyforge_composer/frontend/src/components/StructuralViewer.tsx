@@ -114,7 +114,7 @@ import {
 } from '../utils/viewerPerformance';
 import { usePublishWorkbenchNotices } from '../state/workbenchNotices';
 import { viewerNotices } from '../state/viewerNotices';
-import { VIEWPORT_COLORS } from '../styles/tokens';
+import { STATUS_COLORS, VIEWPORT_COLORS } from '../styles/tokens';
 
 interface StructuralViewerProps {
   viewerActive: boolean;
@@ -612,16 +612,18 @@ function SceneObjectMeshAsset({
   appearance,
   selected,
   wireframe,
+  contactColor,
 }: {
   url: string;
   appearance: SceneObjectAppearance;
   selected: boolean;
   wireframe: boolean;
+  contactColor?: string;
 }) {
-  const presentation = useMemo(
-    () => sceneObjectMaterial(appearance, selected),
-    [appearance, selected],
-  );
+  const presentation = useMemo(() => {
+    const material = sceneObjectMaterial(appearance, selected);
+    return contactColor === undefined ? material : { ...material, color: contactColor, emissive: VIEWPORT_COLORS.noEmissive };
+  }, [appearance, selected, contactColor]);
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
   const clone = useMemo(() => {
     const root = gltf.scene.clone(true);
@@ -664,6 +666,7 @@ function SceneObjectMesh({
   appearance = 'authoritative',
   selected,
   wireframe,
+  contactColor,
 }: {
   shape: Extract<LogicalSceneShape, { type: 'mesh' }>;
   ownerIdentity?: NonNullable<StructuralViewerProps['sceneOwnerIdentity']>;
@@ -671,6 +674,7 @@ function SceneObjectMesh({
   appearance?: SceneObjectAppearance;
   selected: boolean;
   wireframe: boolean;
+  contactColor?: string;
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<Error | null>(null);
@@ -755,13 +759,14 @@ function SceneObjectMesh({
             appearance={appearance}
             selected={selected}
             wireframe={wireframe}
+            contactColor={contactColor}
           />
         </Suspense>
       </AssetErrorBoundary>
     );
 }
 
-export function clonePreviewMesh(source: THREE.Object3D, color: string, opacity: number): THREE.Object3D {
+export function clonePreviewMesh(source: THREE.Object3D, color: string, opacity: number, depthTest = true): THREE.Object3D {
   const root = source.clone(true);
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
@@ -775,17 +780,18 @@ export function clonePreviewMesh(source: THREE.Object3D, color: string, opacity:
       opacity,
       toneMapped: false,
       depthWrite: false,
+      depthTest,
     }));
     mesh.material = Array.isArray(mesh.material) ? materials : materials[0];
-    mesh.renderOrder = 14;
+    mesh.renderOrder = depthTest ? 14 : 19;
     mesh.raycast = ignoreViewerRaycast;
   });
   return root;
 }
 
-function OverlayVisualMesh({ url, color, opacity }: { url: string; color: string; opacity: number }) {
+function OverlayVisualMesh({ url, color, opacity, depthTest = true }: { url: string; color: string; opacity: number; depthTest?: boolean }) {
   const gltf = useGLTF(resolveStructuralAssetUrl(url));
-  const clone = useMemo(() => clonePreviewMesh(gltf.scene, color, opacity), [color, gltf.scene, opacity]);
+  const clone = useMemo(() => clonePreviewMesh(gltf.scene, color, opacity, depthTest), [color, depthTest, gltf.scene, opacity]);
   useEffect(() => () => disposeOwnedMaterials(clone), [clone]);
   return <primitive object={clone} />;
 }
@@ -847,17 +853,19 @@ function PrimitiveOverlay({
   primitive,
   color,
   opacity,
+  depthTest = true,
 }: {
   primitive: SceneUrdfPrimitive;
   color: string;
   opacity: number;
+  depthTest?: boolean;
 }) {
   const cylinderRotation: [number, number, number] | undefined =
     primitive.type === 'cylinder'
     ? [Math.PI / 2, 0, 0]
     : undefined;
   return (
-    <mesh rotation={cylinderRotation} renderOrder={14} raycast={ignoreViewerRaycast}>
+    <mesh rotation={cylinderRotation} renderOrder={depthTest ? 14 : 19} raycast={ignoreViewerRaycast}>
       <PrimitiveGeometry primitive={primitive} />
       <meshBasicMaterial
         color={color}
@@ -865,6 +873,7 @@ function PrimitiveOverlay({
         opacity={opacity}
         toneMapped={false}
         depthWrite={false}
+        depthTest={depthTest}
       />
     </mesh>
   );
@@ -995,6 +1004,7 @@ function RetainedNeutralModel({
 
 export function AttachedLogicalSceneObject({
   presentation,
+  contactColor,
   selected,
   axesVisible,
   axesSizeM,
@@ -1003,6 +1013,7 @@ export function AttachedLogicalSceneObject({
   onSelect,
 }: {
   presentation: AttachedObjectPresentation;
+  contactColor?: string;
   selected: boolean;
   axesVisible: boolean;
   axesSizeM: number;
@@ -1024,6 +1035,7 @@ export function AttachedLogicalSceneObject({
             <SceneObjectMesh
               key={`attached:${object.scene_resource_id}:${index}`}
               shape={shape}
+              contactColor={contactColor}
               ownerIdentity={ownerIdentity}
               appearance="attached"
               selected={selected}
@@ -1034,6 +1046,7 @@ export function AttachedLogicalSceneObject({
             <SceneObjectPrimitive
               key={`attached:${object.scene_resource_id}:${index}`}
               shape={shape}
+              contactColor={contactColor}
               appearance="attached"
               selected={selected}
               wireframe={wireframe}
@@ -1490,32 +1503,48 @@ function MeasuredRuntimeLink({
   );
 }
 
+export function previewContactColor(disposition: 'allowed' | 'clearance' | 'refused' | 'unknown' | undefined): string | undefined {
+  return disposition === 'allowed' ? STATUS_COLORS.running : disposition === 'clearance' ? STATUS_COLORS.interrupted : disposition === 'refused'
+    ? STATUS_COLORS.failure : disposition === 'unknown' ? STATUS_COLORS.idle : undefined;
+}
+
 export function candidateGhostColor(receiptDigest: string | null, stale: boolean, rejected = false): string {
   return rejected
     ? VIEWPORT_COLORS.previewRejected
     : stale || receiptDigest === null ? VIEWPORT_COLORS.previewPending : VIEWPORT_COLORS.previewCurrent;
 }
 
+/** Sampled paths use collision evidence for their base color; non-path ghosts keep their existing status color. */
+export function previewSampleBaseColor(disposition: 'clear' | 'unknown' | undefined, receiptDigest: string | null, stale: boolean, rejected = false): string {
+  return disposition === 'clear' ? VIEWPORT_COLORS.previewCurrent
+    : disposition === 'unknown' ? STATUS_COLORS.idle
+      : candidateGhostColor(receiptDigest, stale, rejected);
+}
+
 function CandidateRobotGhost({
   manifest,
   presentation,
+  ownerIdentity,
   stale,
   rejected = false,
   onAssetError,
 }: {
   manifest: SceneUrdfManifest;
   presentation: CandidateRobotPresentation;
+  ownerIdentity?: StructuralViewerProps['sceneOwnerIdentity'];
   stale: boolean;
   rejected?: boolean;
   onAssetError: (error: Error) => void;
 }) {
-  const color = candidateGhostColor(presentation.receiptDigest, stale, rejected);
+  const color = previewSampleBaseColor(presentation.previewDefaultDisposition, presentation.receiptDigest, stale, rejected);
   const opacity = stale ? 0.6 : 0.5;
   return (
     <group name={`candidate-robot:${presentation.receiptDigest ?? 'unvalidated-tool-target'}`}>
       {manifest.links.map((link) => {
         const transform = presentation.linkTransforms[link.name];
         if (transform === undefined) return null;
+        const disposition = presentation.contactLinks?.[link.name];
+        const linkColor = previewContactColor(disposition) ?? color;
         return (
           <group
             key={`candidate:${manifest.model_key}:${link.name}`}
@@ -1535,8 +1564,9 @@ function CandidateRobotGhost({
                       <Suspense fallback={null}>
                         <OverlayVisualMesh
                           url={visual.mesh_url}
-                          color={color}
+                          color={linkColor}
                           opacity={opacity}
+                          depthTest={!rejected}
                         />
                       </Suspense>
                     </AssetErrorBoundary>
@@ -1544,12 +1574,20 @@ function CandidateRobotGhost({
                   {visual.mesh_url === null && visual.primitive !== null && (
                     <PrimitiveOverlay
                       primitive={visual.primitive}
-                      color={color}
+                      color={linkColor}
                       opacity={opacity}
+                      depthTest={!rejected}
                     />
                   )}
                 </group>
               );
+            })}
+            {presentation.contactAttachments?.filter((item) => item.carrierCompiledFrameName === link.name).map((item) => {
+              const disposition = presentation.contactObjects?.[item.object.scene_resource_id];
+              const contactColor = previewContactColor(disposition) ?? STATUS_COLORS.idle;
+              return <AttachedLogicalSceneObject key={`preview-attachment:${item.attachmentId}`} presentation={item}
+                contactColor={contactColor} selected={false} axesVisible={false} axesSizeM={0.1}
+                wireframe={false} ownerIdentity={ownerIdentity} onSelect={() => undefined} />;
             })}
           </group>
         );
@@ -1599,6 +1637,7 @@ function MeasuredRobotStateGhost({
       }
       // G2-b: an element with no stream, or no data yet, is not drawn.
       const hidden = new Set(current?.hiddenLinkNames ?? []);
+      // eslint-disable-next-line react-hooks/immutability -- Three.js visibility is updated through refs in this layout-effect subscriber.
       for (const [linkName, link] of linkGroups) {
         if (link.current !== null && link.current.visible === hidden.has(linkName)) {
           link.current.visible = !hidden.has(linkName);
@@ -1827,11 +1866,13 @@ function SceneObjectPrimitive({
   appearance,
   selected,
   wireframe,
+  contactColor,
 }: {
   shape: Exclude<LogicalSceneShape, { type: 'mesh' }>;
   appearance: SceneObjectAppearance;
   selected: boolean;
   wireframe: boolean;
+  contactColor?: string;
 }) {
   const material = sceneObjectMaterial(appearance, selected);
   return (
@@ -1841,8 +1882,8 @@ function SceneObjectPrimitive({
     >
       <LogicalShapeGeometry shape={shape} />
       <meshStandardMaterial
-        color={material.color}
-        emissive={material.emissive}
+        color={contactColor ?? material.color}
+        emissive={contactColor === undefined ? material.emissive : VIEWPORT_COLORS.noEmissive}
         transparent={material.transparent || wireframe}
         opacity={material.opacity}
         wireframe={wireframe}
@@ -1987,6 +2028,7 @@ function EditableLogicalSceneObject({
 
 function LogicalSceneObjects({
   objects,
+  contactObjects,
   appearance,
   selectedSceneResourceId,
   onSelect,
@@ -2003,6 +2045,7 @@ function LogicalSceneObjects({
   onContextPointerDown,
 }: {
   objects: readonly LogicalSceneObject[];
+  contactObjects?: CandidateRobotPresentation['contactObjects'];
   appearance: Extract<SceneObjectAppearance, 'authoritative' | 'draft'>;
   selectedSceneResourceId: string | null;
   onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
@@ -2026,6 +2069,8 @@ function LogicalSceneObjects({
       {objects.map((object) => {
         if (object.placement.kind !== 'cell_fixed') return null;
         const selected = selectedSceneResourceId === object.scene_resource_id;
+        const disposition = appearance === 'authoritative' ? contactObjects?.[object.scene_resource_id] : undefined;
+        const contactColor = previewContactColor(disposition);
         return (
           <EditableLogicalSceneObject
             key={object.scene_resource_id}
@@ -2044,6 +2089,7 @@ function LogicalSceneObjects({
                   <SceneObjectMesh
                     key={`${object.scene_resource_id}:${index}`}
                     shape={shape}
+                    contactColor={contactColor}
                     ownerIdentity={ownerIdentity}
                     draftIdentity={draftIdentity}
                     appearance={appearance}
@@ -2056,6 +2102,7 @@ function LogicalSceneObjects({
                     // Three cylinders use Y as their long axis; scene shapes use Z.
                     key={`${object.scene_resource_id}:${index}`}
                     shape={shape}
+                    contactColor={contactColor}
                     appearance={appearance}
                     selected={selected}
                     wireframe={wireframe}
@@ -2080,6 +2127,7 @@ function CandidateTcpGhost({
   contextKey,
   onBegin,
   manifest,
+  ownerIdentity,
   robot,
   tool,
   rejected,
@@ -2095,6 +2143,7 @@ function CandidateTcpGhost({
   contextKey: string;
   onBegin: () => boolean;
   manifest: SceneUrdfManifest | null;
+  ownerIdentity?: StructuralViewerProps['sceneOwnerIdentity'];
   robot: CandidateRobotPresentation | null;
   tool: CandidateRobotPresentation | null;
   rejected: boolean;
@@ -2185,7 +2234,7 @@ function CandidateTcpGhost({
         )}
       </group>
       {manifest !== null && robot !== null && !dragVisible && (
-        <CandidateRobotGhost manifest={manifest} presentation={robot} stale={stale} onAssetError={onAssetError} />
+        <CandidateRobotGhost manifest={manifest} presentation={robot} ownerIdentity={ownerIdentity} stale={stale} onAssetError={onAssetError} />
       )}
       {editable && target !== null && (
         <AuthoringTransformControls
@@ -3089,6 +3138,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
         <LogicalSceneObjects
           key={`logical-scene:${retryGeneration}`}
           objects={sceneObjects}
+          contactObjects={robotEditorActive ? candidateRobot?.contactObjects : undefined}
           appearance={programDraftPreview ? 'draft' : 'authoritative'}
           selectedSceneResourceId={selectedSceneResourceId}
           onSelect={selectSceneResource}
@@ -3137,6 +3187,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
             contextKey={candidateContextKey}
             onBegin={onBeginCandidateTcpDrag}
             manifest={manifest}
+            ownerIdentity={sceneOwnerIdentity}
             robot={candidateRobot}
             tool={candidateTool}
             rejected={candidateRejected}
@@ -3149,6 +3200,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
           <CandidateRobotGhost
             manifest={manifest}
             presentation={candidateRobot}
+            ownerIdentity={sceneOwnerIdentity}
             stale={candidateStale}
             onAssetError={onPreviewAssetError}
           />

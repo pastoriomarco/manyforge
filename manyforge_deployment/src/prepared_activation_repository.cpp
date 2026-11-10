@@ -27,8 +27,8 @@ namespace posix = detail::posix_durability;
 
 [[noreturn]] void fail_global_rule_qualification(const core::ErrorDTO &error) {
   std::string message = error.details.at("reason");
-  // Preserve the existing refusal code and exception type. Contract106 key
-  // and114 group diagnostics retain their actual names in visible text.
+  // Preserve the existing refusal code and exception type. Key and group
+  // diagnostics retain their actual names in visible text.
   const bool named_group =
       (message == "global_interrupt_group_unbound" ||
        message == "global_interrupt_program_binding_missing") &&
@@ -206,25 +206,51 @@ prepared_activation_artifact_rows(std::vector<PreparedActivationArtifact> artifa
 PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const VerifiedRetainedModelMap &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
+    const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog,
     const IRawArtifactStore &raw_artifacts) {
   return assemble_prepared_activation(
       input, bundle, std::optional<VerifiedRetainedModelMap>{model_map},
-      program, role_assignment, catalog, raw_artifacts);
+      program, catalog, raw_artifacts);
 }
 
-PreparedActivationInput assemble_prepared_activation(
-    const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
-    const std::optional<VerifiedRetainedModelMap> &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
-    const ICatalogArtifactSource &catalog,
-    const IRawArtifactStore &raw_artifacts) {
+namespace {
+
+/// Embed each required raw artifact once; a repeated store key must name
+/// identical content.
+void embed_raw_artifacts(const std::vector<core::RetainedArtifactRefDTO> &refs,
+                         const IRawArtifactStore &raw_artifacts,
+                         std::vector<PreparedActivationArtifact> &rows) {
+  for (const auto &ref : refs) {
+    const auto bytes = raw_artifacts.get_verified(
+        ref.content_addressed_store_key, ref.content_digest, ref.byte_size);
+    if (!bytes)
+      fail("io_rule_stop_product_missing");
+    const auto existing =
+        std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+          return row.content_addressed_store_key ==
+                 ref.content_addressed_store_key;
+        });
+    if (existing == rows.end())
+      rows.push_back(
+          {ref.content_addressed_store_key, ref.content_digest, *bytes});
+    else if (existing->content_digest != ref.content_digest ||
+             existing->bytes != *bytes)
+      fail("io_rule_stop_product_ambiguous");
+  }
+}
+
+/// The candidate's model-map artifact (none for a candidate whose products
+/// hold no model map, which must then be empty).
+[[nodiscard]] std::vector<PreparedActivationArtifact>
+model_map_artifacts(const RetainedBundle &bundle,
+                    const std::optional<VerifiedRetainedModelMap> &model_map,
+                    const IRawArtifactStore &raw_artifacts) {
   const auto &maps = bundle.value().compiled_products.symbol_role_maps;
   if (maps.size() > 1U || maps.empty() != !model_map.has_value()) {
     fail("prepared activation model map differs from candidate products");
   }
-  std::vector<PreparedActivationArtifact> raw_artifacts_to_embed;
+  std::vector<PreparedActivationArtifact> rows;
   if (model_map.has_value()) {
     const auto &map_product = maps.front();
     if (map_product.artifact_refs.size() != 1U ||
@@ -239,110 +265,65 @@ PreparedActivationInput assemble_prepared_activation(
     if (!map_bytes.has_value()) {
       fail("prepared activation model-map artifact is unavailable");
     }
-    raw_artifacts_to_embed.push_back(
-        {map_ref.content_addressed_store_key, map_ref.content_digest,
-         std::move(*map_bytes)});
+    rows.push_back({map_ref.content_addressed_store_key, map_ref.content_digest,
+                    std::move(*map_bytes)});
   } else if (!bundle.value().cell_graph.controllable_components.empty() ||
              !bundle.value().cell_graph.model_instances.empty()) {
     fail("prepared activation cannot omit model data for a populated candidate");
   }
-  const RecordingCatalogSource recording(catalog);
-  const auto outcome = compile_program_binding_outcome(
-      program, parse_program_role_assignment(role_assignment), bundle,
-      model_map, recording);
-  // Global scopes/conditions are resolved against this exact prospective
-  // Program binding, or without a Program for signal-only activation rules.
-  const auto globals = compile_retained_io_policies(
-      outcome.binding ? &program : nullptr, outcome.binding.get(), bundle);
+  return rows;
+}
+
+/// Qualify the global I/O policies against the prospective Program binding
+/// (or without a Program for signal-only rules) and embed and validate the
+/// Stop products they select.
+void embed_global_io_stop_products(
+    const ProgramBindingContract *program, const ProgramBinding *binding,
+    const RetainedBundle &bundle,
+    const std::optional<VerifiedRetainedModelMap> &model_map,
+    const IRawArtifactStore &raw_artifacts,
+    std::vector<PreparedActivationArtifact> &rows) {
+  const auto globals = compile_retained_io_policies(program, binding, bundle);
   if (!globals.ok())
     fail_global_rule_qualification(globals.error());
   const auto global_refs =
       required_global_io_stop_artifacts(globals.value(), bundle);
   if (!global_refs.ok())
     fail(global_refs.error().details.at("reason"));
-  for (const auto &ref : global_refs.value()) {
-    const auto bytes = raw_artifacts.get_verified(
-        ref.content_addressed_store_key, ref.content_digest, ref.byte_size);
-    if (!bytes)
-      fail("io_rule_stop_product_missing");
-    const auto existing =
-        std::find_if(raw_artifacts_to_embed.begin(),
-                     raw_artifacts_to_embed.end(), [&](const auto &row) {
-                       return row.content_addressed_store_key ==
-                              ref.content_addressed_store_key;
-                     });
-    if (existing == raw_artifacts_to_embed.end())
-      raw_artifacts_to_embed.push_back(
-          {ref.content_addressed_store_key, ref.content_digest, *bytes});
-    else if (existing->content_digest != ref.content_digest ||
-             existing->bytes != *bytes)
-      fail("io_rule_stop_product_ambiguous");
-  }
+  embed_raw_artifacts(global_refs.value(), raw_artifacts, rows);
   const auto global_entries = validate_global_io_stop_entries(
-      globals.value(), bundle, model_map ? &*model_map : nullptr,
-      raw_artifacts_to_embed);
+      globals.value(), bundle, model_map ? &*model_map : nullptr, rows);
   if (!global_entries.ok())
     fail(global_entries.error().details.at("reason"));
-  CanonicalValue program_outcome(nullptr);
-  CanonicalValue program_binding(nullptr);
-  if (outcome.binding != nullptr) {
-    const auto refs =
-        required_program_io_stop_artifacts(program, *outcome.binding, bundle);
-    if (!refs.ok())
-      fail(refs.error().details.at("reason"));
-    for (const auto &ref : refs.value()) {
-      const auto bytes = raw_artifacts.get_verified(
-          ref.content_addressed_store_key, ref.content_digest, ref.byte_size);
-      if (!bytes)
-        fail("io_rule_stop_product_missing");
-      const auto existing =
-          std::find_if(raw_artifacts_to_embed.begin(),
-                       raw_artifacts_to_embed.end(), [&](const auto &row) {
-                         return row.content_addressed_store_key ==
-                                ref.content_addressed_store_key;
-                       });
-      if (existing == raw_artifacts_to_embed.end())
-        raw_artifacts_to_embed.push_back(
-            {ref.content_addressed_store_key, ref.content_digest, *bytes});
-      else if (existing->content_digest != ref.content_digest ||
-               existing->bytes != *bytes)
-        fail("io_rule_stop_product_ambiguous");
-    }
-    if (!refs.value().empty()) {
-      if (!model_map)
-        fail("io_rule_stop_model_map_mismatch");
-      const auto valid = validate_program_io_stop_responses(
-          program, *outcome.binding, bundle, *model_map,
-          raw_artifacts_to_embed);
-      if (!valid.ok())
-        fail(valid.error().details.at("reason"));
-    }
-    program_binding = outcome.binding->normalized_root();
-    program_outcome = CanonicalValue(CanonicalValue::Object{
-        {"kind", CanonicalValue("bound")},
-        {"program_binding_id",
-         CanonicalValue(outcome.binding->program_binding_id().value())},
-    });
-  } else {
-    program_outcome = CanonicalValue(CanonicalValue::Object{
-        {"kind", CanonicalValue("non_executable")},
-        {"outcome",
-         parse_strict_json_model_yaml(
-             EncodeProgramNonExecutableOutcome(*outcome.non_executable))
-             .root()},
-    });
-  }
+}
+
+/// The Program-dependent parts of one prepared value; all null for
+/// `no_program`.
+struct PreparedProgramParts final {
+  CanonicalValue program = CanonicalValue(nullptr);
+  CanonicalValue program_binding = CanonicalValue(nullptr);
+  CanonicalValue program_id = CanonicalValue(nullptr);
+  CanonicalValue program_revision = CanonicalValue(nullptr);
+  CanonicalValue program_outcome = CanonicalValue(nullptr);
+};
+
+/// Identify the assembled value, then parse and verify it like any stored
+/// value.
+[[nodiscard]] PreparedActivationInput
+identify_prepared_activation(const PreparedActivationAssemblyInput &input,
+                             const RetainedBundle &bundle,
+                             std::vector<PreparedActivationArtifact> catalog_rows,
+                             std::vector<PreparedActivationArtifact> raw_rows,
+                             PreparedProgramParts parts) {
   CanonicalValue::Object identity{
       {"activation_payload",
        CanonicalValue(CanonicalValue::Object{
            {"catalog_artifacts",
-            prepared_activation_artifact_rows(recording.recorded())},
-           {"program", program.normalized_program_root()},
-           {"program_binding", std::move(program_binding)},
-           {"program_role_assignment", role_assignment},
+            prepared_activation_artifact_rows(std::move(catalog_rows))},
+           {"program", std::move(parts.program)},
+           {"program_binding", std::move(parts.program_binding)},
            {"raw_artifacts",
-            prepared_activation_artifact_rows(
-                std::move(raw_artifacts_to_embed))},
+            prepared_activation_artifact_rows(std::move(raw_rows))},
            {"retained_bundle", bundle.normalized_root()},
        })},
       {"assistant_mode", CanonicalValue(input.assistant_mode)},
@@ -353,9 +334,9 @@ PreparedActivationInput assemble_prepared_activation(
       {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
       {"node_environment_digest",
        CanonicalValue(bundle.value().catalogs.node_environment.environment_digest.value())},
-      {"program_id", CanonicalValue(program.value().program_id.value())},
-      {"program_outcome", std::move(program_outcome)},
-      {"program_revision", CanonicalValue(program.value().program_revision.value())},
+      {"program_id", std::move(parts.program_id)},
+      {"program_outcome", std::move(parts.program_outcome)},
+      {"program_revision", std::move(parts.program_revision)},
       {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
       {"origin", prepared_activation_origin_value(input.origin)},
       {"schema_version", CanonicalValue(std::string(kPreparedActivationInputSchemaVersion))},
@@ -366,6 +347,81 @@ PreparedActivationInput assemble_prepared_activation(
   auto prepared = parse_prepared_activation_input(CanonicalValue(std::move(identity)));
   verify_prepared_program_outcome(prepared);
   return prepared;
+}
+
+} // namespace
+
+PreparedActivationInput assemble_prepared_activation(
+    const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
+    const std::optional<VerifiedRetainedModelMap> &model_map,
+    const ProgramBindingContract &program,
+    const ICatalogArtifactSource &catalog,
+    const IRawArtifactStore &raw_artifacts) {
+  auto raw_artifacts_to_embed =
+      model_map_artifacts(bundle, model_map, raw_artifacts);
+  const RecordingCatalogSource recording(catalog);
+  const auto outcome = compile_program_binding_outcome(
+      program, bundle, model_map, recording);
+  // Global scopes/conditions are resolved against this exact prospective
+  // Program binding, or without a Program for signal-only activation rules.
+  embed_global_io_stop_products(outcome.binding ? &program : nullptr,
+                                outcome.binding.get(), bundle, model_map,
+                                raw_artifacts, raw_artifacts_to_embed);
+  PreparedProgramParts parts;
+  parts.program = program.normalized_program_root();
+  parts.program_id = CanonicalValue(program.value().program_id.value());
+  parts.program_revision =
+      CanonicalValue(program.value().program_revision.value());
+  if (outcome.binding != nullptr) {
+    const auto refs =
+        required_program_io_stop_artifacts(program, *outcome.binding, bundle);
+    if (!refs.ok())
+      fail(refs.error().details.at("reason"));
+    embed_raw_artifacts(refs.value(), raw_artifacts, raw_artifacts_to_embed);
+    if (!refs.value().empty()) {
+      if (!model_map)
+        fail("io_rule_stop_model_map_mismatch");
+      const auto valid = validate_program_io_stop_responses(
+          program, *outcome.binding, bundle, *model_map,
+          raw_artifacts_to_embed);
+      if (!valid.ok())
+        fail(valid.error().details.at("reason"));
+    }
+    parts.program_binding = outcome.binding->normalized_root();
+    parts.program_outcome = CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("bound")},
+        {"program_binding_id",
+         CanonicalValue(outcome.binding->program_binding_id().value())},
+    });
+  } else {
+    parts.program_outcome = CanonicalValue(CanonicalValue::Object{
+        {"kind", CanonicalValue("non_executable")},
+        {"outcome",
+         parse_strict_json_model_yaml(
+             EncodeProgramNonExecutableOutcome(*outcome.non_executable))
+             .root()},
+    });
+  }
+  return identify_prepared_activation(input, bundle, recording.recorded(),
+                                      std::move(raw_artifacts_to_embed),
+                                      std::move(parts));
+}
+
+PreparedActivationInput assemble_prepared_activation_without_program(
+    const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
+    const std::optional<VerifiedRetainedModelMap> &model_map,
+    const IRawArtifactStore &raw_artifacts) {
+  auto raw_artifacts_to_embed =
+      model_map_artifacts(bundle, model_map, raw_artifacts);
+  embed_global_io_stop_products(nullptr, nullptr, bundle, model_map,
+                                raw_artifacts, raw_artifacts_to_embed);
+  PreparedProgramParts parts;
+  parts.program_outcome = CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("no_program")},
+  });
+  return identify_prepared_activation(input, bundle, {},
+                                      std::move(raw_artifacts_to_embed),
+                                      std::move(parts));
 }
 
 void verify_prepared_program_outcome(const PreparedActivationInput &prepared) {
@@ -394,8 +450,8 @@ recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
   ProgramBindingOutcome recompiled;
   try {
     recompiled = compile_program_binding_outcome(
-        *closure.program, prepared.program_role_assignment(),
-        *closure.retained_bundle, closure.retained_model_map, catalog);
+        *closure.program, *closure.retained_bundle, closure.retained_model_map,
+        catalog);
   } catch (const ProgramBindingCompilerError &error) {
     fail(std::string("prepared Program outcome does not recompile: ") +
          error.what());

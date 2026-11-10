@@ -209,7 +209,6 @@ def test_mock_robot_plus_io_device_load_prepares_only_the_robot_model(
             deployment={"components": [_mock_robot(), _io_device()]},
             model_source_closure=_closure("robot"),
             program=None,
-            program_role_assignment={"component_roles": [], "target_roles": []},
         )
 
     assert prepared_sources == [("robot", "lite6")]
@@ -422,6 +421,62 @@ def test_model_free_profile_requires_its_own_runtime_kind_and_no_model(
     with pytest.raises(HeadlessApiError, match="do not match captured model profiles"):
         _prepare_model_closure(
             deployment={"components": [component]},
+            model_source_closure=_closure(),
+            profiles=profiles,
+        )
+
+
+def test_an_assistant_component_model_is_a_no_model_row(
+    registry: dict[str, object],
+    tmp_path: Path, prepared_sources: list[tuple[str, str]],
+) -> None:
+    # Like a sensor, the `kind: assistant` model (from `component_models`)
+    # has no model source and no runtime_kind on its descriptor row.
+    descriptor = "components/assistant/manyforge.assistant/component.yaml"
+    registry = {**registry, "component_models": [
+        path for path in registry["component_models"] if path != descriptor
+    ]}
+    capabilities = _capability_root(tmp_path, registry)
+    root = json.loads((capabilities / _DESCRIPTION).read_text(encoding="utf-8"))
+    root["component_models"].append(descriptor)
+    (capabilities / _DESCRIPTION).write_text(json.dumps(root), encoding="utf-8")
+    (capabilities / descriptor).parent.mkdir(parents=True)
+    (capabilities / descriptor).write_text(
+        "api_version: manyforge.component_package.v1\n"
+        "kind: assistant\n"
+        "id: manyforge.assistant\n"
+        "version: 1.0.0\n"
+        "title: AI assistant\n"
+        "license: Apache-2.0\n"
+        "adapter_row: {adapter: assistant, backend: local_process,"
+        " health_period_s: 1.0, stream_budget_s: 5.0}\n",
+        encoding="utf-8",
+    )
+    profiles = _model_preparation_profiles(capabilities)
+    assistant = {
+        "component_id": "assistant",
+        "component_profile_id": "manyforge.assistant",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "assistant",
+            "runtime_configuration": {
+                "model_component_id": "assistant_model",
+                "assistant_profile_id": "assistant_scene_authoring",
+            },
+        },
+    }
+
+    closure = _prepare_model_closure(
+        deployment={"components": [assistant, _ai_model(), _mock_robot()]},
+        model_source_closure=_closure("robot"),
+        profiles=profiles,
+    )
+
+    assert prepared_sources == [("robot", "lite6")]
+    assert [row["component_id"] for row in closure["components"]] == ["robot"]
+    with pytest.raises(HeadlessApiError, match="do not match captured model profiles"):
+        _prepare_model_closure(
+            deployment={"components": [{**assistant, "model_source": {"kind": "package"}}]},
             model_source_closure=_closure(),
             profiles=profiles,
         )

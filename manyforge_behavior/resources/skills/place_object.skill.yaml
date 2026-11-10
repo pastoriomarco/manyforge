@@ -1,83 +1,12 @@
 {
-  "api_version": "manyforge.skill.v1",
+  "api_version": "manyforge.skill.v2",
   "skill_id": "place_object",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "name": "Place object — logical-gripper template",
   "description": "Preserves the historical logical-gripper skill: approach, descend, set a Program flag, request the Scene-owned attachment change, and retreat. It does not actuate or confirm a physical gripper. Add an explicit qualified gripper command/confirmation when needed. Scene revisions invalidate affected cache entries automatically; there is no manual cache-reset node.",
   "compatible_profiles": [
     "composable-cell-v1"
   ],
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "tool": {
-      "required_component_type_tags": [
-        "gripper"
-      ]
-    }
-  },
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
-          "capability_id": "state.observed.current",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "parameters": {},
-          "disposition": "required"
-        }
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "gripper": {
-      "component_role": "tool",
-      "required_capabilities": [
-        {
-          "capability_id": "model.kinematics.fk",
-          "parameters": {},
-          "disposition": "required"
-        }
-      ],
-      "required_collision_body_roles": [
-        "gripper_collision"
-      ]
-    }
-  },
   "parameters": [
     {
       "id": "object_id",
@@ -160,6 +89,27 @@
       "schema": {
         "schema_ref": "#/schema_types/motion_pose"
       }
+    },
+    {
+      "id": "arm_target",
+      "required": true,
+      "schema": {
+        "schema_ref": "#/schema_types/target_reference"
+      }
+    },
+    {
+      "id": "base_frame",
+      "required": true,
+      "schema": {
+        "schema_ref": "#/schema_types/frame_reference"
+      }
+    },
+    {
+      "id": "gripper_target",
+      "required": true,
+      "schema": {
+        "schema_ref": "#/schema_types/target_reference"
+      }
     }
   ],
   "requires": [
@@ -187,17 +137,19 @@
         "node_id": "motion.move_to_pose",
         "instance_id": "approach",
         "parameters": {
-          "target_role": "${target:arm}",
-          "base_frame_role": "base",
-          "tcp_endpoint": {"kind": "current"},
+          "target": "${param:arm_target}",
+          "base_frame": "${param:base_frame}",
+          "tcp_endpoint": {
+            "kind": "current"
+          },
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
             "pose": "${param:place_pose}"
           },
           "offset_reference": {
-            "type": "frame_role",
-            "frame_role_id": "base"
+            "type": "component_frame",
+            "frame": "${param:base_frame}"
           },
           "goal": {
             "position_m": [
@@ -219,17 +171,19 @@
         "node_id": "motion.move_to_pose",
         "instance_id": "descend",
         "parameters": {
-          "target_role": "${target:arm}",
-          "base_frame_role": "base",
-          "tcp_endpoint": {"kind": "current"},
+          "target": "${param:arm_target}",
+          "base_frame": "${param:base_frame}",
+          "tcp_endpoint": {
+            "kind": "current"
+          },
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
             "pose": "${param:place_pose}"
           },
           "offset_reference": {
-            "type": "frame_role",
-            "frame_role_id": "base"
+            "type": "component_frame",
+            "frame": "${param:base_frame}"
           },
           "goal": {
             "position_m": [
@@ -261,7 +215,7 @@
         "instance_id": "detach",
         "parameters": {
           "scene_resource_id": "${param:object_id}",
-          "target_role": "${target:gripper}"
+          "target": "${param:gripper_target}"
         },
         "children": []
       },
@@ -269,17 +223,19 @@
         "node_id": "motion.move_to_pose",
         "instance_id": "retreat",
         "parameters": {
-          "target_role": "${target:arm}",
-          "base_frame_role": "base",
-          "tcp_endpoint": {"kind": "current"},
+          "target": "${param:arm_target}",
+          "base_frame": "${param:base_frame}",
+          "tcp_endpoint": {
+            "kind": "current"
+          },
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
             "pose": "${param:place_pose}"
           },
           "offset_reference": {
-            "type": "frame_role",
-            "frame_role_id": "base"
+            "type": "component_frame",
+            "frame": "${param:base_frame}"
           },
           "goal": {
             "position_m": [
@@ -317,6 +273,18 @@
             -90
           ]
         }
+      },
+      "arm_target": {
+        "component_id": "robot",
+        "command_target_id": "arm"
+      },
+      "base_frame": {
+        "component_id": "robot",
+        "frame_id": "base"
+      },
+      "gripper_target": {
+        "component_id": "tool",
+        "command_target_id": "gripper"
       }
     },
     "program_declarations": {

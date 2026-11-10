@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_headless VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_headless VERSION 0.2.1 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -203,7 +203,7 @@ add_executable(manyforge_manager_daemon src/manager_daemon.cpp)
 target_link_libraries(manyforge_manager_daemon PRIVATE
   manyforge_headless_owner_publication
   manyforge::deployment_admission
-  # Apply acceptance recompiles the stored prepared Program outcome (H1a).
+  # Apply acceptance recompiles the stored prepared Program outcome.
   manyforge::deployment)
 
 option(BUILD_TESTING "Build unit tests" ON)
@@ -403,9 +403,6 @@ if(BUILD_TESTING)
   set(
     MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE
     "${MANYFORGE_HEADLESS_TEST_ASSISTANT_FIXTURE_ROOT}/retained-bundle-id.txt")
-  set(
-    MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/assistant/assistant_instrument_registry_source.v1.json")
   add_custom_command(
     OUTPUT "${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
     COMMAND
@@ -424,7 +421,6 @@ if(BUILD_TESTING)
       manyforge_generate_headless_assistant_test_package
       "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
       "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
-      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE}"
       ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
     VERBATIM)
   add_custom_target(manyforge_headless_test_assistant_package
@@ -481,7 +477,7 @@ if(BUILD_TESTING)
 
   if(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
     # Tests that start a ROS stack run in their own ROS domain (Fast DDS
-    # #6599, N16); same launcher as manyforge_roboplan's tests.
+    # #6599); same launcher as manyforge_roboplan's tests.
     find_program(MANYFORGE_RUN_RMW_ISOLATED run_rmw_isolated
       PATHS ENV AMENT_PREFIX_PATH
       PATH_SUFFIXES lib/rmw_test_fixture_implementation
@@ -644,8 +640,7 @@ if(BUILD_TESTING)
       "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_FIXTURE_ROOT}"
       assistant-ros2-control
       "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
-      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}"
-      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_INSTRUMENT_SOURCE}")
+      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
 
     # The Lite gripper alone: pneumatic, commanded output, with feedback.
     set(MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT
@@ -698,10 +693,10 @@ if(BUILD_TESTING)
         TIMEOUT 180 RUN_SERIAL TRUE)
     endif()
 
-    # O1.4g: a compatible pick/place host consumes a second copy of the same
+    # A compatible pick/place host consumes a second copy of the same
     # semantic package.
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-o1-4g-replacement-fixture")
+      "${CMAKE_CURRENT_BINARY_DIR}/manager-apply-replacement-fixture")
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT
       "${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_FIXTURE_ROOT}/retained-package")
     set(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA
@@ -885,7 +880,6 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/scenario.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/deployment.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/program.yaml"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../examples/mock_lite6_pick_and_place.scenario/assignment.yaml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../examples/lite6_lite_gripper_pick_and_place.program.yaml"
         ${_manager_ros_fixture_models}
       VERBATIM)
@@ -907,7 +901,7 @@ if(BUILD_TESTING)
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication
-    # Publishes real prepared activations for each Apply (H1a).
+    # Publishes real prepared activations for each Apply.
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_daemon_process

@@ -25,7 +25,7 @@ struct SimulatedPlcReadiness final {
   }
 };
 
-/// Bounded Apply-time wait (design §4): on the host's own ROS Context, every
+/// Bounded Apply-time wait: on the host's own ROS Context, every
 /// served SetBool service is ready for a client and the first Bool sample has
 /// arrived on every subscribed topic. A temporary probe node and executor
 /// live only for this call; no state is retained. `abandon` (optional) ends

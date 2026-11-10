@@ -1,4 +1,5 @@
 import type {
+  AssistantModeDetail,
   AssistantModeIndex,
   AssistantProviderResponse,
   AssistantProviderStatus,
@@ -95,10 +96,33 @@ function jsonValue(value: unknown, path: string, depth = 0): JsonValue {
   ]));
 }
 
+/** The fields of one mode projection the panel shows; the rest is the bridge's. */
+export function parseAssistantModeDetail(value: unknown): AssistantModeDetail {
+  const root = objectAt(value, 'assistantMode');
+  const endpoint = objectAt(root.model_endpoint, 'assistantMode.model_endpoint');
+  const contract = endpoint.request_contract === undefined
+    ? {}
+    : objectAt(endpoint.request_contract, 'assistantMode.model_endpoint.request_contract');
+  const optionalCount = (field: unknown, path: string) => (field === undefined ? null : integer(field, path));
+  return {
+    mode: text(root.mode, 'assistantMode.mode'),
+    modelEndpoint: {
+      aiModelComponentId: text(endpoint.ai_model_component_id, 'assistantMode.model_endpoint.ai_model_component_id'),
+      modelId: text(endpoint.model_id, 'assistantMode.model_endpoint.model_id'),
+      baseUrl: text(endpoint.base_url, 'assistantMode.model_endpoint.base_url'),
+      timeoutS: optionalCount(contract.default_timeout_s, 'assistantMode.model_endpoint.request_contract.default_timeout_s'),
+      maxOutputTokens: optionalCount(contract.max_output_tokens, 'assistantMode.model_endpoint.request_contract.max_output_tokens'),
+    },
+    toolCount: array(root.tools, 'assistantMode.tools').length,
+    nodeCount: array(root.nodes, 'assistantMode.nodes').length,
+  };
+}
+
 export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
   const root = objectAt(value, 'assistantModes');
   exact(root, [
     'ai_model_component_id',
+    'assistant_component_id',
     'assistant_projection_digest',
     'graph_revision',
     'instrument_registry_digest',
@@ -108,7 +132,7 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
     'schema_version',
     'source',
   ], 'assistantModes');
-  if (root.schema_version !== 'manyforge.assistant_mode_index.v1') {
+  if (root.schema_version !== 'manyforge.assistant_mode_index.v2') {
     fail('assistantModes.schema_version', 'the supported version');
   }
   const source = objectAt(root.source, 'assistantModes.source');
@@ -150,7 +174,7 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
   text(environment.content_version, 'assistantModes.node_environment.content_version');
   const modes = array(root.modes, 'assistantModes.modes').map((raw, index) => {
     const row = objectAt(raw, `assistantModes.modes[${index}]`);
-    exact(row, ['description', 'grant_policy', 'mode'], `assistantModes.modes[${index}]`);
+    exact(row, ['description', 'grant_policy', 'mode', 'runs_in'], `assistantModes.modes[${index}]`);
     const policy = objectAt(row.grant_policy, `assistantModes.modes[${index}].grant_policy`);
     exact(policy, ['approval_mode', 'review_policy', 'session_kind'], `assistantModes.modes[${index}].grant_policy`);
     const reviewPolicy = text(policy.review_policy, 'grantPolicy.review_policy');
@@ -169,22 +193,30 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
         review_policy: reviewPolicy,
         session_kind: nullableText(policy.session_kind, 'grantPolicy.session_kind'),
       },
+      runsIn: array(row.runs_in, `assistantModes.modes[${index}].runs_in`, 16)
+        .map((state, stateIndex) => text(state, `assistantModes.modes[${index}].runs_in[${stateIndex}]`, 256)),
     };
   });
   const ids = modes.map((mode) => mode.mode);
   if (ids.some((id, index) => index > 0 && id <= ids[index - 1])) {
     fail('assistantModes.modes', 'strictly sorted unique modes');
   }
-  digest(root.assistant_projection_digest, 'assistantModes.assistant_projection_digest');
+  // Without assistant settings the index is empty and has no projection digest.
+  const projectionDigest = root.assistant_projection_digest === null
+    ? null
+    : digest(root.assistant_projection_digest, 'assistantModes.assistant_projection_digest');
   digest(root.instrument_registry_digest, 'assistantModes.instrument_registry_digest');
   return {
     retainedBundleId: text(root.retained_bundle_id, 'assistantModes.retained_bundle_id', 256),
     graphRevision: text(root.graph_revision, 'assistantModes.graph_revision', 256),
-    assistantProjectionDigest: root.assistant_projection_digest as string,
+    assistantProjectionDigest: projectionDigest,
     instrumentRegistryDigest: root.instrument_registry_digest as string,
     aiModelComponentId: root.ai_model_component_id === null
       ? null
       : text(root.ai_model_component_id, 'assistantModes.ai_model_component_id', 256),
+    assistantComponentId: root.assistant_component_id === null
+      ? null
+      : text(root.assistant_component_id, 'assistantModes.assistant_component_id', 256),
     modes,
   };
 }

@@ -92,7 +92,7 @@ build_selected_collision_distance_pairs(
     const CollisionWorldSnapshot& world,
     std::string_view active_contact_policy_id = {});
 
-/// Clearance margins for one move (M6 collision clearance), from the
+/// Clearance margins for one move (collision clearance), from the
 /// existing contact policies. `margin_m` goes on every pair of a robot body
 /// (a component-model body or a carried scene body) and an environment body
 /// (a detached scene resource or a runtime object). A pair the policy allows
@@ -194,8 +194,7 @@ struct ContactReleaseTransitionResult {
 std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
     const CollisionPolicySnapshot& snapshot);
 
-/// CollisionPolicyEvaluator (spec §3.8.1, added in Chunk 3 of the
-/// collision-ownership plan).
+/// CollisionPolicyEvaluator.
 ///
 /// Takes the immutable CollisionPolicySnapshot and a list of normalized,
 /// observed body pairs, and produces:

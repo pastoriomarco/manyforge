@@ -17,7 +17,7 @@ namespace manyforge::core {
 
 /// Non-null immutable ownership root for the frozen logical-scene DTO.
 ///
-/// Spec 220 permits shared immutable logical snapshots. Wrapping the shared
+/// Shared immutable logical snapshots are permitted. Wrapping the shared
 /// pointer prevents a required snapshot field from acquiring a second
 /// "present-but-null" state.
 class LogicalSceneSnapshotRoot final {

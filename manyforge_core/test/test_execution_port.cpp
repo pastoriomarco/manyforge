@@ -207,13 +207,42 @@ TEST(ExecutionPortTest, StaleKeyAndUncertainEffectAreReportedAsScripted) {
   port.QueueCommandResult({ExecutionPortDispatch::kEffectUncertain, std::nullopt, std::nullopt});
 
   EXPECT_EQ(port.Cancel(Key(7U)).refusal, ExecutionPortRefusal::kStaleKey);
-  EXPECT_EQ(port.SetScale(0.5).dispatch, ExecutionPortDispatch::kEffectUncertain);
-  EXPECT_EQ(port.SetScale(0.25).dispatch, ExecutionPortDispatch::kDispatched);
+  EXPECT_EQ(port.SetScale(0.5, port.ReserveScaleSequence()).dispatch, ExecutionPortDispatch::kEffectUncertain);
+  EXPECT_EQ(port.SetScale(0.25, port.ReserveScaleSequence()).dispatch, ExecutionPortDispatch::kDispatched);
 
   const auto commands = port.commands();
   ASSERT_EQ(commands.size(), 3U);
   ASSERT_TRUE(std::holds_alternative<FakeExecutionPort::SetScaleCall>(commands[2]));
   EXPECT_DOUBLE_EQ(std::get<FakeExecutionPort::SetScaleCall>(commands[2]).value, 0.25);
+}
+
+TEST(ExecutionPortTest, ScaleReservationFencesAnOlderUnpublishedValue) {
+  FakeExecutionPort port;
+  const auto old = port.ReserveScaleSequence();
+  const auto current = port.ReserveScaleSequence();
+  EXPECT_EQ(port.SetScale(0.25, current).dispatch, ExecutionPortDispatch::kDispatched);
+  EXPECT_EQ(port.SetScale(0.75, old).dispatch, ExecutionPortDispatch::kNotDispatched);
+  const auto commands = port.commands();
+  ASSERT_EQ(commands.size(), 1U);
+  EXPECT_DOUBLE_EQ(std::get<FakeExecutionPort::SetScaleCall>(commands.front()).value, 0.25);
+}
+
+TEST(ExecutionPortTest, FencedDispatchTokenCannotSubmitAGoal) {
+  FakeExecutionPort port;
+  auto token = std::make_shared<ExecutionDispatchToken>();
+  EXPECT_EQ(token->Fence(), ExecutionDispatchToken::State::kFenced);
+  EXPECT_EQ(port.Submit(Key(1U), Trajectory(1.0), token).dispatch,
+            ExecutionPortDispatch::kNotDispatched);
+  EXPECT_TRUE(port.commands().empty());
+}
+
+TEST(ExecutionPortTest, FencedDispatchWaitsForExactNoSendAnswer) {
+  ExecutionDispatchToken token;
+  EXPECT_EQ(token.Fence(), ExecutionDispatchToken::State::kFenced);
+  EXPECT_FALSE(token.WaitUntil(std::chrono::steady_clock::now()).has_value());
+  token.Finish(ExecutionPortDispatch::kNotDispatched);
+  EXPECT_EQ(token.WaitUntil(std::chrono::steady_clock::now()),
+            ExecutionPortDispatch::kNotDispatched);
 }
 
 TEST(ExecutionPortTest, SampleCarriesNoGoalAttribution) {

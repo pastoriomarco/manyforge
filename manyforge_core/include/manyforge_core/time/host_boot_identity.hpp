@@ -10,7 +10,7 @@
 namespace manyforge::core {
 
 /// One process's view of the host boot it runs in, for ordering owner
-/// incarnations across processes on that host (spec 530 §11). CLOCK_BOOTTIME
+/// incarnations across processes on that host. CLOCK_BOOTTIME
 /// is monotonic across processes of one boot and includes suspend; the boot id
 /// names the boot, so two stamps are comparable only under the same boot id.
 /// The core control plane is single-host by decision; a reader on another host

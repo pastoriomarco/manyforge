@@ -1,0 +1,12 @@
+# ManyForge version floors over the rosdistro sync: unmodified upstream
+# release tags, used only where the sync is older than the qualified level.
+# Remove an entry once a sync carries that version or newer.
+repositories:
+  ros2_controllers:
+    type: git
+    url: https://github.com/ros-controls/ros2_controllers.git
+    version: 6.10.1
+  ros2_control_cmake:
+    type: git
+    url: https://github.com/ros-controls/ros2_control_cmake.git
+    version: 1.0.0

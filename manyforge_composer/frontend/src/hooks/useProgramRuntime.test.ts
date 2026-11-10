@@ -335,10 +335,10 @@ describe('Program command settlement', () => {
         code: 'owner_request_failed',
         message: 'planning failed after the Run request had returned',
         details: {
-          reason: 'frame_role_unresolved',
-          reference_type: 'frame_role',
+          reason: 'frame_unresolved',
+          reference_type: 'component_frame',
           reference_id: 'tool0',
-          target_role_id: 'arm',
+          component_id: 'arm',
         },
         origin: { kind: 'owner', nodeInstanceId: 'node.move', ownerApi: 'scene.frames' },
       },
@@ -355,8 +355,8 @@ describe('Program command settlement', () => {
     expect(message).toContain('run-background-failure: failed, revision 11');
     expect(message).toContain('Run reason: owner_request_failed.');
     expect(message).toContain(
-      "Run failure details: Reason: frame_role_unresolved; Reference: frame_role 'tool0' "
-      + "of target role 'arm'; Origin: scene.frames for node 'node.move'.",
+      "Run failure details: Reason: frame_unresolved; Reference: component_frame 'tool0' "
+      + "of component 'arm'; Origin: scene.frames for node 'node.move'.",
     );
     expect(message).toContain('Current nodes: node.move=failure.');
     expect(programTerminalFailureMessage({ ...run, state: 'running' }, null, null))

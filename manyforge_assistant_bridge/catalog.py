@@ -13,7 +13,7 @@ import unicodedata
 import rfc8785
 
 
-MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v1"
+MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v2"
 MODE_CATALOG_VERSION: Final = "manyforge.assistant_mode_catalog.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 MAXIMUM_ROWS: Final = 4_096
@@ -32,8 +32,11 @@ ORIENTATION_FIELDS: Final = frozenset(
 )
 _PROJECTION_FIELDS: Final = frozenset(
     {
+        "assistant_component_id",
         "assistant_projection_digest",
         "catalog_hash",
+        "compact_history",
+        "constrained_regeneration",
         "description",
         "grant_policy",
         "graph_revision",
@@ -42,12 +45,24 @@ _PROJECTION_FIELDS: Final = frozenset(
         "model_endpoint",
         "node_environment",
         "nodes",
-        "provider",
         "retained_bundle_id",
+        "runs_in",
         "schema_version",
         "skills",
         "source",
+        "stuck_loop_recovery",
         "tools",
+        "types",
+    }
+)
+_NODE_FIELDS: Final = frozenset(
+    {
+        "children",
+        "node_id",
+        "node_schema",
+        "replacement_schema",
+        "summary",
+        "update_schema",
     }
 )
 _SOURCE_FIELDS: Final = frozenset(
@@ -173,9 +188,23 @@ def _validate_projection_rows(projection: dict[str, Any]) -> None:
         tool = _object(raw, path)
         _closed(
             tool,
-            {"description", "effect", "input_schema", "input_schema_hash", "tool_id"},
+            {
+                "argument_types",
+                "description",
+                "effect",
+                "input_schema",
+                "input_schema_hash",
+                "tool_id",
+            },
             path,
         )
+        argument_types = _object(tool["argument_types"], f"{path}.argument_types")
+        types = _object(projection["types"], "types")
+        for name, type_name in argument_types.items():
+            if name not in tool["input_schema"].get("properties", {}) or (
+                type(type_name) is not str or type_name.removesuffix("[]") not in types
+            ):
+                _fail("assistant_projection_invalid", f"{path}.argument_types is not closed")
         tool_id = _text(tool["tool_id"], f"{path}.tool_id", maximum_bytes=256)
         if TOOL_ID_PATTERN.fullmatch(tool_id) is None or tool_id <= previous:
             _fail(
@@ -193,13 +222,21 @@ def _validate_projection_rows(projection: dict[str, Any]) -> None:
     previous = ""
     node_ids: set[str] = set()
     for index, raw in enumerate(_array(projection["nodes"], "nodes")):
-        row = _object(raw, f"nodes[{index}]")
-        _closed(row, {"node_id"}, f"nodes[{index}]")
-        node_id = _text(row["node_id"], f"nodes[{index}].node_id", maximum_bytes=256)
+        path = f"nodes[{index}]"
+        row = _object(raw, path)
+        _closed(row, _NODE_FIELDS, path)
+        node_id = _text(row["node_id"], f"{path}.node_id", maximum_bytes=256)
         if node_id <= previous:
             _fail("assistant_projection_invalid", "nodes must be strictly sorted")
         previous = node_id
         node_ids.add(node_id)
+        _text(row["summary"], f"{path}.summary")
+        children = _object(row["children"], f"{path}.children")
+        _closed(children, {"max", "min"}, f"{path}.children")
+        if any(type(children[field]) is not int for field in ("max", "min")):
+            _fail("assistant_projection_invalid", f"{path}.children bounds are invalid")
+        for field in ("node_schema", "replacement_schema", "update_schema"):
+            _object(row[field], f"{path}.{field}")
 
     previous = ""
     tool_ids = {row["tool_id"] for row in tools}
@@ -231,9 +268,33 @@ def _validate_model_request_contract(value: Any) -> dict[str, Any]:
             "supports_json_object",
             "supports_response_tools",
             "tool_call_family",
-        },
+        }
+        # EXPERIMENTAL optional `reasoning: on|off`; optional `sampling`.
+        | ({"reasoning", "sampling"} & set(contract)),
         "model_endpoint.request_contract",
     )
+    if "sampling" in contract:
+        sampling = _object(contract["sampling"], "model sampling")
+        if not sampling or not set(sampling) <= {"temperature", "top_k", "top_p"}:
+            _fail("assistant_projection_invalid", "model sampling has an unsupported shape")
+        if "temperature" in sampling and not (
+            type(sampling["temperature"]) in {int, float}
+            and math.isfinite(sampling["temperature"])
+            and 0 <= sampling["temperature"] <= 2
+        ):
+            _fail("assistant_projection_invalid", "model sampling temperature is outside its bound")
+        if "top_p" in sampling and not (
+            type(sampling["top_p"]) in {int, float}
+            and math.isfinite(sampling["top_p"])
+            and 0 < sampling["top_p"] <= 1
+        ):
+            _fail("assistant_projection_invalid", "model sampling top_p is outside its bound")
+        if "top_k" in sampling and not (
+            type(sampling["top_k"]) is int and 1 <= sampling["top_k"] <= 1_048_576
+        ):
+            _fail("assistant_projection_invalid", "model sampling top_k is outside its bound")
+    if contract.get("reasoning", "on") not in {"on", "off"}:
+        _fail("assistant_projection_invalid", "model reasoning must be on or off")
     timeout = contract["default_timeout_s"]
     if (
         type(timeout) not in {int, float}
@@ -320,11 +381,12 @@ def verify_active_mode_projection(payload: Any, *, expected_mode: str) -> dict[s
         if type(source[field]) is not int or source[field] < 0:
             _fail("assistant_projection_invalid", f"source.{field} must be non-negative")
 
-    provider = _object(projection["provider"], "provider")
-    _closed(provider, {"provider_alias", "provider_kind"}, "provider")
-    _text(provider["provider_alias"], "provider.provider_alias", maximum_bytes=256)
-    if provider["provider_kind"] not in {"direct", "nemoclaw"}:
-        _fail("assistant_provider_unavailable", "selected provider kind is not implemented by this bridge")
+    _text(projection["assistant_component_id"], "assistant_component_id", maximum_bytes=256)
+    runs_in = _array(projection["runs_in"], "runs_in")
+    if not runs_in:
+        _fail("assistant_projection_invalid", "runs_in must name at least one cell state")
+    for index, state in enumerate(runs_in):
+        _text(state, f"runs_in[{index}]", maximum_bytes=256)
     model = _object(projection["model_endpoint"], "model_endpoint")
     _closed(
         model,
@@ -353,7 +415,7 @@ def verify_active_mode_projection(payload: Any, *, expected_mode: str) -> dict[s
     if request_contract["tool_call_family"] != "openai_chat_tools":
         _fail(
             "assistant_provider_unavailable",
-            "direct bridge requires the openai_chat_tools parser family",
+            "the bridge requires the openai_chat_tools parser family",
         )
     if projection["tools"] and request_contract["supports_response_tools"] is not True:
         _fail(
@@ -382,6 +444,9 @@ def verify_active_mode_projection(payload: Any, *, expected_mode: str) -> dict[s
         if policy[field] is not None:
             _text(policy[field], f"grant_policy.{field}")
 
+    for flag in ("stuck_loop_recovery", "compact_history", "constrained_regeneration"):
+        if type(projection[flag]) is not bool:
+            _fail("assistant_projection_invalid", f"{flag} must be boolean")
     _validate_projection_rows(projection)
     catalog = {
         "grant_policy": policy,

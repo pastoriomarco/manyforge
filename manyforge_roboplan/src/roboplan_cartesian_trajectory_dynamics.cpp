@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include <Eigen/Core>
+#include <Eigen/Dense>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 
@@ -847,7 +847,7 @@ measure_one_frame_dynamics_envelope(
   return core::Result<CartesianFrameDynamicsEnvelope>::Ok(std::move(envelope));
 }
 
-// RP-3: active TCP relative to the requested base frame.
+// Active TCP relative to the requested base frame.
 struct TcpVelocityModel final {
   std::shared_ptr<roboplan::Scene> scene;
   std::string group_name;
@@ -965,6 +965,89 @@ measure_tcp_sample_speed_ratio(const CartesianTrajectoryContractInput &request,
   if (!std::isfinite(ratio))
     return std::nullopt;
   return ratio;
+}
+
+core::Result<double> measure_tcp_chord_speed_mps(
+    const CartesianTrajectoryContractInput &request,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control,
+    double timestamp_multiplier) {
+  const auto invalid = [] {
+    return core::Result<double>::Err(core::ErrorDTO{
+        core::kErrorValidationLimitsViolation,
+        "TCP chord speed could not be measured",
+        {{"reason", "execution_host_scale_preparation_invalid"}}});
+  };
+  if (!scene || !finite_positive(timestamp_multiplier) || trajectory.positions.size() < 2U ||
+      trajectory.times.size() != trajectory.positions.size())
+    return invalid();
+  const auto &base_name = request.compiled_base_frame;
+  const bool world = base_name.empty() || base_name == "universe" ||
+                     base_name == "world" || base_name == "World" ||
+                     base_name == "/World";
+  const auto group = scene->getJointGroupInfo(request.compiled_group_name);
+  if (!group || group->joint_names != trajectory.joint_names ||
+      !scene->getFrameId(request.compiled_tcp_frame) ||
+      (!world && !scene->getFrameId(base_name)))
+    return invalid();
+
+  Eigen::Vector3d previous = Eigen::Vector3d::Zero();
+  double peak_speed = 0.0;
+  for (std::size_t index = 0; index < trajectory.positions.size(); ++index) {
+    if (index % kPlanningControlCheckStride == 0U)
+      if (auto error = planning_control_error(control))
+        return core::Result<double>::Err(*error);
+    const auto &positions = trajectory.positions[index];
+    if (positions.size() != static_cast<Eigen::Index>(trajectory.joint_names.size()) ||
+        !positions.allFinite() || !std::isfinite(trajectory.times[index]))
+      return invalid();
+    const auto full = scene->toFullJointPositions(request.compiled_group_name, positions);
+    const Eigen::Matrix4d tcp = scene->forwardKinematics(full, request.compiled_tcp_frame);
+    Eigen::Matrix4d base_from_robot = Eigen::Matrix4d::Identity();
+    if (!world)
+      base_from_robot = scene->forwardKinematics(full, base_name).inverse();
+    const Eigen::Matrix4d transform = base_from_robot * tcp;
+    const Eigen::Vector3d position = transform.block<3, 1>(0, 3);
+    if (!position.allFinite()) return invalid();
+    if (index != 0U) {
+      // Preparation stores each multiplied timestamp before validation;
+      // prevent a fused multiply-subtract from changing boundary rounding.
+      const volatile double current_time = trajectory.times[index] * timestamp_multiplier;
+      const volatile double previous_time = trajectory.times[index - 1U] * timestamp_multiplier;
+      const double duration = current_time - previous_time;
+      if (!finite_positive(duration)) return invalid();
+      const double speed = (position - previous).norm() / duration;
+      if (!std::isfinite(speed)) return invalid();
+      peak_speed = std::max(peak_speed, speed);
+    }
+    previous = position;
+  }
+  if (!std::isfinite(peak_speed)) return invalid();
+  return core::Result<double>::Ok(peak_speed);
+}
+
+core::Result<double> measure_tcp_chord_speed_ratio(
+    const CartesianTrajectoryContractInput &request,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control) {
+  const double limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
+                       request.speed_profile.velocity_scale;
+  if (!finite_positive(limit))
+    return core::Result<double>::Err(core::ErrorDTO{
+        core::kErrorValidationLimitsViolation,
+        "TCP chord speed limit is invalid",
+        {{"reason", "execution_host_scale_preparation_invalid"}}});
+  const auto speed = measure_tcp_chord_speed_mps(request, scene, trajectory, control, 1.0);
+  if (!speed.ok()) return core::Result<double>::Err(speed.error());
+  const double ratio = speed.value() / limit;
+  if (!std::isfinite(ratio))
+    return core::Result<double>::Err(core::ErrorDTO{
+        core::kErrorValidationLimitsViolation,
+        "TCP chord speed ratio is invalid",
+        {{"reason", "execution_host_scale_preparation_invalid"}}});
+  return core::Result<double>::Ok(ratio);
 }
 
 core::Result<CartesianFrameDynamicsEnvelope>

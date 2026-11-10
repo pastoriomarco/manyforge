@@ -22,9 +22,6 @@ inline constexpr std::string_view kProgramFixtureZeroDigest =
 
 struct ProgramOptions final {
   std::string catalog_content_version;
-  std::vector<std::string> frame_roles{"base", "tcp"};
-  std::vector<std::string> resource_roles{"joints"};
-  std::vector<std::string> capability_ids{"state.observed.current"};
   bool include_legacy_robot{false};
   bool duplicate_tree_instance{false};
   bool include_contact_grasp{false};
@@ -32,8 +29,6 @@ struct ProgramOptions final {
   bool duplicate_value_source_parameter{false};
   bool include_node_policy{false};
   bool explicit_default_node_policy{false};
-  // A logic-only Program declares no component or target role.
-  bool logic_only{false};
 };
 
 [[nodiscard]] inline CanonicalValue
@@ -64,10 +59,9 @@ text_array(const std::vector<std::string> &values) {
                         {"body_a",
                          CanonicalValue(CanonicalValue::Object{
                              {"kind", CanonicalValue("component_model_body")},
-                             {"component_role_id", CanonicalValue("robot")},
-                             {"model_role_id", CanonicalValue("arm_model")},
-                             {"collision_body_role_id",
-                              CanonicalValue("arm_collision")},
+                             {"body", CanonicalValue(CanonicalValue::Object{
+                                 {"component_id", CanonicalValue("lite6_arm")},
+                                 {"collision_body_id", CanonicalValue("arm_collision")}})},
                          })},
                         {"body_b",
                          CanonicalValue(CanonicalValue::Object{
@@ -98,16 +92,6 @@ text_array(const std::vector<std::string> &values) {
 }
 
 [[nodiscard]] inline CanonicalValue make_program_root(const ProgramOptions &options) {
-  CanonicalValue::Array capabilities;
-  capabilities.reserve(options.capability_ids.size());
-  for (const auto &capability_id : options.capability_ids) {
-    capabilities.emplace_back(CanonicalValue::Object{
-        {"capability_id", CanonicalValue(capability_id)},
-        {"parameters", CanonicalValue(CanonicalValue::Object{})},
-        {"disposition", CanonicalValue("required")},
-    });
-  }
-
   CanonicalValue::Array children;
   if (options.duplicate_tree_instance) {
     children.emplace_back(CanonicalValue::Object{
@@ -169,52 +153,18 @@ text_array(const std::vector<std::string> &values) {
   }
 
   CanonicalValue::Object root{
-      {"api_version", CanonicalValue("manyforge.program.v2")},
-      {"program_id", CanonicalValue("i6_contract_program")},
+      {"api_version", CanonicalValue("manyforge.program.v3")},
+      {"program_id", CanonicalValue("contract_program")},
       {"program_revision", CanonicalValue(std::string(kProgramFixtureZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("I6 Program contract fixture")},
+      {"name", CanonicalValue("Program contract fixture")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
-           {"api_version", CanonicalValue("manyforge.node_catalog.v2")},
+           {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
            {"content_version", CanonicalValue(options.catalog_content_version)},
-       })},
-      {"component_roles",
-       CanonicalValue(CanonicalValue::Object{
-           {"robot",
-            CanonicalValue(CanonicalValue::Object{
-                {"required_component_type_tags",
-                 CanonicalValue(
-                     CanonicalValue::Array{CanonicalValue("articulated-arm")})},
-                {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                             CanonicalValue("arm_model")})},
-            })},
-       })},
-      {"target_roles",
-       CanonicalValue(CanonicalValue::Object{
-           {"arm",
-            CanonicalValue(CanonicalValue::Object{
-                {"component_role", CanonicalValue("robot")},
-                {"required_capabilities",
-                 CanonicalValue(std::move(capabilities))},
-                {"required_frame_roles", text_array(options.frame_roles)},
-                {"required_resource_roles", text_array(options.resource_roles)},
-                {"required_collision_body_roles",
-                 CanonicalValue(
-                     CanonicalValue::Array{CanonicalValue("arm_collision")})},
-                {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                             CanonicalValue("arm_model")})},
-            })},
        })},
       {"tree", CanonicalValue(std::move(tree))},
   };
-  if (options.logic_only) {
-    for (auto &[name, value] : root) {
-      if (name == "component_roles" || name == "target_roles") {
-        value = CanonicalValue(CanonicalValue::Object{});
-      }
-    }
-  }
   if (options.include_legacy_robot) {
     root.emplace_back("robot", CanonicalValue(CanonicalValue::Object{
                                    {"robot_id", CanonicalValue("legacy_robot")},
@@ -276,7 +226,7 @@ text_array(const std::vector<std::string> &values) {
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
-                                         .api_version = "manyforge.program.v2",
+                                         .api_version = "manyforge.program.v3",
                                          .own_field = "program_revision",
                                      });
   CanonicalValue::Object members = root.as_object();

@@ -203,7 +203,7 @@ class IOperationJournal {
                                        {{"reason", "io_rule_state_journal_unsupported"}}});
   }
 
-  /// Active TCP (M7, design 4, A2a-2): one confirmed Active TCP change, the
+  /// Active TCP: one confirmed Active TCP change, the
   /// operational `active_tcp_changed` row (the Runner's mirror and History
   /// read it). The robot owner appends it under its own lock; the returned
   /// sequence is its place in the stream.

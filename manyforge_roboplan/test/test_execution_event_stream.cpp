@@ -1,4 +1,4 @@
-// Event subscription stream (contract §8.1): delivery, resume, gap/snapshot,
+// Event subscription stream: delivery, resume, gap/snapshot,
 // heartbeat, slow subscriber isolation and shutdown, on a real SEQPACKET
 // socket with an in-memory journal.
 
@@ -121,7 +121,7 @@ protected:
     EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr *>(&address), sizeof(address)), 0);
     const auto request = canonical_json(CanonicalValue(CanonicalValue::Object{
         {"after_cursor", CanonicalValue(static_cast<double>(after))},
-        {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
         {"command", CanonicalValue("subscribe_events")},
         {"owner_epoch", epoch ? CanonicalValue(*epoch) : CanonicalValue(nullptr)}}));
     EXPECT_EQ(::send(client, request.data(), request.size(), MSG_NOSIGNAL),

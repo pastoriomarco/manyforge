@@ -10,16 +10,35 @@ export interface AssistantModeSummary {
     review_policy: string;
     session_kind: string | null;
   };
+  /** The cell states the mode may run in, e.g. `no_program_active`. */
+  runsIn: string[];
 }
 
 export interface AssistantModeIndex {
   retainedBundleId: string;
   graphRevision: string;
-  assistantProjectionDigest: string;
+  /** Null when the bundle has no assistant settings (the index is then empty). */
+  assistantProjectionDigest: string | null;
   instrumentRegistryDigest: string;
   /** The active Deployment's AI model component, or null when it has none. */
   aiModelComponentId: string | null;
+  /** The active Deployment's assistant component, or null when it has none. */
+  assistantComponentId: string | null;
   modes: AssistantModeSummary[];
+}
+
+/** The model and catalog the active mode uses (the Applied Deployment's). */
+export interface AssistantModeDetail {
+  mode: string;
+  modelEndpoint: {
+    aiModelComponentId: string;
+    modelId: string;
+    baseUrl: string;
+    timeoutS: number | null;
+    maxOutputTokens: number | null;
+  };
+  toolCount: number;
+  nodeCount: number;
 }
 
 export interface AssistantToolCallResult {

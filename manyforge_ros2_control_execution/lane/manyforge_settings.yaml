@@ -1,4 +1,4 @@
-# Mock lane: ManyForge's settings, each with its reason (CONTRACTS §12).
+# Mock lane: ManyForge's settings, each with its reason.
 # The Mock adapter's launch contribution (manyforge_roboplan
 # src/mock_lane.cpp) uses exactly these values; its test compares them.
 

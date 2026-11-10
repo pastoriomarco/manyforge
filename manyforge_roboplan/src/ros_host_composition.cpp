@@ -5,10 +5,12 @@
 #include "io_provider_lifecycle_product.hpp"
 
 #include <manyforge_roboplan/controller_launch_process.hpp>
+#include <manyforge_roboplan/adapter_transport_consumer.hpp>
 #include <manyforge_roboplan/retained_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_component_owner.hpp>
 #include <manyforge_roboplan/retained_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_execution_host.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
 #include <algorithm>
 #include <set>
@@ -16,6 +18,123 @@
 #include <utility>
 
 namespace manyforge::roboplan_backend::host_detail {
+
+core::Result<std::shared_ptr<void>> EnterInstalledTransportEffect(
+    ExecutionCompositionAccess &access, const std::string &component_id,
+    const std::shared_ptr<const InstalledGenericIoMembership> &generic,
+    const std::shared_ptr<const InstalledAdapterTransportMembership> &adapter,
+    const std::shared_ptr<const InstalledRetainedTransportMembership> &retained) {
+  using Reply = core::Result<std::shared_ptr<void>>;
+  const bool uses_generic = generic &&
+      std::any_of(generic->components.begin(), generic->components.end(),
+                  [&](const auto &id) { return id.value() == component_id; });
+  const bool uses_adapter = adapter &&
+      std::any_of(adapter->consumers.begin(), adapter->consumers.end(),
+                  [&](const auto &entry) { return entry.first == component_id; });
+  const bool uses_retained = retained &&
+      std::any_of(retained->entries.begin(), retained->entries.end(),
+                  [&](const auto &entry) { return entry.component == component_id; });
+  if (!uses_generic && !uses_adapter && !uses_retained) return Reply::Ok(nullptr);
+  auto permit = access.TryTransportEffect();
+  if (!permit)
+    return Reply::Err({"component_action_in_progress",
+                       "A shared transport recovery is in progress",
+                       {{"component_id", component_id},
+                        {"effect_disposition", "known_no_effect"}}});
+  return Reply::Ok(std::make_shared<ExecutionCompositionAccess::TransportAdmission>(
+      std::move(*permit)));
+}
+
+core::Result<void> ResetCompositionActiveTcps(
+    Composition &composition, ExecutionCompositionAccess &access) {
+  using Reply = core::Result<void>;
+  std::vector<std::pair<const Composition *, std::shared_ptr<void>>> members;
+  const auto admit = [&](const Composition &view) -> Reply {
+    if (!view.ros2_control_runtime_handle) return Reply::Ok();
+    std::shared_ptr<void> permit;
+    if (access.enter_transport_effect) {
+      auto acquired = access.enter_transport_effect(view.controllable_component_id.value());
+      if (!acquired.ok()) return Reply::Err(acquired.error());
+      permit = std::move(acquired.value());
+    }
+    members.emplace_back(&view, std::move(permit));
+    return Reply::Ok();
+  };
+  auto result = admit(composition);
+  if (!result.ok()) return result;
+  for (const auto &participant : composition.participant_compositions) {
+    result = admit(*participant);
+    if (!result.ok()) return result;
+  }
+  for (const auto &[view, permit] : members) {
+    result = permit ? view->ros2_control_runtime_handle->ResetActiveTcpAdmitted()
+                    : view->ros2_control_runtime_handle->ResetActiveTcp();
+    if (!result.ok()) return result;
+  }
+  return Reply::Ok();
+}
+
+core::Result<std::shared_ptr<StagedAdapterTransportRecovery>>
+StageAdapterTransportRecovery(
+    std::span<const std::pair<std::string, std::shared_ptr<AdapterTransportConsumer>>> consumers,
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &failed,
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &replacement) {
+  using Reply = core::Result<std::shared_ptr<StagedAdapterTransportRecovery>>;
+  if (!failed || !replacement || failed == replacement)
+    return Reply::Err({"component_not_ready", "The transport recovery owner is invalid", {}});
+  if (!failed->joined())
+    return Reply::Err({"component_not_ready", "The failed transport has not joined", {}});
+  auto result = std::make_shared<StagedAdapterTransportRecovery>();
+  result->active = std::make_shared<std::atomic<bool>>(false);
+  result->failed = failed;
+  result->replacement = replacement;
+  std::set<const AdapterTransportConsumer *> included;
+  try {
+    for (const auto &[component_id, consumer] : consumers) {
+      static_cast<void>(component_id);
+      if (!consumer || !included.insert(consumer.get()).second) continue;
+      auto stage = consumer->Stage(failed, replacement, result->active);
+      if (!stage)
+        return Reply::Err({"component_not_ready", "An adapter transport could not be staged", {}});
+      result->entries.push_back({consumer, std::move(stage)});
+    }
+  } catch (const core::TypedError &error) {
+    return Reply::Err(error.error());
+  } catch (const std::exception &error) {
+    return Reply::Err({"component_not_ready", error.what(), {}});
+  }
+  return Reply::Ok(std::move(result));
+}
+
+core::Result<void> CommitAdapterTransportRecovery(StagedAdapterTransportRecovery &stage) {
+  using Reply = core::Result<void>;
+  if (stage.committed || !stage.failed->joined() || !stage.replacement->started() ||
+      stage.replacement->executor_fault())
+    return Reply::Err({"component_not_ready", "The replacement transport is not ready", {}});
+  try {
+    for (const auto &entry : stage.entries)
+      if (!entry.consumer->Validate(entry.stage))
+        return Reply::Err({"component_not_ready", "An adapter changed during transport recovery", {}});
+  } catch (const core::TypedError &error) {
+    return Reply::Err(error.error());
+  } catch (const std::exception &error) {
+    return Reply::Err({"component_not_ready", error.what(), {}});
+  }
+  for (const auto &entry : stage.entries) entry.consumer->Commit(entry.stage);
+  stage.committed = true;
+  return Reply::Ok();
+}
+
+core::Result<void> ActivateAdapterTransportRecovery(
+    StagedAdapterTransportRecovery &stage,
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &published_owner) {
+  if (!stage.committed || published_owner != stage.replacement ||
+      !stage.replacement->started() || stage.replacement->executor_fault())
+    return core::Result<void>::Err(
+        {"component_not_ready", "The replacement transport is not published and healthy", {}});
+  stage.active->store(true, std::memory_order_release);
+  return core::Result<void>::Ok();
+}
 
 bool IsProviderOnlyNativeComponent(
     const core::CellGraphDTO &qualified_graph,
@@ -137,7 +256,7 @@ Composition::~Composition() {
     return gripper_runtime.get();
   if (io_provider_drivers && !io_provider_drivers->empty())
     return io_provider_drivers.get();
-  // An adapter-only component (CONTRACTS §6, e.g. a sensor) is its adapter.
+  // An adapter-only component (e.g. a sensor) is its adapter.
   return component_adapter.get();
   }
 
@@ -201,8 +320,8 @@ Composition::Composition(
       std::shared_ptr<RetainedExecutionHost> selected_runtime,
       core::ProjectionRevisionDTO selected_projection,
       core::ActiveBundlePublicationGeneration selected_generation,
-      std::optional<core::TargetRoleId> selected_status_motion_target_role_id,
-      std::optional<core::TargetRoleId> selected_status_gripper_target_role_id)
+      std::optional<core::ProgramTargetReferenceDTO> selected_status_motion_target,
+      std::optional<core::ProgramTargetReferenceDTO> selected_status_gripper_target)
       : ExecutionProduct(std::move(selected_bundle), std::move(selected_program),
                          std::move(selected_binding), std::move(selected_projection), selected_generation),
         controllable_component_id(std::move(selected_component_id)),
@@ -220,10 +339,10 @@ Composition::Composition(
         direct_control_gripper_descriptor(
             std::move(selected_direct_control_gripper_descriptor)),
         stage(std::move(selected_stage)), runtime(std::move(selected_runtime)),
-        status_motion_target_role_id(
-            std::move(selected_status_motion_target_role_id)),
-        status_gripper_target_role_id(
-            std::move(selected_status_gripper_target_role_id)) {}
+        status_motion_target(
+            std::move(selected_status_motion_target)),
+        status_gripper_target(
+            std::move(selected_status_gripper_target)) {}
 
 ExecutionProduct *ExecutionCompositionAccess::product() const {
   Require(!current || !logical_product, "cell product has conflicting physical/logical owners");
@@ -286,7 +405,7 @@ void ExecutionCompositionAccess::detach_addressed_owner() {
 std::vector<core::CoordinatedComponent> CoordinatedComponentsOf(const Composition *cell) {
   std::vector<core::CoordinatedComponent> components;
   if (cell == nullptr) return components;
-  // CONTRACTS §16: an owner comes before its arm member (its composition
+  // An owner comes before its arm member (its composition
   // builds it), and every member carries its owner and role. The owner of a
   // machine with its arm deactivated is a view of its own (its adapter is
   // the view's).
@@ -365,7 +484,8 @@ std::vector<std::jthread> ExecutionCompositionAccess::replace_current(
     }
     SelectHostRobotTcps(std::move(readers), [&] { current = replacement; });
     logical_product.reset();
-    // CONTRACTS §5, §11 (R3): the selected cell's components are the ones the
+    if (publish_transport_membership) publish_transport_membership(replacement);
+    // The selected cell's components are the ones the
     // component runtime coordinates; removed components no longer count.
     if (!component_runtime) return {};
     return component_runtime->SetComponents(CoordinatedComponentsOf(replacement));

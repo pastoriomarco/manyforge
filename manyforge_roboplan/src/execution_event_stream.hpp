@@ -1,6 +1,6 @@
 #pragma once
 
-// Event subscription stream of the execution host (contract §8.1).
+// Event subscription stream of the execution host.
 //
 // One private SEQPACKET socket (`execution-events.sock` in the run root), one
 // subscription per connection, one writer thread per subscriber. Each writer
@@ -11,7 +11,7 @@
 // nothing with it but the same short reads the `events` command already makes.
 //
 // Client -> host, one packet:
-//   {"after_cursor": <int>, "api_version": "manyforge.execution_command.v1",
+//   {"after_cursor": <int>, "api_version": "manyforge.execution_command.v3",
 //    "command": "subscribe_events", "owner_epoch": <str|null>}
 // Host -> client, one packet per message, each
 //   {"api_version": "manyforge.execution_event_stream.v1", "type": ...}:
@@ -334,7 +334,7 @@ private:
       const auto after = Counter(root, "after_cursor");
       if (!root.is_object() || root.as_object().size() != 4U || api == nullptr ||
           !api->is_string() ||
-          api->as_string() != "manyforge.execution_command.v1" ||
+          api->as_string() != "manyforge.execution_command.v3" ||
           command == nullptr || !command->is_string() ||
           command->as_string() != "subscribe_events" || epoch == nullptr ||
           !(epoch->is_null() ||

@@ -1,4 +1,4 @@
-// Chunk 8 groundwork tests for CollisionEngineMismatchLedger and the
+// Tests for CollisionEngineMismatchLedger and the
 // CollisionEngineCapabilityDescriptor schema. Behaviour under test:
 //   - bounded retention drops oldest first;
 //   - recent(0) returns every retained record newest-first;

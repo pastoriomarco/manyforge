@@ -1,4 +1,4 @@
-"""CP9 component stream health: sample sink (hermetic, no ROS graph)."""
+"""Component stream health: sample sink (hermetic, no ROS graph)."""
 
 from __future__ import annotations
 

@@ -17,39 +17,9 @@
 namespace manyforge::roboplan_backend {
 
 /// The component that owns one model instance in the cell graph.
-struct RetainedSceneFrameModelOwnerInput final {
-  core::ModelInstanceId model_instance_id;
-  core::ControllableComponentId controllable_component_id;
-};
-
-/// The retained frame a Program frame-role binding names. A frame of a tool
-/// mounted on the bound robot keeps its own component (its model's owner);
-/// the binding's component owns every other frame.
-[[nodiscard]] core::ResolvedComponentModelFrameDTO program_binding_frame(
-    const std::vector<RetainedSceneFrameModelOwnerInput> &model_owners,
-    const core::ControllableComponentId &binding_component,
-    const core::ProgramFrameRoleBindingDTO &frame);
-
-/// LOADFIX6: one owner row per model that ends a component-model frame path
-/// of the cell kinematic index, in path order; the owner is the index's
-/// `owner_of` (the cell graph). Passive models have no row.
-template <typename KinematicIndex>
-[[nodiscard]] std::vector<RetainedSceneFrameModelOwnerInput>
-retained_scene_frame_model_owners(const KinematicIndex &index) {
-  std::vector<RetainedSceneFrameModelOwnerInput> owners;
-  for (const auto &path : index.frame_paths()) {
-    const auto *terminal =
-        std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
-    if (terminal == nullptr ||
-        std::any_of(owners.begin(), owners.end(), [&](const auto &row) {
-          return row.model_instance_id == terminal->model_instance_id;
-        }))
-      continue;
-    if (const auto *owner = index.owner_of(terminal->model_instance_id))
-      owners.push_back({terminal->model_instance_id, *owner});
-  }
-  return owners;
-}
+/// Resolve the retained frame named by an exact component reference.
+[[nodiscard]] core::ResolvedComponentModelFrameDTO
+program_binding_frame(const core::ProgramFrameBindingDTO &frame);
 
 struct RetainedTargetSceneFrameInput final {
   core::ControllableComponentId controllable_component_id;
@@ -125,8 +95,6 @@ struct RetainedSceneFrameResolverInput final {
   core::CellId cell_id;
   std::string compiled_cell_frame_name;
   std::vector<core::KinematicFramePathDTO> frame_paths;
-  /// The owner of each model that ends a component-model frame path.
-  std::vector<RetainedSceneFrameModelOwnerInput> model_owners;
   std::vector<RetainedTargetSceneFrameInput> target_frames;
   std::vector<RetainedSceneFrameComponentAttachmentInput> component_attachments;
   /// G6: what each mounted component is mounted on.
@@ -136,8 +104,7 @@ struct RetainedSceneFrameResolverInput final {
 };
 
 /// One "express pose P, given in frame A, in frame B" query. Frames are
-/// `kCellFrame`, robot-qualified `kFrameRole`, or `kSceneResource` references;
-/// every robot frame must belong to a robot hosted by this cell resolver.
+/// `kCellFrame`, component frame, or `kSceneResource` references.
 struct RetainedSceneFrameTransformQuery final {
   core::Pose3DTO pose_in_source_frame;
   core::ReferenceDTO source_frame;
@@ -201,7 +168,6 @@ public:
         model_map.cell_frame().cell_id,
         model_map.cell_frame().compiled_frame_name,
         model_map.kinematic_index().frame_paths(),
-        retained_scene_frame_model_owners(model_map.kinematic_index()),
         {},
         {},
         retained_scene_frame_component_mounts(

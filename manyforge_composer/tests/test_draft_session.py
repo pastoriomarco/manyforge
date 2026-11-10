@@ -67,7 +67,7 @@ def _program(*, metadata: dict | None = None) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -80,7 +80,7 @@ def _program_with_instance_id(instance_id: str) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -113,7 +113,7 @@ def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 
@@ -156,16 +156,22 @@ def test_prepared_program_replacement_is_deeply_immutable() -> None:
     )
 
 
+_ARM = {"component_id": "isaac_lite6_trocar_robot", "command_target_id": "arm"}
+_GRIPPER = {"component_id": "lite_gripper", "command_target_id": "gripper"}
+_GRIPPER_TCP = {"component_id": "lite_gripper", "frame_id": "tcp"}
+_ARM_BASE = {"component_id": "isaac_lite6_trocar_robot", "frame_id": "base"}
+
+
 def _pick_macro_arguments() -> dict:
     return {
         "macro_id": "pick_subtree",
         "scene_resource_id": "graspable",
-        "target_role": "arm",
-        "tool_target_role": "gripper",
-        "base_frame_role": "base",
+        "target": _ARM,
+        "tool_target": _GRIPPER,
+        "base_frame": _ARM_BASE,
         "tcp_endpoint": {"kind": "current"},
-        "carrier_frame_role": "tcp",
-        "touch_body_roles": ["gripper_collision"],
+        "carrier_frame_ref": _GRIPPER_TCP,
+        "touch_bodies": [{"component_id": "lite_gripper", "collision_body_id": "gripper_collision"}],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
         "contact_policy_id": "selected_object_grasp",
         "blackboard_namespace_id": "planning",
@@ -426,8 +432,8 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
         "motion.follow_cartesian_path",
     ]
     assert all(child["children"] == [] for child in inserted["children"])
-    assert inserted["children"][0]["parameters"]["target_role"] == "arm"
-    assert inserted["children"][4]["parameters"]["target_role"] == "gripper"
+    assert inserted["children"][0]["parameters"]["target"] == _ARM
+    assert inserted["children"][4]["parameters"]["target"] == _GRIPPER
     declaration = next(
         row
         for row in snapshot["authoring"]["blackboard"]["keys"]
@@ -448,9 +454,9 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
 @pytest.mark.parametrize("selector", [
     None,
     {"kind": "current"},
-    {"kind": "default_of_role", "role": "gripper"},
+    {"kind": "default_of_target", "target": _GRIPPER},
     # The arm declares no tcp frame since the TCP migration (REGEN-A2).
-    {"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
+    {"kind": "entry", "target": _GRIPPER, "frame": _GRIPPER_TCP},
 ])
 def test_pick_authoring_macro_forwards_selector_to_planner_and_moves(selector) -> None:
     session = ComposerDraftSession(_pick_program())
@@ -531,7 +537,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
         approach_offset_m=[0.0, 0.0, 0.08],
     )
     arguments.pop("contact_policy_id")
-    arguments.pop("touch_body_roles")
+    arguments.pop("touch_bodies")
 
     result = _mutate(
         session,
@@ -584,7 +590,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             "motion.move_to_pose",
             "tcp_pose",
             {
-                "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
                 "current_tcp_pose": {
                     "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -592,7 +598,7 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
             },
             {
                 "goal": {
-                    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                    "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
                     "position_m": [0.1, 0.2, 0.3],
                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
                 }
@@ -612,8 +618,8 @@ def test_store_observed_move_updates_only_selected_node(
     node["node_id"] = node_id
     node["instance_id"] = "observed_target"
     node["parameters"] = {
-        "target_role": "arm",
-        "base_frame_role": "base",
+        "target": _ARM,
+        "base_frame": _ARM_BASE,
         "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
         "goal": (
             [{"joint_name": "joint1", "position_rad": 0.0}]
@@ -635,7 +641,7 @@ def test_store_observed_move_updates_only_selected_node(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -661,7 +667,7 @@ def test_store_observed_move_updates_only_selected_node(
 def test_store_observed_pose_replaces_old_goal_source_and_relative_target() -> None:
     session = ComposerDraftSession(_pick_program())
     observed = {
-        "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+        "frame_ref": {"kind": "target_frame", "frame": _ARM_BASE},
         "current_tcp_pose": {
             "position_m": {"x_m": 0.4, "y_m": 0.2, "z_m": 0.1},
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
@@ -1131,8 +1137,7 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     assert authoring["program_id"].startswith("program-")
     assert len(authoring["program_id"]) == len("program-") + 32
     assert authoring["forest"] == []
-    assert authoring["component_roles"] == {}
-    assert authoring["target_roles"] == {}
+    assert "component_roles" not in authoring and "target_roles" not in authoring
     assert {
         row["parameter_id"]: row["default"] for row in authoring["parameters"]
     } == {
@@ -1578,9 +1583,7 @@ def test_relative_orientation_resolves_to_absolute_and_preserves_metadata() -> N
     resource["pose"] = {
         "frame_ref": {
             "kind": "component_frame",
-            "component_role": "robot",
-            "model_role": "arm_model",
-            "frame_role": "base",
+            "frame": {"component_id": "ur5_robot", "frame_id": "base"},
         },
         "position_m": [0.5, 0.0, 0.4],
         "rotate_local_rpy_deg": [0.0, 0.0, 90.0],
@@ -1627,9 +1630,7 @@ def test_every_source_local_relative_orientation_form_becomes_absolute(
     resource["pose"] = {
         "frame_ref": {
             "kind": "component_frame",
-            "component_role": "robot",
-            "model_role": "arm_model",
-            "frame_role": "base",
+            "frame": {"component_id": "ur5_robot", "frame_id": "base"},
         },
         "position_m": [0.5, 0.0, 0.4],
         **intent,
@@ -1886,50 +1887,19 @@ def test_tree_delete_removes_only_the_node_and_detaches_direct_children() -> Non
         assert instance_id in deleted_nested.snapshot["authoring"]["positions"]
 
 
-def test_program_role_requirements_replace_through_one_operator_mutation() -> None:
-    session = ComposerDraftSession(_program())
-    before = session.snapshot()
-    component_roles = deepcopy(before["authoring"]["component_roles"])
-    component_roles["inspection_tool"] = {
-        "required_component_type_tags": ["camera"]
-    }
-
-    replaced = _mutate(
-        session,
-        "program_draft_replace_roles",
-        {
-            "component_roles": component_roles,
-            "target_roles": before["authoring"]["target_roles"],
-        },
-    )
-
-    assert replaced.mutation in OPERATOR_DRAFT_MUTATIONS
-    assert replaced.details["component_role_count"] == len(component_roles)
-    assert replaced.snapshot["authoring"]["component_roles"] == {
-        key: component_roles[key] for key in sorted(component_roles)
-    }
-    assert replaced.snapshot["program"] is not None
-
-    retained = session.snapshot()
-    with pytest.raises(DraftSessionError) as invalid:
-        _mutate(
-            session,
-            "program_draft_replace_roles",
-            {"component_roles": [], "target_roles": {}},
+def test_removed_role_replacement_is_not_an_operator_mutation() -> None:
+    assert "program_draft_replace_roles" not in OPERATOR_DRAFT_MUTATIONS
+    with pytest.raises(DraftSessionError) as refused:
+        ComposerDraftSession()._edit(
+            {}, tool_id="program_draft_replace_roles", arguments={},
+            catalog=build_node_environment().catalog,
         )
-    assert invalid.value.code == "draft_arguments_invalid"
-    assert session.snapshot() == retained
+    assert refused.value.code == "composer_draft_tool_unsupported"
 
 
 def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
     session = ComposerDraftSession(_lite6_program_with_literal_tcp_limit())
     initial_revision = session.revision
-    bindings = {
-        "velocity_scale": "velocity_scale",
-        "acceleration_scale": "acceleration_scale",
-        "translation_tol_m": "translation_tol_m",
-        "blend_radius_m": "blend_radius_m",
-    }
 
     updated = _mutate(
         session,
@@ -1940,7 +1910,6 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
             "acceleration_scale": 0.7,
             "translation_tol_m": 0.004,
             "blend_radius_m": 0.02,
-            "parameter_bindings": bindings,
             "conflict_resolution": "reject",
         },
     )
@@ -1966,6 +1935,11 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         "program_draft_update_motion_defaults",
         {"mode": "restore", "config": updated.details["previous_config"]},
     )
+    restored_declarations = {
+        row["parameter_id"]: row["default"]
+        for row in restored.snapshot["authoring"]["parameters"]
+    }
+    assert restored_declarations["velocity_scale"] == 0.4
     restored_move = next(
         child
         for child in restored.snapshot["authoring"]["forest"][0]["children"]
@@ -1997,12 +1971,6 @@ def test_program_motion_defaults_reject_invalid_values_without_mutation(
         "acceleration_scale": 1.0,
         "translation_tol_m": 0.005,
         "blend_radius_m": 0.01,
-        "parameter_bindings": {
-            "velocity_scale": "velocity_scale",
-            "acceleration_scale": "acceleration_scale",
-            "translation_tol_m": "translation_tol_m",
-            "blend_radius_m": "blend_radius_m",
-        },
         "conflict_resolution": "reject",
     }
     arguments[field] = value
@@ -2014,167 +1982,282 @@ def test_program_motion_defaults_reject_invalid_values_without_mutation(
     assert session.revision == initial_revision
 
 
-def test_new_motion_node_defaults_to_program_motion_references() -> None:
-    catalog = build_node_environment().catalog
-    program = Program(_LITE6_PROGRAM_PATH, catalog)
-    document = program.to_dict()
-    node = deepcopy(document["tree"]["children"][1])
-    node["instance_id"] = "new_program_limited_move"
-    sources = node.setdefault("value_sources", {})
-    for field, value in (
-        ("velocity_scale", 0.9),
-        ("acceleration_scale", 0.8),
-        ("translation_tol_m", 0.004),
-    ):
-        sources.pop(field, None)
-        node["parameters"][field] = value
-    session = ComposerDraftSession(program)
+def _lite6_document_with(
+    *,
+    drop_parameters: tuple[str, ...] = (),
+    add_parameters: tuple[dict, ...] = (),
+) -> Program:
+    """The Lite 6 example without some motion-default declarations (their
+    node sources dropped too), or with extra Program parameters."""
 
-    inserted = _mutate(
-        session,
-        "tree_draft_insert_node",
-        {"parent_instance_id": "@root", "node": node},
-    )
-
-    authored = next(
-        child
-        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
-        if child["instance_id"] == "new_program_limited_move"
-    )
-    for field in (
-        "velocity_scale",
-        "acceleration_scale",
-        "translation_tol_m",
-    ):
-        assert field not in authored["parameters"]
-        assert authored["value_sources"][field] == {
-            "kind": "program_parameter",
-            "reference": field,
-        }
-
-
-def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
-    catalog = build_node_environment().catalog
-    program = Program(_LITE6_PROGRAM_PATH, catalog)
-    session = ComposerDraftSession(program)
-    node = {
-        "instance_id": "new_cartesian_move",
-        "node_id": "motion.follow_cartesian_path",
-        "parameters": {
-            "target_role": "arm",
-            "base_frame_role": "base",
-            "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
-            "translation_tol_m": 0.002,
-            "blend_radius_m": 0.03,
-        },
-        "value_sources": {
-            "path": {
-                "kind": "blackboard_key",
-                "reference": "planning.cartesian_path",
-            },
-        },
-        "children": [],
-    }
-
-    inserted = _mutate(
-        session,
-        "tree_draft_insert_node",
-        {"parent_instance_id": "@root", "node": node},
-    )
-
-    authored = next(
-        child
-        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
-        if child["instance_id"] == "new_cartesian_move"
-    )
-    for field in ("translation_tol_m", "blend_radius_m"):
-        assert field not in authored["parameters"]
-        assert authored["value_sources"][field] == {
-            "kind": "program_parameter",
-            "reference": field,
-        }
-
-
-def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_names() -> None:
     catalog = build_node_environment().catalog
     document = Program(_LITE6_PROGRAM_PATH, catalog).to_dict()
-    aliases = {
-        "velocity_scale": "cycle_velocity",
-        "acceleration_scale": "cycle_acceleration",
-        "translation_tol_m": "cycle_path_tolerance",
-    }
-    for declaration in document["parameters"]:
-        parameter_id = declaration["parameter_id"]
-        if parameter_id in aliases:
-            declaration["parameter_id"] = aliases[parameter_id]
-    document["parameters"].sort(key=lambda row: row["parameter_id"])
-
+    document["parameters"] = sorted(
+        [
+            row
+            for row in document["parameters"]
+            if row["parameter_id"] not in drop_parameters
+        ]
+        + [deepcopy(row) for row in add_parameters],
+        key=lambda row: row["parameter_id"],
+    )
     pending = [document["tree"]]
     while pending:
         current = pending.pop()
-        for source in current.get("value_sources", {}).values():
-            reference = source.get("reference")
-            if source.get("kind") == "program_parameter" and reference in aliases:
-                source["reference"] = aliases[reference]
+        sources = current.get("value_sources", {})
+        for field in drop_parameters:
+            sources.pop(field, None)
+        if "value_sources" in current and not sources:
+            current.pop("value_sources")
         pending.extend(current.get("children", []))
     document["program_revision"] = compute_content_identity(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
-    session = ComposerDraftSession(Program.from_dict(document, catalog))
+    return Program.from_dict(document, catalog)
 
-    updated = _mutate(
-        session,
-        "program_draft_update_motion_defaults",
-        {
-            "mode": "update",
-            "velocity_scale": 0.3,
-            "acceleration_scale": 0.6,
-            "translation_tol_m": 0.004,
-            "blend_radius_m": 0.02,
-            "parameter_bindings": {
-                **aliases,
-                "blend_radius_m": "blend_radius_m",
-            },
-            "conflict_resolution": "reject",
-        },
-    )
-    declarations = {
-        row["parameter_id"]: row["default"]
-        for row in updated.snapshot["authoring"]["parameters"]
+
+def _authored(snapshot: dict, instance_id: str) -> dict:
+    pending = list(snapshot["authoring"]["forest"])
+    while pending:
+        node = pending.pop()
+        if node["instance_id"] == instance_id:
+            return node
+        pending.extend(node.get("children", []))
+    raise AssertionError(instance_id)
+
+
+def _unset_move(instance_id: str, node_id: str = "motion.move_to_pose") -> dict:
+    """A Lite 6 motion node with every motion-default field unset."""
+
+    document = Program(_LITE6_PROGRAM_PATH, build_node_environment().catalog).to_dict()
+    node = deepcopy(next(
+        child for child in document["tree"]["children"]
+        if child["instance_id"] == "move_to_pick_approach"
+    ))
+    node["instance_id"] = instance_id
+    node["node_id"] = node_id
+    for field in ("velocity_scale", "acceleration_scale", "translation_tol_m", "blend_radius_m"):
+        node["parameters"].pop(field, None)
+        node.setdefault("value_sources", {}).pop(field, None)
+    return node
+
+
+_INHERIT = {
+    field: {"kind": "program_parameter", "reference": field}
+    for field in ("velocity_scale", "acceleration_scale", "translation_tol_m", "blend_radius_m")
+}
+
+
+def test_insert_keeps_set_motion_values_and_sources_at_every_depth() -> None:
+    session = ComposerDraftSession(_lite6_document_with(
+        add_parameters=({"parameter_id": "cycle_velocity", "type": "float64", "default": 0.2},),
+    ))
+    top = _unset_move("kept_top")
+    top["parameters"].update({"velocity_scale": 0.3, "translation_tol_m": 0.002})
+    nested = _unset_move("kept_nested")
+    nested["value_sources"]["velocity_scale"] = {
+        "kind": "program_parameter", "reference": "cycle_velocity",
     }
-    assert declarations["cycle_velocity"] == 0.3
-    assert declarations["cycle_acceleration"] == 0.6
-    assert declarations["cycle_path_tolerance"] == 0.004
-    assert declarations["blend_radius_m"] == 0.02
-    assert not set(aliases).intersection(declarations)
+    nested["parameters"]["acceleration_scale"] = 0.5
+    subtree = {
+        "node_id": "sequence",
+        "instance_id": "kept_sequence",
+        "parameters": {},
+        "children": [top, {
+            "node_id": "sequence",
+            "instance_id": "kept_inner",
+            "parameters": {},
+            "children": [nested],
+        }],
+    }
 
-    node = deepcopy(updated.snapshot["authoring"]["forest"][0]["children"][1])
-    node["instance_id"] = "new_aliased_program_limited_move"
-    node["parameters"].update({
-        "velocity_scale": 0.9,
-        "acceleration_scale": 0.8,
-        "translation_tol_m": 0.003,
-    })
-    node.pop("value_sources", None)
+    inserted = _mutate(
+        session, "tree_draft_insert_node", {"parent_instance_id": "@root", "node": subtree},
+    )
+
+    authored_top = _authored(inserted.snapshot, "kept_top")
+    assert authored_top["parameters"]["velocity_scale"] == 0.3
+    assert authored_top["parameters"]["translation_tol_m"] == 0.002
+    assert "velocity_scale" not in authored_top["value_sources"]
+    assert "translation_tol_m" not in authored_top["value_sources"]
+    assert authored_top["value_sources"]["acceleration_scale"] == _INHERIT["acceleration_scale"]
+    authored_nested = _authored(inserted.snapshot, "kept_nested")
+    assert authored_nested["value_sources"]["velocity_scale"] == {
+        "kind": "program_parameter", "reference": "cycle_velocity",
+    }
+    assert authored_nested["parameters"]["acceleration_scale"] == 0.5
+    assert "acceleration_scale" not in authored_nested["value_sources"]
+    assert authored_nested["value_sources"]["translation_tol_m"] == _INHERIT["translation_tol_m"]
+
+
+def test_insert_of_a_subtree_binds_unset_nested_motion_fields() -> None:
+    session = ComposerDraftSession(_lite6_document_with())
+    subtree = {
+        "node_id": "sequence",
+        "instance_id": "inherit_sequence",
+        "parameters": {},
+        "children": [
+            _unset_move("inherit_pose"),
+            {
+                "node_id": "sequence",
+                "instance_id": "inherit_inner",
+                "parameters": {},
+                "children": [_unset_move("inherit_deep")],
+            },
+        ],
+    }
+
+    inserted = _mutate(
+        session, "tree_draft_insert_node", {"parent_instance_id": "@root", "node": subtree},
+    )
+
+    assert "value_sources" not in _authored(inserted.snapshot, "inherit_sequence")
+    for instance_id in ("inherit_pose", "inherit_deep"):
+        node = _authored(inserted.snapshot, instance_id)
+        for field in ("velocity_scale", "acceleration_scale", "translation_tol_m"):
+            assert field not in node["parameters"]
+            assert node["value_sources"][field] == _INHERIT[field]
+        # Move to pose has no corner blend radius.
+        assert "blend_radius_m" not in node["value_sources"]
+
+
+def test_insert_leaves_undeclared_motion_fields_unset() -> None:
+    session = ComposerDraftSession(_lite6_document_with(
+        drop_parameters=("velocity_scale", "translation_tol_m"),
+    ))
+
     inserted = _mutate(
         session,
         "tree_draft_insert_node",
-        {"parent_instance_id": "@root", "node": node},
+        {"parent_instance_id": "@root", "node": _unset_move("partly_declared")},
     )
-    authored = next(
-        child
-        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
-        if child["instance_id"] == "new_aliased_program_limited_move"
+
+    node = _authored(inserted.snapshot, "partly_declared")
+    for field in ("velocity_scale", "translation_tol_m"):
+        assert field not in node["parameters"]
+        assert field not in node["value_sources"]
+    assert node["value_sources"]["acceleration_scale"] == _INHERIT["acceleration_scale"]
+
+
+def test_renamed_parameters_are_not_motion_defaults() -> None:
+    session = ComposerDraftSession(_lite6_document_with(
+        drop_parameters=("velocity_scale",),
+        add_parameters=({"parameter_id": "cycle_velocity", "type": "float64", "default": 0.3},),
+    ))
+
+    inserted = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {"parent_instance_id": "@root", "node": _unset_move("unaliased")},
     )
-    for field, reference in aliases.items():
-        assert field not in authored["parameters"]
-        assert authored["value_sources"][field] == {
-            "kind": "program_parameter",
-            "reference": reference,
-        }
+    assert "velocity_scale" not in _authored(inserted.snapshot, "unaliased")["value_sources"]
+    with pytest.raises(DraftSessionError) as stale:
+        _mutate(session, "program_draft_update_motion_defaults", {
+            "mode": "update", "velocity_scale": 0.2, "conflict_resolution": "reject",
+        })
+    assert stale.value.code == "program_motion_binding_stale"
+
+
+def test_replace_and_change_kind_bind_unset_motion_fields() -> None:
+    session = ComposerDraftSession(_lite6_document_with())
+    _mutate(session, "tree_draft_insert_node", {
+        "parent_instance_id": "@root",
+        "node": {"node_id": "sequence", "instance_id": "swap_me", "parameters": {}, "children": []},
+    })
+
+    replaced = _mutate(session, "tree_draft_replace_subtree", {
+        "instance_id": "swap_me",
+        "subtree": {
+            "node_id": "sequence",
+            "instance_id": "swapped",
+            "parameters": {},
+            "children": [_unset_move("swapped_move")],
+        },
+    })
+    node = _authored(replaced.snapshot, "swapped_move")
+    assert node["value_sources"]["velocity_scale"] == _INHERIT["velocity_scale"]
+
+    changed = _mutate(session, "tree_draft_change_node_kind", {
+        "instance_id": "swapped_move",
+        "replacement": {"node_id": "motion.follow_cartesian_path", "parameters": {}},
+        "parameters_mode": "replace",
+    })
+    node = _authored(changed.snapshot, "swapped_move")
+    for field in ("velocity_scale", "acceleration_scale", "translation_tol_m", "blend_radius_m"):
+        assert node["value_sources"][field] == _INHERIT[field]
+
+
+def test_pick_macro_children_inherit_unset_motion_fields() -> None:
+    catalog = build_node_environment().catalog
+    document = _pick_program().to_dict()
+    document["parameters"] = sorted(
+        document["parameters"] + [
+            {"parameter_id": "acceleration_scale", "type": "float64", "default": 0.8},
+            {"parameter_id": "translation_tol_m", "type": "float64", "default": 0.004},
+            {"parameter_id": "blend_radius_m", "type": "float64", "default": 0.0},
+        ],
+        key=lambda row: row["parameter_id"],
+    )
+    pending = [document["tree"]]
+    while pending:
+        current = pending.pop()
+        available = {parameter.id for parameter in catalog.get(current["node_id"]).parameters}
+        for field in ("acceleration_scale", "translation_tol_m", "blend_radius_m"):
+            if field in available and field not in current["parameters"]:
+                current.setdefault("value_sources", {})[field] = _INHERIT[field]
+        if "value_sources" in current:
+            current["value_sources"] = dict(sorted(current["value_sources"].items()))
+        pending.extend(current.get("children", []))
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v3",
+    )
+    session = ComposerDraftSession(Program.from_dict(document, catalog))
+
+    _mutate(session, "program_draft_expand_authoring_macro", _pick_macro_arguments())
+
+    snapshot = session.snapshot()
+    approach = _authored(snapshot, "authored_pick.approach")
+    descend = _authored(snapshot, "authored_pick.descend")
+    # Without phase speeds in the motion options, every field inherits.
+    for node in (approach, descend):
+        assert "velocity_scale" not in node["parameters"]
+        assert node["value_sources"]["velocity_scale"] == _INHERIT["velocity_scale"]
+        for field in ("acceleration_scale", "translation_tol_m"):
+            assert field not in node["parameters"]
+            assert node["value_sources"][field] == _INHERIT[field]
+    assert descend["value_sources"]["blend_radius_m"] == _INHERIT["blend_radius_m"]
+
+
+def test_motion_defaults_update_leaves_dynamic_sources_alone() -> None:
+    session = ComposerDraftSession(_lite6_document_with(
+        add_parameters=({"parameter_id": "cycle_velocity", "type": "float64", "default": 0.2},),
+    ))
+    dynamic = _unset_move("dynamic_speed")
+    dynamic["value_sources"]["velocity_scale"] = {
+        "kind": "program_parameter", "reference": "cycle_velocity",
+    }
+    _mutate(session, "tree_draft_insert_node", {"parent_instance_id": "@root", "node": dynamic})
+
+    updated = _mutate(session, "program_draft_update_motion_defaults", {
+        "mode": "update", "velocity_scale": 0.1, "conflict_resolution": "reject",
+    })
+
+    node = _authored(updated.snapshot, "dynamic_speed")
+    assert node["value_sources"]["velocity_scale"] == {
+        "kind": "program_parameter", "reference": "cycle_velocity",
+    }
+    assert updated.details["reduced_node_fields"] == []
+    declarations = {
+        row["parameter_id"]: row["default"] for row in updated.snapshot["authoring"]["parameters"]
+    }
+    assert declarations["velocity_scale"] == 0.1
+    assert declarations["acceleration_scale"] == 1.0
 
 
 def test_authoring_forest_retains_incomplete_topology_until_it_derives_a_program() -> None:
@@ -2564,7 +2647,42 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
             },
         },
     )
+    invoke(
+        "program_draft_upsert_contact_policies",
+        {
+            "contact_policies": [
+                {
+                    "api_version": "manyforge.contact_policy.v1",
+                    "policy_id": "scratch_grasp",
+                    "mode": "contact_grasp",
+                    "sensing_mode": "geometry_only",
+                    "default_unmatched_response": "hard_stop",
+                    "zones": [
+                        {
+                            "zone_id": "fingertips",
+                            "body_pairs": [
+                                {
+                                    "body_a": {"kind": "motion_endpoint"},
+                                    "body_b": {
+                                        "kind": "runtime_object",
+                                        "runtime_object_id": "scratch_object",
+                                    },
+                                }
+                            ],
+                            "max_penetration_m": 0.002,
+                            "terminal_window_start_fraction": 0.8,
+                            "violation_response": "hard_stop",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
 
+    invoke(
+        "program_draft_remove_contact_policies",
+        {"contact_policy_ids": ["scratch_grasp"]},
+    )
     invoke(
         "program_draft_remove_parameters",
         {"parameter_ids": ["scratch_limit"]},
@@ -2586,6 +2704,10 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
     assert operator_result.mutation not in SUPPORTED_DRAFT_MUTATIONS
     assert session.snapshot()["saved"] is False
     assert session.snapshot()["applied"] is False
+
+
+_LITE6_ARM = {"component_id": "lite6_robot", "command_target_id": "arm"}
+_LITE6_BASE = {"component_id": "lite6_robot", "frame_id": "base"}
 
 
 def _lite6_program() -> Program:
@@ -2615,7 +2737,7 @@ def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
             "node": {
                 "node_id": "motion.move_to_pose",
                 "instance_id": "new_move",
-                "parameters": {"base_frame_role": "base"},
+                "parameters": {"base_frame": _LITE6_BASE},
                 "children": [],
             },
         },
@@ -2625,11 +2747,13 @@ def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
     node = _find_node(authoring["forest"][0], "new_move")
     assert node is not None
     assert node["parameters"]["tcp_endpoint"] == {"kind": "current"}
-    # Current declares no frame role.
-    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base"]
 
 
-def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
+_LITE6_FLANGE_ENTRY = {"kind": "entry", "target": _LITE6_ARM,
+                       "frame": {"component_id": "lite6_robot", "frame_id": "flange"}}
+
+
+def test_an_explicit_endpoint_is_kept_on_insert() -> None:
     session = ComposerDraftSession(_lite6_program())
     result = _mutate(
         session,
@@ -2641,9 +2765,9 @@ def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
                 "node_id": "motion.move_to_pose",
                 "instance_id": "flange_move",
                 "parameters": {
-                    "target_role": "arm",
-                    "base_frame_role": "base",
-                    "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+                    "target": _LITE6_ARM,
+                    "base_frame": _LITE6_BASE,
+                    "tcp_endpoint": _LITE6_FLANGE_ENTRY,
                 },
                 "children": [],
             },
@@ -2651,18 +2775,17 @@ def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
     )
     authoring = result.snapshot["authoring"]
     node = _find_node(authoring["forest"][0], "flange_move")
-    assert node["parameters"]["tcp_endpoint"] == {"kind": "entry", "target_role": "arm", "frame_role": "flange"}
-    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base", "flange"]
+    assert node["parameters"]["tcp_endpoint"] == _LITE6_FLANGE_ENTRY
 
 
-def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:
-    """Design §3: picking a TCP adds its frame role to the target role."""
+def test_picking_a_tcp_entry_is_one_edit() -> None:
+    """Picking a TCP is one Draft edit carrying the direct reference."""
 
     session = ComposerDraftSession(_lite6_program())
     node = _find_node(session.snapshot()["program"]["tree"], "move_to_rest")
     assert node is not None
     parameters = {**node["parameters"],
-                  "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "pen"}}
+                  "tcp_endpoint": _LITE6_FLANGE_ENTRY}
     revision = session.revision
     result = _mutate(
         session,
@@ -2676,26 +2799,9 @@ def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:
         },
     )
     assert session.revision == revision + 1
-    program = result.snapshot["program"]
-    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "pen"]
-    assert _find_node(program["tree"], "move_to_rest")["parameters"]["tcp_endpoint"] == {
-        "kind": "entry", "target_role": "arm", "frame_role": "pen",
-    }
-
-
-def test_tcp_entry_declaration_covers_set_tcp_and_keeps_other_selectors_symbolic() -> None:
-    from manyforge_composer.backend.draft_session import _declare_motion_endpoint
-
-    document = {"target_roles": {"tool": {"required_frame_roles": ["base"]}}}
-    _declare_motion_endpoint(document, {"tcp": {
-        "kind": "entry", "target_role": "tool", "frame_role": "tip",
-    }})
-    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
-    _declare_motion_endpoint(document, {"tcp_endpoint": {"kind": "current"}})
-    _declare_motion_endpoint(document, {"tcp_endpoint": {
-        "kind": "default_of_role", "role": "tool",
-    }})
-    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
+    authoring = result.snapshot["authoring"]
+    assert _find_node(authoring["forest"][0], "move_to_rest")["parameters"][
+        "tcp_endpoint"] == _LITE6_FLANGE_ENTRY
 
 
 @pytest.mark.parametrize("selector", [
@@ -2711,3 +2817,174 @@ def test_pick_authoring_macro_rejects_invalid_tcp_selector(selector) -> None:
     with pytest.raises(DraftSessionError):
         _mutate(session, "program_draft_expand_authoring_macro", arguments)
     assert session.retained_state() == before
+
+
+# Every tool argument the assistant schema offers @root for, with its
+# arguments; the alias resolves the same way everywhere.
+_ROOT_ALIAS_CALLS = {
+    "tree_draft_insert_node": {"parent_instance_id": "@root", "node": {
+        "node_id": "timer", "instance_id": "alias_timer",
+        "parameters": {"duration_s": 0.1}, "children": []}},
+    "tree_draft_move_node": {"instance_id": "alias_child", "new_parent_instance_id": "@root"},
+    "tree_draft_wrap_node": {"target_instance_id": "@root", "wrapper": {
+        "node_id": "fallback", "instance_id": "alias_wrapper", "parameters": {}}},
+    "tree_draft_update_node_params": {
+        "instance_id": "@root", "expected_node_id": "sequence", "parameters": {}},
+    "tree_draft_change_node_kind": {"instance_id": "@root", "replacement": {
+        "node_id": "fallback", "parameters": {}}, "parameters_mode": "replace"},
+    "tree_draft_replace_subtree": {"instance_id": "@root", "subtree": {
+        "node_id": "sequence", "instance_id": "alias_root", "parameters": {},
+        "children": []}},
+}
+
+
+def _root_alias_session(*, top_level: int) -> ComposerDraftSession:
+    """A Draft whose root is a sequence with a child alias_child, or N roots."""
+
+    session = ComposerDraftSession(_program())
+    root = session.snapshot()["authoring"]["forest"][0]
+    for child in root["children"]:
+        _mutate(session, "tree_draft_delete_node", {"instance_id": child["instance_id"]})
+    _mutate(session, "tree_draft_change_node_kind", {
+        "instance_id": root["instance_id"],
+        "replacement": {"node_id": "sequence", "parameters": {}},
+        "parameters_mode": "replace"})
+    _mutate(session, "tree_draft_insert_node", {"parent_instance_id": root["instance_id"], "node": {
+        "node_id": "timer", "instance_id": "alias_child",
+        "parameters": {"duration_s": 0.1}, "children": []}})
+    if top_level != 1:
+        _mutate(session, "tree_draft_insert_node", {"parent_instance_id": root["instance_id"], "node": {
+            "node_id": "timer", "instance_id": "alias_second",
+            "parameters": {"duration_s": 0.1}, "children": []}})
+        _mutate(session, "tree_draft_delete_node", {"instance_id": root["instance_id"]})
+    return session
+
+
+@pytest.mark.parametrize("tool_id", sorted(_ROOT_ALIAS_CALLS))
+def test_root_alias_names_the_single_root_node_in_every_tool(tool_id: str) -> None:
+    session = _root_alias_session(top_level=1)
+    root_id = session.snapshot()["authoring"]["forest"][0]["instance_id"]
+    result = _mutate(session, tool_id, deepcopy(_ROOT_ALIAS_CALLS[tool_id]))
+    forest = session.snapshot()["authoring"]["forest"]
+    assert len(forest) == 1
+    if tool_id == "tree_draft_wrap_node":
+        assert forest[0]["instance_id"] == "alias_wrapper"
+        assert forest[0]["children"][0]["instance_id"] == root_id
+    elif tool_id == "tree_draft_replace_subtree":
+        assert forest[0]["instance_id"] == "alias_root"
+    else:
+        assert forest[0]["instance_id"] == root_id
+    assert result is not None
+
+
+@pytest.mark.parametrize("tool_id", sorted(_ROOT_ALIAS_CALLS))
+def test_root_alias_without_a_single_root_says_why(tool_id: str) -> None:
+    session = _root_alias_session(top_level=2)
+    with pytest.raises(DraftSessionError) as error:
+        _mutate(session, tool_id, deepcopy(_ROOT_ALIAS_CALLS[tool_id]))
+    assert error.value.code == "draft_node_not_found"
+    assert "@root names the Program's one root node, but the Draft has 2 " \
+        "top-level nodes: alias_child, alias_second" in str(error.value)
+
+
+@pytest.mark.parametrize(("value", "valid"), [(0.3, True), (0.4, True), (0.5, False)])
+def test_one_node_gets_its_own_value_for_a_bound_motion_parameter(
+    value: float, valid: bool
+) -> None:
+    """A merged literal replaces that parameter's binding on one node only;
+    the literal stays within the Program motion ceiling (velocity_scale 0.4)."""
+
+    session = ComposerDraftSession(
+        Program(_LITE6_PROGRAM_PATH, build_node_environment().catalog))
+    result = _mutate(session, "tree_draft_update_node_params", {
+        "instance_id": "move_to_rest",
+        "expected_node_id": "motion.move_to_joint_target",
+        "parameters": {"velocity_scale": value},
+    })
+    nodes = {}
+    pending = list(result.snapshot["authoring"]["forest"])
+    while pending:
+        node = pending.pop()
+        nodes[node["instance_id"]] = node
+        pending.extend(node.get("children", []))
+    rest = nodes["move_to_rest"]
+    assert rest["parameters"]["velocity_scale"] == value
+    assert "velocity_scale" not in rest["value_sources"]
+    assert rest["value_sources"]["acceleration_scale"] == {
+        "kind": "program_parameter", "reference": "acceleration_scale"}
+    others = [n for i, n in nodes.items()
+              if i != "move_to_rest" and "velocity_scale" in n.get("value_sources", {})]
+    assert others
+    if valid:
+        assert result.snapshot["program"] is not None
+    else:
+        assert result.snapshot["program"] is None
+        assert any("must not exceed Program velocity_scale=0.4" in row["message"]
+                   for row in result.snapshot["diagnostics"])
+
+
+
+def test_move_and_insert_results_name_the_new_neighbours() -> None:
+    session = _root_alias_session(top_level=1)
+    root = session.snapshot()["authoring"]["forest"][0]["instance_id"]
+    for instance_id in ("second", "third"):
+        _mutate(session, "tree_draft_insert_node", {"parent_instance_id": root, "node": {
+            "node_id": "timer", "instance_id": instance_id,
+            "parameters": {"duration_s": 0.1}, "children": []}})
+    inserted = _mutate(session, "tree_draft_insert_node", {
+        "after_instance_id": "alias_child", "node": {
+            "node_id": "timer", "instance_id": "between",
+            "parameters": {"duration_s": 0.1}, "children": []}})
+    assert inserted.details["now_between"] == ["alias_child", "second"]
+    # The index counts positions after the moved node is taken out.
+    moved = _mutate(session, "tree_draft_move_node", {
+        "instance_id": "alias_child", "new_parent_instance_id": root, "index": 3})
+    assert moved.details["now_between"] == ["third", None]
+    children = [c["instance_id"] for c in session.snapshot()["authoring"]["forest"][0]["children"]]
+    assert children == ["between", "second", "third", "alias_child"]
+
+
+def test_reused_instance_id_refusal_says_where_the_existing_node_is() -> None:
+    session = ComposerDraftSession(_program())
+    timer = {"node_id": "timer", "parameters": {"duration_s": 0.1}, "children": []}
+    _mutate(session, "tree_draft_insert_node", {
+        "parent_instance_id": "main_sequence",
+        "node": {"node_id": "sequence", "instance_id": "inner", "parameters": {},
+                 "children": [{**timer, "instance_id": "a"}, {**timer, "instance_id": "settle"}]},
+    })
+    where = "settle already exists (timer, child 1 of inner): "
+    before = session.snapshot()
+
+    # Nested reuse (detected on the whole candidate forest).
+    with pytest.raises(DraftSessionError) as nested:
+        _mutate(session, "tree_draft_insert_node", {
+            "parent_instance_id": "main_sequence",
+            "node": {"node_id": "parallel", "instance_id": "both", "parameters": {},
+                     "children": [{**timer, "instance_id": "settle"}]},
+        })
+    assert nested.value.code == "composer_authoring_node_duplicate"
+    assert str(nested.value).startswith(where)
+    assert "tree_draft_move_node" in str(nested.value)
+    assert "give it a new instance_id" in str(nested.value)
+
+    # Same for replace_subtree and for a top-level insert or wrap id.
+    with pytest.raises(DraftSessionError) as replaced:
+        _mutate(session, "tree_draft_replace_subtree", {
+            "instance_id": "move_to_pick",
+            "subtree": {"node_id": "sequence", "instance_id": "seq2", "parameters": {},
+                        "children": [{**timer, "instance_id": "settle"}]},
+        })
+    assert replaced.value.code == "composer_authoring_node_duplicate"
+    assert str(replaced.value).startswith(where)
+    with pytest.raises(DraftSessionError) as inserted:
+        _mutate(session, "tree_draft_insert_node", {
+            "parent_instance_id": "main_sequence", "node": {**timer, "instance_id": "settle"}})
+    assert inserted.value.code == "draft_node_exists"
+    assert str(inserted.value).startswith(where)
+    with pytest.raises(DraftSessionError) as wrapped:
+        _mutate(session, "tree_draft_wrap_node", {
+            "target_instance_id": "move_to_pick",
+            "wrapper": {"node_id": "sequence", "instance_id": "main_sequence", "parameters": {}},
+        })
+    assert str(wrapped.value).startswith("main_sequence already exists (sequence, top-level node 0): ")
+    assert session.snapshot() == before

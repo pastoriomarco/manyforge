@@ -17,7 +17,7 @@ constexpr std::int64_t kMs = 1'000'000;
 class ComponentStreamHealthTest : public ::testing::Test {
  protected:
   ComponentStreamHealthTest() {
-    clock_.set(1'000 * kMs);
+    clock_->set(1'000 * kMs);
     token_ = health_.SetListener([this](const ControllableComponentId& component,
                                         const ComponentStreamVerdictDTO& verdict) {
       verdicts_[component.value()] = verdict;
@@ -26,9 +26,9 @@ class ComponentStreamHealthTest : public ::testing::Test {
   }
 
   /// Runs every due Monitoring callback at the current time.
-  void Run() { scheduler_.advance_to(clock_.now(), SchedulerPriority::Monitoring); }
+  void Run() { scheduler_.advance_to(clock_->now(), SchedulerPriority::Monitoring); }
   void Advance(std::int64_t ns) {
-    clock_.advance(ns);
+    clock_->advance(ns);
     Run();
   }
 
@@ -45,7 +45,7 @@ class ComponentStreamHealthTest : public ::testing::Test {
     return rows.at(index);
   }
 
-  FakeClock clock_;
+  std::shared_ptr<FakeClock> clock_{std::make_shared<FakeClock>()};
   ManualScheduler scheduler_;
   ComponentStreamHealth health_{clock_, scheduler_};
   std::uint64_t token_{};
@@ -56,6 +56,26 @@ class ComponentStreamHealthTest : public ::testing::Test {
 StreamDeclarationDTO Stream(std::string id, StreamSeverityDTO severity, StreamRecoveryDTO recovery,
                             StreamTimestampSourceDTO source = StreamTimestampSourceDTO::kMessageStamp) {
   return {std::move(id), 100 * kMs, severity, recovery, source};
+}
+
+TEST(ComponentStreamHealthLifetime, DetachedRecorderMayOutliveSchedulerAndClock) {
+  auto clock = std::make_shared<FakeClock>();
+  auto scheduler = std::make_unique<ManualScheduler>();
+  auto health = std::make_unique<ComponentStreamHealth>(clock, *scheduler);
+  auto declared = health->Declare(
+      ControllableComponentId("arm"),
+      Stream("measured_joints", StreamSeverityDTO::kBlocking,
+             StreamRecoveryDTO::kAuto));
+  ASSERT_TRUE(declared.ok());
+  auto recorder = std::move(declared.value());
+  recorder->RecordArrival();
+  health->DetachScheduler();
+  scheduler.reset();
+  clock.reset();
+  EXPECT_NO_THROW(recorder->RecordArrival());
+  EXPECT_NO_THROW(static_cast<void>(health->Read(ControllableComponentId("arm"))));
+  EXPECT_NO_THROW(health.reset());
+  EXPECT_NO_THROW(recorder.reset());
 }
 
 TEST_F(ComponentStreamHealthTest, MessageStampMustAdvanceWithinBudget) {

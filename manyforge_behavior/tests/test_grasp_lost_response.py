@@ -1,4 +1,4 @@
-"""The attach node's literal grasp-lost response (DX-2563, contract §1)."""
+"""The attach node's literal grasp-lost response."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _program(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, catalog)
 

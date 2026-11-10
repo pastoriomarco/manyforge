@@ -1,5 +1,5 @@
 // Presentation of the backend's component, latch, readiness, run-end and I/O
-// facts (R4): labels and catalogue texts only. Nothing here decides health,
+// facts: labels and catalogue texts only. Nothing here decides health,
 // severity of a component or whether something is allowed.
 import type {
   ActionResult,
@@ -7,13 +7,15 @@ import type {
   CodedError,
   ComponentLifecycle,
   ComponentState,
+  ComponentStop,
   Fault,
   ProgramRunEnd,
+  RecoveryComponent,
   RunBlockedReason,
   SignalSample,
   SignalSource,
 } from '../types/components';
-import { LIFECYCLE_ACTIONS, OWNER_UNAVAILABLE } from '../types/components';
+import { LIFECYCLE_ACTIONS, OWNER_UNAVAILABLE, STOPPED_BY_ESTOP } from '../types/components';
 import { errorCatalogRow } from './commandRefusal';
 
 export type PresentationTone = 'ok' | 'neutral' | 'warning' | 'error';
@@ -37,7 +39,7 @@ const ACTION_LABELS: Readonly<Record<string, string>> = {
   sim_reset: 'Reset simulation',
 };
 
-/** Capabilities that are behaviours, not actions (CONTRACTS §3). */
+/** Capabilities that are behaviours, not actions. */
 const BEHAVIOUR_CAPABILITIES = new Set(['io_manual_write', 'io_output_readback']);
 
 export function actionLabel(action: string): string {
@@ -60,7 +62,7 @@ export function actionBusyLabel(action: string): string {
   return ACTION_BUSY_LABELS[action] ?? `${actionLabel(action)}…`;
 }
 
-/** Actions the operator confirms first: an owner's power actions (§16). */
+/** Actions the operator confirms first: an owner's power actions. */
 export const CONFIRMED_ACTIONS: ReadonlySet<string> = new Set(['power_off', 'reboot']);
 
 function listText(items: readonly string[]): string {
@@ -68,7 +70,7 @@ function listText(items: readonly string[]): string {
 }
 
 /**
- * The confirmation of a power action (CONTRACTS §2, §16): the host disables
+ * The confirmation of a power action: the host disables
  * the machine's members first, then shuts its controller down or restarts it
  * (a reboot prepares the machine again once its controller answers).
  */
@@ -90,14 +92,14 @@ export function confirmedActionText(action: string, state: ComponentState,
   ] };
 }
 
-/** §16: the components some other component names as its owner (the machines). */
+/** The components some other component names as its owner (the machines). */
 export function ownerIds(states: readonly ComponentState[]): Set<string> {
   return new Set(states.flatMap((state) => (state.owner_id === undefined ? [] : [state.owner_id])));
 }
 
 /**
- * CONTRACTS §2: the four lifecycle actions plus the declared action
- * capabilities; an owner (§16) offers Prepare and Recover, no Enable/Disable.
+ * The four lifecycle actions plus the declared action
+ * capabilities; an owner offers Prepare and Recover, no Enable/Disable.
  * An enabled component isn't offered Prepare: the host refuses it
  * (`component_enabled`); Disable takes it back to prepared.
  */
@@ -116,7 +118,7 @@ export interface ComponentTreeNode<T> {
 
 /**
  * The items as one tree, in the given order: a machine's members under their
- * owner (§16), a mounted component under the component it is mounted on (the
+ * owner, a mounted component under the component it is mounted on (the
  * owner wins when an item has both). An item whose parent isn't listed stays
  * at the top.
  */
@@ -157,16 +159,26 @@ export function componentStateTree(
     (state) => state.owner_id ?? mounts[state.component_id] ?? null);
 }
 
-/** Prepare all (§2): every `not_prepared` or `offline` component, in cell order. */
+function isSimulator(state: ComponentState): boolean {
+  return state.capabilities.includes('sim_reset');
+}
+
+/** Prepare all offline or not-prepared non-simulator components, in cell order. */
 export function prepareAllTargets(states: readonly ComponentState[]): string[] {
-  return states.filter((state) => state.lifecycle === 'not_prepared' || state.lifecycle === 'offline')
+  return states.filter((state) => !isSimulator(state)
+    && (state.lifecycle === 'not_prepared' || state.lifecycle === 'offline'))
     .map((state) => state.component_id);
 }
 
-/** Enable all (§2): every `prepared` member and owner-less component, never an owner. */
+/**
+ * Enable every non-simulator member and owner-less component that isn't
+ * enabled yet; the backend prepares an unprepared one (and its machine) first.
+ */
 export function enableAllTargets(states: readonly ComponentState[]): string[] {
   const owners = ownerIds(states);
-  return states.filter((state) => state.lifecycle === 'prepared' && !owners.has(state.component_id))
+  return states.filter((state) => !isSimulator(state) && !owners.has(state.component_id)
+    && (state.lifecycle === 'prepared' || state.lifecycle === 'not_prepared'
+      || state.lifecycle === 'offline'))
     .map((state) => state.component_id);
 }
 
@@ -200,17 +212,55 @@ export function faultPresentation(fault: Fault): FaultPresentation {
   };
 }
 
-/** Colour of a component's state: red for a fault, yellow while it can't report. */
+/** An e-stop as the operator reads it: "E-stop pressed or not yet cleared (C2)". */
+export function stopText(stop: ComponentStop): string {
+  return stop.vendor_code === undefined ? stop.message : `${stop.message} (${stop.vendor_code})`;
+}
+
+/** The state's label: "E-stop" while the component reports one (it's a stop, not a fault). */
+export function stateLabel(state: ComponentState): string {
+  return state.stop !== undefined ? 'E-stop' : LIFECYCLE_LABELS[state.lifecycle];
+}
+
+/**
+ * Whether Enable on this component has to recover first: it, or the
+ * machine it belongs to, reports a fault or an e-stop. The preflight
+ * decides what can be recovered; the simulator is never part of it.
+ */
+export function needsRecovery(state: ComponentState, states: readonly ComponentState[]): boolean {
+  if (isSimulator(state)) return false;
+  if (state.fault !== undefined || state.stop !== undefined || state.reason?.code === STOPPED_BY_ESTOP) return true;
+  const owner = state.owner_id === undefined ? undefined
+    : states.find((candidate) => candidate.component_id === state.owner_id);
+  return owner !== undefined && (owner.stop !== undefined
+    || (owner.fault !== undefined && (owner.fault.concerns ?? []).includes(state.component_id)));
+}
+
+/** One preflight row: "xarm: E-stop pressed or not yet cleared (C2)" or its fault. */
+export function recoveryCauseText(row: RecoveryComponent): string {
+  const vendor = row.cause?.vendor_code ?? null;
+  const cause = row.stop !== null ? stopText({ ...row.stop })
+    : row.cause !== null ? `${codedErrorText(row.cause)}${vendor === null ? '' : ` (${vendor})`}`
+      : row.eligibility === 'unknown' ? 'state unknown until its machine recovers' : 'ready';
+  return `${row.component_id}: ${cause}`;
+}
+
+/** Colour of a component's state: simulator faults and unknown actions are warnings. */
 export function componentTone(state: ComponentState): PresentationTone {
+  const simulator = state.capabilities.includes('sim_reset');
+  if (
+    simulator
+    && (state.lifecycle === 'fault' || state.last_action?.outcome === 'unknown')
+  ) return 'warning';
   if (state.lifecycle === 'fault') return 'error';
-  if (state.lifecycle === 'offline' || state.activity === 'unknown') return 'warning';
+  if (state.stop !== undefined || state.lifecycle === 'offline' || state.activity === 'unknown') return 'warning';
   return state.lifecycle === 'enabled' ? 'ok' : 'neutral';
 }
 
 /**
  * Why a component is offline or not prepared, or why an enabled simulated
  * one doesn't move (`simulation_not_playing`). A member offline through its
- * owner (§16) shows the owner's own fault or reason, read from the owner's
+ * owner shows the owner's own fault or reason, read from the owner's
  * state when `states` has it, else the producer's "through <owner>: ..." text.
  */
 export function reasonText(state: ComponentState, states: readonly ComponentState[] = []): string | null {
@@ -227,7 +277,8 @@ export function reasonText(state: ComponentState, states: readonly ComponentStat
 export function componentStateDetail(state: ComponentState, states: readonly ComponentState[] = []): string | null {
   const parts: string[] = [];
   const reason = reasonText(state, states);
-  if (state.fault !== undefined) parts.push(codedErrorText(state.fault));
+  if (state.stop !== undefined) parts.push(stopText(state.stop));
+  else if (state.fault !== undefined) parts.push(codedErrorText(state.fault));
   else if (reason !== null) parts.push(reason);
   if (state.action !== undefined) parts.push(`${actionLabel(state.action.action)} in progress`);
   else if (state.activity !== 'idle') parts.push(state.activity === 'busy' ? 'busy' : 'activity unknown');
@@ -237,7 +288,7 @@ export function componentStateDetail(state: ComponentState, states: readonly Com
 /** One line for a component: state, then its fault, reason or action in progress. */
 export function componentSummary(state: ComponentState, states: readonly ComponentState[] = []): string {
   const detail = componentStateDetail(state, states);
-  return detail === null ? LIFECYCLE_LABELS[state.lifecycle] : `${LIFECYCLE_LABELS[state.lifecycle]} · ${detail}`;
+  return detail === null ? stateLabel(state) : `${stateLabel(state)} · ${detail}`;
 }
 
 /** The state badge (`status-pill`) classes of each tone. */
@@ -249,6 +300,14 @@ export const TONE_BADGE_CLASSES: Readonly<Record<PresentationTone, string>> = {
 };
 
 export function actionResultText(result: ActionResult): string {
+  // Recover and enable: name the step that didn't succeed.
+  const phase = result.phases?.find((step) => step.outcome !== 'succeeded');
+  if (phase !== undefined && result.outcome !== 'succeeded') {
+    const step = `${actionLabel(phase.action)} ${phase.component_id}`;
+    if (phase.outcome === 'unknown') return `Recover and enable stopped: ${step}, outcome unknown (not resent)`;
+    return `Recover and enable stopped: ${step} failed${phase.error === undefined ? '' : `: ${codedErrorText(phase.error)}`}`;
+  }
+  if (result.phases !== undefined && result.outcome === 'succeeded') return 'Recover and enable succeeded';
   const name = actionLabel(result.action);
   if (result.outcome === 'succeeded') return `${name} succeeded`;
   if (result.outcome === 'unknown') return `${name}: outcome unknown (not resent)`;
@@ -256,8 +315,8 @@ export function actionResultText(result: ActionResult): string {
 }
 
 /**
- * CONTRACTS §5 cause kinds, as the operator reads them. A machine is one
- * cause (§16): its fault names the members it concerns.
+ * Cell latch cause kinds, as the operator reads them. A machine is one
+ * cause: its fault names the members it concerns.
  */
 export function latchCauseText(cause: CellLatch['causes'][number]): string {
   if (cause.kind === 'fault') {
@@ -265,6 +324,7 @@ export function latchCauseText(cause: CellLatch['causes'][number]): string {
     return `${cause.component_id}: ${cause.fault === undefined ? 'fault' : codedErrorText(cause.fault)}`
       + (concerns.length === 0 ? '' : ` (concerns ${concerns.join(', ')})`);
   }
+  if (cause.kind === 'stop') return `${cause.component_id}: ${cause.stop === undefined ? 'E-stop' : stopText(cause.stop)}`;
   if (cause.kind === 'offline') return `${cause.component_id}: offline`;
   return `${cause.component_id}: can't report whether it is still moving`;
 }
@@ -284,7 +344,7 @@ export function blockedReasonText(reason: RunBlockedReason): string {
 }
 
 /**
- * The `rule_holds` reason gating motion of these components (§8), as the
+ * The `rule_holds` reason gating motion of these components, as the
  * backend's `rule_hold_meets_program`: `everything` always; `all_motion`
  * when they move anything; execution groups when they share a component.
  */
@@ -305,7 +365,7 @@ export interface RunEndPresentation {
   text: string;
 }
 
-/** CONTRACTS §9: why a run ended (plan, "Program outcomes"). */
+/** Why a run ended. */
 export function runEndPresentation(end: ProgramRunEnd): RunEndPresentation {
   const { details } = end;
   const error = details.error === undefined ? null : codedErrorText(details.error);
@@ -334,7 +394,7 @@ export const SIGNAL_SOURCE_LABELS: Readonly<Record<SignalSource, string>> = {
   device: 'device',
   manyforge_write: 'ManyForge',
   outside: 'outside',
-  last_write: 'last write',
+  not_readable: 'no read-back',
 };
 
 export function signalValueText(sample: SignalSample): string {

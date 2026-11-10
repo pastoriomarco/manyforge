@@ -15,7 +15,7 @@ namespace {
 
 namespace core = manyforge::core;
 
-// Version 6 carries the CONTRACTS §15 host Apply in place of the composition
+// Version 6 carries the host Apply in place of the composition
 // request, its phases and receipts.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
                                               'R', 'C', '6', 0};

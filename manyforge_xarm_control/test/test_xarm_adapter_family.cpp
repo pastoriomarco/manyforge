@@ -18,20 +18,24 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 #include <rclcpp/rclcpp.hpp>
 
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <manyforge_roboplan/component_adapter_registry.hpp>
 #include <manyforge_roboplan/io_output_writer.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lane_config.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 namespace manyforge::xarm_control {
 namespace {
@@ -115,7 +119,7 @@ struct Host final {
 
 constexpr std::string_view kArmRow = R"({"adapter":"xarm","dof":6})";
 
-// CONTRACTS §6 "What a family exports": the library registered under `xarm`
+// What a family exports: the library registered under `xarm`
 // exports the family with its launch contribution and no lane hooks of its
 // own (the generic Real configuration: the driver reports its own state); a
 // context it can't use is refused as invalid adapter data.
@@ -133,7 +137,7 @@ TEST(XArmAdapterFamily, LoadsFromTheIndexAndRefusesWhatItCantUse) {
   auto no_connection = host.Context("lite6_robot", "arm", std::string(kArmRow));
   no_connection.ros2_control = nullptr;
   // A member without its owner's handle (an arm is always a machine's
-  // member, AUD-5), and a role the machine hasn't.
+  // member), and a role the machine hasn't.
   auto orphan = host.Context("lite6_robot", "arm", std::string(kArmRow));
   auto ownerless = host.Context("lite6_robot", "", std::string(kArmRow));
   auto stranger = host.Context("lite6_robot_camera", "camera", std::string(kArmRow));
@@ -151,7 +155,7 @@ TEST(XArmAdapterFamily, LoadsFromTheIndexAndRefusesWhatItCantUse) {
   }
 }
 
-// CONTRACTS §16: the owner returns its handle; the arm and I/O members are
+// The owner returns its handle; the arm and I/O members are
 // made on it.
 TEST(XArmAdapterFamily, MakesTheOwnerAndItsMembers) {
   auto loaded = load_family();
@@ -189,8 +193,106 @@ TEST(XArmAdapterFamily, MakesTheOwnerAndItsMembers) {
             nullptr);
 }
 
+TEST(XArmAdapterFamily, OwnerBackedFamilyRetiresAfterForeignRelease) {
+  auto loaded = load_family();
+  ASSERT_TRUE(loaded.ok()) << loaded.error().message;
+  Host host;
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "xarm_family_owner_test", "/manyforge", 1U);
+  transport->start();
+  auto context = host.Context("lite6", "", R"({"adapter":"xarm"})");
+  context.machine_owner = true;
+  context.node = transport->node();
+  context.ros_entity_owner = transport;
+  auto made = loaded.value().Make(context);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  auto component = std::move(made.value().component);
+  auto handle = std::move(made.value().owner_handle);
+  std::thread foreign([component = std::move(component), handle = std::move(handle)]() mutable {
+    component.reset();
+    handle.reset();
+  });
+  foreign.join();
+  // A synchronous owner task verifies that the owner remains responsive after
+  // the foreign release; quiescence drains any pending nested retirements.
+  bool ran = false;
+  transport->invoke([&] { ran = true; });
+  EXPECT_TRUE(ran);
+  context.ros_entity_owner.reset();
+  transport->quiesce();
+}
+
+TEST(XArmAdapterFamily, FaultedOwnerRefusesEntityCreation) {
+  using namespace std::chrono_literals;
+  auto loaded = load_family();
+  ASSERT_TRUE(loaded.ok()) << loaded.error().message;
+  Host host;
+  std::promise<void> observed;
+  auto reported = observed.get_future();
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "xarm_family_fault_test", "/manyforge", 1U);
+  transport->set_owner_notification([] { throw std::runtime_error("test owner fault"); });
+  transport->set_executor_fault_observer([&](std::string_view) { observed.set_value(); });
+  transport->start();
+  ASSERT_TRUE(transport->notify_owner());
+  ASSERT_EQ(reported.wait_for(3s), std::future_status::ready);
+  auto context = host.Context("lite6", "", R"({"adapter":"xarm"})");
+  context.machine_owner = true;
+  context.node = transport->node();
+  context.ros_entity_owner = transport;
+  try {
+    static_cast<void>(loaded.value().Make(context));
+    FAIL() << "faulted owner accepted xArm entity creation";
+  } catch (const core::TypedError &error) {
+    EXPECT_EQ(error.code(), "ros_transport_executor_failed");
+  }
+  transport->quiesce();
+}
+
+TEST(XArmAdapterFamily, SharedRebindRetainsOwnerAndMemberAdapters) {
+  auto loaded = load_family();
+  ASSERT_TRUE(loaded.ok()) << loaded.error().message;
+  Host host;
+  auto old_owner = ros2_control_execution::Ros2TransportResources::create(
+      "xarm_rebind_old", "/manyforge", 1U);
+  auto new_owner = ros2_control_execution::Ros2TransportResources::create(
+      "xarm_rebind_new", "/manyforge", 1U);
+  old_owner->start();
+  new_owner->start();
+  auto owner_context = host.Context("lite6", "", R"({"adapter":"xarm"})");
+  owner_context.machine_owner = true;
+  owner_context.node = old_owner->node();
+  owner_context.ros_entity_owner = old_owner;
+  auto made = loaded.value().Make(owner_context);
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  auto member_context = host.Context(
+      "lite6_robot_controller_io", "controller_io",
+      R"({"adapter":"xarm","bank":"controller","inputs":["CI0"],"outputs":["CO0"]})");
+  member_context.owner = made.value().owner_handle;
+  member_context.node = old_owner->node();
+  member_context.ros_entity_owner = old_owner;
+  auto member = loaded.value().Make(member_context);
+  ASSERT_TRUE(member.ok()) << member.error().message;
+  auto consumer = made.value().ros_transport_consumer;
+  ASSERT_TRUE(consumer);
+  EXPECT_EQ(consumer, member.value().ros_transport_consumer);
+  auto *const owner_adapter = made.value().component.get();
+  auto *const member_adapter = member.value().component.get();
+  old_owner->quiesce();
+  auto gate = std::make_shared<std::atomic<bool>>(false);
+  auto stage = consumer->Stage(old_owner, new_owner, gate);
+  ASSERT_TRUE(consumer->Validate(stage));
+  consumer->Commit(stage);
+  EXPECT_FALSE(consumer->Validate(stage));
+  EXPECT_EQ(owner_adapter, made.value().component.get());
+  EXPECT_EQ(member_adapter, member.value().component.get());
+  gate->store(true, std::memory_order_release);
+  stage.reset();
+  new_owner->quiesce();
+}
+
 // Each xArm model's `lanes.real` row carries everything the Real lane
-// configuration requires (M7's measured-state gates), as the generator reads
+// configuration requires (the measured-state gates), as the generator reads
 // the row.
 TEST(XArmAdapterFamily, EveryRealModelRowBuildsTheRealLaneGates) {
   const auto models = std::filesystem::path(MANYFORGE_XARM_CONTROL_SOURCE_DIR) / ".." /

@@ -14,7 +14,7 @@ template <typename T>
 [[nodiscard]] Result<T> invalid(std::string reason) {
   return Result<T>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
                                  reason == "tcp_endpoint_legacy_form"
-                                     ? "the TCP is named in the pre-M7 form"
+                                     ? "the TCP is named in the legacy form"
                                      : "the TCP selector is malformed",
                                  {{"reason", std::move(reason)}}});
 }
@@ -50,22 +50,58 @@ Result<TcpEntryDTO> DecodeTcpEntry(const CanonicalValue& value) {
                                              CommandTargetId(*target), FrameRoleId(*frame)});
 }
 
+CanonicalValue EncodeTcpEntryReference(const TcpEntryReferenceDTO& entry) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"target", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(entry.target.component_id.value())},
+          {"command_target_id", CanonicalValue(entry.target.command_target_id.value())}})},
+      {"frame", CanonicalValue(CanonicalValue::Object{
+          {"component_id", CanonicalValue(entry.frame.component_id.value())},
+          {"frame_id", CanonicalValue(entry.frame.frame_id.value())}})}});
+}
+
+Result<TcpEntryReferenceDTO> DecodeTcpEntryReference(const CanonicalValue& value) {
+  if (!value.is_object() || value.as_object().size() != 2U)
+    return invalid<TcpEntryReferenceDTO>("tcp_selector_invalid");
+  const auto* target = value.find_object_member("target");
+  const auto* frame = value.find_object_member("frame");
+  if (!target || !target->is_object() || target->as_object().size() != 2U ||
+      !frame || !frame->is_object() || frame->as_object().size() != 2U)
+    return invalid<TcpEntryReferenceDTO>("tcp_selector_invalid");
+  const auto* component = text(*target, "component_id");
+  const auto* command = text(*target, "command_target_id");
+  const auto* owner = text(*frame, "component_id");
+  const auto* id = text(*frame, "frame_id");
+  if (!component || !command || !owner || !id)
+    return invalid<TcpEntryReferenceDTO>("tcp_selector_invalid");
+  return Result<TcpEntryReferenceDTO>::Ok(TcpEntryReferenceDTO{
+      {ControllableComponentId(*component), CommandTargetId(*command)},
+      {ControllableComponentId(*owner), FrameRoleId(*id)}});
+}
+
 CanonicalValue EncodeTcpSelector(const TcpSelectorDTO& selector) {
+  const auto target_value = [](const ProgramTargetReferenceDTO& target) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"component_id", CanonicalValue(target.component_id.value())},
+        {"command_target_id", CanonicalValue(target.command_target_id.value())}});
+  };
   return std::visit(
-      [](const auto& form) {
+      [&](const auto& form) {
         using Form = std::decay_t<decltype(form)>;
         if constexpr (std::is_same_v<Form, CurrentTcpDTO>) {
           return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("current")}});
-        } else if constexpr (std::is_same_v<Form, DefaultTcpOfRoleDTO>) {
+        } else if constexpr (std::is_same_v<Form, DefaultTcpOfTargetDTO>) {
           return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("default_of_role")},
-              {"role", CanonicalValue(form.role.value())}});
+              {"kind", CanonicalValue("default_of_target")}, {"target", target_value(form.target)}});
         } else {
-          return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("entry")},
-                                                       {"entry", EncodeTcpEntry(form)}});
+          return CanonicalValue(CanonicalValue::Object{
+              {"kind", CanonicalValue("entry")},
+              {"target", target_value(form.target)},
+              {"frame", CanonicalValue(CanonicalValue::Object{
+                  {"component_id", CanonicalValue(form.frame.component_id.value())},
+                  {"frame_id", CanonicalValue(form.frame.frame_id.value())}})}});
         }
-      },
-      selector);
+      }, selector);
 }
 
 Result<TcpSelectorDTO> DecodeTcpSelector(const CanonicalValue& value) {
@@ -77,19 +113,25 @@ Result<TcpSelectorDTO> DecodeTcpSelector(const CanonicalValue& value) {
                                        : "tcp_selector_invalid");
   }
   const auto size = value.as_object().size();
-  if (*kind == "current" && size == 1U) {
+  if (*kind == "current" && size == 1U)
     return Result<TcpSelectorDTO>::Ok(TcpSelectorDTO{CurrentTcpDTO{}});
-  }
-  if (*kind == "default_of_role" && size == 2U) {
-    if (const auto* role = text(value, "role")) {
-      return Result<TcpSelectorDTO>::Ok(TcpSelectorDTO{DefaultTcpOfRoleDTO{TargetRoleId(*role)}});
-    }
-  }
-  if (*kind == "entry" && size == 2U) {
-    if (const auto* entry = value.find_object_member("entry")) {
-      auto decoded = DecodeTcpEntry(*entry);
-      if (!decoded.ok()) return Result<TcpSelectorDTO>::Err(decoded.error());
-      return Result<TcpSelectorDTO>::Ok(TcpSelectorDTO{std::move(decoded.value())});
+  const auto* target = value.find_object_member("target");
+  if (!target || !target->is_object() || target->as_object().size() != 2U)
+    return invalid<TcpSelectorDTO>("tcp_selector_invalid");
+  const auto* component = text(*target, "component_id");
+  const auto* command = text(*target, "command_target_id");
+  if (!component || !command) return invalid<TcpSelectorDTO>("tcp_selector_invalid");
+  ProgramTargetReferenceDTO target_ref{ControllableComponentId(*component), CommandTargetId(*command)};
+  if (*kind == "default_of_target" && size == 2U)
+    return Result<TcpSelectorDTO>::Ok(TcpSelectorDTO{DefaultTcpOfTargetDTO{std::move(target_ref)}});
+  if (*kind == "entry" && size == 3U) {
+    const auto* frame = value.find_object_member("frame");
+    if (frame && frame->is_object() && frame->as_object().size() == 2U) {
+      const auto* owner = text(*frame, "component_id");
+      const auto* id = text(*frame, "frame_id");
+      if (owner && id)
+        return Result<TcpSelectorDTO>::Ok(TcpSelectorDTO{TcpEntryReferenceDTO{
+            std::move(target_ref), {ControllableComponentId(*owner), FrameRoleId(*id)}}});
     }
   }
   return invalid<TcpSelectorDTO>("tcp_selector_invalid");

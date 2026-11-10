@@ -35,7 +35,7 @@ if [[ "${UBSAN_OPTIONS}" != *"exitcode="* ]]; then
 fi
 export UBSAN_OPTIONS
 
-sanitizer_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g -Wno-error=maybe-uninitialized -Wno-error=array-bounds"
+sanitizer_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
 
 cmake \
   -S "${REPO_ROOT}/manyforge_deployment" \
@@ -57,7 +57,10 @@ ctest \
   --output-on-failure \
   --no-tests=error \
   -R "${non_gtest_regex}"
+# Needs the manyforge_headless_py expression binding, which this lane does not
+# build; it runs with the binding in scripts/test-all.sh cpp (local-ci).
+binding_regex="^PrepareActivationVisionBinPick$"
 python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
   --build-dir "${BUILD_DIR}" \
-  --exclude-test-regex "${non_gtest_regex}" \
+  --exclude-test-regex "${non_gtest_regex}|${binding_regex}" \
   --summary-prefix DEPLOYMENT_ASAN_UBSAN

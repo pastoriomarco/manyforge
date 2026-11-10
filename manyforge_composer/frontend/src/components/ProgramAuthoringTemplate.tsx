@@ -1,56 +1,20 @@
 import { useMemo, useRef, useState } from 'react';
 
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
-import { hasUnrepresentedTcpOwner, programTcpSelectorChoices } from '../utils/motionEndpointAuthoring';
-import type { ManualControlMotionDescriptor } from '../types/robotControl';
-import type { ResolvedTargetRole } from '../utils/targetRoleResolution';
+import { programTcpSelectorChoices } from '../utils/motionEndpointAuthoring';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramTemplateIcon } from './programNodeGlyphs';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
-interface TargetChoice {
-  id: string;
-  frames: string[];
-  collisionBodies: string[];
-}
-
 function record(value: JsonValue): Record<string, JsonValue> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, JsonValue>
-    : null;
+    ? value as Record<string, JsonValue> : null;
 }
-
-function strings(value: JsonValue | undefined): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string')
-    : [];
-}
-
-function hasCapability(value: JsonValue, capabilityId: string): boolean {
-  const target = record(value);
-  const capabilities = target?.required_capabilities;
-  return Array.isArray(capabilities) && capabilities.some((item) => (
-    record(item)?.capability_id === capabilityId
-  ));
-}
-
-function targets(
-  program: ProgramAuthoringDocument,
-  capabilityId: string,
-): TargetChoice[] {
-  return Object.entries(program.target_roles)
-    .filter(([, value]) => hasCapability(value, capabilityId))
-    .map(([id, value]) => {
-      const target = record(value);
-      return {
-        id,
-        frames: strings(target?.required_frame_roles),
-        collisionBodies: strings(target?.required_collision_body_roles),
-      };
-    })
-    .sort((left, right) => left.id.localeCompare(right.id));
-}
+const refKey = (value: object) => JSON.stringify(value);
+const sameTarget = (a: {component_id: string; command_target_id: string}, b: {component_id: string; command_target_id: string}) =>
+  a.component_id === b.component_id && a.command_target_id === b.command_target_id;
 
 function contactPolicyIds(program: ProgramAuthoringDocument): string[] {
   return (program.contact_policies ?? []).flatMap((value) => {
@@ -61,16 +25,14 @@ function contactPolicyIds(program: ProgramAuthoringDocument): string[] {
 
 export function ProgramAuthoringTemplate({
   program,
-  boundTargets = [],
-  motionDescriptors = [],
+  selectorFacts = null,
   busy,
   onMutate,
   collapsed,
   onCollapsedChange,
 }: {
   program: ProgramAuthoringDocument;
-  boundTargets?: readonly ResolvedTargetRole[];
-  motionDescriptors?: readonly ManualControlMotionDescriptor[];
+  selectorFacts?: ReferenceSelectorFacts | null;
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
   collapsed?: boolean;
@@ -80,14 +42,10 @@ export function ProgramAuthoringTemplate({
   const placeButton = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   const [operation, setOperation] = useState<'pick' | 'place'>('pick');
-  const armTargets = useMemo(
-    () => targets(program, 'planning.motion.pose_goal'),
-    [program],
-  );
-  const toolTargets = useMemo(
-    () => targets(program, 'tool.gripper.command'),
-    [program],
-  );
+  const armTargets = useMemo(() => (selectorFacts?.targets ?? []).map((row) => ({ ...row,
+    capability: row.capabilities.find((item) => item.capability_id === 'planning.motion.pose_goal') })), [selectorFacts]);
+  const toolTargets = useMemo(() => (selectorFacts?.targets ?? []).map((row) => ({ ...row,
+    capability: row.capabilities.find((item) => item.capability_id === 'tool.gripper.command') })), [selectorFacts]);
   const scenes = useMemo(
     () => (program.scene ?? []).map((row) => row.scene_resource_id).sort(),
     [program.scene],
@@ -108,32 +66,35 @@ export function ProgramAuthoringTemplate({
   const [blackboardKey, setBlackboardKey] = useState('planning.pick_plan');
   const [instancePrefix, setInstancePrefix] = useState('pick_sequence');
   const [placePosition, setPlacePosition] = useState([0, 0, 0.1]);
-  const [placeOrientation, setPlaceOrientation] = useState([0, 0, 0]);
+  const [placeOrientation, setPlaceOrientation] = useState([180, 0, 0]);
 
-  const arm = armTargets.find((row) => row.id === armTargetId) ?? armTargets[0];
-  const tool = toolTargets.find((row) => row.id === toolTargetId) ?? toolTargets[0];
+  const arm = armTargets.find((row) => refKey(row.target) === armTargetId && row.capability?.available)
+    ?? armTargets.find((row) => row.capability?.available);
+  const tool = toolTargets.find((row) => refKey(row.target) === toolTargetId && row.capability?.available)
+    ?? toolTargets.find((row) => row.capability?.available);
   const effectiveScene = scenes.includes(sceneId) ? sceneId : scenes[0] ?? '';
-  const effectiveArm = arm?.id ?? '';
-  const effectiveTool = tool?.id ?? '';
-  const selectedTarget = boundTargets.find((row) => row.target_role_id === effectiveArm);
-  const selectedDescriptor = selectedTarget === undefined ? undefined : motionDescriptors.find((row) => (
-    row.controllableComponentId === selectedTarget.controllable_component_id
-    && row.commandTargetId === selectedTarget.command_target_id
-  ));
-  const endpointChoices = useMemo(() => programTcpSelectorChoices(
-    program, boundTargets, selectedDescriptor, showOtherRobotTcps,
-  ), [program, boundTargets, selectedDescriptor, showOtherRobotTcps]);
-  const effectiveBase = arm?.frames.includes(baseFrame)
-    ? baseFrame
-    : arm?.frames.find((frame) => frame === 'base') ?? arm?.frames[0] ?? '';
-  const effectiveEndpoint = endpointChoices.find((choice) => choice.key === endpointKey)
-    ?? endpointChoices[0];
-  const effectiveCarrier = tool?.frames.includes(carrierFrame)
-    ? carrierFrame
-    : tool?.frames.find((frame) => frame === 'tcp') ?? tool?.frames[0] ?? '';
-  const effectiveTouch = tool?.collisionBodies.includes(touchBody)
-    ? touchBody
-    : tool?.collisionBodies[0] ?? '';
+  const effectiveArm = arm === undefined ? '' : refKey(arm.target);
+  const effectiveTool = tool === undefined ? '' : refKey(tool.target);
+  const endpointChoices = programTcpSelectorChoices(arm?.target ?? null, selectorFacts?.targets ?? null, showOtherRobotTcps);
+  const effectiveEndpoint = endpointChoices.find((choice) => choice.key === endpointKey && !choice.disabled)
+    ?? endpointChoices.find((choice) => !choice.disabled);
+  const armFrameChoices = (selectorFacts?.frames ?? []).map((row) => ({ ...row, eligible: !row.ambiguous && arm !== undefined
+    && row.moving_targets.some((target) => sameTarget(target, arm.target)) }));
+  const toolFrameChoices = (selectorFacts?.frames ?? []).map((row) => ({ ...row, eligible: !row.ambiguous && tool !== undefined
+    && row.moving_targets.some((target) => sameTarget(target, tool.target)) }));
+  const toolBodyChoices = (selectorFacts?.bodies ?? []).map((row) => ({ ...row, eligible: !row.ambiguous && tool !== undefined
+    && row.moving_targets.some((target) => sameTarget(target, tool.target)) }));
+  const armFrames = armFrameChoices.filter((row) => row.eligible);
+  const toolFrames = toolFrameChoices.filter((row) => row.eligible);
+  const toolBodies = toolBodyChoices.filter((row) => row.eligible);
+  const selectedBase = armFrames.find((row) => refKey(row.reference) === baseFrame)
+    ?? armFrames.find((row) => row.reference.frame_id === 'base') ?? armFrames[0];
+  const selectedCarrier = toolFrames.find((row) => refKey(row.reference) === carrierFrame)
+    ?? toolFrames.find((row) => row.reference.frame_id === 'tcp') ?? toolFrames[0];
+  const selectedTouch = toolBodies.find((row) => refKey(row.reference) === touchBody) ?? toolBodies[0];
+  const effectiveBase = selectedBase === undefined ? '' : refKey(selectedBase.reference);
+  const effectiveCarrier = selectedCarrier === undefined ? '' : refKey(selectedCarrier.reference);
+  const effectiveTouch = selectedTouch === undefined ? '' : refKey(selectedTouch.reference);
   const effectivePolicy = policies.includes(policyId) ? policyId : policies[0] ?? '';
   const available = scenes.length > 0
     && arm !== undefined
@@ -224,27 +185,26 @@ export function ProgramAuthoringTemplate({
           className="program-template-form"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!available || busy || effectiveEndpoint === undefined) return;
+            if (!available || busy || effectiveEndpoint === undefined || arm === undefined || tool === undefined || selectedBase === undefined || selectedCarrier === undefined) return;
             onMutate('program_draft_expand_authoring_macro', {
               macro_id: `${operation}_subtree`,
               scene_resource_id: effectiveScene,
-              target_role: effectiveArm,
-              tool_target_role: effectiveTool,
-              base_frame_role: effectiveBase,
+              target: arm.target,
+              tool_target: tool.target,
+              base_frame: selectedBase.reference,
               tcp_endpoint: effectiveEndpoint.selector,
-              carrier_frame_role: effectiveCarrier,
+              carrier_frame_ref: selectedCarrier.reference,
               tool_position: coordinateKind === 'linear_m'
                 ? { kind: coordinateKind, value_m: toolPosition }
                 : { kind: coordinateKind, value_rad: toolPosition },
               ...(operation === 'pick' ? {
                 contact_policy_id: effectivePolicy,
-                touch_body_roles: [effectiveTouch],
+                touch_bodies: selectedTouch === undefined ? [] : [selectedTouch.reference],
               } : {
                 place_pose: {
                   frame_ref: {
                     kind: 'target_frame',
-                    target_role: effectiveArm,
-                    frame_role: effectiveBase,
+                    frame: selectedBase.reference,
                   },
                   position_m: placePosition,
                   orientation: { rpy_deg: placeOrientation },
@@ -254,7 +214,7 @@ export function ProgramAuthoringTemplate({
               blackboard_namespace_id: namespaceId,
               blackboard_key: blackboardKey,
               instance_prefix: instancePrefix,
-            });
+            } as unknown as Record<string, JsonValue>);
             setOpen(false);
           }}
         >
@@ -266,32 +226,29 @@ export function ProgramAuthoringTemplate({
           {!available && (
             <p className="scene-commit-error inline-message severity-error" role="status">
               The template needs a Program scene resource, pose-capable arm,
-              gripper target and frame/body roles. Pick also needs a contact policy.
+              gripper target and qualified frames/bodies. Pick also needs a contact policy.
             </p>
           )}
           <label><span>{operation === 'pick' ? 'Object to pick' : 'Carried object'}</span><select value={effectiveScene} onChange={(event) => setSceneId(event.target.value)}>{scenes.map((id) => <option key={id}>{id}</option>)}</select></label>
-          <label><span>Arm target</span><select value={effectiveArm} onChange={(event) => setArmTargetId(event.target.value)}>{armTargets.map((row) => <option key={row.id}>{row.id}</option>)}</select></label>
-          <label><span>Tool target</span><select value={effectiveTool} onChange={(event) => setToolTargetId(event.target.value)}>{toolTargets.map((row) => <option key={row.id}>{row.id}</option>)}</select></label>
+          <label><span>Arm target</span><select value={effectiveArm} onChange={(event) => setArmTargetId(event.target.value)}>{armTargets.map((row) => <option key={refKey(row.target)} value={refKey(row.target)} disabled={!row.capability?.available} title={row.capability?.reason ?? undefined}>{row.target.component_id} · {row.target.command_target_id}{row.capability?.available ? '' : ` · ${row.capability?.reason ?? 'Capability unavailable'}`}</option>)}</select></label>
+          <label><span>Tool target</span><select value={effectiveTool} onChange={(event) => setToolTargetId(event.target.value)}>{toolTargets.map((row) => <option key={refKey(row.target)} value={refKey(row.target)} disabled={!row.capability?.available} title={row.capability?.reason ?? undefined}>{row.target.component_id} · {row.target.command_target_id}{row.capability?.available ? '' : ` · ${row.capability?.reason ?? 'Capability unavailable'}`}</option>)}</select></label>
           <div className="program-template-grid">
-            <label><span>Base frame</span><select value={effectiveBase} onChange={(event) => setBaseFrame(event.target.value)}>{arm?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
-            <p className="program-form-hint">{`Moves: ${effectiveArm || '—'}`}</p>
-            <label><span>Motion TCP endpoint</span><select value={effectiveEndpoint?.key ?? ''} onChange={(event) => setEndpointKey(event.target.value)}>{endpointChoices.map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}</select></label>
+            <label><span>Base frame</span><select value={effectiveBase} onChange={(event) => setBaseFrame(event.target.value)}>{armFrameChoices.map((row) => <option key={refKey(row.reference)} value={refKey(row.reference)} disabled={!row.eligible} title={!row.eligible ? 'Not qualified for the selected target' : undefined}>{row.reference.component_id} · {row.reference.frame_id}{row.eligible ? '' : ' · Not qualified for the selected target'}</option>)}</select></label>
+            <p className="program-form-hint">{`Moves: ${arm ? `${arm.target.component_id} · ${arm.target.command_target_id}` : '—'}`}</p>
+            <label><span>Motion TCP endpoint</span><select value={effectiveEndpoint?.key ?? ''} onChange={(event) => setEndpointKey(event.target.value)}>{endpointChoices.map((choice) => <option key={choice.key} value={choice.key} disabled={choice.disabled} title={choice.reason}>{choice.label}{choice.reason ? ` · ${choice.reason}` : ''}</option>)}</select></label>
             <label title="Useful only once tool change is implemented: today a TCP whose tool is on another robot is refused when used.">
               <input type="checkbox" checked={showOtherRobotTcps}
                 onChange={(event) => setShowOtherRobotTcps(event.currentTarget.checked)} />
               Show TCPs of tools mounted on other robots
             </label>
-            {selectedDescriptor === undefined && <p className="program-form-hint">Apply to list TCPs and current mounts.</p>}
-            {hasUnrepresentedTcpOwner(program, boundTargets, selectedDescriptor, showOtherRobotTcps) && (
-              <p className="program-form-hint">Add this tool to the Program's roles to use its TCPs.</p>
-            )}
-            <label><span>Carrier frame</span><select value={effectiveCarrier} onChange={(event) => setCarrierFrame(event.target.value)}>{tool?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
-            {operation === 'pick' && <label><span>Touch body</span><select value={effectiveTouch} onChange={(event) => setTouchBody(event.target.value)}>{tool?.collisionBodies.map((id) => <option key={id}>{id}</option>)}</select></label>}
+            {selectorFacts === null && <p className="program-form-hint">Qualified Draft choices are unavailable.</p>}
+            <label><span>Carrier frame</span><select value={effectiveCarrier} onChange={(event) => setCarrierFrame(event.target.value)}>{toolFrameChoices.map((row) => <option key={refKey(row.reference)} value={refKey(row.reference)} disabled={!row.eligible} title={!row.eligible ? 'Not qualified for the selected target' : undefined}>{row.reference.component_id} · {row.reference.frame_id}{row.eligible ? '' : ' · Not qualified for the selected target'}</option>)}</select></label>
+            {operation === 'pick' && <label><span>Touch body</span><select value={effectiveTouch} onChange={(event) => setTouchBody(event.target.value)}>{toolBodyChoices.map((row) => <option key={refKey(row.reference)} value={refKey(row.reference)} disabled={!row.eligible} title={!row.eligible ? 'Not qualified for the selected target' : undefined}>{row.reference.component_id} · {row.reference.collision_body_id}{row.eligible ? '' : ' · Not qualified for the selected target'}</option>)}</select></label>}
           </div>
           {operation === 'pick' && <label><span>Contact policy</span><select value={effectivePolicy} onChange={(event) => setPolicyId(event.target.value)}>{policies.map((id) => <option key={id}>{id}</option>)}</select></label>}
           {operation === 'place' && (
             <fieldset>
-              <legend>Place target in arm base frame</legend>
+              <legend>Gripper (TCP) pose at release, in arm base frame</legend>
               <div className="program-template-grid">
                 {(['X (m)', 'Y (m)', 'Z (m)'] as const).map((label, index) => <label key={label}><span>{label}</span><input type="number" step="any" value={placePosition[index]} onChange={(event) => setPlacePosition((current) => current.map((value, position) => position === index ? event.currentTarget.valueAsNumber : value))} /></label>)}
                 {(['Roll (deg)', 'Pitch (deg)', 'Yaw (deg)'] as const).map((label, index) => <label key={label}><span>{label}</span><input type="number" step="any" value={placeOrientation[index]} onChange={(event) => setPlaceOrientation((current) => current.map((value, position) => position === index ? event.currentTarget.valueAsNumber : value))} /></label>)}

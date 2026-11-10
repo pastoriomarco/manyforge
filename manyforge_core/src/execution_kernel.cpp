@@ -1,4 +1,5 @@
 #include <manyforge_core/io_rule_stop_response.hpp>
+#include <manyforge_core/detail/lookahead_retirement_timing.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -9,6 +10,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <set>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
@@ -43,6 +46,21 @@
 
 namespace manyforge::core {
 namespace {
+
+thread_local const ExecutionKernel* current_execution_worker = nullptr;
+thread_local const ExecutionKernel* current_engine_timer = nullptr;
+struct EngineTimerScope {
+  const ExecutionKernel* previous;
+  explicit EngineTimerScope(const ExecutionKernel* owner)
+      : previous(current_engine_timer) { current_engine_timer = owner; }
+  ~EngineTimerScope() { current_engine_timer = previous; }
+};
+struct ExecutionWorkerScope {
+  const ExecutionKernel* previous;
+  explicit ExecutionWorkerScope(const ExecutionKernel* owner)
+      : previous(current_execution_worker) { current_execution_worker = owner; }
+  ~ExecutionWorkerScope() { current_execution_worker = previous; }
+};
 
 [[nodiscard]] bool resolved_scale_target_matches(const ResolvedRuntimeScaleCommandDTO& command,
                                                  const ResolvedExecutionBindingDTO& binding);
@@ -704,6 +722,200 @@ std::map<std::string, std::string> runtime_lookahead_authority_details(
   return details;
 }
 
+// Preview-only evidence. It never changes validation's decision or policy.
+// The indices belong to the final collision trajectory; positions are mapped
+// back to the original candidate's exact direct-control binding by name.
+std::optional<MotionPathPreview> build_motion_path_preview(
+    const TrajectoryDTO& candidate, const TrajectoryDTO& collision_trajectory,
+    const ResolvedExecutionBindingDTO& binding,
+    const CollisionValidationDecisionBundle& bundle,
+    const CollisionWorldSnapshot& world, const CollisionPolicySnapshot& policy,
+    const std::shared_ptr<const CollisionClearanceMargins>& margins,
+    const std::string& contact_policy_id,
+    ICollisionQueryEngine& engine, const CollisionCancellationToken& cancel,
+    std::int64_t timeout_ns, bool diagnostic_preview) {
+  constexpr std::size_t kSampleLimit = 32U;
+  constexpr std::size_t kPairLimit = 64U;
+  constexpr std::size_t kJointLimit = 256U;
+  const auto count = candidate.waypoints.size();
+  if (count == 0U || collision_trajectory.waypoints.size() != count ||
+      binding.resources.empty() || binding.resources.size() > kJointLimit ||
+      candidate.joint_names.size() != binding.resources.size() ||
+      binding.model_group_binding.compiled_joint_names.size() != binding.resources.size()) return std::nullopt;
+  MotionPathPreview result;
+  std::vector<std::size_t> candidate_indices;
+  std::set<std::string> unique_names;
+  for (const auto& name : binding.model_group_binding.compiled_joint_names) {
+    if (name.empty() || !unique_names.insert(name).second) return std::nullopt;
+    const auto it = std::find(candidate.joint_names.begin(), candidate.joint_names.end(), name);
+    if (it == candidate.joint_names.end()) return std::nullopt;
+    result.joint_names.push_back(name);
+    candidate_indices.push_back(static_cast<std::size_t>(it - candidate.joint_names.begin()));
+  }
+  std::set<std::size_t> selected{0U, count - 1U};
+  if (bundle.decision.first_failing_waypoint && *bundle.decision.first_failing_waypoint >= 0 &&
+      static_cast<std::size_t>(*bundle.decision.first_failing_waypoint) < count)
+    selected.insert(static_cast<std::size_t>(*bundle.decision.first_failing_waypoint));
+  if (count <= kSampleLimit) {
+    for (std::size_t i = 0; i < count; ++i) selected.insert(i);
+  } else {
+    for (std::size_t i = 0; i < kSampleLimit && selected.size() < kSampleLimit; ++i)
+      selected.insert(i * (count - 1U) / (kSampleLimit - 1U));
+  }
+  std::map<CollisionPairId, std::size_t> pair_indices;
+  const bool diagnostic = diagnostic_preview || !bundle.decision.accepted;
+  const auto policy_index = build_collision_policy_index(policy);
+  for (const auto index : selected) {
+    const auto& original = candidate.waypoints[index];
+    const auto& expanded = collision_trajectory.waypoints[index];
+    if (!std::isfinite(original.time_from_start_s) || original.time_from_start_s < 0.0 ||
+        (!result.samples.empty() && original.time_from_start_s <= result.samples.back().time_from_start_s) ||
+        original.positions_rad.size() != candidate.joint_names.size() ||
+        expanded.positions_rad.size() != collision_trajectory.joint_names.size() ||
+        original.time_from_start_s != expanded.time_from_start_s) return std::nullopt;
+    MotionPreviewSample sample;
+    bool incomplete_clearance = false;
+    sample.time_from_start_s = original.time_from_start_s;
+    for (const auto joint_index : candidate_indices) {
+      const auto position = original.positions_rad[joint_index];
+      if (!std::isfinite(position)) return std::nullopt;
+      sample.positions_rad.push_back(position);
+    }
+    const auto record = std::find_if(bundle.waypoint_records.begin(), bundle.waypoint_records.end(),
+        [index](const CollisionValidationWaypointRecord& item) {
+          return item.waypoint_index == static_cast<std::int64_t>(index);
+        });
+    if (record != bundle.waypoint_records.end() &&
+        record->result.engine_status == CollisionEngineStatus::kOk &&
+        record->result.collision_world_revision &&
+        record->result.collision_world_revision->revision_id == world.revision.revision_id &&
+        record->result.collision_world_revision->content_hash == world.revision.content_hash &&
+        record->result.policy_revision_used == std::to_string(policy.revision.revision_id) &&
+        !cancel.is_cancel_requested()) {
+      CollisionQuery query;
+      query.query_id = "motion_preview_geometry_" + std::to_string(index);
+      query.surface = CollisionSurface::kPreExecutionValidation;
+      query.collision_world_revision = world.revision;
+      query.policy_revision = std::to_string(policy.revision.revision_id);
+      query.robot_state = RobotStateDTO{collision_trajectory.joint_names, expanded.positions_rad, {}};
+      query.waypoint_index = static_cast<std::int64_t>(index);
+      query.required_capabilities = {"body_pair_only"};
+      if (timeout_ns > 0) query.timeout_budget_ns = timeout_ns;
+      // Null clearance means the original zero-margin geometry.
+      const auto physical = engine.check(world, query, policy, cancel);
+      if (diagnostic && !bundle.scene_changed_during_validation && !bundle.churn_window_exceeded &&
+          record->result.decision != CollisionDecisionResult::kInconclusiveFail) {
+        for (const auto& violation : record->result.clearance_violations) {
+          const auto& pair = violation.pair;
+          const auto classified = std::find_if(record->result.normalized_pairs_classified.begin(),
+              record->result.normalized_pairs_classified.end(), [&pair](const CollisionPairResult& item) {
+                return item.pair == pair;
+              });
+          const double margin = margins ? margins->margin_for(pair) : 0.0;
+          if (pair.body_a.empty() || pair.body_b.empty() || !(pair.body_a < pair.body_b) ||
+              !std::isfinite(violation.signed_clearance_m) || !std::isfinite(margin) ||
+              !(violation.signed_clearance_m > 0.0 && violation.signed_clearance_m < margin) ||
+              classified == record->result.normalized_pairs_classified.end() ||
+              classified->classification != CollisionPairClassification::kBlockingCollision) {
+            incomplete_clearance = true;
+            continue;
+          }
+          const auto [entry, added] = pair_indices.emplace(pair, result.pairs.size());
+          if (added) {
+            if (result.pairs.size() >= kPairLimit) return std::nullopt;
+            result.pairs.push_back({pair.body_a, pair.body_b});
+          }
+          sample.clearance_violations.push_back({entry->second, violation.signed_clearance_m, margin});
+        }
+      }
+      if ((physical.engine_status == CollisionEngineStatus::kOk ||
+           (diagnostic && engine.capability().diagnostic_reports_all_collision_pairs &&
+            physical.engine_status == CollisionEngineStatus::kDiagnosticIncomplete)) &&
+          (physical.decision != CollisionDecisionResult::kInconclusiveFail || diagnostic) &&
+          (!physical.in_collision || !physical.normalized_pairs.empty()) &&
+          (!diagnostic || physical.in_collision == !physical.normalized_pairs.empty()) &&
+          physical.collision_world_revision &&
+          physical.collision_world_revision->revision_id == world.revision.revision_id &&
+          physical.collision_world_revision->content_hash == world.revision.content_hash) {
+        const bool after_failure = bundle.scene_changed_during_validation || bundle.churn_window_exceeded ||
+            (bundle.decision.first_failing_waypoint &&
+             static_cast<std::int64_t>(index) > *bundle.decision.first_failing_waypoint);
+        sample.status = (after_failure && !diagnostic) || bundle.scene_changed_during_validation ||
+                            bundle.churn_window_exceeded || incomplete_clearance ||
+                            (diagnostic && !engine.capability().diagnostic_reports_all_collision_pairs) ||
+                            physical.engine_status != CollisionEngineStatus::kOk ||
+                            physical.decision == CollisionDecisionResult::kInconclusiveFail ||
+                            record->result.decision == CollisionDecisionResult::kInconclusiveFail
+                            ? MotionPreviewSampleStatus::kUnknown
+                            : MotionPreviewSampleStatus::kChecked;
+        std::set<CollisionPairId> sample_pairs;
+        for (auto pair : physical.normalized_pairs) {
+          if (pair.body_b < pair.body_a) std::swap(pair.body_a, pair.body_b);
+          if (pair.body_a.empty() || pair.body_b.empty() || pair.body_a == pair.body_b)
+            return std::nullopt;
+          if (!sample_pairs.insert(pair).second) continue;
+          const auto [entry, added] = pair_indices.emplace(pair, result.pairs.size());
+          if (added) {
+            if (result.pairs.size() >= kPairLimit) return std::nullopt;
+            result.pairs.push_back({pair.body_a, pair.body_b});
+          }
+          MotionPreviewContactDisposition disposition = MotionPreviewContactDisposition::kUnknown;
+          const auto classified = std::find_if(record->result.normalized_pairs_classified.begin(),
+              record->result.normalized_pairs_classified.end(), [&pair](const CollisionPairResult& item) {
+                return item.pair == pair;
+              });
+          const bool stateful = policy_index->support_contact_index.contains(pair) &&
+              !policy_index->touch_link_index.contains(pair) &&
+              !policy_index->static_static_index.contains(pair);
+          const auto grasp = policy_index->contact_grasp_index.find(contact_policy_id);
+          const bool grasp_pair = grasp != policy_index->contact_grasp_index.end() &&
+              contact_grasp_pair_matches(pair, grasp->second);
+          if (!(diagnostic_preview && count == 1U && (stateful || grasp_pair)) &&
+              (!after_failure || (diagnostic && !stateful &&
+                                  !bundle.scene_changed_during_validation &&
+                                  !bundle.churn_window_exceeded)) &&
+              classified != record->result.normalized_pairs_classified.end()) {
+            if ((classified->is_first_failure && record->result.decision == CollisionDecisionResult::kFail) ||
+                (classified->classification == CollisionPairClassification::kBlockingCollision &&
+                 (!grasp_pair || classified->is_first_failure)) ||
+                classified->classification == CollisionPairClassification::kSupportContactRecontactViolation)
+              disposition = MotionPreviewContactDisposition::kRefused;
+            else if (classified->classification == CollisionPairClassification::kAllowedStaticStatic ||
+                     classified->classification == CollisionPairClassification::kAllowedTouchLink ||
+                     classified->classification == CollisionPairClassification::kAllowedContactGrasp ||
+                     classified->classification == CollisionPairClassification::kSupportContactStart ||
+                     classified->classification == CollisionPairClassification::kSupportContactContinued)
+              disposition = MotionPreviewContactDisposition::kAllowed;
+          }
+          if (!diagnostic && disposition == MotionPreviewContactDisposition::kUnknown)
+            sample.status = MotionPreviewSampleStatus::kUnknown;
+          sample.contacts.push_back({entry->second, disposition});
+        }
+      }
+    }
+    result.samples.push_back(std::move(sample));
+  }
+  // Dictionary order is global canonical pair order, independent of the
+  // first sampled waypoint where a pair appeared.
+  std::vector<std::size_t> remap(result.pairs.size());
+  std::vector<MotionPreviewPair> sorted_pairs;
+  sorted_pairs.reserve(result.pairs.size());
+  for (const auto& [pair, original_index] : pair_indices) {
+    remap[original_index] = sorted_pairs.size();
+    sorted_pairs.push_back({pair.body_a, pair.body_b});
+  }
+  result.pairs = std::move(sorted_pairs);
+  for (auto& sample : result.samples) {
+    for (auto& contact : sample.contacts) contact.pair_index = remap[contact.pair_index];
+    std::sort(sample.contacts.begin(), sample.contacts.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.pair_index < rhs.pair_index; });
+    for (auto& violation : sample.clearance_violations) violation.pair_index = remap[violation.pair_index];
+    std::sort(sample.clearance_violations.begin(), sample.clearance_violations.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.pair_index < rhs.pair_index; });
+  }
+  return result;
+}
+
 }  // namespace
 
 class ExecutionKernel::EventDeferralScope {
@@ -834,24 +1046,29 @@ struct ExecutionKernel::PreparedMotionSession final {
   }
 };
 
-ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
-                                 IExecutionBackend& execution_backend, IClock& clock,
-                                 IScheduler& scheduler, TrajectoryCache& cache,
-                                 ExecutionKernelConfig config)
-    : planner_(planner),
-      observed_state_(ports.observed_state),
-      kinematics_(ports.kinematics),
-      reference_resolver_(ports.reference_resolver),
-      trajectory_validator_(ports.trajectory_validator),
-      collision_projector_(ports.collision_projector),
-      collision_diagnostic_comparator_(ports.collision_diagnostic_comparator),
-      planning_scene_synchronizer_(ports.planning_scene_synchronizer),
-      execution_backend_(execution_backend),
-      clock_(clock),
+ExecutionKernel::ExecutionKernel(std::shared_ptr<IPlannerBackend> planner, ExecutionKernelPorts ports,
+                                 std::shared_ptr<IExecutionBackend> execution_backend,
+                                 std::shared_ptr<IClock> clock, IScheduler& scheduler,
+                                 std::shared_ptr<TrajectoryCache> cache, ExecutionKernelConfig config)
+    : planner_owner_(std::move(planner)),
+      ports_owner_(std::move(ports)),
+      execution_backend_owner_(std::move(execution_backend)),
+      cache_owner_(std::move(cache)),
+      planner_(*planner_owner_),
+      observed_state_(*ports_owner_.observed_state),
+      kinematics_(*ports_owner_.kinematics),
+      reference_resolver_(*ports_owner_.reference_resolver),
+      trajectory_validator_(*ports_owner_.trajectory_validator),
+      collision_projector_(*ports_owner_.collision_projector),
+      collision_diagnostic_comparator_(ports_owner_.collision_diagnostic_comparator.get()),
+      planning_scene_synchronizer_(ports_owner_.planning_scene_synchronizer.get()),
+      execution_backend_(*execution_backend_owner_),
+      clock_owner_(std::move(clock)),
+      clock_(*clock_owner_),
       scheduler_(scheduler),
-      cache_(cache),
+      cache_(*cache_owner_),
       config_(std::move(config)),
-      sm_(clock),
+      sm_(clock_),
       runtime_collision_monitor_(
           clock_, scheduler_, RuntimeCollisionMonitor::Config{config_.collision_monitor_period_ns},
           [this]() { return collision_check_tick(); },
@@ -957,24 +1174,116 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
   }
 }
 
+ExecutionKernel::SchedulerCallAdmission::SchedulerCallAdmission(ExecutionKernel& value, bool cancel)
+    : owner(value) {
+  owner.scheduler_calls_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+  const bool closed = cancel ? owner.scheduler_cancels_closed_.load(std::memory_order_seq_cst)
+                             : owner.scheduler_detach_started_.load(std::memory_order_seq_cst);
+  if (!closed) {
+    admitted = true;
+  } else {
+    owner.scheduler_calls_in_flight_.fetch_sub(1, std::memory_order_seq_cst);
+  }
+}
+
+ExecutionKernel::SchedulerCallAdmission::~SchedulerCallAdmission() {
+  if (!admitted) return;
+  owner.scheduler_calls_in_flight_.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+std::optional<ScheduleHandle> ExecutionKernel::schedule_scoped_deadline_if_attached(
+    TimePoint deadline, std::function<void()> callback, SchedulerPriority priority) {
+  if (current_engine_timer == this || current_execution_worker == this ||
+      runtime_collision_monitor_.in_callback()) {
+    if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return std::nullopt;
+    return scheduler_.schedule(deadline, std::move(callback), priority);
+  }
+  SchedulerCallAdmission borrow(*this);
+  if (!borrow.admitted) return std::nullopt;
+  return scheduler_.schedule(deadline, std::move(callback), priority);
+}
+
+bool ExecutionKernel::cancel_scoped_deadline_if_attached(ScheduleHandle handle) {
+  if (handle == 0U) return true;
+  SchedulerCallAdmission borrow(*this, true);
+  if (!borrow.admitted) return false;
+  scheduler_.cancel(handle);
+  return true;
+}
+
+bool ExecutionKernel::cancel_recovery_deadline_if_attached(ScheduleHandle handle) {
+  if (handle == 0U) return true;
+  return cancel_scoped_deadline_if_attached(handle);
+}
+
+bool ExecutionKernel::start_collision_monitor_if_attached() {
+  if (current_execution_worker == this || runtime_collision_monitor_.in_callback()) {
+    runtime_collision_monitor_.start();
+    return true;
+  }
+  SchedulerCallAdmission borrow(*this);
+  if (!borrow.admitted) return false;
+  runtime_collision_monitor_.start();
+  return true;
+}
+
+bool ExecutionKernel::stop_collision_monitor_if_attached(bool drain_callbacks) {
+  if (current_execution_worker == this || runtime_collision_monitor_.in_callback()) {
+    runtime_collision_monitor_.stop(drain_callbacks);
+    return true;
+  }
+  SchedulerCallAdmission borrow(*this);
+  if (!borrow.admitted) return false;
+  runtime_collision_monitor_.stop(drain_callbacks);
+  return true;
+}
+
 ExecutionKernel::~ExecutionKernel() {
-  if (replacement_preparation_thread_.joinable()) {
-    replacement_preparation_thread_.request_stop();
-    replacement_preparation_thread_.join();
+  (void)detach(std::chrono::steady_clock::time_point::max());
+}
+
+Result<void> ExecutionKernel::detach(std::chrono::steady_clock::time_point deadline) {
+  if (current_execution_worker == this || current_engine_timer == this ||
+      runtime_collision_monitor_.in_callback() ||
+      RuntimeCollisionLookaheadSession::in_any_worker_thread())
+    return Result<void>::Err(ErrorDTO{kErrorExecutionRejected, "Cannot detach from an owned callback",
+                                      {{"reason", "scheduler_not_ready"}}});
+  std::lock_guard detach_lock(scheduler_detach_mutex_);
+  if (scheduler_detach_complete_) return Result<void>::Ok();
+  std::jthread replacement_worker;
+  std::jthread execution_worker;
+  {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    if (!scheduler_detach_started_.load(std::memory_order_seq_cst)) {
+      scheduler_detach_started_.store(true, std::memory_order_seq_cst);
+      std::lock_guard protection_lock(runtime_collision_protection_mutex_);
+      detach_pending_lookahead_ = runtime_collision_lookahead_session_.exchange(
+          nullptr, std::memory_order_acq_rel);
+    }
+    lifecycle_worker_retirement_cv_.wait(lifecycle_lock, [this] {
+      return !worker_retirement_in_progress_locked() && lookahead_retiring_ == 0;
+    });
+    replacement_worker = std::move(replacement_preparation_thread_);
+    execution_worker = std::move(worker_thread_);
+    replacement_worker_retiring_ = replacement_worker.joinable();
+    execution_worker_retiring_ = execution_worker.joinable();
+  }
+
+  if (replacement_worker.joinable()) {
+    replacement_worker.request_stop();
+    replacement_worker.join();
+    {
+      std::lock_guard lifecycle_lock(lifecycle_mutex_);
+      replacement_worker_retiring_ = false;
+      lifecycle_worker_retirement_cv_.notify_all();
+    }
   }
   // Retire the lower-priority lookahead workers while every kernel authority
   // they may call is still alive. Relying on member destruction order would
   // permit a final result callback into partially torn-down state.
-  std::shared_ptr<RuntimeCollisionLookaheadSession> lookahead;
-  {
-    // The execute worker can finish concurrently and release collision
-    // protection from stop_collision_monitoring(). Serialize the retirement
-    // exchange with that release before joining the session's own worker.
-    std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
-    lookahead = runtime_collision_lookahead_session_.exchange(nullptr, std::memory_order_acq_rel);
-  }
+  auto lookahead = std::move(detach_pending_lookahead_);
   if (lookahead) {
-    lookahead->disarm();
+    lookahead->detach();
     lookahead.reset();
   }
   const auto drain_scheduler_or_wait = [this](const char* drain) {
@@ -987,22 +1296,38 @@ ExecutionKernel::~ExecutionKernel() {
         [this] { (void)flight_recorder_.dump_now("scheduler_drain_timeout"); });
   };
 
+  // Join before member destruction so worker callbacks cannot notify the
+  // condition variable after it has been destroyed. This is intentionally
+  // explicit instead of relying on std::jthread member teardown order.
+  if (execution_worker.joinable()) {
+    execution_worker.request_stop();
+    worker_signals_.abandon();
+    execution_worker.join();
+    {
+      std::lock_guard lifecycle_lock(lifecycle_mutex_);
+      execution_worker_retiring_ = false;
+      lifecycle_worker_retirement_cv_.notify_all();
+    }
+  }
+
+  scheduler_cancels_closed_.store(true, std::memory_order_seq_cst);
+  while (scheduler_calls_in_flight_.load(std::memory_order_seq_cst) != 0) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline)
+      return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+          "Participant scheduler admission did not drain", {{"reason", "scheduler_detach_timeout"}}});
+    std::this_thread::sleep_for(std::min(std::chrono::milliseconds(1),
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+  }
   // Scheduled collision callbacks capture `this`; cancel them before any
   // member teardown so destruction cannot race a monitor tick.
+  const auto monitor_detached = runtime_collision_monitor_.detach();
+  if (!monitor_detached.ok()) return monitor_detached;
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown, std::nullopt,
                             /*drain_callbacks=*/true);
   drain_scheduler_or_wait("execution_kernel.scheduler.collision_monitor_stop");
 
-  // Join before member destruction so worker callbacks cannot notify the
-  // condition variable after it has been destroyed. This is intentionally
-  // explicit instead of relying on std::jthread member teardown order.
-  if (worker_thread_.joinable()) {
-    worker_thread_.request_stop();
-    worker_signals_.abandon();
-    worker_thread_.join();
-  }
-
-  // RT-8B freshness deadlines capture `this`. A pending deadline is not
+  // Freshness deadlines capture `this`. A pending deadline is not
   // covered by scheduler drain (drain only waits for already-dequeued work),
   // and the execute worker may have replaced the handle after the earlier
   // drain. Cancel after every kernel-owned worker is joined, then drain once
@@ -1026,6 +1351,10 @@ ExecutionKernel::~ExecutionKernel() {
     }
   }
   drain_scheduler_or_wait("execution_kernel.scheduler.recovery_freshness_deadline_cancel");
+  if (collision_validation_worker_pool_) collision_validation_worker_pool_->detach();
+
+  scheduler_detach_complete_ = true;
+  return Result<void>::Ok();
 }
 
 bool ExecutionKernel::settle_execution(const std::uint64_t exec_id, const std::string& move_id,
@@ -1038,7 +1367,7 @@ bool ExecutionKernel::settle_execution(const std::uint64_t exec_id, const std::s
   if (!sm_.settle(fact).ok()) {
     return false;
   }
-  // RT-8B: an ended execution changes the recovery inputs. This function is
+  // An ended execution changes the recovery inputs. This function is
   // reached both with and without lifecycle_mutex_ held, and std::mutex
   // try_lock by the owning thread is UB; enqueue a coalesced refresh.
   recovery_assessment_dirty_.store(true, std::memory_order_release);
@@ -1403,8 +1732,11 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
       runtime_collision_protection_.execution_id = sm_.status().execution_id;
       runtime_collision_protection_.state_at_acquire = sm_.status().state;
       runtime_collision_protection_.reason = std::move(reason);
+      runtime_collision_protection_epoch_.fetch_add(1, std::memory_order_acq_rel);
       reused_generation = runtime_collision_protection_.generation;
-      runtime_collision_monitor_.start();
+      if (!start_collision_monitor_if_attached())
+        return {reused_generation, ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                             {{"reason", "scheduler_not_ready"}}}};
     }
   }
   if (reused_generation != 0) {
@@ -1415,7 +1747,9 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
   // pending schedule was cancelled. Runtime query results are non-owning views
   // into generation-local engine scratch, so the next session must not prepare
   // or mutate that engine until the old callback has fully returned.
-  runtime_collision_monitor_.stop(/*drain_callbacks=*/true);
+  if (!stop_collision_monitor_if_attached(/*drain_callbacks=*/true))
+    return {0U, ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                         {{"reason", "scheduler_not_ready"}}}};
 
   std::map<std::string, std::string> refresh_details;
   RuntimeCollisionQueryBundlePtr initial_bundle;
@@ -1484,11 +1818,14 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
     runtime_collision_protection_.execution_id = sm_.status().execution_id;
     runtime_collision_protection_.state_at_acquire = sm_.status().state;
     runtime_collision_protection_.reason = std::move(reason);
+    runtime_collision_protection_epoch_.fetch_add(1, std::memory_order_acq_rel);
     generation = runtime_collision_protection_.generation;
     // A failed preparation never arms the monitor: the caller stops this
     // generation fail-closed and does not dispatch.
     if (!query_prepare_error) {
-      runtime_collision_monitor_.start();
+      if (!start_collision_monitor_if_attached())
+        query_prepare_error = ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                       {{"reason", "scheduler_not_ready"}}};
     }
   }
   return {generation, std::move(query_prepare_error)};
@@ -1509,6 +1846,7 @@ void ExecutionKernel::stop_collision_monitoring(RuntimeCollisionMonitorRelease /
       coverage_execution_id = runtime_collision_protection_.execution_id;
       runtime_collision_protection_.active = false;
       runtime_collision_protection_.reason.clear();
+      runtime_collision_protection_epoch_.fetch_add(1, std::memory_order_acq_rel);
       if (const auto lookahead =
               runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
         lookahead->disarm();
@@ -1517,7 +1855,7 @@ void ExecutionKernel::stop_collision_monitoring(RuntimeCollisionMonitorRelease /
     if (!release_current && expected_generation.has_value()) {
       return;
     }
-    runtime_collision_monitor_.stop(drain_callbacks);
+    (void)stop_collision_monitor_if_attached(drain_callbacks);
     runtime_collision_query_session_.store(nullptr, std::memory_order_release);
     if (release_current) {
       clear_runtime_collision_state_projection_unlocked();
@@ -1663,6 +2001,7 @@ ExecutionKernel::apply_runtime_collision_lookahead_authority(
             ExecutionProgressHazardClaimResult::kClaimed) {
       return RuntimeCollisionLookaheadAuthorityDisposition::kStale;
     }
+    runtime_collision_protection_epoch_.fetch_add(1, std::memory_order_acq_rel);
     cache_.invalidate_all();
     // The collision is a participant fact. The addressed Kernel resolves and
     // accepts the containment Stop (or escalates an active one) from this
@@ -1814,6 +2153,7 @@ void ExecutionKernel::emit_contact_policy_violation_event(
 }
 
 void ExecutionKernel::revoke_runtime_collision_lookahead_clear_permits() noexcept {
+  stop_revocation_generation_.fetch_add(1, std::memory_order_acq_rel);
   if (const auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire)) {
     lookahead->revoke_clear_permits();
   }
@@ -1880,9 +2220,11 @@ Result<void> ExecutionKernel::retire_prepared_motion_membership(
 
 bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
                                             const bool containment_already_certified) {
+  if (execution_worker_retiring_) return false;
   if (!worker_thread_.joinable()) {
     return true;
   }
+  if (replacement_worker_retiring_) return false;
   certified_containment_retirement_.store(containment_already_certified, std::memory_order_release);
   if (worker_thread_.get_id() == std::this_thread::get_id()) {
     worker_thread_.request_stop();
@@ -1890,22 +2232,27 @@ bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecy
     return false;
   }
 
-  lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+  execution_worker_retiring_ = true;
+  replacement_worker_retiring_ = replacement_preparation_thread_.joinable();
   {
     std::lock_guard owner_lock(prepared_motion_session_mutex_);
     if (pending_prepared_motion_session_) {
       pending_prepared_motion_session_->replacement_cancellation.request_stop();
     }
   }
-  if (replacement_preparation_thread_.joinable()) replacement_preparation_thread_.request_stop();
-  worker_thread_.request_stop();
-  worker_signals_.notify();
+  auto replacement_worker = std::move(replacement_preparation_thread_);
+  auto execution_worker = std::move(worker_thread_);
   lifecycle_lock.unlock();
-  if (replacement_preparation_thread_.joinable()) replacement_preparation_thread_.join();
-  worker_thread_.join();
+  if (replacement_worker.joinable()) replacement_worker.request_stop();
+  execution_worker.request_stop();
+  worker_signals_.notify();
+  if (replacement_worker.joinable()) replacement_worker.join();
+  execution_worker.join();
   lifecycle_lock.lock();
   certified_containment_retirement_.store(false, std::memory_order_release);
-  lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+  execution_worker_retiring_ = false;
+  replacement_worker_retiring_ = false;
+  lifecycle_worker_retirement_cv_.notify_all();
   return true;
 }
 
@@ -2017,11 +2364,11 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
   if (planning_timeout_ns > 0) {
     const int64_t deadline = planning_start_ns + planning_timeout_ns;
     // Monitoring lane: the watchdog must fire even when the planner
-    // and collision-monitor are blocked behind the scene lock. See
-    // spec/220 threading invariants and ADR-0019. It only records the
-    // expiry and cancels planning; this worker reports the fact.
+    // and collision-monitor are blocked behind the scene lock. It only
+    // records the expiry and cancels planning; this worker reports the fact.
     planning_timeout_handle = scheduler_.schedule(
-        deadline, [this]() { expire_planning_deadline(); }, SchedulerPriority::Monitoring);
+        deadline, [this]() { EngineTimerScope timer_scope(this); expire_planning_deadline(); },
+        SchedulerPriority::Monitoring);
   }
 
   auto plan_result = prepared_session && prepared_session->authority.continuation
@@ -2270,7 +2617,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     if (replan_timeout_ns > 0) {
       const int64_t deadline = replan_start_ns + replan_timeout_ns;
       replan_timeout_handle = scheduler_.schedule(
-          deadline, [this]() { expire_planning_deadline(); }, SchedulerPriority::Monitoring);
+          deadline, [this]() { EngineTimerScope timer_scope(this); expire_planning_deadline(); },
+        SchedulerPriority::Monitoring);
     }
     auto replan_result =
         plan_trajectory_with_evidence(request, scene_snapshot_lease_inventory,
@@ -2474,7 +2822,7 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
   if (!active_trajectory_from_cache)
     store_validated_trajectory(request, trajectory, planning_attempt_index);
 
-  // M6b: the apply-tool-context action (the robot's TCP and payload for this
+  // The apply-tool-context action (the robot's TCP and payload for this
   // motion, sent when they differ and settled) runs before the motion is sent
   // and before it counts as running: the participant stays Validating until
   // it succeeded. A refusal ends the motion before any goal is sent.
@@ -3210,7 +3558,7 @@ void ExecutionKernel::async_execute_worker(
     motion_state.last_runtime_scale_sample_ns = exec_start_ns;
     auto& last_runtime_scale_sample_ns = motion_state.last_runtime_scale_sample_ns;
     auto& runtime_scaled_execution_ns = motion_state.runtime_scaled_execution_ns;
-    // Optional user-set zero-speed hold timeout (item 40). Unset keeps
+    // Optional user-set zero-speed hold timeout. Unset keeps
     // `main`: a hold at zero speed never ends the motion.
     motion_state.zero_speed_hold_timeout_ns =
         request.timeouts.zero_speed_hold_timeout_s.has_value()
@@ -3256,7 +3604,7 @@ void ExecutionKernel::async_execute_worker(
 
       const auto now_ns = clock_.now();
       if (!completed) {
-        // As `main` (item 40): the timeout clock is elapsed time x scale, so
+        // As `main`: the timeout clock is elapsed time x scale, so
         // a zero-scale hold never trips it. The applied factor is used when
         // the mechanism reports a valid one; otherwise the accepted slider
         // value (`main`'s own quantity, 1.0 when none was set). Timing
@@ -3369,8 +3717,8 @@ void ExecutionKernel::async_execute_worker(
   } catch (const std::exception& e) {
     stop_collision_monitoring(RuntimeCollisionMonitorRelease::kFailClosedTerminal,
                               motion_state.runtime_collision_protection_generation);
-    // A backend's reported critical fault (Q52) keeps its own error; any
-    // other exception is the worker's (item 17). Both take this path.
+    // A backend's reported critical fault keeps its own error; any
+    // other exception is the worker's. Both take this path.
     const auto* critical = dynamic_cast<const ExecutionCriticalFault*>(&e);
     const ErrorDTO exception_error =
         critical != nullptr
@@ -3383,7 +3731,7 @@ void ExecutionKernel::async_execute_worker(
                    PreparedMotionDispatchGate::kCommitted;
     }
     if (dispatched) {
-      // Item 17: an exception after dispatch leaves the command's settlement
+      // An exception after dispatch leaves the command's settlement
       // unknown. Issue the lane's hard stop (the primitive Reset uses) and
       // end InterventionRequired, unless an addressed Stop already owns the
       // execution.
@@ -3562,12 +3910,14 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     const std::stop_token stop_token,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
     const MovingReplacementInputDTO* replacement,
-    const std::optional<std::int64_t> suffix_planning_deadline_ns) {
+    const std::optional<std::int64_t> suffix_planning_deadline_ns,
+    std::optional<MotionPathPreview>* path_preview) {
+  if (path_preview != nullptr) path_preview->reset();
   const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
     return Result<ValidatedMotionPlan>::Err(ErrorDTO{
         std::string(to_string(code)), std::move(message), {{"reason", std::move(reason)}}});
   };
-  const auto failure = [&](ErrorDTO error, const char* phase) {
+  const auto phase_failure = [&](ErrorDTO error, const char* phase) {
     if (replacement) {
       error.details.try_emplace("takeover_compute_phase", phase);
       error.details.try_emplace("takeover_preparation_budget_ns",
@@ -3583,9 +3933,12 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     }
     return Result<ValidatedMotionPlan>::Err(std::move(error));
   };
+  std::unique_ptr<PlanningSuccess> failed_planning;
   auto planned =
       plan_trajectory_with_evidence(request, projection_inventory, planning_attempt_index,
-                                    &start_state, replacement, suffix_planning_deadline_ns);
+                                    &start_state, replacement, suffix_planning_deadline_ns,
+                                    path_preview != nullptr && replacement == nullptr
+                                        ? &failed_planning : nullptr);
   const auto planning_finished_ns = clock_.now();
   const auto planning_elapsed_ns = planning_finished_ns - planning_start_ns;
   trace_moving_core_phase(replacement, "candidate_return", planning_start_ns,
@@ -3607,22 +3960,231 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     error.details["planning_elapsed_ns"] =
         std::to_string(std::max<std::int64_t>(0, planning_elapsed_ns));
     error.details["planning_budget_ns"] = std::to_string(planning_timeout_ns);
-    return failure(std::move(error), "candidate_compute");
+    return phase_failure(std::move(error), "candidate_compute");
   }
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
                   "motion_preview_cancelled");
   }
-  if (!planned.ok()) return failure(planned.error(), "candidate_compute");
+  if (!planned.ok()) {
+    const auto original_error = planned.error();
+    const auto deadline = planning_start_ns + planning_timeout_ns;
+    const auto remaining = deadline - clock_.now();
+    if (!failed_planning) return phase_failure(original_error, "candidate_compute");
+    const auto& result = failed_planning->result;
+    const auto reason = original_error.details.find("reason");
+    const auto* pose = std::get_if<PoseGoalDTO>(&failed_planning->request.motion);
+    if (path_preview != nullptr && replacement == nullptr && remaining > 0 && pose != nullptr &&
+        original_error.code == kErrorIkFailed && reason != original_error.details.end() &&
+        reason->second == "native_ik_no_solution") {
+      const auto& source = failed_planning->request;
+      IkRequestDTO ik{source.controllable_component_id, source.command_target_id,
+                      source.model_bindings, source.resources, pose->goal,
+                      source.base_frame, source.tcp_frame, source.start_state,
+                      source.projection_binding, static_cast<double>(remaining) / 1e9,
+                      source.retained_collision_world, source.retained_collision_policy,
+                      PlannerCollisionMode::kDiagnosticDisabled, source.tolerances};
+      auto solved = planner_.solve_ik(ik);
+      if (stop_token.stop_requested())
+        return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
+                      "motion_preview_cancelled");
+      if (!solved.ok || clock_.now() >= deadline ||
+          solved.resources != request.binding.resources ||
+          solved.joint_names != request.binding.model_group_binding.compiled_joint_names ||
+          solved.positions_rad.size() != solved.joint_names.size() ||
+          !std::all_of(solved.positions_rad.begin(), solved.positions_rad.end(),
+                       [](double value) { return std::isfinite(value); }))
+        return phase_failure(original_error, "candidate_compute");
+
+      // This one-state projection is only input to the collision observer. It
+      // is never admitted as an executable or validated motion trajectory.
+      TrajectoryDTO state;
+      state.resources = solved.resources;
+      state.joint_names = solved.joint_names;
+      state.waypoints.push_back({0.0, solved.positions_rad, {}, {}});
+      auto expanded = collision_projector_.expand_for_collision(state, start_state);
+      const auto& world_policy = projection_inventory.bundle;
+      if (!expanded.ok() || !world_policy.world || !world_policy.policy || clock_.now() >= deadline)
+        return phase_failure(original_error, "candidate_compute");
+      const auto resources = collision_resources_.snapshot();
+      const auto engine = std::find_if(resources.validation_engines.begin(), resources.validation_engines.end(),
+                                       [](const auto& value) { return static_cast<bool>(value); });
+      if (engine == resources.validation_engines.end()) return phase_failure(original_error, "candidate_compute");
+      auto cancel = std::make_shared<CollisionCancellationToken>();
+      std::stop_callback stop_collision(stop_token, [cancel]() { cancel->request_cancel("motion_preview_cancelled"); });
+      const auto handle = schedule_scoped_deadline_if_attached(deadline,
+          [cancel]() { cancel->request_cancel("motion_preview_deadline"); }, SchedulerPriority::Monitoring);
+      if (!handle) return phase_failure(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                                {{"reason", "scheduler_not_ready"}}}, "candidate_compute");
+      struct PoseDeadlineGuard {
+        ExecutionKernel& owner;
+        ScheduleHandle handle;
+        ~PoseDeadlineGuard() { owner.cancel_scoped_deadline_if_attached(handle); }
+      } guard{*this, *handle};
+      CollisionValidationPassConfig cfg;
+      cfg.policy_snapshot_ref = std::make_shared<CollisionPolicySnapshot>(*world_policy.policy);
+      cfg.policy_index = build_collision_policy_index(*cfg.policy_snapshot_ref);
+      cfg.surface = CollisionSurface::kPreExecutionValidation;
+      cfg.contact_policy_id = request.contact_policy_id;
+      cfg.clearance_margins = world_policy.clearance_margins;
+      cfg.per_state_timeout_ns = std::min<std::int64_t>(
+          static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns), deadline - clock_.now());
+      const auto observed = collision_validation_worker_pool_->validate_trajectory(
+          world_policy.world, resources.validation_engines, expanded.value(), cancel, cfg, deadline);
+      if (!cancel->is_cancel_requested() && clock_.now() < deadline && !observed.cancelled) {
+        *path_preview = build_motion_path_preview(
+            state, expanded.value(), request.binding, observed, *world_policy.world,
+            *world_policy.policy, world_policy.clearance_margins, request.contact_policy_id,
+            **engine, *cancel, deadline - clock_.now(), true);
+        if (*path_preview) (*path_preview)->diagnostic_kind = "collision_disabled_ik_pose";
+      }
+      if (stop_token.stop_requested()) {
+        path_preview->reset();
+        return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
+                      "motion_preview_cancelled");
+      }
+      if (clock_.now() >= deadline || cancel->is_cancel_requested()) path_preview->reset();
+      // Preserve the already observed pose if the optional path cannot be
+      // planned or checked within the original budget. The pose and path are
+      // advisory only; neither can create a receipt or enter the plan cache.
+      if (*path_preview && clock_.now() < deadline) {
+        auto target = source.start_state;
+        target.positions.clear();
+        for (double position : solved.positions_rad)
+          target.positions.emplace_back(AngularPositionDTO{position});
+        target.velocities.reset();
+        if (validate_controlled_state(target).ok() && angular_position_projection(target).ok()) {
+          auto path_request = source;
+          path_request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+          path_request.diagnostic_qualified_target = target;
+          const auto path_budget = deadline - clock_.now();
+          if (path_budget <= 0) return phase_failure(original_error, "candidate_compute");
+          path_request.planning_timeout_s = static_cast<double>(path_budget) / 1e9;
+          auto path_result = planner_.plan(path_request);
+          if (stop_token.stop_requested()) {
+            path_preview->reset();
+            return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
+                          "motion_preview_cancelled");
+          }
+          if (clock_.now() < deadline && path_result.trajectory &&
+              path_result.projection_revision == projection_inventory.projection_binding.projection_revision &&
+              path_result.trajectory->resources == request.binding.resources &&
+              path_result.trajectory->joint_names == request.binding.model_group_binding.compiled_joint_names &&
+              !path_result.trajectory->waypoints.empty() &&
+              path_result.trajectory->waypoints.back().positions_rad == solved.positions_rad) {
+            std::optional<MotionPathPreview> path;
+            auto checked = validate_trajectory(
+                *path_result.trajectory, request, projection_inventory, &start_state, stop_token,
+                nullptr, {}, nullptr, false, &path, true, deadline);
+            if (stop_token.stop_requested()) {
+              path_preview->reset();
+              return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
+                            "motion_preview_cancelled");
+            }
+            if (clock_.now() < deadline && path && path->samples.size() >= 2U &&
+                (checked.ok() || checked.error().code == kErrorValidationCollision)) {
+              path->diagnostic_kind = "collision_disabled_ik_path";
+              *path_preview = std::move(path);
+            }
+          }
+        }
+      }
+      return phase_failure(original_error, "candidate_compute");
+    }
+    const bool cartesian = std::holds_alternative<CartesianPathDTO>(failed_planning->request.motion);
+    const bool cartesian_failure = cartesian &&
+        (original_error.code == kErrorCartesianIncomplete || original_error.code == kErrorIkFailed ||
+         original_error.code == kErrorValidationLimitsViolation ||
+         original_error.code == kErrorPlanningFailed || original_error.code == kErrorPlanningTimeout);
+    const bool qualified_failure =
+        (original_error.code == kErrorPlanningFailed || original_error.code == kErrorPlanningTimeout) &&
+        result.target_qualified && result.qualified_target.has_value();
+    const bool eligible = path_preview != nullptr && replacement == nullptr && remaining > 0 &&
+        (cartesian_failure || qualified_failure);
+    if (!eligible) return phase_failure(original_error, "candidate_compute");
+    auto fallback_request = failed_planning->request;
+    if (!cartesian) {
+      const auto& target = *result.qualified_target;
+      auto identity = target;
+      identity.positions = fallback_request.start_state.positions;
+      identity.velocities = fallback_request.start_state.velocities;
+      if (identity != fallback_request.start_state || !validate_controlled_state(target).ok() ||
+          !angular_position_projection(target).ok())
+        return phase_failure(original_error, "candidate_compute");
+      fallback_request.diagnostic_qualified_target = target;
+    }
+    fallback_request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+    const auto fallback_budget = deadline - clock_.now();
+    if (fallback_budget <= 0) return phase_failure(original_error, "candidate_compute");
+    fallback_request.planning_timeout_s = static_cast<double>(fallback_budget) / 1e9;
+    auto fallback = planner_.plan(fallback_request);
+    if (stop_token.stop_requested())
+      return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during planning",
+                    "motion_preview_cancelled");
+    if (clock_.now() >= deadline) return phase_failure(original_error, "candidate_compute");
+    if (!fallback.trajectory) {
+      if (!fallback.error) return phase_failure(original_error, "candidate_compute");
+      auto error = *fallback.error;
+      const auto diagnostic_reason = error.details.find("reason");
+      const auto planner_error = error.details.find("planner_error");
+      const bool solver_failure = diagnostic_reason != error.details.end() &&
+          ((error.code == kErrorCartesianIncomplete &&
+            diagnostic_reason->second == "cartesian_ik_failure") ||
+           (error.code == kErrorValidationLimitsViolation &&
+            diagnostic_reason->second == "cartesian_joint_limit_violation") ||
+           (error.code == kErrorCartesianIncomplete &&
+            diagnostic_reason->second == "cartesian_tracking_stalled" &&
+            planner_error != error.details.end() &&
+            planner_error->second.find("singularity") != std::string::npos));
+      if (cartesian && solver_failure)
+        error.details["cartesian_collision_disabled_diagnostic"] = "failed";
+      error.details["original_error_code"] = original_error.code;
+      error.details["original_error_message"] = original_error.message;
+      if (const auto reason = original_error.details.find("reason"); reason != original_error.details.end())
+        error.details["original_error_reason"] = reason->second;
+      return phase_failure(std::move(error), "candidate_compute");
+    }
+    if (fallback.projection_revision != projection_inventory.projection_binding.projection_revision ||
+        fallback.trajectory->resources != request.binding.resources ||
+        fallback.trajectory->joint_names != request.binding.model_group_binding.compiled_joint_names) {
+      return phase_failure(ErrorDTO{kErrorInvariantViolation,
+          "Diagnostic planner changed the retained projection or resources",
+          {{"reason", "diagnostic_planner_projection_mismatch"},
+           {"original_error_code", original_error.code},
+           {"original_error_message", original_error.message}}}, "candidate_compute");
+    }
+    auto diagnostic_validation = validate_trajectory(
+        *fallback.trajectory, request, projection_inventory, &start_state, stop_token,
+        nullptr, {}, nullptr, false, path_preview, true, deadline);
+    if (stop_token.stop_requested()) {
+      path_preview->reset();
+      return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
+                    "motion_preview_cancelled");
+    }
+    if (clock_.now() >= deadline) {
+      path_preview->reset();
+      return phase_failure(original_error, "candidate_compute");
+    }
+    if (*path_preview) (*path_preview)->diagnostic_kind = "collision_disabled_path";
+    if (!diagnostic_validation.ok() && diagnostic_validation.error().code != kErrorValidationCollision) {
+      path_preview->reset();
+      auto error = diagnostic_validation.error();
+      error.details["original_error_code"] = original_error.code;
+      error.details["original_error_message"] = original_error.message;
+      return phase_failure(std::move(error), "candidate_compute");
+    }
+    return phase_failure(original_error, "candidate_compute");
+  }
 
   auto validated = validate_trajectory(
       *planned.value().result.trajectory, request, projection_inventory, &start_state, stop_token,
-      nullptr, std::move(validation_cancellation), replacement);
+      nullptr, std::move(validation_cancellation), replacement, false, path_preview);
   if (stop_token.stop_requested()) {
+    if (path_preview != nullptr) path_preview->reset();
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
                   "motion_preview_cancelled");
   }
-  if (!validated.ok()) return failure(validated.error(), "core_validation");
+  if (!validated.ok()) return phase_failure(validated.error(), "core_validation");
   return Result<ValidatedMotionPlan>::Ok(
       ValidatedMotionPlan{std::move(planned.value()), std::move(validated.value())});
 }
@@ -3630,8 +4192,16 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
 Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     ExecuteRequestDTO request, CollisionWorldLeaseInventory projection_inventory,
     RobotStateDTO start_state, const std::uint32_t planning_attempt_index,
-    const std::stop_token caller_stop_token) {
+    const std::stop_token caller_stop_token,
+    std::optional<MotionPathPreview>* path_preview) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<MotionPreviewResultDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
+  if (path_preview != nullptr) path_preview->reset();
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<MotionPreviewResultDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                    {{"reason", "scheduler_not_ready"}}});
   // Exclusive planner access stays with lifecycle_mutex_; a waiting Stop,
   // Reset or recovery cancels this advisory preview instead of waiting for
   // its planning to finish or time out. Register before reading the waiter
@@ -3720,24 +4290,31 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
   const auto planning_start_ns = clock_.now();
   const auto planning_timeout_ns =
       static_cast<std::int64_t>(request.timeouts.planning_timeout_s * 1.0e9);
-  const auto planning_timeout_handle = scheduler_.schedule(
-      planning_start_ns + planning_timeout_ns, [this]() { planner_.request_cancel(); },
+  const auto planning_timeout_handle = schedule_scoped_deadline_if_attached(
+      planning_start_ns + planning_timeout_ns, [this]() {
+        EngineTimerScope timer_scope(this);
+        planner_.request_cancel();
+      },
       SchedulerPriority::Monitoring);
+  if (!planning_timeout_handle)
+    return Result<MotionPreviewResultDTO>::Err(ErrorDTO{kErrorExecutionRejected,
+        "Participant scheduler is detached", {{"reason", "scheduler_not_ready"}}});
   struct ScheduleCancelGuard final {
-    IScheduler& scheduler;
+    ExecutionKernel& owner;
     ScheduleHandle handle;
-    ~ScheduleCancelGuard() {
-      if (handle != 0U) {
-        scheduler.cancel(handle);
-      }
-    }
-  } timeout_guard{scheduler_, planning_timeout_handle};
+    ~ScheduleCancelGuard() { owner.cancel_scoped_deadline_if_attached(handle); }
+  } timeout_guard{*this, *planning_timeout_handle};
 
   try {
+    std::optional<MotionPathPreview> candidate_path;
     auto computed = compute_validated_motion_plan(
         request, projection_inventory, start_state, planning_attempt_index,
-        planning_start_ns, planning_timeout_ns, stop_token);
-    if (!computed.ok()) return Result<MotionPreviewResultDTO>::Err(computed.error());
+        planning_start_ns, planning_timeout_ns, stop_token, {}, nullptr, std::nullopt,
+        path_preview != nullptr ? &candidate_path : nullptr);
+    if (!computed.ok()) {
+      if (path_preview != nullptr) *path_preview = std::move(candidate_path);
+      return Result<MotionPreviewResultDTO>::Err(computed.error());
+    }
     auto trajectory = std::move(*computed.value().planning.result.trajectory);
     auto validated = std::move(computed.value().validation);
 
@@ -3757,17 +4334,20 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     if (!final_tcp_pose.ok()) {
       return Result<MotionPreviewResultDTO>::Err(final_tcp_pose.error());
     }
+    if (path_preview != nullptr) *path_preview = std::move(candidate_path);
     return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
         std::move(trajectory), std::move(start_state), std::move(final_state),
         std::move(final_controlled_state.value()), std::move(final_tcp_pose.value()),
         projection_inventory.projection_binding, validated.collision_world_revision,
         validated.dynamically_discovered_start_contact_count});
   } catch (const std::exception& error) {
+    if (path_preview != nullptr) path_preview->reset();
     return Result<MotionPreviewResultDTO>::Err(
         ErrorDTO{kErrorPlanningFailed,
                  "Motion preview raised while planning or validating",
                  {{"reason", "motion_preview_exception"}, {"exception", error.what()}}});
   } catch (...) {
+    if (path_preview != nullptr) path_preview->reset();
     return Result<MotionPreviewResultDTO>::Err(
         ErrorDTO{kErrorPlanningFailed,
                  "Motion preview raised a non-standard exception",
@@ -3778,6 +4358,9 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
 
 Result<std::uint64_t> ExecutionKernel::PrepareMotion(
     ResolvedPreparedMotionExecutionRequestDTO request) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   if (!request.ordinary_stop_plan) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{kErrorInvalidRequest,
@@ -3974,9 +4557,10 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
     session->replacement_validation_cancellation->request_cancel("spring_return_cancelled");
     planner_.request_cancel();
   });
-  const auto deadline = scheduler_.schedule(
+  const auto deadline = schedule_scoped_deadline_if_attached(
       session->preparation_deadline_ns,
       [this, session, cancellation = session->replacement_validation_cancellation] {
+        EngineTimerScope timer_scope(this);
         std::lock_guard lock(session->mutex);
         if (session->replacement_validation_cancellation != cancellation ||
             session->preparation_completed)
@@ -3985,13 +4569,13 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
         planner_.request_cancel();
       },
       SchedulerPriority::Monitoring);
+  if (!deadline) return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+      "Participant scheduler is detached", {{"reason", "scheduler_not_ready"}}});
   struct DeadlineGuard {
-    IScheduler& scheduler;
+    ExecutionKernel& owner;
     ScheduleHandle handle;
-    ~DeadlineGuard() {
-      if (handle != 0U) scheduler.cancel(handle);
-    }
-  } guard{scheduler_, deadline};
+    ~DeadlineGuard() { owner.cancel_scoped_deadline_if_attached(handle); }
+  } guard{*this, *deadline};
   const auto remaining_ns = session->preparation_deadline_ns - clock_.now();
   if (remaining_ns <= 0 || stop_token.stop_requested())
     return refuse("spring_return_preparation_budget_expired");
@@ -4041,8 +4625,11 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
 
 Result<bool> ExecutionKernel::PrepareColdMotionAfterStop(const std::uint64_t candidate_id,
                                                          const StopCertificateDTO& certificate) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+  if (worker_retirement_in_progress_locked())
     return Result<bool>::Ok(false);
   // An event may be delivered on the preparation thread itself. Existing
   // reconciliation retries the read; never join that same thread here.
@@ -4142,13 +4729,19 @@ Result<bool> ExecutionKernel::PrepareColdMotionAfterStop(const std::uint64_t can
 }
 Result<std::uint64_t> ExecutionKernel::prepare_motion_replacement(
     std::shared_ptr<PreparedMotionSession> session) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   const auto reject = [](const char* reason) {
     return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
                                                "Motion replacement preparation was refused",
                                                {{"reason", reason}}});
   };
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                    {{"reason", "scheduler_not_ready"}}});
+  if (worker_retirement_in_progress_locked())
     return reject("worker_retirement_in_progress");
   const auto& context = *session->authority.replacement;
   if (context.preparation_budget_ns <= 0 || session->authority.continuation ||
@@ -4210,11 +4803,17 @@ Result<std::uint64_t> ExecutionKernel::prepare_motion_replacement(
   if (replacement_preparation_thread_.joinable()) {
     if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
       return reject("motion_replacement_computation_retiring");
-    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    replacement_worker_retiring_ = true;
+    auto replacement_worker = std::move(replacement_preparation_thread_);
     lifecycle_lock.unlock();
-    replacement_preparation_thread_.join();
+    MANYFORGE_REPLACEMENT_JOIN_TEST_POINT();
+    replacement_worker.join();
     lifecycle_lock.lock();
-    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+    replacement_worker_retiring_ = false;
+    lifecycle_worker_retirement_cv_.notify_all();
+    if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+      return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
     // Joining is never an admission fence; recheck the incumbent after it.
     if (context.spring_return) {
       std::lock_guard lock(source->mutex);
@@ -4254,13 +4853,19 @@ Result<std::uint64_t> ExecutionKernel::prepare_motion_replacement(
 
 Result<std::uint64_t> ExecutionKernel::prepare_spring_motion_attachment(
     ResolvedPreparedMotionExecutionRequestDTO request) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   const auto reject = [](const char* reason) {
     return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
                                                "Sent replacement cold computation was refused",
                                                {{"reason", reason}}});
   };
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                    {{"reason", "scheduler_not_ready"}}});
+  if (worker_retirement_in_progress_locked())
     return reject("worker_retirement_in_progress");
   const auto abandoned_id = request.replacement->spring_return->abandoned_preparation_id;
   const auto budget = request.replacement->preparation_budget_ns;
@@ -4326,11 +4931,17 @@ Result<std::uint64_t> ExecutionKernel::prepare_spring_motion_attachment(
   if (replacement_preparation_thread_.joinable()) {
     if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
       return reject("motion_replacement_computation_retiring");
-    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    replacement_worker_retiring_ = true;
+    auto replacement_worker = std::move(replacement_preparation_thread_);
     lifecycle_lock.unlock();
-    replacement_preparation_thread_.join();
+    MANYFORGE_REPLACEMENT_JOIN_TEST_POINT();
+    replacement_worker.join();
     lifecycle_lock.lock();
-    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+    replacement_worker_retiring_ = false;
+    lifecycle_worker_retirement_cv_.notify_all();
+    if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+      return Result<std::uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
     if (const auto qualified = qualify(); !qualified.ok())
       return Result<std::uint64_t>::Err(qualified.error());
   }
@@ -4372,6 +4983,7 @@ Result<void> ExecutionKernel::launch_motion_replacement_preparation(
     const std::shared_ptr<PreparedMotionSession>& session) {
   try {
     replacement_preparation_thread_ = std::jthread([this, session](std::stop_token token) {
+      ExecutionWorkerScope worker_scope(this);
       std::stop_callback cancellation(token,
                                       [&]() { session->replacement_cancellation.request_stop(); });
       compute_motion_replacement(session->replacement_cancellation.get_token(), session);
@@ -4531,9 +5143,10 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     const auto start_ns = session->preparation_started_ns;
     if (start_ns > std::numeric_limits<std::int64_t>::max() - context.preparation_budget_ns)
       return Result<void>::Err(failed("motion_replacement_budget_unrepresentable"));
-    const auto deadline = scheduler_.schedule(
+    const auto deadline = schedule_scoped_deadline_if_attached(
         session->preparation_deadline_ns,
         [this, session, cancellation = session->replacement_validation_cancellation]() {
+          EngineTimerScope timer_scope(this);
           std::lock_guard lock(session->mutex);
           if (session->replacement_validation_cancellation != cancellation ||
               session->preparation_completed)
@@ -4542,13 +5155,13 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
           planner_.request_cancel();
         },
         SchedulerPriority::Monitoring);
+    if (!deadline) return Result<void>::Err(ErrorDTO{kErrorExecutionRejected,
+        "Participant scheduler is detached", {{"reason", "scheduler_not_ready"}}});
     struct DeadlineGuard {
-      IScheduler& scheduler;
+      ExecutionKernel& owner;
       ScheduleHandle handle;
-      ~DeadlineGuard() {
-        if (handle != 0U) scheduler.cancel(handle);
-      }
-    } deadline_guard{scheduler_, deadline};
+      ~DeadlineGuard() { owner.cancel_scoped_deadline_if_attached(handle); }
+    } deadline_guard{*this, *deadline};
     auto computed = compute_validated_motion_plan(
         request, inventory, start_state, 0U, start_ns, context.preparation_budget_ns, stop_token,
         session->replacement_validation_cancellation, &moving,
@@ -4684,6 +5297,25 @@ bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_toke
     correlation.stamp_details(event.details);
     emit_event(std::move(event));
   };
+  // Captured before the Stop-fence check below: any Stop-side revocation after
+  // it cancels a send this call commits.
+  const auto stop_revocation = stop_revocation_generation_.load(std::memory_order_acquire);
+  // Set when this call commits the dispatch gate: the protection epoch read
+  // with the hazard check under the protection lock.
+  std::optional<std::uint64_t> protection_epoch;
+  // The send's inputs, captured with the commit (the send runs unlocked).
+  std::shared_ptr<const PreparedOperationParticipantDTO> dispatch_participant;
+  ExecutionGoalKey dispatch_goal;
+  std::int64_t dispatch_deadline_ns{};
+  const auto finish_locked = [&] {
+    should_observe = pending->dispatch_gate.load(std::memory_order_acquire) ==
+                         PreparedMotionDispatchGate::kCommitted &&
+                     pending->state == ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
+    if (notify_owner) {
+      notify_owner = !pending->replacement_failure_notified;
+      pending->replacement_failure_notified = true;
+    }
+  };
   {
     std::lock_guard lock(pending->mutex);
     if (pending->cancel_requested || stop_token.stop_requested() ||
@@ -4728,67 +5360,92 @@ bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_toke
           if (!pending->dispatch_gate.compare_exchange_strong(
                   expected, PreparedMotionDispatchGate::kCommitted, std::memory_order_acq_rel))
             return false;
+          protection_epoch = runtime_collision_protection_epoch_.load(std::memory_order_acquire);
           const auto& binding = pending->authority.execution_request.binding;
-          auto receipt = execution_backend_.DispatchReplacement(
-              source, pending->execution_id, *pending->participant,
-              ExecutionGoalKey{binding.controller_goal_id, binding.controller_goal_generation},
-              pending->preparation_deadline_ns);
-          if (receipt.command.dispatch == ExecutionPortDispatch::kNotDispatched) {
-            pending->replacement_observation = PreparedMotionReplacementObservationDTO{
-                PreparedMotionReplacementPhaseDTO::kNoEffect, {}, {}, {}, receipt.command.error};
-            pending->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
-            pending->error = receipt.command.error.value_or(
-                ErrorDTO{kErrorExecutionRejected, "Replacement was not dispatched", {}});
-            notify_owner = true;
-          } else {
-            pending->replacement_observation = PreparedMotionReplacementObservationDTO{
-                PreparedMotionReplacementPhaseDTO::kPossiblySent,
-                {},
-                {},
-                {},
-                receipt.command.error};
-            if (receipt.submitted_at_ns &&
-                *receipt.submitted_at_ns >= pending->preparation_started_ns &&
-                *receipt.submitted_at_ns < pending->preparation_deadline_ns &&
-                *receipt.submitted_at_ns <= clock_.now()) {
-              pending->replacement_execution->exec_start_ns = *receipt.submitted_at_ns;
-              pending->replacement_execution->last_runtime_scale_sample_ns =
-                  *receipt.submitted_at_ns;
-            } else {
-              pending->error = ErrorDTO{
-                  kErrorInvariantViolation, "Replacement submission time is unavailable", {}};
-            }
-            if (receipt.handle) {
-              if (const auto invalid = prepared_execution_handle_field_error(
-                      *receipt.handle, *pending->participant, binding.controller_goal_id,
-                      binding.controller_goal_generation)) {
-                pending->error = ErrorDTO{kErrorInvariantViolation,
-                                          "Replacement handle crosses dispatch identity",
-                                          {{"reason", std::string(*invalid)}}};
-              } else {
-                pending->replacement_execution->execution_handle = std::move(*receipt.handle);
-                pending->backend_execution_generation =
-                    pending->replacement_execution->execution_handle.execution_generation;
-                pending->last_dispatched_participant = pending->participant;
-                pending->replacement_lookahead_arm->execution_generation =
-                    pending->backend_execution_generation;
-              }
-            } else {
-              pending->error = receipt.command.error.value_or(
-                  ErrorDTO{kErrorExecutionRejected, "Replacement send outcome is unresolved", {}});
-            }
-            notify_owner = pending->error.has_value();
-          }
+          dispatch_participant = pending->participant;
+          dispatch_goal = ExecutionGoalKey{binding.controller_goal_id,
+                                           binding.controller_goal_generation};
+          dispatch_deadline_ns = pending->preparation_deadline_ns;
+          // Readers of this session see the send as possibly sent while it is
+          // in flight, as after it.
+          pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+              PreparedMotionReplacementPhaseDTO::kPossiblySent, {}, {}, {}, {}};
         }
       }
     }
-    should_observe = pending->dispatch_gate.load(std::memory_order_acquire) ==
-                         PreparedMotionDispatchGate::kCommitted &&
-                     pending->state == ResolvedPreparedMotionExecutionStateDTO::kDispatchRequested;
-    if (notify_owner) {
-      notify_owner = !pending->replacement_failure_notified;
-      pending->replacement_failure_notified = true;
+    if (!protection_epoch) finish_locked();
+  }
+  if (protection_epoch) {
+    // OD-68: no lock is held across the backend's release hold and send. The
+    // hazard/protection check and the gate commit above moved off the exact
+    // send instant; this lock-free re-check, run by the backend immediately
+    // before the send, cancels it when hazard authority was claimed, the
+    // protection changed, or a Stop revoked after that check. A Stop or claim
+    // after the re-check finds the successor possibly sent and stops it with
+    // the source (the participant's Stop fence).
+    const auto recheck = [this, stop_revocation,
+                          epoch = *protection_epoch]() -> std::optional<ErrorDTO> {
+      if (stop_revocation_generation_.load(std::memory_order_acquire) != stop_revocation)
+        return ErrorDTO{kErrorExecutionRejected,
+                        "A Stop revoked the motion replacement before its send",
+                        {{"reason", "motion_replacement_stop_revoked"}}};
+      if (runtime_collision_protection_epoch_.load(std::memory_order_acquire) != epoch)
+        return ErrorDTO{kErrorExecutionRejected,
+                        "Source runtime protection changed before the replacement send",
+                        {{"reason", "motion_replacement_source_hazard_authority"}}};
+      return std::nullopt;
+    };
+    auto receipt = execution_backend_.DispatchReplacement(source, pending->execution_id,
+                                                          *dispatch_participant, dispatch_goal,
+                                                          dispatch_deadline_ns, recheck);
+    std::lock_guard lock(pending->mutex);
+    const auto& binding = pending->authority.execution_request.binding;
+    // Record the outcome only while this commit is still the session's.
+    if (pending->dispatch_gate.load(std::memory_order_acquire) ==
+        PreparedMotionDispatchGate::kCommitted) {
+      if (receipt.command.dispatch == ExecutionPortDispatch::kNotDispatched) {
+        pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+            PreparedMotionReplacementPhaseDTO::kNoEffect, {}, {}, {}, receipt.command.error};
+        pending->state = ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed;
+        pending->error = receipt.command.error.value_or(
+            ErrorDTO{kErrorExecutionRejected, "Replacement was not dispatched", {}});
+        notify_owner = true;
+      } else {
+        pending->replacement_observation = PreparedMotionReplacementObservationDTO{
+            PreparedMotionReplacementPhaseDTO::kPossiblySent, {}, {}, {}, receipt.command.error};
+        if (receipt.submitted_at_ns &&
+            *receipt.submitted_at_ns >= pending->preparation_started_ns &&
+            *receipt.submitted_at_ns < pending->preparation_deadline_ns &&
+            *receipt.submitted_at_ns <= clock_.now()) {
+          pending->replacement_execution->exec_start_ns = *receipt.submitted_at_ns;
+          pending->replacement_execution->last_runtime_scale_sample_ns = *receipt.submitted_at_ns;
+        } else {
+          pending->error = ErrorDTO{
+              kErrorInvariantViolation, "Replacement submission time is unavailable", {}};
+        }
+        if (receipt.handle) {
+          if (const auto invalid = prepared_execution_handle_field_error(
+                  *receipt.handle, *pending->participant, binding.controller_goal_id,
+                  binding.controller_goal_generation)) {
+            pending->error = ErrorDTO{kErrorInvariantViolation,
+                                      "Replacement handle crosses dispatch identity",
+                                      {{"reason", std::string(*invalid)}}};
+          } else {
+            pending->replacement_execution->execution_handle = std::move(*receipt.handle);
+            pending->backend_execution_generation =
+                pending->replacement_execution->execution_handle.execution_generation;
+            pending->last_dispatched_participant = pending->participant;
+            pending->replacement_lookahead_arm->execution_generation =
+                pending->backend_execution_generation;
+          }
+        } else {
+          pending->error = receipt.command.error.value_or(
+              ErrorDTO{kErrorExecutionRejected, "Replacement send outcome is unresolved", {}});
+        }
+        notify_owner = pending->error.has_value();
+      }
     }
+    finish_locked();
   }
   if (!should_observe) {
     if (notify_owner) notify();
@@ -4845,13 +5502,18 @@ bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_toke
 Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
     const std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source,
     const PreparedMotionReplacementCommitDTO commit) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   const auto reject = [](const char* reason) {
     return Result<bool>::Err(ErrorDTO{
         kErrorExecutionRejected, "Replacement adoption was refused", {{"reason", reason}}});
   };
   if (!commit.owner_commit) return reject("motion_replacement_commit_missing");
-  // A scale submission may synchronously notify the addressed owner. Never
-  // wait for it while that owner's state lock is held by this handover.
+  // A scale acceptance in progress (its checks and bookkeeping; set_runtime_scale
+  // releases the lock before its backend call and event) and this adoption
+  // never interleave; adoption backs off rather than wait while the
+  // addressed owner's state lock is held by this handover.
   std::unique_lock submission_lock(resolved_runtime_scale_submission_mutex_, std::try_to_lock);
   if (!submission_lock.owns_lock()) return Result<bool>::Ok(false);
   std::lock_guard owner_lock(prepared_motion_session_mutex_);
@@ -4968,6 +5630,7 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
   // query engine and no contact-release re-baseline at handover.
   runtime_collision_protection_.execution_id = candidate_id;
   runtime_collision_protection_.generation = ++runtime_collision_protection_next_generation_;
+  runtime_collision_protection_epoch_.fetch_add(1, std::memory_order_acq_rel);
   current->runtime_collision_protection_generation = runtime_collision_protection_.generation;
   if (auto lookahead = runtime_collision_lookahead_session_.load(std::memory_order_acquire))
     lookahead->publish_prepared_arm(std::move(*pending->replacement_lookahead_arm));
@@ -5095,6 +5758,9 @@ Result<ResolvedPreparedMotionExecutionSnapshotDTO> ExecutionKernel::ObservePrepa
 
 Result<void> ExecutionKernel::DispatchPreparedMotion(
     const std::uint64_t execution_id, const ContentDigest& prepared_contract_digest) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<void>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   std::shared_ptr<PreparedMotionSession> session;
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
@@ -5130,6 +5796,9 @@ Result<void> ExecutionKernel::DispatchPreparedMotion(
 }
 
 Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution_id) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<void>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   std::shared_ptr<PreparedMotionSession> session;
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
@@ -5203,8 +5872,25 @@ Result<void> ExecutionKernel::CancelPreparedMotion(const std::uint64_t execution
 }
 
 Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t candidate_id) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
+  return retire_prepared_motion_membership_for_recovery(candidate_id, 0U);
+}
+
+Result<bool> ExecutionKernel::RetireRebuiltUnknownPreparedMotion(
+    const std::uint64_t source_id, const std::uint64_t candidate_id) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
+  if (source_id == 0U) return Result<bool>::Err(ErrorCode::kInvalidRequest);
+  return retire_prepared_motion_membership_for_recovery(candidate_id, source_id);
+}
+
+Result<bool> ExecutionKernel::retire_prepared_motion_membership_for_recovery(
+    const std::uint64_t candidate_id, const std::uint64_t rebuilt_source_id) {
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire))
+  if (worker_retirement_in_progress_locked())
     return Result<bool>::Ok(false);
   std::shared_ptr<PreparedMotionSession> pending;
   std::shared_ptr<PreparedMotionSession> source;
@@ -5216,6 +5902,7 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
   // Replay acknowledges only this already completed old membership retirement;
   // it cannot cancel, dispatch or retire the promoted identity.
   for (const auto& resident : {pending, source}) {
+    if (rebuilt_source_id != 0U) break;
     if (!resident) continue;
     std::lock_guard lock(resident->mutex);
     if (resident->spring_promotion_receipt &&
@@ -5225,6 +5912,23 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
   }
   if (!pending || pending->execution_id != candidate_id)
     return Result<bool>::Err(ErrorCode::kMissingReference);
+  bool rebuilt_unknown = false;
+  if (rebuilt_source_id != 0U) {
+    const auto rebuilt_capture = capture_recovery_authority_locked();
+    rebuilt_unknown =
+        rebuilt_capture.execution_id == rebuilt_source_id &&
+        rebuilt_capture.execution_state == ExecutionState::kInterventionRequired &&
+        rebuilt_capture.terminal_effect == ParticipantEffectKnowledge::kEffectUncertain &&
+        rebuilt_capture.owner_rebuild_rest_qualified && rebuilt_capture.terminal_cleanup_complete &&
+        !rebuilt_capture.fault_preempt_stop_active && !rebuilt_capture.fault_preempt_worker_active &&
+        !rebuilt_capture.operator_stop_active && !rebuilt_capture.motion_trip_stop_active &&
+        !rebuilt_capture.stronger_authority_active && source &&
+        source->execution_id == rebuilt_source_id && pending->authority.replacement &&
+        pending->authority.replacement->source.execution_id == rebuilt_source_id &&
+        execution_backend_.owner_rebuild_unknown_candidate(rebuilt_source_id, candidate_id);
+  }
+  if (rebuilt_source_id != 0U && !rebuilt_unknown)
+    return Result<bool>::Err(ErrorCode::kExecutionRejected);
   std::optional<StopCertificateRefDTO> settled_certificate;
   {
     std::lock_guard lock(pending->mutex);
@@ -5258,8 +5962,9 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
           pending->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared;
       if (source_stop_settled) settled_certificate = settlement.aggregate_stop_certificate;
     }
-    if ((!pending->cancel_requested || !no_effect) && !source_stop_settled)
+    if ((!pending->cancel_requested || !no_effect) && !source_stop_settled && !rebuilt_unknown)
       return Result<bool>::Err(ErrorCode::kExecutionRejected);
+    if (rebuilt_unknown && pending->spring_cold_product) return Result<bool>::Ok(false);
     if (pending->spring_cold_product && !pending->spring_cold_product->cancelled &&
         !pending->cancel_requested) {
       const auto& spring = *pending->spring_cold_product->authority.replacement->spring_return;
@@ -5269,7 +5974,7 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
         return Result<bool>::Err(ErrorCode::kExecutionRejected);
     }
     if (!pending->preparation_completed) return Result<bool>::Ok(false);
-    if (source_stop_settled && ((!worker_signals_.complete() && worker_thread_.joinable()) ||
+    if (source_stop_settled && ((!worker_signals_.complete() && (worker_thread_.joinable() || execution_worker_retiring_)) ||
                                 completion_publication_execution_id_.load(
                                     std::memory_order_acquire) == source->execution_id))
       return Result<bool>::Ok(false);
@@ -5277,14 +5982,20 @@ Result<bool> ExecutionKernel::RetireCancelledPreparedMotion(const std::uint64_t 
   if (replacement_preparation_thread_.joinable()) {
     if (replacement_preparation_thread_.get_id() == std::this_thread::get_id())
       return Result<bool>::Ok(false);
-    lifecycle_worker_retirement_in_progress_.store(true, std::memory_order_release);
+    replacement_worker_retiring_ = true;
+    auto replacement_worker = std::move(replacement_preparation_thread_);
     lifecycle_lock.unlock();
-    replacement_preparation_thread_.join();
+    MANYFORGE_REPLACEMENT_JOIN_TEST_POINT();
+    replacement_worker.join();
     lifecycle_lock.lock();
-    lifecycle_worker_retirement_in_progress_.store(false, std::memory_order_release);
+    replacement_worker_retiring_ = false;
+    lifecycle_worker_retirement_cv_.notify_all();
   }
   if (pending->backend_prepare_result &&
       pending->backend_prepare_result->state == PrepareParticipantResultStateDTO::kPrepared) {
+    if (rebuilt_unknown &&
+        !execution_backend_.owner_rebuild_unknown_candidate(rebuilt_source_id, candidate_id))
+      return Result<bool>::Err(ErrorCode::kExecutionRejected);
     // This also proves a sent candidate ended under the same scoped Stop;
     // source settlement alone never certifies the candidate's effect.
     const auto retired = execution_backend_.RetirePreparedExecution(candidate_id);
@@ -5356,7 +6067,11 @@ Result<void> ExecutionKernel::CancelPreparedCapabilityCommand(std::uint64_t) {
 Result<uint64_t> ExecutionKernel::execute_impl(
     const ExecuteRequestDTO& request, std::shared_ptr<PreparedMotionSession> prepared_session) {
   EventDeferralScope event_scope(*this);
+  MANYFORGE_PRE_EXECUTE_TEST_POINT();
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                    {{"reason", "scheduler_not_ready"}}});
   const bool cold_reuse = prepared_session && prepared_session->authority.replacement &&
                          prepared_session->authority.replacement->spring_return;
   std::shared_ptr<const PreparedOperationParticipantDTO> cold_product;
@@ -5373,7 +6088,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     cold_product = prepared_session->participant;
   }
   clear_runtime_collision_state_projection();
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire)) {
+  if (worker_retirement_in_progress_locked()) {
     return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected,
                                           "Execution worker retirement is in progress",
                                           {{"reason_code", "worker_retirement_in_progress"}}});
@@ -5389,6 +6104,9 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                  "Execution cannot be started from the active execution worker",
                  {{"reason_code", "worker_retirement_self_thread"}}});
   }
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<uint64_t>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                          {{"reason", "scheduler_not_ready"}}});
   planning_reset_requested_.store(false, std::memory_order_release);
 
   if (const auto& fact = admission_status.fact; fact.has_value()) {
@@ -5817,6 +6535,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
        retained_scene = std::move(retained_scene),
        prepared_session = std::move(prepared_session),
        worker_start_gate](std::stop_token st) mutable {
+        ExecutionWorkerScope worker_scope(this);
         if (!worker_start_gate->wait(st)) {
           return;
         }
@@ -5849,6 +6568,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
 
 AddressedParticipantStopFenceDisposition ExecutionKernel::fence_addressed_participant_stop(
     const std::uint64_t execution_id) noexcept {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return AddressedParticipantStopFenceDisposition::kUnknown;
   if (execution_id == 0U) {
     return AddressedParticipantStopFenceDisposition::kUnknown;
   }
@@ -5907,6 +6627,9 @@ AddressedParticipantStopFenceDisposition ExecutionKernel::fence_addressed_partic
 
 Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_participant_stop(
     const AddressedParticipantStopSettlementRequestDTO& request) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<AddressedParticipantStopSettlementDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   const auto& containment = request.containment;
   const auto& stop = request.aggregate_stop_certificate;
   const auto dispatched_containment_complete =
@@ -6097,6 +6820,9 @@ bool ExecutionKernel::control_command_epoch_matches(
 
 ResetResultDTO ExecutionKernel::reset_after_certified_containment(
     const std::uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return ResetResultDTO{false, ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}}};
   EventDeferralScope event_scope(*this);
   const LifecyclePreemption preemption(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -6113,7 +6839,7 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
                          {"current_execution_id", std::to_string(before.execution_id)},
                          {"requested_execution_id", std::to_string(execution_id)}}}};
   }
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire)) {
+  if (worker_retirement_in_progress_locked()) {
     return ResetResultDTO{false, ErrorDTO{kErrorInvalidRequest,
                                           "Execution worker retirement is already in progress",
                                           {{"reason_code", "worker_retirement_in_progress"}}}};
@@ -6140,7 +6866,7 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
   auto retired = retire_prepared_motion_membership();
   if (!retired.ok() && retired.error().details.contains("reason") &&
       retired.error().details.at("reason") == "prepared_execution_not_quiescent") {
-    // Item 12: Reset issues the lane's hard stop and then completes, as
+    // Reset issues the lane's hard stop and then completes, as
     // `main`'s Reset did; it never leaves an unresolved retirement behind
     // while the backend is still winding down. The wait is `main`'s bounded
     // software-stop drain.
@@ -6175,8 +6901,8 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
               ExecutionState::kIdle,
               std::nullopt,
               {{"reason", "reset_after_certified_containment"}}});
-  if (recovery_freshness_deadline_handle_ != 0) {
-    scheduler_.cancel(recovery_freshness_deadline_handle_);
+  if (recovery_freshness_deadline_handle_ != 0 &&
+      cancel_scoped_deadline_if_attached(recovery_freshness_deadline_handle_)) {
     recovery_freshness_deadline_handle_ = 0;
     recovery_freshness_deadline_ns_ = 0;
   }
@@ -6191,6 +6917,9 @@ ResetResultDTO ExecutionKernel::reset_after_certified_containment(
 
 AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     uint64_t execution_id, std::optional<std::uint64_t> expected_epoch) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return AcknowledgeCompletedResultDTO{false, ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}}};
   EventDeferralScope event_scope(*this);
   std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
@@ -6436,6 +7165,11 @@ KernelRecoveryAssessmentDTO ExecutionKernel::get_recovery_assessment() const {
   return recovery_assessment_;
 }
 
+void ExecutionKernel::NotifyOwnerRebuilt() noexcept {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
+  schedule_recovery_assessment_refresh("owner_rebuilt");
+}
+
 std::uint64_t ExecutionKernel::begin_operator_stop_owner_generation(std::uint64_t execution_id) {
   std::lock_guard<std::mutex> lock(operator_stop_identity_mutex_);
   return operator_stop_identity_.begin(execution_id);
@@ -6458,7 +7192,7 @@ RecoveryReadinessPolicy ExecutionKernel::recovery_readiness_policy() const {
 RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
   // Caller holds lifecycle_mutex_: every fact below is read once, in the
   // documented lock order, and cannot be replaced by a concurrent lifecycle
-  // command while captured (spec/230 §3.7.1 coherent capture).
+  // command while captured.
   RecoveryAuthorityCapture capture;
   capture.control_command_epoch = control_command_epoch_.load(std::memory_order_acquire);
   const auto status = sm_.status();
@@ -6466,12 +7200,12 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
   capture.execution_state = recovery_execution_state_locked(status);
   if (status.fact) capture.terminal_effect = status.fact->effect;
   capture.terminal_cleanup_complete =
-      (!worker_thread_.joinable() || worker_signals_.complete()) &&
+      (!(worker_thread_.joinable() || execution_worker_retiring_) || worker_signals_.complete()) &&
       completion_publication_execution_id_.load(std::memory_order_acquire) != status.execution_id;
   capture.operator_stop_owner_generation =
       operator_stop_owner_generation_for_execution(capture.execution_id);
   capture.stronger_authority_active =
-      lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire);
+      worker_retirement_in_progress_locked();
   {
     std::lock_guard<std::mutex> lock(recovery_certificate_mutex_);
     capture.operator_stop_certificate =
@@ -6505,14 +7239,37 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
   const auto observed_sample = capture_observed_state_evidence(
       execution_backend_.observed_robot_state_publication(), clock_.now(),
       config_.recovery_at_rest_velocity_threshold_rad_s);
+  const auto rebuild = execution_backend_.owner_rebuild_observation();
+  capture.owner_rebuild_pending = rebuild && rebuild->first == capture.execution_id &&
+      ((capture.execution_id == 0U && capture.execution_state == ExecutionState::kIdle) ||
+       (capture.execution_id != 0U &&
+        capture.execution_state == ExecutionState::kInterventionRequired &&
+        capture.terminal_effect == ParticipantEffectKnowledge::kEffectUncertain));
+  const auto active_rebuild = capture.owner_rebuild_pending ? rebuild : std::nullopt;
+  if (active_rebuild != recovery_rebuild_marker_) {
+    recovery_readiness_tracker_.reset();
+    recovery_rebuild_marker_ = active_rebuild;
+    recovery_rebuild_rest_qualified_ = false;
+  }
   if (observed_sample.has_value()) {
     capture.observed_state = *observed_sample;
-    capture.observed_state_qualified = recovery_readiness_tracker_.update(
-        *observed_sample, config_.recovery_observed_joint_order_token, recovery_readiness_policy(),
-        clock_.now());
+    if (!capture.owner_rebuild_pending || observed_sample->sequence >= rebuild->second) {
+      capture.observed_state_qualified = recovery_readiness_tracker_.update(
+          *observed_sample, config_.recovery_observed_joint_order_token, recovery_readiness_policy(),
+          clock_.now());
+    } else {
+      recovery_readiness_tracker_.reset();
+    }
   } else {
     recovery_readiness_tracker_.reset();
   }
+  if (capture.owner_rebuild_pending && capture.observed_state_qualified &&
+      !recovery_rebuild_rest_qualified_) {
+    recovery_rebuild_rest_qualified_ = true;
+    execution_backend_.record_owner_rebuild_rest(capture.execution_id);
+  }
+  capture.owner_rebuild_rest_qualified =
+      capture.owner_rebuild_pending && recovery_rebuild_rest_qualified_;
   capture.captured_at_ns = clock_.now();
   return capture;
 }
@@ -6563,8 +7320,8 @@ KernelRecoveryAssessmentDTO ExecutionKernel::publish_recovery_assessment_locked(
       trigger != nullptr ? std::string_view(trigger) : std::string_view{});
   auto& next = publication.candidate;
   if (!publication.changed) {
-    // Equally admissible facts do not churn the published revision
-    // (spec/210 §3.12 offer stability), but a newer equivalent observation
+    // Equally admissible facts do not churn the published revision, but a
+    // newer equivalent observation
     // extends its own freshness deadline. Publish that deadline and keep the
     // expiry schedule current without changing the operator-visible
     // assessment revision; readers must not see an elapsed deadline while
@@ -6596,15 +7353,18 @@ KernelRecoveryAssessmentDTO ExecutionKernel::publish_recovery_assessment_locked(
 }
 
 void ExecutionKernel::schedule_recovery_assessment_refresh(const char* trigger) noexcept {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
   std::lock_guard<std::mutex> refresh_lock(recovery_refresh_mutex_);
   if (recovery_refresh_scheduled_) {
     return;
   }
   recovery_refresh_scheduled_ = true;
   try {
-    recovery_refresh_handle_ = scheduler_.schedule(
-        clock_.now(),
+    const auto deadline = clock_.now();
+    const auto handle = schedule_scoped_deadline_if_attached(
+        deadline,
         [this, trigger]() {
+          EngineTimerScope timer_scope(this);
           {
             EventDeferralScope event_scope(*this);
             std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
@@ -6623,6 +7383,11 @@ void ExecutionKernel::schedule_recovery_assessment_refresh(const char* trigger) 
           }
         },
         SchedulerPriority::Monitoring);
+    if (!handle) {
+      recovery_refresh_scheduled_ = false;
+      return;
+    }
+    recovery_refresh_handle_ = *handle;
   } catch (...) {
     recovery_refresh_scheduled_ = false;
     recovery_refresh_handle_ = 0;
@@ -6642,6 +7407,8 @@ namespace {
 /// deadline is never left to elapse silently.
 [[nodiscard]] bool recovery_observation_tracked(const KernelRecoveryAssessmentDTO& assessment) {
   return assessment.recovery_class == RecoveryClass::kRuntimeCollision ||
+         assessment.reason_code == kOwnerRebuildObservationPending ||
+         assessment.reason_code == kOwnerRebuildObservedAtRest ||
          assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop ||
          (assessment.recovery_class == RecoveryClass::kFailedValidation &&
           assessment.retry_admissible);
@@ -6651,6 +7418,7 @@ namespace {
 
 void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
     const KernelRecoveryAssessmentDTO& assessment) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
   const bool observation_dependent = recovery_observation_tracked(assessment);
   const bool actionable = assessment.status == RecoveryAssessmentStatus::kRetryReady ||
                           assessment.status == RecoveryAssessmentStatus::kActionRequired;
@@ -6659,7 +7427,7 @@ void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
         recovery_freshness_deadline_ns_ == assessment.observed_state_valid_until_ns) {
       return;
     }
-    scheduler_.cancel(recovery_freshness_deadline_handle_);
+    if (!cancel_recovery_deadline_if_attached(recovery_freshness_deadline_handle_)) return;
     recovery_freshness_deadline_handle_ = 0;
     recovery_freshness_deadline_ns_ = 0;
   }
@@ -6674,23 +7442,27 @@ void ExecutionKernel::schedule_recovery_freshness_deadline_locked(
   // Kernel-owned expiry: publishes the non-ready revision even when no new
   // sample or observer read arrives. Monitoring role; the callback briefly
   // takes lifecycle_mutex_ (documented allowance, bounded).
-  recovery_freshness_deadline_handle_ = scheduler_.schedule(
+  const auto freshness_handle = schedule_scoped_deadline_if_attached(
       deadline_ns,
       [this]() {
+        EngineTimerScope timer_scope(this);
         EventDeferralScope event_scope(*this);
         std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         (void)refresh_recovery_assessment_locked("observed_state_freshness_deadline");
       },
       SchedulerPriority::Monitoring);
+  if (!freshness_handle) return;
+  recovery_freshness_deadline_handle_ = *freshness_handle;
   recovery_freshness_deadline_ns_ = deadline_ns;
 }
 
 void ExecutionKernel::schedule_recovery_observation_poll_locked(
     const KernelRecoveryAssessmentDTO& assessment) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
   const bool observation_dependent = recovery_observation_tracked(assessment);
   if (!observation_dependent) {
     if (recovery_observation_poll_handle_ != 0) {
-      scheduler_.cancel(recovery_observation_poll_handle_);
+      if (!cancel_recovery_deadline_if_attached(recovery_observation_poll_handle_)) return;
       recovery_observation_poll_handle_ = 0;
     }
     return;
@@ -6698,19 +7470,26 @@ void ExecutionKernel::schedule_recovery_observation_poll_locked(
   if (recovery_observation_poll_handle_ != 0) {
     return;
   }
-  recovery_observation_poll_handle_ = scheduler_.schedule(
-      clock_.now() + config_.recovery_observation_poll_period_ns,
+  const auto poll_deadline = clock_.now() + config_.recovery_observation_poll_period_ns;
+  const auto poll_handle = schedule_scoped_deadline_if_attached(
+      poll_deadline,
       [this]() {
+        EngineTimerScope timer_scope(this);
         EventDeferralScope event_scope(*this);
         std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         recovery_observation_poll_handle_ = 0;
         (void)refresh_recovery_assessment_locked("observed_state_publication_poll");
       },
       SchedulerPriority::Monitoring);
+  if (poll_handle) recovery_observation_poll_handle_ = *poll_handle;
 }
 
 KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action(
     const KernelRecoveryActionRequestDTO& request) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return {request.request_id, request.action, false, get_recovery_assessment(),
+            ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                     {{"reason", "scheduler_not_ready"}}}};
   return apply_recovery_action_impl(request);
 }
 
@@ -7676,7 +8455,8 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_trajectory_with_e
     const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
     std::uint32_t planning_attempt_index, const RobotStateDTO* start_state_override,
     const MovingReplacementInputDTO* replacement,
-    const std::optional<std::int64_t> suffix_planning_deadline_ns) {
+    const std::optional<std::int64_t> suffix_planning_deadline_ns,
+    std::unique_ptr<PlanningSuccess>* failed_evidence) {
   auto plan_request = make_plan_request(request, projection_inventory, planning_attempt_index,
                                         start_state_override, replacement);
   if (!plan_request.ok()) {
@@ -7720,7 +8500,11 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_trajectory_with_e
   }
 
   if (result.error.has_value()) {
-    return Result<PlanningSuccess>::Err(std::move(*result.error));
+    auto error = *result.error;
+    if (failed_evidence != nullptr)
+      *failed_evidence = std::make_unique<PlanningSuccess>(
+          PlanningSuccess{std::move(plan_request.value()), std::move(result)});
+    return Result<PlanningSuccess>::Err(std::move(error));
   }
 
   return Result<PlanningSuccess>::Err(ErrorCode::kPlanningFailed);
@@ -7778,7 +8562,10 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     const RobotStateDTO* start_state_override, const std::stop_token external_stop_token,
     bool* conclusive_collision_failure,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
-    const MovingReplacementInputDTO* replacement, const bool collision_checked_by_planning) {
+    const MovingReplacementInputDTO* replacement, const bool collision_checked_by_planning,
+    std::optional<MotionPathPreview>* path_preview, const bool diagnostic_preview,
+    const std::optional<std::int64_t> diagnostic_deadline_ns) {
+  if (path_preview != nullptr) path_preview->reset();
   if (conclusive_collision_failure != nullptr) {
     *conclusive_collision_failure = false;
   }
@@ -7831,6 +8618,22 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   const bool registers_active_cancellation = !validation_cancellation;
   auto cancel = validation_cancellation ? std::move(validation_cancellation)
                                         : install_validation_cancel_token();
+  std::optional<ScheduleHandle> deadline_handle{0U};
+  if (diagnostic_deadline_ns) {
+    deadline_handle = schedule_scoped_deadline_if_attached(
+        *diagnostic_deadline_ns, [cancel]() { cancel->request_cancel("motion_preview_deadline"); },
+        SchedulerPriority::Monitoring);
+    if (!deadline_handle) {
+      if (registers_active_cancellation) clear_validation_cancel_token(cancel);
+      return Result<CollisionValidationSuccess>::Err(ErrorDTO{
+          kErrorExecutionRejected, "Participant scheduler is detached", {{"reason", "scheduler_not_ready"}}});
+    }
+  }
+  struct DiagnosticDeadlineGuard {
+    ExecutionKernel& owner;
+    ScheduleHandle handle;
+    ~DiagnosticDeadlineGuard() { owner.cancel_scoped_deadline_if_attached(handle); }
+  } deadline_guard{*this, *deadline_handle};
   std::stop_callback external_cancel(
       external_stop_token, [cancel]() { cancel->request_cancel("motion_preview_cancelled"); });
   if (external_stop_token.stop_requested()) {
@@ -7846,8 +8649,8 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     }
   } cancel_guard{registers_active_cancellation ? this : nullptr, cancel};
 
-  // Full non-collision trajectory validation (including TCP speed limit per
-  // spec 230 §3.3). The manyforge_collision pipeline is the only
+  // Full non-collision trajectory validation (including the TCP speed
+  // limit). The manyforge_collision pipeline is the only
   // collision authority, so the backend validator must not run its legacy
   // collision sweep first and reject contacts the active policy would allow.
   ValidationOptionsDTO opts;
@@ -7976,6 +8779,9 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         per_state_timeout_ns > 0
             ? per_state_timeout_ns
             : static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns);
+    if (diagnostic_deadline_ns)
+      cfg.per_state_timeout_ns = std::min(cfg.per_state_timeout_ns,
+                                         std::max<std::int64_t>(1, *diagnostic_deadline_ns - clock_.now()));
     cfg.surface = CollisionSurface::kPreExecutionValidation;
     cfg.contact_policy_id = request.contact_policy_id;
     cfg.clearance_margins = world_policy_bundle.clearance_margins;
@@ -7984,7 +8790,8 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     attempt.world = world_snapshot;
     attempt.policy = active_policy;
     attempt.bundle = collision_validation_worker_pool_->validate_trajectory(
-        world_snapshot, validation_engines, validation_trajectory, cancel, cfg);
+        world_snapshot, validation_engines, validation_trajectory, cancel, cfg,
+        diagnostic_deadline_ns);
     attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
     attempt.contact_policy_violation =
         contact_policy_violation_details(attempt.bundle, *active_policy, "block_dispatch");
@@ -8022,6 +8829,26 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   }
   if (replacement) trace_moving_core_phase(replacement, "collision_return", collision_started,
                                           clock_.now(), validation_trajectory.waypoints.size());
+  if (path_preview != nullptr && !attempt.bundle.cancelled && attempt.world && attempt.policy) {
+    const auto engine = std::find_if(validation_engines.begin(), validation_engines.end(),
+                                     [](const auto& item) { return static_cast<bool>(item); });
+    if (engine != validation_engines.end()) {
+      try {
+        const auto query_timeout = per_state_timeout_ns > 0 ? per_state_timeout_ns :
+            static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns);
+        *path_preview = build_motion_path_preview(
+            trajectory, collision_trajectory, request.binding, attempt.bundle, *attempt.world,
+            *attempt.policy, scene_snapshot_lease_inventory.bundle.clearance_margins,
+            request.contact_policy_id, **engine, *cancel,
+            diagnostic_deadline_ns ? std::min(query_timeout,
+                std::max<std::int64_t>(1, *diagnostic_deadline_ns - clock_.now())) : query_timeout,
+            diagnostic_preview);
+      } catch (...) {
+        // Advisory evidence cannot alter the authoritative validation result.
+        path_preview->reset();
+      }
+    }
+  }
   auto bundle = std::move(attempt.bundle);
   auto telemetry = attempt.telemetry;
   auto contact_policy_violation = std::move(attempt.contact_policy_violation);
@@ -8168,7 +8995,7 @@ std::optional<ErrorDTO> ExecutionKernel::collision_resource_replacement_refusal_
     return reject("collision_resource_runtime_monitor_active",
                   "Collision resources cannot change while runtime monitoring is active");
   }
-  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire) ||
+  if (worker_retirement_in_progress_locked() ||
       planning_reset_requested_.load(std::memory_order_acquire)) {
     return reject("collision_resource_kernel_transition_active",
                   "Collision resources cannot change during Kernel retirement or Reset");
@@ -8197,13 +9024,15 @@ std::optional<ErrorDTO> ExecutionKernel::collision_resource_replacement_refusal_
 }
 
 void ExecutionKernel::set_collision_resources(
-    ICollisionWorldSnapshotPublisher& publisher,
+    std::shared_ptr<ICollisionWorldSnapshotPublisher> publisher,
     std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
     std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
     std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
   // This API is intentionally limited to the first private-Kernel install.
   // A retained Kernel is replaced only by the exact Apply-fenced API below.
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst)) return;
   if (const auto refusal = collision_resource_replacement_refusal_locked()) {
     throw std::logic_error(refusal->message + ": " + refusal->details.at("reason"));
   }
@@ -8246,7 +9075,8 @@ void ExecutionKernel::set_collision_resources(
   }
 
   CollisionPipelineResources candidate;
-  candidate.snapshot_publisher = &publisher;
+  candidate.snapshot_publisher = publisher.get();
+  candidate.snapshot_publisher_owner = publisher;
   candidate.runtime_monitor_engine = runtime_monitor_engine;
   candidate.validation_engines = validation_engines;
   candidate.runtime_lookahead_engines = runtime_lookahead_engines;
@@ -8272,7 +9102,7 @@ void ExecutionKernel::set_collision_resources(
         config_.runtime_collision_lookahead_min_waypoints_for_parallel;
     lookahead_config.query_budget_ns = config_.runtime_collision_lookahead_query_budget_ns;
     next_lookahead = std::make_shared<RuntimeCollisionLookaheadSession>(
-        lookahead_config, clock_, scheduler_, publisher, *progress, runtime_lookahead_engines,
+        lookahead_config, clock_, scheduler_, *publisher, *progress, runtime_lookahead_engines,
         [this](const RuntimeCollisionLookaheadSession* source_session,
                RuntimeCollisionLookaheadResult result) {
           (void)source_session;
@@ -8284,9 +9114,7 @@ void ExecutionKernel::set_collision_resources(
         });
   }
 
-  collision_resources_.configure(publisher, std::move(runtime_monitor_engine),
-                                 std::move(validation_engines),
-                                 std::move(runtime_lookahead_engines));
+  collision_resources_.configure(std::move(candidate));
   validation_collision_workers_effective_.store(capacity.effective_contexts,
                                                 std::memory_order_relaxed);
   auto previous_lookahead = runtime_collision_lookahead_session_.exchange(
@@ -8310,13 +9138,6 @@ ExecutionKernel::collision_resource_set_readback() const {
         ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
                  "Collision resources have not been installed",
                  {{"reason", "collision_resource_set_not_installed"}}});
-  }
-  if (!installed.snapshot_publisher_owner ||
-      installed.snapshot_publisher_owner.get() != installed.snapshot_publisher) {
-    return Result<CollisionPipelineResourceReadbackDTO>::Err(
-        ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                 "Installed collision publisher is not owned by the Kernel",
-                 {{"reason", "collision_resource_publisher_owner_missing"}}});
   }
   CollisionPipelineResourceOwners owners;
   owners.snapshot_publisher = installed.snapshot_publisher_owner;
@@ -8343,6 +9164,9 @@ ExecutionKernel::replace_collision_resources_under_apply_fence(
     const ConfigurationFenceScopeDTO& apply_fence_scope,
     const IResourceOperationAdmissionGate& admission_gate,
     CollisionPipelineResourceOwners candidate) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
   const auto refuse = [](ErrorCode code, std::string reason, std::string message,
                          std::map<std::string, std::string> additional = {}) {
     additional["reason"] = std::move(reason);
@@ -8376,6 +9200,8 @@ ExecutionKernel::replace_collision_resources_under_apply_fence(
   }
 
   std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return refuse(ErrorCode::kExecutionRejected, "scheduler_not_ready", "Participant scheduler is detached");
   if (const auto refusal = collision_resource_replacement_refusal_locked()) {
     return Result<CollisionPipelineResourceReadbackDTO>::Err(*refusal);
   }
@@ -8540,6 +9366,7 @@ ExecutionKernel::replace_collision_resources_under_apply_fence(
     coordinator_policy_index_ = bundle->policy_index;
     previous_lookahead = runtime_collision_lookahead_session_.exchange(
         std::move(next_lookahead), std::memory_order_acq_rel);
+    if (previous_lookahead) ++lookahead_retiring_;
     validation_collision_workers_effective_.store(validation_capacity.effective_contexts,
                                                   std::memory_order_relaxed);
     ++collision_resource_set_generation_;
@@ -8552,8 +9379,12 @@ ExecutionKernel::replace_collision_resources_under_apply_fence(
   // snapshot alive until disarm and worker join finish, after all Kernel locks
   // have been released so a stale callback can exit without a lock cycle.
   if (previous_lookahead) {
-    previous_lookahead->disarm();
+    MANYFORGE_LOOKAHEAD_RETIREMENT_TEST_POINT();
+    previous_lookahead->detach();
     previous_lookahead.reset();
+    std::lock_guard lifecycle_lock(lifecycle_mutex_);
+    --lookahead_retiring_;
+    lifecycle_worker_retirement_cv_.notify_all();
   }
   (void)previous_resources;
   return Result<CollisionPipelineResourceReadbackDTO>::Ok(std::move(readback));
@@ -8649,7 +9480,13 @@ namespace {
 
 Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
     const ResolvedRuntimeScaleCommandDTO& command) {
-  std::lock_guard submission_lock(resolved_runtime_scale_submission_mutex_);
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst))
+    return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
+                                      {{"reason", "scheduler_not_ready"}}});
+  // Orders this acceptance against replacement adoption (which try-locks
+  // it): checks and bookkeeping only. Released before the backend call and
+  // the synchronous event, which use the values captured here.
+  std::unique_lock submission_lock(resolved_runtime_scale_submission_mutex_);
   if (!resolved_scale_command_well_formed(command)) {
     return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
         ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
@@ -8692,17 +9529,18 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
         return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(
             *accepted_resolved_runtime_scale_result_);
       }
-      const auto previous_generation =
-          accepted_resolved_runtime_scale_command_->requested_runtime_scale_generation;
-      if (command.expected_runtime_scale_generation != previous_generation ||
-          previous_generation.value() == std::numeric_limits<std::uint64_t>::max() ||
-          command.requested_runtime_scale_generation.value() != previous_generation.value() + 1U ||
-          command.operation_revision <
-              accepted_resolved_runtime_scale_command_->operation_revision) {
-        return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
-            ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
-                     "resolved runtime-scale generation or operation revision is stale",
-                     {{"reason", "resolved_runtime_scale_generation_stale"}}});
+      // OD-72: latest value wins. A value the owner accepted earlier that
+      // arrives after a later one is superseded: acknowledged, never applied
+      // and never an error.
+      const auto& previous = *accepted_resolved_runtime_scale_command_;
+      if (command.requested_runtime_scale_generation <= previous.requested_runtime_scale_generation ||
+          command.operation_revision < previous.operation_revision) {
+        return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(make_scale_acceptance(
+            command,
+            accepted_resolved_runtime_scale_result_
+                ? accepted_resolved_runtime_scale_result_->acceptance_sequence
+                : runtime_scale_acceptance_sequence_,
+            clock_.now()));
       }
     } else if (command.expected_runtime_scale_generation.value() != 0U ||
                command.requested_runtime_scale_generation.value() != 0U) {
@@ -8721,10 +9559,12 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
     accepted_resolved_runtime_scale_command_ = command;
     accepted_resolved_runtime_scale_result_ = accepted;
   }
+  const auto accepted_execution_id = sm_.status().execution_id;
+  submission_lock.unlock();
 
-  execution_backend_.set_runtime_velocity_scale(command.requested_scale);
+  execution_backend_.apply_runtime_velocity_scale(command.requested_scale, command.value_sequence);
   emit_event({KernelEventType::kRuntimeVelocityScaleChanged,
-              sm_.status().execution_id,
+              accepted_execution_id,
               clock_.now(),
               {},
               {},
@@ -8733,6 +9573,20 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
                {"runtime_scale_generation",
                 std::to_string(command.requested_runtime_scale_generation.value())}}});
   return Result<ResolvedRuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
+}
+
+void ExecutionKernel::store_runtime_scale_setting(const double scale,
+                                                  const std::uint64_t sequence) {
+  if (scheduler_detach_started_.load(std::memory_order_seq_cst) || !std::isfinite(scale) ||
+      scale < 0.0 || scale > 1.0)
+    return;
+  // OD-72: no operation or generation is involved; the participant's leaf
+  // lock orders it with every other value by `sequence`.
+  execution_backend_.apply_runtime_velocity_scale(scale, sequence);
+}
+
+RuntimeScaleMechanismAvailability ExecutionKernel::runtime_scale_availability() const noexcept {
+  return execution_backend_.runtime_velocity_scale_availability();
 }
 
 Result<ResolvedRuntimeScaleStatusDTO> ExecutionKernel::runtime_scale_status(

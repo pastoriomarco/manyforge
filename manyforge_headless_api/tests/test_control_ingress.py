@@ -368,8 +368,8 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
                     },
                     "selector": {
                         "program_binding_id": "binding.1",
-                        "component_role_id": "controlled_component",
-                        "target_role_id": "command_target",
+                        "component_id": "controlled_component",
+                        "command_target_id": "command_target",
                     },
                     "expected_control_generation": 0,
                     "scale": 0.25,
@@ -452,7 +452,7 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
                     "owner_epoch": "old" if case == "old_owner" else "kernel.1"
                 },
                 "control_state": {
-                    "schema_version": "manyforge.execution_control_state.v6",
+                    "schema_version": "manyforge.execution_control_state.v7",
                     "manual_operations": [
                         {
                             "resident": case != "retired",

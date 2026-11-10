@@ -22,6 +22,7 @@ import type {
 import type {
   CapabilityCommandPreviewReceipt,
   MotionPreviewReceipt,
+  MotionPreviewPath,
 } from '../types/robotControl';
 import type {
   ExecutionOwnerStatus,
@@ -33,6 +34,89 @@ import type {
   ExecutionObservationReader,
   ExecutionObservationTarget,
 } from '../types/viewerObservation';
+
+/** Resolve only identities backed by one retained target and viewer occurrence. */
+export function previewBodyIdentity(
+  identity: string,
+  sourceModel: SourceModelProjection | null,
+  objects: readonly LogicalSceneObject[],
+): { kind: 'link' | 'object'; name: string } | null {
+  const parts = identity.split('/');
+  if (parts.length === 4 && parts[0] === 'scene' && parts[2] === 'shape'
+      && /^(0|[1-9][0-9]*)$/.test(parts[3])) {
+    const rows = objects.filter((object) => object.scene_resource_id === parts[1]);
+    const index = Number(parts[3]);
+    return rows.length === 1 && Number.isSafeInteger(index) && index < rows[0].collision_shapes.length
+      ? { kind: 'object', name: rows[0].scene_resource_id } : null;
+  }
+  if (sourceModel === null || parts.length !== 8 || parts[0] !== 'component'
+      || parts[2] !== 'model' || parts[4] !== 'body' || parts[6] !== 'collision'
+      || !/^(0|[1-9][0-9]*)$/.test(parts[7])) return null;
+  const index = Number(parts[7]);
+  if (!Number.isSafeInteger(index)) return null;
+  const bodies = sourceModel.targets.filter((target) => target.component_id === parts[1])
+    .flatMap((target) => target.collision_bodies)
+    .filter((body) => body.model_instance_id === parts[3] && body.collision_body_role_id === parts[5]);
+  const names = new Set(bodies.map((body) => body.source_link_names[index]).filter((name): name is string => name !== undefined));
+  if (names.size !== 1 || bodies.some((body) => body.source_link_names[index] === undefined)) return null;
+  const occurrences = sourceModel.occurrences.filter((occurrence) => occurrence.component_id === parts[1]
+    && occurrence.model_instance_id === parts[3]);
+  if (occurrences.length !== 1) return null;
+  const links = occurrences[0].links.filter((link) => link.source_link_name === [...names][0]);
+  return links.length === 1 ? { kind: 'link', name: links[0].viewer_link_name } : null;
+}
+
+export function previewContactPresentation(
+  path: MotionPreviewPath,
+  index: number,
+  sourceModel: SourceModelProjection | null,
+  objects: readonly LogicalSceneObject[],
+): { links: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'>; objects: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'>; defaultDisposition: 'clear' | 'unknown' } {
+  const links: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'> = {};
+  const sceneObjects: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'> = {};
+  const priority = { allowed: 0, unknown: 1, clearance: 2, refused: 3 };
+  const sample = path.samples[index];
+  if (sample === undefined) return { links, objects: sceneObjects, defaultDisposition: 'unknown' };
+  let defaultDisposition: 'clear' | 'unknown' = sample.status === 'checked' ? 'clear' : 'unknown';
+  for (const contact of sample.contacts) {
+    const pair = path.pairs[contact.pairIndex];
+    if (pair === undefined) { defaultDisposition = 'unknown'; continue; }
+    const a = previewBodyIdentity(pair.bodyA, sourceModel, objects);
+    const b = previewBodyIdentity(pair.bodyB, sourceModel, objects);
+    const v2 = path.schemaVersion === 'manyforge.motion_preview_diagnostic.v2';
+    if (a === null || b === null || (!v2 && contact.disposition === 'unknown')) defaultDisposition = 'unknown';
+    const disposition = !v2 && (sample.status === 'unknown' || a === null || b === null) ? 'unknown' : contact.disposition;
+    for (const body of [a, b]) {
+      if (body === null) continue;
+      const target = body.kind === 'link' ? links : sceneObjects;
+      const current = target[body.name];
+      if (current === undefined || priority[disposition] > priority[current]) target[body.name] = disposition;
+    }
+  }
+  if (path.schemaVersion === 'manyforge.motion_preview_diagnostic.v2') {
+    for (const violation of sample.clearanceViolations ?? []) {
+      const pair = path.pairs[violation.pairIndex];
+      if (!pair) { defaultDisposition = 'unknown'; continue; }
+      const a = previewBodyIdentity(pair.bodyA, sourceModel, objects);
+      const b = previewBodyIdentity(pair.bodyB, sourceModel, objects);
+      if (a === null || b === null) defaultDisposition = 'unknown';
+      for (const body of [a, b]) {
+        if (body === null) continue;
+        const target = body.kind === 'link' ? links : sceneObjects;
+        const current = target[body.name];
+        if (current === undefined || priority.clearance > priority[current]) target[body.name] = 'clearance';
+      }
+    }
+    if (defaultDisposition === 'unknown') {
+      for (const target of [links, sceneObjects]) {
+        for (const name of Object.keys(target)) {
+          if (priority[target[name]] < priority.unknown) target[name] = 'unknown';
+        }
+      }
+    }
+  }
+  return { links, objects: sceneObjects, defaultDisposition };
+}
 
 export interface RuntimeLinkTransform {
   position_m: Vector3Tuple;
@@ -47,7 +131,7 @@ export function candidateObservationEpoch(
   if (frame === null || status === null || frame.ownerEpoch !== status.ownerEpoch
     || frame.cellId !== status.cellId || frame.retainedBundleId !== status.retainedBundleId
     || frame.graphRevision !== status.graphRevision) return null;
-  // A selection may have no motion target (gripper-only, H1a-IF.2).
+  // A selection may have no motion target (gripper-only).
   const motion = status.directControl;
   const arm = motion === null ? null : frame.targets.find((target) => (
     target.controllableComponentId === motion.controllableComponentId
@@ -69,7 +153,7 @@ export interface MeasuredRobotPresentation {
   sourceSequence: number;
   observedAtNs: Nanoseconds | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
-  /** G2-b: links the measured ghost does not draw (no stream, or no data yet). */
+  /** Links the measured ghost does not draw (no stream, or no data yet). */
   hiddenLinkNames?: readonly string[];
 }
 
@@ -94,7 +178,7 @@ export interface MeasuredPosePresentation {
 export interface RuntimeScenePresentation {
   measuredRobot: MeasuredRobotPresentation | null;
   /**
-   * G2: the fresh outside measured robot sources (`viewer.measured_robot`).
+   * The fresh outside measured robot sources (`viewer.measured_robot`).
    * With none, the measured ghost follows the execution owner's measured rows.
    */
   measuredRobotSources: JointObservationSource[];
@@ -151,6 +235,10 @@ export interface AttachmentPresentationDiagnostic {
 export interface CandidateRobotPresentation {
   receiptDigest: string | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
+  previewDefaultDisposition?: 'clear' | 'unknown';
+  contactLinks?: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'>;
+  contactObjects?: Record<string, 'allowed' | 'clearance' | 'refused' | 'unknown'>;
+  contactAttachments?: AttachedObjectPresentation[];
 }
 
 /**
@@ -426,7 +514,7 @@ export function createExecutionRobotPresentationReader(
  * replaces its commanded row; every other coordinate keeps the solid robot's
  * value, so the comparison differs only where measurement does. A frame with
  * no measured row has no comparison robot. With an outside measured source
- * (G2) it draws that source's robot and each other element's own state in the
+ * it draws that source's robot and each other element's own state in the
  * frame instead. This reader never credits or rejects frames: the solid robot
  * reader owns the capacity-one stream.
  */
@@ -436,6 +524,7 @@ export function createMeasuredComparisonPresentationReader(
   manifest: SceneUrdfManifest | null,
   _measuredRobotSources: readonly JointObservationSource[] = [],
 ): MeasuredRobotPresentationReader {
+  void _measuredRobotSources;
   let cachedFrame: ExecutionObservationFrame | null | undefined;
   let cachedPresentation: MeasuredRobotPresentation | null = null;
   return {
@@ -445,7 +534,7 @@ export function createMeasuredComparisonPresentationReader(
       cachedFrame = frame;
       cachedPresentation = null;
       const measuredRobotSources = measuredRobotSourcesOfFrame(sourceModel === null ? null : frameOfModel(frame, sourceModel));
-      // G2 (C-G2): with an outside measured source the ghost follows it and
+      // With an outside measured source the ghost follows it and
       // every other element's own state in this frame; more than one is off.
       if (measuredRobotSources.length > 0) {
         if (measuredRobotSources.length === 1 && sourceModel !== null && manifest !== null) {
@@ -538,7 +627,7 @@ function attachmentDiagnostic(
  * No source or compiled name is guessed: a missing or crossed join remains a
  * visible diagnostic and the object is not rendered at an invented pose.
  *
- * G4 (C-P5): the part is always drawn at its holder's frame, whatever Robot
+ * The part is always drawn at its holder's frame, whatever Robot
  * control selects. The holder's target names the frame's source link, and
  * the holder's own occurrence maps that link to its viewer link; no
  * Robot-control descriptor takes part.
@@ -889,7 +978,7 @@ function measuredPositions(
   return positions;
 }
 
-/** Components with a movable joint of their own that is not measured (G2-b). */
+/** Components with a movable joint of their own that is not measured. */
 function componentsAwaitingJointState(
   positions: ReadonlyMap<string, number>,
   sourceModel: SourceModelProjection,
@@ -907,7 +996,7 @@ function componentsAwaitingJointState(
 }
 
 /**
- * G2 (C-G2, G2-b): the measured overlay with one outside measured source.
+ * The measured overlay with one outside measured source.
  * The source drives its robot's own occurrences; every other component that
  * streams joints takes them from its own state in the execution owner's frame
  * (measured rows where present). Only those elements are drawn, and a link
@@ -940,7 +1029,7 @@ function outsideMeasuredRobot(
       warnings: warnings.length > 0 ? warnings : ['Measured robot coordinates do not resolve on the viewer model.'],
     };
   }
-  // G2-b: only the measured robot and the components with own state stream.
+  // Only the measured robot and the components with own state stream.
   const drawn = new Set([source.object_id, ...sourceModel.occurrences.flatMap((occurrence) => (
     occurrence.component_id !== null
       && occurrence.coordinates.some((coordinate) => ownState.has(coordinate.viewer_joint_name))
@@ -1000,7 +1089,7 @@ function measuredOverlayFrameWarnings(
 }
 
 /**
- * G2: the panel's frame-dependent overlay lines, read through the owner frame
+ * The panel's frame-dependent overlay lines, read through the owner frame
  * subscription. The result keeps its identity until the lines change, so a
  * steady stream does not re-render the panel.
  */
@@ -1031,7 +1120,7 @@ export function createMeasuredOverlayFrameWarningsReader(
 /**
  * Project fresh Manager-owned observations onto one retained viewer model.
  *
- * G2 (C-G2): the outside measured source (`viewer.measured_robot`) drives the
+ * The outside measured source (`viewer.measured_robot`) drives the
  * joints of its robot's own occurrences. Every other component's joints come
  * from that component's own state, the execution owner's latest frame
  * (measured rows where present); a component with a movable joint but no own
@@ -1191,8 +1280,8 @@ export function candidateRobotPresentation(
   // A manual preview is planned through the manual-control binding whose
   // roles the descriptor carries.
   if (
-    receipt.componentRoleId !== descriptor.componentRoleId
-    || receipt.targetRoleId !== descriptor.targetRoleId
+    receipt.target.componentId !== descriptor.controllableComponentId
+    || receipt.target.commandTargetId !== descriptor.commandTargetId
   ) return null;
   return resolvedPreviewRobotPresentation(receipt, manifest, descriptor, measured);
 }
@@ -1209,19 +1298,21 @@ export function resolvedPreviewRobotPresentation(
   descriptor: ManualControlMotionDescriptor,
   measured: Readonly<Record<string, RuntimeLinkTransform>>,
 ): CandidateRobotPresentation | null {
-  if (
-    receipt.retainedBundleId !== manifest.retained_bundle_id
-    || receipt.graphRevision !== manifest.graph_revision
-    || receipt.sourceJointNames.length !== receipt.finalPositionsRad.length
-    || receipt.sourceJointNames.length !== descriptor.joints.length
-    || new Set(receipt.sourceJointNames).size !== receipt.sourceJointNames.length
-    || receipt.finalPositionsRad.some((value) => !Number.isFinite(value))
-  ) return null;
+  if (receipt.retainedBundleId !== manifest.retained_bundle_id || receipt.graphRevision !== manifest.graph_revision) return null;
+  return sampledPreviewRobotPresentation(receipt.sourceJointNames, receipt.finalPositionsRad, receipt.receiptDigest, manifest, descriptor, measured);
+}
+
+export function sampledPreviewRobotPresentation(
+  sourceJointNames: readonly string[], positionsRad: readonly number[], receiptDigest: string | null,
+  manifest: SceneUrdfManifest, descriptor: ManualControlMotionDescriptor,
+  measured: Readonly<Record<string, RuntimeLinkTransform>>,
+): CandidateRobotPresentation | null {
+  if (sourceJointNames.length !== positionsRad.length || sourceJointNames.length !== descriptor.joints.length
+      || new Set(sourceJointNames).size !== sourceJointNames.length || positionsRad.some((value) => !Number.isFinite(value))) return null;
   const positions = new Map<string, number>();
   for (const [index, joint] of descriptor.joints.entries()) {
-    if (joint.sourceJointName !== receipt.sourceJointNames[index]
-      || positions.has(joint.compiledJointName)) return null;
-    positions.set(joint.compiledJointName, receipt.finalPositionsRad[index]);
+    if (joint.sourceJointName !== sourceJointNames[index] || positions.has(joint.compiledJointName)) return null;
+    positions.set(joint.compiledJointName, positionsRad[index]);
   }
   const transforms = measuredLinkTransforms(
     manifest,
@@ -1245,7 +1336,7 @@ export function resolvedPreviewRobotPresentation(
     if (count === affected.size + changedCoordinates.size) break;
   }
   return transforms === null ? null : {
-    receiptDigest: receipt.receiptDigest,
+    receiptDigest,
     linkTransforms: Object.fromEntries(Object.entries(transforms)
       .filter(([link]) => affected.has(link))),
   };
@@ -1272,8 +1363,8 @@ export function candidateGripperPresentation(
     || receipt.retainedBundleId !== manifest.retained_bundle_id
     || receipt.graphRevision !== sourceModel.graph_revision
     || receipt.graphRevision !== manifest.graph_revision
-    || receipt.componentRoleId !== gripper.componentRoleId
-    || receipt.targetRoleId !== gripper.targetRoleId
+    || receipt.target.componentId !== gripper.controllableComponentId
+    || receipt.target.commandTargetId !== gripper.commandTargetId
     || receipt.requiredCapabilityId !== gripper.operationCapabilityId
     || receipt.commandSchemaId !== gripper.commandSchemaId
     || receipt.commandSchemaRevision !== gripper.commandSchemaRevision

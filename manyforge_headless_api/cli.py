@@ -43,7 +43,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="manyforge-headless")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
-    serve = subcommands.add_parser("serve", help="start the independent H0 API")
+    serve = subcommands.add_parser("serve", help="start the independent headless API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=9010)
     serve.add_argument("--projection-root", type=Path, required=True)
@@ -135,7 +135,7 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("expected_health_generation", type=int)
     _caller_fields(reconcile)
 
-    # Component model v2 (CONTRACTS §2, §7, §10), through the REST endpoints.
+    # Component model v2, through the REST endpoints.
     components = subcommands.add_parser("components")
     components.add_argument("--url", default="http://127.0.0.1:9010")
     component_commands = components.add_subparsers(dest="components_command", required=True)

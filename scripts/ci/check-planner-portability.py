@@ -21,7 +21,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MAPPING = ROOT / "verification/planner_portability/rp5-6-backend-mapping.json"
+MAPPING = ROOT / "scripts/ci/planner-portability-mapping.json"
 
 MAX_CORPUS_FILES: Final = 4_096
 MAX_CORPUS_BYTES: Final = 64 * 1024 * 1024
@@ -896,7 +896,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
             "RoboPlan overclaims more than retained-product consumer qualification",
         )
     if roboplan.get("source_identity") != SELECTED_ROBOPLAN_SOURCE:
-        fail(failures, "RoboPlan mapping does not name the selected UA1 baseline")
+        fail(failures, "RoboPlan mapping does not name the selected RoboPlan source")
     capability_disposition = _string_value_mapping(
         failures,
         roboplan.get("capability_disposition"),
@@ -976,7 +976,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     if curobo.get("status") != "explicitly_unsupported_deferred":
         fail(failures, "cuRobo must remain explicitly unsupported and deferred")
     if curobo.get("implementation_changes_in_rp5_6") != "none":
-        fail(failures, "RP5-6 must not implement or modify a cuRobo adapter")
+        fail(failures, "no cuRobo adapter may be implemented or modified")
 
     evidence_count = _check_evidence(
         failures,

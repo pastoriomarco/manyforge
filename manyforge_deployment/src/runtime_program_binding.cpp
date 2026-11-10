@@ -84,9 +84,28 @@ require_desired_route(const core::RetainedBundleDTO &bundle,
 
 } // namespace
 
+std::pair<const core::DesiredControlConfigurationDTO&,
+          const core::ControlRouteId&>
+qualified_desired_control_route(const core::RetainedBundleDTO& bundle,
+                                const core::ControlDomainDTO& domain,
+                                const core::ControlBindingDTO& binding) {
+  const auto &retained_binding = require_one(
+      bundle.cell_graph.control_bindings,
+      [&](const auto &candidate) {
+        return candidate.control_binding_id == binding.control_binding_id &&
+               candidate.control_binding_revision == binding.control_binding_revision;
+      }, "control binding");
+  if (retained_binding != binding)
+    fail("candidate control binding differs from the retained binding");
+  const auto &retained_domain = require_control_domain(bundle.cell_graph, retained_binding);
+  if (retained_domain != domain)
+    fail("candidate control domain differs from the retained domain");
+  return require_desired_route(bundle, retained_domain, retained_binding);
+}
+
 RuntimeProgramTargetBinding resolve_runtime_program_target(
     const ProgramBinding &program_binding,
-    const core::TargetRoleId &target_role_id,
+    const core::ProgramTargetReferenceDTO &target,
     const core::CapabilityId &capability_id,
     const RetainedBundle &retained_bundle,
     const VerifiedRetainedModelMap &retained_model_map) {
@@ -108,24 +127,18 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
     fail("runtime Program Binding context does not select one exact bundle");
   }
 
-  const auto &target_role = require_one(
-      binding_value.target_role_bindings,
-      [&](const core::ProgramTargetRoleBindingDTO &candidate) {
-        return candidate.target_role_id == target_role_id;
-      },
-      "target role");
-  const auto &component_role = require_one(
-      binding_value.component_role_bindings,
-      [&](const core::ProgramComponentRoleBindingDTO &candidate) {
-        return candidate.component_role_id == target_role.component_role_id;
-      },
-      "component role");
-  if (component_role.controllable_component_id !=
-      target_role.controllable_component_id) {
-    fail("runtime Program Binding target and component roles disagree");
-  }
+  const auto &target_binding = require_one(
+      binding_value.target_bindings,
+      [&](const core::ProgramTargetBindingDTO &candidate) {
+        return candidate.target == target;
+      }, "target");
+  const auto &component_binding = require_one(
+      binding_value.component_bindings,
+      [&](const core::ProgramComponentBindingDTO &candidate) {
+        return candidate.component_id == target.component_id;
+      }, "component");
   const auto &capability = require_one(
-      target_role.capability_bindings,
+      target_binding.capability_bindings,
       [&](const core::ProgramCapabilityBindingDTO &candidate) {
         return candidate.capability_id == capability_id;
       },
@@ -135,19 +148,35 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
       bundle_value.cell_graph.controllable_components,
       [&](const core::ControllableComponentDTO &candidate) {
         return candidate.controllable_component_id ==
-               component_role.controllable_component_id;
+               component_binding.component_id;
       },
       "controllable component");
-  if (component.component_type_id != component_role.component_type_id ||
+  if (component.component_type_id != component_binding.component_type_id ||
       component.component_type_revision !=
-          component_role.component_type_revision) {
+          component_binding.component_type_revision) {
     fail("runtime Program Binding component type differs from retained graph");
   }
 
   const auto *model_target = retained_model_map.find_target(
-      target_role.controllable_component_id, target_role.command_target_id);
+      target.component_id, target.command_target_id);
   if (model_target == nullptr) {
     fail("runtime Program Binding target has no exact retained model mapping");
+  }
+  std::vector<core::ProgramFrameBindingDTO> frames;
+  for (const auto &reference : target_binding.frame_references) {
+    frames.push_back(require_one(
+        binding_value.frame_bindings,
+        [&](const core::ProgramFrameBindingDTO &candidate) {
+          return candidate.reference == reference;
+        }, "target frame"));
+  }
+  std::vector<core::ProgramCollisionBodyBindingDTO> bodies;
+  for (const auto &reference : target_binding.collision_body_references) {
+    bodies.push_back(require_one(
+        binding_value.collision_body_bindings,
+        [&](const core::ProgramCollisionBodyBindingDTO &candidate) {
+          return candidate.reference == reference;
+        }, "target collision body"));
   }
 
   std::optional<core::ControlBindingDTO> control_binding;
@@ -166,8 +195,8 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
         },
         "control binding");
     if (graph_binding.controllable_component_id !=
-            target_role.controllable_component_id ||
-        graph_binding.command_target_id != target_role.command_target_id ||
+            target.component_id ||
+        graph_binding.command_target_id != target.command_target_id ||
         graph_binding.capability_id != capability.capability_id ||
         graph_binding.capability_definition_revision !=
             capability.capability_definition_revision) {
@@ -178,7 +207,7 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
     const auto [configuration, route] =
         require_desired_route(bundle_value, domain, graph_binding);
     const auto *mapped = retained_model_map.find_binding(
-        target_role.controllable_component_id, target_role.command_target_id,
+        target.component_id, target.command_target_id,
         graph_binding.control_binding_id);
     if (mapped == nullptr ||
         mapped->control_binding_id != graph_binding.control_binding_id) {
@@ -215,7 +244,9 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
   return RuntimeProgramTargetBinding(
       binding_value.program_id, binding_value.program_revision,
       binding_value.program_binding_id, binding_value.retained_bundle_id,
-      binding_value.graph_revision, component_role, target_role, capability,
+      binding_value.graph_revision, component_binding, target_binding,
+      std::move(frames), binding_value.frame_bindings, std::move(bodies),
+      binding_value.collision_body_bindings, capability,
       component, *model_target, std::move(control_binding),
       std::move(control_domain), std::move(desired_configuration),
       std::move(desired_route), std::move(coordinate_map),
@@ -301,7 +332,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
     const auto &domain = *target.control_domain();
     const auto &desired = *target.desired_control_configuration();
     if (active_facts.control_route_id != *target.desired_route()) {
-      fail("I6 active route differs from the retained desired route");
+      fail("active route differs from the retained desired route");
     }
     for (const auto &id : domain.runtime_unit_ids) {
       required_runtime_units.insert(id);
@@ -320,7 +351,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         fail("runtime resource is not one exact direct coordinate binding");
       }
       const auto &program_resource = require_one(
-          target.target_role().resource_role_bindings,
+          target.target_binding().resource_role_bindings,
           [&](const core::ProgramResourceRoleBindingDTO &candidate) {
             return candidate.resource_role_id ==
                    resource_binding.resource_role_id;
@@ -439,10 +470,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
         supporting.program_binding_id() != target.program_binding_id() ||
         supporting.retained_bundle_id() != target.retained_bundle_id() ||
         supporting.graph_revision() != target.graph_revision() ||
-        supporting.component_role().component_role_id !=
-            target.component_role().component_role_id ||
-        supporting.target_role().target_role_id !=
-            target.target_role().target_role_id ||
+        supporting.target_binding().target != target.target_binding().target ||
         supporting.component().controllable_component_id !=
             target.component().controllable_component_id ||
         supporting.model_target().command_target_id !=
@@ -525,25 +553,27 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
       target.program_binding_id(),
       target.retained_bundle_id(),
       target.graph_revision(),
-      target.component_role().component_role_id,
-      target.target_role().target_role_id,
       target.component().controllable_component_id,
       target.component().component_type_id,
       target.component().component_type_revision,
-      target.target_role().command_target_id,
+      target.target_binding().target.command_target_id,
       target.capability().capability_id,
       target.capability().capability_definition_revision,
       target.capability().command_schema,
-      target.component_role().model_role_bindings,
+      target.component_binding().model_bindings,
       std::move(model_groups),
-      target.target_role().frame_role_bindings,
+      target.frame_bindings(),
       std::move(resources),
-      target.target_role().collision_body_role_bindings,
+      target.collision_body_bindings(),
       std::move(control_path),
       std::move(provider_path),
       std::move(supporting_paths),
       std::move(runtime_epochs),
-      target.contact_grasp_bindings()};
+      target.contact_grasp_bindings(),
+      std::nullopt,
+      target.program_frame_bindings(),
+      target.program_collision_body_bindings(),
+      target.target_binding().frame_associations};
 }
 
 } // namespace manyforge::deployment

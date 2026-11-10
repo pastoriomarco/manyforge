@@ -10,8 +10,6 @@ import type {
   ProgramAuthoringDocument,
 } from '../types/api';
 import {
-  collectComponentRoleUsages,
-  removeGuardTitle,
   deriveProgramMotionConfiguration,
   flattenProgramForest,
   PROGRAM_MOTION_CEILING_FIELDS,
@@ -33,7 +31,6 @@ interface ProgramSettingsEditorProps {
     args: Record<string, JsonValue>,
   ) => Promise<DraftMutationResponse | null> | DraftMutationResponse | null | void;
   onInvalidChange?: (invalid: boolean) => void;
-  onRoleCreated?: (kind: 'component_role' | 'target_role', id: string) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
 }
 
@@ -73,7 +70,7 @@ function independentExecutionGroups(program: ProgramAuthoringDocument): string {
     .join(', ');
 }
 
-type MotionDefaults = ProgramMotionValues;
+type MotionDefaults = Partial<ProgramMotionValues>;
 
 interface MotionHistory {
   before: JsonValue;
@@ -88,13 +85,8 @@ export function ProgramSettingsEditor({
   runtime,
   onMutate,
   onInvalidChange,
-  onRoleCreated,
   diagnostics = [],
 }: ProgramSettingsEditorProps) {
-  const componentRoleUsages = useMemo(
-    () => collectComponentRoleUsages(program, catalogEntries),
-    [catalogEntries, program],
-  );
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -110,17 +102,6 @@ export function ProgramSettingsEditor({
   );
   const [error, setError] = useState<string | null>(null);
   const [errorTarget, setErrorTarget] = useState('program-settings-name');
-  const [componentRoleId, setComponentRoleId] = useState('');
-  const [componentTypeTags, setComponentTypeTags] = useState('');
-  const [componentModelRoles, setComponentModelRoles] = useState('');
-  const [componentAttachments, setComponentAttachments] = useState('');
-  const [targetRoleId, setTargetRoleId] = useState('');
-  const [targetComponentRole, setTargetComponentRole] = useState('');
-  const [targetCapabilities, setTargetCapabilities] = useState('');
-  const [targetFrameRoles, setTargetFrameRoles] = useState('');
-  const [targetResourceRoles, setTargetResourceRoles] = useState('');
-  const [targetCollisionRoles, setTargetCollisionRoles] = useState('');
-  const [targetModelRoles, setTargetModelRoles] = useState('');
   const [motion, setMotion] = useState<MotionDefaults | null>(appliedMotion);
   const [motionHistory, setMotionHistory] = useState<MotionHistory | null>(null);
   const [motionRedo, setMotionRedo] = useState<MotionHistory | null>(null);
@@ -137,17 +118,6 @@ export function ProgramSettingsEditor({
     setExecutionGroups(independentExecutionGroups(program));
     setError(null);
     setErrorTarget('program-settings-name');
-    setComponentRoleId('');
-    setComponentTypeTags('');
-    setComponentModelRoles('');
-    setComponentAttachments('');
-    setTargetRoleId('');
-    setTargetComponentRole(Object.keys(program.component_roles)[0] ?? '');
-    setTargetCapabilities('');
-    setTargetFrameRoles('');
-    setTargetResourceRoles('');
-    setTargetCollisionRoles('');
-    setTargetModelRoles('');
     setMotion(appliedMotion);
     setMotionConflict(null);
     setMotionError(null);
@@ -258,114 +228,24 @@ export function ProgramSettingsEditor({
       document.getElementById(target)?.focus();
     }
   };
-  const replaceRoles = (
-    componentRoles: Record<string, JsonValue>,
-    targetRoles: Record<string, JsonValue>,
-  ) => Promise.resolve(onMutate('program_draft_replace_roles', {
-    component_roles: componentRoles,
-    target_roles: targetRoles,
-  }));
-  const addComponentRole = () => {
-    try {
-      const roleId = componentRoleId.trim();
-      if (!PORTABLE_ID.test(roleId)) throw new Error('Component role needs a portable ID.');
-      if (program.component_roles[roleId] !== undefined) {
-        throw new Error(`Component role '${roleId}' already exists.`);
-      }
-      const typeTags = parseIdentifierList(componentTypeTags, 'Component type tags');
-      const modelRoles = parseIdentifierList(componentModelRoles, 'Component model roles');
-      const attachments = parseIdentifierList(componentAttachments, 'Attachment interfaces');
-      const role: Record<string, JsonValue> = {};
-      if (typeTags.length) role.required_component_type_tags = typeTags;
-      if (modelRoles.length) role.required_model_roles = modelRoles;
-      if (attachments.length) role.required_attachment_interfaces = attachments;
-      void replaceRoles(
-        { ...program.component_roles, [roleId]: role },
-        program.target_roles,
-      ).then((response) => {
-        if (!response) return;
-        onRoleCreated?.('component_role', roleId);
-        setComponentRoleId('');
-        setComponentTypeTags('');
-        setComponentModelRoles('');
-        setComponentAttachments('');
-        setTargetComponentRole(roleId);
-      });
-      setError(null);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Component role is invalid.');
-      setErrorTarget('program-component-role-id');
-    }
-  };
-  const removeComponentRole = (roleId: string) => {
-    void replaceRoles(
-      Object.fromEntries(
-        Object.entries(program.component_roles).filter(([role]) => role !== roleId),
-      ),
-      program.target_roles,
-    );
-  };
-  const addTargetRole = () => {
-    try {
-      const roleId = targetRoleId.trim();
-      if (!PORTABLE_ID.test(roleId)) throw new Error('Target role needs a portable ID.');
-      if (program.target_roles[roleId] !== undefined) {
-        throw new Error(`Target role '${roleId}' already exists.`);
-      }
-      if (!targetComponentRole || program.component_roles[targetComponentRole] === undefined) {
-        throw new Error('Target role must select a declared component role.');
-      }
-      const capabilities = parseIdentifierList(targetCapabilities, 'Target capabilities');
-      if (capabilities.length === 0) throw new Error('Target role needs at least one capability.');
-      const role: Record<string, JsonValue> = {
-        component_role: targetComponentRole,
-        required_capabilities: capabilities.map((capabilityId) => ({
-          capability_id: capabilityId,
-          parameters: {},
-          disposition: 'required',
-        })),
-      };
-      const optionalLists = {
-        required_frame_roles: parseIdentifierList(targetFrameRoles, 'Frame roles'),
-        required_resource_roles: parseIdentifierList(targetResourceRoles, 'Resource roles'),
-        required_collision_body_roles: parseIdentifierList(targetCollisionRoles, 'Collision-body roles'),
-        required_model_roles: parseIdentifierList(targetModelRoles, 'Target model roles'),
-      };
-      for (const [name, values] of Object.entries(optionalLists)) {
-        if (values.length) role[name] = values;
-      }
-      void replaceRoles(
-        program.component_roles,
-        { ...program.target_roles, [roleId]: role },
-      ).then((response) => {
-        if (!response) return;
-        onRoleCreated?.('target_role', roleId);
-        setTargetRoleId('');
-        setTargetCapabilities('');
-        setTargetFrameRoles('');
-        setTargetResourceRoles('');
-        setTargetCollisionRoles('');
-        setTargetModelRoles('');
-      });
-      setError(null);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Target role is invalid.');
-      setErrorTarget('program-target-role-id');
-    }
-  };
   const motionDirty = motion !== null && appliedMotion !== null
-    && PROGRAM_MOTION_FIELDS.some((field) => (
-    Math.abs(
-      motion[field]
-      - appliedMotion[field],
-    ) > 1e-12
-    ));
+    && PROGRAM_MOTION_FIELDS.some((field) => {
+      const edited = motion[field];
+      const applied = appliedMotion[field];
+      return edited !== undefined && applied !== undefined
+        && Math.abs(edited - applied) > 1e-12;
+    });
+  // Only literals conflict; a node reading another source is checked when
+  // its move starts.
   const motionConflictCount = (values: MotionDefaults): number => (
     flattenProgramForest(program.forest).reduce((count, { node }) => (
       count + PROGRAM_MOTION_CEILING_FIELDS.filter((field) => {
         const value = node.parameters[field];
+        const ceiling = values[field];
         return typeof value === 'number'
-          && value > values[field];
+          && node.value_sources?.[field] === undefined
+          && ceiling !== undefined
+          && value > ceiling;
       }).length
     ), 0)
   );
@@ -377,13 +257,14 @@ export function ProgramSettingsEditor({
       setMotionError(motionConfiguration.reason);
       return;
     }
+    // Each declared field updates the Program parameter of the same name.
+    const declared = Object.fromEntries(PROGRAM_MOTION_FIELDS.flatMap((field) => {
+      const value = values[field];
+      return value === undefined ? [] : [[field, value]];
+    }));
     const response = await onMutate('program_draft_update_motion_defaults', {
       mode: 'update',
-      velocity_scale: values.velocity_scale,
-      acceleration_scale: values.acceleration_scale,
-      translation_tol_m: values.translation_tol_m,
-      blend_radius_m: values.blend_radius_m,
-      parameter_bindings: motionConfiguration.configuration.bindings,
+      ...declared,
       conflict_resolution: conflictResolution,
     });
     if (!response) return;
@@ -398,17 +279,14 @@ export function ProgramSettingsEditor({
   };
   const submitMotion = () => {
     if (busy || !motionDirty || motion === null) return;
+    const outside = (value: number | undefined, valid: (value: number) => boolean) => (
+      value !== undefined && (!Number.isFinite(value) || !valid(value))
+    );
     if (
-      !Number.isFinite(motion.velocity_scale)
-      || motion.velocity_scale <= 0
-      || motion.velocity_scale > 1
-      || !Number.isFinite(motion.acceleration_scale)
-      || motion.acceleration_scale <= 0
-      || motion.acceleration_scale > 1
-      || !Number.isFinite(motion.translation_tol_m)
-      || motion.translation_tol_m <= 0
-      || !Number.isFinite(motion.blend_radius_m)
-      || motion.blend_radius_m < 0
+      outside(motion.velocity_scale, (value) => value > 0 && value <= 1)
+      || outside(motion.acceleration_scale, (value) => value > 0 && value <= 1)
+      || outside(motion.translation_tol_m, (value) => value > 0)
+      || outside(motion.blend_radius_m, (value) => value >= 0)
     ) {
       setMotionError('Scales must be in (0, 1], translation tolerance must be positive, and corner blend radius must be non-negative.');
       return;
@@ -453,17 +331,6 @@ export function ProgramSettingsEditor({
               setDescription(program.description ?? '');
               setCompatibility(initialCompatibility(program));
               setExecutionGroups(independentExecutionGroups(program));
-              setComponentRoleId('');
-              setComponentTypeTags('');
-              setComponentModelRoles('');
-              setComponentAttachments('');
-              setTargetRoleId('');
-              setTargetComponentRole(Object.keys(program.component_roles)[0] ?? '');
-              setTargetCapabilities('');
-              setTargetFrameRoles('');
-              setTargetResourceRoles('');
-              setTargetCollisionRoles('');
-              setTargetModelRoles('');
               setError(null);
               setErrorTarget('program-settings-name');
             }}
@@ -515,7 +382,8 @@ export function ProgramSettingsEditor({
       <section className="dcard program-motion-defaults">
         <h3>Motion defaults</h3>
         <p>
-          These are portable Program defaults. Velocity, acceleration and TCP
+          These are portable Program defaults: a motion node field left unset
+          inherits the Program parameter of the same name. Velocity, acceleration and TCP
           speed remain ceilings; Cartesian nodes may override the inherited
           path tolerance and corner blend radius. The live command-bar Velocity
           control further scales current and subsequent compatible moves for
@@ -531,86 +399,110 @@ export function ProgramSettingsEditor({
         ) : (
           <>
             <dl className="program-motion-bindings">
-              {PROGRAM_MOTION_FIELDS.map((field) => (
-                <div key={field}>
-                  <dt><BreakableId text={field} /></dt>
-                  <dd>
-                    <code><BreakableId text={motionConfiguration.configuration.bindings[field]} /></code>
-                    {' · '}{motionConfiguration.configuration.usageCounts[field]}
-                    /{motionConfiguration.configuration.applicableCounts[field]} bound nodes
-                  </dd>
-                </div>
-              ))}
+              {PROGRAM_MOTION_FIELDS.map((field) => {
+                const configuration = motionConfiguration.configuration;
+                const binding = configuration.bindings[field];
+                const dynamic = configuration.dynamicCounts[field];
+                return (
+                  <div key={field}>
+                    <dt><BreakableId text={field} /></dt>
+                    <dd>
+                      {binding === undefined ? (
+                        'No Program parameter of this name; nodes use their own or catalog values'
+                      ) : (
+                        <>
+                          <code><BreakableId text={binding} /></code>
+                          {' · '}{configuration.usageCounts[field]}
+                          /{configuration.applicableCounts[field]} bound nodes
+                          {dynamic > 0 && (
+                            <span title="These nodes read another value source; the value is checked against this Program value when the move starts.">
+                              {' · '}{dynamic} dynamic
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </dd>
+                  </div>
+                );
+              })}
             </dl>
             <div className="drows">
-              <label>
-                Velocity scale
-                <input
-                  aria-label="Program global velocity scale"
-                  type="number"
-                  min="0.01"
-                  max="1"
-                  step="0.01"
-                  value={motion.velocity_scale}
-                  disabled={busy}
-                  onChange={(event) => setMotion((current) => current === null ? null : ({
-                    ...current,
-                    velocity_scale: event.currentTarget.valueAsNumber,
-                  }))}
-                />
-              </label>
-              <label>
-                Acceleration scale
-                <input
-                  aria-label="Program global acceleration scale"
-                  type="number"
-                  min="0.01"
-                  max="1"
-                  step="0.01"
-                  value={motion.acceleration_scale}
-                  disabled={busy}
-                  onChange={(event) => setMotion((current) => current === null ? null : ({
-                    ...current,
-                    acceleration_scale: event.currentTarget.valueAsNumber,
-                  }))}
-                />
-              </label>
-              <label>
-                Translation tolerance
-                <span className="dunit">
+              {motion.velocity_scale !== undefined && (
+                <label>
+                  Velocity scale
                   <input
-                    aria-label="Program Cartesian translation tolerance"
+                    aria-label="Program global velocity scale"
                     type="number"
-                    min="0.000001"
-                    step="0.001"
-                    value={motion.translation_tol_m}
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                    value={motion.velocity_scale}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      translation_tol_m: event.currentTarget.valueAsNumber,
+                      velocity_scale: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>m</span>
-                </span>
-              </label>
-              <label title="0 keeps exact corners; the tool stops at sharp corners.">
-                Corner blend radius
-                <span className="dunit">
+                </label>
+              )}
+              {motion.acceleration_scale !== undefined && (
+                <label>
+                  Acceleration scale
                   <input
-                    aria-label="Program Cartesian corner blend radius"
+                    aria-label="Program global acceleration scale"
                     type="number"
-                    min="0"
-                    step="0.001"
-                    value={motion.blend_radius_m}
+                    min="0.01"
+                    max="1"
+                    step="0.01"
+                    value={motion.acceleration_scale}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      blend_radius_m: event.currentTarget.valueAsNumber,
+                      acceleration_scale: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>m</span>
-                </span>
-              </label>
+                </label>
+              )}
+              {motion.translation_tol_m !== undefined && (
+                <label>
+                  Translation tolerance
+                  <span className="dunit">
+                    <input
+                      aria-label="Program Cartesian translation tolerance"
+                      type="number"
+                      min="0.000001"
+                      step="0.001"
+                      value={motion.translation_tol_m}
+                      disabled={busy}
+                      onChange={(event) => setMotion((current) => current === null ? null : ({
+                        ...current,
+                        translation_tol_m: event.currentTarget.valueAsNumber,
+                      }))}
+                    />
+                    <span>m</span>
+                  </span>
+                </label>
+              )}
+              {motion.blend_radius_m !== undefined && (
+                <label title="0 keeps exact corners; the tool stops at sharp corners.">
+                  Corner blend radius
+                  <span className="dunit">
+                    <input
+                      aria-label="Program Cartesian corner blend radius"
+                      type="number"
+                      min="0"
+                      step="0.001"
+                      value={motion.blend_radius_m}
+                      disabled={busy}
+                      onChange={(event) => setMotion((current) => current === null ? null : ({
+                        ...current,
+                        blend_radius_m: event.currentTarget.valueAsNumber,
+                      }))}
+                    />
+                    <span>m</span>
+                  </span>
+                </label>
+              )}
             </div>
             <div className="dactions">
               <button type="button" disabled={busy || !motionDirty} onClick={submitMotion}>
@@ -706,8 +598,8 @@ export function ProgramSettingsEditor({
           <dl>
             <div><dt>Scenario</dt><dd><code>{currentScenario?.scenarioId}</code></dd></div>
             <div><dt>Binding</dt><dd><code>{exactBinding.program_binding_id}</code></dd></div>
-            <div><dt>Component roles</dt><dd>{exactBinding.component_role_bindings.length}</dd></div>
-            <div><dt>Target roles</dt><dd>{exactBinding.target_role_bindings.length}</dd></div>
+            <div><dt>Components</dt><dd>{exactBinding.component_bindings.length}</dd></div>
+            <div><dt>Targets</dt><dd>{exactBinding.target_bindings.length}</dd></div>
           </dl>
         ) : (
           <p>
@@ -715,69 +607,6 @@ export function ProgramSettingsEditor({
             Program settings do not infer compatibility in the browser.
           </p>
         )}
-      </section>
-
-      <section className="dcard">
-        <h3>Component and target roles</h3>
-        <p>
-          Node selectors use these logical requirements. Deployment Binding chooses
-          implementations later; this Program does not name live components.
-        </p>
-        <dl>
-          {Object.keys(program.component_roles).map((role) => {
-            const usages = componentRoleUsages.get(role) ?? [];
-            return (
-              <div key={`component:${role}`}>
-                <dt>Component role</dt>
-                <dd>
-                  <code>{role}</code>
-                  {' '}
-                  <button
-                    type="button"
-                    className="text-button"
-                    aria-label={`Remove component role ${role}`}
-                    disabled={busy || usages.length > 0}
-                    title={removeGuardTitle(usages, 'Remove component role')}
-                    onClick={() => removeComponentRole(role)}
-                  >Remove</button>
-                  {usages.length > 0 && (
-                    <small> {usages.length} binding{usages.length === 1 ? '' : 's'}</small>
-                  )}
-                </dd>
-              </div>
-            );
-          })}
-          {Object.keys(program.target_roles).map((role) => (
-            <div key={`target:${role}`}><dt>Target role</dt><dd><code>{role}</code></dd></div>
-          ))}
-        </dl>
-        <details className="dcard">
-          <summary>Create component role</summary>
-          <div className="drows">
-            <label>Role ID<input id="program-component-role-id" value={componentRoleId} disabled={busy} onChange={(event) => setComponentRoleId(event.target.value)} /></label>
-            <label>Type tags<input value={componentTypeTags} disabled={busy} placeholder="articulated-arm, gripper" onChange={(event) => setComponentTypeTags(event.target.value)} /></label>
-            <label>Model roles<input value={componentModelRoles} disabled={busy} placeholder="arm_model" onChange={(event) => setComponentModelRoles(event.target.value)} /></label>
-            <label>Attachments<input value={componentAttachments} disabled={busy} onChange={(event) => setComponentAttachments(event.target.value)} /></label>
-            <div className="dactions">
-              <button type="button" disabled={busy || !componentRoleId.trim()} onClick={addComponentRole}>Create component role</button>
-            </div>
-          </div>
-        </details>
-        <details className="dcard">
-          <summary>Create target role</summary>
-          <div className="drows">
-            <label>Role ID<input id="program-target-role-id" value={targetRoleId} disabled={busy} onChange={(event) => setTargetRoleId(event.target.value)} /></label>
-            <label>Component role<select value={targetComponentRole} disabled={busy} onChange={(event) => setTargetComponentRole(event.target.value)}><option value="" disabled>Select component role</option>{Object.keys(program.component_roles).map((role) => <option key={role}>{role}</option>)}</select></label>
-            <label>Capabilities<input value={targetCapabilities} disabled={busy} placeholder="planning.motion.pose_goal" onChange={(event) => setTargetCapabilities(event.target.value)} /></label>
-            <label>Frame roles<input value={targetFrameRoles} disabled={busy} placeholder="base, tcp" onChange={(event) => setTargetFrameRoles(event.target.value)} /></label>
-            <label>Resource roles<input value={targetResourceRoles} disabled={busy} onChange={(event) => setTargetResourceRoles(event.target.value)} /></label>
-            <label>Collision roles<input value={targetCollisionRoles} disabled={busy} onChange={(event) => setTargetCollisionRoles(event.target.value)} /></label>
-            <label>Model roles<input value={targetModelRoles} disabled={busy} onChange={(event) => setTargetModelRoles(event.target.value)} /></label>
-            <div className="dactions">
-              <button type="button" disabled={busy || !targetRoleId.trim()} onClick={addTargetRole}>Create target role</button>
-            </div>
-          </div>
-        </details>
       </section>
 
       {motionConflict && (

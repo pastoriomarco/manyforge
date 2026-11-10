@@ -7,8 +7,7 @@ import type { JsonValue } from '../types/api';
  * component). Boolean inputs (Mock / ROS Bool / ros2_control GPIO /
  * geometric contact) and outputs (ROS SetBool / Mock / ros2_control GPIO) are
  * authored here. Any other row is kept verbatim. A machine's own I/O banks are
- * not authored here: they are I/O members whose signals come from their model
- * (CONTRACTS §16).
+ * not authored here: they are I/O members whose signals come from their model.
  */
 
 export type IoSourceProfile = 'mock' | 'ros_bool' | 'ros2_control_gpio' | 'geometric_contact';
@@ -21,10 +20,10 @@ export const IO_SOURCE_PROFILE_LABELS: Record<IoSourceProfile, string> = {
 };
 
 /**
- * Input liveness (contracts 76/81): Mock is in-process; a generic ROS Bool
+ * Input liveness: Mock is in-process; a generic ROS Bool
  * topic declares periodic (freshness = a reading within the maximum sample
  * age) or change-only (liveness unproven between changes; refused in any
- * interrupt condition); ros2_control GPIO is periodic (contract 85).
+ * interrupt condition); ros2_control GPIO is periodic.
  */
 export type IoLivenessMode = 'in_process' | 'periodic' | 'change_only';
 export type RosBoolLiveness = 'periodic' | 'change_only';
@@ -38,7 +37,7 @@ export const IO_LIVENESS_LABELS: Record<IoLivenessMode, string> = {
 export const IO_LIVENESS_UNPROVEN_WARNING =
   'Liveness unproven: this change-only source cannot prove it is alive between changes, so a reading may be old without showing stale. It cannot be used in an interrupt condition.';
 
-/** Contract 85: driver-reported freshness caveat of typed ros2_control inputs. */
+/** Driver-reported freshness caveat of typed ros2_control inputs. */
 export const IO_DRIVER_FRESHNESS_NOTE =
   'Freshness depends on the driver reporting read errors.';
 
@@ -63,10 +62,10 @@ export const IO_OUTPUT_PROFILE_LABELS: Record<IoOutputProfile, string> = {
 export const IO_MAXIMUM_SERVICE_NAME_BYTES = 4096;
 
 /**
- * One editable boolean output (SX-2101): the shared row identity plus its
+ * One editable boolean output: the shared row identity plus its
  * provider. An output has no freshness, edge, completion or readback field:
  * a ROS SetBool write completes on the service's correlated
- * acceptance, a ros2_control GPIO write is submitted-only (contract 83), a
+ * acceptance, a ros2_control GPIO write is submitted-only, a
  * Mock write is immediate; readback is a separately declared input.
  */
 export interface IoSignalOutputDraft {
@@ -391,7 +390,7 @@ export function withIoDirection(
     : { kind: 'input', draft: { ...newIoSignalInput(), ...shared } };
 }
 
-/** The liveness an input's source kind declares (contract 81). */
+/** The liveness an input's source kind declares. */
 export function inputLivenessMode(draft: Pick<IoSignalInputDraft, 'profile' | 'liveness'>): IoLivenessMode {
   return draft.profile === 'mock' ? 'in_process'
     : draft.profile === 'ros_bool' ? draft.liveness : 'periodic';
@@ -728,13 +727,13 @@ export function declaredIoOutputs(document: Record<string, JsonValue> | null): I
   return declaredIoRows(document).flatMap((row) => (row.kind === 'output' ? [row.draft] : []));
 }
 
-/** Every declared input of a Deployment document, by component/target/resource role. */
+/** Every declared input of a Deployment document, by component/target/signal name. */
 export function declaredIoSources(
   document: Record<string, JsonValue> | null,
 ): Map<string, DeclaredIoSource> {
   const result = new Map<string, DeclaredIoSource>();
   for (const draft of declaredIoInputs(document)) {
-    result.set(ioSourceKey(draft.componentId, draft.targetId, draft.resourceRoleId), {
+    result.set(ioSourceKey(draft.componentId, draft.targetId, draft.signalName), {
       profile: draft.profile,
       sourceId: draft.sourceId,
       topic: draft.profile === 'mock' || draft.profile === 'geometric_contact' ? null : draft.topic,
@@ -761,15 +760,15 @@ export function declaredIoInputSourceTexts(document: Record<string, JsonValue> |
   ]));
 }
 
-export function ioSourceKey(componentId: string, targetId: string, resourceRoleId: string): string {
-  return JSON.stringify([componentId, targetId, resourceRoleId]);
+export function ioSourceKey(componentId: string, targetId: string, signalName: string): string {
+  return JSON.stringify([componentId, targetId, signalName]);
 }
 
 /* ---- I/O device components (component_profile_id io_device_v0) ---- */
 
 export const IO_DEVICE_PROFILE_ID = 'io_device_v0';
 export const IO_PROVIDER_RUNTIME_KIND = 'io_provider';
-/** Contract 60: per-device lifecycle command time limit, prefilled with the
+/** Per-device lifecycle command time limit, prefilled with the
  * default component lifecycle budget (10 s, as every component). */
 export const IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S = 10;
 /** The existing lifecycle transaction maximum (kMaxLifecycleTransactionTimeoutNs). */
@@ -832,7 +831,7 @@ export function outputAckTimeoutProblem(text: string): string | null {
 /**
  * The one `io_provider_devices` row of an I/O device. The output
  * acknowledgement timeout is carried only when given (only devices with ROS
- * SetBool outputs may carry it, contract 68).
+ * SetBool outputs may carry it).
  */
 export function ioProviderDeviceValue(
   componentId: string,

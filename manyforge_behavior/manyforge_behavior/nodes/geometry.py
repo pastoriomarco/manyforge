@@ -1,4 +1,4 @@
-"""Portable pose-distance math and I6/N geometry-node gates."""
+"""Portable pose-distance math and geometry-node gates."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from manyforge_behavior.geometry import (
 GEOMETRY_NODE_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_geometry_node_unavailable"
 )
-GEOMETRY_NODE_RESTORATION_GATES: Final = ("I6", "N")
 
 
 class GeometryNodeUnavailableError(RuntimeError):
@@ -162,7 +161,7 @@ class _UnavailableGeometryNode:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise GeometryNodeUnavailableError(
             f"{GEOMETRY_NODE_UNAVAILABLE_REASON_CODE}: addressed model/FK "
-            "geometry nodes return at I6/N"
+            "geometry nodes are not available"
         )
 
 

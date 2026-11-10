@@ -22,13 +22,6 @@ if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
 fi
 export TSAN_OPTIONS
 
-# `-Wno-error=array-bounds` works around a known gcc-13 false positive on
-# `std::vector<T>::push_back` where the inner element is itself a small
-# `std::vector<>` (here: `TrajectoryDTO` holding `TrajectoryWaypointDTO`
-# holding `vector<double>`). Under TSan's `RelWithDebInfo` flags the
-# optimizer's inlined memmove path triggers a spurious "forming offset N
-# is out of the bounds [0, N]" warning. The warning stays visible in CI
-# logs (no `-Wno-array-bounds`) but is not promoted to error.
 cmake \
   -S "${REPO_ROOT}/manyforge_core" \
   -B "${BUILD_DIR}" \
@@ -36,7 +29,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1 -DNDEBUG" \
   -DMANYFORGE_GTEST_TIMEOUT_SECONDS="${GTEST_TIMEOUT_SECONDS}" \
-  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=array-bounds" \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
 

@@ -35,7 +35,7 @@ def _program(document: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -104,7 +104,7 @@ def test_the_deployment_join_refuses_an_undeclared_rule() -> None:
 
 
 def test_a_set_rule_active_names_a_rule_the_deployment_must_declare() -> None:
-    """CONTRACTS §9: a `rules.set_active` naming a rule that isn't in the
+    """A `rules.set_active` naming a rule that isn't in the
     Deployment is refused before Execute by the same Program x Deployment join."""
 
     document = _document()

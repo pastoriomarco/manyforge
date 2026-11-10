@@ -27,7 +27,7 @@ import { browserStableIdentity } from './useHeadlessState';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
 
 /**
- * The text of a refused Preview/Apply/Load/New (CONTRACTS §11): the
+ * The text of a refused Preview/Apply/Load/New: the
  * catalogue's text for its code, e.g. `apply_refused_run_in_progress`.
  */
 export function cellApplyErrorText(reason: unknown, fallback: string): string {
@@ -47,6 +47,8 @@ export function useDeploymentWorkspace(
   authoring: AuthoringWorkspaceController,
 ) {
   const [workspace, setWorkspace] = useState<DeploymentWorkspaceResponse | null>(null);
+  const [deploymentDraftInputResetEpoch, setDeploymentDraftInputResetEpoch] = useState(0);
+  const [scenarioDraftInputResetEpoch, setScenarioDraftInputResetEpoch] = useState(0);
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -58,7 +60,7 @@ export function useDeploymentWorkspace(
   /** The typed cause of the shown preparation refusal, if the preparer named one. */
   const [errorCauseCode, setErrorCauseCode] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
-  /** The Preview the operator confirms before the server-side Apply (§11). */
+  /** The Preview the operator confirms before the server-side Apply. */
   const [applyPreview, setApplyPreview] = useState<ApplyPreview | null>(null);
   /** Whether the shown Preview is of the Draft's Apply or of a Revert to Saved. */
   const [applyPreviewKind, setApplyPreviewKind] = useState<'apply' | 'revert'>('apply');
@@ -223,6 +225,9 @@ export function useDeploymentWorkspace(
         refreshSequence.current += 1;
         setWorkspace(next);
         setFeedback(message);
+        if (action === 'discard' || command === 'open_draft') {
+          setDeploymentDraftInputResetEpoch((epoch) => epoch + 1);
+        }
       }
       return next;
     } catch (reason: unknown) {
@@ -250,7 +255,7 @@ export function useDeploymentWorkspace(
   }, [authoring, fence, refresh, snapshot, workspace, mutationUnavailableReason]);
 
   /**
-   * The one server-side Apply (CONTRACTS §11): the server disables, applies
+   * The one server-side Apply: the server disables, applies
    * and prepares the affected components; they end prepared. Refused while a
    * Program run is in progress; allowed during a cell latch.
    */
@@ -272,10 +277,15 @@ export function useDeploymentWorkspace(
     // clears the error it last showed.
     try {
       const result = await operation();
-      await refresh();
+      const refreshed = await refresh();
       if (mounted.current) {
         if (result.outcome === 'failed') setError(applyResultText(result));
         else setFeedback(applyResultText(result));
+        // Revert is Scenario-wide; require both owner success and its refreshed
+        // workspace post-image before clearing pending field text.
+        if (command === 'revert' && result.outcome === 'succeeded' && refreshed !== null) {
+          setScenarioDraftInputResetEpoch((epoch) => epoch + 1);
+        }
       }
       return result;
     } catch (reason: unknown) {
@@ -373,7 +383,7 @@ export function useDeploymentWorkspace(
       'edit',
     ),
     /**
-     * The per-component impact of applying the Draft (§11); effect-free.
+     * The per-component impact of applying the Draft; effect-free.
      * Null when another operation is in progress.
      */
     previewApply: (): Promise<ApplyPreview | null> => preview('apply', 'preview'),
@@ -422,7 +432,7 @@ export function useDeploymentWorkspace(
       'discard',
     ),
     /**
-     * Revert on the one Apply path (§11): Preview the Saved Scenario's impact,
+     * Revert on the one Apply path: Preview the Saved Scenario's impact,
      * then the operator confirms it (`confirmApply`), which applies it.
      */
     revert: () => (
@@ -438,7 +448,7 @@ export function useDeploymentWorkspace(
     applyDraft: () => (mutationUnavailableReason !== null ? Promise.resolve(null) : showPreview('apply')),
     /**
      * The Apply of a Preview confirmed earlier, sent by Reset and Apply once
-     * the run's Reset settled (AUD-4). Resolves to null when it was refused.
+     * the run's Reset settled. Resolves to null when it was refused.
      */
     applyConfirmedScope: (scope: ApplyPreview['scope']) => (
       sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply')
@@ -460,6 +470,8 @@ export function useDeploymentWorkspace(
 
   return {
     workspace,
+    deploymentDraftInputResetEpoch,
+    scenarioDraftInputResetEpoch,
     loading,
     busy,
     applying,

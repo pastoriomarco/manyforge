@@ -8,9 +8,9 @@ import type { MockSignal } from '../utils/mockSimulation';
 import { MockSimulationEditor } from './MockSimulationEditor';
 
 const signals: MockSignal[] = [
-  { targetRole: 'cell', resourceRole: 'door' }, { targetRole: 'cell', resourceRole: 'part' },
+  { component_id: 'cell', signal_name: 'door' }, { component_id: 'cell', signal_name: 'part' },
 ];
-const door = { target_role: 'cell', resource_role: 'door' };
+const door = { component_id: 'cell', signal_name: 'door' };
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -20,20 +20,20 @@ describe('MockSimulationEditor', () => {
       <MockSimulationEditor
         value={[
           { signal: door, start_value: false, change: { after_ms: 300, value: true } },
-          { signal: { target_role: 'cell', resource_role: 'lamp' }, start_value: true },
+          { signal: { component_id: 'cell', signal_name: 'lamp' }, start_value: true },
         ]}
         signals={signals}
-        profiles={new Map([['cell/part', 'ros_bool']])}
+        profiles={new Map([[JSON.stringify(['cell', 'part']), 'ros_bool']])}
         disabled={false}
         onCommit={() => undefined}
         onClear={() => undefined}
       />,
     );
-    expect(html).toContain('aria-label="Mock cell/door"');
-    expect(html).toContain('aria-label="Mock cell/part"');
+    expect(html).toContain('aria-label="Mock cell · door"');
+    expect(html).toContain('aria-label="Mock cell · part"');
     expect(html).toContain('value="300"');
     expect(html).toContain('Inactive: ROS Bool topic source, not Mock');
-    expect(html).toContain('mock_simulation_signal_unused: signal cell/lamp');
+    expect(html).toContain('mock_simulation_signal_unused: signal [&quot;cell&quot;,&quot;lamp&quot;]');
     expect(html).toContain('Remove Mock row 2');
   });
 
@@ -50,16 +50,16 @@ describe('MockSimulationEditor', () => {
     const control = (label: string) => find((props) => props['aria-label'] === label);
     try {
       await render(undefined);
-      await act(() => control('cell/part start value').onChange?.({ target: { value: 'true' } }));
+      await act(() => control('cell · part start value').onChange?.({ target: { value: 'true' } }));
       expect(onCommit).toHaveBeenLastCalledWith([
-        { signal: { target_role: 'cell', resource_role: 'part' }, start_value: true },
+        { signal: { component_id: 'cell', signal_name: 'part' }, start_value: true },
       ]);
       await render([{ signal: door, start_value: false }]);
-      await act(() => control('cell/door change').onChange?.({ target: { value: 'change' } }));
+      await act(() => control('cell · door change').onChange?.({ target: { value: 'change' } }));
       expect(onCommit).toHaveBeenLastCalledWith([
         { signal: door, start_value: false, change: { after_ms: 0, value: true } },
       ]);
-      await act(() => control('cell/door start value').onChange?.({ target: { value: '' } }));
+      await act(() => control('cell · door start value').onChange?.({ target: { value: '' } }));
       expect(onClear).toHaveBeenCalledOnce();
     } finally {
       await act(() => root.unmount());

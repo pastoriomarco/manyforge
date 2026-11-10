@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:345e9790ff50444eb6c26ff685093fccd17fb98c9e631b6a4fc7e70c9ea16405",
+  "capability_id": "simulator.control.play",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

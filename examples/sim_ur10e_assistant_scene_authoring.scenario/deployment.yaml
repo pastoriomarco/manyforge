@@ -1,6 +1,6 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
-  "assistant_profile_id": "assistant_scene_authoring",
+  "assistant_profile_id": null,
   "attachments": [
     {
       "child": {
@@ -29,6 +29,18 @@
     ]
   },
   "components": [
+    {
+      "component_id": "assistant",
+      "component_profile_id": "manyforge.assistant",
+      "configuration": {
+        "runtime_configuration": {
+          "assistant_profile_id": "assistant_scene_authoring",
+          "model_component_id": "assistant_model"
+        },
+        "runtime_kind": "assistant"
+      },
+      "target_settings": {}
+    },
     {
       "component_id": "assistant_model",
       "component_profile_id": "ai_model_v0",

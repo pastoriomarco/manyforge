@@ -1,4 +1,5 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include <manyforge_core/execution_recovery_support.hpp>
 
 namespace manyforge::core {
 
@@ -166,7 +167,7 @@ MotionRetryEligibilityDTO ResourceAddressedExecutionKernel::operation_retry_elig
   if (cell_latched_locked()) return refuse(MotionRetryIneligibilityReason::kLatchPresent);
   if ((!recovery_owner && operation.recovery_effect_in_flight) || operation.stop_effect_in_flight ||
       operation.ordinary_commit_in_flight || operation.ordinary_acceptance_pending ||
-      operation.pending_control || operation.runtime_scale_effect_in_flight ||
+      operation.pending_control ||
       operation.coordinated_cancellation_in_flight || operation.dispatch_effect_in_flight() ||
       operation.reconciliation_in_flight() ||
       std::any_of(operation.participants.begin(), operation.participants.end(),
@@ -241,7 +242,7 @@ bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
       (!closure_owner &&
        (operation.recovery_effect_in_flight || operation.ordinary_commit_in_flight)) ||
       operation.stop_effect_in_flight || operation.ordinary_acceptance_pending ||
-      operation.pending_control || operation.runtime_scale_effect_in_flight ||
+      operation.pending_control ||
       operation.coordinated_cancellation_in_flight || operation.dispatch_effect_in_flight() ||
       operation.reconciliation_in_flight() || operation.takeover_advance_in_flight ||
       !operation.pending_motion_takeover.empty() || !operation.next_motion_takeover.empty() ||
@@ -255,13 +256,28 @@ bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
                                         return !row.prepared_dispatch_released &&
                                                row.slot_state == ResourceSlotState::kTerminal;
                                       }));
+  const auto rebuilt_unknown = [&](std::size_t index) {
+    const auto& row = operation.participants[index];
+    const auto& assessment = assessments[index];
+    const auto& state = operation.state.participants[index];
+    const auto* fact = selected_cause_terminal_fact(state);
+    return row.engine && row.subordinate_id != 0U &&
+           state.state == OperationStateKind::kInterventionRequired && fact &&
+           fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
+           assessment.execution_id == row.subordinate_id && assessment.eligible_close &&
+           (assessment.reason_code == kOwnerRebuildObservedAtRest ||
+            assessment.reason_code == kOwnerRebuildNoFeedback);
+  };
+  bool has_rebuilt_unknown = false;
+  for (std::size_t index = 0; index < assessments.size(); ++index)
+    has_rebuilt_unknown = has_rebuilt_unknown || rebuilt_unknown(index);
   const bool terminal_state =
       operation.state.state == OperationStateKind::kCompleted ||
       operation.state.state == OperationStateKind::kFailed ||
       operation.state.state == OperationStateKind::kStopped ||
       operation.state.state == OperationStateKind::kCancelledPreDispatch ||
       (operation.state.state == OperationStateKind::kInterventionRequired &&
-       (no_effect ||
+       (no_effect || (!operation.state.active_stop_id && has_rebuilt_unknown) ||
         (operation.state.active_stop_id &&
          std::all_of(operation.state.participants.begin(), operation.state.participants.end(),
                      [](const auto& row) {
@@ -281,7 +297,8 @@ bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
         row.deferred_stop_settlement || assessment.stop_owner_active ||
         assessment.stronger_authority_active ||
         (associated_fact &&
-         associated_fact->effect == ParticipantEffectKnowledge::kEffectUncertain))
+         associated_fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
+         !rebuilt_unknown(index)))
       return false;
     if (row.ownership_transferred) {
       if (!associated_fact) return false;
@@ -475,7 +492,7 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     // The Stop's requester decides an ordinary Stop's class: only a Stop the
     // Program's own configuration requested, settled at its first stage,
     // is its ordinary failure; every other Stopped operation stays an
-    // operator hold (spec 260 §2.8.4).
+    // operator hold.
     if (assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
         operation->ordinary_program_stop())
       assessment.recovery_class = RecoveryClass::kOrdinaryProgramStop;
@@ -631,7 +648,7 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
         !operation->pending_motion_takeover.empty() ||
         !operation->next_motion_takeover.empty() || operation->ordinary_commit_in_flight ||
         operation->ordinary_acceptance_pending || operation->pending_control.has_value() ||
-        operation->runtime_scale_effect_in_flight || operation->recovery_effect_in_flight ||
+        operation->recovery_effect_in_flight ||
         operation->coordinated_cancellation_in_flight || operation->dispatch_effect_in_flight() ||
         operation->reconciliation_in_flight() ||
         std::any_of(
@@ -967,6 +984,54 @@ Result<void> ResourceAddressedExecutionKernel::retire_preempted_motion_operation
   return Result<void>::Ok();
 }
 
+Result<void> ResourceAddressedExecutionKernel::retire_rebuilt_motion_operations_for_program_reset(
+    const ProgramRunId& run_id) {
+  std::vector<OperationId> candidates;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    for (const auto& [id, operation] : active_operations_) {
+      if (!operation->manual &&
+          operation->state.program_run_id == run_id &&
+          operation->state.state == OperationStateKind::kInterventionRequired &&
+          !operation->state.active_stop_id)
+        candidates.push_back(id);
+    }
+  }
+  for (const auto& id : candidates) {
+    const auto pending = retire_rebuilt_unknown_takeover_for_program_reset(id);
+    if (!pending.ok()) return Result<void>::Err(pending.error());
+    const auto projection = get_operation_recovery_assessment(id);
+    if (!projection.ok() || !projection.value().assessment.eligible_close) continue;
+    bool rebuilt = false;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto* operation = find_active_operation_locked(id);
+      if (!operation || operation->state.operation_revision != projection.value().operation_revision)
+        continue;
+      rebuilt = std::any_of(operation->recovery_assessment_inputs.begin(),
+                            operation->recovery_assessment_inputs.end(), [](const auto& row) {
+        return (row.reason_code == kOwnerRebuildObservedAtRest ||
+                row.reason_code == kOwnerRebuildNoFeedback) && row.eligible_close;
+      });
+    }
+    if (!rebuilt) continue;
+    const auto& assessment = projection.value().assessment;
+    KernelRecoveryActionRequestDTO request;
+    request.request_id = content_identity::sha256_digest(
+        config_.request_owner_epoch.value() + "\nprogram-reset-rebuilt-motion-close\n" + id.value() +
+        "\n" + std::to_string(projection.value().operation_revision.value()) + "\n" +
+        std::to_string(assessment.assessment_revision));
+    request.action = RecoveryAction::kCloseOperation;
+    request.principal_id = "kernel.program_reset";
+    request.reason = "retire_owner_rebuilt_unknown_motion";
+    bind_recovery_request(request, assessment);
+    const auto closed = close_operation(id, projection.value().operation_revision, request);
+    if (!closed.ok()) return Result<void>::Err(closed.error());
+    if (!closed.value().accepted) return Result<void>::Ok();
+  }
+  return Result<void>::Ok();
+}
+
 Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_operation(
     const OperationId& operation_id, const OperationRevision expected_operation_revision,
     const KernelRecoveryActionRequestDTO& request) {
@@ -1161,7 +1226,7 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
       request.expected_execution_id == assessment.execution_id &&
       request.expected_stop_certificate_id == assessment.stop_certificate_id &&
       request.expected_stop_owner_generation == assessment.stop_owner_generation;
-  // Q8a admits no multi-motion operation; supported coordinated command
+  // No multi-motion operation is admitted; supported coordinated command
   // mixtures are outside plain-motion automatic retry. Manual recovery keeps
   // the existing action intersection and participant dispatch unchanged.
   const bool action_allowed =
@@ -1207,7 +1272,7 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
         operation->participants.size() != operation->recovery_assessment_inputs.size() ||
         operation->stop_effect_in_flight || operation->ordinary_commit_in_flight ||
         operation->ordinary_acceptance_pending || operation->pending_control.has_value() ||
-        operation->runtime_scale_effect_in_flight || operation->recovery_effect_in_flight ||
+        operation->recovery_effect_in_flight ||
         operation->coordinated_cancellation_in_flight || operation->dispatch_effect_in_flight() ||
         operation->reconciliation_in_flight() ||
         std::any_of(operation->participants.begin(), operation->participants.end(),

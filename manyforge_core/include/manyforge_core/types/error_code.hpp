@@ -8,7 +8,7 @@
 
 namespace manyforge::core {
 
-/// Error DTO (spec §5.1)
+/// Error DTO
 struct ErrorDTO {
     std::string code;
     std::string message;
@@ -17,7 +17,7 @@ struct ErrorDTO {
     friend bool operator==(const ErrorDTO&, const ErrorDTO&) = default;
 };
 
-/// Error code enum (spec §5.2)
+/// Error code enum
 enum class ErrorCode {
     kSuccess,
     kInvalidRequest,
@@ -51,7 +51,7 @@ enum class ErrorCode {
     kCollisionDetected,
     kUnknownJointName,
     kSceneChangedDuringValidation,
-    // Motion-scoped interrupt outcomes (spec/210 §5.2).
+    // Motion-scoped interrupt outcomes.
     kMotionInterruptArmFailed,
     kMotionInterruptSourceActiveAtArm,
     kMotionInterruptBackendStopFailed,
@@ -104,7 +104,7 @@ inline const char* to_string(ErrorCode code) {
     }
 }
 
-/// Result type for fallible operations (spec §5)
+/// Result type for fallible operations
 template <typename T>
 struct Result {
 private:
@@ -248,7 +248,7 @@ public:
     }
 };
 
-/// Error code string constants (spec §5.2)
+/// Error code string constants
 
 // Request / capability
 inline const char* kErrorInvalidRequest = "invalid_request";
@@ -296,7 +296,7 @@ inline const char* kErrorRuntimeCollisionMonitorPrepareFailed =
 inline const char* kErrorInternalError = "internal_error";
 inline const char* kErrorInvariantViolation = "invariant_violation";
 
-// Motion-scoped interrupt outcomes (spec/210 §5.2).
+// Motion-scoped interrupt outcomes.
 // `motion_interrupt_arm_failed` — atomic arm-before-dispatch rejected
 // at least one `MotionInterruptScopeDTO`; the execution never reached
 // `Executing`. `motion_interrupt_source_active_at_arm` is the specific

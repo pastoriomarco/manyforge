@@ -25,7 +25,7 @@ struct ProgramExecutionSelectionRequestDTO final {
 
 /// Internal no-effect operator-alarm attention check for one captured Program
 /// node: the held node a motion-producing recovery would move again. Only
-/// that node's effectful target resources are tested (spec 450 §5.2), so an
+/// that node's effectful target resources are tested, so an
 /// alarm on disjoint resources does not block its recovery.
 struct ProgramNodeMotionAttentionCheckDTO final {
   PublicRequestContextDTO request_context;
@@ -94,7 +94,7 @@ struct ProgramExecutionScopeStateDTO final {
   std::vector<ProgramNodeHoldDTO> held_nodes;
   std::vector<ProgramNodeStopEffectDTO> pending_effects;
   std::optional<ProgramSelectionReleaseBlockReasonDTO> selection_release_block_reason{};
-  /// A global rule's `hold` trip held the run (stopped_by: rule, AUD-6).
+  /// A global rule's `hold` trip held the run (stopped_by: rule).
   std::optional<std::string> stopped_by_rule_id{};
 };
 

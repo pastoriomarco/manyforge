@@ -436,7 +436,7 @@ def capture_deployment_model_sources(
         configuration = raw_component.get("configuration")
         model_free = isinstance(configuration, Mapping) and configuration.get(
             "runtime_kind"
-        ) in ("io_provider", "pose_source", "ai_model")
+        ) in ("io_provider", "pose_source", "ai_model", "assistant")
         # A machine's owner (no runtime kind) or member without a model source.
         machine_row = "owner" in raw_component or (
             isinstance(configuration, Mapping) and "runtime_kind" not in configuration
@@ -444,8 +444,8 @@ def capture_deployment_model_sources(
         if source is None and "model_source" not in raw_component and (
             model_free or machine_row
         ):
-            # A model-free I/O device, pose source or AI model, a machine's
-            # owner or its I/O member has no model source closure.
+            # A model-free I/O device, pose source, AI model or assistant, a
+            # machine's owner or its I/O member has no model source closure.
             if (
                 not isinstance(component_id, str)
                 or not component_id

@@ -6,7 +6,7 @@ viewer, and lifecycle contract owners. The explicit generators are:
 
   - ``docs/reference/REST_API.md`` from
     ``create_app(ComposerState()).openapi()``.
-  - ``docs/reference/HEADLESS_REST_API.md`` from the independent H0/N3 FastAPI
+  - ``docs/reference/HEADLESS_REST_API.md`` from the independent headless FastAPI
     route owner.
   - ``docs/reference/MCP_RUNTIME_CONTRACT.md`` from the optional stateless
     Composer adapter and the same FastAPI DTO schemas.
@@ -200,7 +200,7 @@ def gen_rest_api() -> str:
 
 
 def gen_headless_rest_api() -> str:
-    """Render the independent H0 REST surface from its FastAPI owner."""
+    """Render the independent headless REST surface from its FastAPI owner."""
     from manyforge_headless_api.app import create_app
 
     # Route construction is service-neutral. The schema-only sentinel is never
@@ -226,7 +226,7 @@ def gen_headless_rest_api() -> str:
         "interpreted as idle; independently owned native operation and Stop "
         "routes remain available when their owner is configured. No condition "
         "mutation endpoint exists. `/api/health` reports only "
-        "`headless_projection_ready`; robot readiness has no H0 owner and is "
+        "`headless_projection_ready`; robot readiness has no headless owner and is "
         "explicitly unavailable. The alarm page defaults to 32 records and is "
         "bounded at 128, history defaults to and is bounded at 32 records, "
         "ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, "
@@ -315,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     headless_rest = subparsers.add_parser(
         "headless-rest",
-        help="Regenerate only the independent I5/H0 REST reference.",
+        help="Regenerate only the independent headless REST reference.",
     )
     headless_rest.add_argument(
         "--check",

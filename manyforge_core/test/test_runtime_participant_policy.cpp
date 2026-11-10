@@ -17,8 +17,6 @@ using namespace manyforge::core;
       ProgramBindingId("program.binding"),
       RetainedBundleId("bundle"),
       GraphRevision("graph"),
-      ComponentRoleId("robot"),
-      TargetRoleId("arm"),
       ControllableComponentId("robot.1"),
       ComponentTypeId("robot.type"),
       ComponentTypeRevision("robot.type.revision"),
@@ -30,7 +28,7 @@ using namespace manyforge::core;
                                   ModelRevision("model.revision")}},
       {RuntimeModelGroupBindingDTO{
           ModelGroupRoleId("arm"), ModelInstanceId("robot.model"), "robot_arm", {"joint_1"}}},
-      {ProgramFrameRoleBindingDTO{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+      {ProgramFrameBindingDTO{{ControllableComponentId("robot.1"), FrameRoleId("tcp")}, ModelInstanceId("robot.model"),
                                   ModelRevision("model.revision"), "tcp"}},
       {RuntimeResourceBindingDTO{ResourceRoleId("joint_1"), ResourceId("robot.joint.1"), "joint_1",
                                  "joint_1", CoordinateKind::kAngular}},

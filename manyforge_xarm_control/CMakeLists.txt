@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_xarm_control VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_xarm_control VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,7 +41,7 @@ set(
   CACHE PATH
   "Path to the ManyForge RoboPlan source tree (the adapter interfaces)")
 
-# The xArm vendor adapter (CONTRACTS §6, §7, §12, §16): the machine owner,
+# The xArm vendor adapter: the machine owner,
 # arm and I/O member adapters, the driver services, the status and I/O
 # subscriptions and the launch contribution.
 add_library(${PROJECT_NAME}
@@ -61,9 +61,9 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>
   "$<BUILD_INTERFACE:${MANYFORGE_ROBOPLAN_SOURCE_DIR}/include>"
 )
-ament_target_dependencies(${PROJECT_NAME}
-  rclcpp
-  xarm_msgs
+target_link_libraries(${PROJECT_NAME}
+  rclcpp::rclcpp
+  ${xarm_msgs_TARGETS}
 )
 target_link_libraries(${PROJECT_NAME} yaml-cpp)
 set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
@@ -75,7 +75,7 @@ install(
   DIRECTORY include/
   DESTINATION include
 )
-# The adapter folder (CONTRACTS §12): driver.yaml, manyforge_settings.yaml,
+# The adapter folder: driver.yaml, manyforge_settings.yaml,
 # README.md.
 install(
   DIRECTORY vendor
@@ -89,7 +89,7 @@ install(
   RUNTIME DESTINATION bin
 )
 
-# CONTRACTS §6: the xArm adapter family, which the execution host loads from
+# The xArm adapter family, which the execution host loads from
 # the ament resource index. It links the host's adapter runtime, so it is
 # built inside the RoboPlan execution host graph only.
 if(TARGET manyforge_roboplan_ros2_control_runtime)
@@ -107,7 +107,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_ros REQUIRED)
   find_package(ament_lint_auto REQUIRED)
-  # Each test process runs in its own ROS domain (Fast DDS #6599, N16).
+  # Each test process runs in its own ROS domain (Fast DDS #6599).
   set(MANYFORGE_ROS_TEST_ENV ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
 
   foreach(test_name

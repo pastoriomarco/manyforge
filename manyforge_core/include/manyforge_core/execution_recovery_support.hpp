@@ -20,8 +20,8 @@ void apply_observed_state_to_stop_certificate(const ObservedRobotStatePublicatio
                                               double at_rest_velocity_threshold_rad_s,
                                               KernelStopCertificateDTO& certificate);
 
-/// Deterministic store of definitive stop certificates
-/// (spec/230 §3.7.1). NOT thread-safe: the owner guards it with a leaf
+/// Deterministic store of definitive stop certificates. NOT thread-safe:
+/// the owner guards it with a leaf
 /// mutex. Semantics:
 ///  - per stop-owner kind, the AUTHORITATIVE certificate is selected by
 ///    strictly monotonic (stop_owner_generation, certificate_revision):
@@ -117,12 +117,18 @@ struct RecoveryAuthorityCapture {
   ParticipantEffectKnowledge terminal_effect{ParticipantEffectKnowledge::kEffectUncertain};
   /// The terminal publisher and all subordinate worker borrows have finished.
   bool terminal_cleanup_complete{false};
-  /// Observation evidence; absent until RT-8C wires the dedicated
+  /// Observation evidence; absent until a provider wires the dedicated
   /// publication (never lifecycle ExecutionSnapshot).
   std::optional<ObservedStateEvidenceDTO> observed_state;
   bool observed_state_qualified = false;
+  bool owner_rebuild_pending = false;
+  bool owner_rebuild_rest_qualified = false;
   std::int64_t captured_at_ns = 0;
 };
+
+inline constexpr std::string_view kOwnerRebuildObservationPending = "owner_rebuild_observation_pending";
+inline constexpr std::string_view kOwnerRebuildObservedAtRest = "owner_rebuild_observed_at_rest";
+inline constexpr std::string_view kOwnerRebuildNoFeedback = "owner_rebuild_no_feedback";
 
 /// Deployment/observation policy inputs for assessment construction.
 struct RecoveryReadinessPolicy {
@@ -135,7 +141,7 @@ struct RecoveryReadinessPolicy {
   std::uint32_t ready_min_samples = 1;
 };
 
-/// Asymmetric observed-readiness qualifier (spec/230 §3.7.1): any
+/// Asymmetric observed-readiness qualifier: any
 /// unsafe/stale/incomplete sample revokes qualification immediately;
 /// restoration requires a continuous-safe dwell plus consecutive qualifying
 /// samples. NOT thread-safe; the owner serializes access.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scenario Load soak (R3: New always works, Load = New + Apply).
+"""Scenario Load soak (New always works, Load = New + Apply).
 
 Drives a running development workbench through the Composer REST API the
 GUI uses and repeats each Load case per example Scenario:
@@ -580,6 +580,144 @@ def clean_components() -> list[dict[str, Any]]:
             for x in components() if x.get("fault")]
 
 
+
+def host_open_fds() -> int | None:
+    """The execution host's open file descriptors (must stay flat)."""
+    r = in_container("bash", "-c", 'p=$(pgrep -f "^manyforge_ros2_control_execution_host" | head -1); '
+                     '[ -n "$p" ] && ls /proc/$p/fd | wc -l')
+    return int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
+
+
+def activation_store_sizes(root: Path) -> dict[str, list[int]]:
+    """{store: [files, KiB]} of the activation-root content stores (content-
+    store GC: they must stay bounded). Read from the host side of the
+    workbench's state mount."""
+    out: dict[str, list[int]] = {}
+    for store in sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []:
+        files = [f for f in store.rglob("*") if f.is_file()]
+        out[store.name] = [len(files), sum(f.stat().st_size for f in files) // 1024]
+    return out
+
+
+SWITCH_UNANSWERED_MESSAGE = "did not answer the controller switch"
+
+
+def host_identity() -> dict[str, Any]:
+    """The execution host's pid and age (is a failure the first Load after a start?)."""
+    r = in_container("bash", "-c", 'p=$(pgrep -f "^manyforge_ros2_control_execution_host" | head -1); '
+                     '[ -n "$p" ] && echo $p $(ps -o etimes= -p $p)')
+    parts = r.stdout.split()
+    return {"pid": int(parts[0]), "age_s": int(parts[1])} if len(parts) == 2 else {}
+
+
+def switch_unanswered_capture(out: Path, attempt: str, container: str, component_id: str, since: float) -> dict[str, Any]:
+    """Switch request unanswered: the switch
+    service's endpoints, the component's launch/CM/call times, and whether a
+    retried Enable succeeds without a new Load."""
+    d = out / f"{attempt}-switch-unanswered-{component_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    service = f"/manyforge/{component_id}/controller_manager/switch_controller"
+    r = subprocess.run(["docker", "exec", container, "bash", "-lc",
+                        f"source /opt/ros/lyrical/setup.bash; timeout 30 ros2 service info --verbose {service} --no-daemon"],
+                       capture_output=True, text=True, timeout=60)
+    (d / "service-info-verbose.txt").write_text(r.stdout + r.stderr)
+    stamp = datetime.fromtimestamp(since - 30, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    logs = subprocess.run(["docker", "logs", "--timestamps", "--since", stamp, container],
+                          capture_output=True, timeout=60)
+    marks = (f'component="{component_id}"', f"manyforge.{component_id}.", f"component={component_id}")
+    keep = [l for l in (logs.stdout + logs.stderr).decode(errors="replace").splitlines()
+            if any(m in l for m in marks) and ("launch_start" in l or "decision=" in l or "Activating" in l
+                                              or "manyforge_component_call" in l or "Successfully switched" in l)]
+    (d / "timeline.txt").write_text("\n".join(keep))
+    t0 = time.time()
+    st, js = post(f"/api/components/{component_id}/actions", {"action": "enable"})
+    retry: dict[str, Any] = {"http": st}
+    while st == 202 and time.time() - t0 < 40:
+        time.sleep(0.5)
+        c = {x["component_id"]: x for x in components()}.get(component_id) or {}
+        last = c.get("last_action") or {}
+        if c.get("lifecycle") == "enabled" or (last.get("action") == "enable" and last.get("outcome") in ("failed", "unknown")
+                                                 and last.get("started_at_ns", 0) / 1e9 >= t0 - 1):
+            retry.update(lifecycle=c.get("lifecycle"), outcome=last.get("outcome"), after_s=round(time.time() - t0, 1))
+            break
+    (d / "retry.json").write_text(json.dumps(retry))
+    print(f"{time.strftime('%H:%M:%S')} switch-unanswered captured {d} retry={retry}", flush=True)
+    return {"dir": str(d), "retry_enable": retry}
+
+
+PROJECTION_STALE = ("manager_projection_unavailable",)
+
+
+def projection_stale_capture(out: Path, attempt: str, container: str, activation_root: str) -> dict[str, Any]:
+    """S1 (Load 503 manager_projection_unavailable after the post-New Scene
+    clear outlasted its bound): without pausing anything, the Manager,
+    Headless and Runner threads' wchan/state, the source publications' ages,
+    and the cycle status's Scene clear, now and 30 s later."""
+    d = out / f"{attempt}-s1"
+    d.mkdir(parents=True, exist_ok=True)
+    script = ('for pat in manyforge_manager_daemon "manyforge_headless_api serve" "manyforge_program_runner" '
+              '"^manyforge_ros2_control_execution_host"; do p=$(pgrep -f "$pat" | head -1); [ -z "$p" ] && continue; '
+              'echo "== $pat pid=$p"; for t in /proc/$p/task/*; do echo "$(basename $t) $(cat $t/wchan 2>/dev/null) '
+              '$(cut -d" " -f3 $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"; done; done')
+    pubs = Path(activation_root).parent / "publications" if activation_root else None
+
+    def snap(tag: str) -> None:
+        r = subprocess.run(["docker", "exec", "-u", "0", container, "bash", "-c", script],
+                           capture_output=True, text=True, timeout=60)
+        (d / f"threads-{tag}.txt").write_text(r.stdout + r.stderr)
+        ages = {}
+        if pubs is not None and pubs.is_dir():
+            now = time.time()
+            ages = {f.name: round(now - f.stat().st_mtime, 2) for f in pubs.iterdir() if f.is_file()}
+        st, cy = get("/api/cycle/status")
+        (d / f"state-{tag}.json").write_text(json.dumps({"publication_age_s": ages, "cycle": cy}, default=str))
+
+    snap("now")
+    time.sleep(30)
+    snap("plus30s")
+    print(f"{time.strftime('%H:%M:%S')} S1 captured {d}", flush=True)
+    return {"dir": str(d)}
+
+
+HOST_UNAVAILABLE = ("execution_owner_unavailable",)
+
+
+def host_wedge_capture(out: Path, attempt: str, container: str) -> dict[str, Any]:
+    """Wedged-host evidence without pausing the execution host: per-thread stat and
+    wchan, the private sockets' state (host `ss`, same network namespace),
+    the last 2000 log lines; then whether the wedge clears by itself within
+    3 min (Components polled every 10 s, the host left untouched). No gdb:
+    a full backtrace of the host's ~575 threads outlasts its 1 s Manager
+    heartbeat and kills it."""
+    d = out / f"{attempt}-hostwedge"
+    d.mkdir(parents=True, exist_ok=True)
+    pid = in_container("pgrep", "-f", "^manyforge_ros2_control_execution_host").stdout.split()
+    info: dict[str, Any] = {"dir": str(d), "host_pid": pid[0] if pid else None}
+    if pid:
+        script = ("p=%s; for t in /proc/$p/task/*; do echo \"$(basename $t) $(cat $t/wchan 2>/dev/null) "
+                  "$(cut -d' ' -f3 $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)\"; done" % pid[0])
+        r = subprocess.run(["docker", "exec", "-u", "0", container, "bash", "-c", script],
+                           capture_output=True, text=True, timeout=60)
+        (d / "threads-wchan-state.txt").write_text(r.stdout + r.stderr)
+    ss = subprocess.run(["ss", "-xap"], capture_output=True, text=True, timeout=30).stdout
+    (d / "ss-x.txt").write_text("\n".join(l for l in ss.splitlines() if "manyforge-state" in l))
+    logs = subprocess.run(["docker", "logs", "--timestamps", "--tail", "2000", container],
+                          capture_output=True, timeout=60)
+    (d / "last-2000.log").write_bytes(logs.stdout + logs.stderr)
+    t0 = time.time()
+    info["cleared_after_s"] = None
+    while time.time() - t0 < 180:
+        st, _ = get("/api/components")
+        if st == 200:
+            info["cleared_after_s"] = round(time.time() - t0, 1)
+            break
+        time.sleep(10)
+    ss2 = subprocess.run(["ss", "-xap"], capture_output=True, text=True, timeout=30).stdout
+    (d / "ss-x-after.txt").write_text("\n".join(l for l in ss2.splitlines() if "manyforge-state" in l))
+    print(f"{time.strftime('%H:%M:%S')} HOSTWEDGE captured {d} cleared_after_s={info['cleared_after_s']}", flush=True)
+    return info
+
+
 # ---------------------------------------------------------------- freeze evidence
 
 class FreezeWatch:
@@ -630,6 +768,12 @@ class FreezeWatch:
                     self.capture(cid, "measured_joints_stale")
 
     def _follow(self) -> None:
+        # Reconnects when the container is replaced (a stack restart).
+        while not self.stopping.is_set():
+            self._follow_once()
+            time.sleep(5)
+
+    def _follow_once(self) -> None:
         p = subprocess.Popen(["docker", "logs", "-f", "--since", "1s", self.container],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert p.stdout is not None
@@ -818,6 +962,16 @@ class Soak:
         row["timings"] = {k: v for k, v in t.items() if not k.startswith("_")}
         row["end"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         row["crashes"] = self.crashes(start)
+        if self.args.container:
+            row["host_open_fds"] = host_open_fds()
+            row["host"] = host_identity()
+            unanswered = [f["component_id"] for f in ((row.get("info") or {}).get("failed") or [])
+                          if SWITCH_UNANSWERED_MESSAGE in str((f.get("last_action") or {}).get("error"))]
+            if row["outcome"] == "fail" and unanswered:
+                row["switch_unanswered"] = switch_unanswered_capture(
+                    self.out / "logs", f"{n:05d}-{case}-{s}", self.args.container, unanswered[0], start)
+        if self.args.activation_root:
+            row["activation_stores"] = activation_store_sizes(Path(self.args.activation_root))
         if WATCH:
             row["freeze_watch"] = WATCH.take()
             WATCH.induced.clear()
@@ -827,6 +981,12 @@ class Soak:
             signal_pids(alive, "CONT")
         if row["crashes"] and row["outcome"] != "fail":
             row["log"] = self.save_log(row, start)
+        code = ((row.get("info") or {}).get("error") or {}) if row["outcome"] == "fail" else {}
+        if isinstance(code, dict) and code.get("code") in PROJECTION_STALE and self.args.container:
+            row["s1"] = projection_stale_capture(self.out / "logs", f"{n:05d}-{case}-{s}",
+                                                 self.args.container, self.args.activation_root)
+        if isinstance(code, dict) and code.get("code") in HOST_UNAVAILABLE and self.args.container:
+            row["host_wedge"] = host_wedge_capture(self.out / "logs", f"{n:05d}-{case}-{s}", self.args.container)
         if row["outcome"] == "fail":
             row["setup_failure"] = row["step"] in ("setup_load", "load_previous", "execute", "motion_start",
                                                   "run_timeout", "motion_stop", "motion_stop_held",
@@ -839,7 +999,7 @@ class Soak:
         return row
 
     def recover(self, row: dict[str, Any]) -> None:
-        """Back to a known cell: New (R3). An active run is halted first."""
+        """Back to a known cell: New. An active run is halted first."""
         self.ready = None
         st, cy = get("/api/cycle/status")
         rn = cy.get("program_run_id") if isinstance(cy, dict) else None
@@ -851,9 +1011,23 @@ class Soak:
         except StepFailed as f:
             row["recovered"] = False
             row["recover_failure"] = {"step": f.step, "info": f.info}
+            gone = ((f.info or {}).get("error") or {}).get("code") in HOST_UNAVAILABLE
+            if gone and self.args.restart_cmd:
+                # The execution host is gone (e.g. F8): restart the stack,
+                # recorded on the row; the failure stays counted.
+                r = subprocess.run(self.args.restart_cmd, shell=True, capture_output=True, text=True,
+                                   timeout=3600)
+                row["stack_restarted"] = {"rc": r.returncode, "tail": (r.stdout + r.stderr)[-500:]}
+                print(f"{time.strftime('%H:%M:%S')} STACK RESTARTED rc={r.returncode}", flush=True)
+                try:
+                    do_new("recover_new")
+                    row["recovered"] = True
+                except StepFailed as f2:
+                    row["recover_failure_after_restart"] = {"step": f2.step, "info": f2.info}
 
     CRASH_MARKS = ("process has died", "terminate called", "Segmentation fault", "core dumped",
-                   "Aborted (", "std::terminate")
+                   "Aborted (", "std::terminate", "malloc", "free(): ", "double free",
+                   "corrupted", "AddressSanitizer", "execution host child exited")
 
     def crashes(self, start: float) -> list[str]:
         """Crash lines of any process in the attempt window (counted, not
@@ -867,7 +1041,12 @@ class Soak:
         except Exception as e:
             return [f"docker logs failed: {e!r}"]
         lines = (p.stdout + p.stderr).decode(errors="replace").splitlines()
-        return [line[:400] for line in lines if any(m in line for m in self.CRASH_MARKS)][:10]
+        # exit code -9 / -2: the group SIGKILL of a hung node (cases e/f, or a
+        # freeze, which the FreezeWatch backtraces) or the SIGINT of a teardown
+        # (a spawner still starting, case d): a kill, not a crash.
+        return [line[:400] for line in lines
+                if any(m in line for m in self.CRASH_MARKS)
+                and "exit code -9" not in line and "exit code -2" not in line][:10]
 
     def save_log(self, row: dict[str, Any], start: float) -> str | None:
         if self.log_budget <= 0 or not self.args.container:
@@ -894,7 +1073,7 @@ class Soak:
                 for case in cases:
                     row = self.attempt(case, s, rep)
                     print(f"{time.strftime('%H:%M:%S')} rep={rep} {case:10s} {s:42s} {row['outcome']:4s} "
-                          f"{row['duration_s']:7.1f}s load={row['timings'].get('load_s')}"
+                          f"{row['duration_s']:7.1f}s load={row['timings'].get('load_s')} fds={row.get('host_open_fds')}"
                           + (f" CRASH-LINES={len(row['crashes'])}" if row.get("crashes") else "")
                           + ("" if row["outcome"] == "pass" else f" step={row['step']} {json.dumps(row.get('info'), default=str)[:300]}"),
                           flush=True)
@@ -968,6 +1147,9 @@ def main() -> int:
     ap.add_argument("--log-cap-mb", type=int, default=300, help="total cap of saved failure logs")
     ap.add_argument("--log-file-cap-mb", type=int, default=8)
     ap.add_argument("--summary-only", action="store_true")
+    ap.add_argument("--activation-root", default="",
+                    help="host path of the session's activation root (current/artifacts): store sizes per attempt")
+    ap.add_argument("--restart-cmd", default="", help="shell command restarting the stack when its host is gone")
     ap.add_argument("--no-freeze-watch", action="store_true", help="no gdb backtraces of frozen nodes")
     args = ap.parse_args()
     BASE = args.base_url.rstrip("/")

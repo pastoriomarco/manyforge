@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Any, NoReturn
+import re
 import unicodedata
 
 from fastapi import APIRouter, HTTPException, Path
@@ -14,16 +15,18 @@ from .assistant_mode_client import (
     read_active_assistant_context,
 )
 from .assistant_catalog_narrowing import (
+    ORIENTATION_FIELDS,
     AssistantCatalogNarrowingError,
+    narrow_schema,
     normalize_field_policy,
     normalize_requested_tools,
-    resolve_assistant_catalog,
 )
 from .assistant_schema_validation import (
     CallbackSchemaValidationError,
     validate_callback_arguments,
 )
 from .draft_session import DraftSessionError, SUPPORTED_DRAFT_MUTATIONS
+from .routes_draft import assistant_reference_validation, validate_captured_program_source
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
 )
@@ -43,7 +46,63 @@ from .authoring_workspace_fence import (
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
-_DRAFT_READ_TOOLS = {"program_read", "program_validate"}
+_DRAFT_READ_TOOLS = {"program_read", "program_validate", "scene_inspect"}
+
+
+def _validate_typed_arguments(
+    arguments: dict[str, Any],
+    tool: dict[str, Any],
+    types: dict[str, Any],
+    field_policy: dict[str, Any],
+) -> None:
+    """Validate the call, then each named-type argument against its full type
+    schema (its own root, so its local references resolve), narrowed by the
+    same field policy as the tool schemas."""
+
+    validate_callback_arguments(arguments, tool["input_schema"])
+    allowed = set(field_policy.get("allowedOrientationFields", ORIENTATION_FIELDS))
+    for argument, type_ref in tool["argument_types"].items():
+        if argument not in arguments:
+            continue
+        schema = types[type_ref.removesuffix("[]")]
+        if field_policy:
+            schema = narrow_schema(schema, allowed)
+        if type_ref.endswith("[]"):
+            for index, item in enumerate(arguments[argument]):
+                validate_callback_arguments(item, schema, path=f"$.{argument}[{index}]")
+        else:
+            validate_callback_arguments(arguments[argument], schema, path=f"$.{argument}")
+
+
+_FOREST_PATH = re.compile(r"^/?forest[\[/](\d+)\]?((?:[./]children[\[/]\d+\]?)*)(.*)$")
+
+
+def _with_node(row: Any, forest: list[Any]) -> Any:
+    """`row` plus `node: {instance_id, node_id, path}` for a forest path.
+
+    Both forms: `forest[0].children[2].x` and `/forest/0/children/2/x`. The
+    node is the deepest one the path names; `path` is the rest after it.
+    """
+
+    if not isinstance(row, dict):
+        return row
+    location = row.get("location")
+    raw = row.get("path") if isinstance(row.get("path"), str) else (
+        location.get("path") if isinstance(location, dict) else None)
+    match = _FOREST_PATH.match(raw or "")
+    if match is None:
+        return row
+    indexes = [int(match.group(1)), *map(int, re.findall(r"\d+", match.group(2)))]
+    node: Any = None
+    nodes: Any = forest
+    for index in indexes:
+        if not isinstance(nodes, list) or index >= len(nodes) or not isinstance(nodes[index], dict):
+            return row
+        node = nodes[index]
+        nodes = node.get("children")
+    rest = match.group(3).lstrip("./").replace("/", ".")
+    return {**row, "node": {"instance_id": node.get("instance_id"),
+                            "node_id": node.get("node_id"), "path": rest}}
 
 
 class AssistantDraftCallbackRequest(BaseModel):
@@ -174,9 +233,13 @@ def _validation_result(
     body: AssistantDraftCallbackRequest,
     *,
     status_code: int,
+    code: str,
     message: str,
     detail: Any,
 ) -> JSONResponse:
+    # The typed refusal code travels as detail.code; text is only presentation.
+    detail = {**detail, "code": code} if isinstance(detail, dict) else {
+        "code": code, "message": detail}
     return JSONResponse(
         status_code=200,
         content={
@@ -286,8 +349,8 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         try:
             requested_tools = normalize_requested_tools(body.requested_tools)
             field_policy = normalize_field_policy(body.field_policy)
-            resolved_catalog = resolve_assistant_catalog(
-                mode_payload,
+            resolved_catalog = state.assistant_context_cache.resolved_catalog(
+                context,
                 requested_tools=requested_tools,
                 field_policy=field_policy,
             )
@@ -378,13 +441,16 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             field="expectedDraftRevision",
         )
         try:
-            validate_callback_arguments(body.arguments, tool["input_schema"])
+            _validate_typed_arguments(
+                body.arguments, tool, mode_payload["types"], field_policy
+            )
         except CallbackSchemaValidationError as error:
             if validation_as_result:
                 raise _CallbackValidationResult(
                     _validation_result(
                         body,
                         status_code=400,
+                        code="assistant_callback_arguments_invalid",
                         message=str(error),
                         detail={"path": error.path, "message": error.message},
                     )
@@ -413,6 +479,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             _validation_result(
                 body,
                 status_code=error.status_code,
+                code=error.code,
                 message=str(error),
                 detail=error.detail,
             )
@@ -426,8 +493,33 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         details: dict[str, Any],
         next_admission_generation: int,
         next_workspace_revision: int,
+        reference_diagnostics: list[dict[str, Any]] | None = None,
     ) -> JSONResponse:
         mutated = mutation is not None
+        result: dict[str, Any] = {
+            "kind": "composer_draft_mutation" if mutated else "composer_draft_read",
+            "mutation": mutation,
+            "details": details,
+            "draftId": next_snapshot["draft_id"],
+            "draftRevision": next_snapshot["draft_revision"],
+            "candidateAvailable": next_snapshot["candidate_available"],
+            "programRevision": next_snapshot["program_revision"],
+            "diagnostics": next_snapshot["diagnostics"],
+        }
+        if reference_diagnostics is not None:
+            result["referenceDiagnostics"] = reference_diagnostics
+        # Each diagnostic names the node its forest path points into, resolved
+        # against the Draft right after this call (the model works with ids).
+        authoring = state.draft_session.snapshot().get("authoring") or {}
+        forest = authoring.get("forest") or []
+        # The declared scene resources, so a scene reference refusal can name them.
+        result["sceneResourceIds"] = [
+            row.get("scene_resource_id") for row in authoring.get("scene") or []
+            if isinstance(row, dict)
+        ]
+        for key in ("diagnostics", "referenceDiagnostics"):
+            if isinstance(result.get(key), list):
+                result[key] = [_with_node(row, forest) for row in result[key]]
         return JSONResponse(
             status_code=200,
             content={
@@ -440,20 +532,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 "correlationId": body.correlation_id,
                 "nextAdmissionGeneration": next_admission_generation,
                 "nextWorkspaceRevision": next_workspace_revision,
-                "result": {
-                    "kind": (
-                        "composer_draft_mutation"
-                        if mutated
-                        else "composer_draft_read"
-                    ),
-                    "mutation": mutation,
-                    "details": details,
-                    "draftId": next_snapshot["draft_id"],
-                    "draftRevision": next_snapshot["draft_revision"],
-                    "candidateAvailable": next_snapshot["candidate_available"],
-                    "programRevision": next_snapshot["program_revision"],
-                    "diagnostics": next_snapshot["diagnostics"],
-                },
+                "result": result,
             },
         )
 
@@ -521,6 +600,13 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             except AuthoringWorkspaceError as error:
                 raise _http_error(error) from error
             program = commit.snapshot.as_dict()["program"]
+            committed = commit.snapshot.workspace_revision != body.expected_workspace_revision
+            # One validator, two places (OD-28): a committed edit reports the
+            # reference diagnostics of the Draft it installed.
+            reference_diagnostics = (
+                assistant_reference_validation(state, program["authoring"], commit.snapshot.identity)[1]
+                if committed else None
+            )
             return callback_response(
                 body,
                 next_snapshot={
@@ -530,10 +616,13 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     "program_revision": program["programRevision"],
                     "diagnostics": program["diagnostics"],
                 },
-                mutation=prepared.tool_id,
+                # A validated no-op installs nothing and advances no revision;
+                # it is reported as not mutated.
+                mutation=prepared.tool_id if committed else None,
                 details=thaw_json(prepared.details),
                 next_admission_generation=commit.admission_generation,
                 next_workspace_revision=commit.snapshot.workspace_revision,
+                reference_diagnostics=reference_diagnostics,
             )
 
         try:
@@ -544,12 +633,32 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             )
             if tool_id == "program_read":
                 next_snapshot = snapshot
-                details: dict[str, Any] = {"program": snapshot["program"]}
+                # The authoring Draft as edited (the bridge reads a subtree
+                # of it); `program` is the derived candidate, or null.
+                details: dict[str, Any] = {
+                    "program": snapshot["program"],
+                    "authoring": snapshot["authoring"],
+                }
+            elif tool_id == "scene_inspect":
+                next_snapshot = snapshot
+                # The Draft scene, in the shape the scene_draft tools take.
+                details = {"scene": (snapshot["authoring"] or {}).get("scene", [])}
             elif tool_id == "program_validate":
                 next_snapshot = state.draft_session.validate(
                     node_environment.catalog
                 )
-                details = {"valid": True}
+                identity = state.authoring_workspace.identity()
+                body.require_workspace_fence(identity)
+                _require_equal(body.draft_id, identity.program_draft_id, field="draftId")
+                _require_equal(body.expected_draft_revision, identity.program_draft_revision,
+                               field="expectedDraftRevision")
+                validation = validate_captured_program_source(
+                    state, next_snapshot["authoring"], expected_identity=identity
+                )
+                details = {
+                    "valid": validation["valid"],
+                    "reference_validation": validation["reference_validation"],
+                }
             else:
                 raise HTTPException(
                     status_code=400,
@@ -569,6 +678,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             return _validation_result(
                 body,
                 status_code=error.status_code,
+                code=error.code,
                 message=str(error),
                 detail=error.detail,
             )

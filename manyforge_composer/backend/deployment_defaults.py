@@ -1,4 +1,4 @@
-"""Deployment defaults: the backend is their only owner (CONTRACTS §11).
+"""Deployment defaults: the backend is their only owner.
 
 A defaulted field may be absent from the Deployment document; its effective
 value is then the default here. ``GET /api/deployment/effective`` reports each
@@ -32,9 +32,10 @@ from .robot_defaults import (
 )
 
 # COMPONENT_DEFAULTS (same source): per component with its own lifecycle
-# (robots, tools, pose sources, AI models, sensors); optional (absent = this
-# default, the host's kDefaultLifecycleBudgetNs). An I/O device authors its
-# own in `io_provider_devices`; a machine owner and an I/O member have none.
+# (robots, tools, pose sources, AI models, sensors, the assistant); optional
+# (absent = this default, the host's kDefaultLifecycleBudgetNs). An I/O device
+# authors its own in `io_provider_devices`; a machine owner and an I/O member
+# have none.
 # Per point-cloud source (a `kind: sensor` component, runtime_kind `sensor`):
 # the bridge's former defaults. The compiler requires them, so they are
 # filled before compile.
@@ -42,7 +43,7 @@ SENSOR_POINTCLOUD_DEFAULTS: dict[str, Any] = {
     "max_points": 200000,
     "minimum_period_s": 0.1,
 }
-# Per global interrupt rule (CONTRACTS §8); optional in the compiled schema.
+# Per global interrupt rule; optional in the compiled schema.
 RULE_DEFAULTS: dict[str, Any] = {"active_at_start": False}
 # Per rule with `on_trip: stop` only.
 STOP_RULE_DEFAULTS: dict[str, Any] = {"after_stop": "hold"}
@@ -115,7 +116,7 @@ def _defaulted(
 def _has_own_lifecycle_budget(component: dict[str, Any]) -> bool:
     """Whether `configuration.lifecycle_command_timeout_s` belongs to this row:
     every component with `target_settings` (robots, tools, pose sources, AI
-    models, sensors), except an I/O device."""
+    models, sensors, the assistant), except an I/O device."""
 
     configuration = component.get("configuration")
     return (

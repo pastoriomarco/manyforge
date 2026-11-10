@@ -75,19 +75,20 @@ export interface ComponentsTabStatus {
 
 /**
  * 2 for a fault, 1 away from its normal running state (offline, not prepared,
- * a non-owner only prepared, activity unknown), 0 at it: an owner (§16) runs
+ * a non-owner only prepared, activity unknown), 0 at it: an owner runs
  * prepared, every other component enabled.
  */
 function componentSeverity(state: ComponentState, owner: boolean): 0 | 1 | 2 {
-  if (state.lifecycle === 'fault') return 2;
+  // A simulator (`sim_reset`) never blocks the cell: its fault is a warning.
+  if (state.lifecycle === 'fault') return state.capabilities.includes('sim_reset') ? 1 : 2;
   if (state.activity === 'unknown') return 1;
   if (state.lifecycle === 'enabled' || (owner && state.lifecycle === 'prepared')) return 0;
   return 1;
 }
 
 /**
- * The worst state among the cell's components (CONTRACTS §1; deactivated
- * members never reach the cell) and the cell latch (§5): fault for a fault or
+ * The worst state among the cell's components (deactivated
+ * members never reach the cell) and the cell latch: fault for a fault or
  * the latch, degraded for any other component away from its running state.
  */
 export function componentsTabStatus({ components, latch }: Pick<CellState, 'components' | 'latch'>): ComponentsTabStatus {

@@ -1,9 +1,9 @@
 {
   "api_version": "manyforge.node_extension.v1",
   "extension_id": "manyforge_example_nodes",
-  "version": "0.2.0",
-  "catalog_api_version": "manyforge.node_catalog.v2",
-  "catalog_content_version": "2.9.0",
+  "version": "0.2.1",
+  "catalog_api_version": "manyforge.node_catalog.v3",
+  "catalog_content_version": "3.0.0",
   "dependencies": [
     "manyforge_behavior"
   ],
@@ -13,7 +13,7 @@
       "id": "example.check_frame_height",
       "name": "Check frame height",
       "category": "model",
-      "description": "Build-owned extension example: compare a freshly observed frame height in the cell frame.",
+      "description": "Build-owned experimental example that checks the cell-frame height of a component frame against an inclusive range. Fails when the height is outside the range or the observed state is unavailable.",
       "stability": "experimental",
       "tags": [
         "example",
@@ -29,24 +29,25 @@
       },
       "parameters": [
         {
-          "id": "target_role",
+          "id": "target",
           "required": true,
+          "description": "Component and command target whose frame height is read.",
           "schema": {
-            "type": "string",
-            "semantic_type": "target_role"
+            "schema_ref": "#/schema_types/target_reference"
           }
         },
         {
-          "id": "frame_role",
+          "id": "frame",
           "required": true,
+          "description": "Component frame whose height in the cell frame is checked.",
           "schema": {
-            "type": "string",
-            "semantic_type": "frame_role"
+            "schema_ref": "#/schema_types/frame_reference"
           }
         },
         {
           "id": "minimum_height_m",
           "required": true,
+          "description": "Lower bound of the allowed height in meters, inclusive.",
           "schema": {
             "type": "float"
           }
@@ -54,6 +55,7 @@
         {
           "id": "maximum_height_m",
           "required": true,
+          "description": "Upper bound of the allowed height in meters, inclusive.",
           "schema": {
             "type": "float"
           }
@@ -63,12 +65,12 @@
         {
           "capability_id": "model.kinematics.fk",
           "scope": "target_binding",
-          "target_parameter": "target_role"
+          "target_parameter": "target"
         },
         {
           "capability_id": "state.observed.current",
           "scope": "target_binding",
-          "target_parameter": "target_role"
+          "target_parameter": "target"
         }
       ],
       "execution": {

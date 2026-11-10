@@ -17,7 +17,7 @@ decode_ordinary_motion_jerk_settings(const core::JsonObjectDTO& source);
 decode_execution_motion_target_limits(
     const core::JsonValueDTO::Array &motion_target_limits);
 
-/// DX777: pneumatic dwell may be zero; position-commanded duration stays
+/// Pneumatic dwell may be zero; position-commanded duration stays
 /// positive. Shared by authored ROS validation and retained row decoding.
 [[nodiscard]] bool execution_gripper_command_duration_is_valid(
     std::string_view actuation_kind, double duration_s) noexcept;

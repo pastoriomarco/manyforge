@@ -124,7 +124,7 @@ class PreparedDeploymentSave:
 def validate_deployment_draft_document(source: str) -> CompiledDeploymentDocument:
     """Validate one authored intent or an unmigrated compiled artifact.
 
-    Source-referenced intent is the authoritative UA2A authoring document.  The
+    Source-referenced intent is the authoritative authoring document.  The
     compiled branch is a temporary adapter for standalone Deployment consumers
     that have not yet moved to Scenario projects; it is not used as a fallback
     if intent validation fails.
@@ -623,7 +623,7 @@ def _edit_compiled_controlled_stop_profile(
 def _without_orphaned_members(
     before: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, Any]:
-    """Removing a machine's owner removes its members (CONTRACTS §11, §16):
+    """Removing a machine's owner removes its members:
     member rows whose `owner` was a component before the edit and isn't any
     more go with it."""
 

@@ -507,7 +507,7 @@ function PoseSourceComponentForm({ controller, effective, component, robotIds, g
  */
 export function PoseSourceComponentSection({ controller, effective = null, programSceneIds, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
-  /** `GET /api/deployment/effective` (CONTRACTS §11), read once by the editor. */
+  /** `GET /api/deployment/effective`, read once by the editor. */
   effective?: EffectiveValues | null;
   /** The Program Draft's scene object ids; null without a Program (no orphan list). */
   programSceneIds: readonly string[] | null;

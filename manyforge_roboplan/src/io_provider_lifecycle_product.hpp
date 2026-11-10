@@ -56,7 +56,7 @@ struct IoProviderInputAcquisitionBaseline final {
 };
 
 /// The actual generic I/O driver occurrence and the component adapter of its
-/// I/O provider component (CONTRACTS §6, §7): it owns its real driver facts,
+/// I/O provider component: it owns its real driver facts,
 /// delivery mutex and leaves, reports the component's state and runs its
 /// lifecycle actions. Arm-hosted GPIO belongs to the arm's adapter and never
 /// enters here.
@@ -85,21 +85,44 @@ public:
   core::IClock &clock() const noexcept;
   core::RuntimeUnitEpochBindingDTO runtime_unit_epoch() const;
   bool resources_installed() const;
+  // Atomic published identity; this does not acquire the delivery barrier.
+  [[nodiscard]] std::shared_ptr<ros2_control_execution::Ros2TransportResources>
+  RosOwner() const noexcept;
 
   // Host timer/registration/release code takes this same barrier before its
   // final token check. Runtime timer-map locks must never wait for this lock.
   std::unique_lock<std::mutex> AcquireDelivery() const;
   std::uint64_t driver_observation_generation_locked() const noexcept;
 
+  struct RosOwnerRecoverySnapshot;
+  struct RosOwnerRecoveryStage;
+  [[nodiscard]] bool UsesRosOwnerLocked(
+      const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner) const;
+  [[nodiscard]] core::Result<std::shared_ptr<RosOwnerRecoverySnapshot>>
+  CloseAndCaptureRosOwnerRecovery(
+      const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner,
+      bool bridge_observer = false);
+  [[nodiscard]] static core::Result<std::shared_ptr<RosOwnerRecoveryStage>>
+  StageRosOwnerRecovery(
+      std::shared_ptr<RosOwnerRecoverySnapshot> snapshot,
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner);
+  // Caller holds this record's delivery barrier; all snapshots in the batch
+  // are checked before any Commit call.
+  [[nodiscard]] bool MatchesRosOwnerRecoveryLocked(
+      const RosOwnerRecoverySnapshot &snapshot) const noexcept;
+  void CommitRosOwnerRecoveryLocked(RosOwnerRecoveryStage &stage) noexcept;
+  static void ActivateRosOwnerRecovery(RosOwnerRecoveryStage &stage) noexcept;
+
   // Allocate the real resources exactly once before exposing this record.
   // Output aliases are created paused using the generation read above; input
   // subscriptions are created paused here before any callback may publish.
-  core::Result<void> InstallResourcesLocked(
+  core::Result<void> InstallResourcesLocked(std::unique_lock<std::mutex> &delivery,
       std::vector<IoProviderInputSourceInstallation> inputs,
       std::vector<IoProviderOutputChannelInstallation> outputs,
       std::function<void()> cancel_pending_answers,
       InputLifecycleHook input_lifecycle = {},
-      InputAcquisitionHook input_acquisition = {});
+      InputAcquisitionHook input_acquisition = {},
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {});
   core::Result<MockBooleanInputSetReceipt>
   SetMockValueLocked(const core::IoSignalId &signal, bool value);
 
@@ -107,32 +130,36 @@ public:
   // old runtime timers first. New host incarnations bind actual new Apply;
   // exact replay cannot reset the model or resend an acquisition.
   core::Result<void>
-  RebindInputsLocked(std::vector<IoProviderInputSourceInstallation> inputs,
+  RebindInputsLocked(std::unique_lock<std::mutex> &delivery,
+                     std::vector<IoProviderInputSourceInstallation> inputs,
                      std::function<void()> cancel_pending_answers,
                      InputLifecycleHook input_lifecycle = {},
-                     InputAcquisitionHook input_acquisition = {});
+                     InputAcquisitionHook input_acquisition = {},
+                     std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {});
 
-  // CONTRACTS §6. State: `fault` for a driver fault, a lost transport while
+  // State: `fault` for a driver fault, a lost transport while
   // enabled or an exited supervised process; `offline` while the configured
   // transport isn't reachable; streams from the host stream registry.
   // IO-1 senders gone: once a ROS input topic had a publisher since install,
   // every ROS input topic without one is `fault` (`fault_communication`)
   // while enabled, held until Recover or Disable, and `offline` (reason
   // `io_device_senders_gone`) otherwise; prepare, enable and recover are
-  // refused with that code until a sender is back. Publisher counts are read
-  // on the host's component tick. A stale `inputs` stream is
-  // `fault_stream_stale`.
+  // refused with that code until a sender is back. Matched-publisher counts
+  // (ROS matched events) are read on the host's component tick. A stale
+  // `inputs` stream is `fault_stream_stale`.
   // Actions: prepare (installed, reachable), enable (from prepared: resumes
   // the leaves), disable (pauses them), recover (clears a driver fault and
   // pauses). Capability `io_manual_write` when the component has outputs,
-  // plus `io_output_readback` when some are Mock outputs. Activity is
-  // `unknown` while an output's last write has an unknown outcome.
+  // plus `io_output_readback` when some are Mock outputs.
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
+  // Test observation: the matched compatible publisher count summed over the
+  // installed ROS input leaves, the count IO-1 reads.
+  [[nodiscard]] std::size_t RosInputMatchedPublishersForTest() const;
   [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
                                        std::stop_token stop) override;
   [[nodiscard]] std::vector<core::Capability> capabilities() const override;
 
-  // CONTRACTS §6, §7: a manual write of one of this component's outputs,
+  // A manual write of one of this component's outputs,
   // through the output provider of its channel (Mock or ROS bool). The
   // channel's own gate refuses it while the component isn't enabled; a
   // controller-owned output is refused before sending.
@@ -157,6 +184,7 @@ public:
   // resources and transport ready. The recorders live until Shutdown
   // (destruction undeclares).
   [[nodiscard]] bool stream_observer() const noexcept;
+  [[nodiscard]] bool InstalledStreamObserver() const noexcept;
   core::Result<void> InstallObserverStreamsLocked(
       std::vector<std::unique_ptr<core::StreamRecorder>> streams);
 
@@ -177,5 +205,15 @@ private:
   explicit IoProviderDriverRecord(std::unique_ptr<Driver> state);
   std::unique_ptr<Driver> state_;
 };
+
+// Retained pins keep this in-process tie-breaker stable for the entire lock
+// acquisition, including separate records with the same provider instance ID.
+inline bool DeliveryLockOrder(const std::shared_ptr<IoProviderDriverRecord> &left,
+                              const std::shared_ptr<IoProviderDriverRecord> &right) noexcept {
+  const auto &left_id = left->occurrence().provider_instance_id.value();
+  const auto &right_id = right->occurrence().provider_instance_id.value();
+  if (left_id != right_id) return left_id < right_id;
+  return std::less<const IoProviderDriverRecord *>{}(left.get(), right.get());
+}
 
 } // namespace manyforge::roboplan_backend::host_detail

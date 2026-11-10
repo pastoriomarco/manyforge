@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_core_py VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_core_py VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(EXPAT REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
@@ -71,6 +72,10 @@ set_target_properties(manyforge_content_identity_archive PROPERTIES
     "${MANYFORGE_CONTENT_IDENTITY_SOURCE_DIR}/include"
 )
 
+add_library(manyforge_expression_archive STATIC IMPORTED)
+set_target_properties(manyforge_expression_archive PROPERTIES
+  IMPORTED_LOCATION "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_expression.a")
+
 add_library(manyforge_deployment_verification_core_archive STATIC IMPORTED)
 set_target_properties(
   manyforge_deployment_verification_core_archive PROPERTIES
@@ -83,6 +88,7 @@ target_link_libraries(
   manyforge_deployment_verification_core_archive INTERFACE
   # Verification's I/O-provider domain calls Core lifecycle-plan functions.
   "${MANYFORGE_CORE_DIR}/libmanyforge_core.a"
+  manyforge_expression_archive
   manyforge_content_identity_archive
 )
 target_link_libraries(manyforge_deployment_archive INTERFACE
@@ -90,11 +96,38 @@ target_link_libraries(manyforge_deployment_archive INTERFACE
   manyforge_content_identity_archive
   OpenSSL::Crypto
   EXPAT::EXPAT
+  ZLIB::ZLIB
   PkgConfig::LIBYAML
   PkgConfig::UTF8PROC
   double-conversion::double-conversion
 )
 
+endif()
+
+# Preparation is the same archive used by the Apply tool. Standalone Python
+# builds import its existing archive and dependency archives, rather than
+# compiling a second Deployment graph.
+if(NOT TARGET manyforge_preparation_support)
+  add_library(manyforge_preparation_support_archive STATIC IMPORTED)
+  set_target_properties(manyforge_preparation_support_archive PROPERTIES
+    IMPORTED_LOCATION "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_preparation_support.a")
+  add_library(manyforge_canonical_package_generator_archive STATIC IMPORTED)
+  set_target_properties(manyforge_canonical_package_generator_archive PROPERTIES
+    IMPORTED_LOCATION "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_deployment_canonical_package_generator.a")
+  add_library(manyforge_deployment_admission_archive STATIC IMPORTED)
+  set_target_properties(manyforge_deployment_admission_archive PROPERTIES
+    IMPORTED_LOCATION "${MANYFORGE_DEPLOYMENT_DIR}/libmanyforge_deployment_admission.a")
+  # Each archive names the archives it calls, so the static link order puts
+  # Deployment after both of them.
+  target_link_libraries(manyforge_canonical_package_generator_archive INTERFACE
+    manyforge_deployment_admission_archive
+    manyforge_deployment_archive)
+  target_link_libraries(manyforge_deployment_admission_archive INTERFACE
+    manyforge_deployment_archive)
+  target_link_libraries(manyforge_preparation_support_archive INTERFACE
+    manyforge_canonical_package_generator_archive
+    manyforge_deployment_admission_archive
+    manyforge_deployment_archive)
 endif()
 
 # Python bindings module
@@ -107,6 +140,7 @@ pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings_component_type.cpp
   bindings_coordinate_state.cpp
   bindings_deployment.cpp
+  bindings_prepared_candidate.cpp
   bindings_interrupt.cpp
   bindings_model_compiler.cpp
   bindings_operation_runtime.cpp
@@ -117,10 +151,12 @@ pybind11_add_module(manyforge_core_py NO_EXTRAS
 # Reuse existing graph targets without rebuilding another Core/Deployment tree.
 if(TARGET manyforge_core AND TARGET manyforge_deployment)
   target_link_libraries(manyforge_core_py PRIVATE
-    manyforge_core manyforge_deployment pybind11::module pybind11::headers)
+    manyforge_core manyforge_preparation_support manyforge_deployment
+    pybind11::module pybind11::headers)
 else()
 # Link against the manyforge_core library
 target_link_libraries(manyforge_core_py PRIVATE
+  manyforge_preparation_support_archive
   manyforge_deployment_archive
   pybind11::module
   pybind11::headers
@@ -130,6 +166,7 @@ endif()
 
 target_include_directories(manyforge_core_py PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../manyforge_deployment/src
 )
 
 # Install the Python module

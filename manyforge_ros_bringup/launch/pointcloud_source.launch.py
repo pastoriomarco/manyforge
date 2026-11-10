@@ -62,7 +62,7 @@ def node_kwargs(
 
 
 def launch_setup(context, *args, **kwargs):
-    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
+    keep_sigint_out_of_tasks(context)  # Before any Node action exists.
     values = [LaunchConfiguration(name).perform(context) for name in ARGUMENTS]
     return [Node(**node_kwargs(*values))]
 

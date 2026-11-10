@@ -28,7 +28,7 @@ inline constexpr std::size_t kMaximumRetainedPreparedActivations = 8U;
 /// Recompile the prepared Program outcome from the carried Program, authored
 /// role assignment, retained bundle, model map and catalog artifacts, and
 /// require the exact recorded outcome: the same binding identity, or the
-/// identical named non-executable result (H1a). A recorded outcome is thereby
+/// identical named non-executable result. A recorded outcome is thereby
 /// proven, not merely consistent with its summary. Throws
 /// PreparedActivationInputError on any difference.
 void verify_prepared_program_outcome(const PreparedActivationInput &prepared);
@@ -62,7 +62,7 @@ struct PreparedActivationAssemblyInput final {
 [[nodiscard]] PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const VerifiedRetainedModelMap &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
+    const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog, const IRawArtifactStore &raw_artifacts);
 
 /// Assemble for a candidate whose retained product set may contain no model
@@ -71,8 +71,18 @@ struct PreparedActivationAssemblyInput final {
 [[nodiscard]] PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const std::optional<VerifiedRetainedModelMap> &model_map,
-    const ProgramBindingContract &program, const CanonicalValue &role_assignment,
+    const ProgramBindingContract &program,
     const ICatalogArtifactSource &catalog, const IRawArtifactStore &raw_artifacts);
+
+/// Assemble the `no_program` prepared activation of a candidate applied
+/// without a Program (for example a Close): no Program, binding or catalog
+/// artifacts; the candidate's model-map artifact (if any) and the global I/O
+/// Stop products qualified without a Program. `input.assistant_mode` must be
+/// "optional". Verified like any stored value.
+[[nodiscard]] PreparedActivationInput assemble_prepared_activation_without_program(
+    const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
+    const std::optional<VerifiedRetainedModelMap> &model_map,
+    const IRawArtifactStore &raw_artifacts);
 
 /// Immutable content-addressed store of prepared activations under one
 /// trusted activation root (`prepared-activations/<hex>.json`).

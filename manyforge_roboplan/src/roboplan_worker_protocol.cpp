@@ -903,6 +903,16 @@ std::string encode_candidate_request(
   if (planning_deadline_ns &&
       (!value.moving_replacement || !value.moving_replacement->remaining_planning_budget_s))
     fail("moving planning deadline needs a planning budget");
+  if (value.collision_mode != core::PlannerCollisionMode::kEnforced &&
+      value.collision_mode != core::PlannerCollisionMode::kDiagnosticDisabled)
+    fail("invalid collision mode");
+  const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
+  const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(value.motion);
+  if ((!diagnostic && value.diagnostic_qualified_target) ||
+      (diagnostic && !cartesian && !value.diagnostic_qualified_target) ||
+      diagnostic != value.diagnostic_deadline_ns.has_value() ||
+      (diagnostic && value.moving_replacement))
+    fail("invalid diagnostic plan fields");
   Encoder encoder;
   write_strong(encoder, value.controllable_component_id);
   write_strong(encoder, value.command_target_id);
@@ -932,6 +942,12 @@ std::string encode_candidate_request(
                    out.floating(margin.margin_m);
                  });
   write_contact_pairs(encoder, value.contact_allowed_pairs);
+  encoder.boolean(value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled);
+  encoder.optional(value.diagnostic_qualified_target, write_controlled_state);
+  encoder.optional(value.diagnostic_deadline_ns, [](Encoder& out, std::int64_t stamp) {
+    if (stamp <= 0) fail("diagnostic deadline is invalid");
+    out.u64(static_cast<std::uint64_t>(stamp));
+  });
   // Omit the complete extension when absent, preserving ordinary payloads.
   if (value.moving_replacement) {
     encoder.boolean(true);
@@ -1003,7 +1019,23 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
         return margin;
       });
   value.contact_allowed_pairs = read_contact_pairs(decoder);
+  value.collision_mode = decoder.boolean() ? core::PlannerCollisionMode::kDiagnosticDisabled
+                                          : core::PlannerCollisionMode::kEnforced;
+  value.diagnostic_qualified_target = decoder.optional<core::ControlledStateDTO>(read_controlled_state);
+  value.diagnostic_deadline_ns = decoder.optional<std::int64_t>([](Decoder& in) {
+    const auto stamp = in.u64();
+    if (stamp == 0U || stamp > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+      fail("diagnostic deadline is invalid");
+    return static_cast<std::int64_t>(stamp);
+  });
+  const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
+  const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(value.motion);
+  if ((!diagnostic && value.diagnostic_qualified_target) ||
+      (diagnostic && !cartesian && !value.diagnostic_qualified_target) ||
+      diagnostic != value.diagnostic_deadline_ns.has_value())
+    fail("invalid diagnostic plan fields");
   if (!decoder.at_end()) {
+    if (diagnostic) fail("diagnostic plan cannot be a moving replacement");
     if (!decoder.boolean()) {
       fail("absent moving-replacement extension must be omitted");
     }
@@ -1039,32 +1071,42 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
 }
 
 std::string encode_trajectory_result(
-    const core::Result<core::TrajectoryDTO>& value) {
+    const core::Result<core::TrajectoryDTO>& value,
+    const std::optional<core::ControlledStateDTO>& qualified_target) {
   Encoder encoder;
   encoder.boolean(value.ok());
-  if (value.ok()) {
-    write_trajectory(encoder, value.value());
-  } else {
-    write_error(encoder, value.error());
-  }
+  if (value.ok()) write_trajectory(encoder, value.value());
+  else write_error(encoder, value.error());
+  encoder.optional(qualified_target, write_controlled_state);
   return std::move(encoder).finish();
 }
 
 core::Result<core::TrajectoryDTO> decode_trajectory_result(
-    std::string_view bytes) {
+    std::string_view bytes, std::optional<core::ControlledStateDTO>* qualified_target) {
   Decoder decoder(bytes);
   const bool ok = decoder.boolean();
   if (ok) {
     auto value = read_trajectory(decoder);
+    auto target = decoder.optional<core::ControlledStateDTO>(read_controlled_state);
     decoder.require_end();
+    if (qualified_target) *qualified_target = std::move(target);
     return core::Result<core::TrajectoryDTO>::Ok(std::move(value));
   }
   auto value = read_error(decoder);
+  auto target = decoder.optional<core::ControlledStateDTO>(read_controlled_state);
   decoder.require_end();
+  if (qualified_target) *qualified_target = std::move(target);
   return core::Result<core::TrajectoryDTO>::Err(std::move(value));
 }
 
 std::string encode_ik_request(const WorkerIkRequestDTO& value) {
+  if (value.collision_mode != core::PlannerCollisionMode::kEnforced &&
+      value.collision_mode != core::PlannerCollisionMode::kDiagnosticDisabled)
+    fail("invalid collision mode");
+  const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
+  if (diagnostic != value.diagnostic_deadline_ns.has_value() ||
+      diagnostic != value.diagnostic_tolerances.has_value())
+    fail("invalid diagnostic IK fields");
   Encoder encoder;
   write_pose(encoder, value.goal);
   write_frame(encoder, value.base_frame);
@@ -1072,6 +1114,16 @@ std::string encode_ik_request(const WorkerIkRequestDTO& value) {
   write_controlled_state(encoder, value.seed_state);
   encoder.floating(value.timeout_s);
   write_contact_pairs(encoder, value.contact_allowed_pairs);
+  encoder.boolean(value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled);
+  encoder.optional(value.diagnostic_deadline_ns, [](Encoder& out, std::int64_t stamp) {
+    if (stamp <= 0) fail("diagnostic deadline is invalid");
+    out.u64(static_cast<std::uint64_t>(stamp));
+  });
+  encoder.optional(value.diagnostic_tolerances, [](Encoder& out, const core::TolerancesDTO& t) {
+    out.floating(t.joint_position_tol_rad);
+    out.floating(t.translation_tol_m);
+    out.floating(t.rotation_tol_rad);
+  });
   return std::move(encoder).finish();
 }
 
@@ -1082,6 +1134,21 @@ WorkerIkRequestDTO decode_ik_request(std::string_view bytes) {
                            read_controlled_state(decoder),
                            decoder.floating(),
                            read_contact_pairs(decoder)};
+  value.collision_mode = decoder.boolean() ? core::PlannerCollisionMode::kDiagnosticDisabled
+                                          : core::PlannerCollisionMode::kEnforced;
+  value.diagnostic_deadline_ns = decoder.optional<std::int64_t>([](Decoder& in) {
+    const auto stamp = in.u64();
+    if (stamp == 0U || stamp > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+      fail("diagnostic deadline is invalid");
+    return static_cast<std::int64_t>(stamp);
+  });
+  value.diagnostic_tolerances = decoder.optional<core::TolerancesDTO>([](Decoder& in) {
+    return core::TolerancesDTO{in.floating(), in.floating(), in.floating()};
+  });
+  const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
+  if (diagnostic != value.diagnostic_deadline_ns.has_value() ||
+      diagnostic != value.diagnostic_tolerances.has_value())
+    fail("invalid diagnostic IK fields");
   decoder.require_end();
   return value;
 }

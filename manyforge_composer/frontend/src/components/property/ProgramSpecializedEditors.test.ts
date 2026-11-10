@@ -13,6 +13,9 @@ import {
   completeOrientationTransition,
   jointTargetEditorRows,
   jointTargetTransitionMessage,
+  ProgramManualFillPreviewContext,
+  motionReferenceForFrame,
+  motionReferenceFrame,
   ProgramSpecializedEditor,
   toggleJointTargetRow,
 } from './ProgramSpecializedEditors';
@@ -24,22 +27,17 @@ const frameReferenceSchema: CatalogJsonSchema = {
   required: ['kind'],
   properties: {
     kind: { type: 'string', enum: ['cell_frame', 'target_frame', 'scene_resource'] },
-    target_role: { type: 'string' },
-    frame_role: { type: 'string' },
+    frame: { type: 'object', required: ['component_id', 'frame_id'], properties: { component_id: { type: 'string' }, frame_id: { type: 'string' } } },
     scene_resource_id: { type: 'string' },
   },
   allOf: [
     {
       if: { required: ['kind'], properties: { kind: { const: 'target_frame' } } },
-      then: { required: ['frame_role', 'target_role'] },
+      then: { required: ['frame'] },
     },
     {
       if: { not: { required: ['kind'], properties: { kind: { const: 'target_frame' } } } },
-      then: { not: { required: ['target_role'] } },
-    },
-    {
-      if: { not: { required: ['kind'], properties: { kind: { const: 'target_frame' } } } },
-      then: { not: { required: ['frame_role'] } },
+      then: { not: { required: ['frame'] } },
     },
     {
       if: { required: ['kind'], properties: { kind: { const: 'scene_resource' } } },
@@ -145,18 +143,18 @@ const motionReferenceSchema: CatalogJsonSchema = {
   properties: {
     type: {
       type: 'string',
-      enum: ['frame_role', 'component_body_role', 'scene_resource', 'runtime_object', 'pose'],
+      enum: ['component_frame', 'component_body', 'scene_resource', 'runtime_object', 'pose'],
     },
-    frame_role_id: { type: 'string' },
-    collision_body_role_id: { type: 'string' },
+    frame: { type: 'object' },
+    body: { type: 'object' },
     scene_resource_id: { type: 'string' },
     runtime_object_id: { type: 'string' },
     pose: motionPoseSchema,
   },
   allOf: [
     ...[
-      ['frame_role', 'frame_role_id'],
-      ['component_body_role', 'collision_body_role_id'],
+      ['component_frame', 'frame'],
+      ['component_body', 'body'],
       ['scene_resource', 'scene_resource_id'],
       ['runtime_object', 'runtime_object_id'],
       ['pose', 'pose'],
@@ -174,36 +172,33 @@ const motionReferenceSchema: CatalogJsonSchema = {
 };
 
 describe('Program specialized editor transitions', () => {
-  it('stages target_frame until both roles exist and normalizes every frame variant', () => {
+  it('stages target_frame until both reference fields exist and normalizes every frame variant', () => {
     expect(completeFrameReferenceTransition(
       frameReferenceSchema,
       'target_frame',
-      { target_role: 'arm' },
+      { component_id: 'arm' },
     )).toBeUndefined();
     expect(completeFrameReferenceTransition(
       frameReferenceSchema,
       'target_frame',
-      { target_role: 'arm', frame_role: 'tcp', scene_resource_id: 'stale' },
+      { component_id: 'arm', frame_id: 'tcp', scene_resource_id: 'stale' },
     )).toEqual({
       kind: 'target_frame',
-      target_role: 'arm',
-      frame_role: 'tcp',
+      frame: { component_id: 'arm', frame_id: 'tcp' },
     });
     expect(completeFrameReferenceTransition(
       frameReferenceSchema,
       'cell_frame',
-      { target_role: 'stale', frame_role: 'stale' },
+      { component_id: 'stale', frame_id: 'stale' },
     )).toEqual({ kind: 'cell_frame' });
     expect(completeFrameReferenceTransition(
       frameReferenceSchema,
       'scene_resource',
-      { scene_resource_id: 'fixture', target_role: 'stale' },
+      { scene_resource_id: 'fixture', component_id: 'stale' },
     )).toEqual({ kind: 'scene_resource', scene_resource_id: 'fixture' });
   });
 
   it.each([
-    ['frame_role', 'frame_role_id'],
-    ['component_body_role', 'collision_body_role_id'],
     ['scene_resource', 'scene_resource_id'],
     ['runtime_object', 'runtime_object_id'],
   ])('stages and normalizes the %s motion-reference transition', (type, field) => {
@@ -216,6 +211,13 @@ describe('Program specialized editor transitions', () => {
       type,
       'selected-role',
     )).toEqual({ type, [field]: 'selected-role' });
+  });
+
+  it('round-trips a directly owned frame without inventing a target role', () => {
+    const value = { type: 'component_frame', frame: { component_id: 'tool', frame_id: 'tip' } };
+    const frame = motionReferenceFrame(value);
+    expect(frame).toEqual({ kind: 'target_frame', frame: { component_id: 'tool', frame_id: 'tip' } });
+    expect(motionReferenceForFrame(frame!)).toEqual(value);
   });
 
   it('normalizes the pose motion-reference transition to one valid pose variant', () => {
@@ -322,10 +324,51 @@ describe('Program specialized editor transitions', () => {
         onCommit: () => undefined,
       },
     ));
-    expect(render({ rpy_deg: [90, 0, 90] }))
-      .toContain('Quaternion xyzw (read-only): x 0.5, y 0.5, z 0.5, w 0.5');
-    expect(render({ xyzw: [0.5, 0.5, 0.5, 0.5] }))
-      .toContain('RPY degrees (read-only): r 90, p 0, y 90');
+    const rpy = render({ rpy_deg: [90, 0, 90] });
+    expect(rpy).toContain('<legend>Position (m)</legend>');
+    expect(rpy).toContain('<legend>Orientation (deg)</legend>');
+    expect(rpy).toContain('<span>X</span>');
+    expect(rpy).toContain('aria-label="Position x"');
+    expect(rpy).toContain('aria-label="Orientation r"');
+    expect(rpy).toContain('Quaternion xyzw (read-only): x 0.5, y 0.5, z 0.5, w 0.5');
+    const quaternion = render({ xyzw: [0.5, 0.5, 0.5, 0.5] });
+    expect(quaternion).toContain('<legend>Orientation (unit quaternion)</legend>');
+    expect(quaternion).toContain('<span>W</span>');
+    expect(quaternion).toContain('aria-label="Orientation w"');
+    expect(quaternion).toContain('RPY degrees (read-only): r 90, p 0, y 90');
+  });
+
+  it('previews a fill inside the fields, in the form the editor shows, without new rows', () => {
+    const render = (preview: Map<string, string>) => renderToStaticMarkup(createElement(
+      ProgramManualFillPreviewContext.Provider,
+      { value: preview },
+      createElement(ProgramSpecializedEditor, {
+        schema: motionPoseSchema,
+        value: { position_m: [0, 0, 0], orientation: { rpy_deg: [0, 0, 0] } },
+        path: 'goal',
+        disabled: false,
+        onCommit: () => undefined,
+      }),
+    ));
+    const idle = render(new Map());
+    // A quaternion fill on an RPY editor: shown as RPY, with the stored-form change.
+    const hovered = render(new Map([
+      ['goal.position_m[2]', '0.3'],
+      ['goal.orientation.xyzw[0]', '1'],
+      ['goal.orientation.xyzw[1]', '0'],
+      ['goal.orientation.xyzw[2]', '0'],
+      ['goal.orientation.xyzw[3]', '0'],
+      ['goal.orientation.rpy_deg[0]', 'default'],
+    ]));
+    expect(idle).not.toContain('program-fill-overlay');
+    expect(hovered).toContain('<span class="program-fill-overlay" aria-hidden="true">→ 0.3</span>');
+    expect(hovered).toContain('→ Quaternion xyzw');
+    expect(hovered).toContain('→ 180');
+    expect(hovered).not.toContain('default');
+    // The captions and the number of fields are the same in both states.
+    const fields = (markup: string) => (markup.match(/class="program-specialized-number/g) ?? []).length;
+    expect(fields(hovered)).toBe(fields(idle));
+    expect(hovered).toContain('<span>X</span>');
   });
 
   it('shows every commandable joint and preserves sparse authored order', () => {

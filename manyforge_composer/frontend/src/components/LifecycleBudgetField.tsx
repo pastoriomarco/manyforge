@@ -8,8 +8,8 @@ import { DraftTextInput } from './common/DraftInputs';
 /**
  * A component's lifecycle time budget, `configuration.lifecycle_command_timeout_s`
  * of its Scenario row: the time Prepare, Enable and Disable may each take.
- * Shown with its effective value and default from `GET /api/deployment/effective`
- * (CONTRACTS §11): writing it adds it to the Draft, blank or Reset to default
+ * Shown with its effective value and default from `GET /api/deployment/effective`:
+ * writing it adds it to the Draft, blank or Reset to default
  * removes it. The GUI keeps no copy of the default. Like any other setting it
  * takes effect at the confirmed Apply. An I/O device edits its own in its I/O
  * device section.

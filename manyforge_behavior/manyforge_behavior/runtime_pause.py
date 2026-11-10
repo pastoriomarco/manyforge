@@ -1,4 +1,4 @@
-"""Bounded diagnostic sanitation and the I6/N + I8/P5 pause cutover gate.
+"""Bounded diagnostic sanitation and the pause cutover gate.
 
 The former registry minted live runtime-fault identities, generations, resume
 grants, and mutable pause state for the Python CycleManager.  With no current
@@ -25,7 +25,6 @@ _DETAILS_TRUNCATED_KEY: Final = "_manyforge_details_truncated"
 RUNTIME_PAUSE_UNAVAILABLE_REASON_CODE: Final = (
     "composable_cell_runtime_pause_owner_unavailable"
 )
-RUNTIME_PAUSE_RESTORATION_GATES: Final = ("I6", "N", "I8", "P5")
 
 
 class _DetailSanitizer:
@@ -164,7 +163,7 @@ class RuntimePauseOwnerUnavailableError(RuntimeError):
 def _raise_runtime_pause_unavailable() -> None:
     raise RuntimePauseOwnerUnavailableError(
         f"{RUNTIME_PAUSE_UNAVAILABLE_REASON_CODE}: exact native pause and "
-        "recovery identity returns at I6/N and I8/P5"
+        "recovery identity is not available"
     )
 
 
@@ -176,7 +175,7 @@ class RuntimePauseRegistry:
 
 
 class RuntimePauseMixin:
-    """Gate inherited by legacy effectful nodes until their I6 port."""
+    """Gate inherited by legacy effectful nodes until they are ported."""
 
     def _configure_runtime_pause(self, *_args: object, **_kwargs: object) -> None:
         _raise_runtime_pause_unavailable()

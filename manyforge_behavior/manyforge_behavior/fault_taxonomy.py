@@ -18,7 +18,7 @@ from typing import Any, Optional
 class BackendFaultClass:
     """One stable backend fault class.
 
-    `severity` uses the spec/520 operational levels and feeds external
+    `severity` uses the operational levels and feeds external
     diagnostics surfaces (the `diagnostic_msgs` bridge and the ros2_medkit
     adapter). Severity rule: CRITICAL means stop/quiescence was not confirmed
     or the lifecycle is stuck (immediate operator attention; medkit-style

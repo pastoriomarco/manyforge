@@ -272,7 +272,7 @@ private:
               response->unique_ids.end()).size() != expected.size())
             {
               throw std::runtime_error(
-                "native composition differs from exact phase1 constructed nodes; "
+                "native composition differs from the exact constructed nodes; "
                 "inspect load errors");
             }
             StartActionServer();

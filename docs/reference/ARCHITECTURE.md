@@ -50,8 +50,7 @@ container; `scripts/dev-workbench.py` starts these processes in it:
 | Program runner | `python -m manyforge_program_runner` | 9011 | Program cycle: tree ticking, Run/Stop/Reset, cycle journal |
 | Headless API | `python -m manyforge_headless_api serve` | 9010 | REST/WebSocket over the owners: components, cell latch, readiness, I/O, cycle, history, alarms |
 | Manager | `manyforge_manager_daemon` | (local sockets) | Apply journal and convergence; starts and stops the execution host |
-| Execution host | `manyforge_ros2_control_execution_host` (started by the Manager) | — | Kernel, planner, collision, component adapters and their processes (`ros2_control.launch.py`, drivers, bridges) |
-| Assistant bridge | `python -m manyforge_assistant_bridge.bridge` | 8100 | AI tab model loop |
+| Execution host | `manyforge_ros2_control_execution_host` (started by the Manager) | — | Kernel, planner, collision, component adapters and their processes (`ros2_control.launch.py`, drivers, bridges, the AI assistant's host and bridge) |
 | Composer backend | `python -m manyforge_composer` | 9020 | GUI/REST/MCP shell: Drafts, Scenario files, Apply/Load/New orchestration, proxies to the Headless API |
 | Composer frontend | Vite (`npm run dev`) | 3000 | Browser GUI |
 
@@ -80,7 +79,7 @@ container, on the same machine or the LAN, and is reached over ROS 2.
 | `manyforge_isaac_adapter`                 | C++20/ROS 2      | Isaac Sim lane adapter family: lane folder `lane/`, launch contribution, topic-based ros2_control settings, gripper bridges.                                                                                               |
 | `manyforge_behavior`                      | Python           | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                                               |
 | `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, Draft authoring, server-side Apply/Load/New, transparent control/viewer proxies, and backend-state presentation. It owns no execution lifecycle.                                                 |
-| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utilities (simulation control over `simulation_interfaces`, standard controller/gripper surfaces) and launch files (`ros2_control.launch.py`, pose source, point-cloud source, AI model, simulated PLC, Isaac gripper). |
+| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utilities (simulation control over `simulation_interfaces`, standard controller/gripper surfaces) and launch files (`ros2_control.launch.py`, pose source, point-cloud source, AI model, AI assistant host, simulated PLC, Isaac gripper). |
 | `manyforge_example_models`                | data             | Component packages (`component.yaml`, URDF/SRDF, meshes, lane rows) for the included robots and tools; machine models in `components/`.                                                                                    |
 | `manyforge_assistant_bridge`              | Python           | AI tab model loop against the Deployment's `ai_model` endpoint, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
@@ -379,7 +378,7 @@ ManyForge's own validation and collision checks. Adapter details:
   joint and pose goals. `smooth`: TOPP-RA within the joint limits, then one
   uniform stretch until the active TCP is at 0.98 of its speed limit at the
   samples (and joint caps and jerk limits, if set, hold): gentle, slower.
-  `fast` (RP-3): TOPP-RA holds the TCP at 0.98 of its limit on its grid:
+  `fast`: TOPP-RA holds the TCP at 0.98 of its limit on its grid:
   quicker, with abrupt acceleration changes. Cartesian paths follow
   `cartesian_timing` only.
 - **TCP speed limit.** Either way the active TCP targets 0.98 of its speed
@@ -473,8 +472,8 @@ ______________________________________________________________________
 
 ## Component model
 
-Every robot, tool, I/O device, sensor, pose source, AI model and simulator in
-the cell is a **component**. The execution host owns them; the core holds and
+Every robot, tool, I/O device, sensor, pose source, AI model, AI assistant and
+simulator in the cell is a **component**. The execution host owns them; the core holds and
 publishes one view of each, and everything else reads it.
 
 ### Component state
@@ -484,8 +483,10 @@ carries the component's `lifecycle` (`offline`, `not_prepared`, `prepared`,
 `enabled`, `fault`), a `fault` when in `fault`, a `reason` when offline or not
 prepared, its `activity` (`idle`, `busy`, `unknown`: a command's result has
 not come back), stream freshness, declared capabilities, the action in
-progress and the last finished action, and display-only vendor `details`. The
-execution host publishes every change; the Headless API serves
+progress and the last finished action, display-only vendor `details`, and,
+only while enabled, the `endpoints` it serves (`{role_id, url}`, for example
+the AI assistant's `assistant_request` URL; unlike `details`, clients may act
+on them). The execution host publishes every change; the Headless API serves
 `GET /api/components` and pushes `component_state` events on `/ws/control`.
 
 ### Actions and capabilities
@@ -497,6 +498,8 @@ execution host publishes every change; the Headless API serves
 outputs). One action runs at a time per component; a Stop interrupts an
 action in progress; an action whose effect is unknown ends `unknown` and is
 never resent. Actions stay available during a cell latch and during a run.
+Declaring `sim_reset` identifies a simulator; its state never latches the cell
+or blocks Execute.
 
 ### Faults and the cell latch
 
@@ -507,22 +510,27 @@ there is one, and the `operator_action` that clears it (`enable`, `recover`
 or `none`). The adapter maps vendor codes; unmapped ones pass through as
 `fault_vendor`.
 
-The **cell latch** is derived, never stored: after a Stop, it is set while any
-component in the cell is in `fault` or `offline` or reports
-`activity: unknown`, and also when a component faults while anything
-executes. It clears by itself once every component is healthy and idle; there
-is no recovery endpoint or acknowledgement. While latched, Program run and
-resume, every node, interrupt evaluation, manual motion and manual I/O are
-refused (`cell_latched`); component actions, Apply, Load and New are not.
+The **cell latch** is derived, never stored: after a Stop, non-exempt
+components in the cell cause it while in `fault` or `offline` or reporting
+`activity: unknown`; a fault raised while anything executes can also latch
+the cell. A component declaring `sim_reset` is the simulator and is exempt in
+every state, including `offline` or `fault`. The existing operator-power and
+unavailable-owner-member exemptions also apply. The latch clears by itself
+when its causes are gone; there is no recovery endpoint or acknowledgement.
+While latched, Program run and resume, every node, interrupt evaluation,
+manual motion and manual I/O are refused (`cell_latched`); component actions,
+Apply, Load and New are not.
 `GET /api/cell/latch` and the `cell_latch` event carry it.
 
-A simulation that isn't playing is simulator state, never a fault or latch:
-a simulated robot or tool keeps the lifecycle its controller reports with the
-reason `simulation_not_playing` and its streams stale, and the simulator
-component shows `prepared`. Enable and Execute are admitted, so the Program's
-own nodes can play the simulation. New motion and tool commands on such a
-component are refused with `simulation_not_playing`, and the node fails with
-that code.
+A simulation that isn't playing doesn't itself fault or latch the cell. When
+reachable and paused or stopped, the simulator component shows `prepared`; if
+unreachable, it stays `offline` with reason `simulator_unreachable`. Declaring
+`sim_reset` identifies the simulator, whose own state never latches the cell
+or blocks Execute. A simulated robot or tool keeps the lifecycle its
+controller reports with reason `simulation_not_playing` and stale streams.
+Enable and Execute remain available when otherwise ready, so the Program's
+own nodes can play the simulation. New motion and tool commands on a component
+showing `simulation_not_playing` are refused with that reason.
 
 ### Machines: owners and members
 
@@ -546,7 +554,7 @@ reports what the device or controller reports and adds no timers or retries
 of its own. Adapter families are shared libraries registered in the ament
 resource index `manyforge_component_adapters`; the execution host loads every
 family through the registry and links none of them. Families today: Mock,
-simulation and point-cloud (`manyforge_roboplan`), Isaac
+simulation, point-cloud and AI assistant (`manyforge_roboplan`), Isaac
 (`manyforge_isaac_adapter`), xArm (`manyforge_xarm_control`). Components
 without a lane (passive tools, I/O-driven grippers) get the host's small
 generic adapter.
@@ -636,7 +644,7 @@ specific: a Mock pass never qualifies an Isaac or physical run by itself.
 Arm and gripper lifecycles are deliberately separate. A deployment's gripper
 profile selects its command transport, progress/feedback source, dwell or result
 timeout, terminal policy, and any grasp-confirmation requirement. Mock, Isaac
-bridges, ROS `GripperCommand`, and future device transports keep the same
+bridges, ROS `ParallelGripperCommand`, and future device transports keep the same
 gripper node meaning. The viewer renders the authoritative gripper state it
 receives; it does not progress a command. On Stop, a gripper already within
 its finish tolerance of the target (`gripper_stop_finish_tolerance` in the
@@ -650,9 +658,25 @@ concurrent queries pin their own selected value. This avoids repeatedly
 re-verifying unchanged product bytes without adding an observation owner.
 
 The AI assistant is a separate axis and never changes an execution lane's
-command or state authority. The Deployment names the model server with one
-`ai_model` component; the always-started bridge (`:8100`) runs the model loop,
-and assistant edits land only in the Program Draft. See
+command or state authority. The Deployment names the model server with an
+`ai_model` component; its lane-free `assistant` component (at most one) names
+that model and an assistant profile with a chat mode. Headless builds what
+the model sees from the node catalog it loaded (node summaries and schemas,
+tool descriptors, named types) and publishes it with the model endpoint as the
+active assistant mode projection; the authorable nodes are the stable catalog
+nodes whose capabilities the Deployment provides. The assistant component's
+adapter runs a ROS host node (`assistant_host`) from Prepare; at Enable the
+host starts the ROS-free bridge on a loopback socket with an ephemeral port
+and the adapter publishes its URL as the endpoint `assistant_request`, which
+Composer reads for every call. Disable stops the bridge and cancels its
+requests; a host or bridge exit is the component's `fault_process_exited`.
+Chat and Program runs never overlap: Composer refuses a chat request while a
+run exists and Execute while one of its chat requests runs. The bridge runs
+the model loop: it re-verifies that
+projection before every model turn, checks each tool call's arguments, and
+sends Draft edits to Composer's tool callback, which commits them under the
+same fences as manual edits. Assistant edits land only in the Program Draft;
+the operator Applies or Discards them. See
 [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md).
 
 ______________________________________________________________________

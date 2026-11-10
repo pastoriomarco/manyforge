@@ -1,4 +1,4 @@
-"""Focused tests for the two UI6 execution-control lanes."""
+"""Focused tests for the two execution-control lanes."""
 
 from __future__ import annotations
 

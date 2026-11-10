@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-// DX-753: preserve native-named per-unit admission and launch plumbing for the held multi-unit discussion.
+// Preserve native-named per-unit admission and launch plumbing for the held multi-unit discussion.
 namespace manyforge::component_manager {
 namespace {
 

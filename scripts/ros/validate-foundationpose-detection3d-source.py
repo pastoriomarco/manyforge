@@ -7,7 +7,7 @@ raw-message evidence reducer plus the live-entrypoint gate.  It does not expose
 the former deployment-v0 pose-source object or its CLI schema.
 
 The former source-config builder, argument schema, and live ROS subscriber are
-intentionally absent until I9/I.  Their exact implementation is preserved at
+intentionally absent.  Their exact implementation is preserved at
 ManyForge commit 08222188293df8e12f90dc72e204c21f22f92ea1, blob
 0608a1a5cb7f717548414f2aa25271769263f87f.  They are acceptance input, not a
 runnable compatibility contract.
@@ -31,7 +31,7 @@ ROS_TIME_SEC_MAX = 2**31 - 1
 ROS_TIME_NANOSEC_MAX = 999_999_999
 UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: FoundationPose Detection3D live "
-    "qualification requires the I9/I focused ROS/Isaac adapter gate"
+    "qualification requires the focused ROS/Isaac adapter, not available yet"
 )
 
 

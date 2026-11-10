@@ -1,22 +1,20 @@
-"""Always-current mirror of the Kernel's global interrupt rule states (contract 64).
+"""Always-current mirror of the Kernel's global interrupt rule states.
 
-The existing ``events`` reply carries the outer ``interrupt_rule_state_baseline``
-(interrupt-state-events-wire02): null (no installed global rule catalog),
+The existing ``events`` reply carries the outer ``interrupt_rule_state_baseline``:
+null (no installed global rule catalog),
 ``{"status": "projection_pending"}`` or ``{"status": "ready", "snapshot": ...}``.
 The mirror installs a ready baseline whose context the same reply's catalog
-proves (SX-2216), then applies only same-context sparse
+proves, then applies only same-context sparse
 ``interrupt_rule_state_changed`` events whose existing event sequence is
 strictly after the baseline's ``through_sequence``. Pending keeps an already
 qualified mirror of the same context (it keeps following its sparse events),
 except notify rules become unavailable until a ready cut. It otherwise leaves
 the states unavailable, retried on the next poll. An
-owner change, an unknown catalog or one proving another full context
-(SX-2207/2216),
+owner change, an unknown catalog or one proving another full context,
 an unreadable page or a malformed row drops the mirror (unavailable, never
 clear) and recaptures from the next ready baseline.
 
-The same reply carries ``interrupt_rule_catalog`` (global-rule-runner-shape01,
-SX-2184), independent of the baseline's readiness: null (unknown or pending,
+The same reply carries ``interrupt_rule_catalog``, independent of the baseline's readiness: null (unknown or pending,
 never empty), ``{"status": "verified_empty", owner_epoch,
 active_publication_generation, bundle, graph}`` (proof of no global rule for
 that context) or the installed catalog's context with its sorted Applied
@@ -24,19 +22,19 @@ global ``rule_ids`` and the sorted union of their checked condition BB operands
 (``referenced_program_blackboard_keys``), optionally with the per-rule
 ``waiting_for_program`` annotation, or ``{"status": "waiting_for_program",
 owner_epoch, active_publication_generation, bundle, graph, rule_ids,
-waiting_for_program}`` (decision 110: no Program declares a key of these
+waiting_for_program}`` (no Program declares a key of these
 rules, so no rule catalog is installed and no state is sent). The mirror keeps
 the latest one read; its states are current only while that catalog proves
 their full context, and a waiting rule's state is unavailable, never clear.
 
 The same pages carry the existing ``stop_terminal_projected`` rows
-(``manyforge.stop_terminal_projection.v1``, SX-2215). The mirror, as the
+(``manyforge.stop_terminal_projection.v1``). The mirror, as the
 Runner's one reader of this event stream, keeps the latest bounded set of
 them by exact Stop id and generation so an interrupt node can read the
 attempted stages of its own Stop; a row is kept as read (a truncated one
 proves no attempt) and never affects the rule states.
 
-Delivery is a streaming subscription (``follow``, contract §8.1): the host
+Delivery is a streaming subscription (``follow``): the host
 streams every new journal row as an ``event`` and the reply's non-page facts
 as ``state`` when they change, after a first ``snapshot``. A streamed row is
 applied once (by sequence, also against a ``poll`` that read it first); a ready
@@ -121,7 +119,7 @@ _LOSS_ROW_TEXT_KEYS: Final = _LOSS_ROW_KEYS - {"lost", "set_key"}
 
 
 def _carried_object_lost_rows(rows: Any) -> tuple[Mapping[str, Any], ...] | None:
-    """The §8.1/§10 rows, strictly: closed keys, non-empty strings (``set_key``
+    """The carried-object-lost rows, strictly: closed keys, non-empty strings (``set_key``
     a non-empty string or null), ``lost: true`` and the target's signal name.
     Any invalid row makes the whole set unknown (None, nothing offered); the
     rule states are unaffected."""
@@ -152,7 +150,7 @@ _LAST_LOSS_KEYS: Final = frozenset({
 
 
 def _carried_object_last_losses(entries: Any) -> tuple[Mapping[str, Any], ...] | None:
-    """The §10 last losses, strictly: closed keys, all non-empty strings, one
+    """The last losses, strictly: closed keys, all non-empty strings, one
     entry per (robot, target, key). Any invalid entry makes the set unknown."""
 
     if not isinstance(entries, list):
@@ -198,9 +196,9 @@ class InterruptRuleStateMirror:
         self._subscribe = subscribe
         self._on_carried_object_lost = on_carried_object_lost
         # None: unknown (no snapshot yet, a gap, a lost stream): nothing is
-        # offered then, never an inferred empty set (SX-194).
+        # offered then, never an inferred empty set.
         self._carried_object_lost: tuple[Mapping[str, Any], ...] | None = None
-        # Contract §10 "Coalescing": the last loss per gripper and key; known
+        # Coalescing: the last loss per gripper and key; known
         # and unknown together with the rows.
         self._carried_object_last_losses: tuple[Mapping[str, Any], ...] | None = None
         # Streamed rule rows at or below it are covered by the installed
@@ -244,9 +242,9 @@ class InterruptRuleStateMirror:
             return states
 
     def _current_locked(self) -> dict[str, str] | None:
-        # Current only while the latest catalog proves exactly their context
-        # (SX-2216): an unknown (None) catalog proves none. A rule waiting for
-        # a Program (decision 110) is unavailable, never clear.
+        # Current only while the latest catalog proves exactly their context:
+        # an unknown (None) catalog proves none. A rule waiting for
+        # a Program is unavailable, never clear.
         context = self._context
         if context is None or self._catalog is None or not _proves(self._catalog, context):
             return None
@@ -267,7 +265,7 @@ class InterruptRuleStateMirror:
     ) -> Mapping[str, Any] | None:
         """The retained Stop terminal projection of exactly this Stop; None
         when not (yet) read. ``read_to_end`` (only after read_stop reported
-        ``recorded``, SX-2226): first read the events, after any read already
+        ``recorded``): first read the events, after any read already
         in flight, until the exact record or ``has_more`` is false; a reply
         error ends the read (unproven)."""
 
@@ -326,7 +324,7 @@ class InterruptRuleStateMirror:
         self._published = current
         return current, changed
 
-    # Event subscription (contract §8.1) -------------------------------------
+    # Event subscription ---------------------------------------------------------
 
     def follow(
         self, stop: Event, *, on_read: Callable[[], None] | None = None,
@@ -506,16 +504,16 @@ class InterruptRuleStateMirror:
             self._notify_sequences[rule_id] = sequence
 
     def carried_object_last_losses(self) -> tuple[Mapping[str, Any], ...] | None:
-        """The latest validated ``carried_object_last_losses`` (contract §10
-        "Coalescing"): the last loss per gripper and ``set_key``; None while
+        """The latest validated ``carried_object_last_losses``
+        (coalesced): the last loss per gripper and ``set_key``; None while
         the state is unknown, like the rows."""
 
         with self._lock:
             return self._carried_object_last_losses
 
     def carried_object_lost_signals(self) -> tuple[Mapping[str, Any], ...] | None:
-        """The latest validated ``carried_object_lost_signals`` rows (contract
-        §8.1); None while unknown (no snapshot yet, a gap or a lost stream)."""
+        """The latest validated ``carried_object_lost_signals`` rows;
+        None while unknown (no snapshot yet, a gap or a lost stream)."""
 
         with self._lock:
             return self._carried_object_lost
@@ -544,7 +542,7 @@ class InterruptRuleStateMirror:
             raise InterruptStateWireError("rule catalog names another Kernel owner")
         self._catalog, self._catalog_read = catalog, True
         if self._context is not None and (catalog is None or not _proves(catalog, self._context)):
-            # The catalog is unknown or proves another context (SX-2216): the
+            # The catalog is unknown or proves another context: the
             # prior states are no longer current (unavailable) until a ready
             # cut of the context a catalog proves.
             self._drop()

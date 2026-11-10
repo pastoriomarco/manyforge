@@ -196,11 +196,11 @@ struct ParticipantStopStageHelper::Run {
   const PreparedStopStageCommandDTO& command;
   std::stop_token cancellation;
   TimePoint started{};
-  /// This robot's own Stop-time bound (Q51): its controlled deadline for a
-  /// controlled stage, its lane's stop-completion timeout for a hard stage
-  /// (Q57). Once a Stop trajectory (controlled, or the hard stage's brake) is
-  /// sent, a normal motion's no-report bound for it (maintainer M6,
-  /// `FinishReplacement`, SX-609 `TryControlledHardStop`).
+  /// This robot's own Stop-time bound: its controlled deadline for a
+  /// controlled stage, its lane's stop-completion timeout for a hard stage.
+  /// Once a Stop trajectory (controlled, or the hard stage's brake) is
+  /// sent, a normal motion's no-report bound for it (`FinishReplacement`,
+  /// `TryControlledHardStop`).
   TimePoint terminal_deadline{};
   /// The Stop request (t0), recovered from the Kernel's elapsed time.
   TimePoint stop_requested_at{};
@@ -214,12 +214,12 @@ struct ParticipantStopStageHelper::Run {
   std::optional<ExecutionGoalKey> finish_goal;
   /// Trip measured positions (stop distance diagnostic).
   std::vector<double> trip_measured_positions;
-  /// Hard stop observability (§5, `main`'s `hard_stop` keys).
+  /// Hard stop observability (`main`'s `hard_stop` keys).
   std::optional<std::string> hard_stop_level;
   std::optional<std::string> hard_stop_fallback_reason;
-  /// Q50 "measure": the Stop goal's recognition delay (dispatch to anchor).
+  /// The Stop goal's recognition delay (dispatch to anchor).
   std::optional<Duration> recognition_delay_ns;
-  /// Q59: stale controller state seen while waiting; it is the stage failure.
+  /// Stale controller state seen while waiting; it is the stage failure.
   std::optional<ErrorDTO> stale_state_error;
   IStopStageSpringReturnObserver* spring_observer{};
   std::optional<SpringBackReturnPointDTO> spring_return_point{};
@@ -227,6 +227,7 @@ struct ParticipantStopStageHelper::Run {
   bool mode_not_carried_out{};
   double source_offset_s{0.0};
   std::optional<TimePoint> stop_ingress_at{};
+  std::chrono::steady_clock::time_point leaf_deadline{};
   std::optional<double> spring_return_cursor{};
   std::vector<double> spring_return_positions{};
   bool spring_return_target_frozen{};
@@ -257,12 +258,22 @@ ParticipantStopStageHelper::ParticipantStopStageHelper(IExecutionPort& port, con
 }
 
 void ParticipantStopStageHelper::BindDispatchedGoal(
-    StopStageDispatchedGoalDTO goal, std::shared_ptr<ExecutionSampleAssociation> association) {
+    StopStageDispatchedGoalDTO goal, std::shared_ptr<ExecutionSampleAssociation> association,
+    std::shared_ptr<GoalCancelAttempt> cancel) {
   if (!association) throw std::invalid_argument("A dispatched goal requires its association");
+  if (!cancel) cancel = std::make_shared<GoalCancelAttempt>();
   std::lock_guard lock(mutex_);
   sent_.assign(1U, SentGoal{goal.key, goal.trajectory, std::nullopt, std::move(association),
                            false, {}, goal.planned_controller_offset_s});
+  if (cancel) sent_.front().cancel = std::move(cancel);
   goal_ = std::move(goal);
+}
+
+void ParticipantStopStageHelper::ForgetKnownUnsent(const ExecutionGoalKey& key) {
+  std::lock_guard lock(mutex_);
+  if (!goal_ || goal_->key != key || sent_.size() != 1U || sent_.front().key != key) return;
+  sent_.clear();
+  goal_.reset();
 }
 
 ExecutionGoalKey ParticipantStopStageHelper::NextKey() const {
@@ -274,8 +285,17 @@ ExecutionGoalKey ParticipantStopStageHelper::NextKey() const {
 }
 
 void ParticipantStopStageHelper::Record(SentGoal goal) {
+  if (!goal.cancel) goal.cancel = std::make_shared<GoalCancelAttempt>();
   std::lock_guard lock(mutex_);
   sent_.push_back(std::move(goal));
+}
+
+std::optional<std::uint64_t> ParticipantStopStageHelper::SourceExecutionId(
+    const ExecutionGoalKey& key) const {
+  std::lock_guard lock(mutex_);
+  const auto it = std::find_if(sent_.rbegin(), sent_.rend(),
+                               [&](const SentGoal& goal) { return goal.key == key; });
+  return it != sent_.rend() && it->cancel ? it->cancel->execution_id : std::nullopt;
 }
 
 bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& source) {
@@ -290,10 +310,10 @@ bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& sour
 void ParticipantStopStageHelper::RecordReplacement(
     ExecutionGoalKey key, TrajectoryDTO trajectory,
     std::shared_ptr<ExecutionSampleAssociation> association,
-    double planned_controller_offset_s) noexcept {
+    double planned_controller_offset_s, std::shared_ptr<GoalCancelAttempt> cancel) noexcept {
   std::lock_guard lock(mutex_);
   sent_.push_back(SentGoal{std::move(key), std::move(trajectory), std::nullopt,
-                           std::move(association), true, {}, planned_controller_offset_s});
+                           std::move(association), true, {}, planned_controller_offset_s, std::move(cancel)});
 }
 
 void ParticipantStopStageHelper::RetireSettledReplacement(const ExecutionGoalKey& key) noexcept {
@@ -335,11 +355,36 @@ bool ParticipantStopStageHelper::CanCompleteNaturally(const ExecutionGoalKey& so
   return true;
 }
 
-bool ParticipantStopStageHelper::CancelGoals(const std::vector<SentGoal>& goals) {
+ExecutionPortCommandResultDTO ParticipantStopStageHelper::CancelExactGoal(
+    const ExecutionGoalKey& key, std::shared_ptr<GoalCancelAttempt> attempt,
+    std::chrono::steady_clock::time_point deadline) {
+  bool first;
+  {
+    std::lock_guard lock(attempt->mutex);
+    first = !attempt->started;
+    if (first) attempt->started = true;
+  }
+  if (first) {
+    ExecutionPortCommandResultDTO result;
+    try {
+      result = port_.Cancel(key, deadline);
+    } catch (...) {
+      result.dispatch = ExecutionPortDispatch::kEffectUncertain;
+    }
+    attempt->result.set_value(result);
+  }
+  if (attempt->completion.wait_until(deadline) != std::future_status::ready)
+    return {ExecutionPortDispatch::kEffectUncertain, std::nullopt,
+            stage_error("stop_evidence_phase_expired", "Cancel outcome was not confirmed before its deadline")};
+  return attempt->completion.get();
+}
+
+bool ParticipantStopStageHelper::CancelGoals(const std::vector<SentGoal>& goals,
+    std::chrono::steady_clock::time_point deadline) {
   bool sent = false;
   for (const auto& goal : goals) {
     try {
-      sent |= port_.Cancel(goal.key).dispatch != ExecutionPortDispatch::kNotDispatched;
+      sent |= CancelExactGoal(goal.key, goal.cancel, deadline).dispatch != ExecutionPortDispatch::kNotDispatched;
     } catch (...) {
       // A thrown send is uncertain; still request the other retained key.
       sent = true;
@@ -348,8 +393,8 @@ bool ParticipantStopStageHelper::CancelGoals(const std::vector<SentGoal>& goals)
   return sent;
 }
 
-bool ParticipantStopStageHelper::CancelLiveGoals() {
-  return CancelGoals(LiveGoals());
+bool ParticipantStopStageHelper::CancelLiveGoals(std::chrono::steady_clock::time_point deadline) {
+  return CancelGoals(LiveGoals(), deadline);
 }
 
 void ParticipantStopStageHelper::AdoptReplacement(
@@ -433,9 +478,18 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageForT
   return TranslateStopStageImpl(stage, budget, cancellation, &observer);
 }
 
+ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageWithDeadline(
+    const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
+    std::stop_token cancellation, IStopStageSpringReturnObserver* observer,
+    std::chrono::steady_clock::time_point deadline) {
+  return TranslateStopStageImpl(stage, budget, cancellation, observer, deadline);
+}
+
 ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl(
     const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
-    std::stop_token cancellation, IStopStageSpringReturnObserver* observer) {
+    std::stop_token cancellation, IStopStageSpringReturnObserver* observer,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+  const auto wall_started = std::chrono::steady_clock::now();
   const auto started = clock_.now();
   if (cancellation.stop_requested()) return superseded_result(stage);
   const auto refuse = [&](std::string reason, std::string message) {
@@ -457,7 +511,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
   if (command.resolved_stage.evidence_requirements.empty()) {
     return refuse("stop_evidence_requirements_missing", "Stop stage has no evidence contract");
   }
-  // Q51/Q57: a controlled stage runs to this robot's own controlled deadline;
+  // A controlled stage runs to this robot's own controlled deadline;
   // every hard stage is bounded by the lane's stop-completion timeout.
   const std::int64_t terminal_remaining =
       budget.remaining_controlled_deadline_ns.value_or(config_.hard_stop_completion_timeout_ns);
@@ -540,10 +594,12 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
           std::nullopt,
           std::nullopt};
   run.spring_observer = observer;
+  run.leaf_deadline = std::min(deadline.value_or(std::chrono::steady_clock::time_point::max()),
+      wall_started + std::chrono::nanoseconds(std::max<Duration>(0, terminal_remaining)));
   if (budget.stop_ingress_age_ns)
     run.stop_ingress_at = started - *budget.stop_ingress_age_ns;
   if (run.lane.supports_scheduled_replacement) run.lane.experiment.release_timer = true;
-  // Q42: the lane's hard stop is the controlled hard stop (level 3) with the
+  // The lane's hard stop is the controlled hard stop (level 3) with the
   // cancel (level 4) as its floor; a controller-goal cancel is level 4 itself.
   if (!controlled) return RunHardStage(run, software_hard);
   return RunControlledStage(run);
@@ -582,7 +638,7 @@ bool ParticipantStopStageHelper::Await(Run& run, const TimePoint deadline, Done&
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::Fail(const Run& run,
                                                                ErrorDTO error) const {
-  // Q59: stale controller state is the stage's failure whatever wait it ended.
+  // Stale controller state is the stage's failure whatever wait it ended.
   if (run.stale_state_error.has_value()) {
     auto stale = *run.stale_state_error;
     const auto reason = error.details.find("reason");
@@ -636,7 +692,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::Succeed(Run& run,
   std::optional<TimePoint> finish_goal_observed_at;
   const auto finish_key = run.finish_goal.value_or(run.goal.key);
   // One post-finish sample of the controller records the provenance of the
-  // finish (items 1/26: the controller reports the finish; no rest check).
+  // finish (the controller reports the finish; no rest check).
   const bool observed = Await(run, run.terminal_deadline, [&] {
     sample = port_.ReadSample();
     if (needs_goal_terminal) {
@@ -797,11 +853,11 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
   }
   run.profile = std::move(decoded.value());
   const auto& requested = *run.profile;
-  // Q42: a profile selecting the hard stop gets the cancel (level 4) directly.
+  // A profile selecting the hard stop gets the cancel (level 4) directly.
   if (requested.stop_mode == MotionInterruptStopMode::kHardDeceleration) {
     return RunHardStage(run, false);
   }
-  // Q36: an explicit jerk choice; only authored angular limits are frozen.
+  // An explicit jerk choice; only authored angular limits are frozen.
   if (!requested.jerk_limits_enabled.has_value() ||
       std::any_of(requested.per_joint_max_jerk.begin(), requested.per_joint_max_jerk.end(),
                   [](const auto& row) {
@@ -823,16 +879,23 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
                 stage_error("pending_replacement_has_no_controlled_source",
                             "The pending replacement leaves no qualified source or goal slot"));
 
-  // §4.2 step 1 (Q17/Q38): speed publication stops; the factor is frozen.
-  const double frozen = freeze_speed_factor_();
-  const double factor = run.lane.supports_scale ? frozen : 1.0;
-  // Q28/Q51: this robot's Stop deadline from its own profile, measured from the
+  // This robot's Stop deadline from its own profile, measured from the
   // Stop request; the Kernel's per-robot value is the same bound (never
   // extended).
   const auto stop_deadline =
       std::min(run.terminal_deadline,
                run.stop_requested_at +
                    controlled_stop_deadline_ns(requested, config_.complete_move_on_signal_timeout_ns));
+
+  // Freeze outside Core state locks, bounded by the same stage deadline.
+  const auto remaining = std::max<Duration>(0, stop_deadline - clock_.now());
+  const auto deadline = std::min(run.leaf_deadline,
+      std::chrono::steady_clock::now() + std::chrono::nanoseconds(remaining));
+  run.leaf_deadline = deadline;
+  const auto frozen = freeze_speed_factor_(deadline);
+  if (!frozen) return Fail(run, stage_error("stop_evidence_phase_expired",
+                                            "Stop scale freeze was not confirmed before its deadline"));
+  const double factor = run.lane.supports_scale ? *frozen : 1.0;
 
   const auto original = port_.ReadGoal(run.goal.key);
   if (terminal(original)) {
@@ -850,10 +913,10 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
     association = sent_.front().association;
   }
   if (run.lane.supports_scale) {
-    // Q45: the factor the controller reports as applied, from the latest
+    // The factor the controller reports as applied, from the latest
     // sample associated with the dispatched goal, is exactly 0 at the Stop
     // request (the arm stands still on its path): the Stop is the plain cancel
-    // (the Kernel's hard stop, finished per Q35) and ends Stopped with no
+    // (the Kernel's hard stop) and ends Stopped with no
     // error. Any non-zero applied factor (e.g. a ramp-down in progress)
     // follows the frozen-factor Stop below.
     const auto sample = port_.ReadSample();
@@ -873,7 +936,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
   }
 
   // Trip evidence: the latest sample associated with the dispatched goal that
-  // confirms the frozen factor (§3.2: reporting the last value sent proves
+  // confirms the frozen factor (reporting the last value sent proves
   // every earlier value was applied).
   std::optional<ExecutionControllerSampleDTO> trip;
   const bool tripped = Await(run, run.terminal_deadline, [&] {
@@ -900,7 +963,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
     run.source_offset_s = trip->cursor_s - estimate_stop_source_cursor(
         run.goal.trajectory, *trip, run.lane, run.goal.planned_controller_offset_s);
 
-  // §4.2 step 1: trip evidence per authority.
+  // Trip evidence per authority.
   SoftOnPathInitialStateDTO initial;
   initial.state.joint_names = run.lane.joint_names;
   const bool measured = config_.trip_authority == StateAuthorityClass::kMeasured;
@@ -1148,7 +1211,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   const std::string mode =
       run.outcome->executed_stop_mode == MotionInterruptStopMode::kSoftOnPath ? "soft_on_path"
                                                                               : "spring_back";
-  // §4.2 steps 3-4 (Q17, Q20): the original trajectory's own points up to the
+  // The original trajectory's own points up to the
   // trip point (the lead-in end), then the checked ramp in path time at the
   // frozen factor.
   auto lead_in_end =
@@ -1159,9 +1222,9 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   if (run.cancellation.stop_requested()) return superseded_result(run.stage);
   const auto next = NextKey();
   const auto baseline = port_.ReadSample();
-  // Q26: the join is computed immediately before the send, so the local time
+  // The join is computed immediately before the send, so the local time
   // since the trip sample is measured at the dispatch itself; checked against
-  // `main`'s acceptance-within-lead-in rule (Q22): the mechanism must start
+  // `main`'s acceptance-within-lead-in rule: the mechanism must start
   // the replacement before the planned trip point.
   const auto dispatched_at = clock_.now();
   auto start = compute_stop_replacement_start(
@@ -1232,10 +1295,16 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   if (const auto held = HoldForRelease(run, start.value(), dispatched_at, stop_deadline, mode)) {
     return *held;
   }
+  const auto cancel_slot = std::make_shared<GoalCancelAttempt>();
+  cancel_slot->execution_id = SourceExecutionId(run.goal.key);
+  if (!cancel_slot->execution_id || *cancel_slot->execution_id == 0U)
+    return Fail(run, stage_error("stop_execution_identity_missing",
+                                 "Stop replacement has no owning execution identity"));
+  auto dispatch_token = std::make_shared<ExecutionDispatchToken>(cancel_slot->execution_id);
   const auto sent = start.value().scheduled
                         ? port_.ReplaceScheduled(run.goal.key, next, joined.value(),
-                                                 *start.value().scheduled)
-                        : port_.Replace(run.goal.key, next, joined.value());
+                                                 *start.value().scheduled, dispatch_token)
+                        : port_.Replace(run.goal.key, next, joined.value(), dispatch_token);
   std::optional<StopReplacementCursorMapDTO> cursor_map;
   if (sent.dispatch != ExecutionPortDispatch::kNotDispatched &&
       law.replacement_path_time_s.size() == continuation.value().waypoints.size()) {
@@ -1257,15 +1326,15 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   }
   return FinishReplacement(run, sent, next, std::move(joined.value()), std::move(cursor_map),
                            baseline, dispatched_at, trip, mode, plan.path_deviation_max_rad,
-                           stop_deadline, start.value().controller_offset_s, frozen_factor);
+                           stop_deadline, start.value().controller_offset_s, frozen_factor, cancel_slot);
 }
 
-// Q130 (maintainer): ManyMove's controlled stop for searches and probes stopped
+// ManyMove's controlled stop for searches and probes stopped
 // by an interrupt. The active trajectory's points already passed (negative
 // times) plus one point at the trip position with zero velocity and
 // acceleration at the deceleration time; the controller interpolates the rest
 // (brake, overshoot, return). Sent at once: no planner, connector, limit or
-// collision check, by explicit maintainer decision.
+// collision check, by design.
 ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
     Run& run, const ExecutionControllerSampleDTO& trip,
     const std::vector<double>& trip_positions, const double frozen_factor,
@@ -1385,11 +1454,17 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
   }
   const auto next = NextKey();
   const auto baseline = port_.ReadSample();
-  const auto sent = scheduled ? port_.ReplaceScheduled(run.goal.key, next, stop, *scheduled)
-                              : port_.Replace(run.goal.key, next, stop);
+  const auto cancel_slot = std::make_shared<GoalCancelAttempt>();
+  cancel_slot->execution_id = SourceExecutionId(run.goal.key);
+  if (!cancel_slot->execution_id || *cancel_slot->execution_id == 0U)
+    return Fail(run, stage_error("stop_execution_identity_missing",
+                                 "Stop replacement has no owning execution identity"));
+  auto dispatch_token = std::make_shared<ExecutionDispatchToken>(cancel_slot->execution_id);
+  const auto sent = scheduled ? port_.ReplaceScheduled(run.goal.key, next, stop, *scheduled, dispatch_token)
+                              : port_.Replace(run.goal.key, next, stop, dispatch_token);
   return FinishReplacement(run, sent, next, std::move(stop), std::nullopt, baseline,
                            dispatched_at, trip, "spring_back_fast", 0.0, stop_deadline,
-                           scheduled_start.controller_offset_s, frozen_factor);
+                           scheduled_start.controller_offset_s, frozen_factor, cancel_slot);
 }
 
 // EXPERIMENTAL release timer: hold before the send through the stage's own
@@ -1433,7 +1508,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     const std::optional<ExecutionControllerSampleDTO>& baseline, const TimePoint dispatched_at,
     const ExecutionControllerSampleDTO& trip, const std::string& mode,
     const double initial_path_deviation_rad, const TimePoint stop_deadline, double controller_offset_s,
-    const double frozen_factor) {
+    const double frozen_factor, std::shared_ptr<GoalCancelAttempt> cancel_slot) {
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     const auto original = port_.ReadGoal(run.goal.key);
     if (original.has_value() && original->result == ExecutionGoalResult::kSucceeded &&
@@ -1452,7 +1527,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   }
   run.dispatched = true;
   run.finish_goal = next;
-  // Maintainer M6: once sent, the Stop trajectory finishes like a normal
+  // Once sent, the Stop trajectory finishes like a normal
   // motion, on the controller's report (success, or its goal-tolerance
   // verdict after `goal_time`). Its no-report bound is a normal motion's for
   // the trajectory as the controller runs it (path time at the frozen
@@ -1468,17 +1543,17 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   const auto association = std::make_shared<ExecutionSampleAssociation>(
       port_.ReadReadiness().binding_epoch, baseline, dispatched_at);
   Record(SentGoal{next, std::move(sent_trajectory), std::move(cursor_map), association,
-                  false, {}, controller_offset_s});
+                  false, {}, controller_offset_s, std::move(cancel_slot)});
   if (sent.dispatch == ExecutionPortDispatch::kEffectUncertain) {
     return Fail(run, stage_error(mode + "_path_ramp_dispatch_uncertain",
                                  "The Stop replacement may already affect the controller"));
   }
 
-  // `main`'s replacement-within-lead-in check (Q22), with Q59's proof: the
+  // `main`'s replacement-within-lead-in check, with a proof: the
   // replacement took over only once its own feedback or its own result is
   // observed within the lane lead-in (`stop_traj_delta_s`); acceptance alone
   // is never proof. `replacement_start_allowance_s` stays only the join
-  // timing estimate (Q26/Q55). SX-263: the proof counts by when it was
+  // timing estimate. The proof counts by when it was
   // received (the anchor's local receipt), not by when the poll wakes.
   bool rejected = false;
   const auto lead_in_ns = static_cast<Duration>(config_.stop_traj_delta_s * 1e9);
@@ -1492,7 +1567,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     return association->ObserveGoal(goal);
   });
   const auto recognition = association->recognition_delay_ns();
-  // SX-268: eligibility uses the actual capped window (the lead-in, or less
+  // Eligibility uses the actual capped window (the lead-in, or less
   // when the stage deadline comes first).
   const bool accepted =
       anchored && recognition.has_value() && *recognition <= accept_deadline - dispatched_at;
@@ -1505,7 +1580,12 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
                                  "The controller rejected the Stop replacement"));
   }
   if (!accepted) {
-    (void)port_.Cancel(next);
+    for (const auto& goal : LiveGoals()) {
+      if (goal.key == next) {
+        (void)CancelExactGoal(next, goal.cancel, run.leaf_deadline);
+        break;
+      }
+    }
     return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
                                  "The Stop replacement showed no own feedback or result within "
                                  "the lead-in",
@@ -1519,7 +1599,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   }
 
   // Finish: the replacement's result, like a normal motion's; the path
-  // deviation is measured from the controller samples meanwhile (Q22
+  // deviation is measured from the controller samples meanwhile (a
   // diagnostic). The post-finish observation shares the same bound.
   run.terminal_deadline = no_report_deadline;
   double deviation = initial_path_deviation_rad;
@@ -1579,7 +1659,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   }
   if (finished->result == ExecutionGoalResult::kAbortedGoalTolerance &&
       run.lane.goal_tolerance_policy == ExecutionGoalTolerancePolicy::kKept) {
-    // Q18: `main`'s confirmed-but-not-settled case; the Kernel ends the
+    // `main`'s confirmed-but-not-settled case; the Kernel ends the
     // participant InterventionRequired without a second Stop command.
     return Fail(run, stage_error("stop_goal_tolerance_violated",
                                  "The Stop ramp ended outside the controller's goal tolerance",
@@ -1653,7 +1733,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunEndedGoalHold(Run& 
   TimePoint finish_receipt{};
   const bool held = Await(run, run.terminal_deadline, [&] {
     const auto sample = port_.ReadSample();
-    // Q50 (SX-264): the hold is a sample of the ended goal's epoch whose
+    // The hold is a sample of the ended goal's epoch whose
     // controller source stamp is newer than the newest evidence associated
     // with that goal (or, with none, than the newest sample before it was
     // sent); a local receipt after the result alone never orders it.
@@ -1678,14 +1758,20 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunEndedGoalHold(Run& 
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::RunHardStage(
     Run& run, const bool controlled_hard_stop_allowed) {
-  // Q28/Q57 (as `main`): the hard stop is bounded by the lane's stop
+  // The hard stop is bounded by the lane's stop
   // completion timeout from the stage start; the Kernel arms no watchdog of
   // its own for it. A brake that is sent finishes like a normal motion
-  // instead (SX-609, `TryControlledHardStop`).
+  // instead (`TryControlledHardStop`).
   run.terminal_deadline =
       std::min(run.terminal_deadline, run.started + config_.hard_stop_completion_timeout_ns);
-  // Q35: on any hard-stop trigger the speed ramp stops.
-  (void)freeze_speed_factor_();
+  // On any hard-stop trigger the speed ramp stops.
+  const auto hard_remaining = std::max<Duration>(0, run.terminal_deadline - clock_.now());
+  const auto deadline = std::min(run.leaf_deadline,
+      std::chrono::steady_clock::now() + std::chrono::nanoseconds(hard_remaining));
+  run.leaf_deadline = deadline;
+  if (!freeze_speed_factor_(deadline))
+    return Fail(run, stage_error("stop_evidence_phase_expired",
+                                 "Stop scale freeze was not confirmed before its deadline"));
   if (run.profile.has_value()) {
     ControlledStopResultDTO outcome;
     outcome.accepted = true;
@@ -1696,11 +1782,12 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunHardStage(
   const auto live = LiveGoals();
   if (live.empty()) return RunEndedGoalHold(run);
 
-  // Q35: freeze at the controller's actual applied factor, pinned once.
+  // Freeze at the controller's actual applied factor, pinned once.
   const auto sample = port_.ReadSample();
   std::optional<double> applied;
   if (sample.has_value() && sample->applied_factor.has_value()) applied = sample->applied_factor;
-  if (run.lane.supports_scale && applied.has_value()) (void)port_.SetScale(*applied);
+  if (run.lane.supports_scale && applied.has_value())
+    (void)port_.SetScale(*applied, port_.ReserveScaleSequence());
   const double factor = run.lane.supports_scale ? applied.value_or(0.0) : 1.0;
 
   std::string fallback_reason;
@@ -1768,7 +1855,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     positions = source.value().positions_rad;
     velocities = source.value().velocities_rad_s;
   }
-  // Q42's unchanged law uses the first commanded source P/V, including the
+  // The brake's unchanged law uses the first commanded source P/V, including the
   // existing sampler endpoint clamp. Its initial A is the brake's own law.
   const auto brake = plan_controlled_hard_stop_brake(
       {names, *positions, *velocities, factor, config_.max_deceleration_on_cancel_rad_s2,
@@ -1779,7 +1866,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   }
   const auto next = NextKey();
   const auto pre_dispatch = port_.ReadSample();
-  // Q26: the join is computed immediately before the send (local time since
+  // The join is computed immediately before the send (local time since
   // the sample measured at the dispatch itself).
   const auto dispatched_at = start ? join_started_at : clock_.now();
   const auto elapsed = start ? Result<double>::Ok(start->elapsed_path_s)
@@ -1809,9 +1896,15 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     fallback_reason = "controlled_hard_stop_join_failed";
     return std::nullopt;
   }
+  const auto cancel_slot = std::make_shared<GoalCancelAttempt>();
+  cancel_slot->execution_id = SourceExecutionId(live.key);
+  if (!cancel_slot->execution_id || *cancel_slot->execution_id == 0U)
+    return Fail(run, stage_error("stop_execution_identity_missing",
+                                 "Stop replacement has no owning execution identity"));
+  auto dispatch_token = std::make_shared<ExecutionDispatchToken>(cancel_slot->execution_id);
   const auto sent = start ? port_.ReplaceScheduled(live.key, next, joined.value(),
-                                                   *start->scheduled)
-                          : port_.Replace(live.key, next, joined.value());
+                                                   *start->scheduled, dispatch_token)
+                          : port_.Replace(live.key, next, joined.value(), dispatch_token);
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     fallback_reason = "controlled_hard_stop_refused";
     return std::nullopt;
@@ -1821,8 +1914,8 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   const auto association =
       std::make_shared<ExecutionSampleAssociation>(goal->binding_epoch, pre_dispatch, dispatched_at);
   Record(SentGoal{next, joined.value(), std::nullopt, association, false, {},
-                  start ? start->controller_offset_s : 0.0});
-  // The brake's final point in lane joint order (Q50 level-3 finish).
+                  start ? start->controller_offset_s : 0.0, cancel_slot});
+  // The brake's final point in lane joint order.
   const auto final_point =
       reorder(joined.value().waypoints.back().positions_rad, names, run.lane.joint_names);
   if (!final_point.has_value()) {
@@ -1830,11 +1923,11 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return std::nullopt;
   }
 
-  // Q59: the brake has taken over only when its own
-  // first anchor (Q50: its feedback, or its own terminal result when that
+  // The brake has taken over only when its own
+  // first anchor (its feedback, or its own terminal result when that
   // arrives first) is observed within the lane lead-in (`stop_traj_delta_s`);
   // otherwise level 4 (the cancel) follows. Acceptance alone is never proof
-  // and a cursor restart never counts. SX-263: the proof counts by when it
+  // and a cursor restart never counts. The proof counts by when it
   // was received (the anchor's local receipt within dispatch + lead-in), not
   // by when the poll wakes.
   bool rejected = false;
@@ -1849,7 +1942,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return association->ObserveGoal(brake_goal);
   });
   const auto recognition = association->recognition_delay_ns();
-  // SX-268: eligibility uses the actual capped window (the lead-in, or less
+  // Eligibility uses the actual capped window (the lead-in, or less
   // when the stage deadline comes first).
   const bool started =
       anchored && recognition.has_value() && *recognition <= install_deadline - dispatched_at;
@@ -1864,7 +1957,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   }
   run.hard_stop_level = "controlled_hard_stop";
   run.recognition_delay_ns = association->recognition_delay_ns();
-  // SX-609 (maintainer M6): the installed brake is a trajectory with the
+  // The installed brake is a trajectory with the
   // arrival check, so it finishes like a normal motion: on the controller's
   // report, with a normal motion's no-report bound for the brake in wall time
   // at the frozen factor (its path time / factor), not the lane's hard-stop
@@ -1875,7 +1968,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
           joined.value().waypoints.empty()
               ? 0.0
               : std::max(0.0, joined.value().waypoints.back().time_from_start_s) / factor);
-  // Q50 level-3 finish, as JTC realizes it (Track 2 SX-162/164): this brake's
+  // Level-3 finish, as JTC realizes it: this brake's
   // own kSucceeded plus a sample newer (controller source stamp) than the
   // newest evidence associated with the brake (or, with none, than the newest
   // sample seen before the Replace was sent) whose reference velocity is
@@ -1886,12 +1979,12 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   std::optional<ExecutionGoalResult> ended_unsuccessfully;
   const bool finished = Await(run, run.terminal_deadline, [&] {
     const auto brake_goal = port_.ReadGoal(next);
-    // Q50: the brake's newly read own feedback is evidence before any
-    // NewerThanEvidence test in this poll (Track 2 SX-202).
+    // The brake's newly read own feedback is evidence before any
+    // NewerThanEvidence test in this poll.
     (void)association->ObserveGoal(brake_goal);
     if (brake_goal.has_value() && brake_goal->phase == ExecutionGoalPhase::kTerminal &&
         brake_goal->result != ExecutionGoalResult::kSucceeded) {
-      // Q42: a brake that ends any other way is not finished; level 4 follows
+      // A brake that ends any other way is not finished; level 4 follows
       // at once instead of waiting for the hard-stop bound.
       ended_unsuccessfully = brake_goal->result.value_or(ExecutionGoalResult::kEndedUnknown);
       return true;
@@ -1940,7 +2033,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
   if (live.empty()) return RunEndedGoalHold(run);
   // The newest sample before the cancel orders every counted sample.
   auto baseline = port_.ReadSample();
-  // SX-218 (Q50): the switch baseline is only a sample that the association
+  // The switch baseline is only a sample that the association
   // of a cancelled goal attributes to that goal. A sample before any such
   // goal's first anchor (e.g. the controller's pre-goal hold) is no
   // baseline: no switch can then be established, and without the factor-0
@@ -1955,15 +2048,9 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
       }
     }
   }
-  // Q35: always cancel, also at factor 0; every goal that may still run.
+  // Always cancel, also at factor 0; every goal that may still run.
   const bool pending_replacement = HasPendingReplacement();
-  bool any_sent = false;
-  if (pending_replacement) {
-    any_sent = CancelGoals(live);
-  } else {
-    for (const auto& goal : live)
-      any_sent |= port_.Cancel(goal.key).dispatch != ExecutionPortDispatch::kNotDispatched;
-  }
+  bool any_sent = CancelGoals(live, run.leaf_deadline);
   if (live.empty() || !any_sent) {
     return Fail(run, stage_error("hard_stop_cancel_not_dispatched",
                                  "The controller cancel was not dispatched"));
@@ -1972,7 +2059,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
   auto newest = live.front().key;
   std::array<bool, kExecutionGoalRecordCapacity> restoration_attempted{};
   run.finish_goal = newest;
-  // Q5/Q35 finish with Q50 ordering. Every counted sample is received after
+  // Cancel finish and sample ordering. Every counted sample is received after
   // this cancel was sent and is newer (controller source stamp, same epoch)
   // than the sample read before it. (1) Cancel braking: the positively
   // acknowledged cancel, the observed switch to the cancel trajectory (cursor
@@ -2008,10 +2095,25 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunCancel(Run& run) {
         if (fresh_baseline && live[index].association &&
             live[index].association->Observe(*fresh_baseline, predecessor))
           fresh_switch_baseline = fresh_baseline;
+        // The key's one cancel slot is one-shot. If its first attempt sent
+        // nothing (stale while superseded), this retry gets a fresh slot;
+        // otherwise it joins the existing one.
+        auto slot = live[index].cancel;
+        if (slot && slot->completion.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+            slot->completion.get().dispatch == ExecutionPortDispatch::kNotDispatched) {
+          auto fresh = std::make_shared<GoalCancelAttempt>();
+          fresh->execution_id = slot->execution_id;
+          {
+            std::lock_guard lock(mutex_);
+            for (auto& sent : sent_)
+              if (sent.key == live[index].key && sent.cancel == slot) sent.cancel = fresh;
+          }
+          slot = std::move(fresh);
+        }
         bool possibly_sent = true;
         try {
           possibly_sent =
-              port_.Cancel(live[index].key).dispatch != ExecutionPortDispatch::kNotDispatched;
+              CancelExactGoal(live[index].key, slot, run.leaf_deadline).dispatch != ExecutionPortDispatch::kNotDispatched;
         } catch (...) {
           // Keep uncertainty and let only this key's actual evidence finish.
         }

@@ -505,10 +505,10 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     record.api_version,
     'managerDeploymentCandidatePreview.api_version',
   );
-  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+  if (apiVersion !== 'manyforge.manager_command_response.v2') {
     return fail(
       'managerDeploymentCandidatePreview.api_version',
-      'manyforge.manager_command_response.v1',
+      'manyforge.manager_command_response.v2',
     );
   }
   const receipt = objectAt(
@@ -621,34 +621,26 @@ function programUnresolvedReferencesAt(
   const strings = (item: unknown, itemPath: string) => boundedArrayAt(item, itemPath, 4096)
     .map((entry, index) => stringAt(entry, `${itemPath}[${index}]`));
   const unresolvedReferences = boundedArrayAt(
-    outcome.unresolved_roles,
-    `${outcomePath}.unresolved_roles`,
+    outcome.unresolved_targets,
+    `${outcomePath}.unresolved_targets`,
     256,
   ).map((entry, index) => {
-    const rowPath = `${outcomePath}.unresolved_roles[${index}]`;
+    const rowPath = `${outcomePath}.unresolved_targets[${index}]`;
     const row = objectAt(entry, rowPath);
-    exactKeysAt(
-      row,
-      [
-        'command_target_id', 'component_role_id', 'controllable_component_id',
-        'detail', 'reason', 'target_role_id',
-      ],
-      rowPath,
-    );
+    exactKeysAt(row, ['target', 'detail', 'reason'], rowPath);
+    const target = objectAt(row.target, `${rowPath}.target`);
+    exactKeysAt(target, ['component_id', 'command_target_id'], `${rowPath}.target`);
     return {
-      component_role_id: stringAt(row.component_role_id, `${rowPath}.component_role_id`),
-      target_role_id: nullableStringAt(row.target_role_id, `${rowPath}.target_role_id`),
-      controllable_component_id: stringAt(
-        row.controllable_component_id,
-        `${rowPath}.controllable_component_id`,
-      ),
-      command_target_id: nullableStringAt(row.command_target_id, `${rowPath}.command_target_id`),
+      target: {
+        component_id: stringAt(target.component_id, `${rowPath}.target.component_id`),
+        command_target_id: stringAt(target.command_target_id, `${rowPath}.target.command_target_id`),
+      },
       reason: stringAt(row.reason, `${rowPath}.reason`),
       detail: stringAt(row.detail, `${rowPath}.detail`),
     };
   });
   if (unresolvedReferences.length === 0) {
-    return fail(`${outcomePath}.unresolved_roles`, 'at least one named reference');
+    return fail(`${outcomePath}.unresolved_targets`, 'at least one named reference');
   }
   return {
     unresolvedReferences,
@@ -810,10 +802,10 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     'managerApply',
   );
   const apiVersion = stringAt(record.api_version, 'managerApply.api_version');
-  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+  if (apiVersion !== 'manyforge.manager_command_response.v2') {
     return fail(
       'managerApply.api_version',
-      'manyforge.manager_command_response.v1',
+      'manyforge.manager_command_response.v2',
     );
   }
   const ok = booleanAt(record.ok, 'managerApply.ok');
@@ -859,7 +851,7 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     );
   }
   const base = {
-    apiVersion: 'manyforge.manager_command_response.v1' as const,
+    apiVersion: 'manyforge.manager_command_response.v2' as const,
     applyGeneration: positiveIntegerAt(
       record.apply_generation,
       'managerApply.apply_generation',
@@ -950,10 +942,10 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
     record.api_version,
     'managerApplyStatus.api_version',
   );
-  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+  if (apiVersion !== 'manyforge.manager_command_response.v2') {
     return fail(
       'managerApplyStatus.api_version',
-      'manyforge.manager_command_response.v1',
+      'manyforge.manager_command_response.v2',
     );
   }
   if (!booleanAt(record.ok, 'managerApplyStatus.ok')) {
@@ -1207,10 +1199,10 @@ export function parsePreparedActivationInput(
     'node_environment_digest', 'assistant_mode',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.prepared_activation_input.v6') {
+  if (schemaVersion !== 'manyforge.prepared_activation_input.v7') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v6',
+      'manyforge.prepared_activation_input.v7',
     );
   }
   const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);

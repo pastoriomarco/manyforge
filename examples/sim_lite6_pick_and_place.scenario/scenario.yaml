@@ -1,20 +1,18 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Isaac Sim pick and place with a UFACTORY Lite6 and the articulated lite pneumatic gripper, driven through ROS 2 control. Start Isaac, Load and Execute the Program to watch the Lite6 move the part.",
   "members": {
-    "assignment.yaml": "sha256:8159792a2275afe3fdd8e7f0e7012c133a8a6792a3876900b78ce6611ee7ff82",
-    "deployment.yaml": "sha256:23f9e57bde99587a6a04d5a2e396dd687fe8194409bee4e35e02e5e085b1d7e7",
-    "program.yaml": "sha256:07c0ed1863a97deb8f03448c19e1e27851464f735c15a9b88e39a4d5e5410998"
+    "deployment.yaml": "sha256:e56253011f4804fbf5dd280d3c2a8ff02fa096eaa2d6100ee1884bffd0250485",
+    "program.yaml": "sha256:0a2712b5addc716a32f51c01397f058ea0c2f587ff618b5a5ae1e1e5b24eb2fb"
   },
   "name": "sim_lite6_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:bf65ff7dd8291287ae0f5466d50a2b33367dc4558eab11207439ba47f1d00103",
-    "last_known_status": "ready",
+    "checked_content_digest": "sha256:60dcd63f4302a3f016ecf103c9925c7a6a6cba67505885594120957f7c79a312",
+    "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },
   "scenario_id": "sim_lite6_pick_and_place",

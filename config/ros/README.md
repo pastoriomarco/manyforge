@@ -19,11 +19,11 @@ inputs, then set `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
 `MANYFORGE_RMW_IMPLEMENTATION`, `MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`,
 `MANYFORGE_ROS_STATIC_PEERS`), identically in every participant shell.
 
-## `isaac_i9.env.sh`: explicit peer list
+## `isaac_static_peers.env.sh`: explicit peer list
 
 ```bash
 MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
-source "${MANYFORGE_ROOT}/config/ros/isaac_i9.env.sh"
+source "${MANYFORGE_ROOT}/config/ros/isaac_static_peers.env.sh"
 ```
 
 Defaults (an already set standard variable is kept):

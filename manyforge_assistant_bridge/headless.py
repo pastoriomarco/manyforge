@@ -8,11 +8,11 @@ from typing import Any, Final, Protocol
 from manyforge_headless_api.read_client import HeadlessReadClient
 
 
-ASSISTANT_H0_READ_OPERATIONS: Final = frozenset(HeadlessReadClient.operations())
+ASSISTANT_READ_OPERATIONS: Final = frozenset(HeadlessReadClient.operations())
 
 
 class AssistantHeadlessReadError(ValueError):
-    """An assistant requested behavior outside the closed H0 read surface."""
+    """An assistant requested behavior outside the closed read surface."""
 
 
 class HeadlessReadPort(Protocol):
@@ -36,7 +36,7 @@ class AssistantHeadlessReadClient:
         operation: str,
         arguments: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if operation not in ASSISTANT_H0_READ_OPERATIONS:
+        if operation not in ASSISTANT_READ_OPERATIONS:
             raise AssistantHeadlessReadError(
                 f"assistant operation {operation!r} is outside the closed "
                 "owner-neutral read surface"
@@ -45,7 +45,7 @@ class AssistantHeadlessReadClient:
 
 
 __all__ = [
-    "ASSISTANT_H0_READ_OPERATIONS",
+    "ASSISTANT_READ_OPERATIONS",
     "AssistantHeadlessReadClient",
     "AssistantHeadlessReadError",
 ]

@@ -122,6 +122,17 @@ describe('Components tab status', () => {
     expect(componentsTabStatus({ components: liveCell(), latch: null }).readiness).toBe('ready');
   });
 
+  it('shows a simulator fault or offline simulator as a warning, never a fault (OD-45)', () => {
+    for (const lifecycle of ['fault', 'offline'] as const) {
+      const states = [...liveCell(), component('isaac_sim', lifecycle, { capabilities: ['sim_reset'] })];
+      expect(componentsTabStatus({ components: states, latch: UNLATCHED }).readiness).toBe('degraded');
+    }
+    // Any other component's fault stays a fault.
+    const states = liveCell().map((state) => state.component_id === 'plc_io'
+      ? component('plc_io', 'fault') : state);
+    expect(componentsTabStatus({ components: states, latch: UNLATCHED }).readiness).toBe('fault');
+  });
+
   it('wants attention for a non-owner only prepared, not prepared, offline or unknown activity', () => {
     const cases: Array<[ComponentState, string]> = [
       [component('plc_io', 'prepared'), 'plc_io: Prepared'],

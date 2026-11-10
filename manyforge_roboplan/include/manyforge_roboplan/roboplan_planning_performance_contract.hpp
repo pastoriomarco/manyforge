@@ -12,8 +12,8 @@ namespace manyforge::roboplan_backend {
 
 // Owner-neutral qualification contract extracted from
 // manyforge_roboplan/include/manyforge_roboplan/roboplan_planner_backend.hpp at
-// parent c4b075fa6dfb69e463c61f3efa8cfce8de681e8a (deleted by 0822218). The
-// future I6 planning adapter may consume this contract, but no planner owner is
+// parent c4b075fa6dfb69e463c61f3efa8cfce8de681e8a (deleted by 0822218). A
+// planning adapter may consume this contract, but no planner owner is
 // restored here.
 struct RoboPlanCollisionProbeSnapshot {
   bool available = false;

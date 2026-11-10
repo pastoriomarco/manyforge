@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -58,7 +59,11 @@ struct World final {
                               status->Set(next);
                             },
                             [this] { return measured; }, &clock,
-                            [this] { return broadcaster; }});
+                            [this] { return broadcaster; },
+                            [this] {
+                              if (on_activity) on_activity();
+                              return controllers_inactive;
+                            }});
   }
   [[nodiscard]] core::ActionResult Run(const ComponentAction action) {
     return adapter->Run(action, std::stop_token{});
@@ -96,6 +101,8 @@ struct World final {
   bool arms_robot{true};
   /// The controller manager's activity shows the broadcaster active.
   bool broadcaster{true};
+  bool controllers_inactive{false};
+  std::function<void()> on_activity;
   /// The controller keeps reporting.
   bool reporting{true};
   /// The plugin's own controller switching, after a hardware switch and on
@@ -129,7 +136,7 @@ void CycleControllersAfterTheArming(World &world, const bool reactivates,
 using Actions = std::vector<ComponentAction>;
 using Ids = std::vector<std::string>;
 
-// XPW-1: Prepare and Recover leave the motors off: the lane's action (no
+// Prepare and Recover leave the motors off: the lane's action (no
 // hardware switch), the hardware off, a fresh report; no driver call (the
 // owner clears errors), never the hardware on (the plugin's motion_enable).
 TEST(XArmArmAdapter, PrepareAndRecoverKeepTheMotorsOffAndPowerIsTheMachines) {
@@ -199,6 +206,99 @@ TEST(XArmArmAdapter, PrepareFailsWithoutAStatusReportOrWithTheHardwareRefused) {
   EXPECT_EQ(refused.lane->actions, Actions{ComponentAction::kRecover});
 }
 
+TEST(XArmArmAdapter, EstopFlagOnlyReplacesStaleForKnownInactiveControllers) {
+  World world;
+  ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  world.adapter->ObserveOwnerEstop();
+  world.status->Set(report(world.clock.now()));
+  world.lane->state.lifecycle = ComponentLifecycle::kFault;
+  world.lane->state.fault = core::Fault{core::FaultCode::kStreamStale,
+      "measured stream stopped", true, core::FaultOperatorAction::kRecover,
+      {}, {}, {}, world.clock.now()};
+
+  // During the reported e-stop, only the stale stream fault is replaced.
+  world.status->Set(report(world.clock.now(), 2));
+  const auto during_stop = world.adapter->State(world.clock.now());
+  EXPECT_FALSE(during_stop.fault);
+  ASSERT_TRUE(during_stop.reason);
+  EXPECT_EQ(during_stop.reason->code, "stopped_by_estop");
+  world.status->Set(report(world.clock.now()));
+
+  // Unknown or active controller activity does not explain stream silence.
+  EXPECT_EQ(world.adapter->State(world.clock.now()).fault->code,
+            core::FaultCode::kStreamStale);
+  world.controllers_inactive = true;
+  const auto stopped = world.adapter->State(world.clock.now());
+  EXPECT_FALSE(stopped.fault);
+  EXPECT_EQ(stopped.lifecycle, ComponentLifecycle::kPrepared);
+  ASSERT_TRUE(stopped.reason);
+  EXPECT_EQ(stopped.reason->code, "controllers_stopped_after_estop");
+
+  // A different controller error must not be relabelled as a cleared e-stop.
+  world.status->Set(report(world.clock.now(), 31));
+  EXPECT_EQ(world.adapter->State(world.clock.now()).fault->code,
+            core::FaultCode::kStreamStale);
+  world.status->Set(report(world.clock.now()));
+
+  // A new owner cannot inherit the old owner's presentation flag.
+  world.adapter->ForgetOwnerEstop();
+  EXPECT_EQ(world.adapter->State(world.clock.now()).fault->code,
+            core::FaultCode::kStreamStale);
+}
+
+TEST(XArmArmAdapter, ArmActionsClearPriorEstopPresentation) {
+  for (const auto action : {ComponentAction::kEnable, ComponentAction::kDisable,
+                            ComponentAction::kRecover}) {
+    World world;
+    ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+    world.adapter->ObserveOwnerEstop();
+    ASSERT_EQ(world.Run(action).outcome, ActionOutcome::kSucceeded);
+    world.controllers_inactive = true;
+    world.lane->state.lifecycle = ComponentLifecycle::kFault;
+    world.lane->state.fault = core::Fault{core::FaultCode::kStreamStale,
+        "measured stream stopped", true, core::FaultOperatorAction::kRecover,
+        {}, {}, {}, world.clock.now()};
+    EXPECT_EQ(world.adapter->State(world.clock.now()).fault->code,
+              core::FaultCode::kStreamStale);
+  }
+}
+
+TEST(XArmArmAdapter, OwnerReplacementDuringActivityReadKeepsStaleFault) {
+  World world;
+  ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  world.adapter->ObserveOwnerEstop();
+  world.controllers_inactive = true;
+  world.lane->state.lifecycle = ComponentLifecycle::kFault;
+  world.lane->state.fault = core::Fault{core::FaultCode::kStreamStale,
+      "measured stream stopped", true, core::FaultOperatorAction::kRecover,
+      {}, {}, {}, world.clock.now()};
+  std::promise<void> entered;
+  std::promise<void> resume;
+  auto resume_signal = resume.get_future();
+  world.on_activity = [&] { entered.set_value(); resume_signal.wait(); };
+  auto state = std::async(std::launch::async, [&] {
+    return world.adapter->State(world.clock.now());
+  });
+  entered.get_future().wait();
+  world.adapter->ForgetOwnerEstop();
+  resume.set_value();
+  const auto result = state.get();
+  ASSERT_TRUE(result.fault);
+  EXPECT_EQ(result.fault->code, core::FaultCode::kStreamStale);
+}
+
+TEST(XArmArmAdapter, EstopWhileNotArmedDoesNotMaskStale) {
+  World world;
+  world.adapter->ObserveOwnerEstop();
+  world.controllers_inactive = true;
+  world.lane->state.lifecycle = ComponentLifecycle::kFault;
+  world.lane->state.fault = core::Fault{core::FaultCode::kStreamStale,
+      "measured stream stopped", true, core::FaultOperatorAction::kRecover,
+      {}, {}, {}, world.clock.now()};
+  EXPECT_EQ(world.adapter->State(world.clock.now()).fault->code,
+            core::FaultCode::kStreamStale);
+}
+
 TEST(XArmArmAdapter, StateIsTheLanesControllerErrorsAreTheOwnersAndAllMotorsOffIsIdle) {
   World world;
   auto state = world.adapter->State(world.clock.now());
@@ -220,7 +320,7 @@ TEST(XArmArmAdapter, StateIsTheLanesControllerErrorsAreTheOwnersAndAllMotorsOffI
   EXPECT_EQ(state.activity, core::ComponentActivity::kBusy);
 }
 
-// M7's rule: armed, settled, error-free, out of joint-servo mode or out of
+// The rule: armed, settled, error-free, out of joint-servo mode or out of
 // the moving and ready states. The owner reports it; the arm's state doesn't.
 TEST(XArmArmAdapter, ExternalControlFollowsM7sRuleAndTheOwnerReleasesIt) {
   World world;
@@ -261,7 +361,7 @@ TEST(XArmArmAdapter, ExternalControlFollowsM7sRuleAndTheOwnerReleasesIt) {
   EXPECT_FALSE(estop.adapter->ExternalControl(report(then, 0, kXArmJointServoMode, 4, 0), then));
 }
 
-// XPW-1: Enable switches the motors on: the arm controller off, the hardware
+// Enable switches the motors on: the arm controller off, the hardware
 // on (the plugin's motion_enable, set_mode(1), set_state(0)), fresh joints,
 // the gate, then the controller.
 TEST(XArmArmAdapter, EnableFromPreparedSwitchesTheHardwareOnThenTheController) {
@@ -299,7 +399,7 @@ TEST(XArmArmAdapter, EnableOnARobotNotReadyRunsTheFullArmingSequenceAsM7) {
   }
 }
 
-// As M7: after the arming Enable continues once the joint state broadcaster
+// After the arming Enable continues once the joint state broadcaster
 // delivers a sample stamped after it, bounded by the lifecycle timeout.
 TEST(XArmArmAdapter, EnablesArmingWaitsForJointStatesWithinTheLifecycleTimeout) {
   World world;
@@ -383,6 +483,21 @@ TEST(XArmArmAdapter, EnableFailsTypedWhenTheRobotNeverReportsReadyAfterTheArming
   EXPECT_EQ(world.lane->actions, Actions{ComponentAction::kDisable});
 }
 
+// 2026-11-08 (maintainer): Enable is the explicit clear of an e-stop error;
+// an e-stop still pressed (C1-C3 after the activation's clear) is refused
+// with its own typed reason.
+TEST(XArmArmAdapter, EnableIsRefusedTypedWhileTheEstopStaysPressed) {
+  World world;
+  world.arms_robot = false;
+  world.status->Set(report(world.clock.now(), 2, 0, 4));
+  const auto failed = world.Run(ComponentAction::kEnable);
+  EXPECT_EQ(failed.outcome, ActionOutcome::kFailed);
+  EXPECT_EQ(failed.action, ComponentAction::kEnable);
+  EXPECT_EQ(failed.error->code, "robot_estop_active");
+  EXPECT_EQ(failed.error->vendor_code, "C2");
+  EXPECT_NE(world.adapter->State(world.clock.now()).lifecycle, ComponentLifecycle::kEnabled);
+}
+
 TEST(XArmArmAdapter, DisableSwitchesTheControllerThenTheHardwareOffAndStaysPrepared) {
   World world;
   world.hardware_on = true;
@@ -463,7 +578,7 @@ TEST(XArmArmAdapter, EnableGateRefusesStaleZeroOrDisagreeingJoints) {
   EXPECT_EQ(refused.error->code, "xarm_status_unavailable");
 }
 
-// XPW-1: with the hardware off (prepared, motors off) the driver's own joint
+// With the hardware off (prepared, motors off) the driver's own joint
 // topic is the measured stream, e-stop included; with it on, display only.
 TEST(XArmArmAdapter, VendorJointSamplesLeadWhileTheHardwareIsOffAndNonPosesAreIgnored) {
   World world;

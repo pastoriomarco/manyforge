@@ -2,8 +2,8 @@
 
 This module performs no I/O, imports no orchestration engine, resolves no
 implementation or provider, and owns no command or Stop truth.  It retains only
-the dependency-neutral attempt decisions from the historical example so the
-future I6/N owner client has an exact behavioral reference.
+the dependency-neutral attempt decisions from the historical example so a
+future owner client has an exact behavioral reference.
 """
 
 from __future__ import annotations

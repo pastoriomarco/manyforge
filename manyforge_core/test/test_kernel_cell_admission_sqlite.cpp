@@ -477,7 +477,7 @@ TEST(KernelCellAdmissionSqlite, HeldManualParentAndOfferSurviveOwnerReplacement)
 }
 
 TEST(KernelCellAdmissionSqlite, V12ClaimsAreRefusedNotConvertedAfterTheStopTimingFormat) {
-  // Q51/Q53: a journal of an earlier format (here v12, before the attribution
+  // A journal of an earlier format (here v12, before the attribution
   // columns and the per-robot Stop timing) is refused, never migrated.
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);

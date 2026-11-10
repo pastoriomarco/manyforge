@@ -14,9 +14,9 @@ namespace manyforge::core {
 
 inline constexpr std::string_view kOperatorAlarmAttentionSchemaVersion =
     "manyforge.operator_alarm_motion_attention.v3";
-/// Matches the Alarm Lifecycle Owner hard live cap (spec 530 §7).
+/// Matches the Alarm Lifecycle Owner hard live cap.
 inline constexpr std::size_t kMaximumOperatorAlarmAttentionMembers = 256U;
-/// Matches the owner's per-subject resource bound (spec 530 §7).
+/// Matches the owner's per-subject resource bound.
 inline constexpr std::size_t kMaximumOperatorAlarmSubjectResources = 16U;
 inline constexpr std::size_t kMaximumOperatorAlarmAttentionTextBytes = 2048U;
 /// Bound on each refusal membership detail's canonical JSON. Whole entries
@@ -32,7 +32,7 @@ inline constexpr std::size_t kMaximumOperatorAlarmRefusalMembershipBytes = 4096U
 /// Program motion closed.
 inline constexpr Duration kOperatorAlarmAttentionMaximumSnapshotAgeNs = 2'000'000'000;
 
-/// Stable refusal reasons (spec 450 §5.2, spec 530 §11).
+/// Stable refusal reasons.
 inline constexpr std::string_view kOperatorAlarmInterlockActiveReason =
     "operator_alarm_interlock_active";
 inline constexpr std::string_view kOperatorAlarmStateUnavailableReason =
@@ -126,7 +126,7 @@ struct RetainedOperatorAlarmAttentionDTO final {
 [[nodiscard]] Result<void> validate_operator_alarm_attention_snapshot(
     const OperatorAlarmAttentionSnapshotDTO& snapshot);
 
-/// Spec 450 §5.2 / spec 530 §11 for one candidate operation whose exact
+/// Attention and fencing check for one candidate operation whose exact
 /// reserved resource set (union over coordinated participants) is
 /// `reserved_resources`. Returns the refusal, or nothing when this attention
 /// input admits the operation. A matching condition interlock reports

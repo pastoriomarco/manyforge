@@ -20,7 +20,7 @@ ignores any tool speed limit (`max_linear_speed` applies to Bounded only).
 
 ## Impact
 
-ManyForge `time_optimal` Cartesian moves (CT-1) must hold the vendor TCP speed
+ManyForge `time_optimal` Cartesian moves must hold the vendor TCP speed
 limit. Without the bound the whole trajectory is stretched uniformly
 afterwards, slowing the move along its whole length.
 
@@ -37,7 +37,7 @@ on the tip speed stays under it at the grid points.
 
 ## Sanitizer evidence
 
-Pending the M9 build; the patch copies one option.
+Pending a build; the patch copies one option.
 
 ## Compatibility risk
 

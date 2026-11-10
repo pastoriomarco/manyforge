@@ -21,22 +21,21 @@ const ADMITTED_HEADER_HINT = 'TCP speed the execution owner admitted for this ro
 
 /** One motion node's TCP-speed request, as authored. */
 interface SpeedRequest {
-  targetRoleId: string | null;
+  /** The moving target as `component/target`, or null when the node names none. */
+  targetKey: string | null;
   value: number | null;
   parameterId: string | null;
 }
 
 const targetKey = (componentId: string, commandTargetId: string) => `${componentId}/${commandTargetId}`;
 
-/**
- * Program target role -> exact command target (controllable component and
- * command target), from the Applied Binding's target-role rows.
- */
-function targetRoleTargets(applied: AppliedProgramSelection): Map<string, string> {
-  return new Map(applied.programBinding.target_role_bindings.map((row) => [
-    row.target_role_id,
-    targetKey(row.controllable_component_id, row.command_target_id),
-  ]));
+/** A node's moving target (`target` parameter) as `component/target`. */
+function nodeTargetKey(node: ProgramTreeNode): string | null {
+  const target = node.parameters.target;
+  if (target === null || typeof target !== 'object' || Array.isArray(target)) return null;
+  const { component_id: componentId, command_target_id: commandTargetId } = target as Record<string, JsonValue>;
+  return typeof componentId === 'string' && typeof commandTargetId === 'string'
+    ? targetKey(componentId, commandTargetId) : null;
 }
 
 function speedRequests(applied: AppliedProgramSelection): SpeedRequest[] {
@@ -47,17 +46,16 @@ function speedRequests(applied: AppliedProgramSelection): SpeedRequest[] {
   const walk = (node: ProgramTreeNode) => {
     const literal = node.parameters.max_tcp_linear_speed_mps;
     const source = node.value_sources?.max_tcp_linear_speed_mps;
-    const role = node.parameters.target_role;
-    const targetRoleId = typeof role === 'string' ? role : null;
+    const nodeTarget = nodeTargetKey(node);
     if (source !== undefined && source.kind === 'program_parameter') {
       const value: JsonValue | undefined = parameters.get(source.reference);
       requests.push({
-        targetRoleId,
+        targetKey: nodeTarget,
         value: typeof value === 'number' ? value : null,
         parameterId: source.reference,
       });
     } else if (typeof literal === 'number') {
-      requests.push({ targetRoleId, value: literal, parameterId: null });
+      requests.push({ targetKey: nodeTarget, value: literal, parameterId: null });
     }
     node.children.forEach(walk);
   };
@@ -138,10 +136,6 @@ export function ProgramRunSetup({
     return <p className="hint">No Program is applied.</p>;
   }
   const requests = speedRequests(applied);
-  const targetByRole = targetRoleTargets(applied);
-  const rolesFor = (key: string) => [...targetByRole]
-    .filter(([, target]) => target === key)
-    .map(([role]) => role);
   return (
     <div className="program-run-setup">
       <p>
@@ -156,8 +150,8 @@ export function ProgramRunSetup({
           return (
             <div key={key} className="program-run-setup-robot">
               <h6>
-                {rolesFor(key).join(', ') || '—'}
-                <span className="program-run-setup-component">{target.controllableComponentId}</span>
+                {target.controllableComponentId}
+                <span className="program-run-setup-component">{target.commandTargetId}</span>
               </h6>
               <div className="program-run-setup-stats">
                 <div className="program-run-setup-stat">
@@ -171,8 +165,7 @@ export function ProgramRunSetup({
                 </div>
                 {(() => {
                   const request = requestSummary(requests.filter(
-                    (candidate) => candidate.targetRoleId !== null
-                      && targetByRole.get(candidate.targetRoleId) === key,
+                    (candidate) => candidate.targetKey === key,
                   ));
                   return (
                     <div className="program-run-setup-stat">

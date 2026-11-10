@@ -88,6 +88,10 @@ make_gripper_request(double target_position, double duration_s,
   request.transport_kind = std::move(transport_kind);
   request.completion_policy = std::move(completion_policy);
   request.state_authority = "sim_observed";
+  // The node's completion timeout: a pneumatic delivery bound, or the time a
+  // position gripper has after duration_s to report done.
+  request.completion_timeout_s =
+      request.completion_policy == "output_delivery" ? 0.1 : 5.0;
   return request;
 }
 
@@ -459,11 +463,11 @@ private:
   SecondAdapter &second_;
 };
 
-std::unique_ptr<Ros2TransportResources> test_transport_resources(
+std::shared_ptr<Ros2TransportResources> test_transport_resources(
     std::shared_ptr<core::IExecutionStateSink> sink, core::IClock& clock,
     const std::string& group) {
   // Transport host setup is independent of adapter config validation tests.
-  return std::make_unique<Ros2TransportResources>("manyforge_transport_test_" + unique_suffix(),
+  return Ros2TransportResources::create("manyforge_transport_test_" + unique_suffix(),
                                                   "/", 3, std::move(sink), group, clock);
 }
 } // namespace

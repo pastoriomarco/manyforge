@@ -77,9 +77,12 @@ struct ResolvedExecutionBindingDTO final {
   /// compiler-issued correspondences.
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
-  TargetRoleId target_role_id;
-  std::vector<ProgramFrameRoleBindingDTO> frame_role_bindings;
-  std::vector<ProgramCollisionBodyRoleBindingDTO> collision_body_role_bindings;
+  ProgramTargetReferenceDTO target;
+  std::vector<ProgramFrameBindingDTO> frame_bindings;
+  std::vector<ProgramCollisionBodyBindingDTO> collision_body_bindings;
+  /// Program-wide references used for motion reference projection only.
+  std::vector<ProgramFrameBindingDTO> program_frame_bindings{};
+  std::vector<ProgramCollisionBodyBindingDTO> program_collision_body_bindings{};
 
   friend bool operator==(const ResolvedExecutionBindingDTO&,
                          const ResolvedExecutionBindingDTO&) = default;
@@ -137,9 +140,10 @@ struct ProgramFrameResolutionContextDTO final {
         !binding.program_id.empty() && !binding.program_revision.empty() &&
         !binding.program_binding_id.empty() && !binding.program_run_id.empty() &&
         !binding.retained_bundle_id.empty() && !binding.graph_revision.empty() &&
-        !binding.target_role_id.empty() && !binding.controllable_component_id.empty() &&
+        !binding.target.component_id.empty() && !binding.target.command_target_id.empty() &&
+        !binding.controllable_component_id.empty() &&
         !binding.command_target_id.empty() && !binding.capability_id.empty() &&
-        !binding.model_bindings.empty() && !binding.frame_role_bindings.empty() &&
+        !binding.model_bindings.empty() && !binding.frame_bindings.empty() &&
         projection_binding.valid() && logical_scene && logical_scene->locally_valid() &&
         captured_at_ns >= 0 &&
         projection_binding.projection_revision.retained_bundle_id == binding.retained_bundle_id &&
@@ -194,7 +198,7 @@ struct ProgramFrameResolutionContextDTO final {
   }
 };
 
-/// Execute request - kernel input (spec §3.10)
+/// Execute request - kernel input
 struct ExecuteRequestDTO {
   explicit ExecuteRequestDTO(ResolvedExecutionBindingDTO exact_binding)
       : binding(std::move(exact_binding)) {}
@@ -228,17 +232,16 @@ struct ExecuteRequestDTO {
   /// compiled body ids carried by this value.
   std::optional<ResolvedContactGraspBindingDTO> resolved_contact_grasp;
   /// Per-move bindings that arm `scope_kind == kMove` interrupt
-  /// policies for exactly this execute request (spec/260 §2.6 +
-  /// spec/210 §3.10). Atomic with dispatch: the kernel arms scopes
+  /// policies for exactly this execute request. Atomic with dispatch: the kernel arms scopes
   /// after planning and validation pass and immediately before
   /// backend dispatch, then auto-reaps on any terminal execution
   /// state. Empty preserves free-move semantics.
   std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
-  /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
+  /// Per-joint absolute dynamics caps. Empty preserves prior
   /// behavior. Resolved against model/backend/controller limits and enforced in
   /// time-parameterization; copied into the PlanRequestDTO by the kernel.
   PerResourceDynamicsLimitsDTO per_resource_dynamics_limits;
-  /// Causal action-span envelope for this motion request (spec/210 §3.1.1).
+  /// Causal action-span envelope for this motion request.
   /// Empty means the caller has no span context; the kernel does not mint
   /// behavior-node attempts.
   std::optional<ActionSpanDTO> action_span;

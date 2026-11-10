@@ -43,7 +43,7 @@ describe('headless Composer presentation adapters', () => {
     }])).toBe('Cell recovery required · physical rest unproven.');
   });
 
-  it('shows a lifecycle-fault alarm inside the incident item only for that component (ERRUI)', () => {
+  it('shows a lifecycle-fault alarm inside the incident item only for that component', () => {
     const lifecycle = (subjectId: string): OperatorAlarmRecord => ({
       conditionId: `condition-${subjectId}`, activationId: `activation-${subjectId}`,
       recordRevision: 1, activatedAtNs: 100,

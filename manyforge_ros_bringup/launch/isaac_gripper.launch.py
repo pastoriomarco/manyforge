@@ -3,7 +3,7 @@
 The tool's joints are part of the robot's Isaac articulation and its state is
 on the shared joint-states topic, so the tool has no controller manager. This
 launch publishes the tool's description in the tool's own namespace and, for
-an action transport, runs the thin GripperCommand bridge there. The retained
+an action transport, runs the thin ParallelGripperCommand bridge there. The retained
 C++ backend owns command meaning, lifecycle admission, timeouts and Stop. The
 host passes every value; this launch only reads them.
 """
@@ -63,7 +63,7 @@ def generate_launch_description() -> LaunchDescription:
 
 
 def _launch_setup(context, *_, **__) -> list[object]:
-    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
+    keep_sigint_out_of_tasks(context)  # Before any Node action exists.
 
     def value(name: str) -> str:
         return LaunchConfiguration(name).perform(context).strip()

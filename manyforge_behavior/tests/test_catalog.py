@@ -161,7 +161,7 @@ def test_recomputed_previous_catalog_version_is_not_an_alias(tmp_path: Path) -> 
         NodeCatalog(path)
 
 
-def test_catalog_exposes_structured_v2_semantics() -> None:
+def test_catalog_exposes_structured_v3_semantics() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     move = catalog.get("motion.move_to_pose")
 
@@ -174,7 +174,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "acceleration_scale",
         "automatic_retries",
         "automatic_retry_delay_s",
-        "base_frame_role",
+        "base_frame",
         "cache_mode",
         "clearance_m",
         "contact_scene_resource_id",
@@ -192,7 +192,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "rotation_tol_rad",
         "target_reference",
         "target_mode",
-        "target_role",
+        "target",
         "tcp_endpoint",
         "translation_tol_m",
         "velocity_scale",
@@ -229,7 +229,6 @@ def test_effectful_requirements_are_explicit_target_commands() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     expected = {
         "execution.reset",
-        "execution.runtime_scale.operation_scoped",
         "execution.stop.soft",
         "execution.trajectory.execute",
         "io.gpio.set_output",
@@ -256,15 +255,15 @@ def test_profile_comparison_has_no_legacy_profile_family() -> None:
     assert not profile_satisfied("v0.1", "v0.2")
 
 
-def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
+def test_catalog_schema_retains_direct_target_and_validates_defaults() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     move = catalog.get("motion.move_to_pose")
     joint_target = catalog.schema_registry.types["joint_target"]
-    target_role = next(parameter for parameter in move.parameters if parameter.id == "target_role")
+    target = next(parameter for parameter in move.parameters if parameter.id == "target")
     planner = next(parameter for parameter in move.parameters if parameter.id == "planner")
     joint_name = catalog.schema_registry.resolve(joint_target.properties["joint_name"])
 
-    assert catalog.schema_registry.resolve(target_role.schema).semantic_type == "target_role"
+    assert catalog.schema_registry.resolve(target.schema).semantic_type == "target_reference"
     assert joint_target.required == ("joint_name", "position_rad")
     assert joint_name.semantic_type == "source_joint"
     # Planner block: optional, no default (the Deployment's applies); any
@@ -293,44 +292,27 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
     )
 
 
-def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scoped() -> None:
+def test_reference_frames_preserve_exact_component_identity() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     registry = catalog.schema_registry
     reference = registry.resolve(registry.types["motion_reference"])
     assert reference.properties["type"].enum_values[-1] == "cell_frame"
-    target = registry.resolve(reference.properties["target_role"])
-    assert target.semantic_type == "target_role"
-    assert dict(target.allowed_when) == {"type": "frame_role"}
-    # The unqualified form stays the moving robot's own frame role.
-    frame = registry.resolve(reference.properties["frame_role_id"])
-    assert frame.semantic_scope_parameter == "target_role"
-    # Pick and approach offsets accept every motion-reference form, including
-    # the cell frame and another robot's frame: one shared schema.
-    assert "pick_offset_reference" not in registry.types
+    assert registry.resolve(reference.properties["frame"]).semantic_type == "frame_reference"
+    assert registry.resolve(reference.properties["body"]).semantic_type == "collision_body_reference"
     synthesis = registry.resolve(registry.types["pick_synthesis"])
     for offset in ("pick_offset_reference", "approach_offset_reference"):
         assert synthesis.properties[offset].ref == "#/schema_types/motion_reference"
     move = {parameter.id: parameter for parameter in catalog.get("motion.move_to_pose").parameters}
-    assert registry.resolve(move["base_frame_role"].schema).semantic_scope_parameter == "target_role"
-    assert move["tcp_endpoint"].required is False and move["tcp_endpoint"].has_default
+    assert registry.resolve(move["base_frame"].schema).semantic_type == "frame_reference"
     endpoint = registry.resolve(move["tcp_endpoint"].schema)
     assert endpoint.required == ("kind",)
-    assert endpoint.properties["kind"].enum_values == ("current", "default_of_role", "entry")
-    assert registry.resolve(endpoint.properties["target_role"]).semantic_type == "target_role"
-    assert registry.resolve(endpoint.properties["frame_role"]).semantic_type == "frame_role"
+    assert endpoint.properties["kind"].enum_values == ("current", "default_of_target", "entry")
+    assert registry.resolve(endpoint.properties["target"]).semantic_type == "target_reference"
+    assert registry.resolve(endpoint.properties["frame"]).semantic_type == "frame_reference"
     assert move["tcp_endpoint"].default == {"kind": "current"}
-    for node_id in (
-        "motion.move_to_joint_target",
-        "motion.move_to_pose",
-        "motion.follow_cartesian_path",
-        "motion.move_until_signal",
-        "motion.probe_search",
-    ):
-        selector = next(
-            row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint"
-        )
-        assert selector.required is False
-        assert selector.default == {"kind": "current"}
+    for node_id in ("motion.move_to_joint_target", "motion.move_to_pose", "motion.follow_cartesian_path", "motion.move_until_signal", "motion.probe_search"):
+        selector = next(row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint")
+        assert not selector.required and selector.default == {"kind": "current"}
         assert selector.schema.ref == "#/schema_types/tcp_selector"
 
     set_tcp = catalog.get("motion.set_tcp")
@@ -354,7 +336,7 @@ def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scope
     attach = {
         row.id: row for row in catalog.get("scene.attach_carried_object").parameters
     }
-    assert attach["carrier_frame_role"].required is False
+    assert attach["carrier_frame_ref"].required is False
     assert attach["carrier_frame"].schema.ref == "#/schema_types/active_tcp_carrier_frame"
     # Geometry and Scene nodes choose any declared frame.
     offset = {
@@ -368,23 +350,24 @@ def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scope
     }
     assert object_pose["frame"].schema.ref == "#/schema_types/pose_frame_ref"
     for node_id, phrase in (
-        ("geometry.offset_pose", "in the pose's own frame"),
-        ("geometry.check_pose_bounds", "first expressed in frame_ref"),
-        ("geometry.check_pose_distance", "Pose B is first expressed in pose A's frame"),
-        ("scene.get_object_pose", "the cell frame when absent"),
+        ("geometry.offset_pose", "stays in the input pose's frame"),
+        ("geometry.check_pose_bounds", "first expressed in the box frame"),
+        ("geometry.check_pose_distance", "Pose B is expressed in pose A's frame"),
     ):
         assert phrase in catalog.get(node_id).description
+    frame = {p.id: p for p in catalog.get("scene.get_object_pose").parameters}["frame"]
+    assert "omitted means the cell frame" in frame.description
 
 
 @pytest.mark.parametrize(
     "value,valid",
     [
         ({"kind": "current"}, True),
-        ({"kind": "default_of_role", "role": "tool"}, True),
-        ({"kind": "entry", "target_role": "tool", "frame_role": "tcp"}, True),
-        ({"kind": "entry", "target_role": "tool"}, False),
-        ({"kind": "default_of_role", "target_role": "tool", "frame_role": "tcp"}, False),
-        ({"kind": "current", "role": "tool"}, False),
+        ({"kind": "default_of_target", "target": {"component_id": "robot", "command_target_id": "arm"}}, True),
+        ({"kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"}, "frame": {"component_id": "tool", "frame_id": "tcp"}}, True),
+        ({"kind": "entry", "target": {"component_id": "robot", "command_target_id": "arm"}}, False),
+        ({"kind": "default_of_target", "frame": {"component_id": "tool", "frame_id": "tcp"}}, False),
+        ({"kind": "current", "target": {"component_id": "robot", "command_target_id": "arm"}}, False),
         ({"kind": "unknown"}, False),
     ],
 )
@@ -419,13 +402,12 @@ def test_attach_active_tcp_frame_schema_is_explicit(value, valid) -> None:
 @pytest.mark.parametrize(
     "value,valid",
     [
-        ({"component_id": "arm", "target_id": "robot", "frame_role_id": "flange"}, True),
-        ({"component_id": "arm", "target_id": "robot"}, False),
+        ({"target": {"component_id": "robot", "command_target_id": "arm"}, "frame": {"component_id": "tool", "frame_id": "flange"}}, True),
+        ({"target": {"component_id": "robot", "command_target_id": "arm"}}, False),
         (
             {
-                "component_id": "arm",
-                "target_id": "robot",
-                "frame_role_id": "flange",
+                "target": {"component_id": "robot", "command_target_id": "arm"},
+                "frame": {"component_id": "tool", "frame_id": "flange"},
                 "extra": 1,
             },
             False,
@@ -444,24 +426,22 @@ def test_tcp_entry_schema_is_the_structured_runtime_identity(value, valid) -> No
     ) is valid
 
 
-def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -> None:
+def test_catalog_projects_direct_frame_and_body_references() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     attach = catalog.get("scene.attach_carried_object")
     detach = catalog.get("scene.detach_carried_object")
     parameters = {parameter.id: parameter for parameter in attach.parameters}
 
-    # ``carried`` is the internal owner/API placement kind.  The operator
-    # vocabulary remains the historical Attached/Detached workflow.
+    # The operator names keep the Attach/Detach workflow; ``carried`` is the
+    # placement kind the descriptions explain.
     assert attach.name == "Attach object"
     assert detach.name == "Detach object"
-    assert "Attached" in detach.description
-    assert "Detached" in detach.description
+    assert "carried" in detach.description
 
-    carrier_schema = catalog.schema_registry.to_json_schema(parameters["carrier_frame_role"].schema)
-    touch_schema = catalog.schema_registry.to_json_schema(parameters["touch_body_roles"].schema)
-
-    assert carrier_schema["x-manyforge-semantic-scope-parameter"] == "target_role"
-    assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == ("target_role")
+    carrier_schema = catalog.schema_registry.to_json_schema(parameters["carrier_frame_ref"].schema)
+    touch_schema = catalog.schema_registry.to_json_schema(parameters["touch_bodies"].schema)
+    assert carrier_schema["x-manyforge-semantic-type"] == "frame_reference"
+    assert touch_schema["items"]["x-manyforge-semantic-type"] == "collision_body_reference"
 
 
 def test_attach_node_grasp_lost_bound_parameters_have_defaults() -> None:
@@ -539,8 +519,9 @@ def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
         carrier = next(
             parameter
             for parameter in attach["parameters"]
-            if parameter["id"] == "carrier_frame_role"
+            if parameter["id"] == "scene_resource_id"
         )
+        carrier["schema"]["semantic_type"] = "frame_role"
         carrier["schema"]["semantic_scope_parameter"] = "missing_target"
 
     path = _write_recomputed(tmp_path, mutate)
@@ -664,12 +645,11 @@ def test_check_input_reads_one_input_like_get_input() -> None:
 
     assert (check.name, check.category) == ("Check input", "io")
     assert [parameter.id for parameter in check.parameters] == [
-        "target_role",
-        "resource_role",
+        "signal",
         "expected_value",
         "mock_simulation",
     ]
-    assert check.parameters[2].schema.schema_type == "bool"
+    assert check.parameters[1].schema.schema_type == "bool"
     assert check.required_capabilities == get.required_capabilities
     assert check.execution.owner_api == get.execution.owner_api
     assert not check.blackboard_writes
@@ -695,6 +675,19 @@ def test_query_model_template_variables_are_a_map_of_typed_values() -> None:
         assert validate_value(parameter.schema, value, registry=registry) == []
     for value in ([], {"pose": {"x": 1.0}}, {"ids": ["a", 1]}):
         assert validate_value(parameter.schema, value, registry=registry)
+
+
+def test_assistant_nodes_require_a_usable_model_query() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    for node_id in (
+        "assistant.build_scene_selection",
+        "assistant.query_model",
+        "assistant.validate_scene_selection",
+    ):
+        assert [
+            (requirement.capability_id, requirement.scope)
+            for requirement in catalog.get(node_id).required_capabilities
+        ] == [("assistant.model.query", "cell_global")], node_id
 
 
 def test_catalog_preserves_assistant_and_planning_only_pick_place_contracts() -> None:
@@ -752,7 +745,7 @@ def test_old_catalog_apis_are_not_runtime_inputs(
 
     with pytest.raises(
         CatalogValidationError,
-        match="api_version must be 'manyforge.node_catalog.v2'",
+        match="api_version must be 'manyforge.node_catalog.v3'",
     ):
         NodeCatalog(path)
 
@@ -802,7 +795,7 @@ def test_recomputed_packet_change_cannot_reuse_frozen_content_version(
 def test_strict_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.yaml"
     path.write_text(
-        "api_version: manyforge.node_catalog.v2\n" "api_version: manyforge.node_catalog.v2\n",
+        "api_version: manyforge.node_catalog.v3\n" "api_version: manyforge.node_catalog.v3\n",
         encoding="utf-8",
     )
 
@@ -895,9 +888,9 @@ def test_recomputed_catalog_rejects_source_joint_without_one_target_scope(
             entry for entry in data["entries"] if entry["id"] == "motion.move_to_joint_target"
         )
         target = next(
-            parameter for parameter in move["parameters"] if parameter["id"] == "target_role"
+            parameter for parameter in move["parameters"] if parameter["id"] == "target"
         )
-        target["schema"]["semantic_type"] = "component_role"
+        target["schema"] = {"type": "string"}
         # Frame roles are scoped by target_role; unscope them so this
         # mutation reaches the source_joint rule under test.
         for parameter in move["parameters"]:
@@ -932,14 +925,15 @@ def test_cancellable_leaves_declare_interrupted_and_others_never_do() -> None:
 
     assert leaves
     for entry in leaves:
-        # The timer's own work cannot fail: it succeeds or is interrupted.
-        expected = ({"success"} if entry.id == "timer" else {"success", "failure"}) | (
+        # Every leaf can fail; the timer only when duration_s is unresolvable.
+        expected = {"success", "failure"} | (
             {"interrupted"} if entry.execution.cancellable else set()
         )
         assert set(entry.outcomes) == expected, entry.id
     assert catalog.get("gripper.wait_for_status").outcomes["interrupted"] == "cancelled"
     assert dict(catalog.get("timer").outcomes) == {
         "success": "elapsed",
+        "failure": "input_unavailable",
         "interrupted": "cancelled",
     }
 
@@ -1011,7 +1005,7 @@ def test_recomputed_catalog_rejects_blackboard_control_protocol(
 ) -> None:
     def mutate(data: dict[str, object]) -> None:
         getter = next(entry for entry in data["entries"] if entry["id"] == "io.get_input")
-        getter["parameters"][2]["id"] = "stop_requested"
+        next(row for row in getter["parameters"] if row["id"] == "output_key")["id"] = "stop_requested"
         getter["blackboard"]["writes"][0]["key_parameter"] = "stop_requested"
 
     path = _write_recomputed(tmp_path, mutate)
@@ -1092,3 +1086,80 @@ def test_joint_goal_exposes_the_same_explicit_contact_inputs_as_pose_goal() -> N
         assert joint[name].required is False
         assert joint[name].has_default is False
         assert joint[name].schema == pose[name].schema
+
+
+def test_every_entry_parameter_and_schema_type_is_documented() -> None:
+    """The catalog is the one documentation source (assistant, palette, docs).
+
+    Self-evident schema-type properties may stay undescribed.
+    """
+    catalog = NodeCatalog(CATALOG_PATH)
+    missing = [
+        f"entries.{entry.id}" for entry in catalog.entries if not entry.description.strip()
+    ]
+    missing += [
+        f"entries.{entry.id}.parameters.{parameter.id}"
+        for entry in catalog.entries
+        for parameter in entry.parameters
+        if not parameter.description.strip()
+    ]
+    missing += [
+        f"schema_types.{name}"
+        for name, schema in catalog.schema_registry.types.items()
+        if not schema.description.strip()
+    ]
+    assert missing == []
+
+
+def test_parameter_and_schema_reference_descriptions_are_accepted(tmp_path: Path) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        selector = data["schema_types"]["tcp_selector"]["properties"]["target"]
+        selector["description"] = "Described reference property."
+
+    catalog_module_digest = catalog_module.EXPECTED_BUILTIN_CATALOG_DIGEST
+    path = _write_recomputed(tmp_path, mutate)
+    computed = json.loads(path.read_text(encoding="utf-8"))["catalog_digest"]
+    try:
+        catalog_module.EXPECTED_BUILTIN_CATALOG_DIGEST = computed
+        catalog = NodeCatalog(path)
+    finally:
+        catalog_module.EXPECTED_BUILTIN_CATALOG_DIGEST = catalog_module_digest
+    target = catalog.schema_registry.types["tcp_selector"].properties["target"]
+    assert target.description == "Described reference property."
+    entry = catalog.get("motion.move_to_pose")
+    assert all(parameter.description for parameter in entry.parameters)
+
+
+def test_schema_defaults_match_the_pick_code_fallbacks() -> None:
+    """Catalog defaults of the pick types are the values production_ports.py
+    falls back to (_pick_synthesis, _phase_motion_payload)."""
+
+    catalog = NodeCatalog(CATALOG_PATH)
+    types = catalog.schema_registry.types
+    defaults = {
+        name: {
+            field: schema.default
+            for field, schema in types[name].properties.items()
+            if schema.has_default
+        }
+        for name in ("pick_synthesis", "pick_motion_options")
+    }
+    assert defaults["pick_synthesis"] == {
+        "base_tool_orientation_rpy_deg": [180.0, 0.0, 0.0],
+        "translation_step_m": 0.01,
+        "rotation_step_deg": 15.0,
+        "force_vertical_pick": False,
+        "maximum_candidate_count": 4096,
+        "search_strategy": "first_feasible",
+    }
+    assert defaults["pick_motion_options"]["cache_mode"] == "disable"
+    assert defaults["pick_motion_options"]["approach_velocity_scale"] == 0.35
+
+
+def test_schema_default_must_satisfy_its_schema(tmp_path: Path) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        data["schema_types"]["pick_motion_options"]["properties"]["cache_mode"]["default"] = "x"
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError):
+        NodeCatalog(path)

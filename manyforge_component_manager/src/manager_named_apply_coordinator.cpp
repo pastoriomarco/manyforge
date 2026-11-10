@@ -343,7 +343,7 @@ public:
                     inventory.value().error->message +
                     "; restart the workbench container");
     // This observation runs under the held parent admission and before a
-    // fence attempt, runtime convergence or Scene staging. CONTRACTS §11: a
+    // fence attempt, runtime convergence or Scene staging. A
     // replaced or removed component that is still Active with a live process
     // is disabled first (the server-side orchestration does that); one whose
     // launch processes are gone, or that is faulted, is removed or replaced
@@ -679,7 +679,7 @@ core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
     Require(selected.motion_target_limits.empty() && !selected.gripper_target_configurations.empty() &&
                 std::all_of(selected.gripper_target_configurations.begin(), selected.gripper_target_configurations.end(),
                     [&](const auto &target) {
-                      // D4: a lane-free tool (no controller profile) drives its
+                      // A lane-free tool (no controller profile) drives its
                       // valve through referenced I/O; it owns no process either.
                       return target.controllable_component_id == row.controllable_component_id &&
                              target.actuation_kind == "pneumatic" &&
@@ -1055,7 +1055,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
     if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) throw;
     // The host's typed refusal of the candidate (nothing installed or
     // published, nothing changed) is a known before-effect failure: like a
-    // pre-fence failure (CLAIM-1) it releases its fence and claim at once,
+    // pre-fence failure it releases its fence and claim at once,
     // so authoring and New work again. Any other failure keeps them.
     const auto disposition = PreparationFailureDisposition(error);
     const bool host_refused = disposition == ManagerApplyEffectDisposition::kKnown &&
@@ -1637,7 +1637,7 @@ void ManagerNamedApplyCoordinator::ReleaseFailedApply(
                 evidence.active_publication_generation == active.active_publication.publication_generation &&
                 evidence.active_public_pointer_digest ==
                     active.active_publication.durable_public_pointer_content_digest &&
-                // New empties whatever the failed Apply changed (N7).
+                // New empties whatever the failed Apply changed.
                 (for_new || evidence.active_control_configurations ==
                     status->fence_attempt->fence_intent.expected_active_control_configurations),
             "failed Apply fence no longer proves the unchanged predecessor");

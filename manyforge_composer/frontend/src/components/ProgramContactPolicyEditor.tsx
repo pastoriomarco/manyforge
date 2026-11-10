@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
+import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
@@ -11,15 +12,15 @@ const EMPTY_POLICIES: JsonValue[] = [];
 interface ContactTargetOption {
   id: string;
   label: string;
-  componentRole: string;
-  collisionBodyRole: string;
-  modelRole?: string;
+  componentId: string;
+  collisionBodyId: string;
+  unavailableReason?: string;
 }
 
 type ContactMode = 'contact_grasp' | 'contact_release';
 type ReleaseEvidence = 'signed_penetration' | 'binary_contact';
 
-/** Spec 250 §3.2 release envelope (signed defaults; binary keeps only the last two). */
+/** Release envelope (signed defaults; binary keeps only the last two). */
 interface ReleaseEnvelope {
   evidence: ReleaseEvidence;
   enforceMaxStartPenetration: boolean;
@@ -58,59 +59,6 @@ function objectValue(value: JsonValue | undefined): Record<string, JsonValue> | 
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, JsonValue>
     : null;
-}
-
-function stringArray(value: JsonValue | undefined): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string')
-    : [];
-}
-
-function targetOptions(program: ProgramAuthoringDocument): ContactTargetOption[] {
-  const targets = Object.entries(program.target_roles).flatMap(([targetRole, value]) => {
-    const target = objectValue(value);
-    if (target === null) return [];
-    const componentRole = target.component_role;
-    if (typeof componentRole !== 'string') return [];
-    return [{
-      targetRole,
-      componentRole,
-      collisionBodyRoles: stringArray(target.required_collision_body_roles),
-      modelRoles: stringArray(target.required_model_roles),
-    }];
-  });
-  const options: ContactTargetOption[] = [];
-  for (const target of targets) {
-    for (const collisionBodyRole of target.collisionBodyRoles) {
-      const sameBody = targets.filter((candidate) => (
-        candidate.componentRole === target.componentRole
-        && candidate.collisionBodyRoles.includes(collisionBodyRole)
-      ));
-      if (sameBody.length === 1) {
-        options.push({
-          id: `${target.targetRole}:${collisionBodyRole}`,
-          label: `${target.targetRole} · ${collisionBodyRole}`,
-          componentRole: target.componentRole,
-          collisionBodyRole,
-        });
-        continue;
-      }
-      for (const modelRole of target.modelRoles) {
-        const sameModel = sameBody.filter((candidate) => (
-          candidate.modelRoles.includes(modelRole)
-        ));
-        if (sameModel.length !== 1) continue;
-        options.push({
-          id: `${target.targetRole}:${modelRole}:${collisionBodyRole}`,
-          label: `${target.targetRole} · ${modelRole} · ${collisionBodyRole}`,
-          componentRole: target.componentRole,
-          collisionBodyRole,
-          modelRole,
-        });
-      }
-    }
-  }
-  return options.sort((left, right) => left.label.localeCompare(right.label));
 }
 
 function runtimeObjectKeys(program: ProgramAuthoringDocument): string[] {
@@ -169,17 +117,17 @@ function fromPolicy(
   );
   const component = selectors.find((row) => row?.kind === 'component_model_body');
   const runtime = selectors.find((row) => row?.kind === 'runtime_object');
+  const body = objectValue(component?.body);
   const option = options.find((row) => (
-    row.componentRole === component?.component_role_id
-    && row.collisionBodyRole === component?.collision_body_role_id
-    && row.modelRole === component?.model_role_id
+    row.componentId === body?.component_id && row.collisionBodyId === body?.collision_body_id
   ));
   const mode = policy?.mode;
   if (
     typeof policy?.policy_id !== 'string'
     || typeof zone?.zone_id !== 'string'
     || (mode !== 'contact_grasp' && mode !== 'contact_release')
-    || (endpoint === undefined && option === undefined)
+    || (endpoint === undefined && (typeof body?.component_id !== 'string'
+      || typeof body.collision_body_id !== 'string'))
     || (endpoint !== undefined && Object.keys(endpoint).length !== 1)
     || (endpoint !== undefined && component !== undefined)
     || typeof runtime?.runtime_object_id !== 'string'
@@ -197,7 +145,7 @@ function fromPolicy(
     zoneId: zone.zone_id,
     mode,
     bodySource: endpoint === undefined ? 'component_model_body' : 'motion_endpoint',
-    targetOptionId: option?.id ?? '',
+    targetOptionId: option?.id ?? (body ? JSON.stringify([body.component_id, body.collision_body_id]) : ''),
     runtimeObjectKey: runtime.runtime_object_id,
     // A release policy keeps the grasp defaults for a later mode switch only.
     maxPenetrationM: typeof zone.max_penetration_m === 'number' ? zone.max_penetration_m : 0.002,
@@ -273,26 +221,34 @@ function validDraft(
   return PORTABLE_ID.test(draft.policyId)
     && PORTABLE_ID.test(draft.zoneId)
     && (draft.bodySource === 'motion_endpoint'
-      || options.some((option) => option.id === draft.targetOptionId))
+      || options.some((option) => option.id === draft.targetOptionId && !option.unavailableReason))
     && keys.includes(draft.runtimeObjectKey)
     && envelopeValid(draft);
 }
 
 export function ProgramContactPolicyEditor({
   program,
+  selectorFacts = null,
   draftRevision,
   busy,
   busyReason = null,
   mutate,
 }: {
   program: ProgramAuthoringDocument;
+  selectorFacts?: ReferenceSelectorFacts | null;
   draftRevision: number;
   busy: boolean;
   busyReason?: string | null;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
   const blockedTitle = busy ? busyReason ?? undefined : undefined;
-  const options = useMemo(() => targetOptions(program), [program]);
+  const options = useMemo<ContactTargetOption[]>(() => (selectorFacts?.bodies ?? []).map((row) => ({
+    id: JSON.stringify([row.reference.component_id, row.reference.collision_body_id]),
+    label: `${row.reference.component_id} · ${row.reference.collision_body_id}`,
+    componentId: row.reference.component_id,
+    collisionBodyId: row.reference.collision_body_id,
+    ...(row.ambiguous ? { unavailableReason: 'Ambiguous collision body identity.' } : {}),
+  })), [selectorFacts]);
   const keys = useMemo(() => runtimeObjectKeys(program), [program]);
   const keyNamespaces = useNamespaceGroups();
   const policies = program.contact_policies ?? EMPTY_POLICIES;
@@ -303,7 +259,7 @@ export function ProgramContactPolicyEditor({
     zoneId: 'tool_contact',
     mode: 'contact_grasp',
     bodySource: 'component_model_body',
-    targetOptionId: options[0]?.id ?? '',
+    targetOptionId: options.find((option) => !option.unavailableReason)?.id ?? '',
     runtimeObjectKey: keys[0] ?? '',
     maxPenetrationM: 0.002,
     terminalWindowStartFraction: 0.8,
@@ -331,9 +287,7 @@ export function ProgramContactPolicyEditor({
       ? { kind: 'motion_endpoint' }
       : {
         kind: 'component_model_body',
-        component_role_id: target!.componentRole,
-        collision_body_role_id: target!.collisionBodyRole,
-        ...(target!.modelRole === undefined ? {} : { model_role_id: target!.modelRole }),
+        body: { component_id: target!.componentId, collision_body_id: target!.collisionBodyId },
       };
     void mutate('program_draft_upsert_contact_policies', {
       contact_policies: [{
@@ -464,13 +418,13 @@ export function ProgramContactPolicyEditor({
             </select>
           </label>
           {draft.bodySource === 'component_model_body' ? (
-            options.length === 0 ? (
+            options.length === 0 && draft.targetOptionId === '' ? (
               <p className="scene-commit-error inline-message severity-error" role="status">
-                This Program has no declared component collision bodies. Choose the selected motion endpoint if its modeled frame exposes contact bodies.
+                No component collision bodies are available from the captured model. Choose the selected motion endpoint if its modeled frame exposes contact bodies.
               </p>
             ) : (
               <label>
-                <span>Component target and collision body</span>
+                <span>Component and collision body</span>
                 <select
                   value={draft.targetOptionId}
                   disabled={busy}
@@ -479,8 +433,13 @@ export function ProgramContactPolicyEditor({
                     { ...draft, targetOptionId: event.target.value }, existing,
                   )}
                 >
+                  {!options.some((option) => option.id === draft.targetOptionId) && (
+                    <option value={draft.targetOptionId} disabled>Current body is unavailable in the captured model</option>
+                  )}
                   {options.map((option) => (
-                    <option key={option.id} value={option.id}>{option.label}</option>
+                    <option key={option.id} value={option.id} disabled={Boolean(option.unavailableReason)}>
+                      {option.label}{option.unavailableReason ? ` · ${option.unavailableReason}` : ''}
+                    </option>
                   ))}
                 </select>
               </label>

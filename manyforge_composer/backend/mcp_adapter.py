@@ -116,12 +116,11 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "manager": ("GET", "/api/manager/status"),
         "graph": ("GET", "/api/manager/graph"),
     },
-    # CONTRACTS §11: the same server-side Load and New as the GUI.
+    # The same server-side Load and New as the GUI.
     "manyforge_scenario": {
         "load": ("POST", "/api/scenario/load"),
         "new": ("POST", "/api/scenario/new"),
     },
-    # CONTRACTS §1, §2, §5, §7, §10.
     "manyforge_components": {
         "list": ("GET", "/api/components"),
         "action": ("POST", "/api/components/{component_id}/actions"),
@@ -334,7 +333,7 @@ class ComposerMcpAdapter:
             for route in app.routes
             if isinstance(route, Route)
         }
-        server = Server("ManyForge", version="0.2.0")
+        server = Server("ManyForge", version="0.2.1")
         contracts = [types.Tool.model_validate(value) for value in tool_contracts(app)]
 
         @server.list_tools()

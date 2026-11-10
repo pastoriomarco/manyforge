@@ -14,7 +14,7 @@ class OrchestratorRunner:
 
     Program execution identity comes from the Applied Program binding this
     run was admitted with, never from the execution owner's status: the
-    owner reports runtime identity only (execution_identity.v2, H1a-IF.2).
+    owner reports runtime identity only (execution_identity.v2).
     """
 
     def __init__(
@@ -34,32 +34,29 @@ class OrchestratorRunner:
             value = applied_program_binding.get(field)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"applied Program binding has no {field}")
-        targets = applied_program_binding.get("target_role_bindings")
+        targets = applied_program_binding.get("target_bindings")
         if not isinstance(targets, list):
-            raise ValueError("applied Program binding has no target role bindings")
+            raise ValueError("applied Program binding has no target bindings")
         self._kernel = kernel
         self._binding = applied_program_binding
 
     def _bound_capability(
-        self, *, component_role_id: str, target_role_id: str, capability_id: str
+        self, *, target: Mapping[str, str], capability_id: str
     ) -> Mapping[str, Any]:
-        """The Program-bound capability of one authored target role."""
-
+        """The capability bound to one exact component/command-target pair."""
+        if not isinstance(target, Mapping) or set(target) != {"component_id", "command_target_id"} or any(
+            not isinstance(value, str) or not value for value in target.values()
+        ):
+            raise ValueError("target must be an exact component and command target")
         matches = [
             capability
-            for target in self._binding["target_role_bindings"]
-            if isinstance(target, Mapping)
-            and target.get("target_role_id") == target_role_id
-            and target.get("component_role_id") == component_role_id
-            for capability in target.get("capability_bindings", [])
-            if isinstance(capability, Mapping)
-            and capability.get("capability_id") == capability_id
+            for row in self._binding["target_bindings"]
+            if isinstance(row, Mapping) and row.get("target") == target
+            for capability in row.get("capability_bindings", [])
+            if isinstance(capability, Mapping) and capability.get("capability_id") == capability_id
         ]
         if len(matches) != 1:
-            raise ValueError(
-                "target_role_id is not bound to this capability in the "
-                "applied Program"
-            )
+            raise ValueError("target is not bound to this capability in the applied Program")
         return matches[0]
 
     def _selected_status(self) -> dict[str, Any]:
@@ -92,8 +89,8 @@ class OrchestratorRunner:
         *,
         request_id: str,
         program_run_id: str,
-        component_role_id: str,
-        target_role_id: str,
+        target: Mapping[str, str],
+        base_frame: Mapping[str, str],
         node_instance_id: str,
         node_attempt_id: str,
         move_id: str,
@@ -104,25 +101,23 @@ class OrchestratorRunner:
         """Resolve selection from owner status and submit one portable goal."""
 
         self._bound_capability(
-            component_role_id=component_role_id,
-            target_role_id=target_role_id,
+            target=target,
             capability_id="execution.trajectory.execute",
         )
-        target = next(
-            target for target in self._binding["target_role_bindings"]
-            if isinstance(target, Mapping)
-            and target.get("target_role_id") == target_role_id
-            and target.get("component_role_id") == component_role_id
-        )
-        tcps = target.get("robot_tcps")
-        end_effectors = [row.get("entry") for row in tcps if isinstance(row, Mapping)
-                         and row.get("end_effector") is True] if isinstance(tcps, list) else []
+        row = next(row for row in self._binding["target_bindings"]
+                   if isinstance(row, Mapping) and row.get("target") == target)
+        tcps = row.get("robot_tcps")
+        end_effectors = [item.get("entry") for item in tcps if isinstance(item, Mapping)
+                         and item.get("end_effector") is True] if isinstance(tcps, list) else []
         if len(end_effectors) != 1 or not isinstance(end_effectors[0], Mapping):
             raise ValueError("applied Program binding has no unique end-effector TCP")
         entry = end_effectors[0]
-        if not all(isinstance(entry.get(key), str) and entry[key]
-                   for key in ("component_id", "target_id", "frame_role_id")):
+        if (set(entry) != {"target", "frame"} or
+            not isinstance(entry.get("target"), Mapping) or not isinstance(entry.get("frame"), Mapping)):
             raise ValueError("applied Program binding has an invalid end-effector TCP")
+        if (not isinstance(base_frame, Mapping) or set(base_frame) != {"component_id", "frame_id"}
+            or any(not isinstance(value, str) or not value for value in base_frame.values())):
+            raise ValueError("base_frame must be an exact component frame")
         status = self._selected_status()
         span = ActionSpan(
             action_source="program_node",
@@ -147,18 +142,19 @@ class OrchestratorRunner:
             "expected_scene_revision": None,
             "participants": [
                 {
-                    "component_role_id": component_role_id,
-                    "target_role_id": target_role_id,
+                    "target": dict(target),
                     "required_capability_id": "execution.trajectory.execute",
                     "action_span": span.as_request(),
+                    "execution_scope": {"node_instance_id": node_instance_id,
+                                        "node_attempt_id": node_attempt_id},
                     "payload": {
                         "kind": "motion",
                         "move_id": move_id,
-                        "base_frame_role_id": "base",
+                        "base_frame": dict(base_frame),
                         "tcp_endpoint": {
                             "kind": "entry",
-                            "entry": {key: entry[key] for key in
-                                      ("component_id", "target_id", "frame_role_id")},
+                            "target": dict(entry["target"]),
+                            "frame": dict(entry["frame"]),
                         },
                         "tolerances": {
                             "joint_position_tol_rad": 0.001,
@@ -198,8 +194,7 @@ class OrchestratorRunner:
         *,
         request_id: str,
         program_run_id: str,
-        component_role_id: str,
-        target_role_id: str,
+        target: Mapping[str, str],
         node_instance_id: str,
         node_attempt_id: str,
         position_kind: Literal["angular_rad", "linear_m"],
@@ -227,8 +222,7 @@ class OrchestratorRunner:
             raise ValueError("completion_timeout_s must be finite and positive")
 
         capability = self._bound_capability(
-            component_role_id=component_role_id,
-            target_role_id=target_role_id,
+            target=target,
             capability_id="tool.gripper.command",
         )
         command_schema = capability.get("command_schema")
@@ -294,10 +288,11 @@ class OrchestratorRunner:
             "expected_scene_revision": None,
             "participants": [
                 {
-                    "component_role_id": component_role_id,
-                    "target_role_id": target_role_id,
+                    "target": dict(target),
                     "required_capability_id": "tool.gripper.command",
                     "action_span": span.as_request(),
+                    "execution_scope": {"node_instance_id": node_instance_id,
+                                        "node_attempt_id": node_attempt_id},
                     "payload": {
                         "kind": "capability_command",
                         "command_schema_id": schema_id,

@@ -50,7 +50,7 @@ from manyforge_headless_api import control_state as control_state_module
 from manyforge_headless_api.program_cycle import (
     program_cycle_event_class as _program_event_class,
 )
-from scripts.qualification.source_snapshot_fixture import source_snapshot_text
+from manyforge_headless_api.tests.source_snapshot_fixture import source_snapshot_text
 
 
 def _cycle() -> dict[str, Any]:
@@ -119,7 +119,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         }
     )
     run = {
-        "schema_version": "manyforge.program_run_status.v3",
+        "schema_version": "manyforge.program_run_status.v4",
         "owner_id": "runner",
         "owner_epoch": "runner.1",
         "run_revision": 1,

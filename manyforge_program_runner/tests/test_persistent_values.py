@@ -46,9 +46,16 @@ _RUN = "program-cycle.1"
 
 def _program(*keys: dict[str, Any]) -> dict[str, Any]:
     environment = build_node_environment()
-    document = Program(
-        _ROOT / "examples/pick_and_place_minimal.program.yaml", environment.catalog
-    ).to_dict()
+    document = {
+        "api_version": "manyforge.program.v3",
+        "program_id": "persistent_values_fixture",
+        "program_revision": "sha256:" + "0" * 64,
+        "program_profile": "composable-cell-v1",
+        "name": "Persistent values fixture",
+        "catalog": {"api_version": "manyforge.node_catalog.v3",
+                    "content_version": environment.catalog.content_version},
+        "parameters": [],
+    }
     document["blackboard"] = {
         "namespaces": [],
         "keys": sorted(keys, key=lambda row: row["key"]),
@@ -63,7 +70,7 @@ def _program(*keys: dict[str, Any]) -> dict[str, Any]:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return document
 
@@ -133,12 +140,31 @@ class _Headless(_Transport):
     def committed_scenario_activation(self) -> dict[str, Any]:
         if isinstance(self.current, Exception):
             raise self.current
+        program = self.current["program"]
+        executable = (
+            isinstance(program, dict)
+            and isinstance(program.get("program_revision"), str)
+        )
         # As the Headless client hands it to the runner: validated.
         return validate_committed_scenario_activation(
             {
-                "schema_version": "manyforge.committed_scenario_activation.v3",
+                "schema_version": "manyforge.committed_scenario_activation.v4",
                 "publication_generation": len(self.applies) + 1,
                 **deepcopy(self.current),
+                "program_binding_id": "sha256:" + "b" * 64 if executable else None,
+                "retained_bundle_id": "sha256:" + "c" * 64,
+                "graph_revision": "sha256:" + "d" * 64,
+                "program_frame_facts": (
+                    None if not executable else {
+                        "applied_record_digest": self.current["record_digest"],
+                        "program_binding_id": "sha256:" + "b" * 64,
+                        "program_revision": program["program_revision"],
+                        "retained_bundle_id": "sha256:" + "c" * 64,
+                        "graph_revision": "sha256:" + "d" * 64,
+                        "components": [],
+                        "frames": [],
+                    }
+                ),
                 "committed_applies": sorted(
                     deepcopy(self.applies[-(self.retain or len(self.applies)):]),
                     key=lambda row: row["record_digest"],
@@ -907,6 +933,7 @@ def test_unreadable_scenario_program_keeps_precedence_over_stale_record(tmp_path
 @pytest.mark.parametrize("schema", [
     "manyforge.committed_scenario_activation.v1",
     "manyforge.committed_scenario_activation.v3",
+    "manyforge.committed_scenario_activation.v4",
 ])
 def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
     tmp_path, monkeypatch, schema
@@ -1029,3 +1056,73 @@ def test_same_named_projects_in_different_folders_keep_separate_values(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     assert register.values(elsewhere)["layer"]["value"] == 2
+
+
+def test_persistent_pose_uses_exact_committed_frame_snapshot(tmp_path, monkeypatch):
+    runtime, headless = _runtime(tmp_path)
+    document = _program(_key("pose", "stored_pose"))
+    frame = {"component_id": "arm", "frame_id": "base"}
+    document["tree"] = {
+        "node_id": "motion.move_to_pose", "instance_id": "move",
+        "parameters": {
+            "target": {"component_id": "arm", "command_target_id": "arm"},
+            "base_frame": frame,
+            "goal": {"frame_ref": {"kind": "target_frame", "frame": frame},
+                     "position_m": [0.0, 0.0, 0.0],
+                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}},
+        }, "children": [],
+    }
+    document["program_revision"] = compute_content_identity(
+        document, own_field="program_revision", identity_domain="program-revision",
+        api_version="manyforge.program.v3",
+    )
+    headless.apply(document)
+    original = headless.committed_scenario_activation
+    wire_facts = {
+        "applied_record_digest": headless.current["record_digest"],
+        "program_binding_id": "sha256:" + "b" * 64,
+        "program_revision": document["program_revision"],
+        "retained_bundle_id": "sha256:" + "c" * 64,
+        "graph_revision": "sha256:" + "d" * 64,
+        "components": ["arm"],
+        "frames": [
+            {"reference": {"component_id": "arm", "frame_id": "ambiguous"}, "match_count": 2},
+            {"reference": frame, "match_count": 1},
+        ],
+    }
+
+    def projection():
+        result = original()
+        result["program_frame_facts"] = deepcopy(wire_facts)
+        return result
+
+    monkeypatch.setattr(headless, "committed_scenario_activation", projection)
+    runtime.read_persistent_values()
+
+    def pose(frame_id: str):
+        return {"frame_ref": {"kind": "target_frame", "frame": {
+                    "component_id": "arm", "frame_id": frame_id}},
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}}
+
+    request_sequence = iter(range(1, 20))
+
+    def edit(value):
+        return runtime.set_persistent_value(_set(
+            runtime, "pose", value, request_id=f"pose.{next(request_sequence)}",
+            expected_program_revision=document["program_revision"]))
+
+    edit(pose("base"))
+    with pytest.raises(ProgramRunnerError) as ambiguous:
+        edit(pose("ambiguous"))
+    assert ambiguous.value.code == "persistent_key_value_invalid"
+    assert ambiguous.value.details["reason"] == "reference_ambiguous"
+    with pytest.raises(ProgramRunnerError) as missing:
+        edit(pose("missing"))
+    assert missing.value.details["reason"] == "frame_missing"
+    wire_facts["applied_record_digest"] = "sha256:" + "f" * 64
+    assert _refusal(lambda: edit(pose("base"))) == "persistent_key_activation_unavailable"
+    monkeypatch.setattr(headless, "committed_scenario_activation", lambda: {
+        **original(), "program_frame_facts": None,
+    })
+    assert _refusal(lambda: edit(pose("base"))) == "persistent_key_program_unavailable"

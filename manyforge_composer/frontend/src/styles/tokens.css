@@ -1,5 +1,5 @@
 /*
- * Composer design tokens (UI6-I-VC). The only place raw colours and scale
+ * Composer design tokens. The only place raw colours and scale
  * values are written. Colour tokens are named --mf-<role>-<family>-<lightness>
  * [-a<alpha>]: role is the property kind (bg, border, text, shadow, var), family
  * the hue family (neutral, accent, danger, warning, success, olive, violet, rose).
@@ -293,6 +293,7 @@
   --mf-font-size-130: 1.3rem;
 
   --mf-font-weight-regular: 400;
+  --mf-font-weight-medium: 500;
   --mf-font-weight-semibold: 650;
   --mf-font-weight-bold: 700;
   --mf-font-weight-heavy: 800;
@@ -332,10 +333,11 @@
   --mf-status-success: #65c59b;
   --mf-status-failure: #d86f66;
   --mf-status-interrupted: #d0894a;
+  --mf-preview-current: #58ddff;
   --mf-availability-configuration-required: #d5a34b;
   --mf-availability-unavailable: #7d8d96;
 
-  /* Program node design (UI6-I-VC D3): five category families, icon only. */
+  /* Program node design: five category families, icon only. */
   --mf-category-execution-control: #9daab4;
   --mf-category-motion: #6798c1;
   --mf-category-gripper: #b07088;

@@ -1655,11 +1655,11 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
                                       {"condition", condition},
                                       {"scope", std::move(normalized_scope)},
                                       {"priority", CanonicalValue(priority)}};
-    // CONTRACTS §8. stop: the operator's Stop on the scope, then the scope
+    // stop: the operator's Stop on the scope, then the scope
     // is gated while the condition holds; after_stop says whether the
     // interrupted motion node holds or fails. notify only publishes the rule
     // state. stop_entry_stage_id and after_stop belong to stop only.
-    // CONTRACTS §8 defaults: after_stop `hold` (stop only), active_at_start
+    // Defaults: after_stop `hold` (stop only), active_at_start
     // false; both are always written to the normalized rule.
     const auto on_trip = require_string(require_member(rule, "on_trip", path),
                                         child_path(path, "on_trip"));

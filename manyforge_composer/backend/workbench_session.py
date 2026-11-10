@@ -30,6 +30,6 @@ def previous_session_notice(path: str | None) -> dict | None:
             or not isinstance(report.get("message"), str)
             or not 0 < len(report["message"].encode()) <= 1024):
         raise ValueError("previous workbench session report is invalid")
-    # DX1005: opacity after an ordinary closed shutdown is a History-only
+    # Opacity after an ordinary closed shutdown is a History-only
     # diagnostic. A positive unresolved fact remains a visible warning.
     return None if report["shutdown"] == "clean" and report["effects"] != "unresolved" else report

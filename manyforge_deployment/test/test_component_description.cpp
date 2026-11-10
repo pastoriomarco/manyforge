@@ -1,9 +1,9 @@
-// N17 S2: the launch values the Deployment compiler writes into each
+// The launch values the Deployment compiler writes into each
 // controller profile row (description, arm joints, tool gripper joint).
 //
 // - The static frames of a description (moved from the execution host).
 // - Parity: on every example the compiled values are byte-identical to the
-//   ones the M9 execution host derived from the model map and the planning
+//   ones the execution host derived from the model map and the planning
 //   model's source URDFs.
 #include <gtest/gtest.h>
 
@@ -41,7 +41,7 @@ namespace host_contract = ros2_control_execution_runtime_contract;
 // Static frames
 // ===========================================================================
 
-// TCP-A: the TF static publication is the robot_state_publisher description:
+// The TF static publication is the robot_state_publisher description:
 // each static frame becomes one empty link and one fixed joint with the
 // frame's origin, appended before </robot>; every other byte is kept.
 TEST(ComponentStaticFrames, DescriptionCarriesOffsetFramesAsFixedLinks) {
@@ -112,13 +112,13 @@ TEST(ComponentStaticFrames, FixedLinksBelowStopAtMovingJoints) {
 }
 
 // ===========================================================================
-// Parity with the M9 execution host (delete with this section when S2 merges)
+// Parity with the earlier execution-host derivation
 // ===========================================================================
 
-// The M9 host's derivation (roboplan_backend::retained_component_description,
+// The earlier host's derivation (roboplan_backend::retained_component_description,
 // retained_static_frames.cpp), verbatim but for names: from the component's
 // spec, the retained model map and the planning model's source URDFs.
-namespace m9 {
+namespace earlier_host {
 
 [[noreturn]] void fail(const std::string &message) {
   throw std::invalid_argument("retained static frames: " + message);
@@ -218,7 +218,7 @@ std::string retained_component_description(
   return append_fixed_links(urdf_bytes, retained_component_static_frames(spec, model_map, sources));
 }
 
-} // namespace m9
+} // namespace earlier_host
 
 struct Example final {
   std::string name;
@@ -251,7 +251,7 @@ struct Example final {
 }
 
 /// The source joints of a component target's binding in the model map, in
-/// binding order: what the M9 host took for its controllers file.
+/// binding order: what the earlier host took for its controllers file.
 [[nodiscard]] std::vector<std::string> BindingSourceJoints(const VerifiedRetainedModelMap &map,
                                                            const core::ControllableComponentId &id,
                                                            std::string_view target) {
@@ -266,7 +266,7 @@ struct Example final {
   return {};
 }
 
-TEST(ComponentDescription, CompiledLaunchValuesEqualTheM9HostOnEveryExample) {
+TEST(ComponentDescription, CompiledLaunchValuesEqualTheEarlierHostDerivationOnEveryExample) {
   std::size_t arms = 0;
   std::size_t tools = 0;
   for (const auto &example : Examples()) {
@@ -301,7 +301,7 @@ TEST(ComponentDescription, CompiledLaunchValuesEqualTheM9HostOnEveryExample) {
         });
         ASSERT_NE(source, sources.end());
         EXPECT_EQ(profile.description,
-                  m9::retained_component_description(source->urdf_bytes, spec, *model_map, sources));
+                  earlier_host::retained_component_description(source->urdf_bytes, spec, *model_map, sources));
         const auto arm = BindingSourceJoints(*model_map, id, "arm");
         if (!arm.empty()) {
           ++arms;

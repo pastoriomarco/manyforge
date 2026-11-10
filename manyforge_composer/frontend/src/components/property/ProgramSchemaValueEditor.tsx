@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import type {
   CatalogEntry,
@@ -35,6 +35,7 @@ import {
 import { DraftTextInput, DraftTextarea } from '../common/DraftInputs';
 import {
   defaultMotionPoseValue,
+  ProgramManualFillPreviewContext,
   ProgramSpecializedEditor,
   supportsProgramSpecializedEditor,
   type ValueCommit,
@@ -69,6 +70,8 @@ export interface ProgramSchemaValueEditorContext {
   node: ProgramTreeNode;
   parameterId: string;
   program: ProgramAuthoringDocument;
+  frameScope?: FrameScope;
+  directReferenceChoices?: Record<string, Array<{ value: JsonValue; label: string; reason?: string }>>;
   /** The Deployment Draft's global rule ids (`interrupt_state.<rule_id>` keys). */
   globalRuleIds?: readonly string[];
   sourceJointInventory?: ProgramSourceJointInventory | null;
@@ -97,14 +100,63 @@ interface ProgramSchemaValueEditorProps {
   onInvalidChange?: (message: string | null) => void;
 }
 
+const DIRECT_REFERENCE_FIELDS: Record<string, readonly string[]> = {
+  target_reference: ['component_id', 'command_target_id'],
+  frame_reference: ['component_id', 'frame_id'],
+  collision_body_reference: ['component_id', 'collision_body_id'],
+  signal_reference: ['component_id', 'signal_name'],
+};
+
+function referenceKey(value: JsonValue | undefined, fields: readonly string[]): string {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return '';
+  const parts = fields.map((field) => value[field]);
+  return parts.every((part) => typeof part === 'string') ? JSON.stringify(parts) : '';
+}
+
+function DirectReferenceEditor({ schema, value, disabled, context, path = 'value', onCommit, onInvalidChange }: ProgramSchemaValueEditorProps) {
+  const semanticType = schema['x-manyforge-semantic-type']!;
+  const fields = DIRECT_REFERENCE_FIELDS[semanticType];
+  const choices = context.directReferenceChoices?.[semanticType] ?? [];
+  const selected = referenceKey(value, fields);
+  const current = choices.find((choice) => referenceKey(choice.value, fields) === selected);
+  const issue = selected && (!current || current.reason) ? current?.reason ?? 'This reference is unavailable in the current Draft candidate.' : null;
+  useInvalidReport(issue || null, onInvalidChange);
+  return <select
+    aria-label={`Choose ${semanticType.replaceAll('_', ' ')} for ${path.replaceAll('_', ' ')}`}
+    aria-invalid={Boolean(issue) || undefined}
+    title={issue || undefined}
+    value={selected}
+    disabled={disabled}
+    onChange={(event) => {
+      const choice = choices.find((row) => referenceKey(row.value, fields) === event.target.value);
+      if (choice && !choice.reason) onCommit(choice.value);
+    }}
+  >
+    {!selected && <option value="" disabled>Select {semanticType.replaceAll('_', ' ')}</option>}
+    {selected && !current && <option value={selected} disabled>{selected} · unavailable in the current Draft candidate</option>}
+    {choices.map((choice) => <option key={referenceKey(choice.value, fields)} value={referenceKey(choice.value, fields)} disabled={Boolean(choice.reason)}>
+      {choice.label}{choice.reason ? ` · ${choice.reason}` : ''}
+    </option>)}
+  </select>;
+}
+
 /** The Program's frames as one node sees them: its own robot's frames first. */
 function nodeFrameScope(context: ProgramSchemaValueEditorContext): FrameScope {
-  const targetRole = context.node.parameters.target_role
-    ?? context.entry.parameters.find((parameter) => parameter.id === 'target_role')?.default;
+  const target = context.node.parameters.target;
+  const targetObject = target !== null && typeof target === 'object' && !Array.isArray(target) ? target : null;
+  const componentId = typeof targetObject?.component_id === 'string' ? targetObject.component_id : undefined;
   return {
     program: context.program,
-    ...(typeof targetRole === 'string' ? { movingTargetRole: targetRole } : {}),
+    ...context.frameScope,
+    ...(componentId === undefined ? {} : { movingComponentId: componentId }),
   };
+}
+
+// A relative motion states its goal from target_reference (motion_target_resolution).
+function nodeHasRelativeGoal(context: ProgramSchemaValueEditorContext): boolean {
+  const targetMode = context.node.parameters.target_mode
+    ?? context.entry.parameters.find((parameter) => parameter.id === 'target_mode')?.default;
+  return targetMode === 'relative';
 }
 
 // Reporting belongs to a mounted field, not to the parent's callback identity.
@@ -429,6 +481,7 @@ function ArrayEditor(props: ProgramSchemaValueEditorProps) {
 
 function ObjectEditor(props: ProgramSchemaValueEditorProps) {
   const { schema, value, disabled, context, path = 'value', onCommit, onInvalidChange } = props;
+  const previewValues = useContext(ProgramManualFillPreviewContext);
   const defaults = useMemo(() => Object.fromEntries(
     Object.entries(schema.properties ?? {}).map(([name, child]) => [name, defaultSchemaValue(child)]),
   ), [schema]);
@@ -455,17 +508,39 @@ function ObjectEditor(props: ProgramSchemaValueEditorProps) {
       <legend>{path.split('.').at(-1)?.replaceAll('_', ' ')}</legend>
       {Object.entries(properties).map(([name, childSchema]) => {
         const present = Object.prototype.hasOwnProperty.call(draft, name);
+        const previewValue = previewValues.get(`${path}.${name}`);
         if (!present && !required.has(name)) {
           return (
-            <button type="button" className="text-button" key={name} disabled={disabled} onClick={() => {
-              submit({ ...draft, [name]: defaultSchemaValue(childSchema) });
-            }}>Add {name.replaceAll('_', ' ')}</button>
+            <button
+              type="button"
+              className={`text-button${previewValue === undefined ? '' : ' program-manual-fill-preview'}`}
+              key={name}
+              disabled={disabled}
+              onClick={() => {
+                submit({ ...draft, [name]: defaultSchemaValue(childSchema) });
+              }}
+            >
+              Add {name.replaceAll('_', ' ')}
+              {previewValue !== undefined && (
+                <span className="program-manual-fill-new-value" aria-hidden="true"> → {previewValue}</span>
+              )}
+            </button>
           );
         }
         return (
-          <div className="program-schema-object-field" key={name}>
-            <div className="program-property-heading">
-              <span>{name}</span>
+          <div
+            className={`program-schema-object-field${previewValue === undefined ? '' : ' program-manual-fill-changed'}`}
+            key={name}
+          >
+            <div className={`program-property-heading${previewValue === undefined ? '' : ' program-manual-fill-changed'}`}>
+              <span>
+                {name}
+                {previewValue !== undefined && (
+                  <span className="program-manual-fill-new-value" aria-hidden="true">
+                    {' '}→ {previewValue}
+                  </span>
+                )}
+              </span>
               {!required.has(name) && (
                 <button type="button" className="text-button" disabled={disabled} onClick={() => {
                   const candidate = { ...draft };
@@ -494,6 +569,7 @@ function ObjectEditor(props: ProgramSchemaValueEditorProps) {
 
 function MapEditor(props: ProgramSchemaValueEditorProps) {
   const { schema, value, disabled, context, path = 'value', onCommit, onInvalidChange } = props;
+  const previewValues = useContext(ProgramManualFillPreviewContext);
   const incoming = plainObject(value);
   const [rows, setRows] = useState(() => Object.entries(incoming).map(
     ([key, value], id) => ({ id, key, value }),
@@ -525,6 +601,19 @@ function MapEditor(props: ProgramSchemaValueEditorProps) {
     .filter((key): key is string => typeof key === 'string'
       && !Object.prototype.hasOwnProperty.call(draft, key))
     .sort();
+  const previewOnlyEntries = new Map<string, Array<[string, string]>>();
+  const previewPrefix = `${path}.`;
+  for (const [fieldPath, previewValue] of previewValues) {
+    if (!fieldPath.startsWith(previewPrefix)) continue;
+    const remainder = fieldPath.slice(previewPrefix.length);
+    const separator = remainder.indexOf('.');
+    if (separator <= 0) continue;
+    const key = remainder.slice(0, separator);
+    if (Object.prototype.hasOwnProperty.call(draft, key) || sourcedEntries.includes(key)) continue;
+    const fields = previewOnlyEntries.get(key) ?? [];
+    fields.push([remainder.slice(separator + 1), previewValue]);
+    previewOnlyEntries.set(key, fields);
+  }
   const submit = (nextRows: typeof rows, moves?: readonly ListMove[]) => {
     setRows(nextRows);
     const candidate = Object.fromEntries(nextRows.map((row) => [row.key, row.value]));
@@ -593,6 +682,19 @@ function MapEditor(props: ProgramSchemaValueEditorProps) {
             onCommit={(value) => submit([...rows, { id: nextId.current++, key, value }])}
             onInvalidChange={(message) => report(`sourced:${key}`, message)}
           />
+        </div>
+      ))}
+      {[...previewOnlyEntries].map(([key, fields]) => (
+        <div className="program-schema-map-row program-schema-map-preview-row" key={`preview:${key}`}>
+          <span className="program-schema-map-preview-key">{key}</span>
+          <div className="program-schema-map-preview-fields">
+            {fields.map(([field, previewValue]) => (
+              <span key={field}>
+                {field.replaceAll('.', ' › ')}
+                <span className="program-manual-fill-new-value"> → {previewValue}</span>
+              </span>
+            ))}
+          </div>
         </div>
       ))}
       <div className="program-schema-map-add">
@@ -753,6 +855,9 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
   const typing = keyValueTyping(schema, context.node, programBlackboardKeys(context.program, context.globalRuleIds));
   if (typing !== null) return <KeyValueEditor {...stableProps} typing={typing} />;
   const semanticType = schema['x-manyforge-semantic-type'];
+  if (semanticType && DIRECT_REFERENCE_FIELDS[semanticType]) {
+    return whole(<DirectReferenceEditor {...stableProps} />);
+  }
   if (semanticType && semanticType !== 'source_joint') {
     return whole(<SemanticChoiceEditor {...stableProps} />);
   }
@@ -830,6 +935,7 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
         path={path}
         sourceJointInventory={props.context.sourceJointInventory}
         frameScope={nodeFrameScope(props.context)}
+        relativeGoal={nodeHasRelativeGoal(props.context)}
         onCommit={onCommit}
         onInvalidChange={onInvalidChange}
       />,

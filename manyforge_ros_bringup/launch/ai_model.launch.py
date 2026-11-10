@@ -30,7 +30,7 @@ def node_kwargs(site_config_path: str) -> dict:
 
 
 def launch_setup(context, *args, **kwargs):
-    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
+    keep_sigint_out_of_tasks(context)  # Before any Node action exists.
     return [
         Node(**node_kwargs(LaunchConfiguration("site_config_path").perform(context)))
     ]

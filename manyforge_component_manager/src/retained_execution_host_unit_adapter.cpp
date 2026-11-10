@@ -5,6 +5,7 @@
 #include "manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp"
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
+#include "manyforge_component_manager/execution_host_exit.hpp"
 #include <manyforge_deployment/apply_affected_scope.hpp>
 
 #include <fcntl.h>
@@ -54,7 +55,7 @@
 
 extern char **environ;
 
-// DX-753: preserve native-named unit maps, launch, epochs, inventory, liveness and Stop plumbing.
+// Preserve native-named unit maps, launch, epochs, inventory, liveness and Stop plumbing.
 namespace manyforge::component_manager {
 namespace {
 
@@ -920,6 +921,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     // name an unrelated process, so it is never waited on again; the stale
     // registry row is observed as absent and erased by its next observer.
     bool reaped{};
+    std::optional<int> exit_status;
     bool shutdown_requested{};
     bool shutdown_acknowledged{};
     bool shutdown_progress_pending{};
@@ -1212,6 +1214,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     }
     if (result == child.pid) {
       if (WIFEXITED(status)) {
+        child.exit_status = WEXITSTATUS(status);
         std::cerr << "execution host child exited: pid=" << child.pid
                   << " status=" << WEXITSTATUS(status) << '\n';
       } else if (WIFSIGNALED(status)) {
@@ -1462,11 +1465,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     }
     auto found = children.begin();
     if (!ChildIsLive(found->second)) {
+      const auto exit_reason =
+          execution_host_child_exit_reason(found->second.exit_status);
       EraseChild(found);
       return manyforge::core::Result<Response>::Err(
           {"kernel_owner_unavailable",
            "managed Kernel child exited before its cell-admission response",
-           {{"reason", "execution_host_child_exited"}}});
+           {{"reason", std::string(exit_reason)}}});
     }
     if (!SettlePendingInspection(found->second))
       return manyforge::core::Result<Response>::Err(

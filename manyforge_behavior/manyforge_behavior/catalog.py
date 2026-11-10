@@ -1,4 +1,4 @@
-"""Strict v2 node-catalog model and validator.
+"""Strict v3 node-catalog model and validator.
 
 The catalog is portable authored meaning.  It contains stable runner
 implementation identities, not Python imports or runtime availability.
@@ -31,11 +31,11 @@ from manyforge_behavior.catalog_schema import (
 )
 
 
-EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.9.0"
+EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
+EXPECTED_CONTENT_VERSION = "3.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:0078bbc926b924bbc3a2d00ba46f00fee2b4deb546b7462383a6a56ae22d9e78"
+    "sha256:59fa3d425937116723fbb04ae19c8775fae761ae3061d5da5eac5f328889fef5"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -71,7 +71,6 @@ _OWNER_APIS = {
     "kernel.recovery",
     "kernel.reset",
     "kernel.rules",
-    "kernel.runtime_scaling",
     "kernel.stop",
     "model.kinematics",
     "orchestration.blackboard",
@@ -94,7 +93,6 @@ _TARGET_CAPABILITIES = {
     "execution.feedback.phase_events",
     "execution.feedback.state_snapshots",
     "execution.reset",
-    "execution.runtime_scale.operation_scoped",
     "execution.stop.motion.hard_deceleration",
     "execution.stop.motion.soft_on_path",
     "execution.stop.motion.spring_back_hold",
@@ -117,6 +115,7 @@ _TARGET_CAPABILITIES = {
     "validation.trajectory.non_collision",
 }
 _CELL_CAPABILITIES = {
+    "assistant.model.query",
     "collision.query.detailed",
     "collision.query.pre_execution",
     "collision.query.runtime",
@@ -266,7 +265,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class CatalogValidationError(ValueError):
-    """The descriptor is not the closed v2 catalog contract."""
+    """The descriptor is not the closed v3 catalog contract."""
 
 
 @dataclass(frozen=True)
@@ -276,6 +275,7 @@ class CatalogParameter:
     schema: CatalogSchema
     has_default: bool = False
     default: Any = None
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -699,7 +699,7 @@ class NodeCatalog:
             or self._catalog_digest != EXPECTED_BUILTIN_CATALOG_DIGEST
         ):
             raise CatalogValidationError(
-                f"catalog does not match the frozen built-in v2/{EXPECTED_CONTENT_VERSION} packet"
+                f"catalog does not match the frozen built-in v3/{EXPECTED_CONTENT_VERSION} packet"
             )
 
         self._entries = MappingProxyType(entries)
@@ -770,7 +770,7 @@ class NodeCatalog:
                         scope_parameter.schema,
                         self._schema_registry,
                     )
-                    != "target_role"
+                    not in {"target_role", "target_reference"}
                 ):
                     raise CatalogValidationError(
                         f"{label}.parameters.{parameter.id} semantic scope must "
@@ -784,7 +784,8 @@ class NodeCatalog:
                 for parameter in parameters
             )
             and sum(
-                _schema_semantic_type(parameter.schema, self._schema_registry) == "target_role"
+                _schema_semantic_type(parameter.schema, self._schema_registry)
+                in {"target_role", "target_reference"}
                 for parameter in parameters
             )
             != 1
@@ -870,7 +871,7 @@ class NodeCatalog:
             # leaf never reports it. `failure` is declared when the leaf's own
             # work can fail (the timer's wait cannot). Separately, any node,
             # whatever it declares, fails an attempt whose inputs cannot be
-            # resolved before its work starts (spec 440 §4.6), so no
+            # resolved before its work starts, so no
             # consumer may refuse or hide that `failure` for lack of a
             # declared `failure` outcome.
             interrupted = {"interrupted"} if execution.cancellable else set()
@@ -994,17 +995,13 @@ class NodeCatalog:
             _closed(
                 parameter,
                 required={"id", "required"},
-                allowed={"id", "required", "schema", "schema_ref", "default"},
+                allowed={"id", "required", "description", "schema", "schema_ref", "default"},
                 label=parameter_label,
             )
             parameter_id = _identifier(parameter["id"], f"{parameter_label}.id")
             if parameter_id in seen:
                 raise CatalogValidationError(
                     f"{label} contains duplicate parameter ID {parameter_id!r}"
-                )
-            if parameter_id in _FORBIDDEN_PORTABLE_NAMES:
-                raise CatalogValidationError(
-                    f"{parameter_label}.id is forbidden runtime identity/evidence"
                 )
             seen.add(parameter_id)
             required = _boolean(parameter["required"], f"{parameter_label}.required")
@@ -1024,6 +1021,13 @@ class NodeCatalog:
                 self._schema_registry.resolve(schema)
             except CatalogSchemaError as exc:
                 raise CatalogValidationError(str(exc)) from exc
+            if parameter_id in _FORBIDDEN_PORTABLE_NAMES and not (
+                parameter_id == "base_frame"
+                and _schema_semantic_type(schema, self._schema_registry) == "frame_reference"
+            ):
+                raise CatalogValidationError(
+                    f"{parameter_label}.id is forbidden runtime identity/evidence"
+                )
             if _schema_references_authoring(
                 schema,
                 self._schema_registry,
@@ -1051,6 +1055,11 @@ class NodeCatalog:
                     schema=schema,
                     has_default=has_default,
                     default=_freeze_json_value(default),
+                    description=(
+                        _text(parameter["description"], f"{parameter_label}.description")
+                        if "description" in parameter
+                        else ""
+                    ),
                 )
             )
         return tuple(parameters)
@@ -1124,7 +1133,15 @@ class NodeCatalog:
                         f"{requirement_label}.{field_name} references unknown "
                         f"parameter {selector!r}"
                     )
-                if _schema_semantic_type(parameter.schema, self._schema_registry) != semantic_type:
+                selected_type = _schema_semantic_type(
+                    parameter.schema, self._schema_registry
+                )
+                allowed_types = (
+                    {"target_role", "target_reference", "signal_reference"}
+                    if field_name == "target_parameter"
+                    else {semantic_type}
+                )
+                if selected_type not in allowed_types:
                     raise CatalogValidationError(
                         f"{requirement_label}.{field_name} must select a "
                         f"{semantic_type} parameter"

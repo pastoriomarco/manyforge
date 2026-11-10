@@ -5,20 +5,8 @@ namespace manyforge::core::reason_codes {
 // Shared diagnostic reason-code vocabulary. Keep these values stable: they are
 // stored in event details, failure archives, and UI/MCP incident payloads.
 
-inline constexpr char kRawIkFailure[] = "raw_ik_failure";
-inline constexpr char kCollisionAwareIkFailure[] =
-    "collision_aware_ik_failure";
-inline constexpr char kCollisionValidationFailure[] =
-    "collision_validation_failure";
-inline constexpr char kSupportContactRejection[] =
-    "support_contact_rejection";
-inline constexpr char kContactPolicyRejection[] =
-    "contact_policy_rejection";
-inline constexpr char kStartStateInCollision[] = "start_state_in_collision";
 inline constexpr char kPreviewFailed[] = "preview_failed";
 
-inline constexpr char kRuntimeContactGraspMonitor[] =
-    "runtime_contact_grasp_monitor";
 inline constexpr char kRuntimeContactGraspUnknownPolicy[] =
     "runtime_contact_grasp_unknown_policy";
 inline constexpr char kRuntimeContactGraspInvalidPolicy[] =
@@ -43,8 +31,6 @@ inline constexpr char kCollisionValidationSerialFallbackException[] =
     "collision_validation_serial_fallback_exception";
 inline constexpr char kCollisionValidationWorkerException[] =
     "collision_validation_worker_exception";
-inline constexpr char kCollisionValidationSerialReferenceException[] =
-    "collision_validation_serial_reference_exception";
 inline constexpr char kEventSubscriberException[] =
     "event_subscriber_exception";
 inline constexpr char kGripperStateUnavailable[] = "gripper_state_unavailable";
@@ -53,7 +39,7 @@ inline constexpr char kTrackingSampleInvalid[] = "tracking_sample_invalid";
 inline constexpr char kTerminalPublicationInProgress[] =
     "terminal_publication_in_progress";
 
-// Recovery assessment/admission (spec/230 §3.7.1, spec/210 §3.12).
+// Recovery assessment/admission.
 inline constexpr char kRecoveryNoneActive[] = "no_recovery_active";
 inline constexpr char kRecoveryStopNotCertified[] = "stop_not_certified";
 inline constexpr char kRecoveryStopCertified[] = "stop_certified";
@@ -71,8 +57,6 @@ inline constexpr char kRecoveryStrongerAuthorityActive[] =
 inline constexpr char kRecoveryLatchMissing[] = "recovery_latch_missing";
 inline constexpr char kRecoveryLatchNotRetryable[] =
     "recovery_latch_not_retryable";
-inline constexpr char kRecoveryInterventionChoiceRequired[] =
-    "intervention_choice_required";
 inline constexpr char kRecoveryFailedValidationRetryable[] =
     "failed_validation_retryable";
 inline constexpr char kRecoveryFailedNotRetryable[] =
@@ -84,8 +68,6 @@ inline constexpr char kRecoveryStopCertificateChanged[] =
     "stop_certificate_changed";
 inline constexpr char kRecoveryStopOwnerGenerationChanged[] =
     "stop_owner_generation_changed";
-inline constexpr char kRecoveryPreemptionNotSucceeded[] =
-    "preemption_not_succeeded";
 inline constexpr char kRecoveryActionNotAllowed[] = "action_not_allowed";
 inline constexpr char kRecoveryPrincipalMissing[] =
     "principal_id_missing";

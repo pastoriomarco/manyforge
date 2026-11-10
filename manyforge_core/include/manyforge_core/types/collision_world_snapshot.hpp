@@ -32,9 +32,7 @@ namespace manyforge::core {
                          std::to_string(shape_index));
 }
 
-/// One collision body present in a `CollisionWorldSnapshot` (spec
-/// §3.8.1, defined by the kernel-architecture sprint
-/// P-2-impl-snapshot chunk).
+/// One collision body present in a `CollisionWorldSnapshot`.
 ///
 /// A body is the unit of pose: every geometry attached to the body
 /// inherits the body's `pose` and is offset by its own
@@ -47,7 +45,7 @@ namespace manyforge::core {
 /// publishers MUST construct a fresh snapshot for any change and
 /// advance the snapshot's `revision`.
 struct CollisionWorldBody {
-  /// Body identifier in the spec §3.8.1 normative format:
+  /// Body identifier in the normative format:
   /// `component/<component>/model/<model>/body/<role>/collision/<index>`,
   /// `scene/<scene_resource>/shape/<index>`, or
   /// `runtime_object/<runtime_object>/shape/<index>`.
@@ -100,9 +98,7 @@ struct CollisionComponentModelFrame {
   Pose3DTO world_pose;
 };
 
-/// Immutable snapshot of the active collision world (spec §3.8.1,
-/// defined by the kernel-architecture sprint P-2-impl-snapshot
-/// chunk).
+/// Immutable snapshot of the active collision world.
 ///
 /// The snapshot is the *world* half of the (world, policy) pair that
 /// every `ICollisionQueryEngine` worker consumes. It carries the

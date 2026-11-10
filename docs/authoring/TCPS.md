@@ -149,8 +149,8 @@ applies when Attach runs.
 
 ## TCP speed limit
 
-Every move is limited at its TCP, the robot's Active TCP during the move
-(TCP-1): ManyForge sets that TCP on the robot, so it checks no other frame,
+Every move is limited at its TCP, the robot's Active TCP during the move:
+ManyForge sets that TCP on the robot, so it checks no other frame,
 the flange included. The limit is the robot row's TCP ceiling
 (`target_settings.arm.maximum_tcp_linear_speed_mps`); a move's own
 `max_tcp_linear_speed_mps` can only lower it. Keep the ceiling at or below the

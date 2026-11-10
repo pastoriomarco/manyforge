@@ -418,6 +418,7 @@ def test_launch_node_contract():
     assert kwargs["name"] == "sim_plc_plc_io"
     assert kwargs["namespace"] == "/manyforge"
     assert kwargs["arguments"] == ["--device", "plc_io", "--config-dir", "/cfg"]
+    assert kwargs["ros_arguments"] == ["--disable-external-lib-logs"]
     assert kwargs["additional_env"] == {"ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST"}
 
 

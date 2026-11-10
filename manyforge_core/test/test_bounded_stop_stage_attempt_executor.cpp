@@ -131,10 +131,18 @@ class IsolatedPort final : public IControlDomainExecutionPort {
 
 class CompletionReceiver final : public IStopStageAttemptCompletionReceiver {
  public:
-  void StageAttemptCompleted(const StopStageAttemptHandle handle) noexcept override {
+  void StageAttemptCompleted(BoundedStopStageAttemptExecutor& source,
+                             const StopStageAttemptHandle handle) noexcept override {
     std::lock_guard lock(mutex_);
     ++counts_[handle];
+    sources_[handle] = &source;
     changed_.notify_all();
+  }
+
+  [[nodiscard]] BoundedStopStageAttemptExecutor* Source(const StopStageAttemptHandle handle) {
+    std::lock_guard lock(mutex_);
+    const auto found = sources_.find(handle);
+    return found == sources_.end() ? nullptr : found->second;
   }
 
   [[nodiscard]] bool Wait(const StopStageAttemptHandle handle) {
@@ -151,6 +159,7 @@ class CompletionReceiver final : public IStopStageAttemptCompletionReceiver {
   std::mutex mutex_;
   std::condition_variable changed_;
   std::map<StopStageAttemptHandle, std::size_t> counts_;
+  std::map<StopStageAttemptHandle, BoundedStopStageAttemptExecutor*> sources_;
 };
 
 [[nodiscard]] StopStageAttemptTakeResult WaitForResult(BoundedStopStageAttemptExecutor& executor,
@@ -459,6 +468,49 @@ TEST(BoundedStopStageAttemptExecutorTest, DestructionWithoutOwnerDrainDrainsInst
     EXPECT_TRUE(executor.prequalified_ready());
   }
   EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+}
+
+// OD-65: an owner that swaps its executor settles the retired executor's
+// late attempts on that executor. Handles therefore never repeat across
+// executors, and every completion names the executor that ran it.
+TEST(BoundedStopStageAttemptExecutorTest, HandlesAreUniqueAcrossExecutorsAndNameTheirSource) {
+  IsolatedPort port;
+  CompletionReceiver receiver;
+  BoundedStopStageAttemptExecutor retired(8U, 1U, receiver);
+  BoundedStopStageAttemptExecutor successor(8U, 1U, receiver);
+
+  const auto first = retired.TryStart({&port, stage("fast"), budget()});
+  const auto second = successor.TryStart({&port, stage("fast"), budget()});
+  ASSERT_EQ(first.status, StopStageAttemptStartStatus::kStarted);
+  ASSERT_EQ(second.status, StopStageAttemptStartStatus::kStarted);
+  ASSERT_TRUE(first.handle.has_value());
+  ASSERT_TRUE(second.handle.has_value());
+  // Same lane index, distinct generations.
+  EXPECT_EQ(first.handle->slot, second.handle->slot);
+  EXPECT_NE(first.handle->generation, second.handle->generation);
+
+  ASSERT_TRUE(receiver.Wait(*first.handle));
+  ASSERT_TRUE(receiver.Wait(*second.handle));
+  EXPECT_EQ(receiver.Source(*first.handle), &retired);
+  EXPECT_EQ(receiver.Source(*second.handle), &successor);
+
+  // A retired executor's handle is stale on its successor and the reverse.
+  EXPECT_EQ(successor.TryTake(*first.handle).status, StopStageAttemptTakeStatus::kStaleHandle);
+  EXPECT_EQ(successor.Release(*first.handle), StopStageAttemptReleaseStatus::kStaleHandle);
+  EXPECT_FALSE(successor.RequestCancel(*first.handle));
+  EXPECT_EQ(retired.TryTake(*second.handle).status, StopStageAttemptTakeStatus::kStaleHandle);
+
+  // Each settles on its own executor.
+  EXPECT_EQ(WaitForResult(retired, *first.handle).status, StopStageAttemptTakeStatus::kCompleted);
+  EXPECT_EQ(retired.Release(*first.handle), StopStageAttemptReleaseStatus::kReleased);
+  EXPECT_EQ(WaitForResult(successor, *second.handle).status,
+            StopStageAttemptTakeStatus::kCompleted);
+  EXPECT_EQ(successor.Release(*second.handle), StopStageAttemptReleaseStatus::kReleased);
+
+  retired.CloseIngress();
+  successor.CloseIngress();
+  EXPECT_TRUE(retired.DrainFor(1s));
+  EXPECT_TRUE(successor.DrainFor(1s));
 }
 
 }  // namespace

@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { buildJointMotionIntent } from '../state/robotControl';
+import { statusFixture } from '../testFixtures/robotControl';
 import {
   ApiError,
   authoringRefusalMessage,
@@ -94,6 +96,29 @@ it('keeps an unlisted typed preparation cause visible when no catalog row exists
   );
 });
 
+it('accepts a joint-flange fallback only for a joint-goal motion preview', async () => {
+  const intent = buildJointMotionIntent(statusFixture(), [0.2, 0.1], 'preview-1');
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(motionPreviewResponse(intent))));
+  await expect(api.execution.previewMotion(intent)).resolves.toMatchObject({
+    resolvedTcp: { source: 'joint_flange_fallback', entry: { frame: { frameId: 'flange' } } },
+  });
+
+  const poseIntent = structuredClone(intent);
+  const payload = poseIntent.participants[0].payload;
+  if (payload.kind !== 'motion') throw new Error('expected motion payload');
+  payload.motion = {
+    kind: 'pose_goal',
+    goal: {
+      position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
+      orientation: { x: 0, y: 0, z: 0, w: 1 },
+    },
+  };
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(motionPreviewResponse(poseIntent))));
+  await expect(api.execution.previewMotion(poseIntent)).rejects.toThrow(
+    /joint flange fallback is only valid for a joint-goal preview/,
+  );
+});
+
 it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
   const error = new ApiError('refused', 409, { detail: {
     code: 'stale_generation',
@@ -157,7 +182,10 @@ import type {
   LocalWorkspaceFenceRequest,
 } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
-import type { RuntimeScaleControlSelector } from '../types/robotControl';
+import type {
+  DirectControlOperationIntent,
+  RuntimeScaleControlSelector,
+} from '../types/robotControl';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -251,41 +279,41 @@ describe('runtime-scale control reads', () => {
   it('serializes singular and group selectors with their exact query shape', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(runtimeScaleResponse({
-        kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
+        kind: 'singular', programBindingId: 'binding/1', componentId: 'robot', commandTargetId: 'arm',
       })))
       .mockResolvedValueOnce(response(runtimeScaleResponse({
         kind: 'group', programBindingId: 'binding/1', groupTargets: [
-          { componentRoleId: 'robot', targetRoleId: 'arm' },
-          { componentRoleId: 'robot', targetRoleId: 'gripper' },
+          { componentId: 'robot', commandTargetId: 'arm' },
+          { componentId: 'robot', commandTargetId: 'gripper' },
         ],
       })));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.execution.runtimeScaleControl({
-      kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
+      kind: 'singular', programBindingId: 'binding/1', componentId: 'robot', commandTargetId: 'arm',
     });
     await api.execution.runtimeScaleControl({
       kind: 'group', programBindingId: 'binding/1', groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     });
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/execution/runtime-scale-control?program_binding_id=binding%2F1&component_role_id=robot&target_role_id=arm',
+      '/api/execution/runtime-scale-control?program_binding_id=binding%2F1&component_id=robot&command_target_id=arm',
     );
     expect(fetchMock.mock.calls[1]?.[0]).toContain(
-      'program_binding_id=binding%2F1&group_targets=%5B%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22arm%22%7D%2C%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22gripper%22%7D%5D',
+      'program_binding_id=binding%2F1&group_targets=%5B%7B%22component_id%22%3A%22robot%22%2C%22command_target_id%22%3A%22arm%22%7D%2C%7B%22component_id%22%3A%22robot%22%2C%22command_target_id%22%3A%22gripper%22%7D%5D',
     );
   });
 
   it('rejects malformed and crossed owner responses', async () => {
     const selector = {
-      kind: 'singular' as const, programBindingId: 'binding-1', componentRoleId: 'robot', targetRoleId: 'arm',
+      kind: 'singular' as const, programBindingId: 'binding-1', componentId: 'robot', commandTargetId: 'arm',
     };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({}))
-      .mockResolvedValueOnce(response(runtimeScaleResponse({ ...selector, targetRoleId: 'gripper' })));
+      .mockResolvedValueOnce(response(runtimeScaleResponse({ ...selector, commandTargetId: 'gripper' })));
     vi.stubGlobal('fetch', fetchMock);
     await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('Invalid response');
     await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('does not match');
@@ -294,8 +322,8 @@ describe('runtime-scale control reads', () => {
   it('rejects crossed group members and bindings', async () => {
     const selector = {
       kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     };
     const fetchMock = vi.fn()
@@ -303,7 +331,7 @@ describe('runtime-scale control reads', () => {
         ...selector,
         groupTargets: [
           selector.groupTargets[0],
-          { componentRoleId: 'robot', targetRoleId: 'camera' },
+          { componentId: 'robot', commandTargetId: 'camera' },
         ],
       })))
       .mockResolvedValueOnce(response(runtimeScaleResponse({
@@ -317,8 +345,8 @@ describe('runtime-scale control reads', () => {
   it('validates a deferred response against a selector snapshot', async () => {
     const selector = {
       kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     };
     let resolveResponse: ((value: Response) => void) | undefined;
@@ -327,11 +355,11 @@ describe('runtime-scale control reads', () => {
     })));
     const pending = api.execution.runtimeScaleControl(selector);
     selector.programBindingId = 'binding-crossed';
-    selector.groupTargets[0].targetRoleId = 'camera';
+    selector.groupTargets[0].commandTargetId = 'camera';
     resolveResponse?.(response(runtimeScaleResponse({
       kind: 'group', programBindingId: 'binding-1', groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     })));
     await expect(pending).resolves.toMatchObject({ selector: { kind: 'group' } });
@@ -340,8 +368,8 @@ describe('runtime-scale control reads', () => {
   it('accepts a group response whose target order differs', async () => {
     const selector = {
       kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'gripper' },
       ],
     };
     const returned = { ...selector, groupTargets: [...selector.groupTargets].reverse() };
@@ -362,17 +390,65 @@ function response(
   } as unknown as Response;
 }
 
+function motionPreviewResponse(intent: DirectControlOperationIntent): Record<string, unknown> {
+  const participant = intent.participants[0];
+  if (participant.payload.kind !== 'motion') throw new Error('expected motion payload');
+  const joints = ['joint1', 'joint2'];
+  return {
+    ok: true,
+    command: 'preview_motion',
+    preview_receipt: {
+      schema_version: 'manyforge.direct_control_motion_preview.v4',
+      receipt_digest: 'sha256:receipt',
+      intent_digest: 'sha256:intent',
+      request_id: intent.request_context.request_id,
+      request_owner_epoch: intent.request_context.request_owner_epoch,
+      program_id: intent.program_id,
+      program_revision: intent.program_revision,
+      program_binding_id: intent.program_binding_id,
+      program_run_id: intent.program_run_id,
+      graph_revision: intent.expected_graph_revision,
+      retained_bundle_id: intent.expected_retained_bundle_id,
+      scene_revision: { scene_id: 'scene.1', revision_id: 1, content_hash: 'sha256:scene' },
+      target: participant.target,
+      resolved_tcp: {
+        entry: {
+          target: participant.target,
+          frame: { component_id: participant.target.component_id, frame_id: 'flange' },
+        },
+        source: 'joint_flange_fallback',
+        owner_epoch: intent.request_context.request_owner_epoch,
+        registration_generation: 1,
+        sequence: 0,
+      },
+      required_capability_id: participant.required_capability_id,
+      source_joint_names: joints,
+      start_positions_rad: [0, 0],
+      final_positions_rad: [0.1, 0.2],
+      final_tcp_pose: {
+        position_m: { x_m: 0, y_m: 0, z_m: 0.1 },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      collision_world_revision: { revision_id: 1, content_hash: 'sha256:collision' },
+      path_preview: { source_joint_names: joints, pairs: [], samples: [
+        { time_from_start_s: 0, positions_rad: [0, 0], contacts: [], status: 'checked' },
+      ] },
+      commit_eligible: true,
+    },
+  };
+}
+
 function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<string, unknown> {
-  const member = (target: { componentRoleId: string; targetRoleId: string }) => ({
+  const member = (target: { componentId: string; commandTargetId: string }) => ({
     active_control_configuration_generation: 1,
-    active_control_configuration_id: `active-${target.targetRoleId}`,
-    control_binding_id: `binding-${target.targetRoleId}`,
+    active_control_configuration_id: `active-${target.commandTargetId}`,
+    control_binding_id: `binding-${target.commandTargetId}`,
     control_binding_revision: 'revision-1',
-    control_domain_id: `domain-${target.targetRoleId}`,
+    control_domain_id: `domain-${target.commandTargetId}`,
     control_domain_revision: 'revision-1',
-    scaling_domain_id: `scale-${target.targetRoleId}`,
-    component_role_id: target.componentRoleId,
-    target_role_id: target.targetRoleId,
+    scaling_domain_id: `scale-${target.commandTargetId}`,
+    component_id: target.componentId,
+    command_target_id: target.commandTargetId,
   });
   const status = {
     active_control_configuration_generation: selector.kind === 'group' ? null : 1,
@@ -393,13 +469,13 @@ function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<str
     scaling_domain_id: selector.kind === 'group' ? null : 'scale-arm',
     selector: selector.kind === 'singular' ? {
       program_binding_id: selector.programBindingId,
-      component_role_id: selector.componentRoleId,
-      target_role_id: selector.targetRoleId,
+      component_id: selector.componentId,
+      command_target_id: selector.commandTargetId,
     } : {
       program_binding_id: selector.programBindingId,
       group_targets: selector.groupTargets.map((target) => ({
-        component_role_id: target.componentRoleId,
-        target_role_id: target.targetRoleId,
+        component_id: target.componentId,
+        command_target_id: target.commandTargetId,
       })),
     },
     supported: true,
@@ -408,7 +484,7 @@ function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<str
       : {}),
   };
   return {
-    api_version: 'manyforge.execution_command_response.v1',
+    api_version: 'manyforge.execution_command_response.v4',
     command: 'get_runtime_scale_control',
     ok: true,
     runtime_scale_control: status,
@@ -446,16 +522,14 @@ function workspaceFixture(): Record<string, unknown> {
     children: [],
   };
   const programFields = {
-    api_version: 'manyforge.program.v2',
+    api_version: 'manyforge.program.v3',
     program_id: 'fixture',
     program_profile: 'composable-cell-v1',
     name: 'Fixture',
     catalog: {
-      api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.4.0',
+      api_version: 'manyforge.node_catalog.v3',
+      content_version: '3.0.0',
     },
-    component_roles: {},
-    target_roles: {},
   };
   return {
     schemaVersion: 'manyforge.composer_program_workspace.v2',
@@ -469,7 +543,7 @@ function workspaceFixture(): Record<string, unknown> {
       draftRevision: 1,
       programLoaded: true,
       authoring: {
-        schema_version: 'manyforge.composer_authoring_forest.v1',
+        schema_version: 'manyforge.composer_authoring_forest.v2',
         ...programFields,
         forest: [tree],
         positions: {},
@@ -514,7 +588,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
   const draft = workspace.draft as Record<string, unknown>;
   const saved = workspace.saved as Record<string, unknown>;
   return {
-    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v2',
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v3',
     workspaceEpoch: 'workspace.epoch.1',
     workspaceRevision: 3,
     program: { ...draft, saved },
@@ -534,7 +608,6 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
       document_description: '',
       source_diagnostics: [],
       source_document_digest: null,
-      program_role_assignment: null,
       source_program_digest: null,
       source_deployment_digest: null,
     },
@@ -549,7 +622,7 @@ function appliedResultFixture(): Record<string, unknown> {
     status: 'applied',
     confirmation_token: null,
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v6',
+      schema_version: 'manyforge.prepared_activation_input.v7',
       prepared_activation_id: digestC,
       origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
       captured_input_digest: digestB,
@@ -575,12 +648,13 @@ describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({
-        schema_version: 'manyforge.assistant_mode_index.v1',
+        schema_version: 'manyforge.assistant_mode_index.v2',
         retained_bundle_id: 'bundle.1',
         graph_revision: 'graph.1',
         assistant_projection_digest: `sha256:${'1'.repeat(64)}`,
         instrument_registry_digest: `sha256:${'2'.repeat(64)}`,
         ai_model_component_id: 'assistant_model',
+        assistant_component_id: 'assistant',
         node_environment: {
           catalog_digest: `sha256:${'5'.repeat(64)}`,
           catalog_id: 'manyforge',
@@ -901,7 +975,7 @@ describe('resolveStructuralAssetUrl', () => {
 describe('headless intent client', () => {
   it('submits one exact current-revision scene transaction', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       committed_projection_revision: {
         retained_bundle_id: 'bundle-1',
         graph_revision: 'graph-1',
@@ -964,7 +1038,7 @@ describe('headless intent client', () => {
 
   it('observes one exact Manager Apply without replaying the effect', async () => {
     const payload = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 3,
       apply_id: 'apply-3',
       candidate_projection_revision: null,
@@ -1035,7 +1109,7 @@ describe('headless intent client', () => {
 
   it('rejects an Apply status for a different durable identity', async () => {
     const payload = {
-      api_version: 'manyforge.manager_command_response.v1',
+      api_version: 'manyforge.manager_command_response.v2',
       apply_generation: 4,
       apply_id: 'different-apply',
       candidate_projection_revision: null,
@@ -1202,7 +1276,7 @@ describe('headless intent client', () => {
   });
 });
 
-describe('server-side Apply, Load and New (CONTRACTS §11)', () => {
+describe('server-side Apply, Load and New', () => {
   const applied = { outcome: 'succeeded', components: [
     { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] };
   it.each([
@@ -1228,8 +1302,8 @@ describe('server-side Apply, Load and New (CONTRACTS §11)', () => {
     { component_id: 'gripper', disposition: 'retain', reasons: [], restarts: false }],
   scope: { deployment_draft_revision: 4 },
   program: { executable: false, program_id: 'pick', unresolved_references: [{
-    component_role_id: 'arm', target_role_id: null, controllable_component_id: 'arm',
-    command_target_id: null, reason: 'component_removed', detail: 'arm is removed' }],
+    target: { component_id: 'arm', command_target_id: 'arm' },
+    reason: 'component_missing', detail: 'arm is removed' }],
   affected_nodes: ['move_1'], affected_execution_groups: [] },
   attachment_changed_components: ['gripper'], detached_components: ['camera'] };
   it.each([

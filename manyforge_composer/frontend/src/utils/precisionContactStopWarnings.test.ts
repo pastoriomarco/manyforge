@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import type { JsonValue, ProgramTreeNode } from '../types/api';
 import { deploymentArmControlledStop, precisionContactStopWarnings } from './precisionContactStopWarnings';
 
-const bindings = [{ target_role_id: 'arm', controllable_component_id: 'robot', command_target_id: 'arm' }];
 const intent = (stop: Record<string, JsonValue>): Record<string, JsonValue> => ({
   api_version: 'manyforge.deployment_intent.v2',
   components: [{ component_id: 'robot', target_settings: { arm: { controlled_stop: stop } } }],
@@ -21,7 +20,7 @@ const compiled = (parameters: Record<string, JsonValue>): Record<string, JsonVal
 });
 const probe = (stopMode: string): ProgramTreeNode => ({
   node_id: 'motion.probe_search', instance_id: 'probe', children: [],
-  parameters: { target_role: 'arm', stop_mode: stopMode },
+  parameters: { target: { component_id: 'robot', command_target_id: 'arm' }, stop_mode: stopMode },
 });
 const NATURAL = 'This probe may finish a short remaining path instead of stopping on contact.';
 const SPRING = 'If the soft Stop cannot be carried out, this probe will spring back instead of stopping at the contact point.';
@@ -31,7 +30,7 @@ describe('precisionContactStopWarnings', () => {
   it('warns when natural completion is inherited from the Deployment', () => {
     const warnings = precisionContactStopWarnings(
       probe('spring_back_hold'),
-      intent({ stop_mode: 'spring_back_hold', allow_natural_completion_on_short_path: true }), bindings,
+      intent({ stop_mode: 'spring_back_hold', allow_natural_completion_on_short_path: true }),
     );
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(NATURAL);
@@ -44,9 +43,9 @@ describe('precisionContactStopWarnings', () => {
     // Natural completion is not used by the hard stop; the substitution only by soft_on_path.
     const settings = { allow_natural_completion_on_short_path: true, recoverable_substitution_mode: 'spring_back_hold' };
     expect(precisionContactStopWarnings(probe('hard_deceleration'),
-      compiled({ stop_mode: 'hard_deceleration', ...settings }), bindings)).toEqual([]);
+      compiled({ stop_mode: 'hard_deceleration', ...settings }))).toEqual([]);
     const fast = precisionContactStopWarnings(probe('spring_back_fast'),
-      compiled({ stop_mode: 'spring_back_fast', ...settings }), bindings);
+      compiled({ stop_mode: 'spring_back_fast', ...settings }));
     expect(fast).toHaveLength(1);
     expect(fast[0]).toContain(NATURAL);
   });
@@ -59,7 +58,7 @@ describe('precisionContactStopWarnings', () => {
     expect(deploymentArmControlledStop(document, 'robot', 'arm')).toEqual({
       stopMode: 'soft_on_path', allowNaturalCompletion: false, fallbackStopModes: ['spring_back_hold'],
     });
-    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document, bindings);
+    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(SPRING);
     expect(warnings[0]).toContain('The spring-back fallback (spring_back_hold) is inherited');
@@ -75,7 +74,7 @@ describe('precisionContactStopWarnings', () => {
       stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: false,
       fallback_stop_modes: fallbacks,
     });
-    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document, bindings);
+    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(SPRING);
     expect(warnings[0]).toContain(`The spring-back fallback (${named}) is inherited from the Deployment's arm Stop settings (robot · arm)`);
@@ -88,12 +87,12 @@ describe('precisionContactStopWarnings', () => {
       { stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: false, fallback_stop_modes: [] },
     ];
     for (const stop of stops) {
-      expect(precisionContactStopWarnings(probe('soft_on_path'), intent(stop), bindings)).toEqual([]);
+      expect(precisionContactStopWarnings(probe('soft_on_path'), intent(stop))).toEqual([]);
     }
     expect(precisionContactStopWarnings(probe('spring_back_hold'), intent({
       stop_mode: 'spring_back_hold', allow_natural_completion_on_short_path: false,
       fallback_stop_modes: ['spring_back_fast'],
-    }), bindings)).toEqual([]);
+    }))).toEqual([]);
   });
 
   it('reads a list field a compiled Deployment carries, guarded by presence', () => {
@@ -102,7 +101,7 @@ describe('precisionContactStopWarnings', () => {
       fallback_stop_modes: ['spring_back_fast'],
     });
     expect(deploymentArmControlledStop(document, 'robot', 'arm')?.fallbackStopModes).toEqual(['spring_back_fast']);
-    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document, bindings);
+    const warnings = precisionContactStopWarnings(probe('soft_on_path'), document);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('(spring_back_fast)');
     expect(deploymentArmControlledStop(compiled({
@@ -119,12 +118,12 @@ describe('precisionContactStopWarnings', () => {
 
   it('gives no warning when neither setting is allowed, or for other nodes', () => {
     const stop = intent({ stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: false });
-    expect(precisionContactStopWarnings(probe('soft_on_path'), stop, bindings)).toEqual([]);
+    expect(precisionContactStopWarnings(probe('soft_on_path'), stop)).toEqual([]);
     const natural = intent({ stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: true });
     expect(precisionContactStopWarnings(
-      { ...probe('soft_on_path'), node_id: 'motion.move_until_signal' }, natural, bindings,
+      { ...probe('soft_on_path'), node_id: 'motion.move_until_signal' }, natural,
     )).toEqual([]);
-    expect(precisionContactStopWarnings(probe('soft_on_path'), natural, [])).toEqual([]);
+    expect(precisionContactStopWarnings({ ...probe('soft_on_path'), parameters: {} }, natural)).toEqual([]);
   });
 
   it('says a run-time node mode must resolve to the Deployment mode', () => {
@@ -133,7 +132,7 @@ describe('precisionContactStopWarnings', () => {
     } };
     const warnings = precisionContactStopWarnings(node, intent({
       stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: true,
-    }), bindings);
+    }));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(
       "This node's Stop mode is set at run time; it must resolve to soft_on_path, the Deployment's Stop mode, for the probe to run.",

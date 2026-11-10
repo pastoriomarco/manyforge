@@ -1,5 +1,6 @@
 import type { ProgramBindingDocument } from '../types/programBindingTransport.generated';
 import type { DirectControlMotionStatus, ExecutionOwnerStatus } from '../types/robotControl';
+import { tcpEntryIdentityKey } from '../types/robotControl';
 
 export interface ResumeTcpChange {
   robot: string;
@@ -20,26 +21,24 @@ function snapshot(
   const result: TcpSnapshot = new Map();
   if (binding === null || status === null || status.graphRevision !== graphRevision
       || status.retainedBundleId !== retainedBundleId) return result;
-  for (const row of binding.target_role_bindings) {
+  for (const row of binding.target_bindings) {
     if (row.robot_tcps === undefined) continue;
     const matches = status.directControlTargets.filter((target) => (
-      target.controllableComponentId === row.controllable_component_id
-      && target.commandTargetId === row.command_target_id
+      target.controllableComponentId === row.target.component_id
+      && target.commandTargetId === row.target.command_target_id
       && target.operationCapabilityId === 'execution.trajectory.execute'
     ));
     if (matches.length !== 1) continue;
     const active = matches[0].activeTcp;
     if (active === null || active.ownerEpoch !== status.ownerEpoch) continue;
-    result.set(row.controllable_component_id, { robot: row.controllable_component_id,
+    result.set(row.target.component_id, { robot: row.target.component_id,
       active: { ...active, entry: active.entry === null ? null : { ...active.entry } } });
   }
   return result;
 }
 
 function entryKey(active: ActiveTcp): string | null {
-  return active.entry === null ? null : JSON.stringify([
-    active.entry.componentId, active.entry.targetId, active.entry.frameRoleId,
-  ]);
+  return active.entry === null ? null : tcpEntryIdentityKey(active.entry);
 }
 
 /** Browser-memory only: the first observation of a run is never a hold edge. */

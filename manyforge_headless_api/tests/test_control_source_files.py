@@ -9,7 +9,7 @@ import threading
 import pytest
 
 from manyforge_headless_api import control_state as module
-from scripts.qualification.source_snapshot_fixture import source_snapshot_text
+from manyforge_headless_api.tests.source_snapshot_fixture import source_snapshot_text
 
 
 def test_file_hint_is_bounded_and_rejects_nonregular_or_invalid_inputs(tmp_path):

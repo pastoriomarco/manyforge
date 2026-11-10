@@ -36,15 +36,16 @@ selects NVIDIA's `noble-jetpack` package suite by itself.
    ```
    Open `http://localhost:3000`.
 1. Optional, for the AI tab: run your own OpenAI-compatible model server and
-   add an `ai_model` component to the Deployment
-   ([`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md)).
+   add an `ai_model` component and an AI assistant component to the
+   Deployment ([`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md)).
 
 ## Runtime Selection
 
 Robot execution and the AI assistant are independent. Each component of the
 Scenario's Deployment runs on one execution lane (`components[].lane`; a
-machine member runs on its owner's lane); the assistant is enabled by the
-Deployment's `ai_model` component and never changes motion authority,
+machine member runs on its owner's lane); the assistant is the Deployment's
+lane-free `assistant` component, which chats through an `ai_model` component
+and never changes motion authority,
 controller binding, or robot-state precedence. All lanes run ros2_control with
 the stock joint trajectory controller, in the same workbench image and
 container.
@@ -88,6 +89,11 @@ not playing** (never a fault), and a new motion or gripper command on them is
 refused with `simulation_not_playing` (the node fails; the tree handles it).
 Play the simulation in Isaac, or from the Program with a **Set simulation
 state** node before its motion.
+
+If Isaac is not reachable when the workbench starts, the simulator component
+stays Offline with `simulator_unreachable` and a warning. Its state never
+latches the cell or blocks Execute; robot and tool health still follows their
+own reported states.
 
 For the multi-machine Lite6 trocar workflow with Isaac ROS
 YOLOv8/FoundationPose perception, use
@@ -198,27 +204,40 @@ e-stop, then Recover the machine and Enable the arm
 
 Runtime nodes such as `query_model` name a model alias of the Deployment's
 assistant profile; each alias resolves to one of the Deployment's `ai_model`
-components (the chat uses the same mechanism for its alias). A token, if any,
+components (the chat's model is chosen on the assistant component instead). A token, if any,
 comes from the component's `api_key_env` variable (`MANYFORGE_AI_*`).
+The `assistant.*` nodes require the cell capability `assistant.model.query`,
+which a Deployment offers when its assistant profile has a model alias and
+at least one prompt template; otherwise the palette shows them as
+unavailable (`capability_not_offered`).
 
 #### Composer AI assistant
 
 The AI tab chats with a model that edits the Program Draft through a fixed
 tool set (mode `composer-assistant`). The model server is yours: any
 OpenAI-compatible server with tool calling (llama.cpp `llama-server --jinja`,
-vLLM `--enable-auto-tool-choice --tool-call-parser ...`). The Deployment names
+vLLM `--enable-auto-tool-choice --tool-call-parser ...`; a Jetson AGX Thor
+example is in the cookbook). The Deployment names
 it with an `ai_model` component (`base_url`, `model`, optional token
 environment variable name `api_key_env`, which must start with
-`MANYFORGE_AI_`) next to an assistant profile. Run
-`export MANYFORGE_AI_<NAME>=<token>` before starting the workbench. Prepare
-and Enable never refuse because of the model server; its reachability is the
-freshness of the component's `endpoint` stream, which only shows stale and
-never faults the component.
+`MANYFORGE_AI_`). Run `export MANYFORGE_AI_<NAME>=<token>` before starting
+the workbench. Prepare and Enable never refuse because of the model server;
+its reachability is the freshness of the component's `endpoint` stream, which
+only shows stale and never faults the component.
 
-The workbench always starts the assistant bridge on `127.0.0.1:8100`. The AI
-tab is enabled when the active Deployment has an AI model component; otherwise
-it shows "No AI model component in this Deployment". Assistant edits land in
-the Draft; Apply, or Discard/Revert, as for manual edits.
+The chat itself is the Deployment's AI assistant component (kind `assistant`,
+one per cell), which names that AI model and an assistant profile. Its
+lifecycle runs the assistant bridge: Prepare starts the component's host
+process, Enable starts the bridge on a loopback port the host picked and
+publishes its URL, Disable stops it. No launcher starts a bridge and no fixed
+port is used. The bridge reads the model endpoint from the Applied Deployment
+for every request. The AI tab is enabled while the assistant and its AI model
+are enabled and no Program run exists; otherwise it says why (for example "Add
+an Assistant component"). Assistant edits land in the Draft; Apply, or
+Discard/Revert, as for manual edits. The assistant profile sets the request
+limits and the chat's correction behaviour (stuck-loop recovery, constrained
+regeneration); see the cookbook's
+[Assistant profile](ASSISTANT_E2E_COOKBOOK.md#assistant-profile) table.
 
 Setup and checks: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 
@@ -279,9 +298,12 @@ checked patch manifest must still apply.
 
 ### Model aliasing
 
-Assistant profiles name model aliases; the Deployment's single `ai_model`
-component serves every alias, so the served model is always the component's
-`model`.
+Assistant profiles name model aliases. The chat alias `assistant_model` is
+bound by the AI assistant component's AI model. For the runtime aliases (such
+as `selection_model`), one `ai_model` component serves every alias; with
+several, the Deployment's `assistant_model_components` maps each alias to one
+(**Deployment > Cell settings > AI model aliases**). The model name sent to
+the server is always the mapped component's `model`.
 
 ## Troubleshooting
 

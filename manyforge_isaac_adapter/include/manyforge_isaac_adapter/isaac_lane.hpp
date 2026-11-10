@@ -9,7 +9,7 @@
 
 namespace manyforge::isaac_adapter {
 
-/// The Isaac lane adapter (CONTRACTS §12, §14; lane/README.md). Isaac robots
+/// The Isaac lane adapter (lane/README.md). Isaac robots
 /// run the ros2_control lane with the topic-based hardware this lane
 /// contributes; Isaac tools drive their joints through the robot's
 /// articulation. Per-robot values are the models' `lanes.isaac` rows, the
@@ -42,7 +42,7 @@ struct IsaacLaneSettings final {
 /// hardware, the row's vendor controllers (`vendor`) or else the lane's
 /// controllers template, each with the lane's manager parameters, and the
 /// world's parent frame; no driver parameters, no remappings. For an `arm`
-/// (RP-1b) also the stock reset-position writer that serves `reset_position`,
+/// also the stock reset-position writer that serves `reset_position`,
 /// acknowledged on the hardware's joint commands topic (`command_echo_topic`).
 [[nodiscard]] roboplan_backend::LaunchContribution isaac_launch_contribution(
     const IsaacLaneSettings &settings, const roboplan_backend::ModelLaneRow &row, bool arm);
@@ -61,7 +61,7 @@ struct IsaacArmFacts final {
 
 /// A tool's `lanes.isaac` row: its gripper transport. `isaac_joint_state_effort`
 /// writes effort on `command_topic` (no bridge); `ros_gripper_command` runs the
-/// GripperCommand bridge with the lane's `gripper_bridges/<gripper_bridge>`.
+/// ParallelGripperCommand bridge with the lane's `gripper_bridges/<gripper_bridge>`.
 struct IsaacGripperFacts final {
   std::string transport_kind;
   /// `<controller>/gripper_cmd`, relative to the tool's namespace.
@@ -74,7 +74,6 @@ struct IsaacGripperFacts final {
   double open_effort{};
   double close_effort{};
   bool publish_nominal_position{};
-  double result_timeout_s{};
   /// `gripper_stop_finish_tolerance` (finger position units); only for
   /// `ros_gripper_command`, whose Stop may let a nearly finished goal finish.
   double stop_finish_tolerance{};

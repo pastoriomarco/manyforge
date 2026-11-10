@@ -90,7 +90,7 @@ struct HardStopResourceLimitDTO final {
 struct SoftOnPathStopParametersDTO final {
   MotionControlledStopMode stop_mode{MotionControlledStopMode::kSoftOnPath};
   double deceleration_time_s{};
-  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// `main`'s per-profile override: the robot's controlled-Stop
   /// deadline from the Stop request; absent: deceleration time + 0.5 s.
   std::optional<double> max_stop_time_s;
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
@@ -102,11 +102,11 @@ struct SoftOnPathStopParametersDTO final {
                          const SoftOnPathStopParametersDTO&) = default;
 };
 
-/// Also carries `kSpringBackFast` (Q130): the same parameters, a different law.
+/// Also carries `kSpringBackFast`: the same parameters, a different law.
 struct SpringBackHoldStopParametersDTO final {
   MotionControlledStopMode stop_mode{MotionControlledStopMode::kSpringBackHold};
   double deceleration_time_s{};
-  /// Q28/Q51 (`main`'s per-profile override): the robot's controlled-Stop
+  /// `main`'s per-profile override: the robot's controlled-Stop
   /// deadline from the Stop request; absent: deceleration time + 0.5 s.
   std::optional<double> max_stop_time_s;
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
@@ -172,7 +172,7 @@ struct RegisteredStopCommandDefinitionDTO final {
                          const RegisteredStopCommandDefinitionDTO&) = default;
 };
 
-/// Complete immutable table fixed by spec 240. Consumers classify a
+/// Complete immutable table. Consumers classify a
 /// registered command only through this table, never through token spelling.
 inline const std::array<RegisteredStopCommandDefinitionDTO, 4U> kRegisteredStopCommandDefinitions{{
     {RegisteredStopCommandKindId("manyforge.stop.controlled.provider"),

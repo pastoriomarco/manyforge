@@ -1,4 +1,4 @@
-"""Parity tests for the immutable C0.2e model-asset DTO boundary."""
+"""Parity tests for the immutable model-asset DTO boundary."""
 
 from __future__ import annotations
 

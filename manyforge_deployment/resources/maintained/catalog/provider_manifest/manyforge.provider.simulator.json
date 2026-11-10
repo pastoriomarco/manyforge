@@ -1,0 +1,33 @@
+{
+  "api_version": "manyforge.provider_manifest.v1",
+  "offered_capabilities": [
+    {
+      "capability_definition_revision": "sha256:155d3628cea7b682bd95c1126776aa7314e751fadf9b383e3e3730894fe7c9d3",
+      "capability_id": "simulator.control.pause",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:345e9790ff50444eb6c26ff685093fccd17fb98c9e631b6a4fc7e70c9ea16405",
+      "capability_id": "simulator.control.play",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:7ed06295945087622e96dcd91e390a402898be91e1f94233f5c93daa35dfe23a",
+      "capability_id": "simulator.control.reset",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:9fd7cae735d502dc7876c5e176f8dc134691476940c18a487ba04e27cf23cd33",
+      "capability_id": "simulator.control.step",
+      "required_endpoint_role_ids": []
+    },
+    {
+      "capability_definition_revision": "sha256:cd72b14a50066a268c347d524169ef26d675bf9ec425e6130b84a841b0c6ac79",
+      "capability_id": "simulator.entity_state.set",
+      "required_endpoint_role_ids": []
+    }
+  ],
+  "provider_contracts": [],
+  "provider_manifest_id": "manyforge.provider.simulator",
+  "provider_manifest_revision": "sha256:430d77b06a60786a38b2a14e1fec82a6fe34bd1effdf39aba22c16623b3846ab"
+}

@@ -16,22 +16,21 @@
 #include <manyforge_core/types/resolved_frame.hpp>
 #include <manyforge_deployment/cell_kinematic_index.hpp>
 
-// M7 part A: U1 (the index over the maintained cell shapes and synthetic
-// graphs) and U2 (the equivalence oracle against verbatim copies of the
-// merge-6b helpers the index replaces). The oracle is test-local and goes at
-// the next milestone.
+// The index over the maintained cell shapes and synthetic graphs, and the
+// equivalence oracle against verbatim copies of the earlier helpers the index
+// replaces. The oracle is test-local.
 namespace {
 namespace c = manyforge::core;
 namespace d = manyforge::deployment;
 
-// -- Merge-6b reference code (verbatim; only the noted parameter changes) ----
-namespace m6b {
+// -- Replaced reference code (verbatim; only the noted parameter changes) ----
+namespace replaced_helpers {
 
 [[noreturn]] void fail(const std::string& message) {
   throw std::runtime_error(message);
 }
 
-// program_binding.cpp:2384 (deleted in M7 A).
+// program_binding.cpp:2384 (since deleted).
 bool is_self_or_mounted_descendant(
     const c::CellGraphDTO& graph,
     const c::ControllableComponentId& component,
@@ -50,7 +49,7 @@ bool is_self_or_mounted_descendant(
   }
 }
 
-// retained_tool_context.cpp:74-78 (R17's carrier set).
+// retained_tool_context.cpp:74-78 (the carrier set).
 std::set<c::ControllableComponentId> carriers(
     const c::CellGraphDTO& graph, const c::ControllableComponentId& robot) {
   std::set<c::ControllableComponentId> result;
@@ -62,9 +61,9 @@ std::set<c::ControllableComponentId> carriers(
   return result;
 }
 
-// program_binding_compiler.cpp:1905-1911 (D7) and program_binding.cpp:2422
-// (D1): the first edge on the parent's interface. D7 and D1 spell it with
-// "flange"; the interface is a parameter here.
+// program_binding_compiler.cpp:1905-1911 and program_binding.cpp:2422: the
+// first edge on the parent's interface. Both spell it with "flange"; the
+// interface is a parameter here.
 const c::ControllableComponentId* first_edge_child(
     const c::CellGraphDTO& graph, const c::ControllableComponentId& robot,
     std::string_view interface) {
@@ -78,10 +77,10 @@ const c::ControllableComponentId* first_edge_child(
   return &edge->child.controllable_component_id;
 }
 
-// program_binding_compiler.cpp:2789-2797 (D10's owner_of lambda), over the
+// program_binding_compiler.cpp:2789-2797 (its owner_of lambda), over the
 // bundle's graph.
-std::optional<std::string> d10_owner_of(const c::CellGraphDTO& graph,
-                                        const c::ModelInstanceId& model) {
+std::optional<std::string> direct_control_owner_of(
+    const c::CellGraphDTO& graph, const c::ModelInstanceId& model) {
   const auto owner_of = [&](const c::ModelInstanceId& instance) {
     for (const auto& component : graph.controllable_components) {
       for (const auto& role : component.model_role_bindings) {
@@ -98,7 +97,7 @@ std::optional<std::string> d10_owner_of(const c::CellGraphDTO& graph,
   }
 }
 
-// apply_component_delta.cpp:127-153 (D17 FindComponent and the model part of
+// apply_component_delta.cpp:127-153 (FindComponent and the model part of
 // Relations); the bundle parameter is its cell graph.
 const c::ControllableComponentDTO* FindComponent(
     const c::CellGraphDTO& graph, const c::ControllableComponentId& id) {
@@ -126,7 +125,7 @@ std::set<c::ModelInstanceId> relations_model_instances(
   return model_instances;
 }
 
-// merge-6b apply_component_delta.cpp (RuntimeFamilies' mount rows), at the
+// The earlier apply_component_delta.cpp (RuntimeFamilies' mount rows), at the
 // id level: the children of the component's mounts, in edge order.
 std::vector<c::ControllableComponentId> runtime_family_mount_children(
     const c::CellGraphDTO& graph, const c::ControllableComponentId& component) {
@@ -155,7 +154,7 @@ const c::KinematicFramePathDTO* find_kinematic_frame_path(
   return match;
 }
 
-}  // namespace m6b
+}  // namespace replaced_helpers
 
 // -- The migrated call shapes (what D and R write against the index) --------
 
@@ -166,7 +165,7 @@ std::set<c::ModelInstanceId> new_relations_model_instances(
   for (const auto& role : component.model_role_bindings)
     model_instances.insert(role.model_instance_id);
   for (const auto& child_id : index.children_of(component.controllable_component_id)) {
-    if (const auto* child = m6b::FindComponent(graph, child_id)) {
+    if (const auto* child = replaced_helpers::FindComponent(graph, child_id)) {
       for (const auto& role : child->model_role_bindings)
         model_instances.insert(role.model_instance_id);
     }
@@ -401,25 +400,26 @@ std::vector<c::ModelInstanceId> ProbeModels(const c::CellGraphDTO& graph) {
 const std::vector<std::string_view> kInterfaces{"flange", "rail", "port",
                                                 "mount", "missing"};
 
-// U2: every query equals the merge-6b code over the graph and its paths.
-void ExpectEquivalentToM6b(const c::CellGraphDTO& graph,
-                           const std::vector<c::KinematicFramePathDTO>& paths) {
+// Every query equals the replaced code over the graph and its paths.
+void ExpectEquivalentToReplacedHelpers(
+    const c::CellGraphDTO& graph,
+    const std::vector<c::KinematicFramePathDTO>& paths) {
   const d::CellKinematicIndex index(graph, paths);
   const auto components = ProbeComponents(graph);
 
   for (const auto& carrier : components) {
     for (const auto& member : components) {
       EXPECT_EQ(index.carries(carrier, member),
-                m6b::is_self_or_mounted_descendant(graph, carrier, member))
+                replaced_helpers::is_self_or_mounted_descendant(graph, carrier, member))
           << carrier << " carries " << member;
     }
-    EXPECT_EQ(index.self_and_mounted(carrier), m6b::carriers(graph, carrier))
+    EXPECT_EQ(index.self_and_mounted(carrier), replaced_helpers::carriers(graph, carrier))
         << carrier;
     EXPECT_EQ(index.children_of(carrier),
-              m6b::runtime_family_mount_children(graph, carrier))
+              replaced_helpers::runtime_family_mount_children(graph, carrier))
         << carrier;
     for (const auto interface : kInterfaces) {
-      const auto* expected = m6b::first_edge_child(graph, carrier, interface);
+      const auto* expected = replaced_helpers::first_edge_child(graph, carrier, interface);
       const auto* actual = index.tool_on(carrier, interface);
       ASSERT_EQ(actual == nullptr, expected == nullptr) << carrier << " " << interface;
       if (actual != nullptr) { EXPECT_EQ(*actual, *expected); }
@@ -434,30 +434,30 @@ void ExpectEquivalentToM6b(const c::CellGraphDTO& graph,
 
   for (const auto& component : graph.controllable_components) {
     EXPECT_EQ(new_relations_model_instances(graph, index, component),
-              m6b::relations_model_instances(graph, component))
+              replaced_helpers::relations_model_instances(graph, component))
         << component.controllable_component_id;
   }
 
   for (const auto& model : ProbeModels(graph)) {
-    const auto expected = m6b::d10_owner_of(graph, model);
+    const auto expected = replaced_helpers::direct_control_owner_of(graph, model);
     const auto* actual = index.owner_of(model);
     ASSERT_EQ(actual == nullptr, !expected.has_value()) << model;
     if (actual != nullptr) { EXPECT_EQ(actual->value(), *expected); }
 
-    // R16 is proved by ProgramBindingFrameOwnersFromTheIndexEqualTheM6bPathScan
-    // (roboplan), against the shipped owner-table code.
+    // The owner-stamping invariant is proved in the roboplan tests, against
+    // the shipped owner-table code.
   }
 
   std::vector<c::ResolvedFrameDTO> terminals{
       c::ResolvedCellFrameDTO{c::CellId("other_cell"), "world"}};
   for (const auto& path : paths) terminals.push_back(path.terminal_frame);
   for (const auto& terminal : terminals) {
-    const auto* expected = m6b::find_kinematic_frame_path(index.frame_paths(), terminal);
+    const auto* expected = replaced_helpers::find_kinematic_frame_path(index.frame_paths(), terminal);
     EXPECT_EQ(index.find_frame_path(terminal), expected);
   }
 }
 
-// The R16 invariant on the given paths: every model frame path carries the
+// The owner-stamping invariant on the given paths: every model frame path carries the
 // graph owner of its model.
 void ExpectOwnerStamped(const c::CellGraphDTO& graph,
                         const std::vector<c::KinematicFramePathDTO>& paths) {
@@ -476,15 +476,15 @@ void ExpectOwnerStamped(const c::CellGraphDTO& graph,
   }
 }
 
-// -- U2 ----------------------------------------------------------------------
+// -- Equivalence oracle ------------------------------------------------------
 
-TEST(CellKinematicIndexOracle, EveryQueryEqualsMergeSixBOnEveryGraph) {
+TEST(CellKinematicIndexOracle, EveryQueryEqualsTheReplacedHelpersOnEveryGraph) {
   for (const auto& [name, graph] : AllGraphs()) {
     SCOPED_TRACE(name);
     const auto paths = OwnerStampedPaths(graph);
     ExpectOwnerStamped(graph, paths);
-    ExpectEquivalentToM6b(graph, paths);
-    ExpectEquivalentToM6b(graph, {});
+    ExpectEquivalentToReplacedHelpers(graph, paths);
+    ExpectEquivalentToReplacedHelpers(graph, {});
   }
 }
 
@@ -493,7 +493,7 @@ TEST(CellKinematicIndexOracle, EachApplySideKeepsItsOwnMounts) {
   const auto relations = [](const c::CellGraphDTO& graph, std::string_view id) {
     const d::CellKinematicIndex index(graph);
     return new_relations_model_instances(graph, index,
-                                         *m6b::FindComponent(graph, Id(id)));
+                                         *replaced_helpers::FindComponent(graph, Id(id)));
   };
   const std::set<c::ModelInstanceId> a_only{Model("arm_a.model")};
   const std::set<c::ModelInstanceId> a_with_tool{Model("arm_a.model"),
@@ -520,7 +520,7 @@ TEST(CellKinematicIndexOracle, EachApplySideKeepsItsOwnMounts) {
   }
 }
 
-// -- U1 ----------------------------------------------------------------------
+// -- Index over cell shapes -------------------------------------------------
 
 TEST(CellKinematicIndex, Ur5HasNoMounts) {
   const d::CellKinematicIndex index(Ur5());
@@ -657,8 +657,7 @@ TEST(CellKinematicIndex, FindFramePathIsNoneOneOrAmbiguous) {
   EXPECT_NE(ambiguous.find_frame_path(paths.front().terminal_frame), nullptr);
 }
 
-// -- M7 part B (B-dep): ancestors_of, default_tcp_of, end_effector_entry and
-// the primary tool (B5, B1) ---------------------------------------------------
+// -- ancestors_of, default_tcp_of, end_effector_entry and the primary tool ---
 
 // The compiled `default_tcp` of one component row.
 c::CellGraphDTO WithDefault(c::CellGraphDTO graph, std::string_view component,
@@ -685,7 +684,7 @@ c::TcpEntryDTO Entry(std::string_view component, std::string_view target,
                         c::FrameRoleId(std::string(role))};
 }
 
-TEST(CellKinematicIndexB, AncestorsOfIsTheMountChainNearestFirst) {
+TEST(CellKinematicIndexToolQueries, AncestorsOfIsTheMountChainNearestFirst) {
   const d::CellKinematicIndex chained(Chained());
   EXPECT_EQ(chained.ancestors_of(Id("tool")),
             (std::vector<c::ControllableComponentId>{Id("arm"), Id("base")}));
@@ -702,7 +701,7 @@ TEST(CellKinematicIndexB, AncestorsOfIsTheMountChainNearestFirst) {
             std::vector<c::ControllableComponentId>{Id("ur5e_robot")});
 }
 
-TEST(CellKinematicIndexB, DefaultTcpOfReadsTheCompiledRow) {
+TEST(CellKinematicIndexToolQueries, DefaultTcpOfReadsTheCompiledRow) {
   const d::CellKinematicIndex index(WithDefault(
       WithDefault(Lite6Gripper(), "lite6_robot", "arm", "flange"),
       "lite_gripper", "gripper", "cup_center"));
@@ -718,7 +717,7 @@ TEST(CellKinematicIndexB, DefaultTcpOfReadsTheCompiledRow) {
   EXPECT_EQ(none.default_tcp_of(Id("lite_gripper")), nullptr);
 }
 
-TEST(CellKinematicIndexB, ThePrimaryToolWinsOnASharedInterface) {
+TEST(CellKinematicIndexToolQueries, ThePrimaryToolWinsOnASharedInterface) {
   // Without a primary the first edge stays (the part-A order).
   const d::CellKinematicIndex plain(SiblingsOutOfIdOrder());
   EXPECT_EQ(*plain.tool_on(Id("arm"), "flange"), Id("nozzle"));
@@ -733,7 +732,7 @@ TEST(CellKinematicIndexB, ThePrimaryToolWinsOnASharedInterface) {
   EXPECT_EQ(index.tool_on(Id("arm"), "rail"), nullptr);
 }
 
-TEST(CellKinematicIndexB, EndEffectorEntryIsTheDefaultMark) {
+TEST(CellKinematicIndexToolQueries, EndEffectorEntryIsTheDefaultMark) {
   const c::CommandTargetId arm("arm");
   // 1. The tool on the flange: its default TCP, whatever its name.
   const auto lite6 = WithDefault(
@@ -741,7 +740,7 @@ TEST(CellKinematicIndexB, EndEffectorEntryIsTheDefaultMark) {
       "lite_gripper", "gripper", "cup_center");
   EXPECT_EQ(d::CellKinematicIndex(lite6).end_effector_entry(Id("lite6_robot"), arm),
             Entry("lite_gripper", "gripper", "cup_center"));
-  // C-P2: a tool without a default TCP leaves no mark (no robot fallback).
+  // A tool without a default TCP leaves no mark (no robot fallback).
   const auto bare_tool =
       WithDefault(Lite6Gripper(), "lite6_robot", "arm", "flange");
   const d::CellKinematicIndex bare_tool_index(bare_tool);

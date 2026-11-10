@@ -10,6 +10,7 @@ import {
   acceptedRuntimeScaleStatus,
   mergeRuntimeScaleStatus,
   previewTargetRejection,
+  cartesianDiagnosticRejection,
   runtimeScaleControlScopeFence,
   runtimeScaleFlushDelay,
   manualAvailabilityScopeFence,
@@ -17,9 +18,14 @@ import {
   buildManualAvailabilityIntent,
   useRobotControl,
 } from './useRobotControl';
-import { gripperReceiptFixture, statusFixture } from '../testFixtures/robotControl';
+import { gripperReceiptFixture, receiptFixture, statusFixture } from '../testFixtures/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
-import { buildPreviewIntent, initialRobotControlState, robotControlReducer } from '../state/robotControl';
+import {
+  buildPreviewIntent,
+  initialRobotControlState,
+  robotControlAcceptedOperationMode,
+  robotControlReducer,
+} from '../state/robotControl';
 
 it('manual availability follows owner and hold changes, not observed poses or node ticks', () => {
   const snapshot = {
@@ -50,15 +56,15 @@ it('pairs a robot with the descriptor-selected primary among multiple tools', ()
   motion.targetDescriptor.endEffectorComponentId = 'tool-z';
   const robotTcp = motion.targetDescriptor.tcps[0];
   const otherMountedTool = { ...robotTcp,
-    entry: { componentId: 'tool-a', targetId: 'gripper', frameRoleId: 'tcp' },
+    entry: { componentId: 'tool-a', targetId: 'gripper', frameComponentId: 'tool-a', frameRoleId: 'tcp' },
     controllableComponentId: 'tool-a', commandTargetId: 'gripper',
     qualifiedName: 'tool-a.tcp', isDefault: false, mountedHere: true, mountedElsewhere: false };
   const primaryMountedTool = { ...robotTcp,
-    entry: { componentId: 'tool-z', targetId: 'gripper', frameRoleId: 'tcp' },
+    entry: { componentId: 'tool-z', targetId: 'gripper', frameComponentId: 'tool-z', frameRoleId: 'tcp' },
     controllableComponentId: 'tool-z', commandTargetId: 'gripper',
     qualifiedName: 'tool-z.tcp', isDefault: true, mountedHere: true, mountedElsewhere: false };
   const unmountedTool = { ...robotTcp,
-    entry: { componentId: 'tool-outside', targetId: 'gripper', frameRoleId: 'tcp' },
+    entry: { componentId: 'tool-outside', targetId: 'gripper', frameComponentId: 'tool-outside', frameRoleId: 'tcp' },
     controllableComponentId: 'tool-outside', commandTargetId: 'gripper',
     qualifiedName: 'tool-outside.tcp', isDefault: false, mountedHere: false, mountedElsewhere: false };
   motion.targetDescriptor.tcps = [otherMountedTool, unmountedTool, primaryMountedTool];
@@ -72,7 +78,7 @@ it('pairs a selected flange tool even when it declares no TCP row', () => {
   motion.targetDescriptor.endEffectorComponentId = 'tcp-less-primary';
   const robotTcp = motion.targetDescriptor.tcps[0];
   motion.targetDescriptor.tcps = [{ ...robotTcp,
-    entry: { componentId: 'other-tool', targetId: 'gripper', frameRoleId: 'tcp' },
+    entry: { componentId: 'other-tool', targetId: 'gripper', frameComponentId: 'other-tool', frameRoleId: 'tcp' },
     controllableComponentId: 'other-tool', commandTargetId: 'gripper',
     qualifiedName: 'other-tool.tcp', isDefault: false, mountedHere: true, mountedElsewhere: false }];
 
@@ -197,8 +203,8 @@ const status = {
   selector: {
     kind: 'singular',
     programBindingId: 'binding-1',
-    componentRoleId: 'robot',
-    targetRoleId: 'arm',
+    componentId: 'robot',
+    commandTargetId: 'arm',
   },
   controlGeneration: 3,
   requestedScale: 0.4,
@@ -227,20 +233,20 @@ describe('persistent runtime-scale transport cadence', () => {
         kind: 'group' as const,
         programBindingId: 'binding-1',
         groupTargets: [
-          { componentRoleId: 'robot', targetRoleId: 'arm' },
-          { componentRoleId: 'robot', targetRoleId: 'gripper' },
+          { componentId: 'robot', commandTargetId: 'arm' },
+          { componentId: 'robot', commandTargetId: 'gripper' },
         ],
       },
       groupMembers: [
         {
-          componentRoleId: 'robot', targetRoleId: 'arm',
+          componentId: 'robot', commandTargetId: 'arm',
           controlDomainId: 'domain-arm', controlDomainRevision: 'rev-arm',
           controlBindingId: 'binding-arm', controlBindingRevision: 'binding-rev-arm',
           scalingDomainId: 'scale-arm', activeControlConfigurationId: 'config-arm',
           activeControlConfigurationGeneration: 1,
         },
         {
-          componentRoleId: 'robot', targetRoleId: 'gripper',
+          componentId: 'robot', commandTargetId: 'gripper',
           controlDomainId: 'domain-gripper', controlDomainRevision: 'rev-gripper',
           controlBindingId: 'binding-gripper', controlBindingRevision: 'binding-rev-gripper',
           scalingDomainId: 'scale-gripper', activeControlConfigurationId: 'config-gripper',
@@ -251,8 +257,8 @@ describe('persistent runtime-scale transport cadence', () => {
     const differentGroup = {
       ...group,
       selector: { ...group.selector, groupTargets: [
-        { componentRoleId: 'robot', targetRoleId: 'arm' },
-        { componentRoleId: 'robot', targetRoleId: 'camera' },
+        { componentId: 'robot', commandTargetId: 'arm' },
+        { componentId: 'robot', commandTargetId: 'camera' },
       ] },
     };
     expect(runtimeScaleControlScopeFence('owner-1', group)).not.toBe(
@@ -264,8 +270,8 @@ describe('persistent runtime-scale transport cadence', () => {
         kind: 'group' as const,
         programBindingId: 'binding-1',
         groupTargets: [
-          { componentRoleId: 'a', targetRoleId: 'b\u0000c' },
-          { componentRoleId: 'a\u0000b', targetRoleId: 'c' },
+          { componentId: 'a', commandTargetId: 'b\u0000c' },
+          { componentId: 'a\u0000b', commandTargetId: 'c' },
         ],
       },
     };
@@ -279,7 +285,7 @@ describe('persistent runtime-scale transport cadence', () => {
     const changedMember = {
       ...group,
       groupMembers: group.groupMembers.map((member) => (
-        member.targetRoleId === 'arm'
+        member.commandTargetId === 'arm'
           ? { ...member, activeControlConfigurationGeneration: 2 }
           : member
       )),
@@ -430,6 +436,79 @@ describe('pneumatic manual availability observation', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
+  it('drops an in-flight preview after hiding and refuses hidden approval', async () => {
+    const status = statusFixture();
+    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
+    let release!: (receipt: ReturnType<typeof receiptFixture>) => void;
+    const pendingPreview = new Promise<ReturnType<typeof receiptFixture>>((resolve) => { release = resolve; });
+    const preview = vi.mocked(api.execution.previewMotion).mockReturnValue(pendingPreview);
+    const send = vi.fn();
+    const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
+    function VisibleHarness() {
+      const result = useRobotControl(true, false, false, snapshot, source);
+      useEffect(() => { latest = result; }, [result]);
+      return null;
+    }
+    vi.spyOn(window, 'setTimeout').mockImplementation(((callback: () => void) => globalThis.setTimeout(callback, 0)) as never);
+    await act(async () => root.render(createElement(VisibleHarness)));
+    await act(async () => { latest.setManualPanelVisible(true); latest.editJoint(0, 0.2); });
+    await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
+    expect(preview).toHaveBeenCalledTimes(1);
+    const generation = latest.state.generation;
+    await act(async () => latest.setManualPanelVisible(false));
+    await act(async () => { release(receiptFixture(status, 'late', [0.2, 0])); await pendingPreview; });
+    expect(latest.state.generation).toBeGreaterThan(generation);
+    expect(latest.state.preview).toBeNull();
+    expect(latest.state.ghost).toBeNull();
+    await act(async () => latest.approve());
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('retains the Move To label only for the operation id in the accepted receipt', async () => {
+    const status = statusFixture();
+    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
+    const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => ({
+      result: { ok: true, command: 'submit', accepted: { request_id: requestId, operation_id: 'move-to.1' } },
+    }));
+    const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
+    function MoveToHarness({ current }: { current: ComposerHeadlessState }) {
+      const result = useRobotControl(true, false, false, current, source);
+      useEffect(() => { latest = result; }, [result]);
+      return null;
+    }
+    vi.spyOn(window, 'setTimeout')
+      .mockImplementation(((callback: () => void) => globalThis.setTimeout(callback, 0)) as never);
+    vi.mocked(api.execution.previewMotion).mockImplementation(async (intent) => (
+      receiptFixture(status, intent.request_context.request_id, [0.2, 0.3])
+    ));
+    await act(async () => root.render(createElement(MoveToHarness, { current: snapshot })));
+    await act(async () => {
+      latest.setManualPanelVisible(true);
+      latest.selectMode('move_to');
+      latest.editMoveToJoints([0.2, 0.3]);
+    });
+    await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
+    expect(latest.state.phase).toBe('ready');
+    await act(async () => latest.approve());
+    expect(latest.state.acceptedOperationMode).toMatchObject({
+      ownerEpoch: status.ownerEpoch, operationId: 'move-to.1', mode: 'move_to',
+    });
+
+    const movingStatus = structuredClone(status);
+    const target = movingStatus.directControl!;
+    movingStatus.manualOperations = [{
+      programRunId: target.programRunId,
+      operationId: 'move-to.1', operationRevision: 1, resident: true, state: 'executing',
+      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null,
+      controllableComponentId: target.controllableComponentId, commandTargetId: target.commandTargetId,
+    }];
+    const movingSnapshot = { ...snapshot, executionControlStatus: movingStatus } as ComposerHeadlessState;
+    await act(async () => root.render(createElement(MoveToHarness, { current: movingSnapshot })));
+    expect(robotControlAcceptedOperationMode(latest.state)).toBe('move_to');
+    expect(robotControlAcceptedOperationMode({
+      ...latest.state,
+      operation: { ...latest.state.operation!, operationId: 'external-operation' },
+    })).toBeNull();
+  });
   it('does not submit Set TCP during an active manual operation', async () => {
     const status = statusFixture();
     const row = status.directControl!.targetDescriptor.tcps[0];
@@ -437,6 +516,8 @@ describe('pneumatic manual availability observation', () => {
       frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
     status.directControl!.targetDescriptor.tcps.push(flange);
     status.manualOperations = [{ programRunId: status.directControl!.programRunId,
+      controllableComponentId: status.directControl!.controllableComponentId,
+      commandTargetId: status.directControl!.commandTargetId,
       operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing',
       progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null }];
     const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
@@ -469,8 +550,10 @@ describe('pneumatic manual availability observation', () => {
     const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => {
       await sent;
       return { result: { ok: true, command: 'submit', accepted: { request_id: requestId, operation_id: 'operation.1' },
-        active_tcp: [{ component_id: 'robot-a', entry: { component_id: 'robot-a', target_id: 'arm',
-          frame_role_id: 'flange' }, owner_epoch: status.ownerEpoch, registration_generation: 1, sequence: 1 }] } };
+        active_tcp: [{ component_id: 'robot-a', entry: {
+          target: { component_id: 'robot-a', command_target_id: 'arm' },
+          frame: { component_id: 'robot-a', frame_id: 'flange' },
+        }, owner_epoch: status.ownerEpoch, registration_generation: 1, sequence: 1 }] } };
     });
     let transportStatus = 'connected';
     let transportError: string | null = null;
@@ -479,12 +562,15 @@ describe('pneumatic manual availability observation', () => {
       getShellSnapshot: () => ({ transportStatus, transportError, semanticStatus: 'current', snapshot: shellSnapshot }),
     } as unknown as Parameters<typeof useRobotControl>[4];
     function SetTcpHarness({ current }: { current: ComposerHeadlessState }) {
-      shellSnapshot = current;
       const result = useRobotControl(true, false, false, current, source);
       useEffect(() => { latest = result; }, [result]);
       return null;
     }
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    const renderTcp = async (current: ComposerHeadlessState) => {
+      shellSnapshot = current;
+      await act(async () => root.render(createElement(SetTcpHarness, { current })));
+    };
+    await renderTcp(snapshot);
     await act(async () => latest.selectTcp(tcpEntryIdentityKey(flange.entry)));
     expect(latest.tcpApplying).toBe(true);
     expect(latest.tcpResumeStatus!.directControlTargets[0].activeTcp).toBeNull();
@@ -492,7 +578,9 @@ describe('pneumatic manual availability observation', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith('operation_start', expect.objectContaining({
       participants: [expect.objectContaining({ payload: { kind: 'set_tcp', tcp: {
-        kind: 'entry', entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'flange' },
+        kind: 'entry',
+        target: { component_id: 'robot-a', command_target_id: 'arm' },
+        frame: { component_id: 'robot-a', frame_id: 'flange' },
       } } })],
     }), expect.any(String));
     await act(async () => latest.selectTcp(tcpEntryIdentityKey(flange.entry)));
@@ -502,14 +590,14 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.selectedStatus!.directControl!.activeTcp!.entry!.frameRoleId).toBe('flange');
     expect(latest.tcpResumeStatus!.directControlTargets[0].activeTcp!.entry!.frameRoleId).toBe('flange');
     transportError = 'Command delivery is unconfirmed';
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    await renderTcp(snapshot);
     expect(latest.tcpResumeStatus).toBeNull();
     transportError = null;
     transportStatus = 'disconnected';
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    await renderTcp(snapshot);
     expect(latest.tcpResumeStatus).toBeNull();
     transportStatus = 'connected';
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    await renderTcp(snapshot);
     await act(async () => {
       latest.selectMode('pose_goal');
       latest.editPose({ position_m: { x_m: 0.2, y_m: 0.3, z_m: 0.4 },
@@ -521,14 +609,14 @@ describe('pneumatic manual availability observation', () => {
       entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
       registrationGeneration: 1, sequence: 0,
     };
-    await act(async () => root.render(createElement(SetTcpHarness, { current: stale })));
+    await renderTcp(stale);
     expect(latest.tcpApplying).toBe(true);
     const updated = structuredClone(snapshot);
     updated.executionControlStatus!.directControl!.activeTcp = {
       entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
       registrationGeneration: 1, sequence: 1,
     };
-    await act(async () => root.render(createElement(SetTcpHarness, { current: updated })));
+    await renderTcp(updated);
     expect(latest.tcpApplying).toBe(false);
     expect(latest.selectedStatus!.directControl!.activeTcp!.entry!.frameRoleId).toBe('flange');
     expect(send).toHaveBeenCalledTimes(1);
@@ -581,7 +669,10 @@ describe('pneumatic manual availability observation', () => {
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     const raw = { ok: false, error: { code: 'tcp_failed', message: 'TCP failed',
       details: { immediate_step: 'admitted' } }, active_tcp: [{ component_id: 'robot-a',
-      entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'flange' },
+      entry: {
+        target: { component_id: 'robot-a', command_target_id: 'arm' },
+        frame: { component_id: 'robot-a', frame_id: 'flange' },
+      },
       owner_epoch: status.ownerEpoch, registration_generation: 1, sequence: 1 }] };
     const send = vi.fn(async () => { throw new CommandRefusalError(
       { code: 'tcp_failed', message: 'TCP failed', details: { immediate_step: 'admitted' }, origin: null },
@@ -624,23 +715,26 @@ describe('pneumatic manual availability observation', () => {
       transportStatus, semanticStatus: 'current', transportError, snapshot: currentShell,
     }) } as unknown as Parameters<typeof useRobotControl>[4];
     function SetTcpHarness({ current }: { current: ComposerHeadlessState | null }) {
-      currentShell = current;
       const result = useRobotControl(true, false, false, current, source);
       useEffect(() => { latest = result; }, [result]);
       return null;
     }
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    const renderTcp = async (current: ComposerHeadlessState | null) => {
+      currentShell = current;
+      await act(async () => root.render(createElement(SetTcpHarness, { current })));
+    };
+    await renderTcp(snapshot);
     await act(async () => latest.selectTcp(tcpEntryIdentityKey(flange.entry)));
     expect(send).toHaveBeenCalledTimes(1);
     transportStatus = 'disconnected';
     transportError = 'Command delivery is unconfirmed';
-    await act(async () => root.render(createElement(SetTcpHarness, { current: null })));
+    await renderTcp(null);
     await act(async () => loseReceipt());
     expect(latest.tcpApplying).toBe(true);
     expect(latest.tcpResumeStatus).toBeNull();
     transportStatus = 'connected';
     transportError = null;
-    await act(async () => root.render(createElement(SetTcpHarness, { current: snapshot })));
+    await renderTcp(snapshot);
     expect(latest.tcpApplying).toBe(true);
     expect(latest.tcpResumeStatus!.directControlTargets[0].activeTcp).toBeNull();
     const observed = structuredClone(snapshot);
@@ -648,7 +742,7 @@ describe('pneumatic manual availability observation', () => {
       entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
       registrationGeneration: 1, sequence: 1,
     };
-    await act(async () => root.render(createElement(SetTcpHarness, { current: observed })));
+    await renderTcp(observed);
     expect(latest.tcpApplying).toBe(false);
     expect(latest.tcpResumeStatus!.directControlTargets[0].activeTcp!.entry).toEqual(flange.entry);
     expect(send).toHaveBeenCalledTimes(1);
@@ -674,7 +768,7 @@ describe('pneumatic manual availability observation', () => {
   it('shows a Set TCP refusal and leaves the owner value unchanged', async () => {
     const status = statusFixture();
     const row = status.directControl!.targetDescriptor.tcps[0];
-    const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameRoleId: 'tcp' },
+    const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameComponentId: 'other-tool', frameRoleId: 'tcp' },
       mountedHere: false, mountedElsewhere: true };
     status.directControl!.targetDescriptor.tcps.push(other);
     const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
@@ -693,7 +787,7 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.selectedStatus!.directControl!.activeTcp!.entry!.frameRoleId).toBe('tcp');
     expect(send).toHaveBeenCalledTimes(1);
   });
-  it('has no idle-only gate for mapped pneumatic manual control (V2-3)', async () => {
+  it('has no idle-only gate for mapped pneumatic manual control', async () => {
     const status = pneumaticStatus();
     Object.assign(status.directControlGripper!.targetDescriptor, {
       completionPolicy: 'no_output', pneumaticOutputs: [{ controllableComponentId: 'valve_io',
@@ -821,7 +915,7 @@ describe('pneumatic manual availability observation', () => {
       manualHandover: { program_run_id: 'program.1', program_runner_owner_epoch: 'runner.offered',
         claim_generation: 2, selection_revision: 1 } }));
     expect(latest.manualControlAllowed).toBe(true);
-    await act(async () => latest.editJoint(0, 0.2));
+    await act(async () => { latest.setManualPanelVisible(true); latest.editJoint(0, 0.2); });
     await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith('program_manual_handover', expect.objectContaining({
@@ -829,8 +923,8 @@ describe('pneumatic manual availability observation', () => {
     }), expect.any(String));
   });
 
-  it.each(['runner', 'execution'] as const)(
-    'continues the confirmed pneumatic sequence after an owner-only %s change', async (owner) => {
+  it.each(['runner', 'execution', 'panel-hidden'] as const)(
+    'continues the confirmed pneumatic sequence after %s', async (owner) => {
       const status = pneumaticStatus('none');
       const descriptor = status.directControlGripper!.targetDescriptor;
       descriptor.closedStateRef = 'configured-closed';
@@ -841,9 +935,9 @@ describe('pneumatic manual availability observation', () => {
         { controllableComponentId: 'valve-b', signalName: 'close', openValue: true, closeValue: false },
       ];
       status.ioSignalBindings = descriptor.pneumaticOutputs.map((row, index) => ({
-        programBindingId: `binding-${index}`, targetRoleId: `target-${index}`,
-        controllableComponentId: row.controllableComponentId, commandTargetId: 'io',
-        signalRoleBindings: [{ resourceRoleId: `signal-${index}`, signalName: row.signalName,
+        programBindingId: `binding-${index}`, componentId: row.controllableComponentId,
+        commandTargetId: 'io',
+        signals: [{ componentId: row.controllableComponentId, signalName: row.signalName,
           valueType: 'bool', direction: 'output', transitionCapability: 'sampled_only', signalDescriptorDigest: 'digest' }],
       }));
       const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
@@ -856,7 +950,7 @@ describe('pneumatic manual availability observation', () => {
       const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => (
         { result: { accepted: { request_id: requestId, operation_id: 'gripper-op' } } }));
       let writes = 0;
-      // The one output write path (CONTRACTS §7); the first valve write waits.
+      // The one output write path; the first valve write waits.
       vi.spyOn(api.io, 'setOutput').mockImplementation(async () => {
         if (++writes === 1) { firstStarted(); await gate; }
         return { outcome: 'succeeded' };
@@ -873,7 +967,7 @@ describe('pneumatic manual availability observation', () => {
         gripperReceiptFixture(status, intent.request_context.request_id, 0.037)
       ));
       await act(async () => root.render(createElement(SequenceHarness, { current: snapshot })));
-      await act(async () => { latest.selectMode('gripper'); latest.editGripper(0.037); });
+      await act(async () => { latest.setManualPanelVisible(true); latest.selectMode('gripper'); latest.editGripper(0.037); });
       await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
       expect(latest.state.phase).toBe('ready');
       let approval!: Promise<void>;
@@ -881,8 +975,9 @@ describe('pneumatic manual availability observation', () => {
       await started;
       const successor = structuredClone(snapshot);
       if (owner === 'runner') successor.programCycle.programRunnerOwnerEpoch = 'runner.2';
-      else successor.executionControlStatus!.ownerEpoch = 'execution.2';
-      await act(async () => root.render(createElement(SequenceHarness, { current: successor })));
+      else if (owner === 'execution') successor.executionControlStatus!.ownerEpoch = 'execution.2';
+      if (owner === 'panel-hidden') await act(async () => latest.setManualPanelVisible(false));
+      else await act(async () => root.render(createElement(SequenceHarness, { current: successor })));
       releaseFirst();
       await act(async () => { await approval; });
       // Two valve writes, then the gripper command; no automatic resend.
@@ -894,3 +989,14 @@ describe('pneumatic manual availability observation', () => {
   );
 });
 
+
+
+it('shows the typed Cartesian diagnostic reason only for the owner marker', () => {
+  const detail = { code: 'cartesian_incomplete', message: 'Cartesian failed', origin: null,
+    details: { cartesian_collision_disabled_diagnostic: 'failed', planner_error: 'joint limit' } };
+  expect(cartesianDiagnosticRejection(detail)).toBe(
+    'The planner found no straight path, even ignoring collisions: joint limit.',
+  );
+  expect(cartesianDiagnosticRejection({ ...detail, code: 'planning_timeout', details: { reason: 'planning_timeout' } })).toBeNull();
+  expect(cartesianDiagnosticRejection({ ...detail, code: 'worker_failed', details: { reason: 'worker_failed' } })).toBeNull();
+});

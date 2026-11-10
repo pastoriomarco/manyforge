@@ -18,7 +18,7 @@ class CommandSchemaCodecError final : public std::invalid_argument {
 };
 
 /// One exact command schema whose closed descriptor, semantic identity, and
-/// build-owned I6 family row have all been verified.
+/// build-owned family row have all been verified.
 class QualifiedCommandSchema final {
  public:
   QualifiedCommandSchema(const QualifiedCommandSchema&) noexcept = default;

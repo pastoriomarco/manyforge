@@ -17,7 +17,7 @@ export function effectiveField(
 }
 
 /**
- * Each Deployment field's effective value and default (CONTRACTS §11), read
+ * Each Deployment field's effective value and default, read
  * again whenever the Draft changes. The backend is the only owner of defaults.
  */
 export function useEffectiveValues(controller: DeploymentWorkspaceController): EffectiveValues | null {

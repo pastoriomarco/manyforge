@@ -247,7 +247,7 @@ TEST(CellAdmissionCommandCodec,
                    .active_configuration.has_value());
   EXPECT_EQ(ci::canonical_json(CellAdmissionResponseValue(decoded->command,
                                                           response)),
-            "{\"api_version\":\"manyforge.execution_command_response.v1\","
+            "{\"api_version\":\"manyforge.execution_command_response.v4\","
             "\"command\":\"cell_admission_publish_operator_alarm_attention\","
             "\"ok\":true,\"operator_alarm_attention\":{\"generation\":5,"
             "\"owner_epoch\":\"alarm.owner.1\"}}");
@@ -298,8 +298,11 @@ TEST(CellAdmissionCommandCodec, ProgramNodeEvidenceIsExactAcrossBothTransports) 
 }
 
 TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(
+                   R"({"api_version":"manyforge.execution_command.v2","command":"cell_admission_get"})"),
+               std::invalid_argument);
   EXPECT_FALSE(TryDecodeCellAdmissionCommand(
-                   R"({"api_version":"manyforge.execution_command.v1","command":"status"})")
+                   R"({"api_version":"manyforge.execution_command.v3","command":"status"})")
                    .has_value());
   auto extra = Readiness().as_object();
   extra.emplace_back("unknown", Value(false));
@@ -453,7 +456,7 @@ TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
       core::AuthoringAdmissionDTO{true, core::AdmissionGeneration(9U)}));
   EXPECT_EQ(
       admission,
-      R"({"api_version":"manyforge.execution_command_response.v1","authoring_admission":{"admission_generation":9,"authoring_allowed":true},"command":"cell_admission_release","ok":true})");
+      R"({"api_version":"manyforge.execution_command_response.v4","authoring_admission":{"admission_generation":9,"authoring_allowed":true},"command":"cell_admission_release","ok":true})");
 
   const auto packet = *TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope("cell_admission_acquire", Intent())));
@@ -471,7 +474,7 @@ TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
   EXPECT_EQ(
       ci::canonical_json(CellAdmissionResponseValue(
           "cell_admission_acquire", error)),
-      R"({"api_version":"manyforge.execution_command_response.v1","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale","producer":"kernel"},"ok":false})");
+      R"({"api_version":"manyforge.execution_command_response.v4","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale","producer":"kernel"},"ok":false})");
 
   auto payload = Envelope("cell_admission_release", Release()).as_object();
   for (auto &[key, value] : payload) {

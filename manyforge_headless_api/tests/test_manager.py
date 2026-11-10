@@ -27,7 +27,7 @@ def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) ->
 
 def _prepared_activation() -> dict[str, object]:
     return {
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                    "source_document_digest": "sha256:" + "1" * 64,
                    "project_path": "/projects/scenario.1.scenario"},
@@ -142,9 +142,9 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
         with connection:
             received.append(connection.recv(16 * 1024))
             connection.send(
-                b'{"api_version":"manyforge.manager_command_response.v1",'
+                b'{"api_version":"manyforge.manager_command_response.v2",'
                 b'"error":{"code":"kernel_owner_unavailable",'
-                b'"message":"returns at I6"},"ok":false,'
+                b'"message":"Apply is unavailable"},"ok":false,'
                 b'"request_id":"request.1",'
                 b'"request_owner_epoch":"client.epoch.1"}'
             )
@@ -213,7 +213,7 @@ def test_manager_client_default_wait_covers_a_bounded_durable_mutation(
             # sent, so the production client must wait for the bounded result.
             time.sleep(0.3)
             connection.send(
-                b'{"api_version":"manyforge.manager_command_response.v1",'
+                b'{"api_version":"manyforge.manager_command_response.v2",'
                 b'"error":null,"ok":true,"request_id":"request.1",'
                 b'"request_owner_epoch":"client.epoch.1"}'
             )
@@ -236,7 +236,7 @@ def test_manager_client_does_not_compare_the_response_echo(
     # Each exchange is its own connection: the echoed identity is not compared.
     client = ManagerCommandClient(tmp_path)
     response = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "ok": False,
         "request_id": "request.other",
         "request_owner_epoch": "client.epoch.1",
@@ -273,7 +273,7 @@ def test_manager_client_observes_apply_without_replaying_submission(
 
 def _status_response() -> dict[str, object]:
     return {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "apply_generation": 3,
         "apply_id": "apply.3",
         "candidate_projection_revision": None,
@@ -484,7 +484,7 @@ def test_manager_client_reports_an_unknown_operation_status_as_a_typed_error(
 
     def exchange(_command: dict[str, object]) -> dict[str, object]:
         return {
-            "api_version": "manyforge.manager_command_response.v1",
+            "api_version": "manyforge.manager_command_response.v2",
             "error": {
                 "code": "apply_status_not_found",
                 "message": "Manager Apply identity is unknown",
@@ -576,7 +576,7 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
             connection.send(
                 json.dumps(
                     {
-                        "api_version": "manyforge.manager_command_response.v1",
+                        "api_version": "manyforge.manager_command_response.v2",
                         "committed_projection_revision": {
                             "retained_bundle_id": "sha256:" + "b" * 64,
                             "graph_revision": "sha256:" + "c" * 64,
@@ -667,7 +667,7 @@ def test_scene_client_rejects_an_inconsistent_owner_result(
 ) -> None:
     client = ManagerCommandClient(tmp_path)
     valid_failure = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "committed_projection_revision": None,
         "error": {"code": "object_not_found", "details": {}, "message": "absent"},
         "ok": False,
@@ -694,7 +694,7 @@ def test_scene_client_rejects_an_inconsistent_owner_result(
 
     scene_id = "sha256:" + "d" * 64
     mismatched_success = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "committed_projection_revision": {
             "retained_bundle_id": "sha256:" + "e" * 64,
             "graph_revision": "sha256:" + "c" * 64,
@@ -732,7 +732,7 @@ def test_scene_result_lookup_is_read_only_and_validates_the_nested_owner_result(
     client = ManagerCommandClient(tmp_path)
     request = _scene_request()
     commands = []
-    response = {"api_version": "manyforge.manager_command_response.v1", "ok": True,
+    response = {"api_version": "manyforge.manager_command_response.v2", "ok": True,
                 "result": None}
 
     def exchange(command):
@@ -744,7 +744,7 @@ def test_scene_result_lookup_is_read_only_and_validates_the_nested_owner_result(
     assert commands[0]["command"] == "scene_transaction_status"
     assert "program_node_evidence" not in commands[0]["transaction"]
     response["result"] = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "committed_projection_revision": None,
         "error": {"code": "object_not_found", "details": {}, "message": "absent"},
         "ok": False, "projection_status": "not_attempted", "replay_status": "replayed_exact",
@@ -772,7 +772,7 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
     def exchange(command: dict[str, object]) -> dict[str, object]:
         commands.append(command)
         return {
-            "api_version": "manyforge.manager_command_response.v1",
+            "api_version": "manyforge.manager_command_response.v2",
             "ok": True,
             "poses": [
                 {
@@ -830,7 +830,7 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
     assert captured.value.code == "manager_command_response_invalid"
 
     rejected = {
-        "api_version": "manyforge.manager_command_response.v1",
+        "api_version": "manyforge.manager_command_response.v2",
         "error": {
             "code": "missing_reference",
             "details": {"reason": "scene_frame_resolution_ambiguous"},
@@ -850,7 +850,7 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
 @pytest.mark.parametrize("producer", ["component_manager", "kernel"])
 def test_manager_refusal_keeps_its_typed_producer(tmp_path, monkeypatch, producer):
     client = ManagerCommandClient(tmp_path)
-    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+    response = {"api_version": "manyforge.manager_command_response.v2", "ok": False,
                 "error": {"code": "stale_generation", "details": {"reason": "expected_generation_stale"},
                           "message": "cell-admission request rejected", "producer": producer}}
     monkeypatch.setattr(client, "_exchange", lambda _: response)
@@ -868,7 +868,7 @@ def test_manager_refusal_keeps_its_typed_producer(tmp_path, monkeypatch, produce
 ])
 def test_manager_refusal_with_malformed_producer_is_invalid(tmp_path, monkeypatch, error):
     client = ManagerCommandClient(tmp_path)
-    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False, "error": error}
+    response = {"api_version": "manyforge.manager_command_response.v2", "ok": False, "error": error}
     monkeypatch.setattr(client, "_exchange", lambda _: response)
     with pytest.raises(HeadlessApiError) as caught:
         client.scene_runtime_owner()
@@ -887,3 +887,97 @@ def test_manager_transport_sends_explicit_scene_initialization(tmp_path, monkeyp
     monkeypatch.setattr(client, "_exchange", exchange)
     client.apply(request)
     assert commands[0]["scene_initialization"] == purpose
+
+
+def _reference_error() -> dict[str, object]:
+    return {
+        "code": "program_reference_validation_failed",
+        "message": "Program references are invalid for the candidate Deployment",
+        "details": {},
+        "producer": "component_manager",
+        "reference_validation": {
+            "diagnostics": [{
+                "code": "program_reference_missing",
+                "location": {"document": "program", "path": "/nodes/0",
+                             "node_instance_id": "node.1", "parameter": "robot"},
+                "payload": {"component_id": "missing.1"},
+            }],
+            "total_count": 2,
+            "truncated": True,
+        },
+    }
+
+
+def test_manager_apply_preserves_reference_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    client = ManagerCommandClient(tmp_path)
+    error = _reference_error()
+    monkeypatch.setattr(client, "_exchange", lambda _command: {"ok": False, "error": error})
+    with pytest.raises(HeadlessApiError) as raised:
+        client.apply(_request())
+    assert raised.value.code == error["code"]
+    assert raised.value.producer == "component_manager"
+    assert raised.value.details == error["reference_validation"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "wrong_code", "extra_key", "bad_row", "bad_count", "bad_truncation",
+])
+def test_manager_apply_rejects_malformed_reference_diagnostics(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    import copy
+    error = copy.deepcopy(_reference_error())
+    reference = error["reference_validation"]
+    if mutation == "wrong_code":
+        error["code"] = "other_error"
+    elif mutation == "extra_key":
+        reference["extra"] = True
+    elif mutation == "bad_row":
+        reference["diagnostics"][0]["location"]["document"] = "deployment"
+    elif mutation == "bad_count":
+        reference["total_count"] = True
+    elif mutation == "bad_truncation":
+        reference["truncated"] = False
+    client = ManagerCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda _command: {"ok": False, "error": error})
+    with pytest.raises(HeadlessApiError) as raised:
+        client.apply(_request())
+    assert raised.value.code == "manager_command_response_invalid"
+
+
+def test_manager_reference_field_is_optional(tmp_path: Path, monkeypatch) -> None:
+    error = _reference_error()
+    del error["reference_validation"]
+    response = {"ok": False, "error": error}
+    client = ManagerCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    assert client.apply(_request()) == response
+
+
+def test_manager_rejects_v1_response(tmp_path: Path) -> None:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    path = tmp_path / "manager-command.sock"
+    server.bind(str(path))
+    path.chmod(0o600)
+    server.listen(1)
+
+    def serve() -> None:
+        connection, _ = server.accept()
+        with connection:
+            connection.recv(128 * 1024)
+            connection.send(rfc8785.dumps({
+                "api_version": "manyforge.manager_command_response.v1",
+                "ok": False,
+                "error": {"code": "busy", "message": "busy"},
+            }))
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        with pytest.raises(HeadlessApiError) as raised:
+            ManagerCommandClient(tmp_path).apply(_request())
+        assert raised.value.code == "manager_command_response_invalid"
+    finally:
+        server.close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()

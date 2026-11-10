@@ -105,6 +105,30 @@ struct World final {
   std::thread spinner;
 };
 
+TEST(XArmDriverServices, OwnerRetainsNodeUntilAllClientsRetire) {
+  auto node = std::make_shared<rclcpp::Node>("xarm_owned_services_test");
+  std::weak_ptr<rclcpp::Node> weak_node = node;
+  std::shared_ptr<void> retired;
+  int invoked = 0;
+  XArmRosOwner owner{node, {},
+                     [&](std::function<void()> work) { ++invoked; work(); },
+                     [&](std::shared_ptr<void> entity) {
+                       auto *raw = entity.get();
+                       return std::shared_ptr<void>(raw, [&, entity = std::move(entity)](void *) mutable {
+                         retired = std::move(entity);
+                       });
+                     }, {}, {}, {}};
+  auto services = std::make_unique<XArmDriverServices>(*node, unique_namespace(), &owner);
+  EXPECT_EQ(invoked, 1);
+  owner.node.reset();
+  node.reset();
+  services.reset();
+  ASSERT_TRUE(retired);
+  EXPECT_FALSE(weak_node.expired());
+  retired.reset();
+  EXPECT_TRUE(weak_node.expired());
+}
+
 TEST(XArmDriverServices, CleanErrorIsOneCallAndReportsTheVendorReturn) {
   World world;
   const auto cleared = world.Clear();
@@ -142,7 +166,7 @@ TEST(XArmDriverServices, CleanWarnIsOneCallOnItsOwnService) {
   EXPECT_EQ(world.clean_error_calls.load(), 0);
 }
 
-// TOOLCTX: the payload reaches `set_tcp_load` once, in kg and millimetres.
+// The payload reaches `set_tcp_load` once, in kg and millimetres.
 TEST(XArmDriverServices, SetTcpLoadSendsKilogramsAndMillimetresOnce) {
   using SetTcpLoad = xarm_msgs::srv::SetTcpLoad;
   World world;
@@ -178,7 +202,7 @@ TEST(XArmDriverServices, SetTcpLoadSendsKilogramsAndMillimetresOnce) {
   EXPECT_EQ(calls.load(), 2);
 }
 
-// TOOLCTX: the TCP reaches `set_tcp_offset` once, in mm and radians.
+// The TCP reaches `set_tcp_offset` once, in mm and radians.
 TEST(XArmDriverServices, SetTcpOffsetSendsMillimetresAndRadiansOnce) {
   using SetFloat32List = xarm_msgs::srv::SetFloat32List;
   World world;

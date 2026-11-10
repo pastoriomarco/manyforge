@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock Lite6 motion preemption. A slow priority-10 move is taken over after 1 s by a priority-50 move (expect preempted plus a smooth takeover or spring-back); then a priority-10 newcomer against a running priority-50 move is refused_by_priority. Both losers return success (preempted_result) so the tree continues to the outcome-key checks.",
   "members": {
-    "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:fd1042ef095885c4b39c3a353bfa8fe5462b8012b316e54473eb048887b2b5e4",
-    "program.yaml": "sha256:40a34d9e3635577025a514f7be38942bac414967c66e910f0e1527ac22f951d7"
+    "deployment.yaml": "sha256:f539310d25eb982c30469e98e578c31fde2a1c14ce22e4c778a83e46b1f6804a",
+    "program.yaml": "sha256:f3293b85403dcc53522932a1ec5f72c75065d4012737acf2e78e73f95de552d0"
   },
   "name": "mock_lite6_motion_preemption",
   "saved_status": {
-    "checked_content_digest": "sha256:b7b57b6c906d8f5cbe59eb75a7f299790c9bc875a110fcba09ef8d59880b94ba",
+    "checked_content_digest": "sha256:0fb932bf9db54c57deff845a8f5692ab335ba92ebfce07f61c8696213996df63",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

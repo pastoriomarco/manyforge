@@ -70,15 +70,6 @@ LoadMaintainedInterruptProgram(
   d::test::ProgramOptions options;
   options.catalog_content_version =
       bundle->value().catalogs.node_environment.content_version;
-  options.resource_roles = {"arm_joints"};
-  // The Lite6 arm declares no `tcp` frame role: use the current TCP (B-DEP).
-  options.frame_roles = {"base"};
-  options.capability_ids = {"execution.feedback.phase_events",
-                            "execution.trajectory.execute",
-                            "planning.motion.pose_goal",
-                            "planning.trajectory.time_parameterized",
-                            "state.observed.current",
-                            "validation.trajectory.non_collision"};
   auto fields = d::test::make_program_root(options).as_object();
   const auto replace = [&](const std::string &name, V value) {
     for (auto &[key, selected] : fields)
@@ -95,32 +86,34 @@ LoadMaintainedInterruptProgram(
                             .root());
   replace("tree", d::parse_strict_json_model_yaml(R"({
     "node_id":"motion.move_until_signal","instance_id":"move","children":[],
-    "parameters":{"target_role":"arm","tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
+    "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
       "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
-      "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
+      "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
         "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
       "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":true}}}})")
                       .root());
   const auto authored = d::test::with_program_revision(
       d::normalize_program_authoring(V(std::move(fields))));
-  const auto program =
-      d::verify_program_binding_contract(d::canonical_json(authored), *bundle);
   d::FilesystemCatalogArtifactStore artifacts(package_root);
-  const c::ProgramRoleAssignmentDTO assignment{
-      {{c::ComponentRoleId("robot"),
-        c::ControllableComponentId("lite6_robot")}},
-      {{c::TargetRoleId("arm"), c::CommandTargetId("arm")}}};
-  const auto binding = d::compile_program_binding(*program, assignment, *bundle,
-                                                  *map, artifacts);
+  const auto program = d::verify_program_binding_contract(
+      d::canonical_json(authored), *bundle, *map, artifacts);
+  const auto binding = d::compile_program_binding(*program, *bundle, *map, artifacts);
 
+  // The durable Program repository verifies against its own root. Copy the
+  // genuine retained bundle, map artifacts and sealed catalogs into this
+  // isolated writable root so reload uses the same exact captured inputs.
+  for (const auto *directory : {"retained-bundles", "raw-artifacts", "catalog-artifacts"})
+    std::filesystem::copy(package_root / directory, program_artifact_root / directory,
+                          std::filesystem::copy_options::recursive);
   d::FilesystemProgramRepository programs(program_artifact_root);
   (void)programs.put_if_absent(program, *bundle);
   const auto read_program = programs.get_verified(
       program->value().program_id, program->value().program_revision, *bundle);
   d::FilesystemProgramBindingRepository bindings(program_artifact_root);
-  (void)bindings.put_if_absent(binding, *bundle, *map);
+  (void)bindings.put_if_absent(binding, *bundle, *map, artifacts);
   const auto read_binding =
-      bindings.get_verified(binding->program_binding_id(), *bundle, *map);
+      bindings.get_verified(binding->program_binding_id(), *bundle, *map,
+                            artifacts);
   if (!read_program || !read_binding ||
       read_program->canonical_program_bytes() !=
           program->canonical_program_bytes() ||

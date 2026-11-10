@@ -95,7 +95,7 @@ struct ObservedRobotStateSourceMetrics {
 };
 
 /// Fixed-capacity, allocation-free-after-construction publication channel for
-/// observed robot state (spec/210 section 3.13, RT-8C).
+/// observed robot state.
 ///
 /// Each configured source owns a three-slot single-writer lane. Readers pin a
 /// published slot with a bounded atomic reference count; writers only reuse an

@@ -178,8 +178,7 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     RuntimeParticipantBindingDTO value) {
   if (value.program_id.empty() || value.program_revision.empty() ||
       value.program_binding_id.empty() || value.retained_bundle_id.empty() ||
-      value.graph_revision.empty() || value.component_role_id.empty() ||
-      value.target_role_id.empty() || value.controllable_component_id.empty() ||
+      value.graph_revision.empty() || value.controllable_component_id.empty() ||
       value.component_type_id.empty() || value.component_type_revision.empty() ||
       value.command_target_id.empty() || value.capability_id.empty() ||
       value.capability_definition_revision.empty()) {
@@ -212,20 +211,38 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
                    "runtime_model_group_invalid");
   }
   if ((!value.frame_bindings.empty() &&
-       !unique_nonempty(value.frame_bindings, [](const auto& item) { return item.frame_role_id; })) ||
+       !unique_nonempty(value.frame_bindings, [](const auto& item) { return item.reference; })) ||
       std::any_of(value.frame_bindings.begin(), value.frame_bindings.end(), [](const auto& item) {
-        return item.frame_role_id.empty() || item.model_instance_id.empty() ||
+        return item.reference.component_id.empty() || item.reference.frame_id.empty() || item.model_instance_id.empty() ||
                item.model_revision.empty() || item.compiled_frame_name.empty();
       })) {
     return invalid("runtime participant frame bindings are incomplete or duplicate",
                    "runtime_frame_binding_invalid");
   }
+  if ((!value.frame_associations.empty() &&
+       !sorted_unique(value.frame_associations, [](const auto& association) {
+         return association.frame;
+       })) ||
+      std::any_of(value.frame_associations.begin(), value.frame_associations.end(),
+                  [&](const auto& association) {
+        return association.frame.component_id.empty() || association.frame.frame_id.empty() ||
+               association.contact_body_role_ids.size() > kMaxProgramNestedRoleBindings ||
+               !sorted_unique(association.contact_body_role_ids, [](const auto& role) { return role; }) ||
+               std::any_of(association.contact_body_role_ids.begin(), association.contact_body_role_ids.end(),
+                           [](const auto& role) { return role.empty(); }) ||
+               std::none_of(value.frame_bindings.begin(), value.frame_bindings.end(),
+                            [&](const auto& frame) { return frame.reference == association.frame; });
+      })) {
+    return invalid("runtime participant frame associations are incomplete or duplicate",
+                   "runtime_frame_binding_invalid");
+  }
   if (value.motion_endpoint) {
     const auto& endpoint = *value.motion_endpoint;
     const auto& frame = endpoint.frame;
-    const auto& roles = frame.contact_body_role_ids;
-    if (!value.control_path || value.model_groups.size() != 1U || endpoint.target_role_id.empty() ||
-        endpoint.command_target_id.empty() || frame.frame_role_id.empty() ||
+    const auto& roles = endpoint.contact_body_role_ids;
+    if (!value.control_path || value.model_groups.size() != 1U || endpoint.target.component_id.empty() ||
+        endpoint.target.command_target_id.empty() || frame.reference.component_id.empty() ||
+        frame.reference.frame_id.empty() ||
         frame.model_instance_id.empty() || frame.model_revision.empty() ||
         frame.compiled_frame_name.empty() ||
         // TCP-D: the frame may be on a tool mounted on the motion component;
@@ -239,11 +256,9 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     }
     for (std::size_t index = 0; index < roles.size(); ++index) {
       const auto& body = endpoint.contact_body_bindings[index];
-      if (body.component_role_id.empty() || body.target_role_id != endpoint.target_role_id ||
-          body.controllable_component_id.empty() ||
-          body.command_target_id != endpoint.command_target_id ||
+      if (body.body.component_id != frame.reference.component_id ||
           (body.model_role_id && body.model_role_id->empty()) ||
-          body.collision_body_role_id != roles[index] ||
+          body.body.collision_body_id != roles[index] ||
           body.model_instance_id != frame.model_instance_id ||
           body.model_revision != frame.model_revision || body.collision_body_ids.empty() ||
           body.collision_body_ids.size() > kMaxProgramNestedRoleBindings) {
@@ -252,7 +267,7 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       }
       for (std::size_t body_index = 0; body_index < body.collision_body_ids.size(); ++body_index) {
         if (body.collision_body_ids[body_index] !=
-            make_component_collision_body_id(body.controllable_component_id,
+            make_component_collision_body_id(body.body.component_id,
                                              frame.model_instance_id, roles[index], body_index)) {
           return invalid("motion endpoint body does not retain its exact semantic identity",
                          "runtime_motion_endpoint_body_invalid");
@@ -354,26 +369,24 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
                 policy.bodies_from_motion_endpoint != policy.allowed_body_bindings.empty() ||
                 !valid_program_contact_envelope(policy.envelope) ||
                 !sorted_unique(policy.allowed_body_bindings, [](const auto& body) {
-                  return std::tie(body.component_role_id, body.target_role_id, body.model_role_id,
-                                  body.collision_body_role_id);
+                  return std::tie(body.body, body.model_role_id);
                 })) {
               return true;
             }
             return std::any_of(
                 policy.allowed_body_bindings.begin(), policy.allowed_body_bindings.end(),
                 [&](const auto& body) {
-                  if (body.component_role_id.empty() || body.target_role_id.empty() ||
-                      body.controllable_component_id.empty() || body.command_target_id.empty() ||
+                  if (body.body.component_id.empty() ||
                       (body.model_role_id.has_value() && body.model_role_id->empty()) ||
-                      body.collision_body_role_id.empty() || body.model_instance_id.empty() ||
+                      body.body.collision_body_id.empty() || body.model_instance_id.empty() ||
                       body.model_revision.empty() || body.collision_body_ids.empty()) {
                     return true;
                   }
                   for (std::size_t index = 0U; index < body.collision_body_ids.size(); ++index) {
                     if (body.collision_body_ids[index] !=
-                        make_component_collision_body_id(body.controllable_component_id,
+                        make_component_collision_body_id(body.body.component_id,
                                                          body.model_instance_id,
-                                                         body.collision_body_role_id, index)) {
+                                                         body.body.collision_body_id, index)) {
                       return true;
                     }
                   }

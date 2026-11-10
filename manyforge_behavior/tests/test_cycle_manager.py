@@ -1,4 +1,4 @@
-"""Portable cycle vocabulary and the I6/N + I8/P5 runtime cutover gate."""
+"""Portable cycle vocabulary and the runtime cutover gate."""
 
 from pathlib import Path
 import re
@@ -7,7 +7,6 @@ import pytest
 
 from manyforge_behavior import cycle_manager
 from manyforge_behavior.cycle_manager import (
-    CYCLE_MANAGER_RESTORATION_GATES,
     ROS2_CONTROL_BACKEND_FAULT_CLASSES,
     CycleManager,
     CycleManagerUnavailableError,
@@ -111,5 +110,3 @@ def test_cycle_manager_fails_before_runner_or_kernel_access() -> None:
         match="composable_cell_cycle_manager_unavailable",
     ):
         CycleManager(poison, poison, event_sink=poison)
-
-    assert CYCLE_MANAGER_RESTORATION_GATES == ("I6", "N", "I8", "P5")

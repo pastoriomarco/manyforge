@@ -10,7 +10,7 @@
 
 namespace manyforge::core {
 
-/// Planner block (M9 decision "planner block"): the Deployment's planner
+/// Planner block: the Deployment's planner
 /// default per robot, optionally overridden per motion (the node's `planner`
 /// parameter). Joint and pose goals use it; Cartesian paths do not search.
 

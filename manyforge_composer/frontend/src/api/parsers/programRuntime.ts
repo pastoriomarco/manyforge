@@ -276,17 +276,17 @@ const PROGRAM_RUN_STATES = new Set<ProgramRunStateName>([
 ]);
 
 /**
- * Registered failure-detail keys (spec error contract §1.1). A run record
+ * Registered failure-detail keys. A run record
  * carries no other key; the message already names any other cause.
  */
 const FAILURE_DETAIL_KEYS: ReadonlySet<string> = new Set([
   // Owner refusals.
-  'reason', 'reference_type', 'reference_id', 'target_role_id',
+  'reason', 'reference_type', 'reference_id', 'reference',
   // Node input failures.
   'input_problem', 'path', 'source_kind', 'source_reference',
   // Required ErrorDTO details a run may surface.
   'retryable', 'required_action',
-  // Run end and readiness ids (CONTRACTS §9, §10).
+  // Run end and readiness ids.
   'rule_id', 'component_id',
 ]);
 
@@ -311,6 +311,29 @@ function failureDetailsAt(value: unknown, path: string): FailureDetails | null {
     if (!FAILURE_DETAIL_KEYS.has(key)) {
       return fail(`${path}.${key}`, 'a registered failure-detail key');
     }
+    if (key === 'reference') {
+      const featureKeys: Record<string, string> = {
+        target: 'command_target_id', signal: 'signal_name', frame: 'frame_id',
+        collision_body: 'collision_body_id',
+      };
+      const feature = typeof record.reference_type === 'string'
+        && Object.prototype.hasOwnProperty.call(featureKeys, record.reference_type)
+        ? featureKeys[record.reference_type] : undefined;
+      if (feature === undefined) return fail(`${path}.reference_type`, 'a qualified reference type');
+      const ref = objectAt(item, `${path}.reference`);
+      exactKeysAt(ref, ['component_id', feature], `${path}.reference`);
+      const component = stringAt(ref.component_id, `${path}.reference.component_id`);
+      const identity = stringAt(ref[feature], `${path}.reference.${feature}`);
+      if (!/^[a-z][a-z0-9_.-]*$/.test(component) || utf8Length(component) > 128
+        || (feature === 'signal_name'
+          ? identity.length === 0 || identity.includes('\0') || utf8Length(identity) > 512
+            || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(identity)
+          : !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(identity) || utf8Length(identity) > 128)) {
+        return fail(`${path}.reference`, 'a bounded qualified reference');
+      }
+      details[key] = { component_id: component, [feature]: identity };
+      continue;
+    }
     if (
       !(item === null || typeof item === 'boolean'
         || (typeof item === 'number' && Number.isFinite(item)
@@ -324,7 +347,7 @@ function failureDetailsAt(value: unknown, path: string): FailureDetails | null {
     }
     details[key] = item;
   }
-  // Sorted keys and scalar values: JSON.stringify is the RFC 8785 canonical form.
+  // Property ordering does not change the encoded byte count.
   if (utf8Length(JSON.stringify(details)) > FAILURE_DETAIL_MAX_CANONICAL_BYTES) {
     return fail(path, `failure details of at most ${FAILURE_DETAIL_MAX_CANONICAL_BYTES} bytes`);
   }
@@ -565,13 +588,13 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'state',
       'tree_status',
     ],
-    // CONTRACTS §9: why the run ended, once it has.
+    // Why the run ended, once it has.
     ['run_end'],
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_status.v3') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v3');
+  if (schemaVersion !== 'manyforge.program_run_status.v4') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v4');
   }
   const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
   if (!PROGRAM_RUN_STATES.has(state)) {
@@ -1754,27 +1777,27 @@ function runtimeScaleControlSelectorAt(
     }
     const targets = rows.map((row, index) => {
       const member = objectAt(row, `${path}.group_targets[${index}]`);
-      exactKeysAt(member, ['component_role_id', 'target_role_id'], `${path}.group_targets[${index}]`);
+      exactKeysAt(member, ['component_id', 'command_target_id'], `${path}.group_targets[${index}]`);
       return {
-        componentRoleId: runtimeScalePortableAt(member.component_role_id, `${path}.group_targets[${index}].component_role_id`),
-        targetRoleId: runtimeScalePortableAt(member.target_role_id, `${path}.group_targets[${index}].target_role_id`),
+        componentId: runtimeScalePortableAt(member.component_id, `${path}.group_targets[${index}].component_id`),
+        commandTargetId: runtimeScalePortableAt(member.command_target_id, `${path}.group_targets[${index}].command_target_id`),
       };
     });
     const identities = targets.map((target) => runtimeScalePairIdentity(
-      target.componentRoleId,
-      target.targetRoleId,
+      target.componentId,
+      target.commandTargetId,
     ));
     if (new Set(identities).size !== identities.length) {
       return fail(`${path}.group_targets`, 'unique target pairs');
     }
     return { kind: 'group', programBindingId: binding, groupTargets: targets };
   }
-  exactKeysAt(selector, ['component_role_id', 'program_binding_id', 'target_role_id'], path);
+  exactKeysAt(selector, ['component_id', 'program_binding_id', 'command_target_id'], path);
   return {
     kind: 'singular',
-    componentRoleId: runtimeScalePortableAt(selector.component_role_id, `${path}.component_role_id`),
+    componentId: runtimeScalePortableAt(selector.component_id, `${path}.component_id`),
     programBindingId: binding,
-    targetRoleId: runtimeScalePortableAt(selector.target_role_id, `${path}.target_role_id`),
+    commandTargetId: runtimeScalePortableAt(selector.command_target_id, `${path}.command_target_id`),
   };
 }
 
@@ -1895,7 +1918,7 @@ export function runtimeScaleControlStatusAt(
       return fail(`${path}.group_members`, 'between 2 and 4096 members');
     }
     const expected = new Set(selector.groupTargets.map((target) => (
-      runtimeScalePairIdentity(target.componentRoleId, target.targetRoleId)
+      runtimeScalePairIdentity(target.componentId, target.commandTargetId)
     )));
     const seen = new Set<string>();
     if (!supported) return fail(path, 'a group must be supported');
@@ -1904,11 +1927,11 @@ export function runtimeScaleControlStatusAt(
       exactKeysAt(member, [
         'active_control_configuration_generation', 'active_control_configuration_id',
         'control_binding_id', 'control_binding_revision', 'control_domain_id',
-        'control_domain_revision', 'scaling_domain_id', 'component_role_id', 'target_role_id',
+        'control_domain_revision', 'scaling_domain_id', 'component_id', 'command_target_id',
       ], `${path}.group_members[${index}]`);
-      const componentRoleId = runtimeScalePortableAt(member.component_role_id, `${path}.group_members[${index}].component_role_id`);
-      const targetRoleId = runtimeScalePortableAt(member.target_role_id, `${path}.group_members[${index}].target_role_id`);
-      const identity = runtimeScalePairIdentity(componentRoleId, targetRoleId);
+      const componentId = runtimeScalePortableAt(member.component_id, `${path}.group_members[${index}].component_id`);
+      const commandTargetId = runtimeScalePortableAt(member.command_target_id, `${path}.group_members[${index}].command_target_id`);
+      const identity = runtimeScalePairIdentity(componentId, commandTargetId);
       if (!expected.has(identity) || seen.has(identity)) return fail(`${path}.group_members[${index}]`, 'exactly one selected target');
       seen.add(identity);
       const fields = [
@@ -1916,7 +1939,7 @@ export function runtimeScaleControlStatusAt(
         'control_binding_revision', 'scaling_domain_id', 'active_control_configuration_id',
       ].map((field) => runtimeScalePortableAt(member[field], `${path}.group_members[${index}].${field}`));
       return {
-        componentRoleId, targetRoleId,
+        componentId, commandTargetId,
         controlDomainId: fields[0], controlDomainRevision: fields[1], controlBindingId: fields[2],
         controlBindingRevision: fields[3], scalingDomainId: fields[4], activeControlConfigurationId: fields[5],
         activeControlConfigurationGeneration: nonnegativeIntegerAt(

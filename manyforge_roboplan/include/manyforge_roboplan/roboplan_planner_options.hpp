@@ -1,7 +1,7 @@
 #pragma once
 
 // Pure policy extraction from this path at parent
-// c4b075fa6dfb69e463c61f3efa8cfce8de681e8a. The future I6 planning adapter
+// c4b075fa6dfb69e463c61f3efa8cfce8de681e8a. A planning adapter
 // must consume these qualified defaults; this restores no planner owner.
 
 #include <string>
@@ -31,7 +31,7 @@ inline constexpr bool shortcut_candidate_for_attempt(
   // authority. Validation checks the executed curve with the collision
   // clearance, so a shortcut that skims an obstacle at a checked sample is
   // rejected there rather than dispatched. The first retry (0.01 step) is
-  // therefore shortcut too: without it the M55 F-1 detour took 17.9 s instead
+  // therefore shortcut too: without it a measured detour took 17.9 s instead
   // of about 8.5 s. If validation rejects that shortcut path as well, later
   // retries keep the unshortcut collision-avoiding detour.
   return planning_attempt_index <= 1U;

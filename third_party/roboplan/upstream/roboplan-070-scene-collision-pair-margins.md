@@ -1,10 +1,8 @@
 # RoboPlan 0.7.0 per-pair collision margin (security margin) on `Scene`
 
 Status: feature gap confirmed by source inspection; the local patch is written
-against the exact patched 0.7.0 closure but has not yet been built or run
-(merge 6 build); not yet submitted upstream
-
-ManyForge tracking ID: `RP-UP-070-001`
+against the exact patched 0.7.0 closure but has not yet been built or run;
+not yet submitted upstream
 
 ## Exact upstream source and dependency closure
 
@@ -40,7 +38,7 @@ closer than a chosen clearance as colliding:
   RRT checks through a per-call `SceneContext` (`roboplan_rrt/src/rrt.cpp`),
   whose `GeometryData` is freshly default-constructed.
 
-Measured consequence (ManyForge M55 F-1, Lite 6 + gripper, coal 3.0.3): a
+Measured consequence (ManyForge, Lite 6 + gripper, coal 3.0.3): a
 gripper finger grazed a wall with 0.09 mm penetration over a 0.0019 rad band
 of joint 2. Sampled edge checks missed it at 0.05, 0.01 and 0.002 rad steps;
 with a 3 mm margin on the robot-to-wall pairs it was caught at the default
@@ -95,7 +93,7 @@ runtime state monitor keeps margin 0.
 
 ## Focused regression and sanitizer evidence
 
-Required before qualification, at the merge 6 build:
+Required before qualification:
 
 1. `RoboPlanSceneTest.TestCollisionPairMargins` passes in Release and under
    ASan/UBSan;
@@ -142,7 +140,7 @@ and kernel clearance rows pass without the patch.
 
 1. Reduce the change to its upstream form (no dependency on patch 0010) with
    the focused test and the suggested Python binding.
-2. Attach the F-1 measurement summary above and the broadphase consistency
+2. Attach the measurement summary above and the broadphase consistency
    evidence (same results through the broadphase and the verbose path).
 3. Carry the exact local patch until an upstream release satisfies the
    removal predicate.

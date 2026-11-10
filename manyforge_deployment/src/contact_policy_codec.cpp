@@ -89,19 +89,12 @@ response(const CanonicalValue &value, std::string_view name) {
 decode_selector(const CanonicalValue &value, std::string_view path) {
   const auto &kind = text(member(value, "kind"), std::string(path) + ".kind");
   if (kind == "component_model_body") {
-    std::optional<core::ModelRoleId> model_role_id;
-    if (const auto *selected = value.find_object_member("model_role_id");
-        selected != nullptr) {
-      model_role_id.emplace(
-          text(*selected, std::string(path) + ".model_role_id"));
-    }
-    return core::ContactComponentModelBodySelectorDTO{
-        core::ComponentRoleId(text(member(value, "component_role_id"),
-                                   std::string(path) + ".component_role_id")),
-        std::move(model_role_id),
-        core::CollisionBodyRoleId(
-            text(member(value, "collision_body_role_id"),
-                 std::string(path) + ".collision_body_role_id"))};
+    const auto &body = member(value, "body");
+    return core::ContactComponentModelBodySelectorDTO{{
+        core::ControllableComponentId(text(member(body, "component_id"),
+                                           std::string(path) + ".body.component_id")),
+        core::CollisionBodyRoleId(text(member(body, "collision_body_id"),
+                                       std::string(path) + ".body.collision_body_id"))}};
   }
   if (kind == "scene_resource") {
     return core::ContactSceneResourceSelectorDTO{

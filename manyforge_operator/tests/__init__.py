@@ -1,1 +1,1 @@
-"""Contract tests for the frozen O1.2 operator boundary."""
+"""Contract tests for the frozen operator boundary."""

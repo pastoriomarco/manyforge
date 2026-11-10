@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <manyforge_core/cache/trajectory_cache.hpp>
@@ -79,11 +80,10 @@ struct ExecutionKernelConfig {
   int runtime_collision_lookahead_min_waypoints_for_parallel = 8;
   Duration runtime_collision_lookahead_query_budget_ns = 75'000'000;
 
-  // RT-8B recovery readiness policy (spec/230 §3.7.1). Measured-observation
-  // enforcement is fail-closed before RT-8C wires the dedicated observed-state
-  // publication: observation-dependent recovery remains waiting rather than
-  // substituting lifecycle state. The dwell/sample values are conservative
-  // placeholders and are qualified in RT-8C evidence.
+  // Recovery readiness policy. Measured-observation enforcement is
+  // fail-closed until the dedicated observed-state publication is wired:
+  // observation-dependent recovery remains waiting rather than substituting
+  // lifecycle state. The dwell/sample values are conservative placeholders.
   bool recovery_require_measured_observation = true;
   std::int64_t recovery_ready_dwell_ns = 200'000'000;  // 200 ms
   std::uint32_t recovery_ready_min_samples = 2;
@@ -215,14 +215,15 @@ struct RuntimeCollisionProtectionSnapshot {
 /// Focused, non-owning kernel dependencies for planning admission and
 /// validation. Each reference has one authority; no member is a combined
 /// scene/state/planner facade. Owners must outlive ExecutionKernel.
+// Required port owners are nonnull; optional diagnostic/synchronizer may be absent.
 struct ExecutionKernelPorts {
-  IObservedRobotStateProvider& observed_state;
-  IRobotKinematics& kinematics;
-  IReferencePoseResolver& reference_resolver;
-  ITrajectoryValidator& trajectory_validator;
-  ICollisionTrajectoryProjector& collision_projector;
-  const ICollisionDiagnosticComparator* collision_diagnostic_comparator = nullptr;
-  IPlanningSceneSynchronizer* planning_scene_synchronizer = nullptr;
+  std::shared_ptr<IObservedRobotStateProvider> observed_state;
+  std::shared_ptr<IRobotKinematics> kinematics;
+  std::shared_ptr<IReferencePoseResolver> reference_resolver;
+  std::shared_ptr<ITrajectoryValidator> trajectory_validator;
+  std::shared_ptr<ICollisionTrajectoryProjector> collision_projector;
+  std::shared_ptr<const ICollisionDiagnosticComparator> collision_diagnostic_comparator{};
+  std::shared_ptr<IPlanningSceneSynchronizer> planning_scene_synchronizer{};
 };
 
 /// Per-participant motion execution: planning, validation, preview,
@@ -231,16 +232,22 @@ struct ExecutionKernelPorts {
 /// how each execution ended (`ExecutionStatus::fact`, kParticipantSettled);
 /// the addressed Kernel owns operation identity, outcomes and Stop.
 ///
-/// Spec 230: all operations are ROS-free.
+/// All operations are ROS-free.
 class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                         public IResolvedPreparedParticipantExecutionEngine,
                         public IMotionPreview {
  public:
-  ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts ports,
-                  IExecutionBackend& execution_backend, IClock& clock, IScheduler& scheduler,
-                  TrajectoryCache& cache, ExecutionKernelConfig config = {});
+  // Planner, backend, clock and cache owners are nonnull construction preconditions.
+  ExecutionKernel(std::shared_ptr<IPlannerBackend> planner, ExecutionKernelPorts ports,
+                  std::shared_ptr<IExecutionBackend> execution_backend, std::shared_ptr<IClock> clock,
+                  IScheduler& scheduler, std::shared_ptr<TrajectoryCache> cache,
+                  ExecutionKernelConfig config = {});
 
   ~ExecutionKernel() override;
+
+  // Host teardown driver only: call before scheduler close/discard.
+  // Admission wait observes deadline; internal cooperative joins use the host watchdog.
+  [[nodiscard]] Result<void> detach(std::chrono::steady_clock::time_point deadline);
 
   AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept override;
@@ -255,6 +262,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                       const ContentDigest& prepared_contract_digest) override;
   Result<void> CancelPreparedMotion(std::uint64_t execution_id) override;
   Result<bool> RetireCancelledPreparedMotion(std::uint64_t candidate_id) override;
+  Result<bool> RetireRebuiltUnknownPreparedMotion(std::uint64_t source_id,
+                                                   std::uint64_t candidate_id) override;
   Result<PreparedMotionReplacementSourceDTO> CaptureMotionReplacementSource(
       std::uint64_t execution_id) const override;
   Result<bool> CommitPreparedMotionReplacement(std::uint64_t candidate_id,
@@ -294,7 +303,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                 CollisionWorldLeaseInventory projection_inventory,
                                                 RobotStateDTO start_state,
                                                 std::uint32_t planning_attempt_index = 0U,
-                                                std::stop_token stop_token = {}) override;
+                                                std::stop_token stop_token = {},
+                                                std::optional<MotionPathPreview>* path_preview = nullptr) override;
 
   /// Motion-free retirement after the addressed owner certified containment:
   /// retires the prepared membership and local bookkeeping; never resets the
@@ -320,12 +330,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   AcknowledgeCompletedResultDTO acknowledge_completed(
       uint64_t execution_id, std::optional<std::uint64_t> expected_epoch = std::nullopt) override;
 
-  /// RT-8B (spec/200, spec/230 §3.7.1): the only kernel statement of
+  /// The only kernel statement of
   /// recovery admissibility. Pure bounded read of the latest published
   /// assessment revision.
   KernelRecoveryAssessmentDTO get_recovery_assessment() const;
+  /// Wake existing observation monitoring after the retained owner rebuilds.
+  void NotifyOwnerRebuilt() noexcept;
 
-  /// RT-8B single generation-bound recovery command. Holds the lifecycle
+  /// Single generation-bound recovery command. Holds the lifecycle
   /// admission boundary across the coherent re-check and interrupt
   /// disposition; rejections are side-effect-free and return the newest
   /// assessment. `reset_cycle` is deliberately not an action here.
@@ -334,8 +346,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) override;
+  void store_runtime_scale_setting(double scale, std::uint64_t sequence) override;
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
       const OperationId& operation_id, const ControlBindingId& control_binding_id) const override;
+  [[nodiscard]] RuntimeScaleMechanismAvailability runtime_scale_availability()
+      const noexcept override;
 
   /// Get current kernel status.
   ExecutionStatus get_status() const override;
@@ -374,8 +389,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// publisher is borrowed and its composition owner must keep it alive until
   /// an owned replacement has completed (and through Kernel teardown if none
   /// is performed).
+  /// The publisher is a nonnull, shared-owned construction precondition.
   void set_collision_resources(
-      ICollisionWorldSnapshotPublisher& publisher,
+      std::shared_ptr<ICollisionWorldSnapshotPublisher> publisher,
       std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
       std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
       std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines = {});
@@ -422,6 +438,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   MetricsSnapshot get_metrics() const;
 
  private:
+  Result<bool> retire_prepared_motion_membership_for_recovery(std::uint64_t candidate_id,
+                                                             std::uint64_t rebuilt_source_id);
   struct PreparedMotionSession;
   struct ActiveMotionExecution;
   [[nodiscard]] std::shared_ptr<PreparedMotionSession> failed_preparation_never_dispatched_locked();
@@ -465,7 +483,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       std::uint32_t planning_attempt_index = 0, const RobotStateDTO* start_state_override = nullptr,
       const MovingReplacementInputDTO* replacement = nullptr,
-      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt);
+      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt,
+      std::unique_ptr<PlanningSuccess>* failed_evidence = nullptr);
   Result<PlanningSuccess> plan_motion_continuation(
       ExecuteRequestDTO& request, const CollisionWorldLeaseInventory& projection_inventory,
       const detail::MotionResumeIntent& continuation);
@@ -522,7 +541,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       bool* conclusive_collision_failure = nullptr,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
       const MovingReplacementInputDTO* replacement = nullptr,
-      bool collision_checked_by_planning = false);
+      bool collision_checked_by_planning = false,
+      std::optional<MotionPathPreview>* path_preview = nullptr,
+      bool diagnostic_preview = false,
+      std::optional<std::int64_t> diagnostic_deadline_ns = std::nullopt);
 
   /// Shared computation only. The caller owns planner serialization, the
   /// deadline/cancellation registration, projection lifetime and admission.
@@ -533,7 +555,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::int64_t planning_start_ns, std::int64_t planning_timeout_ns, std::stop_token stop_token,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
       const MovingReplacementInputDTO* replacement = nullptr,
-      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt);
+      std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt,
+      std::optional<MotionPathPreview>* path_preview = nullptr);
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
@@ -631,7 +654,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// execute worker alone reports the resulting fact.
   void expire_planning_deadline();
 
-  // RT-8B internals.
+  // Recovery authority internals.
   RecoveryAuthorityCapture capture_recovery_authority_locked();
   Result<void> apply_acknowledge_and_continue_locked(const std::string& principal_id,
                                                      const std::string& reason);
@@ -763,6 +786,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                      ExecutionHandle& execution_handle,
                                      ActiveMotionExecution& motion_state);
 
+  std::shared_ptr<IPlannerBackend> planner_owner_;
+  ExecutionKernelPorts ports_owner_;
+  std::shared_ptr<IExecutionBackend> execution_backend_owner_;
+  std::shared_ptr<TrajectoryCache> cache_owner_;
   IPlannerBackend& planner_;
   IObservedRobotStateProvider& observed_state_;
   IRobotKinematics& kinematics_;
@@ -772,6 +799,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   const ICollisionDiagnosticComparator* collision_diagnostic_comparator_;
   IPlanningSceneSynchronizer* planning_scene_synchronizer_;
   IExecutionBackend& execution_backend_;
+  std::shared_ptr<IClock> clock_owner_;
   IClock& clock_;
   IScheduler& scheduler_;
   TrajectoryCache& cache_;
@@ -801,8 +829,17 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   mutable std::mutex runtime_collision_protection_mutex_;
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_;
   std::uint64_t runtime_collision_protection_next_generation_ = 0;
+  // A moving replacement checks hazard and protection under the protection
+  // mutex, captures these two generations, releases every lock, and re-checks
+  // them lock-free immediately before its send (service_motion_replacement).
+  // Bumped under runtime_collision_protection_mutex_ whenever the protection
+  // state changes or hazard authority is claimed.
+  std::atomic<std::uint64_t> runtime_collision_protection_epoch_{0};
+  // Bumped by every Stop-side revocation (revoke_runtime_collision_lookahead_
+  // clear_permits, also from fence_addressed_participant_stop); lock-free.
+  std::atomic<std::uint64_t> stop_revocation_generation_{0};
 
-  // RT-8B recovery authority state. Lock order (documented at the admission
+  // Recovery authority state. Lock order (documented at the admission
   // site): lifecycle_mutex_ -> exactly one of
   // {recovery_certificate_mutex_, recovery_assessment_mutex_,
   //  recovery_refresh_mutex_, operator_stop_identity_mutex_}; the leaf
@@ -819,6 +856,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ScheduleHandle recovery_refresh_handle_ = 0;
   bool recovery_refresh_scheduled_ = false;
   ObservedReadinessTracker recovery_readiness_tracker_;
+  std::optional<std::pair<std::uint64_t, std::uint64_t>> recovery_rebuild_marker_;
+  bool recovery_rebuild_rest_qualified_{false};
   ScheduleHandle recovery_freshness_deadline_handle_ = 0;  // lifecycle-guarded
   std::int64_t recovery_freshness_deadline_ns_ = 0;        // lifecycle-guarded
   ScheduleHandle recovery_observation_poll_handle_ = 0;    // lifecycle-guarded
@@ -849,12 +888,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>> runtime_collision_query_session_;
   std::atomic<std::shared_ptr<RuntimeCollisionLookaheadSession>>
       runtime_collision_lookahead_session_;
+  // Held across an admission timeout; serialized by scheduler_detach_mutex_.
+  std::shared_ptr<RuntimeCollisionLookaheadSession> detach_pending_lookahead_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 
   // Serializes low-rate lifecycle authority transitions across admission,
   // certified-containment reset, recovery and acknowledge.
   std::mutex lifecycle_mutex_;
+  std::condition_variable lifecycle_worker_retirement_cv_;
   /// A native preview holds lifecycle_mutex_ for exclusive planner access
   /// while it plans. Lifecycle commands that must not wait for that planning
   /// (certified-containment reset, recovery) announce themselves here and cancel the active
@@ -862,6 +904,25 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   struct LifecyclePreemption;
   std::atomic<std::uint32_t> lifecycle_preemption_waiters_{0U};
   std::mutex preview_cancellation_mutex_;
+  // Sequential consistency fences scheduler borrows against detach without a
+  // mutex on admission or release.
+  std::mutex scheduler_detach_mutex_;
+  std::atomic<bool> scheduler_detach_started_{false};
+  std::atomic<bool> scheduler_cancels_closed_{false};
+  bool scheduler_detach_complete_{false};
+  std::atomic<std::size_t> scheduler_calls_in_flight_{0};
+  [[nodiscard]] std::optional<ScheduleHandle> schedule_scoped_deadline_if_attached(
+      TimePoint deadline, std::function<void()> callback, SchedulerPriority priority);
+  bool cancel_scoped_deadline_if_attached(ScheduleHandle handle);
+  bool cancel_recovery_deadline_if_attached(ScheduleHandle handle);
+  bool start_collision_monitor_if_attached();
+  bool stop_collision_monitor_if_attached(bool drain_callbacks);
+  struct SchedulerCallAdmission {
+    ExecutionKernel& owner;
+    bool admitted{false};
+    explicit SchedulerCallAdmission(ExecutionKernel& value, bool cancel = false);
+    ~SchedulerCallAdmission();
+  };
   std::optional<std::stop_source> active_preview_cancellation_;
   // Lifecycle/recovery command epoch, bumped by each settled addressed Stop and
   // captured into the recovery assessment.
@@ -903,7 +964,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<bool> planning_reset_requested_{false};
   // Set by the planning-deadline watchdog for the current planning attempt.
   std::atomic<bool> planning_deadline_expired_{false};
-  std::atomic<bool> lifecycle_worker_retirement_in_progress_{false};
+  // Protected by lifecycle_mutex_: preserve exact member identity while joined
+  // outside the lock, so observations do not mistake a moved worker for idle.
+  bool execution_worker_retiring_{false};
+  bool replacement_worker_retiring_{false};
+  std::size_t lookahead_retiring_{0};
+  [[nodiscard]] bool worker_retirement_in_progress_locked() const noexcept {
+    return execution_worker_retiring_ || replacement_worker_retiring_;
+  }
   // Set before requesting worker retirement only after the addressed owner has
   // committed its immutable Stop certificate. The retiring worker must then
   // release local state without issuing a duplicate backend Stop.

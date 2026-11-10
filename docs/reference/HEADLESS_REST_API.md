@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-11-02 14:57:37 UTC
+  Last regenerated: 2026-11-09 11:41:10 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
 # Headless Runtime REST API
 
-This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, explicit Program Stop, and component actions are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
+This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, explicit Program Stop, and component actions are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no headless owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -27,7 +27,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/cell/latch` |  | Cell Latch |
 | `GET` | `/api/components` |  | Components |
 | `POST` | `/api/components/actions` |  | Component Group Action |
+| `POST` | `/api/components/recover-enable` |  | Component Recover Enable Group |
 | `POST` | `/api/components/{component_id}/actions` |  | Component Action |
+| `POST` | `/api/components/{component_id}/recover-enable` |  | Component Recover Enable |
+| `GET` | `/api/components/{component_id}/recover-enable/preflight` |  | Component Recovery Preflight |
 | `POST` | `/api/control/commands` |  | Execution Control Command |
 | `GET` | `/api/control/diagnostics` |  | Execution Control Diagnostics |
 | `GET` | `/api/control/state` |  | Execution Control Projection |
@@ -86,6 +89,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/settle` |  | Settle Authoring Transaction |
 | `GET` | `/api/program/committed-activation` |  | Program Committed Activation |
+| `POST` | `/api/program/component-frame-lookup` |  | Lookup Component Frame |
 | `POST` | `/api/program/cycle/reset` |  | Program Cycle Reset |
 | `POST` | `/api/program/diagnostics` |  | Program Diagnostic |
 | `GET` | `/api/program/diagnostics/health` |  | Program Diagnostic Health |
@@ -95,6 +99,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/persistent-values/clear` |  | Clear Program Persistent Values |
 | `POST` | `/api/program/persistent-values/reset` |  | Reset Program Persistent Value |
 | `GET` | `/api/program/readiness` |  | Program Readiness |
+| `POST` | `/api/program/reference-validation` |  | Validate Program References |
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |

@@ -531,7 +531,7 @@ struct QualifiedIndexes final {
   require_exact_closure(result.manifests, result.required_manifests,
                         "provider-manifest closure");
 
-  // Complete selected topology declarations are retained for I3. Their exact
+  // Complete selected topology declarations are retained. Their exact
   // contract selectors therefore belong to the required closure even when a
   // deployment binding chooses only a subset of the topology's legal routes.
   for (const auto &topology_key : result.required_topologies) {
@@ -653,7 +653,7 @@ require_coordinate_map(const CompositionQualifiedCellIr &composition,
                value.command_target_id == binding.command_target_id;
       });
   if (result == nullptr) {
-    fail("control binding has no exact C0.2m coordinate map");
+    fail("control binding has no exact coordinate map");
   }
   return *result;
 }
@@ -865,7 +865,7 @@ using BoundResourceMap =
   }
 
   if (coordinate_map.resources.size() != binding.resource_bindings.size()) {
-    fail("C0.2m coordinate-map coverage differs from the control binding");
+    fail("coordinate-map coverage differs from the control binding");
   }
   for (std::size_t index = 0; index < binding.resource_bindings.size();
        ++index) {
@@ -873,7 +873,7 @@ using BoundResourceMap =
     const auto &composed = coordinate_map.resources[index];
     if (authored.resource_role_id != composed.resource_role_id ||
         authored.resource_id != composed.resource_id) {
-      fail("C0.2m coordinate-map resource order differs from the control "
+      fail("coordinate-map resource order differs from the control "
            "binding");
     }
   }
@@ -1940,7 +1940,7 @@ void qualify_capability_provider_target(
       require_target_capability(target_type, binding.capability_id, binding.capability_definition_revision);
       if (binding.capability_id.value() == "scene.pose.observe" ||
           binding.capability_id.value() == kAiModelCapabilityId) {
-        // CP9 pose-source and AI model targets: no resource roles.
+        // Pose-source and AI model targets: no resource roles.
         if (!target_type.resource_roles.empty())
           fail("model-free target declares resource roles");
         const auto bound = ValidateNonCoordinateProviderTarget(graph, binding);
@@ -3283,7 +3283,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   std::size_t materialized_state_claims = 0U;
   for (auto &binding : bindings) {
     if (!binding.interface_template.has_value()) {
-      fail("internal C0.2n error: binding interfaces were not materialized");
+      fail("internal applicability error: binding interfaces were not materialized");
     }
     checked_add(materialized_command_claims,
                 binding.interface_template->command_claims.size(),
@@ -3298,7 +3298,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
   if (materialized_command_claims != expected_cardinality.command_claims ||
       materialized_state_claims != expected_cardinality.state_claims ||
       logical_rows != expected_cardinality.logical_rows) {
-    fail("internal C0.2n error: materialized output cardinality differs from "
+    fail("internal applicability error: materialized output cardinality differs from "
          "its checked preflight");
   }
 

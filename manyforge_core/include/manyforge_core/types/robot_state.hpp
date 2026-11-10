@@ -5,7 +5,7 @@
 
 namespace manyforge::core {
 
-/// Robot state DTO (spec §3.7)
+/// Robot state DTO
 struct RobotStateDTO {
     std::vector<std::string> joint_names;
     std::vector<double> positions_rad;

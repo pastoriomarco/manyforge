@@ -18,20 +18,20 @@ import {
   mountCandidates,
   nextFreeComponentId,
   renameComponentRows,
-  rolesFittingEntry,
   toolMountRow,
   withMountRobot,
-  type RoleFeedback,
 } from '../utils/componentManager';
+import { aiModelComponents } from './AiModelComponentForm';
+import { DEFAULT_ASSISTANT_PROFILE_ID, NO_AI_MODEL_FOR_ASSISTANT } from './AssistantComponentForm';
 
-const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
+const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor', 'assistant'];
 
 /** An absolute ROS topic name (the compiler checks it fully). */
 const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
 
 interface AddDraft {
   entry: ComponentCatalogEntry;
-  /** A machine model: `entry` is its owner and member rows (CONTRACTS §16). */
+  /** A machine model: `entry` is its owner and member rows. */
   machine: MachineCatalogEntry | null;
   /** A machine's lane (its owner's; the members take it). */
   lane: string;
@@ -76,23 +76,18 @@ function initialDraft(
   entry: ComponentCatalogEntry,
   machine: MachineCatalogEntry | null,
   document: Record<string, JsonValue> | null,
-  feedback: readonly RoleFeedback[],
   mounts: readonly string[],
 ): AddDraft {
   const existing = draftComponents(document);
   const taken = new Set(existing.map((row) => row.component_id as string));
   const ids: Record<string, string> = {};
   const mainId = mainRowId(entry);
-  const roleId = rolesFittingEntry(entry, feedback)
-    .map((role) => role.componentId)
-    .find((id): id is string => id !== null && !taken.has(id));
   for (const row of entry.components) {
     const original = row.component_id as string;
     // A machine's members follow a free owner id: `<owner_id>_<role>`.
     const memberDefault = machine !== null && typeof row.role === 'string' && ids[entry.componentId] !== undefined
       ? defaultMemberId(ids[entry.componentId], row.role) : original;
-    ids[original] = original === mainId && roleId !== undefined
-      ? roleId : nextFreeComponentId(memberDefault, taken);
+    ids[original] = nextFreeComponentId(memberDefault, taken);
     taken.add(ids[original]);
   }
   const main = entry.components.find((row) => row.component_id === mainId);
@@ -138,6 +133,7 @@ function withId(draft: AddDraft, original: string, id: string): AddDraft {
 function addedComponentRows(
   draft: AddDraft,
   catalog: ComponentCatalog | null,
+  document: Record<string, JsonValue> | null,
 ): Array<Record<string, JsonValue>> | string {
   const entry = draft.machine === null ? draft.entry
     : machineCatalogEntry(draft.machine, draft.lane, catalog?.componentProfiles ?? {});
@@ -157,6 +153,8 @@ function addedComponentRows(
   if (entry.kind === 'sensor' && draft.sourceFrame.trim() === '') {
     return 'Enter the frame the cloud is published in.';
   }
+  const aiModels = aiModelComponents(document);
+  if (entry.kind === 'assistant' && aiModels.length === 0) return NO_AI_MODEL_FOR_ASSISTANT;
   const renamed = renameComponentRows(entry.components, draft.ids);
   const rows = entry.kind === 'tool' ? withMountRobot(renamed, draft.mountOn) : renamed;
   return rows.map((row) => {
@@ -172,6 +170,21 @@ function addedComponentRows(
             ...(object(configuration.runtime_configuration) ?? {}),
             topic: draft.topic.trim(),
             source_frame_id: draft.sourceFrame.trim(),
+          },
+        },
+      };
+    }
+    if (entry.kind === 'assistant') {
+      // Its AI model (the only one; several: chosen on its page) and the default chat profile.
+      const configuration = object(row.configuration) ?? {};
+      return {
+        ...row,
+        configuration: {
+          ...configuration,
+          runtime_configuration: {
+            ...(object(configuration.runtime_configuration) ?? {}),
+            ...(aiModels.length === 1 ? { model_component_id: aiModels[0].componentId } : {}),
+            assistant_profile_id: DEFAULT_ASSISTANT_PROFILE_ID,
           },
         },
       };
@@ -193,14 +206,12 @@ function addedComponentRows(
 /**
  * Add component: compose components that already exist (the curated catalog)
  * into the Deployment Draft, like every other Draft edit (remove, mount, base
- * pose, lane). Nothing runs until Apply; the Program role feedback shows what
- * each choice binds.
+ * pose, lane). Nothing runs until Apply.
  */
-export function AddComponentPanel({ controller, catalog, catalogError, feedback, onAdded }: {
+export function AddComponentPanel({ controller, catalog, catalogError, onAdded }: {
   controller: DeploymentWorkspaceController;
   catalog: ComponentCatalog | null;
   catalogError: string | null;
-  feedback: readonly RoleFeedback[];
   /** Called with the added main component's id. */
   onAdded: (componentId: string) => void;
 }) {
@@ -234,7 +245,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
 
   const add = async () => {
     if (draft === null) return;
-    const rows = addedComponentRows(draft, catalog);
+    const rows = addedComponentRows(draft, catalog, document);
     if (typeof rows === 'string') {
       setError({ message: rows, refused: false });
       return;
@@ -263,7 +274,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
     return (
       <div className="dactions">
         <button type="button" className="primary-action" disabled={disabled}
-          title={unavailable ?? 'Add a machine, robot, tool, I/O device, pose source, AI model or sensor to the Deployment Draft.'}
+          title={unavailable ?? 'Add a machine, robot, tool, I/O device, pose source, AI model, sensor or AI assistant to the Deployment Draft.'}
           onClick={() => { setOpen(true); setError(null); }}>Add component</button>
       </div>
     );
@@ -280,7 +291,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
         owner and every member) or a sensor model. It is added to the Deployment Draft only; Preview and Apply bring it
         up prepared, then Enable it.
       </p>
-      {/* Yellow: a failed read blocks nothing else (M55 notice rule). */}
+      {/* Yellow: a failed read blocks nothing else. */}
       {catalogError !== null && <p className="inline-message severity-warning" role="alert">{catalogError}</p>}
       {catalog === null && catalogError === null && <p className="muted" role="status">Reading the component catalog…</p>}
       <div className="dseg" role="radiogroup" aria-label="Component kind">
@@ -295,7 +306,6 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
       <div className="drows" role="listbox" aria-label="Available components">
         {catalog !== null && entries.length === 0 && <p className="muted">No component of this kind is available.</p>}
         {entries.map(({ entry, machine }) => {
-          const fits = rolesFittingEntry(entry, feedback);
           const selected = draft?.entry.entryId === entry.entryId;
           const others = entry.components.map((row) => row.component_id as string)
             .filter((id) => id !== entry.componentId);
@@ -304,7 +314,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
               className={`dpick${selected ? ' selected' : ''}`}
               title={entry.description ?? undefined}
               onClick={() => {
-                setDraft(initialDraft(entry, machine, document, feedback, mounts));
+                setDraft(initialDraft(entry, machine, document, mounts));
                 setError(null);
               }}>
               <span>
@@ -313,15 +323,14 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
                   {entry.componentId}
                   {others.length > 0 ? ` + ${others.join(', ')}` : ''}
                   {machine !== null ? ` · ${machine.modelId}` : entry.lane !== null ? ` · ${entry.lane}` : ''}
-                  {entry.kind === 'sensor' ? ` · ${entry.description ?? ''}` : ''}
+                  {entry.kind === 'sensor' || entry.kind === 'assistant' ? ` · ${entry.description ?? ''}` : ''}
                   {entry.tags.length > 0 ? ` · ${entry.tags.join(', ')}` : ''}
                 </small>
               </span>
               <small>
-                {fits.length > 0
-                  ? `Fits role ${fits.map((role) => role.roleId).join(', ')}`
-                  : machine !== null ? `${machine.members.length} members`
+                {machine !== null ? `${machine.members.length} members`
                     : entry.kind === 'sensor' ? 'sensor model'
+                    : entry.kind === 'assistant' ? 'assistant model'
                     : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
               </small>
             </button>
@@ -367,7 +376,6 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
           {draft.entry.components.map((row) => {
             const original = row.component_id as string;
             const id = draft.ids[original];
-            const role = feedback.find((candidate) => candidate.componentId === id);
             const slot = draft.machine?.members.find((member) => member.role === row.role);
             const name = draft.machine === null ? original
               : slot === undefined ? 'machine (owner)' : `${slot.title}, ${slot.role}`;
@@ -379,9 +387,6 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
                     setDraft(withId(draft, original, event.target.value));
                     setError(null);
                   }} />
-                <small>{role !== undefined
-                  ? `Binds Program role ${role.roleId}.`
-                  : 'No Program role names this id.'}</small>
               </label>
             );
           })}

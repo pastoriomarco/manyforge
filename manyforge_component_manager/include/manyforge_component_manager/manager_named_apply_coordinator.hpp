@@ -92,10 +92,10 @@ struct ManagerNamedApplyResult final {
   bool settlement_pending{false};
 };
 
-/// Single-progression-owner composition of the I4 named-Apply phase owners.
+/// Single-progression-owner composition of the named-Apply phase owners.
 ///
 /// This class adds no replacement state machine: it routes each durable phase
-/// to the already qualified I4 coordinator that owns it. A new request first
+/// to the already qualified coordinator that owns it. A new request first
 /// resolves the exact current publication and sealed bundles. It samples the
 /// Kernel admission state once before the first Acquire; Acquire then performs
 /// the atomic reject-if-busy compare-and-swap. Same-process progression reuses
@@ -110,8 +110,8 @@ public:
   using InitialSceneSource = std::function<std::vector<manyforge::core::AddObjectRequestDTO>(
       const ManagerApplyPreparedActivationDTO &,
       const manyforge::deployment::RetainedBundle &)>;
-  /// Fresh caller continuation after the host accepted the Apply (CONTRACTS
-  /// §15). It runs before Scene Begin and publication. Retained or recovered
+  /// Fresh caller continuation after the host accepted the Apply. It
+  /// runs before Scene Begin and publication. Retained or recovered
   /// acceptance cannot reconstruct this callback.
   using OriginalPrepareAcknowledgement = std::function<void(
       const ManagerApplyIntentDTO &,
@@ -181,7 +181,7 @@ public:
                               const manyforge::core::RequestId &request_id,
                               const std::string &source_label);
 
-  /// New (R3, N7): release the fence and claim that a failed Apply still
+  /// New: release the fence and claim that a failed Apply still
   /// holds, whatever it changed in the cell; New's own Apply then stops and
   /// removes everything the host has. Returns the released Apply, or none
   /// when no failed Apply holds the cell. The original failure is retained.

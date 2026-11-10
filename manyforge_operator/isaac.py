@@ -1,4 +1,4 @@
-"""Supported O1 split Isaac operator profile.
+"""Supported split Isaac operator profile.
 
 The profile is an outer lifecycle owner only. It attaches to an Isaac Sim run
 on its own simulator host, starts the source-matched ManyForge/ROS composition
@@ -199,6 +199,23 @@ class RemoteNativeConfig:
             raise ValueError("canonical_empty_admission_filename must be package-relative")
 
 
+def _make_private_directories(path: Path) -> None:
+    """Create `path` and its missing parents as owner-only directories.
+
+    The mode is set after creation because ``mkdir``'s mode is masked by the
+    umask; directories that already exist are left as they are.
+    """
+
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        os.chmod(directory, 0o700)
+
+
 @dataclass(frozen=True, slots=True)
 class IsaacLauncherConfig:
     """Control-host outer-lifecycle configuration for the split Isaac profile."""
@@ -245,7 +262,7 @@ class IsaacLauncherConfig:
         if type(self.ros_domain) is not int or not 0 <= self.ros_domain <= 232:
             raise ValueError("ros_domain must be in [0, 232]")
         if self.rmw != "rmw_fastrtps_cpp" or self.discovery_range != "LOCALHOST":
-            raise ValueError("O1 Isaac requires the recorded Fast DDS LOCALHOST topology")
+            raise ValueError("Isaac requires the recorded Fast DDS LOCALHOST topology")
         peers = tuple(sorted(set(self.static_peers)))
         if peers != self.static_peers or not peers:
             raise ValueError("static_peers must be sorted and unique")
@@ -425,7 +442,7 @@ class IsaacLauncher:
 
     @staticmethod
     def _make_store(config: IsaacLauncherConfig) -> _StateStore:
-        config.instance_root.mkdir(parents=True, exist_ok=True)
+        _make_private_directories(config.instance_root)
         return _StateStore(
             root=config.instance_root,
             lock_root=config.instance_root,
@@ -436,7 +453,7 @@ class IsaacLauncher:
         if not instance_id or "/" in instance_id or "\\" in instance_id:
             raise LauncherError("invalid_instance_id", "instance id is invalid", exit_code=64)
         root = Path(state_root).absolute() / instance_id
-        root.mkdir(parents=True, exist_ok=True)
+        _make_private_directories(root)
         store = _StateStore(root=root, lock_root=root)
         launcher = cls.__new__(cls)
         launcher.store = store
@@ -824,7 +841,7 @@ class IsaacLauncher:
     def _verify_remote_source(self, expected: SourceIdentityV1) -> None:
         remote = self._require_config().remote
         result = self._ssh_json(shlex.join([remote.python_executable,
-            f"{remote.source_root}/scripts/qualification/source_identity.py", "--repo-root", remote.source_root]), timeout=60)
+            f"{remote.source_root}/scripts/lib/source_identity.py", "--repo-root", remote.source_root]), timeout=60)
         try:
             actual = SourceIdentityV1.model_validate_json(json.dumps(result))
         except Exception as error:
@@ -834,8 +851,15 @@ class IsaacLauncher:
         if actual != expected:
             raise LauncherError("source_identity_mismatch", "remote source differs from the exact G source", exit_code=71)
 
+    def _remote_native_build(self) -> None:
+        # Its own call before start: a cold native build takes about 30-40
+        # minutes, and start's own timeout then bounds readiness only.
+        self._ssh(self._container_shell("build-native"), timeout=2700)
+
     def _remote_native_start(self) -> dict[str, Any]:
         if getattr(self._require_config().remote, "container_image_id", ""):
+            # Nothing has started yet: a failed build leaves no container.
+            self._remote_native_build()
             try:
                 status = self._remote_container_operation("start")
             except LauncherError:

@@ -1,13 +1,11 @@
-"""UI6-H captured selection semantics; no effect owner or runtime group latch."""
+"""Captured selection semantics; no effect owner or runtime group latch."""
 
 from copy import deepcopy
-import json
 from pathlib import Path
 
 import pytest
 
 import manyforge_behavior.program as program_module
-from manyforge_behavior.cli import main
 from manyforge_behavior.canonical_artifact import (
     compute_content_identity,
     load_strict_json_yaml,
@@ -18,8 +16,6 @@ from manyforge_behavior.program import (
     ProgramValidationError,
     TreeNode,
     apply_tree_param_overrides,
-    migrate_program_execution_groups,
-    migrate_program_v1,
     tree_node_from_dict,
 )
 
@@ -59,7 +55,7 @@ def document(*children: dict, groups="inherit") -> dict:
     result = load_strict_json_yaml(
         ROOT / "examples/pick_and_place_minimal.program.yaml"
     )
-    result["api_version"] = "manyforge.program.v2"
+    result["api_version"] = "manyforge.program.v3"
     result["tree"] = {
         "node_id": "sequence",
         "instance_id": "root",
@@ -285,121 +281,6 @@ def test_target_effect_budget_does_not_reduce_logical_node_capacity(
     )
     with pytest.raises(ProgramValidationError, match="target effects exceed"):
         Program(ROOT / "examples/pick_and_place_minimal.program.yaml", catalog)
-
-
-def test_v1_migration_is_explicit_identity_checked_and_nonmutating(
-    catalog: NodeCatalog,
-) -> None:
-    previous = document()
-    previous["api_version"] = "manyforge.program.v1"
-    previous = identified(previous)
-    original = deepcopy(previous)
-    with pytest.raises(ProgramValidationError, match="manyforge.program.v2"):
-        Program.from_dict(previous, catalog)
-    current = migrate_program_v1(previous, catalog)
-    assert previous == original
-    assert current.to_dict()["api_version"] == "manyforge.program.v2"
-    assert current.program_revision != previous["program_revision"]
-    assert current.to_dict()["tree"] == previous["tree"]
-    assert current.execution_selections == {"all": ("root", "wait")}
-    previous["tree"]["instance_id"] = "tampered"
-    with pytest.raises(ProgramValidationError, match="identity mismatch"):
-        migrate_program_v1(previous, catalog)
-
-
-def test_v1_migration_does_not_ignore_new_or_unknown_fields(
-    catalog: NodeCatalog,
-) -> None:
-    previous = document(groups=["robot_a"])
-    previous["api_version"] = "manyforge.program.v1"
-    with pytest.raises(ProgramValidationError, match="unknown fields"):
-        migrate_program_v1(identified(previous), catalog)
-
-
-def test_execution_group_migration_preserves_independent_and_common_start_intent(
-    catalog: NodeCatalog,
-) -> None:
-    first = motion_leaf("arm_a", "robot_group")
-    second = motion_leaf("arm_b", "robot_group")
-    legacy = document()
-    legacy["tree"] = {
-        "node_id": "parallel",
-        "instance_id": "paired_motion",
-        "parameters": {"success_policy": "all"},
-        "children": [first, second],
-    }
-    legacy.pop("execution_groups", None)
-    legacy["synchronized_execution_groups"] = ["robot_group"]
-    legacy = identified(legacy)
-
-    migrated = migrate_program_execution_groups(legacy, catalog)
-
-    assert migrated.execution_group_policies == {"robot_group": "common_start"}
-    assert migrated.coordinated_execution_selections == {
-        "robot_group": ("arm_a", "arm_b")
-    }
-    assert "synchronized_execution_groups" not in migrated.to_dict()
-
-
-def test_execution_group_migration_rejects_unknown_or_already_current_input(
-    catalog: NodeCatalog,
-) -> None:
-    legacy = document(leaf("wait", ["robot_group"]))
-    legacy.pop("execution_groups")
-    legacy["synchronized_execution_groups"] = ["missing_group"]
-    with pytest.raises(ProgramValidationError, match="unused"):
-        migrate_program_execution_groups(identified(legacy), catalog)
-    current = document()
-    current["execution_groups"] = {}
-    with pytest.raises(ProgramValidationError, match="already uses"):
-        migrate_program_execution_groups(current, catalog)
-
-
-def test_offline_migration_cli_never_overwrites_and_cleans_temporary_files(
-    tmp_path, catalog
-) -> None:
-    previous = document()
-    previous["api_version"] = "manyforge.program.v1"
-    previous = identified(previous)
-    source = tmp_path / "old.program.yaml"
-    output = tmp_path / "new.program.yaml"
-    original = json.dumps(previous).encode()
-    source.write_bytes(original)
-    assert (
-        main(["program", "migrate-v1", "--input", str(source), "--output", str(output)])
-        == 0
-    )
-    converted = Program(output, catalog)
-    assert converted.program_revision != previous["program_revision"]
-    result = output.read_bytes()
-    assert (
-        main(["program", "migrate-v1", "--input", str(source), "--output", str(output)])
-        == 2
-    )
-    assert output.read_bytes() == result
-    assert (
-        main(["program", "migrate-v1", "--input", str(source), "--output", str(source)])
-        == 2
-    )
-    assert source.read_bytes() == original
-    assert not list(tmp_path.glob(".program-migration-*"))
-    previous["name"] = "tampered after identity"
-    source.write_text(json.dumps(previous))
-    assert (
-        main(
-            [
-                "program",
-                "migrate-v1",
-                "--input",
-                str(source),
-                "--output",
-                str(tmp_path / "bad"),
-            ]
-        )
-        == 2
-    )
-    assert not (tmp_path / "bad").exists()
-    assert not list(tmp_path.glob(".program-migration-*"))
 
 
 def test_viewer_hidden_execution_groups_name_declared_groups_only(

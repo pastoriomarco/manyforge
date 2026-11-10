@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:ea0a625d949b1287de5b1eb0ed1e9d400d927f86c62c00b63c69898bdc58da36",
+  "capability_id": "execution.interrupt.resource_scoped",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "cell_global"
+}

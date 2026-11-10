@@ -10,7 +10,7 @@ execution host):
 * ``test_benchmark_cached_vs_uncached`` uses cache identity
   bound to the complete component/target/capability/artifact tuple; and
 * ``test_benchmark_five_moves`` uses sequential native
-  execution, then participates in the I8/P5 native regression proving that
+  execution, then participates in the native regression proving that
   manager/compiler NRT work does not disturb execution or Stop hot paths.
 
 The old Python ``ExecuteRequest(robot_id, group_id, ...)``, ad-hoc
@@ -28,7 +28,7 @@ import sys
 
 _DIRECT_ENTRYPOINT_UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: the addressed native benchmark "
-    "requires the build-qualified N7 process fixture; run its RoboPlan process "
+    "requires the build-qualified process fixture; run its RoboPlan process "
     "test in Docker."
 )
 
@@ -58,7 +58,6 @@ class _Transport:
         return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
 
     acknowledge_completed = reset
-    set_runtime_scale = reset
 
     def stop(self, body):
         operation_id = body["operations"][0]["operation_id"]

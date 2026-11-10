@@ -738,7 +738,7 @@ def test_open_identities_use_the_existing_256_byte_utf8_budget(
         load_isaac_pose_observer_site_config(path)
 
 
-def test_q94_identity_budget_does_not_narrow_unrelated_authored_text(
+def test_identity_budget_does_not_narrow_unrelated_authored_text(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "site.json"

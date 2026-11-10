@@ -21,6 +21,14 @@ public:
   using std::invalid_argument::invalid_argument;
 };
 
+/// Exact retained desired configuration and legal binding route. Returned
+/// references borrow from `bundle`; no runtime admission is implied.
+[[nodiscard]] std::pair<const core::DesiredControlConfigurationDTO&,
+                        const core::ControlRouteId&>
+qualified_desired_control_route(const core::RetainedBundleDTO& bundle,
+                                const core::ControlDomainDTO& domain,
+                                const core::ControlBindingDTO& binding);
+
 /// Sealed runtime resolution of one Program target/capability.
 ///
 /// Construction proves that the exact Program Binding, retained bundle,
@@ -54,14 +62,22 @@ public:
   [[nodiscard]] const core::GraphRevision &graph_revision() const noexcept {
     return graph_revision_;
   }
-  [[nodiscard]] const core::ProgramComponentRoleBindingDTO &
-  component_role() const noexcept {
-    return component_role_;
+  [[nodiscard]] const core::ProgramComponentBindingDTO &
+  component_binding() const noexcept {
+    return component_binding_;
   }
-  [[nodiscard]] const core::ProgramTargetRoleBindingDTO &
-  target_role() const noexcept {
-    return target_role_;
+  [[nodiscard]] const core::ProgramTargetBindingDTO &
+  target_binding() const noexcept {
+    return target_binding_;
   }
+  [[nodiscard]] const std::vector<core::ProgramFrameBindingDTO> &
+  frame_bindings() const noexcept { return frame_bindings_; }
+  [[nodiscard]] const std::vector<core::ProgramFrameBindingDTO> &
+  program_frame_bindings() const noexcept { return program_frame_bindings_; }
+  [[nodiscard]] const std::vector<core::ProgramCollisionBodyBindingDTO> &
+  collision_body_bindings() const noexcept { return collision_body_bindings_; }
+  [[nodiscard]] const std::vector<core::ProgramCollisionBodyBindingDTO> &
+  program_collision_body_bindings() const noexcept { return program_collision_body_bindings_; }
   [[nodiscard]] const core::ProgramCapabilityBindingDTO &
   capability() const noexcept {
     return capability_;
@@ -109,8 +125,12 @@ private:
       core::ProgramBindingId program_binding_id,
       core::RetainedBundleId retained_bundle_id,
       core::GraphRevision graph_revision,
-      core::ProgramComponentRoleBindingDTO component_role,
-      core::ProgramTargetRoleBindingDTO target_role,
+      core::ProgramComponentBindingDTO component_binding,
+      core::ProgramTargetBindingDTO target_binding,
+      std::vector<core::ProgramFrameBindingDTO> frame_bindings,
+      std::vector<core::ProgramFrameBindingDTO> program_frame_bindings,
+      std::vector<core::ProgramCollisionBodyBindingDTO> collision_body_bindings,
+      std::vector<core::ProgramCollisionBodyBindingDTO> program_collision_body_bindings,
       core::ProgramCapabilityBindingDTO capability,
       core::ControllableComponentDTO component,
       CompositionTargetResolution model_target,
@@ -128,8 +148,12 @@ private:
         program_binding_id_(std::move(program_binding_id)),
         retained_bundle_id_(std::move(retained_bundle_id)),
         graph_revision_(std::move(graph_revision)),
-        component_role_(std::move(component_role)),
-        target_role_(std::move(target_role)),
+        component_binding_(std::move(component_binding)),
+        target_binding_(std::move(target_binding)),
+        frame_bindings_(std::move(frame_bindings)),
+        program_frame_bindings_(std::move(program_frame_bindings)),
+        collision_body_bindings_(std::move(collision_body_bindings)),
+        program_collision_body_bindings_(std::move(program_collision_body_bindings)),
         capability_(std::move(capability)), component_(std::move(component)),
         model_target_(std::move(model_target)),
         control_binding_(std::move(control_binding)),
@@ -146,8 +170,12 @@ private:
   core::ProgramBindingId program_binding_id_;
   core::RetainedBundleId retained_bundle_id_;
   core::GraphRevision graph_revision_;
-  core::ProgramComponentRoleBindingDTO component_role_;
-  core::ProgramTargetRoleBindingDTO target_role_;
+  core::ProgramComponentBindingDTO component_binding_;
+  core::ProgramTargetBindingDTO target_binding_;
+  std::vector<core::ProgramFrameBindingDTO> frame_bindings_;
+  std::vector<core::ProgramFrameBindingDTO> program_frame_bindings_;
+  std::vector<core::ProgramCollisionBodyBindingDTO> collision_body_bindings_;
+  std::vector<core::ProgramCollisionBodyBindingDTO> program_collision_body_bindings_;
   core::ProgramCapabilityBindingDTO capability_;
   core::ControllableComponentDTO component_;
   CompositionTargetResolution model_target_;
@@ -162,7 +190,7 @@ private:
   std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings_;
 
   friend RuntimeProgramTargetBinding resolve_runtime_program_target(
-      const ProgramBinding &, const core::TargetRoleId &,
+      const ProgramBinding &, const core::ProgramTargetReferenceDTO &,
       const core::CapabilityId &, const RetainedBundle &,
       const VerifiedRetainedModelMap &);
 };
@@ -192,13 +220,14 @@ struct ActiveRuntimeParticipantFactsDTO final {
 /// scene access, or hardware I/O.
 [[nodiscard]] RuntimeProgramTargetBinding resolve_runtime_program_target(
     const ProgramBinding &program_binding,
-    const core::TargetRoleId &target_role_id,
+    const core::ProgramTargetReferenceDTO &target,
     const core::CapabilityId &capability_id,
     const RetainedBundle &retained_bundle,
     const VerifiedRetainedModelMap &retained_model_map);
 
 /// Combine one sealed retained target with current owner-issued runtime facts.
-/// I6 admits the retained desired route; generic route switching starts at I7.
+/// Only the retained desired route is admitted; generic route switching is not
+/// available yet.
 /// The Kernel independently verifies and seals the returned owner-to-owner DTO.
 [[nodiscard]] core::RuntimeParticipantBindingDTO
 build_runtime_participant_binding_dto(

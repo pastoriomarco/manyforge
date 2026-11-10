@@ -12,7 +12,7 @@ using TimePoint = int64_t;
 using Duration = int64_t;
 
 /// Abstract clock interface for injectable time.
-/// ADR-0004: all time-dependent logic uses IClock, not wall time.
+/// All time-dependent logic uses IClock, not wall time.
 /// Production: backed by steady_clock or ROS time.
 /// Tests: use FakeClock for deterministic behavior.
 class IClock {

@@ -47,7 +47,7 @@ void nodes(const CanonicalValue &node, const Visitor &visit) {
       for (const auto &[path, unused] : sources->as_object()) {
         (void)unused;
         for (const std::string_view literal :
-             {"interrupt_condition", "target_role", "activation_mode",
+             {"interrupt_condition", "target", "activation_mode",
               "stop_mode", "priority", "stop_entry_stage_id",
               "success_through_stage_id", "fallback_outcome"})
           if (path == literal || path.starts_with(std::string(literal) + ".") ||
@@ -64,10 +64,15 @@ const core::ControlBindingDTO &node_binding(const CanonicalValue &node,
                                             const ProgramBinding &binding,
                                             const RetainedBundle &bundle) {
   const auto &parameters = member(node, "parameters");
-  const auto &role = member(parameters, "target_role").as_string();
-  const core::ProgramTargetRoleBindingDTO *target = nullptr;
-  for (const auto &row : binding.value().target_role_bindings)
-    if (row.target_role_id.value() == role) {
+  const auto &reference = member(parameters, "target");
+  if (!reference.is_object() || reference.as_object().size() != 2U)
+    throw Invalid("io_rule_stop_target_unbound");
+  const core::ProgramTargetReferenceDTO requested{
+      core::ControllableComponentId(member(reference, "component_id").as_string()),
+      core::CommandTargetId(member(reference, "command_target_id").as_string())};
+  const core::ProgramTargetBindingDTO *target = nullptr;
+  for (const auto &row : binding.value().target_bindings)
+    if (row.target == requested) {
       if (target)
         throw Invalid("io_rule_stop_target_ambiguous");
       target = &row;
@@ -93,8 +98,8 @@ const core::ControlBindingDTO &node_binding(const CanonicalValue &node,
                    selected->control_binding_revision;
       });
   if (found == graph.control_bindings.end() ||
-      found->controllable_component_id != target->controllable_component_id ||
-      found->command_target_id != target->command_target_id)
+      found->controllable_component_id != target->target.component_id ||
+      found->command_target_id != target->target.command_target_id)
     throw Invalid("io_rule_stop_target_unbound");
   return *found;
 }

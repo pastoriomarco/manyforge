@@ -1,9 +1,9 @@
-// Activate and execute (decision AUD-7: the Deployment decides; every active
+// Activate and execute (the Deployment decides; every active
 // component must be enabled). Pure reads of the backend's RunReadiness and
 // component states; the backend runs every action.
 import type { ComponentState, RunBlockedReason, RunReadiness } from '../types/components';
 import { OWNER_NOT_PREPARED } from '../types/components';
-import { actionResultText, codedErrorText, ownerIds } from './componentPresentation';
+import { actionResultText, codedErrorText, needsRecovery, ownerIds } from './componentPresentation';
 
 /** Blocked reasons that Activate (Prepare all, then Enable all) clears. */
 const ACTIVATION_CODES = new Set(['component_not_enabled', 'component_not_prepared', OWNER_NOT_PREPARED]);
@@ -11,14 +11,27 @@ const ACTIVATION_CODES = new Set(['component_not_enabled', 'component_not_prepar
 /**
  * Whether Activate clears a blocked reason: a component not enabled or not
  * prepared, or an offline one, which Prepare all prepares
- * (an owner before its members, §2, §16; e.g. after an execution host restart).
+ * (an owner before its members; e.g. after an execution host restart).
  * A latched cell keeps its `cell_latched` reason, so Activate isn't offered.
  */
 export function activationClears(reason: RunBlockedReason, states: readonly ComponentState[]): boolean {
   if (ACTIVATION_CODES.has(reason.code)) return true;
   if (reason.code !== 'component_unhealthy') return false;
   const state = states.find((candidate) => candidate.component_id === reason.component_id);
-  return state?.lifecycle === 'offline';
+  if (state === undefined) return false;
+  // A fault or e-stop that Recover and enable may clear (the dialog shows the causes;
+  // one it can't recover keeps the button disabled), on the component or on a machine
+  // whose members need it.
+  return state.lifecycle === 'offline' || needsRecovery(state, states)
+    || recoveryTargets(states).some((id) => states.find((member) => member.component_id === id)
+      ?.owner_id === state.component_id);
+}
+
+/** Components Execute has to recover and enable: not enabled, not a machine, and their own or their machine's fault or e-stop. */
+export function recoveryTargets(states: readonly ComponentState[]): string[] {
+  const owners = ownerIds(states);
+  return states.filter((state) => state.lifecycle !== 'enabled' && !owners.has(state.component_id)
+    && needsRecovery(state, states)).map((state) => state.component_id);
 }
 
 /**

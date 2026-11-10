@@ -1,19 +1,19 @@
-"""Server-side Apply orchestration (CONTRACTS §11): the one path for Apply,
+"""Server-side Apply orchestration: the one path for Apply,
 Load, New and Close, used alike by the GUI, REST and MCP.
 
 For each ``replace``/``remove`` component: ``disable`` → Apply → (``replace``
 and ``add``) ``prepare``. Retained components are untouched. A component in
 ``fault`` or ``offline`` (faulted, or its process is gone) is not disabled:
 the host removes it by stopping its processes. Afterwards the affected
-components are ``prepared``, never enabled (V2-6). Machines (§16): owners are
+components are ``prepared``, never enabled. Machines: owners are
 prepared before their members, and members are disabled first. Each step is
 bounded by the component's lifecycle timeout; a ``prepare`` of an arriving
 component is bounded as the host bounds it, by the launch bound
 (:func:`launch_settle_bound_s`) plus its lifecycle timeout. One Apply at a time. Refused
 while a Program run's motion is executing or stopping; a finished run awaiting
-Reset, or a run with all its motion held, is reset first (R3, as M7); allowed
+Reset, or a run with all its motion held, is reset first; allowed
 during a cell latch. Every
-step is tried and each failure is reported on its row (AUD-8); the Apply then
+step is tried and each failure is reported on its row; the Apply then
 ends ``failed``: no retries, no rollback.
 """
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import logging
@@ -29,6 +30,7 @@ from typing import Any, Protocol, TypeVar
 
 from manyforge_headless_api.component_model import (
     DEFAULT_LIFECYCLE_TIMEOUT_S,
+    HOST_COMPONENT_STOP_GRACE_S,
     ActionResult,
     ComponentState,
     action_wait_s,
@@ -38,7 +40,7 @@ from manyforge_headless_api.component_model import (
 
 # The Runner cycle state in which no Program run is in progress.
 _IDLE_CYCLE_STATE = "idle_after_reset"
-# A finished run awaiting Reset: the Apply resets it itself (R3, as M7).
+# A finished run awaiting Reset: the Apply resets it itself.
 _FINISHED_CYCLE_STATE = "terminal_awaiting_reset"
 # A run whose motion is all held (``run_held``) is reset alike.
 _RUNNING_CYCLE_STATE = "running"
@@ -56,11 +58,22 @@ class ApplyRefused(Exception):
 class ApplyStepFailed(Exception):
     """A step failed after the Apply started; the Apply ends `failed`."""
 
-    def __init__(self, code: str, message: str, component_id: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        component_id: str | None = None,
+        *,
+        before_effect: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
         # The component the failure names, if any: reported on its row.
         self.component_id = component_id
+        # The owner stated that this failure made no configuration, runtime,
+        # component or Scene change (a Manager ``failed`` terminal whose
+        # failure has ``effect_boundary: before_effect``).
+        self.before_effect = before_effect
 
 
 @contextmanager
@@ -113,10 +126,6 @@ class ApplyPorts(Protocol):
         """Reset the finished or held run and return once the cycle is idle
         (raise :class:`ApplyStepFailed` otherwise)."""
 
-    def await_authoring(self) -> None:
-        """Return once the Kernel's authoring admission is open, as after a
-        Reset (raise :class:`ApplyStepFailed` past the Apply's bound)."""
-
     def preview(self) -> Preview: ...
 
     def components(self) -> list[ComponentState]: ...
@@ -153,18 +162,8 @@ def candidate_preview(response: dict[str, Any] | None) -> Preview:
             "executable": program.get("executable") is not False,
             "program_id": program.get("program_id"),
             "unresolved_references": [
-                {
-                    key: row.get(key)
-                    for key in (
-                        "component_role_id",
-                        "target_role_id",
-                        "controllable_component_id",
-                        "command_target_id",
-                        "reason",
-                        "detail",
-                    )
-                }
-                for row in outcome.get("unresolved_roles") or ()
+                deepcopy(row)
+                for row in outcome.get("unresolved_targets") or ()
                 if isinstance(row, dict)
             ],
             "affected_nodes": list(outcome.get("affected_nodes") or ()),
@@ -180,7 +179,7 @@ def candidate_preview(response: dict[str, Any] | None) -> Preview:
 
 
 def preview_view(preview: Preview, scope: dict[str, Any]) -> dict[str, Any]:
-    """CONTRACTS §11 `POST /api/deployment/preview` response.
+    """`POST /api/deployment/preview` response.
 
     ``scope`` is the activation input the Preview was computed from; the GUI
     sends it back with the Apply, which is refused when the input changed.
@@ -220,7 +219,7 @@ def lifecycle_timeouts(deployment: dict[str, Any] | None) -> dict[str, float]:
 
 
 def launch_settle_bound_s(ports: ApplyPorts, rows: tuple[ComponentImpact, ...]) -> float:
-    """The host's launch bound for this Apply (M7's bring-up bound,
+    """The host's launch bound for this Apply (the bring-up bound,
     `LaunchSettleBound`): the sum of the lifecycle timeouts of the components
     it adds, replaces or removes, one default when it changes none. A
     just-launched component's ``prepare`` first waits up to this for its
@@ -292,11 +291,11 @@ def run_apply(
 ) -> dict[str, Any]:
     """Run one orchestrated Apply and return its ApplyResult.
 
-    Every step is tried and each failure is reported on its component's row
-    (AUD-8): no rollback, no retry. A component that must leave but is still
+    Every step is tried and each failure is reported on its component's row:
+    no rollback, no retry. A component that must leave but is still
     ``enabled`` after the disable phase without a failed Disable in this Apply
     would be refused by the host, so the Apply isn't submitted; one whose
-    Disable failed is stopped by the host's Apply (N28, the failure stays on
+    Disable failed is stopped by the host's Apply (the failure stays on
     its row). Once installed, the Apply stays; every arriving
     component is prepared, owners before members, and a member whose owner's
     prepare failed is reported ``owner_not_prepared`` without being tried.
@@ -316,13 +315,11 @@ def run_apply(
 
     # The Preview prepares the candidate, which the authoring admission
     # allows only once the cycle is idle again: a finished or held run is
-    # Reset first. An idle cycle's admission reopens a moment after its Reset
-    # (an operator's Reset right before this Apply, R3): wait for it too.
+    # Reset first. A momentarily closed admission (it reopens a moment after
+    # a Reset) is waited for by the preparation itself (Headless).
     try:
         if require_no_run(ports):
             ports.reset_cycle()
-        else:
-            ports.await_authoring()
     except ApplyRefused:
         raise
     except Exception as failure:  # noqa: BLE001 - the Apply's result
@@ -368,8 +365,8 @@ def run_apply(
 
         def disable_failed(state: ComponentState) -> bool:
             # This Apply's Disable ended `failed`, nothing runs and it isn't
-            # moving: the host stops that component like a dead one (N28,
-            # host_detail::LeavingComponentRefusesApply).
+            # moving: the host stops that component like a dead one
+            # (host_detail::LeavingComponentRefusesApply).
             last = state.get("last_action") or {}
             return (
                 state["component_id"] in attempted

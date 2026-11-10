@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "blackboard": {
     "keys": [
       {
@@ -54,8 +54,8 @@
     ]
   },
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -74,21 +74,6 @@
       "pick-and-place"
     ]
   },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "tool": {
-      "required_component_type_tags": [
-        "gripper"
-      ]
-    }
-  },
   "contact_policies": [
     {
       "api_version": "manyforge.contact_policy.v1",
@@ -96,14 +81,16 @@
       "mode": "contact_grasp",
       "policy_id": "selected_object_grasp",
       "sensing_mode": "geometry_only",
-      "version": "sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c",
+      "version": "sha256:4dd457c3867359c71b3ff8a1885042786887a79dec93808446726efa1dabc5c1",
       "zones": [
         {
           "body_pairs": [
             {
               "body_a": {
-                "collision_body_role_id": "gripper_collision",
-                "component_role_id": "tool",
+                "body": {
+                  "collision_body_id": "gripper_collision",
+                  "component_id": "lite_gripper"
+                },
                 "kind": "component_model_body"
               },
               "body_b": {
@@ -154,7 +141,10 @@
               "kind": "linear_m",
               "value_m": 0.0081
             },
-            "target_role": "gripper"
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "lite_gripper"
+            }
           }
         },
         {
@@ -162,7 +152,10 @@
           "instance_id": "move_to_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -191,7 +184,10 @@
               }
             ],
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -208,8 +204,14 @@
           "instance_id": "plan_foundationpose_trocar_pick",
           "node_id": "planning.plan_pick_sequence",
           "parameters": {
-            "base_frame_role": "base",
-            "carrier_frame_role": "tcp",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
+            "carrier_frame_ref": {
+              "component_id": "lite_gripper",
+              "frame_id": "tcp"
+            },
             "contact_policy_id": "selected_object_grasp",
             "motion_options": {
               "approach_velocity_scale": 0.35,
@@ -244,9 +246,11 @@
                 ]
               },
               "approach_offset_reference": {
-                "frame_role_id": "tcp",
-                "target_role": "gripper",
-                "type": "frame_role"
+                "frame": {
+                  "component_id": "lite_gripper",
+                  "frame_id": "tcp"
+                },
+                "type": "component_frame"
               },
               "force_vertical_pick": true,
               "min_tcp_z_m": 0.016,
@@ -273,15 +277,20 @@
                 ]
               },
               "pick_offset_reference": {
-                "frame_role_id": "tcp",
-                "target_role": "gripper",
-                "type": "frame_role"
+                "frame": {
+                  "component_id": "lite_gripper",
+                  "frame_id": "tcp"
+                },
+                "type": "component_frame"
               },
               "rotation_step_deg": 15.0,
               "search_strategy": "first_feasible",
               "translation_step_m": 0.01
             },
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -294,7 +303,10 @@
               "kind": "linear_m",
               "value_m": 0.0
             },
-            "tool_target_role": "gripper"
+            "tool_target": {
+              "command_target_id": "gripper",
+              "component_id": "lite_gripper"
+            }
           }
         },
         {
@@ -302,10 +314,16 @@
           "instance_id": "move_to_planned_pick_approach",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -327,10 +345,16 @@
           "instance_id": "move_to_planned_pick",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -368,7 +392,10 @@
                   "kind": "linear_m",
                   "value_m": 0.0
                 },
-                "target_role": "gripper"
+                "target": {
+                  "command_target_id": "gripper",
+                  "component_id": "lite_gripper"
+                }
               }
             },
             {
@@ -376,10 +403,19 @@
               "instance_id": "attach_graspable",
               "node_id": "scene.attach_carried_object",
               "parameters": {
-                "carrier_frame_role": "tcp",
-                "target_role": "gripper",
-                "touch_body_roles": [
-                  "gripper_collision"
+                "carrier_frame_ref": {
+                  "component_id": "lite_gripper",
+                  "frame_id": "tcp"
+                },
+                "target": {
+                  "command_target_id": "gripper",
+                  "component_id": "lite_gripper"
+                },
+                "touch_bodies": [
+                  {
+                    "collision_body_id": "gripper_collision",
+                    "component_id": "lite_gripper"
+                  }
                 ]
               },
               "value_sources": {
@@ -408,10 +444,16 @@
           "instance_id": "retreat_after_pick",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -433,13 +475,18 @@
           "instance_id": "move_to_drop_approach",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "isaac_lite6_trocar_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -455,7 +502,10 @@
               ]
             },
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -472,13 +522,18 @@
           "instance_id": "move_to_drop",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "isaac_lite6_trocar_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -494,7 +549,10 @@
               ]
             },
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -515,7 +573,10 @@
               "kind": "linear_m",
               "value_m": 0.0081
             },
-            "target_role": "gripper"
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "lite_gripper"
+            }
           }
         },
         {
@@ -523,7 +584,10 @@
           "instance_id": "detach_graspable",
           "node_id": "scene.detach_carried_object",
           "parameters": {
-            "target_role": "gripper"
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "lite_gripper"
+            }
           },
           "value_sources": {
             "scene_resource_id": {
@@ -538,13 +602,18 @@
           "instance_id": "drop_retreat",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
-                "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "isaac_lite6_trocar_robot",
+                  "frame_id": "base"
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -560,7 +629,10 @@
               ]
             },
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -577,7 +649,10 @@
           "instance_id": "return_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "isaac_lite6_trocar_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -606,7 +681,10 @@
               }
             ],
             "planning_timeout_s": 10.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "isaac_lite6_trocar_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             }
@@ -673,10 +751,11 @@
       },
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
-          "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "isaac_lite6_trocar_robot",
+            "frame_id": "base"
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "rpy_deg": [
@@ -763,98 +842,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.cartesian_path",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.joint_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    },
-    "gripper": {
-      "component_role": "tool",
-      "required_capabilities": [
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.command",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.feedback",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "gripper_collision"
-      ],
-      "required_frame_roles": [
-        "tcp"
-      ],
-      "required_resource_roles": [
-        "fingers"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

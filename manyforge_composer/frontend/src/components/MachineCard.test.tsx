@@ -82,7 +82,7 @@ function card(document = draft()) {
   return { controller, element, onRemoved, onSelect };
 }
 
-describe('MachineCard (CONTRACTS §16)', () => {
+describe('MachineCard', () => {
   it('shows the owner with lane, address and machine actions, and its members inside', () => {
     const html = renderToStaticMarkup(card().element);
     // Header: name, model, the machine-wide state as a badge.
@@ -112,7 +112,7 @@ describe('MachineCard (CONTRACTS §16)', () => {
     expect(arm).not.toContain('Recover on lite6');
   });
 
-  it('shows the controller status details read-only on the owner card (AUD-2)', () => {
+  it('shows the controller status details read-only on the owner card', () => {
     const plain = renderToStaticMarkup(card().element);
     expect(plain).not.toContain('Controller status');
     states[0] = { ...owner, details: [{ name: 'Mode', value: '1' }, { name: 'Error code', value: 'C2' }] };
@@ -171,7 +171,7 @@ describe('MachineCard (CONTRACTS §16)', () => {
     } finally { await act(() => root.unmount()); }
   });
 
-  it('greys a deactivated member; every member may be deactivated and none removed (AUD-5b revised)', () => {
+  it('greys a deactivated member; every member may be deactivated and none removed', () => {
     const html = renderToStaticMarkup(card().element);
     expect(html).toMatch(/class="machine-member component-inactive" role="group" aria-label="lite6_robot_tool_io member"/);
     const tool = html.slice(html.indexOf('aria-label="lite6_robot_tool_io member"'));

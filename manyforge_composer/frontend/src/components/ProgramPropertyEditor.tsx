@@ -17,14 +17,14 @@ import type {
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
-  SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
-import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
+import type { ManualPreviewToNodeController } from '../hooks/useRobotControl';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
+  IO_INPUT_NODE_IDS,
   ioEmptyOmits,
-  ioSignalRoleChoices,
+  ioSignalChoices,
   ioTimeoutHint,
   ioUnsupportedChoices,
 } from '../utils/ioAuthoring';
@@ -32,11 +32,9 @@ import {
   globalRuleIds,
   interruptKeyInitialProblem,
   INTERRUPT_NODE_IDS,
+  candidateStopStages,
   nodeConditionChoices,
-  operandId,
-  stopStagesForTargetRole,
   successThroughStages,
-  type TargetStopChain,
 } from '../utils/interruptAuthoring';
 import { keyValueParameterRule } from '../utils/keyValueAuthoring';
 import {
@@ -65,11 +63,9 @@ import {
 import { valueSourceMenuModel } from '../utils/valueSourceMenu';
 import {
   buildMotionEndpointMutation,
-  hasUnrepresentedTcpOwner,
   motionEndpointKeyOfNode,
   programTcpSelectorChoices,
 } from '../utils/motionEndpointAuthoring';
-import { customTcpsOf } from '../utils/customTcps';
 import {
   hasSourcesWithin,
   setValueAtPath,
@@ -90,6 +86,9 @@ import {
   type ProgramSchemaValueEditorContext,
 } from './property/ProgramSchemaValueEditor';
 import {
+  ProgramManualFillPreviewProvider,
+} from './property/ProgramSpecializedEditors';
+import {
   SourceableValue,
   ValueSourceContext,
   valueSourceMenuEntries,
@@ -101,11 +100,20 @@ import { PneumaticRequiredInputsEditor } from './PneumaticRequiredInputsEditor';
 import { declaredPneumaticInputs } from '../utils/pneumaticGripperAuthoring';
 import { IO_LIVENESS_UNPROVEN_WARNING } from '../utils/ioSignalConfiguration';
 import { precisionContactStopWarnings } from '../utils/precisionContactStopWarnings';
-import { resolvedTargetRoles } from '../utils/targetRoleResolution';
+import type { ReferenceIssue, ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { StopStagePicker } from './StopStagePicker';
 import { GraspLostPolicyEditor } from './GraspLostPolicyEditor';
 import { TripPresetEditor } from './TripPresetEditor';
+import { manualPreviewToNode, type ManualFillNotice } from '../utils/manualPreviewToNode';
+import { manualFillPreviewValues as getManualFillPreviewValues } from '../utils/manualFillPreview';
+import { observedMoveToNodePreview } from '../utils/observedMoveToNode';
+import {
+  directControlTcpDisabledReason,
+  ROBOT_CONTROL_MODE_LABELS,
+  robotControlPreviewApprovable,
+  selectedTcpOf,
+} from '../state/robotControl';
 
 interface ProgramPropertyEditorProps {
   embedded?: boolean;
@@ -114,18 +122,12 @@ interface ProgramPropertyEditorProps {
   catalogEntries: CatalogEntry[];
   program: ProgramAuthoringDocument;
   appliedProgram?: AppliedProgramSelection | null;
-  sourceModel?: SourceModelProjection | null;
-  sourceModelUnavailableReason?: string | null;
+  manualPreviewController?: ManualPreviewToNodeController | null;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
-  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
   /** Outputs holding a core-held `changed outside` signal (`<component>/<signal>`). */
   changedOutsideOutputs?: ReadonlySet<string>;
   systemSignalsNeedApply?: boolean;
-  /** The scenario's Program role assignment: resolves target roles while the workspace has no binding. */
-  programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
-  /** Published motion targets' qualified Stop chains (SX-2167); absent = "available after Apply". */
-  stopChains?: TargetStopChain[];
   busy: boolean;
   onMutate: (
     mutation: string,
@@ -143,6 +145,8 @@ interface ProgramPropertyEditorProps {
   onUpdateNodePresentation?: (instanceId: string, collapsedByDefault: boolean) => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
+  referenceIssues?: ReferenceIssue[];
+  selectorFacts?: ReferenceSelectorFacts | null;
 }
 
 function isProgramMotionField(field: string): field is ProgramMotionField {
@@ -155,7 +159,25 @@ function isProgramMotionCeilingField(field: string): boolean {
   );
 }
 
-const NO_CHANGED_OUTSIDE: ReadonlySet<string> = new Set();
+type ManualFillSource = 'robot_pose' | 'move_preview';
+
+function jsonObject(value: JsonValue | undefined): Record<string, JsonValue> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function programTargetReferenceValid(value: JsonValue | undefined): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.component_id === 'string' && typeof value.command_target_id === 'string';
+}
+
+function ResetArrowIcon() {
+  return (
+    <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none">
+      <path d="M3.1 6.3A5.5 5.5 0 1 1 2.7 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M2.8 2.8v3.8h3.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 /**
  * One change to a node's parameters and value sources, at a value path:
@@ -281,15 +303,10 @@ export function ProgramPropertyEditor({
   catalogEntries,
   program,
   appliedProgram = null,
-  sourceModel = null,
-  sourceModelUnavailableReason = null,
+  manualPreviewController = null,
   deploymentWorkspace = null,
-  systemSignalChoices = [],
-  changedOutsideOutputs = NO_CHANGED_OUTSIDE,
   systemSignalsNeedApply = false,
-  programRoleAssignment = null,
   motionDescriptors = [],
-  stopChains = [],
   busy,
   onMutate,
   onCreateReference,
@@ -299,6 +316,8 @@ export function ProgramPropertyEditor({
   onUpdateNodePresentation,
   onInvalidEditChange,
   diagnostics = [],
+  referenceIssues = [],
+  selectorFacts = null,
 }: ProgramPropertyEditorProps) {
   const programParameters = program.parameters ?? [];
   const deploymentDocument = deploymentWorkspace?.draft?.document ?? null;
@@ -308,12 +327,7 @@ export function ProgramPropertyEditor({
     [deploymentDocument],
   );
   const blackboardKeys = useMemo(() => programBlackboardKeys(program, ruleIds), [program, ruleIds]);
-  const conditionChoices = useMemo(() => nodeConditionChoices(
-    program, deploymentWorkspace?.binding, ruleIds,
-    deploymentDocument as Record<string, JsonValue> | null, programRoleAssignment, systemSignalChoices,
-    changedOutsideOutputs,
-  ), [changedOutsideOutputs, deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment,
-    ruleIds, systemSignalChoices]);
+  const conditionChoices = useMemo(() => nodeConditionChoices(program, selectorFacts?.signals ?? null, ruleIds), [program, ruleIds, selectorFacts]);
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -336,6 +350,11 @@ export function ProgramPropertyEditor({
   }, []);
   const [discardEpoch, setDiscardEpoch] = useState(0);
   const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
+  const [hoveredManualFill, setHoveredManualFill] = useState<ManualFillSource | null>(null);
+  // A robot change waits for the operator's confirmation; what a copy changed stays shown.
+  const [robotChangePending, setRobotChangePending] = useState<string | null>(null);
+  const [fillNotices, setFillNotices] = useState<{ nodeId: string; notices: ManualFillNotice[] } | null>(null);
+  const [focusedManualFill, setFocusedManualFill] = useState<ManualFillSource | null>(null);
   const [sourceMenu, setSourceMenu] = useState<{
     path: string;
     schema: CatalogJsonSchema;
@@ -356,6 +375,103 @@ export function ProgramPropertyEditor({
     )?.node ?? null,
     [roots, selectedId],
   );
+  const manualPreviewCopy = useMemo(() => {
+    if (manualPreviewController === null || selected === null) {
+      return { ok: false as const, reason: 'Show a successful motion preview first.' };
+    }
+    const status = manualPreviewController.selectedStatus;
+    const binding = appliedProgram !== null
+      && appliedProgram.graphRevision === status?.graphRevision
+      && appliedProgram.retainedBundleId === status?.retainedBundleId
+      ? appliedProgram.programBinding : null;
+    return manualPreviewToNode(
+      manualPreviewController.state,
+      status,
+      selected,
+      binding,
+    );
+  }, [appliedProgram, manualPreviewController, selected]);
+  const manualPreviewCopyReason = (() => {
+    if (!manualPreviewCopy.ok) return manualPreviewCopy.reason;
+    if (busy) return 'Editing is unavailable.';
+    if (manualPreviewController === null) return 'Show a successful motion preview first.';
+    if (!manualPreviewController.manualControlAllowed) {
+      return manualPreviewController.manualControlUnavailableReason ?? 'Manual control is unavailable.';
+    }
+    const state = manualPreviewController.state;
+    const tcpBlocksCartesian = manualPreviewController.tcpApplying
+      && (state.mode === 'pose_goal' || state.mode === 'cartesian_path'
+        || (state.mode === 'move_to' && state.moveToKind === 'pose'));
+    if (tcpBlocksCartesian) return 'The selected TCP is still applying.';
+    if (manualPreviewController.authoringPending) return 'Finish the current manual control edit first.';
+    const tcpRequired = state.mode !== 'joint' && state.mode !== 'gripper'
+      && !(state.mode === 'move_to' && state.moveToKind === 'joint');
+    const motion = manualPreviewController.selectedStatus?.directControl ?? null;
+    const tcp = motion === null ? null : selectedTcpOf(motion);
+    if (tcpRequired && tcp === null) return 'Select a TCP for this motion preview.';
+    if (tcp !== null) {
+      const reason = directControlTcpDisabledReason(tcp);
+      if (reason !== null) return reason;
+    }
+    if (!robotControlPreviewApprovable(state) || state.poseDragging) {
+      return 'Show a successful motion preview first.';
+    }
+    return null;
+  })();
+  const observedOwnerStatus = manualPreviewController?.currentStatus ?? null;
+  const observedMovePreview = useMemo(() => observedMoveToNodePreview(
+    observedOwnerStatus,
+    appliedProgram,
+    selected,
+  ), [appliedProgram, observedOwnerStatus, selected]);
+  const observedMovePreviewReason = busy
+    ? 'Editing is unavailable.'
+    : observedMovePreview.ok ? null : observedMovePreview.reason;
+  const robotPoseActionUnavailable = busy
+    ? 'Editing is unavailable.'
+    : selected === null || !programTargetReferenceValid(selected.parameters.target)
+      ? 'Choose the target first.'
+      : null;
+  const activeManualFill = hoveredManualFill ?? focusedManualFill;
+  const summaryManualFill = activeManualFill ?? 'move_preview';
+  const manualFillPreviewFor = useCallback((source: ManualFillSource) => {
+    if (selected === null) return new Map<string, string>();
+    if (source === 'robot_pose') {
+      return observedMovePreview.ok && observedMovePreviewReason === null
+        ? getManualFillPreviewValues(selected, observedMovePreview.parameters, observedMovePreview.valueSources)
+        : new Map<string, string>();
+    }
+    if (!manualPreviewCopy.ok || manualPreviewCopyReason !== null) return new Map<string, string>();
+    return getManualFillPreviewValues(
+      selected,
+      jsonObject(manualPreviewCopy.args.parameters),
+      jsonObject(manualPreviewCopy.args.value_sources),
+    );
+  }, [manualPreviewCopy, manualPreviewCopyReason, observedMovePreview,
+    observedMovePreviewReason, selected]);
+  const manualFillPreviewValues = useMemo(() => activeManualFill === null
+    ? new Map<string, string>() : manualFillPreviewFor(activeManualFill),
+  [activeManualFill, manualFillPreviewFor]);
+  const summaryFillPreviewValues = useMemo(
+    () => manualFillPreviewFor(summaryManualFill),
+    [manualFillPreviewFor, summaryManualFill],
+  );
+  const activeFillPreviewReason = summaryManualFill === 'robot_pose'
+    ? observedMovePreviewReason : manualPreviewCopyReason;
+  const activeFillPreviewSummary = (() => {
+    if (activeFillPreviewReason !== null) return activeFillPreviewReason;
+    const count = summaryFillPreviewValues.size;
+    const fieldCount = `${count} field${count === 1 ? '' : 's'} ${count === 1 ? 'changes' : 'change'}`;
+    if (summaryManualFill === 'robot_pose' && observedMovePreview.ok) {
+      return `Robot ${observedMovePreview.kind === 'joint' ? 'joints' : 'pose'} preview · ${observedMovePreview.referenceSummary} · ${fieldCount}`;
+    }
+    const state = manualPreviewController?.state;
+    const mode = state ? ROBOT_CONTROL_MODE_LABELS[state.mode] : 'Motion';
+    const reference = state?.mode === 'move_to'
+      ? state.moveToDraft?.source.id ?? (state.moveToKind === 'pose' ? 'pose target' : 'joint target')
+      : state?.mode === 'joint' ? 'current joint positions' : 'current TCP pose';
+    return `${mode} preview · ${reference} · ${fieldCount}`;
+  })();
   const inheritedGroups = useMemo(
     () => inheritedProgramExecutionGroups(roots, selectedId),
     [roots, selectedId],
@@ -367,70 +483,46 @@ export function ProgramPropertyEditor({
     programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
   ), [diagnostics, roots, selectedId]);
   // Warnings only: never part of the node's validity or Apply gating.
-  const workspaceBinding = deploymentWorkspace?.binding;
-  // The binding's target rows, or without one the Draft-resolved rows (targetRoleResolution).
-  const targetRoleRows = useMemo(() => (workspaceBinding == null
-    ? resolvedTargetRoles(program, programRoleAssignment)
-    : workspaceBinding.target_role_bindings), [workspaceBinding, program, programRoleAssignment]);
-  const draftTargetRoles = useMemo(() => (programRoleAssignment == null
-    ? targetRoleRows : resolvedTargetRoles(program, programRoleAssignment)),
-  [program, programRoleAssignment, targetRoleRows]);
   const stopWarnings = useMemo(() => (selected === null ? [] : precisionContactStopWarnings(
-    selected, deploymentDocument as Record<string, JsonValue> | null, targetRoleRows,
-  )), [deploymentDocument, targetRoleRows, selected]);
+    selected, deploymentDocument as Record<string, JsonValue> | null,
+  )), [deploymentDocument, selected]);
   // The bound robot's qualified Stop chain; null keeps "available after Apply".
-  const qualifiedStopStages = useMemo(() => (selected === null ? null : stopStagesForTargetRole(
-    stopChains, targetRoleRows, selected.parameters.target_role,
-  )), [targetRoleRows, selected, stopChains]);
+  const movingTargetValue = selected?.parameters.target;
+  const movingTarget = movingTargetValue !== null && typeof movingTargetValue === 'object'
+    && !Array.isArray(movingTargetValue) && typeof movingTargetValue.component_id === 'string'
+    && typeof movingTargetValue.command_target_id === 'string'
+    ? { component_id: movingTargetValue.component_id, command_target_id: movingTargetValue.command_target_id } : null;
+  const stopCapability = entry?.requiredCapabilities.find((requirement) =>
+    requirement.targetParameter === 'target' && requirement.capabilityId === 'execution.trajectory.execute')?.capabilityId ?? null;
+  const stopResolution = candidateStopStages(movingTarget, stopCapability, selectorFacts?.targets ?? null);
+  const qualifiedStopStages = stopResolution.stages;
   const selectedDeploymentSpeed = useMemo(() => {
     if (selected === null) return null;
-    const targetRole = selected.parameters.target_role;
-    if (typeof targetRole !== 'string') return null;
-    const target = targetRoleRows.find(
-      (row) => row.target_role_id === targetRole,
-    );
-    if (target === undefined) return null;
+    const target = selected.parameters.target;
+    if (target === null || typeof target !== 'object' || Array.isArray(target)
+      || typeof target.component_id !== 'string' || typeof target.command_target_id !== 'string') return null;
     const descriptor = motionDescriptors.find(
-      (candidate) => candidate.controllableComponentId === target.controllable_component_id
+      (candidate) => candidate.controllableComponentId === target.component_id
         && candidate.commandTargetId === target.command_target_id,
     );
     if (descriptor?.operationalLimit === null || descriptor?.operationalLimit === undefined) {
       return null;
     }
     return {
-      target: `${target.controllable_component_id}/${target.command_target_id}`,
+      target: `${target.component_id}/${target.command_target_id}`,
       maximum: descriptor.operationalLimit.maximumTcpLinearSpeedMps,
     };
-  }, [targetRoleRows, motionDescriptors, selected]);
+  }, [motionDescriptors, selected]);
   const sourceJointInventory = useMemo(() => selected === null
     ? null
-    : programSourceJointInventory(
-      program,
-      selected,
-      appliedProgram,
-      sourceModel,
-      sourceModelUnavailableReason
-        ?? 'The active source-model projection is unavailable.',
-    ), [
-      appliedProgram,
-      program,
-      selected,
-      sourceModel,
-      sourceModelUnavailableReason,
-    ]);
-  const selectedMotionDescriptor = useMemo(() => {
-    const role = selected?.parameters.target_role;
-    const target = draftTargetRoles.find((row) => row.target_role_id === role);
-    return target === undefined ? undefined : motionDescriptors.find((candidate) => (
-      candidate.controllableComponentId === target.controllable_component_id
-      && candidate.commandTargetId === target.command_target_id
-    ));
-  }, [draftTargetRoles, motionDescriptors, selected]);
-  const motionEndpointChoices = useMemo(() => programTcpSelectorChoices(
-    program, draftTargetRoles, selectedMotionDescriptor, showOtherRobotTcps,
-    (componentId) => customTcpsOf(deploymentDocument as Record<string, JsonValue> | null, componentId)
-      .map((tcp) => tcp.tcpId),
-  ), [deploymentDocument, draftTargetRoles, program, selectedMotionDescriptor, showOtherRobotTcps]);
+    : programSourceJointInventory(selected, selectorFacts?.targets ?? null, 'The qualified Draft candidate is unavailable.'), [selected, selectorFacts]);
+  const manualMotion = manualPreviewController?.selectedStatus?.directControl ?? null;
+  const activeTcpNow = manualMotion !== null && movingTarget !== null
+    && manualMotion.controllableComponentId === movingTarget.component_id
+    && manualMotion.commandTargetId === movingTarget.command_target_id
+    ? manualMotion.activeTcp?.display ?? null : null;
+  const motionEndpointChoices = programTcpSelectorChoices(
+    movingTarget, selectorFacts?.targets ?? null, showOtherRobotTcps, activeTcpNow);
   useEffect(() => {
     setErrors({});
     setShowOtherRobotTcps(false);
@@ -476,33 +568,8 @@ export function ProgramPropertyEditor({
     ? motionBindings?.[parameterId] ?? null
     : null;
 
-  // These keys are portable declarations for roles selected by a motion or
-  // planner, or requiring trajectory execution. Keep them local to Set TCP's
-  // key menu; scalar expressions and conditions must not gain tcp_entry.
+  // Candidate-qualified ActiveTCP keys are supplied when the Draft result is available.
   const tcpSourceKeys = [...blackboardKeys];
-  const tcpRoles = new Set<string>();
-  for (const [role, value] of Object.entries(program.target_roles)) {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
-    const capabilities = value.required_capabilities;
-    if (Array.isArray(capabilities) && capabilities.some((item) => (
-      item !== null && typeof item === 'object' && !Array.isArray(item)
-      && item.capability_id === 'execution.trajectory.execute'
-    ))) tcpRoles.add(role);
-  }
-  for (const { node } of flattenProgramForest(roots)) {
-    if ((node.node_id === 'motion.move_to_joint_target' || node.node_id === 'motion.move_to_pose'
-        || node.node_id === 'motion.move_until_signal' || node.node_id === 'motion.follow_cartesian_path'
-        || node.node_id === 'motion.probe_search' || node.node_id === 'planning.plan_pick_sequence'
-        || node.node_id === 'planning.plan_place_sequence')
-        && typeof node.parameters.target_role === 'string'
-        && node.parameters.target_role in program.target_roles) tcpRoles.add(node.parameters.target_role);
-  }
-  for (const role of tcpRoles) {
-    const key = `active_tcp.${role}`;
-    if (!tcpSourceKeys.some((row) => row.key === key)) {
-      tcpSourceKeys.push({ key, type: 'tcp_entry', access: 'read', persistence: 'run' });
-    }
-  }
   const valueSourceModel = (path: string, schema: CatalogJsonSchema) => valueSourceMenuModel({
     entry,
     path,
@@ -819,17 +886,63 @@ export function ProgramPropertyEditor({
             : { ...parameter.schema, enum: [...rule.choices] };
           const backendDiagnostic = selectedDiagnostics.find((diagnostic) =>
             diagnosticTargetsParameter(diagnostic.path, parameter.id));
-          const signalChoices = parameter.id === 'resource_role'
-            ? ioSignalRoleChoices(
-              selected.node_id,
-              selected.parameters.target_role,
-              deploymentWorkspace?.binding,
-              { program, roleAssignment: programRoleAssignment,
-                deploymentDocument: deploymentDocument as Record<string, JsonValue> | null },
-              systemSignalChoices,
-              changedOutsideOutputs,
-            )
-            : null;
+          const parameterReferenceIssues = referenceIssues.filter((issue) => (
+            issue.location.node_instance_id === selected.instance_id && issue.location.parameter === parameter.id
+          ));
+          const requiredCapabilities = entry.requiredCapabilities.filter((requirement) =>
+            requirement.scope === 'target_binding' && requirement.targetParameter === parameter.id
+            && (requirement.whenParameter === undefined
+              || (selected.parameters[requirement.whenParameter]
+                ?? entry.parameters.find((item) => item.id === requirement.whenParameter)?.default) === requirement.whenEquals));
+          const selectedTarget = selected.parameters.target;
+          const isMovingTarget = (candidate: {component_id: string; command_target_id: string}) => (
+            selectedTarget !== null && typeof selectedTarget === 'object' && !Array.isArray(selectedTarget)
+            && candidate.component_id === selectedTarget.component_id
+            && candidate.command_target_id === selectedTarget.command_target_id
+          );
+          const targetChoices = (selectorFacts?.targets ?? []).map((row) => {
+            const unavailable = requiredCapabilities.map((requirement) => {
+              const capability = row.capabilities.find((item) => item.capability_id === requirement.capabilityId);
+              return capability?.available ? null : capability?.reason ?? `Missing ${requirement.capabilityId}`;
+            }).find((reason) => reason !== null);
+            return { value: { ...row.target }, label: `${row.target.component_id} · ${row.target.command_target_id}`,
+              ...(unavailable ? { reason: unavailable } : {}) };
+          });
+          const frameFacts = selectorFacts?.frames ?? [];
+          const bodyFacts = selectorFacts?.bodies ?? [];
+          const ioChoices = ioSignalChoices(selected.node_id, selectorFacts?.signals ?? null);
+          const frameNeedsTarget = parameter.id === 'base_frame';
+          // A carried object's touch bodies: those moving with the selected target (its own and its mounted tools').
+          const bodyNeedsTarget = parameter.id === 'touch_bodies' && movingTarget !== null;
+          const movingFrames = frameFacts.filter((row) => !row.ambiguous && row.moving_targets.some(isMovingTarget)).map((row) => row.reference);
+          const directReferenceChoices = {
+            target_reference: targetChoices,
+            frame_reference: frameFacts.map((row) => ({ value: { ...row.reference },
+              label: `${row.reference.component_id} · ${row.reference.frame_id}`,
+              ...(row.ambiguous ? { reason: 'Ambiguous frame identity' }
+                : frameNeedsTarget && !row.moving_targets.some(isMovingTarget) ? { reason: 'Frame is not qualified for the selected target' } : {}) })),
+            collision_body_reference: bodyFacts.filter((row) => !bodyNeedsTarget || row.moving_targets.some(isMovingTarget))
+              .map((row) => ({ value: { ...row.reference },
+              label: `${row.reference.component_id} · ${row.reference.collision_body_id}`,
+              ...(row.ambiguous ? { reason: 'Ambiguous collision body identity' } : {}) })),
+            signal_reference: (selectorFacts?.signals ?? []).map((row) => {
+              const input = ['io.get_input', 'io.check_input', 'io.wait_for_input'].includes(selected.node_id);
+              const ioChoice = ioChoices?.find((choice) => choice.value.component_id === row.reference.component_id
+                && choice.value.signal_name === row.reference.signal_name);
+              const signalTarget = row.target && selectorFacts?.targets.find((candidate) => (
+                candidate.target.component_id === row.target?.component_id
+                && candidate.target.command_target_id === row.target?.command_target_id
+              ));
+              const capabilityIssue = (input && row.provider_profile === 'system_carried_object' ? [] : requiredCapabilities).map((requirement) => {
+                const capability = signalTarget?.capabilities.find((item) => item.capability_id === requirement.capabilityId);
+                return capability?.available ? null : capability?.reason ?? `Missing ${requirement.capabilityId}`;
+              }).find((issue) => issue !== null);
+              const reason = row.ambiguous ? 'Ambiguous signal identity'
+                : ioChoice?.reason ?? capabilityIssue ?? undefined;
+              return { value: { ...row.reference }, label: `${row.reference.component_id} · ${row.reference.signal_name}`,
+                ...(reason ? { reason } : {}) };
+            }),
+          };
           const unsupportedChoices = ioUnsupportedChoices(
             selected.node_id,
             parameter.id,
@@ -841,7 +954,7 @@ export function ProgramPropertyEditor({
             && (parameter.id === 'interrupt_condition' || parameter.id === 'stop_entry_stage_id'
               || parameter.id === 'success_through_stage_id')
             ? parameter.id : null;
-          // Catalog schema type `mock_signal_simulation` (contract 133): literal rows only.
+          // Catalog schema type `mock_signal_simulation`: literal rows only.
           const mockField = MOCK_SIMULATION_NODE_IDS.has(selected.node_id)
             && parameter.id === MOCK_SIMULATION_PARAMETER && !repairMode;
           const requiredInputsField = selected.node_id === 'gripper.command_position'
@@ -852,15 +965,37 @@ export function ProgramPropertyEditor({
             ))).size === literal.length);
           const graspLostPolicyField = selected.node_id === 'scene.attach_carried_object'
             && parameter.id === 'on_grasp_lost' && source === undefined && !repairMode;
+          const parameterLabel = hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint'
+            ? 'Motion TCP endpoint'
+            : parameter.id === 'max_tcp_linear_speed_mps'
+            ? 'TCP speed ceiling (m/s)'
+            : parameter.id === 'clearance_m'
+            ? 'Collision clearance (m)'
+            : parameter.id === 'wait_for_duration'
+            ? 'Wait for command duration'
+            : parameter.id;
+          const parameterPreviewValue = manualFillPreviewValues.get(parameter.id);
+          const resetLabel = isProgramMotionField(parameter.id)
+            && motionBindings?.[parameter.id] !== undefined
+            ? 'Use Program default' : 'Use catalog default / omit';
+          const showReset = !source && (!parameter.required || parameter.hasDefault);
           const valueEditorContext: ProgramSchemaValueEditorContext = {
             entry,
             node: selected,
             parameterId: parameter.id,
             program,
+            directReferenceChoices,
+            frameScope: {
+              program,
+              frames: frameFacts.filter((row) => !row.ambiguous && (!frameNeedsTarget || row.moving_targets.some(isMovingTarget))).map((row) => row.reference),
+              movingFrames,
+              unavailableFrames: frameFacts.filter((row) => row.ambiguous || (frameNeedsTarget && !row.moving_targets.some(isMovingTarget)))
+                .map((row) => ({ reference: row.reference, reason: row.ambiguous ? 'Ambiguous frame identity' : 'Frame is not qualified for the selected target' })),
+              bodies: bodyFacts.filter((row) => !row.ambiguous).map((row) => row.reference),
+            },
             globalRuleIds: ruleIds,
             sourceJointInventory,
             onCreateReference,
-            semanticChoices: signalChoices,
             unsupportedChoices,
             emptyOmits: emptyOmits
               ? { placeholder: 'Wait forever', onOmit: () => removeLiteral(parameter) }
@@ -870,24 +1005,41 @@ export function ProgramPropertyEditor({
             ? selected.parameters[id] as string : undefined);
           return (
             <div
-              className={`program-property${backendDiagnostic ? ' backend-invalid' : ''}`}
+              className={`program-property${backendDiagnostic || parameterReferenceIssues.length ? ' backend-invalid' : ''}${parameterPreviewValue === undefined ? '' : ' program-manual-fill-changed'}`}
               title={backendDiagnostic?.message}
               key={`${parameter.id}:${discardEpoch}`}
             >
               <div className="program-property-heading">
-                <label htmlFor={`property-${selected.instance_id}-${parameter.id}`}>
-                  {hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint'
-                    ? 'Motion TCP endpoint'
-                    : parameter.id === 'max_tcp_linear_speed_mps'
-                    ? 'TCP speed ceiling (m/s)'
-                    : parameter.id === 'clearance_m'
-                    ? 'Collision clearance (m)'
-                    : parameter.id === 'wait_for_duration'
-                    ? 'Wait for command duration'
-                    : parameter.id}
+                <label
+                  htmlFor={`property-${selected.instance_id}-${parameter.id}`}
+                  className={parameterPreviewValue === undefined ? '' : 'program-manual-fill-changed'}
+                >
+                  {parameterLabel}
+                  {parameterPreviewValue !== undefined && (
+                    <span className="program-manual-fill-new-value" aria-hidden="true">
+                      {' '}→ {parameterPreviewValue}
+                    </span>
+                  )}
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
+                {showReset && (
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={resetLabel}
+                    title={resetLabel}
+                    disabled={busy || rule.locked !== undefined || selected.parameters[parameter.id] === undefined}
+                    onClick={() => removeLiteral(parameter)}
+                  >
+                    <ResetArrowIcon />
+                  </button>
+                )}
               </div>
+              {parameterReferenceIssues.map((issue, index) => (
+                <p className="program-form-error inline-message severity-error" key={`${issue.code}:${issue.location.path}:${index}`}>
+                  {issue.code.replaceAll('_', ' ')}
+                </p>
+              ))}
               {parameter.id === 'max_tcp_linear_speed_mps' && (
                 <p className="muted">
                   {selectedDeploymentSpeed === null
@@ -918,21 +1070,12 @@ export function ProgramPropertyEditor({
               {rule.inapplicable !== undefined && (
                 <p className="program-form-hint">{rule.inapplicable} Omit it below.</p>
               )}
-              {signalChoices !== null && signalChoices.length === 0 && (
-                <p className="program-form-hint">
-                  The current binding has no {selected.node_id === 'io.set_output' ? 'output' : 'input'} signal for {String(selected.parameters.target_role)}.
-                </p>
+              {systemSignalsNeedApply && parameter.id === 'signal' && IO_INPUT_NODE_IDS.has(selected.node_id) && (
+                <p className="program-form-hint">Qualified Draft system signals are unavailable.</p>
               )}
-              {systemSignalsNeedApply && signalChoices !== null && selected.node_id !== 'io.set_output'
-                && parameter.id === 'resource_role' && (
-                <p className="program-form-hint">Apply to list system signals.</p>
-              )}
-              {signalChoices !== null && selected.node_id !== 'io.set_output'
+              {parameter.id === 'signal' && selected.node_id !== 'io.set_output'
                 && conditionChoices.some((choice) => choice.liveness === 'change_only'
-                  && operandId(choice.operand) === operandId({ signal: {
-                    target_role: selected.parameters.target_role ?? null,
-                    resource_role: selected.parameters.resource_role ?? null,
-                  } })) && (
+                  && JSON.stringify(choice.operand) === JSON.stringify({ signal: selected.parameters.signal ?? null })) && (
                 <p className="inline-message severity-warning" role="note">{IO_LIVENESS_UNPROVEN_WARNING}</p>
               )}
               {unsupportedChoices !== undefined && (
@@ -958,13 +1101,18 @@ export function ProgramPropertyEditor({
                   onCommit={(value) => commitLiteral(parameter, value)}
                 />
               ) : requiredInputsField ? (() => {
-                const target = draftTargetRoles.find((row) => row.target_role_id === selected.parameters.target_role);
+                const declaredKeys = movingTarget === null ? [] : declaredPneumaticInputs(
+                  deploymentDocument as Record<string, JsonValue> | null,
+                  movingTarget.component_id, movingTarget.command_target_id,
+                );
                 return <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   <PneumaticRequiredInputsEditor value={literal}
-                    declaredKeys={declaredPneumaticInputs(deploymentDocument as Record<string, JsonValue> | null,
-                      target?.controllable_component_id, target?.command_target_id)}
-                    disabled={busy || rule.locked !== undefined}
+                    declaredKeys={declaredKeys}
+                    disabled={busy || rule.locked !== undefined || declaredKeys.length === 0}
                     onCommit={(value) => commitLiteral(parameter, value)} />
+                  {declaredKeys.length === 0 && (
+                    <p className="program-form-hint">Pneumatic input choices require qualified Draft candidate routes.</p>
+                  )}
                 </div>;
               })() : mockField ? (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
@@ -976,9 +1124,7 @@ export function ProgramPropertyEditor({
                         <MockSimulationEditor
                           value={hasLiteral ? literal : undefined}
                           signals={signals}
-                          profiles={mockSignalProfiles(signals, deploymentWorkspace?.binding,
-                            deploymentDocument as Record<string, JsonValue> | null,
-                            program, programRoleAssignment)}
+                          profiles={mockSignalProfiles(signals, selectorFacts?.signals ?? null)}
                           disabled={busy || rule.locked !== undefined}
                           onCommit={(value) => commitLiteral(parameter, value)}
                           onClear={() => removeLiteral(parameter)}
@@ -994,7 +1140,7 @@ export function ProgramPropertyEditor({
               ) : interruptField === 'interrupt_condition' ? (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   {systemSignalsNeedApply && (
-                    <p className="program-form-hint">Apply to list system signals.</p>
+                    <p className="program-form-hint">Qualified Draft system signals are unavailable.</p>
                   )}
                   <InterruptConditionEditor
                     label="Interrupt condition"
@@ -1025,6 +1171,13 @@ export function ProgramPropertyEditor({
                     onChange={(next) => (next === undefined
                       ? removeLiteral(parameter) : commitLiteral(parameter, next))}
                   />
+                  {stopResolution.reason && <p className="program-form-hint">{stopResolution.reason}</p>}
+                  {stopResolution.routes.length > 1 || stopResolution.routes.some((route) => !route.available) ? <ul className="program-form-hint">
+                    {stopResolution.routes.map((route) => <li key={`${route.control_binding_id}:${route.control_binding_revision}:${route.control_route_id}`}>
+                      {route.control_binding_id} · {route.control_binding_revision} · {route.control_route_id}: {route.available ? 'Available' : route.reason?.message ?? 'Unavailable'}
+                      {route.reason && <> ({route.reason.code}){Object.entries(route.reason.details).map(([key, value]) => <span key={key}> · {key}: {value}</span>)}</>}
+                    </li>)}
+                  </ul> : null}
                   {interruptField === 'success_through_stage_id' && (
                     <p className="program-form-hint">
                       A trip contained up to this stage follows on_signal; containment at a later stage fails the node through its normal failure handling.
@@ -1091,7 +1244,7 @@ export function ProgramPropertyEditor({
                     return (
                       <>
                         {parameter.id === 'tcp_endpoint' && (
-                          <p className="program-form-hint">{`Moves: ${typeof selected.parameters.target_role === 'string' ? selected.parameters.target_role : '—'}`}</p>
+                          <p className="program-form-hint">{`Moves: ${movingTarget === null ? '—' : `${movingTarget.component_id} · ${movingTarget.command_target_id}`}`}</p>
                         )}
                         <select
                           value={currentKey}
@@ -1101,8 +1254,9 @@ export function ProgramPropertyEditor({
                             const choice = motionEndpointChoices.find(
                               (candidate) => candidate.key === event.currentTarget.value,
                             );
+                            if (!choice || choice.disabled) return;
                             const request = buildMotionEndpointMutation(
-                              selected, choice?.selector ?? null, parameter.id,
+                              selected, choice.selector, parameter.id,
                             );
                             void onMutate(request.mutation, request.args);
                           }}
@@ -1112,7 +1266,9 @@ export function ProgramPropertyEditor({
                             <option value={currentKey}>{currentLabel}</option>
                           )}
                           {motionEndpointChoices.map((choice) => (
-                            <option key={choice.key} value={choice.key}>{choice.label}</option>
+                            <option key={choice.key} value={choice.key} disabled={choice.disabled}>
+                              {choice.label}{choice.reason ? ` · ${choice.reason}` : ''}
+                            </option>
                           ))}
                         </select>
                         {selected.node_id === 'motion.set_tcp' && (
@@ -1125,14 +1281,11 @@ export function ProgramPropertyEditor({
                             onChange={(event) => setShowOtherRobotTcps(event.currentTarget.checked)} />
                           Show TCPs of tools mounted on other robots
                         </label>
-                        {selectedMotionDescriptor === undefined && (
-                          <p className="program-form-hint">Apply to list TCPs and current mounts.</p>
-                        )}
-                        {hasUnrepresentedTcpOwner(program, draftTargetRoles, selectedMotionDescriptor, showOtherRobotTcps) && (
-                          <p className="program-form-hint">Add this tool to the Program's roles to use its TCPs.</p>
+                        {selectorFacts === null && (
+                          <p className="program-form-hint">Validate the Deployment Draft to list qualified TCPs.</p>
                         )}
                         <p className="program-form-hint">
-                          Current uses the robot's Active TCP. A role default or an entry sets the Active TCP to that TCP.
+                          Current uses the robot's Active TCP. A target default or an entry sets the Active TCP to that TCP.
                         </p>
                       </>
                     );
@@ -1141,66 +1294,140 @@ export function ProgramPropertyEditor({
                 </div>
               ) : (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
-                  <ProgramSchemaValueEditor
-                    schema={schema}
-                    value={literal}
-                    disabled={busy || rule.locked !== undefined}
-                    context={valueEditorContext}
-                    path={parameter.id}
-                    onCommit={(value, moves) => commitLiteral(parameter, value, moves)}
-                    onInvalidChange={(message) => setFieldError(parameter.id, message)}
-                  />
+                  <ProgramManualFillPreviewProvider values={manualFillPreviewValues}>
+                    <ProgramSchemaValueEditor
+                      schema={schema}
+                      value={literal}
+                      disabled={busy || rule.locked !== undefined}
+                      context={valueEditorContext}
+                      path={parameter.id}
+                      onCommit={(value, moves) => commitLiteral(parameter, value, moves)}
+                      onInvalidChange={(message) => setFieldError(parameter.id, message)}
+                    />
+                  </ProgramManualFillPreviewProvider>
                 </div>
               )}
               {parameter.id === 'goal'
                 && (selected.node_id === 'motion.move_to_pose'
                   || selected.node_id === 'motion.move_to_joint_target') && (() => {
                 const pose = selected.node_id === 'motion.move_to_pose';
-                const targetRole = selected.parameters.target_role;
+                const target = selected.parameters.target;
+                const targetValid = target !== null && typeof target === 'object' && !Array.isArray(target)
+                  && typeof target.component_id === 'string' && typeof target.command_target_id === 'string';
                 const relative = pose && selected.parameters.target_mode === 'relative';
-                const unavailable = busy
-                  ? 'Editing is unavailable.'
-                  : typeof targetRole !== 'string'
-                    ? 'Choose the target role first.'
-                    : null;
+                const robotPoseLabel = pose ? 'Robot pose' : 'Robot joints';
+                const robotPoseMutation = observedMovePreview.ok
+                  ? observedMovePreview.mutation
+                  : { instance_id: selected.instance_id, observed_kind: pose ? 'tcp_pose' : 'joint' };
+                const robotPoseTitle = robotPoseActionUnavailable ?? (
+                  `Write the ${pose ? 'current TCP pose' : 'current joint positions'} of `
+                  + `${targetValid ? `${target.component_id}/${target.command_target_id}` : 'the selected target'} into this goal`
+                  + (pose ? '. Replaces the goal frame with this robot’s base frame' : '')
+                  + (pose && selected.parameters.tcp_endpoint !== undefined
+                    ? '. The pose is the selected TCP’s, which must be one of the robot’s Applied TCPs'
+                    : '')
+                  + (relative ? '. This switches the move to absolute.' : '.')
+                );
+                const movePreviewTitle = manualPreviewCopyReason
+                  ?? `Fill ${selected.instance_id} from the current manual motion preview.`;
                 return (
-                  <button
-                    type="button"
-                    className="text-button"
-                    disabled={unavailable !== null}
-                    title={unavailable ?? (
-                      `Write the ${pose ? 'current TCP pose' : 'current joint positions'} of `
-                      + `${String(targetRole)} into this goal`
-                      + (pose ? '. Replaces the goal frame with this robot’s base frame' : '')
-                      + (pose && selected.parameters.tcp_endpoint !== undefined
-                        ? '. The pose is the selected TCP’s, which must be one of the robot’s Applied TCPs'
-                        : '')
-                      + (relative ? '. This switches the move to absolute.' : '.')
+                  <div className="program-fill-from" data-testid="program-fill-from">
+                    <div className="program-fill-from-topline">
+                      <span className="program-fill-from-label">FILL FROM</span>
+                      <div className="program-fill-from-actions">
+                        <button
+                          type="button"
+                          className="program-fill-action-button"
+                          data-testid="fill-from-robot-pose"
+                          disabled={robotPoseActionUnavailable !== null}
+                          title={robotPoseTitle}
+                          onMouseEnter={() => setHoveredManualFill('robot_pose')}
+                          onMouseLeave={() => setHoveredManualFill((current) => current === 'robot_pose' ? null : current)}
+                          onFocus={() => setFocusedManualFill('robot_pose')}
+                          onBlur={() => setFocusedManualFill((current) => current === 'robot_pose' ? null : current)}
+                          onClick={() => {
+                            void onMutate('program_draft_store_observed_move', robotPoseMutation);
+                          }}
+                        >
+                          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="8" r="4.3" stroke="currentColor" strokeWidth="1.4" />
+                            <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                          </svg>
+                          {robotPoseLabel}
+                        </button>
+                        <button
+                          type="button"
+                          className="program-fill-action-button"
+                          data-testid="fill-from-move-preview"
+                          disabled={manualPreviewCopyReason !== null}
+                          title={movePreviewTitle}
+                          onMouseEnter={() => setHoveredManualFill('move_preview')}
+                          onMouseLeave={() => setHoveredManualFill((current) => current === 'move_preview' ? null : current)}
+                          onFocus={() => setFocusedManualFill('move_preview')}
+                          onBlur={() => setFocusedManualFill((current) => current === 'move_preview' ? null : current)}
+                          onClick={() => {
+                            if (!manualPreviewCopy.ok || manualPreviewCopyReason !== null) return;
+                            if (manualPreviewCopy.robotChange !== null) {
+                              setRobotChangePending(selected.instance_id);
+                              return;
+                            }
+                            setFillNotices({ nodeId: selected.instance_id, notices: manualPreviewCopy.notices });
+                            void onMutate('tree_draft_update_node_params', manualPreviewCopy.args);
+                          }}
+                        >
+                          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none">
+                            <path d="M2 11.8 5.5 8l2.2 1.8L12.9 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                            <circle cx="2" cy="11.8" r="1" fill="currentColor" />
+                            <circle cx="5.5" cy="8" r="1" fill="currentColor" />
+                            <circle cx="7.7" cy="9.8" r="1" fill="currentColor" />
+                            <circle cx="12.9" cy="4" r="1" fill="currentColor" />
+                          </svg>
+                          Move preview
+                        </button>
+                      </div>
+                    </div>
+                    <div className={`program-fill-from-preview${activeFillPreviewReason === null ? ' compatible' : ''}`}>
+                      {activeFillPreviewSummary}
+                    </div>
+                    {robotChangePending === selected.instance_id && manualPreviewCopy.ok
+                      && manualPreviewCopy.robotChange !== null && (
+                      <div className="program-fill-from-confirm" role="alertdialog" aria-label="Confirm robot change">
+                        <p>
+                          This node moves <strong>{manualPreviewCopy.robotChange.from}</strong>; the preview
+                          moves <strong>{manualPreviewCopy.robotChange.to}</strong>. Copy the move and switch the
+                          node to {manualPreviewCopy.robotChange.to}?
+                        </p>
+                        <div className="program-fill-from-confirm-actions">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRobotChangePending(null);
+                              if (!manualPreviewCopy.ok || manualPreviewCopyReason !== null) return;
+                              setFillNotices({ nodeId: selected.instance_id, notices: manualPreviewCopy.notices });
+                              void onMutate('tree_draft_update_node_params', manualPreviewCopy.args);
+                            }}
+                          >
+                            Switch robot and copy
+                          </button>
+                          <button type="button" onClick={() => setRobotChangePending(null)}>Cancel</button>
+                        </div>
+                      </div>
                     )}
-                    onClick={() => {
-                      void onMutate('program_draft_store_observed_move', {
-                        instance_id: selected.instance_id,
-                        observed_kind: pose ? 'tcp_pose' : 'joint',
-                      });
-                    }}
-                  >
-                    {pose ? 'Use current robot pose' : 'Use current joints'}
-                  </button>
+                    {(() => {
+                      const notices = fillNotices?.nodeId === selected.instance_id
+                        ? fillNotices.notices
+                        : manualPreviewCopy.ok && manualPreviewCopyReason === null ? manualPreviewCopy.notices : [];
+                      return notices.length > 0 && (
+                        <ul className="program-fill-from-notices" data-testid="fill-from-notices">
+                          {notices.map((notice) => (
+                            <li key={notice.text} className={notice.tone}>{notice.text}</li>
+                          ))}
+                        </ul>
+                      );
+                    })()}
+                  </div>
                 );
               })()}
-              {!source && (!parameter.required || parameter.hasDefault) && (
-                <button
-                  type="button"
-                  className="text-button"
-                  disabled={busy || rule.locked !== undefined || selected.parameters[parameter.id] === undefined}
-                  onClick={() => removeLiteral(parameter)}
-                >
-                  {isProgramMotionField(parameter.id)
-                    && motionBindings?.[parameter.id] !== undefined
-                    ? 'Use Program default'
-                    : 'Use catalog default / omit'}
-                </button>
-              )}
             </div>
           );
         })}

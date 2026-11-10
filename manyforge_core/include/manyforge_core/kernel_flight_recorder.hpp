@@ -34,8 +34,7 @@ struct FlightRecord {
 /// best-effort). Dumping is crash-context aware: it spins briefly for the
 /// ring lock and, failing that, emits a minimal `torn=true` marker without
 /// reading concurrently-written storage. The output stays line-valid without
-/// relying on undefined data-race behavior (observability plan OW3;
-/// spec 520 §4.2).
+/// relying on undefined data-race behavior.
 class KernelFlightRecorder {
  public:
   static constexpr std::size_t kCapacity = 512;

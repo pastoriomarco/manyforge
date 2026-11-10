@@ -1,4 +1,4 @@
-"""Exact private Program-operation scope and one-shot control wire."""
+"""Exact private Program-operation scope wire."""
 
 from copy import deepcopy
 
@@ -6,19 +6,16 @@ import pytest
 from pydantic import ValidationError
 
 from manyforge_headless_api.execution import ExecutionCommandClient
-from manyforge_headless_api.models import (
-    ProgramOperationQuery,
-    OperationRuntimeScaleRequest,
-)
+from manyforge_headless_api.models import ProgramOperationQuery
 from manyforge_headless_api.native import HeadlessApiError
 
 
 QUERY = {
-    "schema_version": "manyforge.program_operation_query.v1",
+    "schema_version": "manyforge.program_operation_query.v2",
     "owner_epoch": "owner.1",
     "program_binding_id": "sha256:" + "a" * 64,
     "program_run_id": "run.1",
-    "target_role_id": "arm",
+    "target": {"component_id": "robot", "command_target_id": "arm"},
 }
 
 
@@ -40,7 +37,7 @@ def _response():
         "ok": True,
         "command": "query_operation",
         "owner_epoch": "owner.1",
-        "target_role_id": "arm",
+        "target": {"component_id": "robot", "command_target_id": "arm"},
         "operation": {
             "operation_id": "operation.1",
             "operation_revision": 2,
@@ -59,7 +56,7 @@ def test_operation_query_is_one_read_without_command_or_retry_identity():
     )
     assert requests == [
         {
-            "api_version": "manyforge.execution_command.v1",
+            "api_version": "manyforge.execution_command.v3",
             "command": "query_operation",
             "query": QUERY,
         }
@@ -70,7 +67,7 @@ def test_operation_query_is_one_read_without_command_or_retry_identity():
     "change",
     [
         {"program_run_id": ""},
-        {"target_role_id": 1},
+        {"target": {"component_id": "robot", "command_target_id": 1}},
         {"owner_epoch": ""},
         {"program_binding_id": "latest"},
         {"operation_id": "caller-selected"},
@@ -114,56 +111,8 @@ def test_operation_response_must_have_its_command_kind():
 def test_operation_response_echo_is_not_compared():
     # Each exchange is its own connection: the echoed identity is not compared.
     response = _response()
-    response.update(owner_epoch="foreign", target_role_id="gripper")
+    response.update(owner_epoch="foreign", target={"component_id": "robot", "command_target_id": "gripper"})
     response["operation"]["program_run_id"] = "foreign"
     client, requests = _client(response)
     assert client.query_operation(ProgramOperationQuery.model_validate(QUERY)) == response
-    assert len(requests) == 1
-
-
-def test_operation_scale_wire_keeps_generation_and_never_changes_persistent_selector():
-    request = OperationRuntimeScaleRequest.model_validate(
-        {
-            "request_context": {
-                "request_id": "scale.1",
-                "request_owner_epoch": "owner.1",
-                "source_label": "program_runner",
-            },
-            "operation_id": "operation.1",
-            "expected_operation_revision": 2,
-            "expected_runtime_scale_generation": 3,
-            "scale": 0.4,
-        }
-    )
-    response = {
-        "ok": True,
-        "command": "set_operation_runtime_scale",
-        "accepted": {
-            "request_id": "scale.1",
-            "operation_id": "operation.1",
-            "operation_revision": 2,
-            "runtime_scale_generation": 4,
-            "requested_scale": 0.4,
-        },
-    }
-    client, requests = _client(response)
-    assert (
-        client.set_operation_runtime_scale(request, trusted_principal_id=None)
-        == response
-    )
-    assert len(requests) == 1
-    assert requests[0]["request"] == request.model_dump(mode="json")
-    assert "selector" not in requests[0]["request"]
-    # Like Stop, the Kernel resolves scaling to the current operation revision.
-    response["accepted"]["operation_revision"] = 3
-    client, requests = _client(response)
-    assert (
-        client.set_operation_runtime_scale(request, trusted_principal_id=None)
-        == response
-    )
-    response["command"] = "query_operation"
-    client, requests = _client(response)
-    with pytest.raises(HeadlessApiError) as error:
-        client.set_operation_runtime_scale(request, trusted_principal_id=None)
-    assert error.value.code == "execution_command_response_invalid"
     assert len(requests) == 1

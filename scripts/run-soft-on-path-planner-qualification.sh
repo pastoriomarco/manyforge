@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 4.5G soft_on_path planner latency qualification probe.
+# soft_on_path planner latency qualification probe.
 #
 # Produces one archival JSON evidence line for the side-effect-free
 # replacement-trajectory planner. This does not replace live ros2/Isaac/robot

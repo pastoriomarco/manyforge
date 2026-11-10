@@ -33,7 +33,7 @@ class FrameHeightQuery:
             raise ValueError("frame-height range must be finite and ordered")
         query = replace(
             inputs,
-            parameters={key: inputs.parameters[key] for key in ("target_role", "frame_role")},
+            parameters={key: inputs.parameters[key] for key in ("target", "frame")},
         )
         result = self._model_port.invoke("model.get_frame_pose", identity, query)
         if not result.succeeded:

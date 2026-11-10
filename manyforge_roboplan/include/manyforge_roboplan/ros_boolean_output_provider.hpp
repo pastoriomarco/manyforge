@@ -22,6 +22,8 @@
 #include <variant>
 #include <vector>
 
+namespace manyforge::ros2_control_execution { class Ros2TransportResources; }
+
 namespace manyforge::roboplan_backend {
 
 struct RosBooleanOutputAlias final {
@@ -48,7 +50,7 @@ struct RosBooleanOutputChannel final {
   std::vector<RosBooleanOutputAlias> aliases;
   core::ActiveBundlePublicationGeneration active_publication_generation;
   /// A SetBool service's answer bound: the device's authored
-  /// `output_source_ack_timeout_s` (CONTRACTS §7). Unused for GPIO, which
+  /// `output_source_ack_timeout_s`. Unused for GPIO, which
   /// has no answer.
   core::Duration ack_timeout_ns{};
 };
@@ -65,9 +67,33 @@ public:
   /// Opaque shared transport/write-model of one actual ROS context+command
   /// topic. It owns no lifecycle/admission or command correlation authority.
   struct GpioTopic;
+  struct TransportRecoverySnapshot;
+  struct TransportRecoveryStage;
+  struct GpioTransportRecoveryStage;
+  [[nodiscard]] bool BelongsToTransport(
+      const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner) const;
+  // Capture and match while the lifecycle authority holds the relevant
+  // delivery barriers. Stage without them; validate every snapshot before
+  // committing the shared topic and then its channels.
+  [[nodiscard]] std::shared_ptr<const TransportRecoverySnapshot>
+  CaptureTransportRecovery() const;
+  [[nodiscard]] bool MatchesTransportRecovery(
+      const TransportRecoverySnapshot &snapshot) const noexcept;
+  [[nodiscard]] static core::Result<std::shared_ptr<GpioTransportRecoveryStage>>
+  StageGpioTransportRecovery(
+      const std::shared_ptr<GpioTopic> &topic,
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner);
+  [[nodiscard]] static core::Result<std::shared_ptr<TransportRecoveryStage>>
+  StageTransportRecovery(
+      std::shared_ptr<const TransportRecoverySnapshot> snapshot,
+      std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner,
+      std::shared_ptr<GpioTransportRecoveryStage> gpio = {});
+  static void CommitGpioTransportRecovery(GpioTransportRecoveryStage &stage) noexcept;
+  void CommitTransportRecovery(TransportRecoveryStage &stage) noexcept;
   [[nodiscard]] static core::Result<std::unique_ptr<RosBooleanOutputProvider>>
   Create(rclcpp::Node::SharedPtr node, RosBooleanOutputChannel channel,
-         std::shared_ptr<GpioTopic> gpio_topic = {});
+         std::shared_ptr<GpioTopic> gpio_topic,
+         std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner);
   /// Actual retained topic pin only; null for acknowledged service outputs.
   [[nodiscard]] std::shared_ptr<GpioTopic> gpio_topic() const noexcept;
   ~RosBooleanOutputProvider();
@@ -75,7 +101,7 @@ public:
   RosBooleanOutputProvider &
   operator=(const RosBooleanOutputProvider &) = delete;
 
-  /// CONTRACTS §6, §7: the one write of one alias, behind its component's
+  /// The one write of one alias, behind its component's
   /// output-writer interface: one send while the alias's occurrence is
   /// enabled. A service
   /// answer is the outcome; no answer within the channel's `ack_timeout_ns`,
@@ -87,8 +113,11 @@ public:
   /// Actual client connectivity / publisher resource only; no waiting,
   /// subscriber count guarantee or lifecycle-state inference.
   [[nodiscard]] bool ServiceReady() const;
+  /// Cached SetBool discovery or GPIO context readiness; unknown is not ready.
+  [[nodiscard]] std::optional<bool> CachedServiceReady() const noexcept;
   /// Existing host delivery/domain owner supplies its actual observation
-  /// generation after full lifecycle checks. No CCLC generation is minted.
+  /// generation after full lifecycle checks. No component lifecycle generation
+  /// is minted.
   core::Result<void>
   Pause(const core::ResolvedLifecycleProviderOccurrenceDTO &provider,
         std::uint64_t driver_observation_generation,
@@ -119,9 +148,9 @@ private:
   struct State;
   struct Entities;
   RosBooleanOutputProvider(std::shared_ptr<State> state,
-                           std::unique_ptr<Entities> entities);
+                           std::shared_ptr<Entities> entities);
   std::shared_ptr<State> state_;
-  std::unique_ptr<Entities> entities_;
+  std::shared_ptr<Entities> entities_;
 };
 
 } // namespace manyforge::roboplan_backend

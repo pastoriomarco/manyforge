@@ -98,7 +98,8 @@ enabled.
 | I/O | Prepare, Enable, Disable | Needs the driver's I/O stream; Enable allows output writes. |
 
 Controller errors become faults of the machine (owner), naming the members
-they concern: C1–C3 e-stop, C31 protective stop, C22 self-collision, C10–C17
+they concern, except an e-stop (C1–C3), which is a stop that gates motion
+only: C31 protective stop, C22 self-collision, C10–C17
 drive, C19/C33 communication, and so on. A mode or state change made in Studio
 or on the pendant while the arm is enabled is "taken over outside ManyForge".
 While the machine isn't usable, its members show **offline** with
@@ -106,8 +107,10 @@ While the machine isn't usable, its members show **offline** with
 
 **Errors stay until cleared.** After an e-stop is released the controller
 keeps the error (C2 for this cell's wiring, the control box emergency input)
-until `clean_error`. That is normal: Recover (or Prepare) the machine, then
-Enable the arm. If the error comes back, the e-stop is still active.
+until `clean_error`. That is normal: Load and Prepare work with the e-stop
+pressed and never clear it. Once it is released, **Enable all** (or Recover
+the machine, then Enable the arm) clears it with the motors off. If the error
+comes back, the e-stop is still active.
 
 ## First session checklist
 

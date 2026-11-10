@@ -8,13 +8,13 @@
 
 namespace manyforge::core {
 
-/// Execution state machine states (spec §3.10)
+/// Execution state machine states
 enum class ExecutionState {
   kIdle,
   kPlanning,
   kValidating,  // pre-execution validation phase
   kExecuting,
-  /// Interrupted annotation from spec/260.
+  /// Interrupted annotation.
   kInterrupted,
   kStopping,
   kStopped,
@@ -43,7 +43,7 @@ inline const char* to_string(ExecutionState state) {
   return "Unknown";
 }
 
-/// Cache mode for trajectory caching (spec §3.1)
+/// Cache mode for trajectory caching
 enum class CacheMode {
   kDefault,  // kernel MAY use and populate the trajectory cache
   kDisable,   // kernel MUST NOT read from or write to the trajectory cache
@@ -71,7 +71,7 @@ enum class ParticipantExecutionFactKind : std::uint8_t {
 };
 
 /// What the participant knows about physical effects of its ended execution.
-/// A participant-level subset of the CCLC domain-effect vocabulary.
+/// A participant-level subset of the Kernel's domain-effect vocabulary.
 enum class ParticipantEffectKnowledge : std::uint8_t {
   /// Nothing was dispatched, or the effect was prevented before dispatch.
   kNoEffect,
@@ -129,10 +129,10 @@ struct ExecutionStatus {
   /// Timestamp of last state transition (nanoseconds, from IClock).
   int64_t last_transition_ns = 0;
 
-  /// Execution ID for correlation (ADR-0011).
+  /// Execution ID for correlation.
   uint64_t execution_id = 0;
 
-  /// The move_id of the in-flight request (empty in Idle). Spec 230 §1.
+  /// The move_id of the in-flight request (empty in Idle).
   std::string active_move_id;
 
   /// Present from the end of the current execution until its retirement.

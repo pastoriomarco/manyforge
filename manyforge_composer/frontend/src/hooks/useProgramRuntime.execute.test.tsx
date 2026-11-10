@@ -1,4 +1,4 @@
-import { StrictMode, act } from 'react';
+import { StrictMode, act, useLayoutEffect } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type {
   AppliedProgramSelection,
@@ -8,7 +8,7 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { RuntimeScaleControlSelector, RuntimeScaleControlStatus } from '../types/robotControl';
 import { heldRun } from '../testFixtures/heldRun';
-import { useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
+import { ASSISTANT_TURN_IN_PROGRESS, useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
 import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
 import { CommandRefusalError } from '../state/commandRefusal';
 
@@ -72,7 +72,7 @@ let cleanup: (() => Promise<void>) | null = null;
 afterEach(async () => {
   await cleanup?.(); cleanup = null; vi.unstubAllGlobals(); vi.useRealTimers();
 });
-async function mount(resumed = false) {
+async function mount(resumed = false, assistantTurnRunning = false) {
   vi.useFakeTimers();
   for (const section of Object.values(apiMock)) for (const method of Object.values(section)) method.mockReset();
   const host = domHost();
@@ -92,13 +92,15 @@ async function mount(resumed = false) {
     retainedBundleId: 'bundle', activePublicationGeneration: 1, controlManagementMode: 'component_lifecycle' });
   const admissionsAtSend: number[] = [];
   const send = vi.fn(async (_kind: string, _payload: unknown, _correlation: string) => {
+    void _kind; void _payload; void _correlation;
     admissionsAtSend.push(snapshot.authoringAdmission.admissionGeneration);
     return { disposition: 'received' };
   });
   const source = { sendExecutionCommand: send } as unknown as HeadlessStateSource;
   let runtime!: ProgramRuntimeController;
   function Harness() {
-    runtime = useProgramRuntime(true, snapshot, workspace, source, false);
+    const value = useProgramRuntime(true, snapshot, workspace, source, false, assistantTurnRunning);
+    useLayoutEffect(() => { runtime = value; }, [value]);
     return null;
   }
   const { createRoot } = await import('react-dom/client');
@@ -122,6 +124,28 @@ it('Execute sends one ordinary run request and shows an authoritative refusal', 
   expect(test.send).toHaveBeenCalledTimes(1);
   expect(test.send.mock.calls[0]?.[0]).toBe('program_run');
   expect(test.runtime.state.error).toContain('Simulator unavailable');
+});
+
+it('refuses Execute, Run and Resume while this page\'s assistant request runs', async () => {
+  const idle = await mount();
+  expect(idle.runtime.composerRefusalReason).toBeNull();
+  await idle.unmount(); cleanup = null;
+  const test = await mount(false, true);
+  expect(test.runtime.composerRefusalReason).toBe(ASSISTANT_TURN_IN_PROGRESS);
+});
+
+it('shows the Composer\'s typed refusal of an Execute during an assistant request', async () => {
+  const test = await mount();
+  const refusal = {
+    code: 'execution_assistant_turn_in_progress',
+    message: 'an assistant request is in progress',
+    details: null,
+    origin: null,
+  };
+  test.send.mockRejectedValueOnce(new CommandRefusalError(refusal));
+  await act(async () => { await test.runtime.run(); });
+  expect(test.runtime.state.errorRefusal).toEqual(refusal);
+  expect(test.runtime.state.error).toContain('an assistant request is in progress');
 });
 
 it('retains the owner refusal code for a holding rule until dismissed', async () => {
@@ -188,7 +212,7 @@ it('keeps an exact selection refusal visible and projects the next owner snapsho
   });
 
   expect(test.send).toHaveBeenCalledTimes(1);
-  // N8: Resume names its run and selection; tree ticks move only the run revision.
+  // Resume names its run and selection; tree ticks move only the run revision.
   const payload = test.send.mock.calls[0]?.[1] as Record<string, unknown>;
   expect(payload).toMatchObject({ program_run_id: run.capture.programRunId,
     expected_owner_epoch: run.ownerEpoch, expected_selection_revision: 7 });
@@ -322,10 +346,12 @@ it('clears the failed-run notice when a new Run starts', async () => {
 // One backend scaling setting, shared by every row that targets it (as "All
 // groups" and a named group do for a single robot).
 const scaleSelector: RuntimeScaleControlSelector = { kind: 'singular',
-  programBindingId: `sha256:${'c'.repeat(64)}`, componentRoleId: 'robot', targetRoleId: 'arm' };
+  programBindingId: `sha256:${'c'.repeat(64)}`, componentId: 'robot', commandTargetId: 'arm' };
 async function mountScaleRows(groupIds: string[]) {
   const test = await mount();
-  const backend = { generation: 2, scale: 0.5 };
+  // OD-72: the owner applies the latest value whatever generation it names;
+  // `refusal` models a refusal that remains (e.g. a frozen control).
+  const backend = { generation: 2, scale: 0.5, refusal: null as string | null };
   const status = (): RuntimeScaleControlStatus => ({ selector: scaleSelector,
     controlGeneration: backend.generation, requestedScale: backend.scale,
     supported: true, frozen: false, controlDomainId: 'domain-1',
@@ -340,9 +366,9 @@ async function mountScaleRows(groupIds: string[]) {
     const command = payload as { selector: Record<string, unknown>;
       expected_control_generation: number; scale: number };
     expect(kind).toBe('runtime_scale');
-    if (command.expected_control_generation !== backend.generation) {
-      throw new CommandRefusalError({ code: 'runtime_scale_control_generation_stale',
-        message: 'stale', details: {}, origin: null });
+    if (backend.refusal !== null) {
+      throw new CommandRefusalError({ code: backend.refusal,
+        message: 'refused', details: {}, origin: null });
     }
     backend.generation += 1; backend.scale = command.scale;
     return { disposition: 'received', result: { ok: true, api_version: 1,
@@ -388,14 +414,16 @@ it('sends the final value of a fast drag after the first value is accepted', asy
   expect(test.send).toHaveBeenCalledTimes(2);
   expect(test.send.mock.calls[1]?.[1]).toMatchObject({
     expected_control_generation: 3, scale: 0.8 });
-  expect(test.backend).toEqual({ generation: 4, scale: 0.8 });
+  expect(test.backend).toMatchObject({ generation: 4, scale: 0.8 });
   expect(test.runtime.groupRuntimeScales.all).toMatchObject({ draft: 0.8, pending: false });
 });
 
-it('reverts a refused value and re-reads every row after a stale generation', async () => {
+it('reverts a refused value and re-reads every row after a refusal', async () => {
   const test = await mountScaleRows(['all', 'carry']);
-  // The shared setting moved without this client re-reading it.
+  // The shared setting moved without this client re-reading it, and the
+  // control is now refused (frozen while a Stop is active).
   test.backend.generation = 5; test.backend.scale = 0.2;
+  test.backend.refusal = 'runtime_scale_control_unavailable';
   const reads = apiMock.execution.runtimeScaleControl.mock.calls.length;
   await act(async () => { test.runtime.setGroupRuntimeScale('all', 0.9); });
   expect(test.send).toHaveBeenCalledTimes(1);

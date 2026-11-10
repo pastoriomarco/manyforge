@@ -3,12 +3,11 @@
 The former implementation is pinned at source blob
 ``1d074cc77f3a25ccb1af9f0616bdff2bf1298ccc``.  It owned the private
 ``manyforge.isaac.collider_{query,report}.v0.1`` String-topic wire, DDS retry,
-correlation, response validation, and a live ROS CLI.  The collider inspection
-algorithms remain separately in ``isaac_collider_probe_lib.py``; this obsolete
-wire is not retained as a callable fallback.
+correlation, response validation, and a live ROS CLI.  This obsolete wire is
+not retained as a callable fallback.
 
-I9/I must restore a thin client only after the Isaac retained-product contract
-is frozen.  Historical test blob
+A thin client returns only after the Isaac retained-product contract is
+frozen.  Historical test blob
 ``03e1c87e5a8689fa2fa832b500395b115028bbff`` preserves its six acceptance
 cases: the live correlated-RPC cohort at lines 9-96 and five strict response
 rejection cases at lines 98-154.
@@ -26,8 +25,7 @@ RESTORATION_GATE: Final = "I9/I"
 HISTORICAL_SOURCE_BLOB: Final = "1d074cc77f3a25ccb1af9f0616bdff2bf1298ccc"
 HISTORICAL_TEST_BLOB: Final = "03e1c87e5a8689fa2fa832b500395b115028bbff"
 UNAVAILABLE_MESSAGE: Final = (
-    f"{UNAVAILABLE_REASON_CODE}: live Isaac scene inspection requires the "
-    f"{RESTORATION_GATE} restoration gate"
+    f"{UNAVAILABLE_REASON_CODE}: live Isaac scene inspection is not available"
 )
 
 

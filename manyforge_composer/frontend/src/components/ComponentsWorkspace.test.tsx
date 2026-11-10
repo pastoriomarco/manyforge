@@ -8,8 +8,14 @@ import type { ComponentState } from '../types/components';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
 import { applyPreviewFixture } from '../test/applyPreview';
 import { reactPropsHost } from '../test/reactPropsHost';
-import { ComponentsWorkspace } from './ComponentsWorkspace';
+import { ComponentsWorkspace, sceneResourceChoices } from './ComponentsWorkspace';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
+
+it('offers each authored or runtime Scene object once', () => {
+  expect(sceneResourceChoices(['probe_block', 'draft_only'], ['probe_block', 'runtime_only']))
+    .toEqual(['draft_only', 'probe_block', 'runtime_only']);
+  expect(sceneResourceChoices(null, ['runtime_only'])).toEqual(['runtime_only']);
+});
 
 afterEach(() => vi.unstubAllGlobals());
 

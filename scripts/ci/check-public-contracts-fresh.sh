@@ -6,7 +6,7 @@
 # `scripts/regen-public-contracts.py` from
 # the configured schema-only Composer route superset;
 # `docs/reference/HEADLESS_REST_API.md`
-# comes from the independent H0 FastAPI route owner. The optional MCP contract
+# comes from the independent headless FastAPI route owner. The optional MCP contract
 # is derived from the actual Composer routes. Removed aggregate
 # assistant-provider, viewer, execution, and lifecycle contracts are not
 # generated.

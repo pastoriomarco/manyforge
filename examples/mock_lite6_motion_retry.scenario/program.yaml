@@ -1,14 +1,16 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "blackboard": {
     "keys": [
       {
         "access": "read_write",
         "initial": {
           "frame_ref": {
-            "frame_role": "base",
-            "kind": "target_frame",
-            "target_role": "arm"
+            "frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
+            "kind": "target_frame"
           },
           "orientation": {
             "rpy_deg": [
@@ -36,8 +38,8 @@
     ]
   },
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -50,16 +52,6 @@
       "r5-live-trial"
     ]
   },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    }
-  },
   "description": "Mock Lite6 automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
   "forest": [
     {
@@ -69,7 +61,10 @@
           "instance_id": "start_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -98,7 +93,10 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -114,10 +112,16 @@
               "parameters": {
                 "automatic_retries": 3,
                 "automatic_retry_delay_s": 1.0,
-                "base_frame_role": "base",
+                "base_frame": {
+                  "component_id": "lite6_robot",
+                  "frame_id": "base"
+                },
                 "execution_timeout_s": 30.0,
                 "planning_timeout_s": 1.0,
-                "target_role": "arm",
+                "target": {
+                  "command_target_id": "arm",
+                  "component_id": "lite6_robot"
+                },
                 "tcp_endpoint": {
                   "kind": "current"
                 },
@@ -148,9 +152,11 @@
                     "key": "trial.goal",
                     "value": {
                       "frame_ref": {
-                        "frame_role": "base",
-                        "kind": "target_frame",
-                        "target_role": "arm"
+                        "frame": {
+                          "component_id": "lite6_robot",
+                          "frame_id": "base"
+                        },
+                        "kind": "target_frame"
                       },
                       "orientation": {
                         "rpy_deg": [
@@ -193,7 +199,10 @@
           "instance_id": "end_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "lite6_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -222,7 +231,10 @@
               }
             ],
             "planning_timeout_s": 5.0,
-            "target_role": "arm",
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "lite6_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -270,59 +282,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.joint_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

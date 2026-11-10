@@ -1,4 +1,4 @@
-import type { ApplyPreview, ApplyResult } from '../types/components';
+import type { ApplyPreview, ApplyResult, ApplyUnresolvedReference } from '../types/components';
 import { codedErrorText, LIFECYCLE_LABELS } from '../state/componentPresentation';
 
 function names(ids: readonly string[]): string {
@@ -6,7 +6,7 @@ function names(ids: readonly string[]): string {
   return `${ids.slice(0, -1).join(', ')} and ${ids[ids.length - 1]}`;
 }
 
-/** The Preview's one-line impact (plan, "Authoring and Apply"). */
+/** The Preview's one-line impact. */
 export function applyImpactSummary(preview: ApplyPreview): string {
   const rows = preview.components;
   const restarts = rows.filter((row) => row.restarts).map((row) => row.component_id);
@@ -22,6 +22,15 @@ export function applyImpactSummary(preview: ApplyPreview): string {
   return `${sentence[0]!.toUpperCase()}${sentence.slice(1)}${untouched ? '; the others keep running' : ''}.`;
 }
 
+/** Why a Program reference can't be bound after this Apply. */
+const UNRESOLVED_REASON_TEXT: Record<ApplyUnresolvedReference['reason'], string> = {
+  component_missing: 'the component is not in the Deployment',
+  component_incompatible: 'the component is incompatible',
+  target_missing: 'the component has no such target',
+  target_incompatible: 'the target is incompatible',
+  capability_unavailable: 'a feature this Program uses is unavailable',
+};
+
 /** The Preview's Program outcome: nothing when it stays executable. */
 function ProgramNotExecutable({ program }: { program: ApplyPreview['program'] }) {
   if (program.executable || program.program_id === null) return null;
@@ -33,15 +42,13 @@ function ProgramNotExecutable({ program }: { program: ApplyPreview['program'] })
       </p>
       <ul>
         {program.unresolved_references.map((reference) => (
-          <li key={`${reference.component_role_id}/${reference.target_role_id ?? ''}`}>
-            {reference.target_role_id !== null
-              ? <>Target role <code>{reference.target_role_id}</code></>
-              : <>Component role <code>{reference.component_role_id}</code></>}
-            {' → '}
-            <code>{reference.controllable_component_id}</code>
-            {reference.command_target_id !== null && <code>/{reference.command_target_id}</code>}
+          <li
+            key={`${reference.target.component_id}/${reference.target.command_target_id}/${reference.reason}`}
+            title={reference.detail || undefined}
+          >
+            <code>{reference.target.component_id}/{reference.target.command_target_id}</code>
             {': '}
-            {reference.reason.replaceAll('_', ' ')}
+            {UNRESOLVED_REASON_TEXT[reference.reason]}
           </li>
         ))}
       </ul>

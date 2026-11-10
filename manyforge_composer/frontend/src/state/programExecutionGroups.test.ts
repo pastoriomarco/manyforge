@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { AppliedProgramSelection, ProgramTreeNode } from '../types/api';
 import {
   appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
-  executionGroupTargetLabels, executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
+  executionGroupVisibilityChange, executionGroupVisibilityUnavailableReason,
   executionSelectionIsQuiescent, HARDWARE_ACTING_NODE_IDS, shownExecutionGroupIds,
 } from './programExecutionGroups';
 
@@ -26,7 +26,7 @@ const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
 function appliedProgram(): AppliedProgramSelection {
   return {
-    schemaVersion: 'manyforge.applied_program_selection.v3',
+    schemaVersion: 'manyforge.applied_program_selection.v4',
     scenarioId: 'two-robots',
     sourceDocumentDigest: digest('a'),
     projectPath: '/projects/two-robots.scenario',
@@ -41,20 +41,23 @@ function appliedProgram(): AppliedProgramSelection {
     sourceOwnerEpoch: 'applied-owner.epoch.1',
     sourceGeneration: 1,
     assistantProjection: null,
+    programFrameFacts: {
+      appliedRecordDigest: digest('1'), programBindingId: digest('c'),
+      programRevision: digest('b'), retainedBundleId: digest('d'), graphRevision: digest('e'),
+      components: [], frames: [],
+    },
     ownerIdentities: [{
       ownerRole: 'headless_projection',
       ownerId: 'applied-owner',
       ownerEpoch: 'applied-owner.epoch.1',
     }],
     program: {
-      api_version: 'manyforge.program.v2',
+      api_version: 'manyforge.program.v3',
       program_id: 'two-robots',
       program_revision: digest('b'),
       program_profile: 'composable-cell-v1',
       name: 'Two robots',
-      catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
-      component_roles: {},
-      target_roles: {},
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
       execution_groups: { robots: { execution_policy: 'independent' } },
       tree: {
         node_id: 'parallel',
@@ -64,18 +67,18 @@ function appliedProgram(): AppliedProgramSelection {
         children: [{
           node_id: 'motion.move_to_joint_target',
           instance_id: 'left-motion',
-          parameters: { target_role: 'left-arm' },
+          parameters: { target: { component_id: 'left', command_target_id: 'arm' } },
           children: [],
         }, {
           node_id: 'motion.move_to_pose',
           instance_id: 'right-motion',
-          parameters: { target_role: 'right-arm' },
+          parameters: { target: { component_id: 'right', command_target_id: 'arm' } },
           children: [],
         }],
       },
     },
     programBinding: {
-      api_version: 'manyforge.program_binding.v2',
+      api_version: 'manyforge.program_binding.v3',
       program_binding_id: digest('c'),
       program_id: 'two-robots',
       program_revision: digest('b'),
@@ -85,21 +88,20 @@ function appliedProgram(): AppliedProgramSelection {
         catalog_id: 'default', content_version: '2.4.0',
         catalog_digest: digest('2'), environment_digest: digest('f'),
       },
-      component_role_bindings: [],
-      target_role_bindings: [{
-        target_role_id: 'left-arm', component_role_id: 'left-robot',
-        controllable_component_id: 'left', command_target_id: 'arm',
-        frame_role_bindings: [], resource_role_bindings: [],
-        collision_body_role_bindings: [], capability_bindings: [],
+      component_bindings: [],
+      target_bindings: [{
+        target: { component_id: 'left', command_target_id: 'arm' },
+        frame_references: [], frame_associations: [], collision_body_references: [],
+        signal_references: [], resource_role_bindings: [], capability_bindings: [],
       }, {
-        target_role_id: 'right-arm', component_role_id: 'right-robot',
-        controllable_component_id: 'right', command_target_id: 'arm',
-        frame_role_bindings: [], resource_role_bindings: [],
-        collision_body_role_bindings: [], capability_bindings: [],
+        target: { component_id: 'right', command_target_id: 'arm' },
+        frame_references: [], frame_associations: [], collision_body_references: [],
+        signal_references: [], resource_role_bindings: [], capability_bindings: [],
       }],
+      frame_bindings: [], collision_body_bindings: [], signal_bindings: [],
       node_policies: [], contact_grasp_bindings: [],
       provenance: {
-        binding_compiler_contract_digest: digest('3'), role_assignment_digest: digest('4'),
+        binding_compiler_contract_digest: digest('3'),
         source_records: [], resolved_output_records: [],
       },
     },
@@ -117,11 +119,30 @@ describe('Applied Program execution-group projection', () => {
       kind: 'group',
       programBindingId: digest('c'),
       groupTargets: [
-        { componentRoleId: 'left-robot', targetRoleId: 'left-arm' },
-        { componentRoleId: 'right-robot', targetRoleId: 'right-arm' },
+        { componentId: 'left', commandTargetId: 'arm' },
+        { componentId: 'right', commandTargetId: 'arm' },
       ],
     });
   });
+
+  it('refuses a selector when an addressed motion target lacks an exact binding', () => {
+    const applied = appliedProgram();
+    applied.programBinding.target_bindings.pop();
+    const group = appliedExecutionSelectionRows(applied).find((row) => row.groupId === 'robots');
+    expect(group?.runtimeScaleSelector).toBeNull();
+    expect(group?.runtimeScaleUnavailableReason).toBe('captured_motion_target_binding_unavailable');
+  });
+
+  it('keeps an I/O command in coverage without guessing a target from its signal', () => {
+    const node: ProgramTreeNode = { node_id: 'io.set_output', instance_id: 'output',
+      parameters: { signal: { component_id: 'station', signal_name: 'lamp' } }, children: [] };
+    const [all] = executionGroupScopes([node], []);
+    expect(all.hardwareNodeIds).toEqual(['output']);
+    expect(all.targetKeys).toEqual([]);
+    expect(all.motionTargetKeys).toEqual([]);
+  });
+
+
 });
 
 describe('visible hardware-node coverage', () => {
@@ -131,7 +152,7 @@ describe('visible hardware-node coverage', () => {
     tree.children[1].execution_groups = 'all';
     const scopes = executionGroupScopes([tree], ['left', 'shared']);
     expect(scopes.find((scope) => scope.groupId === 'left')).toMatchObject({
-      nodeIds: ['root', 'left-motion'], hardwareNodeIds: ['left-motion'], targetRoleIds: ['left-arm'],
+      nodeIds: ['root', 'left-motion'], hardwareNodeIds: ['left-motion'], targetKeys: ['left/arm'],
     });
     expect(scopes.find((scope) => scope.groupId === 'shared')?.hardwareNodeIds).toEqual(['left-motion']);
     expect(shownExecutionGroupIds(['all', 'left', 'shared'], undefined, scopes))
@@ -145,7 +166,7 @@ describe('visible hardware-node coverage', () => {
     tree.execution_groups = ['shared'];
     tree.children[0].execution_groups = ['left', 'shared'];
     tree.children[1].execution_groups = ['right', 'shared'];
-    tree.children[1].parameters.target_role = 'left-arm';
+    tree.children[1].parameters.target = { component_id: 'left', command_target_id: 'arm' };
     const scopes = executionGroupScopes([tree], ['left', 'right', 'shared']);
     expect(executionGroupVisibilityUnavailableReason(scopes, ['left'])).toContain('Show All');
     expect(executionGroupVisibilityUnavailableReason(scopes, ['left', 'right'])).toBeNull();
@@ -172,7 +193,9 @@ describe('visible hardware-node coverage', () => {
 const leaf = (
   instanceId: string, nodeId: string, groups?: ProgramTreeNode['execution_groups'], target?: string,
 ): ProgramTreeNode => ({
-  node_id: nodeId, instance_id: instanceId, parameters: target === undefined ? {} : { target_role: target },
+  node_id: nodeId, instance_id: instanceId, parameters: target === undefined ? {} : {
+    target: { component_id: target === 'left-arm' ? 'left' : target, command_target_id: 'arm' },
+  },
   ...(groups === undefined ? {} : { execution_groups: groups }), children: [],
 });
 
@@ -185,7 +208,7 @@ describe('hardware-acting node rule', () => {
       const id = entry.split('\n', 1)[0].trim();
       const owner = /^ {4}owner_api: (\S+)$/m.exec(entry)?.[1];
       const kernelControl = new Set([
-        'kernel.stop', 'kernel.full_stop', 'kernel.reset', 'kernel.runtime_scaling']);
+        'kernel.stop', 'kernel.full_stop', 'kernel.reset']);
       if ((/^ {4}effectful: true$/m.test(entry)
           && (owner === 'kernel.operation' || owner === 'kernel.command_target'))
           || (owner !== undefined && kernelControl.has(owner))) derived.add(id);
@@ -212,8 +235,8 @@ describe('hardware-acting node rule', () => {
     const scopes = executionGroupScopes([tree], ['arm']);
     const all = scopes.find((scope) => scope.groupId === 'all')!;
     expect([...all.hardwareNodeIds].sort()).toEqual(['grip', 'move', 'out', 'reset']);
-    expect(all.targetRoleIds).toEqual(['arm', 'gripper', 'io']);
-    expect(all.motionTargetRoleIds).toEqual(['arm']);
+    expect(all.targetKeys).toEqual(['arm/arm', 'gripper/arm', 'io/arm']);
+    expect(all.motionTargetKeys).toEqual(['arm/arm']);
     expect(executionGroupVisibilityUnavailableReason(scopes, ['arm'])).toContain('Show All');
     expect(executionGroupDisplay(['all', 'arm'], undefined, scopes))
       .toEqual({ preferred: ['arm'], shown: ['all', 'arm'], fallback: 'uncovered' });
@@ -236,8 +259,8 @@ describe('hardware-acting node rule', () => {
     const scopes = executionGroupScopes([tree], ['other', 'tcp']);
     const all = scopes.find((scope) => scope.groupId === 'all')!;
     expect(all.hardwareNodeIds).toEqual(['set-tcp']);
-    expect(all.targetRoleIds).toEqual(['left-arm']);
-    expect(all.motionTargetRoleIds).toEqual([]);
+    expect(all.targetKeys).toEqual(['left/arm']);
+    expect(all.motionTargetKeys).toEqual([]);
 
     const groupIds = scopes.map((scope) => scope.groupId);
     expect(executionGroupDisplay(groupIds, ['all', 'tcp'], scopes)).toEqual({
@@ -303,21 +326,5 @@ describe('visibility preference', () => {
       .toEqual({ preferred: ['left', 'right'], shown: groupIds, fallback: 'membership_unavailable' });
     expect(executionGroupDisplay(groupIds, groupIds, scopes).fallback).toBe('empty');
     expect(executionGroupDisplay(groupIds, ['left', 'right'], []).fallback).toBeNull();
-  });
-});
-
-describe('group target labels', () => {
-  it('names robots only from a supplied binding, else the declared component role', () => {
-    const applied = appliedProgram();
-    const roles = { 'left-arm': { component_role: 'left-robot' }, 'right-arm': { component_role: 'right-robot' },
-      loose: {} };
-    expect(executionGroupTargetLabels(roles, null)).toEqual({
-      'left-arm': 'left-arm (component role: left-robot)',
-      'right-arm': 'right-arm (component role: right-robot)',
-      loose: 'loose',
-    });
-    expect(executionGroupTargetLabels(roles, applied.programBinding)).toEqual({
-      'left-arm': 'left-arm (left)', 'right-arm': 'right-arm (right)', loose: 'loose',
-    });
   });
 });

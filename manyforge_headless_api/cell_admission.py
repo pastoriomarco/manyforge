@@ -27,8 +27,8 @@ EXECUTION_SOCKET_FILE: Final = "execution-command.sock"
 # The operator-alarm attention heartbeat is served beside Stop on the
 # independent control socket; it never waits behind ordinary traffic.
 EXECUTION_CONTROL_SOCKET_FILE: Final = "execution-control.sock"
-EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v1"
-EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v1"
+EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v3"
+EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v4"
 MAXIMUM_PACKET_BYTES: Final = 1024 * 1024
 MAXIMUM_RESPONSE_BYTES: Final = 4 * 1024 * 1024
 _CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
@@ -454,7 +454,7 @@ class CellAdmissionClient:
         """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
 
         The Kernel retains the newest generation of one owner epoch and alone
-        evaluates it at Run/Resume/recovery admission (spec 450 §5.2). The
+        evaluates it at Run/Resume/recovery admission. The
         whole exchange (connect, send, receive) ends by the monotonic
         ``deadline``; a later Kernel acceptance is then unobserved here.
         """

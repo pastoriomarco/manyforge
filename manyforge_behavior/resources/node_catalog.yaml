@@ -1,93 +1,105 @@
 # Generated extension composition; edit extension entries in their package descriptor.
-api_version: manyforge.node_catalog.v2
-content_version: 2.9.0
+api_version: manyforge.node_catalog.v3
+content_version: 3.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:0078bbc926b924bbc3a2d00ba46f00fee2b4deb546b7462383a6a56ae22d9e78
+catalog_digest: sha256:59fa3d425937116723fbb04ae19c8775fae761ae3061d5da5eac5f328889fef5
 schema_types:
   tcp_selector:
     type: object
+    description: 'Selects the TCP a motion uses: the active TCP held on the blackboard,
+      the default TCP of a command target, or an explicit target and frame. The kind
+      decides which of the other fields apply.'
     additional_properties: false
     required:
     - kind
     properties:
       kind:
         type: enum
+        description: current uses the active TCP; default_of_target uses the target's
+          default TCP; entry uses the given target and frame.
         values:
         - current
-        - default_of_role
+        - default_of_target
         - entry
-      role:
-        type: string
-        semantic_type: target_role
+      target:
+        schema_ref: '#/schema_types/target_reference'
+        description: Command target for default_of_target and entry; not allowed for
+          current.
         required_when:
-          kind: default_of_role
+          kind:
+          - default_of_target
+          - entry
         allowed_when:
-          kind: default_of_role
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          kind: entry
-        allowed_when:
-          kind: entry
-      frame_role:
-        type: string
-        semantic_type: frame_role
+          kind:
+          - default_of_target
+          - entry
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        description: Frame used as the TCP; required only for kind entry.
         required_when:
           kind: entry
         allowed_when:
           kind: entry
   active_tcp_carrier_frame:
     type: object
+    description: Selects the carrier frame for a carried object as the active TCP.
+      Its only kind is active_tcp, which is resolved when the object is attached.
     additional_properties: false
     required:
     - kind
     properties:
       kind:
         type: enum
+        description: Always active_tcp; there are no other kinds.
         values:
         - active_tcp
   tcp_entry:
     type: object
+    description: 'A stored active-TCP value: the command target and the frame that
+      acts as the TCP for it. Both fields are required.'
     additional_properties: false
     required:
-    - component_id
-    - target_id
-    - frame_role_id
+    - target
+    - frame
     properties:
-      component_id:
-        type: string
-      target_id:
-        type: string
-      frame_role_id:
-        type: string
-        semantic_type: frame_role
+      target:
+        schema_ref: '#/schema_types/target_reference'
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        description: Frame of the component that acts as the TCP for the target.
   coordinate_position:
     type: object
+    description: 'A single coordinate position: an angle in radians, a linear position
+      in meters, or a named preset. The kind decides which one field is used.'
     additional_properties: false
     required:
     - kind
     properties:
       kind:
         type: enum
+        description: angular_rad uses value_rad, linear_m uses value_m, named_preset
+          uses name.
         values:
         - angular_rad
         - linear_m
         - named_preset
       value_rad:
         type: float
+        description: Angle in radians; used only for kind angular_rad.
         required_when:
           kind: angular_rad
         allowed_when:
           kind: angular_rad
       value_m:
         type: float
+        description: Linear position in meters; used only for kind linear_m.
         required_when:
           kind: linear_m
         allowed_when:
           kind: linear_m
       name:
         type: enum
+        description: Preset name, open or closed; used only for kind named_preset.
         values:
         - open
         - closed
@@ -97,17 +109,24 @@ schema_types:
           kind: named_preset
   coordinate_effort_limit:
     type: object
+    description: 'An effort limit for one coordinate: a torque in newton-meters for
+      an angular coordinate or a force in newtons for a linear one. The kind decides
+      which unit field is used and must match the gripper''s own coordinate kind,
+      also when the position is the named open or closed preset.'
     additional_properties: false
     required:
     - kind
     properties:
       kind:
         type: enum
+        description: angular_newton_meter uses value_nm; linear_newton uses value_n.
         values:
         - angular_newton_meter
         - linear_newton
       value_nm:
         type: float
+        description: Torque limit in newton-meters, 0 or more; used only for kind
+          angular_newton_meter.
         constraints:
           min_inclusive: 0.0
         required_when:
@@ -116,6 +135,7 @@ schema_types:
           kind: angular_newton_meter
       value_n:
         type: float
+        description: Force limit in newtons, 0 or more; used only for kind linear_newton.
         constraints:
           min_inclusive: 0.0
         required_when:
@@ -124,72 +144,75 @@ schema_types:
           kind: linear_newton
   orientation_reference:
     type: object
+    description: 'Names where an orientation is taken from: the current Draft pose,
+      a scene resource, or a target frame. The source decides which of the other two
+      fields is required.'
     additional_properties: false
     required:
     - source
     properties:
       source:
         type: enum
+        description: current_pose uses the existing Draft orientation; scene_resource
+          uses a scene resource; target_frame names a frame, which a Draft cannot
+          resolve.
         values:
         - current_pose
         - scene_resource
         - target_frame
       scene_resource_id:
         type: string
+        description: Scene resource whose orientation is used; required for source
+          scene_resource.
         semantic_type: scene_resource
         required_when:
           source: scene_resource
         allowed_when:
           source: scene_resource
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          source: target_frame
-        allowed_when:
-          source: target_frame
-      frame_role:
-        type: string
-        semantic_type: frame_role
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        description: Frame whose orientation is used; required for source target_frame.
         required_when:
           source: target_frame
         allowed_when:
           source: target_frame
   pose_frame_ref:
     type: object
+    description: 'The frame a stored pose is expressed in: the cell frame, a component
+      target frame, or a scene resource. The kind decides which of the other two fields
+      is required.'
     additional_properties: false
     required:
     - kind
     properties:
       kind:
         type: enum
+        description: cell_frame, target_frame or scene_resource; each kind allows
+          only its matching field.
         values:
         - cell_frame
         - target_frame
         - scene_resource
-      target_role:
-        type: string
-        semantic_type: target_role
-        required_when:
-          kind: target_frame
-        allowed_when:
-          kind: target_frame
-      frame_role:
-        type: string
-        semantic_type: frame_role
-        required_when:
-          kind: target_frame
-        allowed_when:
-          kind: target_frame
       scene_resource_id:
         type: string
+        description: Scene resource whose frame is used; required for kind scene_resource.
         semantic_type: scene_resource
         required_when:
           kind: scene_resource
         allowed_when:
           kind: scene_resource
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        description: Component frame reference; required for kind target_frame.
+        required_when:
+          kind: target_frame
+        allowed_when:
+          kind: target_frame
   stored_pose:
     type: object
+    description: 'A pose kept on the blackboard: a position in meters and an orientation,
+      both expressed in the frame named by frame_ref. The orientation is exactly one
+      of xyzw or rpy_deg.'
     additional_properties: false
     required:
     - frame_ref
@@ -198,13 +221,17 @@ schema_types:
     properties:
       frame_ref:
         schema_ref: '#/schema_types/pose_frame_ref'
+        description: Frame the position and orientation are expressed in. Required.
       position_m:
         type: array
+        description: Position x, y, z in meters. Required.
         items:
           type: float
         length: 3
       orientation:
         type: object
+        description: Exactly one of xyzw (quaternion) or rpy_deg (roll, pitch and
+          yaw in degrees).
         additional_properties: false
         properties:
           xyzw:
@@ -222,6 +249,9 @@ schema_types:
           - rpy_deg
   motion_pose:
     type: object
+    description: 'A target pose for a motion: a position and an orientation, where
+      the orientation is exactly one of xyzw or rpy_deg. When frame_ref is omitted
+      the pose is stated in the moving robot''s base frame.'
     additional_properties: false
     required:
     - position_m
@@ -229,13 +259,17 @@ schema_types:
     properties:
       frame_ref:
         schema_ref: '#/schema_types/pose_frame_ref'
+        description: Frame the pose is stated in; omitted means the moving robot's
+          base frame.
       position_m:
         type: array
+        description: Position x, y, z in meters. Required.
         items:
           type: float
         length: 3
       orientation:
         type: object
+        description: Exactly one of xyzw or rpy_deg. Required.
         additional_properties: false
         properties:
           xyzw:
@@ -253,6 +287,9 @@ schema_types:
           - rpy_deg
   cartesian_waypoint:
     type: object
+    description: 'One waypoint of a Cartesian path: a pose and an optional blend radius
+      for that point. When blend_radius_m is set it overrides the move''s default
+      blend radius at this waypoint.'
     additional_properties: false
     required:
     - position_m
@@ -260,13 +297,17 @@ schema_types:
     properties:
       frame_ref:
         schema_ref: '#/schema_types/pose_frame_ref'
+        description: Frame the waypoint is stated in; omitted means the moving robot's
+          base frame.
       position_m:
         type: array
+        description: Position x, y, z in meters. Required.
         items:
           type: float
         length: 3
       orientation:
         type: object
+        description: Exactly one of xyzw or rpy_deg. Required.
         additional_properties: false
         properties:
           xyzw:
@@ -284,49 +325,33 @@ schema_types:
           - rpy_deg
       blend_radius_m:
         type: float
+        description: Blend radius in meters, 0 or more; overrides the move's blend_radius_m
+          for this waypoint only.
         constraints:
           min_inclusive: 0.0
   motion_reference:
     type: object
+    description: 'Names what a motion targets: a component frame or collision body,
+      a scene resource, a runtime object, an absolute pose, or the cell frame. The
+      type decides which other field is required; cell_frame needs none.'
     additional_properties: false
     required:
     - type
     properties:
       type:
         type: enum
+        description: component_frame, component_body, scene_resource, runtime_object,
+          pose or cell_frame; each type allows only its matching field.
         values:
-        - frame_role
-        - component_body_role
+        - component_frame
+        - component_body
         - scene_resource
         - runtime_object
         - pose
         - cell_frame
-      frame_role_id:
-        type: string
-        semantic_type: frame_role
-        semantic_scope_parameter: target_role
-        required_when:
-          type: frame_role
-        allowed_when:
-          type: frame_role
-        description: A frame role of target_role when it is named, otherwise of the
-          moving robot (the node's target_role).
-      target_role:
-        type: string
-        semantic_type: target_role
-        description: The robot that owns frame_role_id; absent means the moving robot.
-          Another robot's frame is sampled once when the motion is admitted.
-        allowed_when:
-          type: frame_role
-      collision_body_role_id:
-        type: string
-        semantic_type: collision_body_role
-        required_when:
-          type: component_body_role
-        allowed_when:
-          type: component_body_role
       scene_resource_id:
         type: string
+        description: Scene resource id; required for type scene_resource.
         semantic_type: scene_resource
         required_when:
           type: scene_resource
@@ -334,18 +359,38 @@ schema_types:
           type: scene_resource
       runtime_object_id:
         type: string
+        description: Runtime object id, the object bound to a scene resource during
+          a pick; required for type runtime_object.
         required_when:
           type: runtime_object
         allowed_when:
           type: runtime_object
       pose:
         schema_ref: '#/schema_types/motion_pose'
+        description: Absolute pose; required for type pose.
         required_when:
           type: pose
         allowed_when:
           type: pose
+      frame:
+        schema_ref: '#/schema_types/frame_reference'
+        description: Component frame reference; required for type component_frame.
+        required_when:
+          type: component_frame
+        allowed_when:
+          type: component_frame
+      body:
+        schema_ref: '#/schema_types/collision_body_reference'
+        description: Collision body reference; required for type component_body.
+        required_when:
+          type: component_body
+        allowed_when:
+          type: component_body
   pose_authoring_input:
     type: object
+    description: 'Authoring form of a pose that the Draft resolves into a stored_pose.
+      It needs frame_ref and position_m, plus exactly one orientation form: absolute,
+      or relative to the current orientation.'
     additional_properties: false
     required:
     - frame_ref
@@ -354,13 +399,18 @@ schema_types:
     properties:
       frame_ref:
         schema_ref: '#/schema_types/pose_frame_ref'
+        description: Frame the position is stated in; carried into the resolved stored
+          pose.
       position_m:
         type: array
+        description: Position x, y, z in meters, carried into the resolved stored
+          pose.
         items:
           type: float
         length: 3
       orientation:
         type: object
+        description: 'Absolute orientation: exactly one of xyzw or rpy_deg.'
         additional_properties: false
         properties:
           xyzw:
@@ -378,25 +428,32 @@ schema_types:
           - rpy_deg
       rotate_local_rpy_deg:
         type: array
+        description: Roll, pitch and yaw rotation in degrees composed in the local
+          frame of the current orientation; needs an existing orientation.
         items:
           type: float
         length: 3
         requires_current_value: true
       rotate_world_rpy_deg:
         type: array
+        description: Roll, pitch and yaw rotation in degrees composed in the world
+          frame onto the current orientation; needs an existing orientation.
         items:
           type: float
         length: 3
         requires_current_value: true
       rpy_delta_deg:
         type: array
+        description: Component-wise addition of degrees to the current roll, pitch
+          and yaw; this is not a physical rotation composition.
         items:
           type: float
         length: 3
         requires_current_value: true
-        description: Component-wise authored RPY field addition, not physical composition.
       orientation_from:
         schema_ref: '#/schema_types/orientation_reference'
+        description: Takes the orientation from the current pose or a scene resource;
+          a target_frame source cannot be resolved in a Draft.
     exactly_one:
     - - orientation
       - rotate_local_rpy_deg
@@ -405,6 +462,7 @@ schema_types:
       - orientation_from
   joint_target:
     type: object
+    description: 'A target angle for one joint: the joint name and a position in radians.'
     additional_properties: false
     required:
     - joint_name
@@ -412,43 +470,59 @@ schema_types:
     properties:
       joint_name:
         type: string
+        description: Name of the joint, as the source component declares it.
         semantic_type: source_joint
       position_rad:
         type: float
   joint_target_list:
     type: array
+    description: An ordered list of 1 to 256 joint_target entries.
     min_items: 1
     max_items: 256
     items:
       schema_ref: '#/schema_types/joint_target'
   joint_dynamics_limit:
     type: object
+    description: Velocity, acceleration and jerk limits for one joint. Each field
+      is optional, and each one that is set must be greater than 0.
     additional_properties: false
     properties:
       max_velocity_rad_s:
         type: float
+        description: Velocity limit in radians per second, above 0 when set.
         constraints:
           min_exclusive: 0.0
       max_acceleration_rad_s2:
         type: float
+        description: Acceleration limit in radians per second squared, above 0 when
+          set.
         constraints:
           min_exclusive: 0.0
       max_jerk_rad_s3:
         type: float
+        description: Jerk limit in radians per second cubed, above 0 when set.
         constraints:
           min_exclusive: 0.0
   per_joint_dynamics_limits:
     type: object
+    description: A map from joint name to joint_dynamics_limit; each key names the
+      joint that the limit applies to.
     additional_properties:
       schema_ref: '#/schema_types/joint_dynamics_limit'
   cartesian_path:
     type: array
+    description: An ordered list of 2 to 4096 cartesian_waypoint entries that a motion
+      follows as one path.
     min_items: 2
     max_items: 4096
     items:
       schema_ref: '#/schema_types/cartesian_waypoint'
   pose_offset_envelope:
     type: object
+    description: 'Per-axis bounds of a grid of pose offsets: position in meters and
+      orientation in roll, pitch and yaw degrees. The grid is sampled at the synthesis
+      step sizes; the orientation bounds are not sampled when force_vertical_pick
+      is true.'
     additional_properties: false
     required:
     - position_min_m
@@ -458,26 +532,32 @@ schema_types:
     properties:
       position_min_m:
         type: array
+        description: Lower bound of the x, y, z offsets in meters.
         items:
           type: float
         length: 3
       position_max_m:
         type: array
+        description: Upper bound of the x, y, z offsets in meters.
         items:
           type: float
         length: 3
       orientation_rpy_min_deg:
         type: array
+        description: Lower bound of the roll, pitch and yaw offsets in degrees.
         items:
           type: float
         length: 3
       orientation_rpy_max_deg:
         type: array
+        description: Upper bound of the roll, pitch and yaw offsets in degrees.
         items:
           type: float
         length: 3
   pose_offset:
     type: object
+    description: 'A single pose offset: a position change in meters and a roll, pitch
+      and yaw change in degrees.'
     additional_properties: false
     required:
     - position_m
@@ -485,16 +565,21 @@ schema_types:
     properties:
       position_m:
         type: array
+        description: Offset x, y, z in meters.
         items:
           type: float
         length: 3
       rpy_deg:
         type: array
+        description: Offset roll, pitch and yaw in degrees.
         items:
           type: float
         length: 3
   pick_synthesis:
     type: object
+    description: 'Settings for generating pick candidates: pick and approach offset
+      grids, the base tool orientation, sampling steps, a vertical-pick option, a
+      minimum TCP height, the candidate count limit and the search strategy.'
     additional_properties: false
     required:
     - pick_offset_envelope
@@ -502,102 +587,164 @@ schema_types:
     properties:
       pick_offset_envelope:
         schema_ref: '#/schema_types/pose_offset_envelope'
+        description: Offset grid for the pick pose.
       approach_offset_envelope:
         schema_ref: '#/schema_types/pose_offset_envelope'
+        description: Offset grid for the approach pose.
       pick_offset_reference:
         schema_ref: '#/schema_types/motion_reference'
+        description: Motion reference that gives the frame in which the pick offsets
+          are applied. Optional.
       approach_offset_reference:
         schema_ref: '#/schema_types/motion_reference'
+        description: Motion reference that gives the frame in which the approach offsets
+          are applied. Optional.
       base_tool_orientation_rpy_deg:
         type: array
+        description: 'Base tool orientation in roll, pitch and yaw degrees; the grid''s
+          rotation offsets are added to it. Omitted: 180, 0, 0.'
+        default:
+        - 180.0
+        - 0.0
+        - 0.0
         items:
           type: float
         length: 3
       translation_step_m:
         type: float
+        description: 'Sampling step of the position offsets in meters, above 0. Omitted:
+          0.01.'
+        default: 0.01
         constraints:
           min_exclusive: 0.0
       rotation_step_deg:
         type: float
+        description: 'Sampling step of the rotation offsets in degrees, above 0. Omitted:
+          15. Not used when force_vertical_pick is true.'
+        default: 15.0
         constraints:
           min_exclusive: 0.0
       force_vertical_pick:
         type: bool
+        description: 'When true, pick and approach orientations are a vertical-down
+          orientation derived from the object and no rotation offsets are sampled.
+          Omitted: false.'
+        default: false
       min_tcp_z_m:
         type: float
+        description: 'Minimum TCP height in meters, 0 or more. Pick and approach poses
+          below it are raised to it. Omitted: no minimum.'
         constraints:
           min_inclusive: 0.0
       maximum_candidate_count:
         type: int
+        description: 'Upper bound on generated candidates, from 1 to 4096. Omitted:
+          4096.'
+        default: 4096
         constraints:
           min_inclusive: 1
           max_inclusive: 4096
       search_strategy:
         type: enum
+        description: 'first_feasible takes the first candidate that plans; best_cost
+          plans all candidates and takes the lowest planning score. Omitted: first_feasible.'
+        default: first_feasible
         values:
         - first_feasible
         - best_cost
   pick_motion_options:
     type: object
+    description: Speed, acceleration, tolerance, timeout and cache options for the
+      approach, descend and retreat motions of a pick. Every field is optional.
     additional_properties: false
     properties:
       approach_velocity_scale:
         type: float
+        description: 'Velocity scale from above 0 to 1 for the approach motion. Omitted:
+          0.35.'
+        default: 0.35
         constraints:
           min_exclusive: 0.0
           max_inclusive: 1.0
       descend_velocity_scale:
         type: float
+        description: 'Velocity scale from above 0 to 1 for the descend motion. Omitted:
+          0.35.'
+        default: 0.35
         constraints:
           min_exclusive: 0.0
           max_inclusive: 1.0
       retreat_velocity_scale:
         type: float
+        description: 'Velocity scale from above 0 to 1 for the retreat motion. Omitted:
+          0.35.'
+        default: 0.35
         constraints:
           min_exclusive: 0.0
           max_inclusive: 1.0
       acceleration_scale:
         type: float
+        description: 'Acceleration scale from above 0 to 1. Omitted: 1.0.'
+        default: 1.0
         constraints:
           min_exclusive: 0.0
           max_inclusive: 1.0
       max_tcp_linear_speed_mps:
         type: float
+        description: 'Cap on TCP linear speed in meters per second, above 0. Omitted:
+          no cap.'
         constraints:
           min_exclusive: 0.0
       joint_position_tol_rad:
         type: float
+        description: 'Joint position tolerance in radians, 0 or more. Omitted: 0.05.'
+        default: 0.05
         constraints:
           min_inclusive: 0.0
       translation_tol_m:
         type: float
+        description: 'Translation tolerance in meters, 0 or more. Omitted: 0.005.'
+        default: 0.005
         constraints:
           min_inclusive: 0.0
       rotation_tol_rad:
         type: float
+        description: 'Rotation tolerance in radians, 0 or more. Omitted: 0.05.'
+        default: 0.05
         constraints:
           min_inclusive: 0.0
       planning_timeout_s:
         type: float
+        description: 'Planning timeout in seconds, above 0. Omitted: 2.0.'
+        default: 2.0
         constraints:
           min_exclusive: 0.0
       execution_timeout_s:
         type: float
+        description: 'Execution timeout in seconds, above 0. Omitted: 10.0.'
+        default: 10.0
         constraints:
           min_exclusive: 0.0
       cache_mode:
         type: enum
+        description: 'default allows reuse of cached results; disable skips the cache.
+          Omitted: disable.'
+        default: disable
         values:
         - default
         - disable
   shape:
     type: object
+    description: A box, sphere, cylinder or mesh shape. The type decides which dimension
+      or resource fields are required and which are not allowed.
     additional_properties: false
     required:
     - type
     properties:
       type:
         type: enum
+        description: box, sphere, cylinder or mesh; each type requires its own fields
+          and forbids the others.
         values:
         - box
         - sphere
@@ -605,6 +752,8 @@ schema_types:
         - mesh
       box_dimensions_m:
         type: array
+        description: Box size in meters along x, y, z, each above 0; required for
+          box.
         items:
           type: float
           constraints:
@@ -616,6 +765,7 @@ schema_types:
           type: box
       sphere_radius_m:
         type: float
+        description: Sphere radius in meters, above 0; required for sphere.
         constraints:
           min_exclusive: 0.0
         required_when:
@@ -624,6 +774,7 @@ schema_types:
           type: sphere
       cylinder_radius_m:
         type: float
+        description: Cylinder radius in meters, above 0; required for cylinder.
         constraints:
           min_exclusive: 0.0
         required_when:
@@ -632,6 +783,7 @@ schema_types:
           type: cylinder
       cylinder_height_m:
         type: float
+        description: Cylinder height in meters, above 0; required for cylinder.
         constraints:
           min_exclusive: 0.0
         required_when:
@@ -640,12 +792,14 @@ schema_types:
           type: cylinder
       mesh_resource_uri:
         type: string
+        description: URI of the mesh resource; required for mesh.
         required_when:
           type: mesh
         allowed_when:
           type: mesh
       mesh_scale:
         type: array
+        description: Scale factors along x, y, z, each above 0; allowed only for mesh.
         items:
           type: float
           constraints:
@@ -655,28 +809,23 @@ schema_types:
           type: mesh
   mock_signal_simulation:
     type: object
+    description: 'A simulated boolean signal for mock runs: the signal, its start
+      value and an optional single change to a new value after a delay.'
     additional_properties: false
     required:
     - signal
     - start_value
     properties:
       signal:
-        type: object
-        additional_properties: false
-        required:
-        - target_role
-        - resource_role
-        properties:
-          target_role:
-            type: string
-            semantic_type: target_role
-          resource_role:
-            type: string
-            semantic_type: resource_role
+        schema_ref: '#/schema_types/signal_reference'
+        description: The signal the simulation drives, as a signal reference.
       start_value:
         type: bool
+        description: Boolean value the signal has at the start of the simulation.
       change:
         type: object
+        description: 'Optional. An object with after_ms (delay in milliseconds, 0
+          or more) and value (the boolean the signal takes). Omitted: no change.'
         additional_properties: false
         required:
         - after_ms
@@ -690,39 +839,110 @@ schema_types:
             type: bool
   planner_override:
     type: object
+    description: Optional per-motion override of the Deployment's RRT planner settings.
+      Only the members that are set replace the Deployment defaults; the others keep
+      their Deployment values.
     additional_properties: false
     properties:
       search:
         type: enum
+        description: rrt or rrt_connect; rrt_connect selects the RRT-Connect search.
         values:
         - rrt
         - rrt_connect
       optimize:
         type: enum
+        description: first returns the first path found; rrt_star rewires toward a
+          cheaper path; best_of_n plans n first-path candidates and keeps the shortest.
         values:
         - first
         - rrt_star
         - best_of_n
       n:
         type: int
+        description: Number of plans for best_of_n, from 2 to 32. Not used by the
+          other optimize values.
         constraints:
           min_inclusive: 2
           max_inclusive: 32
       collision_check_step_rad:
         type: float
+        description: Collision-check sampling step in radians, above 0 and at most
+          0.2.
         constraints:
           min_exclusive: 0.0
           max_inclusive: 0.2
       max_nodes:
         type: int
+        description: Node budget of the RRT search, from 100 to 1000000.
         constraints:
           min_inclusive: 100
           max_inclusive: 1000000
+  target_reference:
+    type: object
+    description: Names one command target of a controllable component by component
+      id and command target id.
+    semantic_type: target_reference
+    additional_properties: false
+    required:
+    - component_id
+    - command_target_id
+    properties:
+      component_id:
+        type: string
+      command_target_id:
+        type: string
+        description: Command target identifier within the component.
+  signal_reference:
+    type: object
+    description: Names one signal of a component by component id and signal name.
+    semantic_type: signal_reference
+    additional_properties: false
+    required:
+    - component_id
+    - signal_name
+    properties:
+      component_id:
+        type: string
+      signal_name:
+        type: string
+        description: Signal name on the component.
+  frame_reference:
+    type: object
+    description: Names one frame of a component by component id and frame id.
+    semantic_type: frame_reference
+    additional_properties: false
+    required:
+    - component_id
+    - frame_id
+    properties:
+      component_id:
+        type: string
+      frame_id:
+        type: string
+        description: Frame identifier within the component.
+  collision_body_reference:
+    type: object
+    description: Names one collision body of a component by component id and collision
+      body id.
+    semantic_type: collision_body_reference
+    additional_properties: false
+    required:
+    - component_id
+    - collision_body_id
+    properties:
+      component_id:
+        type: string
+      collision_body_id:
+        type: string
+        description: Collision body identifier within the component.
 entries:
 - id: sequence
   name: Sequence
   category: control_flow
-  description: Tick children in order until one fails or all succeed.
+  description: Runs its children in order and succeeds when all of them succeed; it
+    fails at the first child that fails. It resumes at the child that was running
+    on the previous tick, and takes 1 to 4096 children.
   stability: stable
   tags:
   - control_flow
@@ -747,7 +967,9 @@ entries:
 - id: fallback
   name: Fallback
   category: control_flow
-  description: Tick children in order until one succeeds or all fail.
+  description: Runs its children in order and succeeds at the first child that succeeds;
+    it fails only when every child fails. It resumes at the child that was running
+    on the previous tick, and takes 1 to 4096 children.
   stability: stable
   tags:
   - control_flow
@@ -772,7 +994,9 @@ entries:
 - id: parallel
   name: Parallel
   category: control_flow
-  description: Tick children concurrently under one explicit success policy.
+  description: Ticks all of its children on every tick and decides its result by success_policy.
+    Any child that fails fails the node under either policy, and takes 1 to 4096 children.
+    With one, the first child to succeed ends the node and stops children still running.
   stability: stable
   tags:
   - control_flow
@@ -786,6 +1010,9 @@ entries:
   parameters:
   - id: success_policy
     required: false
+    description: 'Success rule: all needs every child to succeed; one needs any child
+      to succeed. Omitted: all. An invalid value fails the attempt before any child
+      runs.'
     default: all
     schema:
       type: enum
@@ -805,7 +1032,9 @@ entries:
 - id: inverter
   name: Inverter
   category: control_flow
-  description: Invert a child success or failure result.
+  description: 'Inverts the result of its single child: a child success becomes a
+    failure and a child failure becomes a success. A running child stays running,
+    and it takes exactly one child.'
   stability: stable
   tags:
   - control_flow
@@ -830,7 +1059,9 @@ entries:
 - id: repeat
   name: Repeat
   category: control_flow
-  description: Repeat one child a finite number of times or indefinitely (-1).
+  description: Runs its single child again after each success and succeeds after num_cycles
+    successful runs; a child failure fails the node at once. With -1 it never succeeds
+    by itself and ends only on a child failure or a stop.
   stability: stable
   tags:
   - control_flow
@@ -844,6 +1075,8 @@ entries:
   parameters:
   - id: num_cycles
     required: false
+    description: 'Number of successful child runs before success, from 1 to 1000000,
+      or -1 for no limit. 0 is rejected. Omitted: -1. Resolved once per attempt.'
     default: -1
     schema:
       type: int
@@ -864,7 +1097,9 @@ entries:
 - id: retry
   name: Retry
   category: control_flow
-  description: Retry one child a finite number of attempts or indefinitely (-1).
+  description: Runs its single child and runs it again after each failure, so the
+    node succeeds on the first child success. After the last allowed failure the node
+    fails; a child success passes straight through.
   stability: stable
   tags:
   - control_flow
@@ -878,6 +1113,9 @@ entries:
   parameters:
   - id: num_attempts
     required: false
+    description: 'Total child runs allowed before the node fails, from 1 to 1000000,
+      or -1 for no limit. 0 is rejected. Omitted: -1. Resolved when the node starts
+      an attempt.'
     default: -1
     schema:
       type: int
@@ -898,13 +1136,11 @@ entries:
 - id: timer
   name: Timer
   category: control_flow
-  description: 'Delay for duration_s seconds of Program time, then succeed. Program
-    time is monotonic and stands still while the Program is halted; Execute after
-    Halt continues the same delay. By default (duration_while_held: pause) time the
-    node itself is held by an operator Stop does not count and the delay resumes with
-    the remaining time; with duration_while_held: count held time counts too. A node
-    whose stop policy keeps it running during a Stop keeps counting. Program Stop
-    and Reset end the delay.'
+  description: 'Succeeds after duration_s seconds of Program time. Program time stands
+    still while the Program is halted, and by default the time an operator Stop holds
+    this node is also left out of the delay. The wait itself cannot fail: the node
+    fails only when duration_s cannot be resolved, before the delay starts. A Program
+    Stop or Reset ends the delay as interrupted.'
   stability: stable
   tags:
   - control_flow
@@ -918,6 +1154,8 @@ entries:
   parameters:
   - id: duration_s
     required: true
+    description: Delay in seconds of Program time. Required; greater than 0 and at
+      most 86400.
     schema:
       type: float
       constraints:
@@ -925,6 +1163,8 @@ entries:
         max_inclusive: 86400.0
   - id: duration_while_held
     required: false
+    description: 'pause leaves out time an operator Stop holds this node; count includes
+      it. Omitted: pause. Resolved once per attempt.'
     default: pause
     schema:
       type: enum
@@ -938,6 +1178,7 @@ entries:
     owner_api: orchestration.clock
   outcomes:
     success: elapsed
+    failure: input_unavailable
     interrupted: cancelled
   runners:
     py_trees:
@@ -947,7 +1188,9 @@ entries:
 - id: motion.move_to_joint_target
   name: Move to joint target
   category: motion
-  description: Plan, validate, and execute a target-scoped source-joint goal.
+  description: Moves the robot to a set of joint targets. It plans, validates and
+    executes the joint trajectory, and fails when planning, validation or execution
+    fails after any automatic retries.
   stability: stable
   tags:
   - motion
@@ -960,27 +1203,31 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) that the move runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that the move is stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the move uses; omitted means current, the robot's Active TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
+    description: Joint targets, each a joint name with a position in radians; deltas
+      from the start state when target_mode is relative.
     schema_ref: '#/schema_types/joint_target_list'
   - id: target_mode
     required: false
+    description: absolute reaches the stated joint positions; relative applies them
+      as offsets from the start state.
     default: absolute
     schema:
       type: enum
@@ -989,9 +1236,12 @@ entries:
       - relative
   - id: planner
     required: false
+    description: Planner settings for this move; only the fields set here override
+      the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: velocity_scale
     required: false
+    description: Velocity scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1000,6 +1250,7 @@ entries:
         max_inclusive: 1.0
   - id: acceleration_scale
     required: false
+    description: Acceleration scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1008,12 +1259,16 @@ entries:
         max_inclusive: 1.0
   - id: max_tcp_linear_speed_mps
     required: false
+    description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
+      limit applies. Omitted uses the Deployment limit.
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: clearance_m
     required: false
+    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
+      the Deployment clearance.
     schema:
       type: float
       constraints:
@@ -1021,10 +1276,14 @@ entries:
         max_inclusive: 0.05
   - id: per_joint_dynamics_limits
     required: false
+    description: Per-joint velocity, acceleration and jerk caps keyed by joint name.
+      Empty means no per-move caps.
     default: {}
     schema_ref: '#/schema_types/per_joint_dynamics_limits'
   - id: joint_position_tol_rad
     required: false
+    description: Joint tolerance in radians for the start-state check and cached trajectory
+      matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1032,6 +1291,8 @@ entries:
         min_inclusive: 0.0
   - id: translation_tol_m
     required: false
+    description: Translation tolerance in meters for pose checks in planning and cached
+      trajectory matching; default 0.005.
     default: 0.005
     schema:
       type: float
@@ -1039,6 +1300,8 @@ entries:
         min_inclusive: 0.0
   - id: rotation_tol_rad
     required: false
+    description: Rotation tolerance in radians for pose checks in planning and cached
+      trajectory matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1046,6 +1309,7 @@ entries:
         min_inclusive: 0.0
   - id: planning_timeout_s
     required: false
+    description: Seconds allowed for planning before the attempt fails; default 2.0.
     default: 2.0
     schema:
       type: float
@@ -1053,6 +1317,8 @@ entries:
         min_exclusive: 0.0
   - id: execution_timeout_s
     required: false
+    description: Seconds allowed for executing the trajectory before the attempt fails;
+      default 10.0.
     default: 10.0
     schema:
       type: float
@@ -1060,6 +1326,8 @@ entries:
         min_exclusive: 0.0
   - id: cache_mode
     required: false
+    description: default reuses a stored trajectory when it still matches the scene
+      and start state; disable always plans fresh.
     default: default
     schema:
       type: enum
@@ -1068,15 +1336,21 @@ entries:
       - disable
   - id: contact_policy_id
     required: false
+    description: Contact policy that makes planning and validation contact-tolerant
+      for this move. Omit for free-space motion.
     schema:
       type: string
   - id: contact_scene_resource_id
     required: false
+    description: Scene resource the contact policy applies to. Must be given together
+      with contact_policy_id.
     schema:
       type: string
       semantic_type: scene_resource
   - id: automatic_retries
     required: false
+    description: Automatic retries after a planning no-effect or nominal collision
+      stop, 0 to 10; default 3. Relative joint moves are never retried.
     default: 3
     schema:
       type: int
@@ -1085,6 +1359,7 @@ entries:
         max_inclusive: 10
   - id: automatic_retry_delay_s
     required: false
+    description: Seconds to wait before each automatic retry, 0 to 60; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1093,6 +1368,8 @@ entries:
         max_inclusive: 60.0
   - id: preemption_priority
     required: false
+    description: Priority from 0 to 100 for taking over the robot. Equal or higher
+      priority preempts a running move; lower is refused. Default 0.
     default: 0
     schema:
       type: int
@@ -1101,6 +1378,8 @@ entries:
         max_inclusive: 100
   - id: preempted_result
     required: false
+    description: 'Node result when this move is preempted or refused by priority:
+      success or failure; default failure.'
     default: failure
     schema:
       type: enum
@@ -1110,25 +1389,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.joint_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1145,7 +1424,10 @@ entries:
 - id: motion.move_to_pose
   name: Move to pose
   category: motion
-  description: Plan, validate, and execute a portable pose goal.
+  description: Moves the robot's TCP to a pose. It plans, validates and executes the
+    motion, and fails when planning, validation or execution fails after any automatic
+    retries. The goal is an absolute pose, or an offset from target_reference when
+    target_mode is relative.
   stability: stable
   tags:
   - motion
@@ -1158,27 +1440,30 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) that the move runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that absolute poses are stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the move uses; omitted means current, the robot's Active TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
+    description: Pose to reach, with its frame_ref (default the robot base frame);
+      an offset from target_reference when relative.
     schema_ref: '#/schema_types/motion_pose'
   - id: target_mode
     required: false
+    description: absolute reaches the stated pose; relative offsets it from target_reference.
     default: absolute
     schema:
       type: enum
@@ -1187,15 +1472,22 @@ entries:
       - relative
   - id: target_reference
     required: false
+    description: 'Origin of a relative offset: the pose the offset is applied to.
+      Required for relative moves.'
     schema_ref: '#/schema_types/motion_reference'
   - id: offset_reference
     required: false
+    description: Pose whose orientation gives the axes of a relative offset; omitted
+      uses the target_reference orientation.
     schema_ref: '#/schema_types/motion_reference'
   - id: planner
     required: false
+    description: Planner settings for this move; only the fields set here override
+      the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: velocity_scale
     required: false
+    description: Velocity scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1204,6 +1496,7 @@ entries:
         max_inclusive: 1.0
   - id: acceleration_scale
     required: false
+    description: Acceleration scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1212,12 +1505,16 @@ entries:
         max_inclusive: 1.0
   - id: max_tcp_linear_speed_mps
     required: false
+    description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
+      limit applies. Omitted uses the Deployment limit.
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: clearance_m
     required: false
+    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
+      the Deployment clearance.
     schema:
       type: float
       constraints:
@@ -1225,10 +1522,14 @@ entries:
         max_inclusive: 0.05
   - id: per_joint_dynamics_limits
     required: false
+    description: Per-joint velocity, acceleration and jerk caps keyed by joint name.
+      Empty means no per-move caps.
     default: {}
     schema_ref: '#/schema_types/per_joint_dynamics_limits'
   - id: joint_position_tol_rad
     required: false
+    description: Joint tolerance in radians for the start-state check and cached trajectory
+      matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1236,6 +1537,8 @@ entries:
         min_inclusive: 0.0
   - id: translation_tol_m
     required: false
+    description: Translation tolerance in meters for pose checks in planning and cached
+      trajectory matching; default 0.005.
     default: 0.005
     schema:
       type: float
@@ -1243,6 +1546,8 @@ entries:
         min_inclusive: 0.0
   - id: rotation_tol_rad
     required: false
+    description: Rotation tolerance in radians for pose checks in planning and cached
+      trajectory matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1250,6 +1555,7 @@ entries:
         min_inclusive: 0.0
   - id: planning_timeout_s
     required: false
+    description: Seconds allowed for planning before the attempt fails; default 2.0.
     default: 2.0
     schema:
       type: float
@@ -1257,6 +1563,8 @@ entries:
         min_exclusive: 0.0
   - id: execution_timeout_s
     required: false
+    description: Seconds allowed for executing the trajectory before the attempt fails;
+      default 10.0.
     default: 10.0
     schema:
       type: float
@@ -1264,6 +1572,8 @@ entries:
         min_exclusive: 0.0
   - id: cache_mode
     required: false
+    description: default reuses a stored trajectory when it still matches the scene
+      and start state; disable always plans fresh.
     default: default
     schema:
       type: enum
@@ -1272,15 +1582,21 @@ entries:
       - disable
   - id: contact_policy_id
     required: false
+    description: Contact policy that makes planning and validation contact-tolerant
+      for this move. Omit for free-space motion.
     schema:
       type: string
   - id: contact_scene_resource_id
     required: false
+    description: Scene resource the contact policy applies to. Must be given together
+      with contact_policy_id.
     schema:
       type: string
       semantic_type: scene_resource
   - id: automatic_retries
     required: false
+    description: Automatic retries after a planning no-effect or nominal collision
+      stop, 0 to 10; default 3. Zero disables retries.
     default: 3
     schema:
       type: int
@@ -1289,6 +1605,7 @@ entries:
         max_inclusive: 10
   - id: automatic_retry_delay_s
     required: false
+    description: Seconds to wait before each automatic retry, 0 to 60; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1297,6 +1614,8 @@ entries:
         max_inclusive: 60.0
   - id: preemption_priority
     required: false
+    description: Priority from 0 to 100 for taking over the robot. Equal or higher
+      priority preempts a running move; lower is refused. Default 0.
     default: 0
     schema:
       type: int
@@ -1305,6 +1624,8 @@ entries:
         max_inclusive: 100
   - id: preempted_result
     required: false
+    description: 'Node result when this move is preempted or refused by priority:
+      success or failure; default failure.'
     default: failure
     schema:
       type: enum
@@ -1314,25 +1635,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1349,7 +1670,10 @@ entries:
 - id: motion.follow_cartesian_path
   name: Follow Cartesian path
   category: motion
-  description: Plan, validate, and execute a portable ordered Cartesian path.
+  description: Moves the TCP through an ordered list of waypoints as one Cartesian
+    path. It plans, validates and executes the whole path, and fails when the path
+    cannot be followed in Cartesian space unless the fallback policy allows a joint-space
+    plan.
   stability: stable
   tags:
   - motion
@@ -1362,27 +1686,31 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) that the path runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that absolute waypoints are stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the path uses; omitted means current, the robot's Active TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
   - id: path
     required: true
+    description: Ordered waypoint poses, at least two, all in one frame. Relative
+      waypoints are offsets from target_reference.
     schema_ref: '#/schema_types/cartesian_path'
   - id: target_mode
     required: false
+    description: absolute reaches the stated waypoints; relative offsets them from
+      target_reference.
     default: absolute
     schema:
       type: enum
@@ -1391,12 +1719,17 @@ entries:
       - relative
   - id: target_reference
     required: false
+    description: Origin of relative waypoint offsets. Required for relative paths.
     schema_ref: '#/schema_types/motion_reference'
   - id: offset_reference
     required: false
+    description: Pose whose orientation gives the axes of relative offsets; omitted
+      uses the target_reference orientation.
     schema_ref: '#/schema_types/motion_reference'
   - id: max_translation_step_m
     required: false
+    description: Largest translation in meters between planned path samples; default
+      0.005.
     default: 0.005
     schema:
       type: float
@@ -1404,6 +1737,8 @@ entries:
         min_exclusive: 0.0
   - id: max_rotation_step_rad
     required: false
+    description: Largest rotation in radians between planned path samples; default
+      0.05.
     default: 0.05
     schema:
       type: float
@@ -1411,6 +1746,7 @@ entries:
         min_exclusive: 0.0
   - id: max_angular_speed_rad_s
     required: false
+    description: Angular speed limit for the path in rad/s; default 0.5.
     default: 0.5
     schema:
       type: float
@@ -1418,6 +1754,7 @@ entries:
         min_exclusive: 0.0
   - id: max_linear_acceleration_mps2
     required: false
+    description: Linear acceleration limit for the path in m/s2; default 0.5.
     default: 0.5
     schema:
       type: float
@@ -1425,6 +1762,7 @@ entries:
         min_exclusive: 0.0
   - id: max_angular_acceleration_rad_s2
     required: false
+    description: Angular acceleration limit for the path in rad/s2; default 2.5.
     default: 2.5
     schema:
       type: float
@@ -1432,6 +1770,8 @@ entries:
         min_exclusive: 0.0
   - id: blend_radius_m
     required: false
+    description: Blend radius in meters at waypoints that set none; default 0.0, which
+      gives no blending.
     default: 0.0
     schema:
       type: float
@@ -1439,6 +1779,8 @@ entries:
         min_inclusive: 0.0
   - id: fallback_policy
     required: false
+    description: fail_closed (default) fails when the path cannot be followed in Cartesian
+      space. allow_joint_space_fallback may plan it in joint space instead.
     default: fail_closed
     schema:
       type: enum
@@ -1447,6 +1789,7 @@ entries:
       - allow_joint_space_fallback
   - id: velocity_scale
     required: false
+    description: Velocity scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1455,6 +1798,7 @@ entries:
         max_inclusive: 1.0
   - id: acceleration_scale
     required: false
+    description: Acceleration scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1463,12 +1807,16 @@ entries:
         max_inclusive: 1.0
   - id: max_tcp_linear_speed_mps
     required: false
+    description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
+      limit applies. Omitted uses the Deployment limit.
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: clearance_m
     required: false
+    description: Collision clearance in meters for this path, 0 to 0.05. Omitted keeps
+      the Deployment clearance.
     schema:
       type: float
       constraints:
@@ -1476,6 +1824,8 @@ entries:
         max_inclusive: 0.05
   - id: cartesian_timing
     required: false
+    description: constant_speed or time_optimal path timing. Omitted uses the Deployment
+      Cartesian timing.
     schema:
       type: enum
       values:
@@ -1483,10 +1833,14 @@ entries:
       - time_optimal
   - id: per_joint_dynamics_limits
     required: false
+    description: Per-joint velocity, acceleration and jerk caps keyed by joint name.
+      Empty means no per-move caps.
     default: {}
     schema_ref: '#/schema_types/per_joint_dynamics_limits'
   - id: joint_position_tol_rad
     required: false
+    description: Joint tolerance in radians for the start-state check and cached trajectory
+      matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1494,6 +1848,8 @@ entries:
         min_inclusive: 0.0
   - id: translation_tol_m
     required: false
+    description: Translation tolerance in meters for pose checks in planning and cached
+      trajectory matching; default 0.005.
     default: 0.005
     schema:
       type: float
@@ -1501,6 +1857,8 @@ entries:
         min_exclusive: 0.0
   - id: rotation_tol_rad
     required: false
+    description: Rotation tolerance in radians for pose checks in planning and cached
+      trajectory matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1508,6 +1866,7 @@ entries:
         min_exclusive: 0.0
   - id: planning_timeout_s
     required: false
+    description: Seconds allowed for planning before the attempt fails; default 2.0.
     default: 2.0
     schema:
       type: float
@@ -1515,6 +1874,8 @@ entries:
         min_exclusive: 0.0
   - id: execution_timeout_s
     required: false
+    description: Seconds allowed for executing the path before the attempt fails;
+      default 10.0.
     default: 10.0
     schema:
       type: float
@@ -1522,6 +1883,8 @@ entries:
         min_exclusive: 0.0
   - id: cache_mode
     required: false
+    description: default reuses a stored trajectory when it still matches the scene
+      and start state; disable always plans fresh.
     default: default
     schema:
       type: enum
@@ -1530,15 +1893,21 @@ entries:
       - disable
   - id: contact_policy_id
     required: false
+    description: Contact policy that makes planning and validation contact-tolerant
+      for this path. Omit for free-space motion.
     schema:
       type: string
   - id: contact_scene_resource_id
     required: false
+    description: Scene resource the contact policy applies to. Must be given together
+      with contact_policy_id.
     schema:
       type: string
       semantic_type: scene_resource
   - id: automatic_retries
     required: false
+    description: Automatic retries after a planning no-effect or nominal collision
+      stop, 0 to 10; default 3. Zero disables retries.
     default: 3
     schema:
       type: int
@@ -1547,6 +1916,7 @@ entries:
         max_inclusive: 10
   - id: automatic_retry_delay_s
     required: false
+    description: Seconds to wait before each automatic retry, 0 to 60; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1555,6 +1925,8 @@ entries:
         max_inclusive: 60.0
   - id: preemption_priority
     required: false
+    description: Priority from 0 to 100 for taking over the robot. Equal or higher
+      priority preempts a running move; lower is refused. Default 0.
     default: 0
     schema:
       type: int
@@ -1563,6 +1935,8 @@ entries:
         max_inclusive: 100
   - id: preempted_result
     required: false
+    description: 'Node result when this path is preempted or refused by priority:
+      success or failure; default failure.'
     default: failure
     schema:
       type: enum
@@ -1572,25 +1946,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -1607,7 +1981,10 @@ entries:
 - id: motion.move_until_signal
   name: Move until signal
   category: motion
-  description: Execute a portable motion with one operation-scoped interrupt policy.
+  description: Moves the robot to a stored pose and stops it early when the interrupt
+    condition trips. A trip gives the node result set by on_signal, and a move that
+    ends without a trip gives on_no_signal. The node fails when the Stop cannot be
+    proven or the signal source is lost.
   stability: stable
   tags:
   - motion
@@ -1619,36 +1996,44 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) that the move runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that the stored goal pose is stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the move uses; omitted means current, the robot's Active TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
+    description: Stored pose the move goes to; its frame_ref sets the frame it is
+      stated in.
     schema_ref: '#/schema_types/stored_pose'
   - id: planner
     required: false
+    description: Planner settings for this move; only the fields set here override
+      the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: max_tcp_linear_speed_mps
     required: false
+    description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
+      limit applies. Omitted uses the Deployment limit.
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: clearance_m
     required: false
+    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
+      the Deployment clearance.
     schema:
       type: float
       constraints:
@@ -1656,6 +2041,7 @@ entries:
         max_inclusive: 0.05
   - id: velocity_scale
     required: false
+    description: Velocity scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1664,6 +2050,7 @@ entries:
         max_inclusive: 1.0
   - id: acceleration_scale
     required: false
+    description: Acceleration scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1672,6 +2059,8 @@ entries:
         max_inclusive: 1.0
   - id: joint_position_tol_rad
     required: false
+    description: Joint tolerance in radians for the start-state check and cached trajectory
+      matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1679,6 +2068,8 @@ entries:
         min_inclusive: 0.0
   - id: translation_tol_m
     required: false
+    description: Translation tolerance in meters for pose checks in planning and cached
+      trajectory matching; default 0.005.
     default: 0.005
     schema:
       type: float
@@ -1686,6 +2077,8 @@ entries:
         min_inclusive: 0.0
   - id: rotation_tol_rad
     required: false
+    description: Rotation tolerance in radians for pose checks in planning and cached
+      trajectory matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1693,6 +2086,7 @@ entries:
         min_inclusive: 0.0
   - id: planning_timeout_s
     required: false
+    description: Seconds allowed for planning before the attempt fails; default 2.0.
     default: 2.0
     schema:
       type: float
@@ -1700,6 +2094,8 @@ entries:
         min_exclusive: 0.0
   - id: execution_timeout_s
     required: false
+    description: Seconds allowed for executing the move before the attempt fails;
+      default 10.0.
     default: 10.0
     schema:
       type: float
@@ -1707,6 +2103,8 @@ entries:
         min_exclusive: 0.0
   - id: cache_mode
     required: false
+    description: default reuses a stored trajectory when it still matches the scene
+      and start state; disable always plans fresh.
     default: default
     schema:
       type: enum
@@ -1715,6 +2113,8 @@ entries:
       - disable
   - id: stop_mode
     required: true
+    description: 'Primary Stop mode used when the condition trips: spring_back_hold,
+      soft_on_path, hard_deceleration or spring_back_fast.'
     schema:
       type: enum
       values:
@@ -1724,6 +2124,9 @@ entries:
       - spring_back_fast
   - id: activation_mode
     required: false
+    description: 'Arming rule: require_inactive_at_arm (default) needs the signal
+      off at start; fresh_edge_after_arm needs a new change; trip_if_already_active
+      trips if on.'
     default: require_inactive_at_arm
     schema:
       type: enum
@@ -1733,10 +2136,14 @@ entries:
       - trip_if_already_active
   - id: interrupt_condition
     required: true
+    description: Condition that trips the interrupt, built from signals and keys.
+      Keys it reads must declare an initial value.
     schema:
-      type: interrupt_condition
+      type: component_interrupt_condition
   - id: on_signal
     required: false
+    description: 'Node result when the condition trips: success or failure; default
+      success.'
     schema:
       type: enum
       values:
@@ -1744,6 +2151,8 @@ entries:
       - failure
   - id: on_no_signal
     required: false
+    description: 'Node result when the move ends without a trip: success or failure;
+      default success for this node.'
     schema:
       type: enum
       values:
@@ -1751,6 +2160,8 @@ entries:
       - failure
   - id: priority
     required: false
+    description: Priority from 0 to 100 used to choose the Stop when several rules
+      act on the same robot; default 0.
     default: 0
     schema:
       type: int
@@ -1759,14 +2170,20 @@ entries:
         max_inclusive: 100
   - id: stop_entry_stage_id
     required: false
+    description: Stop stage the interrupt's Stop starts from. Omitted means the robot's
+      first stage.
     schema:
       type: string
   - id: success_through_stage_id
     required: false
+    description: Last Stop stage at which a trip still counts as success. Omitted
+      means only the entry stage counts.
     schema:
       type: string
   - id: mock_simulation
     required: false
+    description: 'Scripted signal values for Mock runs: each row sets a signal''s
+      start value and an optional timed change. Omitted means none.'
     schema:
       type: array
       items:
@@ -1774,25 +2191,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: execution.interrupt.resource_scoped
     scope: cell_global
   execution:
@@ -1811,7 +2228,10 @@ entries:
 - id: motion.probe_search
   name: Probe search
   category: motion
-  description: Execute a precision contact search with a scoped interrupt.
+  description: Moves the robot toward a stored pose to find contact and stops it when
+    the interrupt condition trips. It has no automatic retries. A trip gives on_signal,
+    and a move that ends without contact gives on_no_signal, which fails by default;
+    the node also fails when the Stop cannot be proven or the signal source is lost.
   stability: stable
   tags:
   - motion
@@ -1824,36 +2244,44 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) that the probe runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that the stored goal pose is stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the probe uses; omitted means current, the robot's Active TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
+    description: Stored pose the probe moves toward; its frame_ref sets the frame
+      it is stated in.
     schema_ref: '#/schema_types/stored_pose'
   - id: planner
     required: false
+    description: Planner settings for this move; only the fields set here override
+      the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: max_tcp_linear_speed_mps
     required: false
+    description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
+      limit applies. Omitted uses the Deployment limit.
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: clearance_m
     required: false
+    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
+      the Deployment clearance.
     schema:
       type: float
       constraints:
@@ -1861,6 +2289,7 @@ entries:
         max_inclusive: 0.05
   - id: velocity_scale
     required: false
+    description: Velocity scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1869,6 +2298,7 @@ entries:
         max_inclusive: 1.0
   - id: acceleration_scale
     required: false
+    description: Acceleration scaling factor, above 0 up to 1; default 1.0.
     default: 1.0
     schema:
       type: float
@@ -1877,6 +2307,8 @@ entries:
         max_inclusive: 1.0
   - id: joint_position_tol_rad
     required: false
+    description: Joint tolerance in radians for the start-state check and cached trajectory
+      matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1884,6 +2316,8 @@ entries:
         min_inclusive: 0.0
   - id: translation_tol_m
     required: false
+    description: Translation tolerance in meters for pose checks in planning and cached
+      trajectory matching; default 0.005.
     default: 0.005
     schema:
       type: float
@@ -1891,6 +2325,8 @@ entries:
         min_inclusive: 0.0
   - id: rotation_tol_rad
     required: false
+    description: Rotation tolerance in radians for pose checks in planning and cached
+      trajectory matching; default 0.05.
     default: 0.05
     schema:
       type: float
@@ -1898,6 +2334,7 @@ entries:
         min_inclusive: 0.0
   - id: planning_timeout_s
     required: false
+    description: Seconds allowed for planning before the attempt fails; default 2.0.
     default: 2.0
     schema:
       type: float
@@ -1905,6 +2342,8 @@ entries:
         min_exclusive: 0.0
   - id: execution_timeout_s
     required: false
+    description: Seconds allowed for executing the probe before the attempt fails;
+      default 10.0.
     default: 10.0
     schema:
       type: float
@@ -1912,6 +2351,8 @@ entries:
         min_exclusive: 0.0
   - id: cache_mode
     required: false
+    description: default reuses a stored trajectory when it still matches the scene
+      and start state; disable always plans fresh.
     default: default
     schema:
       type: enum
@@ -1920,15 +2361,19 @@ entries:
       - disable
   - id: contact_policy_id
     required: true
+    description: Contact policy the probe may make contact under. Required.
     schema:
       type: string
   - id: contact_scene_resource_id
     required: true
+    description: Scene resource the contact policy applies to. Required.
     schema:
       type: string
       semantic_type: scene_resource
   - id: stop_mode
     required: true
+    description: 'Primary Stop mode used when the condition trips: spring_back_hold,
+      soft_on_path, hard_deceleration or spring_back_fast.'
     schema:
       type: enum
       values:
@@ -1938,10 +2383,14 @@ entries:
       - spring_back_fast
   - id: interrupt_condition
     required: true
+    description: Condition that trips the interrupt, built from signals and keys.
+      Keys it reads must declare an initial value.
     schema:
-      type: interrupt_condition
+      type: component_interrupt_condition
   - id: on_signal
     required: false
+    description: 'Node result when the condition trips: success or failure; default
+      success.'
     schema:
       type: enum
       values:
@@ -1949,6 +2398,8 @@ entries:
       - failure
   - id: on_no_signal
     required: false
+    description: 'Node result when the move ends without a trip: success or failure;
+      default failure for this node.'
     schema:
       type: enum
       values:
@@ -1956,6 +2407,8 @@ entries:
       - failure
   - id: priority
     required: false
+    description: Priority from 0 to 100 used to choose the Stop when several rules
+      act on the same robot; default 0.
     default: 0
     schema:
       type: int
@@ -1964,14 +2417,20 @@ entries:
         max_inclusive: 100
   - id: stop_entry_stage_id
     required: false
+    description: Stop stage the interrupt's Stop starts from. Omitted means the robot's
+      first stage.
     schema:
       type: string
   - id: success_through_stage_id
     required: false
+    description: Last Stop stage at which a trip still counts as success. Omitted
+      means only the entry stage counts.
     schema:
       type: string
   - id: mock_simulation
     required: false
+    description: 'Scripted signal values for Mock runs: each row sets a signal''s
+      start value and an optional timed change. Omitted means none.'
     schema:
       type: array
       items:
@@ -1979,25 +2438,25 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: execution.interrupt.resource_scoped
     scope: cell_global
   - capability_id: execution.interrupt.contact_policy
@@ -2018,7 +2477,9 @@ entries:
 - id: motion.set_tcp
   name: Set TCP
   category: motion
-  description: Set the robot's Active TCP, the TCP its Current moves use.
+  description: Sets the robot's Active TCP, the TCP that later Current moves use.
+    It fails when the Kernel refuses the change, for example while a rule holds the
+    robot's motion scope.
   stability: stable
   tags:
   - motion
@@ -2030,18 +2491,20 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target (component and command target) whose Active TCP is set.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: tcp
     required: true
+    description: 'TCP to make active: current keeps the TCP already active, default_of_target
+      uses the target''s default, entry names an explicit TCP frame.'
     schema_ref: '#/schema_types/tcp_selector'
   required_capabilities:
   - capability_id: execution.trajectory.execute
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   execution:
     blocking: true
@@ -2059,7 +2522,11 @@ entries:
 - id: scene.add_object
   name: Add scene object
   category: scene
-  description: Add one portable logical scene resource.
+  description: Adds one declared scene resource at a pose while the run executes.
+    Every declared scene resource is already present when the run starts, so this
+    succeeds only after the same run removed it (scene.remove_object); to make a resource
+    appear or move whether or not it exists, use scene.upsert_object. Fails when a
+    resource with the same id already exists or the scene commit is rejected.
   stability: stable
   tags:
   - scene
@@ -2072,14 +2539,20 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Declared scene resource to add (scene_draft_add_object); it exists
+      at run start, so remove it earlier in the run (scene.remove_object) or use scene.upsert_object.
     schema:
       type: string
       semantic_type: scene_resource
   - id: shape
     required: true
+    description: Geometry type (box, sphere, cylinder or mesh) with its type-specific
+      dimensions in meters.
     schema_ref: '#/schema_types/shape'
   - id: pose
     required: true
+    description: Position in meters and orientation, expressed in the frame it names
+      (cell frame, target frame or scene resource).
     schema_ref: '#/schema_types/stored_pose'
   required_capabilities:
   - capability_id: scene.shape.box
@@ -2107,7 +2580,10 @@ entries:
 - id: scene.upsert_object
   name: Upsert scene object
   category: scene
-  description: Add or replace one portable logical scene resource.
+  description: Adds one declared scene resource, or replaces its shape and pose when
+    it already exists (declared resources are present when the run starts). Use it
+    to make a resource appear or move during the run. Fails when the existing resource
+    is carried by a target.
   stability: stable
   tags:
   - scene
@@ -2120,14 +2596,19 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the scene resource to add or replace.
     schema:
       type: string
       semantic_type: scene_resource
   - id: shape
     required: true
+    description: Geometry type (box, sphere, cylinder or mesh) with its type-specific
+      dimensions in meters.
     schema_ref: '#/schema_types/shape'
   - id: pose
     required: true
+    description: Position in meters and orientation, expressed in the frame it names
+      (cell frame, target frame or scene resource).
     schema_ref: '#/schema_types/stored_pose'
   required_capabilities:
   - capability_id: scene.shape.box
@@ -2155,7 +2636,10 @@ entries:
 - id: scene.remove_object
   name: Remove scene object
   category: scene
-  description: Remove one logical scene resource.
+  description: Removes one declared scene resource while the run executes; declared
+    resources are present when the run starts, so this works from the first step,
+    and scene.add_object can add the resource back later in the run. Fails when the
+    resource does not exist or is currently attached to a target.
   stability: stable
   tags:
   - scene
@@ -2168,6 +2652,8 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the existing scene resource to remove; it must not
+      be attached.
     schema:
       type: string
       semantic_type: scene_resource
@@ -2189,7 +2675,8 @@ entries:
 - id: scene.update_object_pose
   name: Update scene object pose
   category: scene
-  description: Update one logical scene resource pose.
+  description: Moves one existing logical scene resource to a new pose. Fails when
+    the resource does not exist or is currently attached to a target.
   stability: stable
   tags:
   - scene
@@ -2202,11 +2689,14 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the existing scene resource to move.
     schema:
       type: string
       semantic_type: scene_resource
   - id: pose
     required: true
+    description: New position in meters and orientation, expressed in the frame it
+      names (cell frame, target frame or scene resource).
     schema_ref: '#/schema_types/stored_pose'
   required_capabilities:
   - capability_id: scene.edit.update_pose
@@ -2226,7 +2716,10 @@ entries:
 - id: scene.attach_carried_object
   name: Attach object
   category: scene
-  description: Attach a scene resource to a declared carrier target and frame role.
+  description: Attaches one scene resource to a carrier frame of a target so it moves
+    with that target. Exactly one of carrier_frame_ref and carrier_frame is given.
+    Fails when the resource is missing or already carried, or when the carrier frame
+    or touch bodies do not belong to the target.
   stability: stable
   tags:
   - scene
@@ -2240,35 +2733,41 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the existing scene resource to attach; it must not
+      already be carried.
     schema:
       type: string
       semantic_type: scene_resource
-  - id: target_role
+  - id: target
     required: true
+    description: Component and command target that carries the resource.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: carrier_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: carrier_frame_ref
     required: false
+    description: Frame of the target's component that carries the resource; give exactly
+      one of this and carrier_frame.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: carrier_frame
     required: false
+    description: Active TCP selector for the carrier frame; give exactly one of this
+      and carrier_frame_ref.
     schema_ref: '#/schema_types/active_tcp_carrier_frame'
-  - id: touch_body_roles
+  - id: touch_bodies
     required: true
+    description: Collision bodies of the target allowed to touch the resource, 1 to
+      256 unique bodies of its component.
     schema:
       type: array
       min_items: 1
       max_items: 256
       items:
-        type: string
-        semantic_type: collision_body_role
-        semantic_scope_parameter: target_role
+        schema_ref: '#/schema_types/collision_body_reference'
   - id: grasp_lost_translation_m
     required: false
+    description: Translation in meters from the attached pose that counts as a lost
+      grasp; must be greater than zero, default 0.03.
     default: 0.03
     schema:
       type: float
@@ -2276,6 +2775,8 @@ entries:
         min_exclusive: 0.0
   - id: grasp_lost_rotation_rad
     required: false
+    description: Rotation in radians from the attached pose that counts as a lost
+      grasp; must be greater than zero, default 0.26.
     default: 0.26
     schema:
       type: float
@@ -2283,6 +2784,8 @@ entries:
         min_exclusive: 0.0
   - id: on_grasp_lost
     required: false
+    description: 'Response on a lost grasp: raise_alarm, stop_motion, detach and an
+      optional blackboard set_key. Omitted: alarm, stop and detach, no key.'
     default:
       raise_alarm: true
       stop_motion: true
@@ -2307,7 +2810,7 @@ entries:
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: false
@@ -2323,7 +2826,9 @@ entries:
 - id: scene.detach_carried_object
   name: Detach object
   category: scene
-  description: Set a scene-owned Attached object to Detached at its current pose.
+  description: Detaches one carried scene resource from a target and leaves it at
+    its current pose. Fails when the resource has no single carried-object attachment
+    for that target.
   stability: stable
   tags:
   - scene
@@ -2337,14 +2842,16 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the carried scene resource to detach.
     schema:
       type: string
       semantic_type: scene_resource
-  - id: target_role
+  - id: target
     required: true
+    description: Component and command target whose attachment is released; it must
+      match the attachment.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: scene.edit.attach_detach
     scope: cell_global
@@ -2363,9 +2870,9 @@ entries:
 - id: scene.get_object_pose
   name: Get object pose
   category: scene
-  description: Write one scene resource's current pose to a pose key, expressed in
-    frame (the cell frame when absent); another frame is resolved once by the cell
-    frame resolver.
+  description: Writes one scene resource's current pose to a blackboard key. Fails
+    when the resource is not in the scene or its pose cannot be expressed in the requested
+    frame.
   stability: stable
   tags:
   - scene
@@ -2379,14 +2886,18 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the scene resource whose pose is read.
     schema:
       type: string
       semantic_type: scene_resource
   - id: frame
     required: false
+    description: 'Frame to express the pose in: cell frame, target frame or scene
+      resource; omitted means the cell frame.'
     schema_ref: '#/schema_types/pose_frame_ref'
   - id: output_key
     required: true
+    description: Blackboard key that receives the pose.
     schema:
       type: string
       semantic_type: blackboard_key
@@ -2413,7 +2924,8 @@ entries:
 - id: logic.check_condition
   name: Check condition
   category: logic
-  description: Succeed when one boolean condition is true; fail when it is false.
+  description: Succeeds when its boolean condition is true and fails when it is false.
+    It reads and writes no blackboard keys.
   stability: stable
   tags:
   - logic
@@ -2427,6 +2939,7 @@ entries:
   parameters:
   - id: condition
     required: true
+    description: Boolean value to test, resolved once per attempt. Required.
     schema:
       type: bool
   required_capabilities: []
@@ -2448,7 +2961,9 @@ entries:
 - id: logic.set_value
   name: Set value
   category: logic
-  description: Write one declared blackboard key with a value of the key's type.
+  description: Writes one declared blackboard key and succeeds once the value is stored.
+    The value must match the key's declared type, which is one of bool, float64, int64,
+    stored_pose or string; a failed store fails the node.
   stability: stable
   tags:
   - logic
@@ -2462,11 +2977,15 @@ entries:
   parameters:
   - id: key
     required: true
+    description: Declared blackboard key to write. Its declared type decides which
+      value type is accepted. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: value
     required: true
+    description: Value to store, of the key's declared type. Required; resolved once
+      per attempt.
     schema:
       type: key_value
       value_type_from_key: key
@@ -2505,7 +3024,10 @@ entries:
 - id: logic.check_value
   name: Check value
   category: logic
-  description: Compare one declared blackboard key with a value of the key's type.
+  description: Compares one declared blackboard key with a value and succeeds when
+    the comparison holds, failing otherwise. A missing key fails the node, and a comparison
+    that cannot run also fails it. Only bool, string, float64 and int64 keys can be
+    compared.
   stability: stable
   tags:
   - logic
@@ -2519,11 +3041,15 @@ entries:
   parameters:
   - id: key
     required: true
+    description: Declared blackboard key read when the attempt starts. A key that
+      is still empty fails the node. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: operator
     required: false
+    description: 'Comparison: ==, !=, <, <=, >, or >=. Omitted: ==. Ordering operators
+      need numeric keys; bool and string keys accept only == and !=.'
     default: ==
     schema:
       type: enum
@@ -2536,6 +3062,7 @@ entries:
       - '>='
   - id: value
     required: true
+    description: Value to compare the key against, of the key's declared type. Required.
     schema:
       type: key_value
       value_type_from_key: key
@@ -2546,6 +3073,8 @@ entries:
       - string
   - id: tolerance
     required: false
+    description: 'Allowed absolute difference for == and != on numeric keys; 0 or
+      more. Omitted: exact comparison. Not allowed with ordering operators.'
     schema:
       type: float
       constraints:
@@ -2581,16 +3110,11 @@ entries:
 - id: logic.wait_for_value
   name: Wait for value
   category: logic
-  description: 'Wait until one declared blackboard key compares true. Without timeout_s
-    it waits until the value matches or the run ends; a supplied timeout_s is positive
-    and bounds the wait, counting Program time from the start of the attempt. Program
-    time is monotonic and stands still while the Program is halted; Execute after
-    Halt continues the same wait. By default (timeout_while_held: pause) time the
-    node itself is held by an operator Stop does not count and the wait resumes with
-    the remaining time; with timeout_while_held: count held time counts too. A node
-    whose stop policy keeps it running during a Stop keeps counting. Program Stop
-    and Reset end the wait; an operator Stop holds it according to the node''s stop
-    policy.'
+  description: Waits until a declared blackboard key compares true with the value,
+    then succeeds. The key is re-read on every tick, so an empty key keeps the node
+    waiting. Without timeout_s the wait lasts until a match or until the run ends;
+    when timeout_s elapses the node fails, and a Program Stop or Reset ends it as
+    interrupted.
   stability: stable
   tags:
   - logic
@@ -2604,11 +3128,15 @@ entries:
   parameters:
   - id: key
     required: true
+    description: Declared blackboard key re-read on every tick; while it is empty
+      the node keeps waiting. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: operator
     required: false
+    description: 'Comparison: ==, !=, <, <=, >, or >=. Omitted: ==. Ordering operators
+      need numeric keys; bool and string keys accept only == and !=.'
     default: ==
     schema:
       type: enum
@@ -2621,6 +3149,7 @@ entries:
       - '>='
   - id: value
     required: true
+    description: Value to wait for, of the key's declared type. Required.
     schema:
       type: key_value
       value_type_from_key: key
@@ -2631,12 +3160,16 @@ entries:
       - string
   - id: tolerance
     required: false
+    description: 'Allowed absolute difference for == and != on numeric keys; 0 or
+      more. Omitted: exact match. Not allowed with ordering operators.'
     schema:
       type: float
       constraints:
         min_inclusive: 0.0
   - id: timeout_s
     required: false
+    description: 'Seconds of Program time before the wait fails, from 0.01 to 3600.
+      Omitted: no timeout, so the wait lasts until a match or the run ends.'
     schema:
       type: float
       constraints:
@@ -2644,6 +3177,8 @@ entries:
         max_inclusive: 3600.0
   - id: timeout_while_held
     required: false
+    description: 'pause leaves out time an operator Stop holds this node from the
+      timeout; count includes it. Omitted: pause. Only applies when timeout_s is set.'
     default: pause
     schema:
       type: enum
@@ -2682,7 +3217,9 @@ entries:
 - id: io.set_output
   name: Set output
   category: io
-  description: Set one semantic output resource on a target.
+  description: Sets one boolean output signal of a component once. Fails when the
+    signal is not a declared output or the write is refused, and a failed write is
+    not resent.
   stability: stable
   tags:
   - io
@@ -2693,24 +3230,20 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
+    description: Output signal to write, as component and signal name.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: value
     required: true
+    description: Boolean level to write to the output signal.
     schema:
       type: bool
   required_capabilities:
   - capability_id: io.gpio.set_output
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
     effectful: true
   execution:
     blocking: true
@@ -2728,7 +3261,8 @@ entries:
 - id: io.get_input
   name: Get input
   category: io
-  description: Read one semantic input resource from a target.
+  description: Reads one boolean input signal once into a blackboard key. Fails unless
+    the signal's current value is fresh.
   stability: stable
   tags:
   - io
@@ -2739,23 +3273,21 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
+    description: Input signal to read, as component and signal name.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: output_key
     required: true
+    description: Blackboard key that receives the boolean value read.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: mock_simulation
     required: false
+    description: Simulated start value and optional timed change rows for signals,
+      started before the read; omitted when not authored.
     schema:
       type: array
       items:
@@ -2763,7 +3295,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   blackboard:
     reads: []
     writes:
@@ -2784,8 +3316,9 @@ entries:
 - id: io.check_input
   name: Check input
   category: io
-  description: Read one semantic input resource once and compare it with an expected
-    value.
+  description: Reads one boolean input signal once and compares it with expected_value.
+    Succeeds when the fresh value matches and fails when it does not match or is not
+    fresh.
   stability: stable
   tags:
   - io
@@ -2796,22 +3329,20 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
+    description: Input signal to read, as component and signal name.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: expected_value
     required: true
+    description: Boolean level the input must have for the check to succeed.
     schema:
       type: bool
   - id: mock_simulation
     required: false
+    description: Simulated start value and optional timed change rows for signals,
+      started before the read; omitted when not authored.
     schema:
       type: array
       items:
@@ -2819,7 +3350,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.get_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   execution:
     blocking: true
     cancellable: false
@@ -2835,10 +3366,9 @@ entries:
 - id: io.wait_for_input
   name: Wait for input
   category: io
-  description: Wait for one semantic input resource to reach a value. While the source
-    is stale or unavailable the wait stays pending and visibly unavailable. Without
-    timeout_s it waits indefinitely; with it, the wait fails once that much Program
-    time has passed, which stands still while the Program is halted.
+  description: Waits until one boolean input signal equals expected_value. A stale
+    or unavailable input keeps the wait pending, and the wait fails when timeout_s
+    expires.
   stability: stable
   tags:
   - io
@@ -2849,31 +3379,28 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
+    description: Input signal to watch, as component and signal name.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   - id: expected_value
     required: true
+    description: Boolean level of the input that ends the wait.
     schema:
       type: bool
   - id: edge
     required: false
+    description: 'Edge condition; level, the only accepted value. Omitted: level.'
     default: level
     schema:
       type: enum
       values:
       - level
-      - rising
-      - falling
   - id: timeout_s
     required: false
+    description: Seconds of Program time before the wait fails, from 0.01 to 3600;
+      omitted waits indefinitely.
     schema:
       type: float
       constraints:
@@ -2881,6 +3408,8 @@ entries:
         max_inclusive: 3600.0
   - id: mock_simulation
     required: false
+    description: Simulated start value and optional timed change rows for signals,
+      started before the wait; omitted when not authored.
     schema:
       type: array
       items:
@@ -2888,7 +3417,7 @@ entries:
   required_capabilities:
   - capability_id: io.gpio.wait_for_input
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: signal
   execution:
     blocking: true
     cancellable: true
@@ -2905,8 +3434,8 @@ entries:
 - id: io.clear_outside_change
   name: Clear outside change
   category: io
-  description: Clear the changed outside flag of one output with read-back (CO0 →
-    changed outside). Writes nothing to the device and succeeds at once.
+  description: Clears the changed-outside flag of one output signal. It writes no
+    value to the device and succeeds at once.
   stability: stable
   tags:
   - io
@@ -2917,16 +3446,12 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: signal
     required: true
+    description: Output signal whose changed-outside flag is cleared, as component
+      and signal name.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: resource_role
-    required: true
-    schema:
-      type: string
-      semantic_type: resource_role
+      schema_ref: '#/schema_types/signal_reference'
   required_capabilities: []
   execution:
     blocking: false
@@ -2943,10 +3468,10 @@ entries:
 - id: rules.set_active
   name: Set rule active
   category: logic
-  description: Activate or deactivate one global interrupt rule of the Deployment.
-    Succeeds at once. An inactive rule doesn't watch, trip, stop or gate; activating
-    a rule whose condition already holds trips it at once. Every rule returns to its
-    active_at_start at the end of the run and at Reset.
+  description: Activates or deactivates one global interrupt rule of the Deployment
+    and succeeds at once. Activating a rule whose condition already holds trips it
+    immediately, and every rule returns to its active_at_start at the end of each
+    run and at Reset.
   stability: stable
   tags:
   - logic
@@ -2960,10 +3485,13 @@ entries:
   parameters:
   - id: rule_id
     required: true
+    description: Identifier of a rule in the Deployment. An unknown id fails the node
+      with rule_unknown. Required.
     schema:
       type: string
   - id: active
     required: true
+    description: true activates the rule and false deactivates it. Required.
     schema:
       type: bool
   required_capabilities: []
@@ -2982,7 +3510,10 @@ entries:
 - id: gripper.command_position
   name: Command gripper position
   category: gripper
-  description: Command one semantic gripper target position.
+  description: Commands a gripper to a numeric position or to its open or closed preset
+    and waits for the command to complete. A pneumatic gripper instead writes its
+    valve outputs, confirms its required inputs and holds for its dwell, and a Close
+    that requires grasp evidence fails when no evidence is found.
   stability: stable
   tags:
   - gripper
@@ -2994,30 +3525,40 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Gripper component and command target to command.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: position
     required: true
+    description: Target as an angular (radians) or linear (meters) position for the
+      gripper kind, or the named open or closed preset.
     schema_ref: '#/schema_types/coordinate_position'
   - id: max_effort
     required: false
+    description: Effort limit in newton-meters or newtons, sent only to a controller
+      that exposes an effort interface; omitted sends no limit.
     schema_ref: '#/schema_types/coordinate_effort_limit'
   - id: command_duration_s
     required: false
+    description: Command duration in seconds; omitted uses the configured duration
+      of a pneumatic gripper and 0 for other grippers.
     schema:
       type: float
       constraints:
         min_inclusive: 0.0
   - id: wait_for_duration
     required: false
+    description: When true, a completed command is held until command_duration_s has
+      elapsed; omitted or false completes on the controller result.
     default: false
     schema:
       type: bool
   - id: required_inputs
     required: false
+    description: Input levels to confirm after a pneumatic gripper's valve outputs,
+      at most four, each a declared input of that gripper; ignored by other grippers.
     default: []
     schema:
       type: array
@@ -3040,6 +3581,8 @@ entries:
             type: bool
   - id: dwell_while_held
     required: false
+    description: 'Whether the pneumatic dwell keeps running while an operator Stop
+      holds the node: pause stops it, count keeps it running.'
     default: pause
     schema:
       type: enum
@@ -3048,7 +3591,10 @@ entries:
       - pause
   - id: completion_timeout_s
     required: false
-    default: 30.0
+    description: 'Seconds allowed after command_duration_s for the gripper to report
+      done (goal result or confirming signal); the command fails when it has not.
+      A pneumatic delivery is bounded by this value alone. Omitted: 5.0.'
+    default: 5.0
     schema:
       type: float
       constraints:
@@ -3056,11 +3602,11 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: true
@@ -3077,7 +3623,9 @@ entries:
 - id: gripper.check_status
   name: Check gripper status
   category: gripper
-  description: Compare immutable gripper-target status with an expected state.
+  description: Reads the gripper target's current command state once and compares
+    it with expected_state. Succeeds on a match and fails without waiting when the
+    state differs.
   stability: stable
   tags:
   - gripper
@@ -3089,13 +3637,15 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Gripper component and command target whose command state is read.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: expected_state
     required: true
+    description: 'Command state to match: idle, moving (executing), reached (completed)
+      or failed.'
     schema:
       type: enum
       values:
@@ -3106,25 +3656,25 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: idle
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: moving
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: reached
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: failed
@@ -3143,10 +3693,9 @@ entries:
 - id: gripper.wait_for_status
   name: Wait for gripper status
   category: gripper
-  description: 'Wait for the captured gripper command and source, with a bounded timeout
-    counted in Program time, which stands still while the Program is halted. By default
-    (timeout_while_held: pause) time the node itself is held by an operator Stop does
-    not count toward the timeout; with timeout_while_held: count it does.'
+  description: Waits until the captured gripper command reaches expected_state. Fails
+    on timeout, when the command or its source is replaced or unavailable, or when
+    the command reports failed.
   stability: stable
   tags:
   - gripper
@@ -3158,13 +3707,15 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Gripper component and command target whose command is observed.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: expected_state
     required: true
+    description: 'Command state to wait for: idle, moving (executing), reached (completed)
+      or failed.'
     schema:
       type: enum
       values:
@@ -3174,6 +3725,8 @@ entries:
       - failed
   - id: timeout_s
     required: true
+    description: Program-time seconds before the wait fails, from 0.01 to 3600; a
+      Halt pauses this time.
     schema:
       type: float
       constraints:
@@ -3181,6 +3734,8 @@ entries:
         max_inclusive: 3600.0
   - id: timeout_while_held
     required: false
+    description: 'Whether time held by an operator Stop counts toward timeout_s: pause
+      excludes it, count includes it.'
     default: pause
     schema:
       type: enum
@@ -3190,25 +3745,25 @@ entries:
   required_capabilities:
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: idle
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: moving
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: reached
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     when:
       parameter: expected_state
       equals: failed
@@ -3228,7 +3783,8 @@ entries:
 - id: model.get_frame_pose
   name: Get frame pose
   category: model
-  description: Resolve one declared frame role from fresh qualified state.
+  description: Resolves one component frame's pose from the target's current observed
+    state, in the cell frame. Fails when that state cannot be resolved.
   stability: stable
   tags:
   - model
@@ -3240,28 +3796,31 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Component and command target whose observed state places the frame,
+      for example the arm that carries a tool frame.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: frame
     required: true
+    description: Component frame to resolve, as component and frame id.
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: output_key
     required: true
+    description: 'Blackboard key that receives the pose: position in meters and orientation
+      in the cell frame.'
     schema:
       type: string
       semantic_type: blackboard_key
   required_capabilities:
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   blackboard:
     reads: []
     writes:
@@ -3282,9 +3841,10 @@ entries:
 - id: geometry.check_pose_distance
   name: Check pose distance
   category: geometry
-  description: Compare two pose keys with translation and rotation thresholds. Pose
-    B is first expressed in pose A's frame (read once from the cell frame resolver
-    when the frames differ), then compared.
+  description: Compares two stored poses against translation and rotation thresholds.
+    It succeeds when both distances are within their thresholds and fails otherwise,
+    and it fails when either key is missing. Pose B is expressed in pose A's frame
+    before the comparison.
   stability: stable
   tags:
   - geometry
@@ -3298,22 +3858,27 @@ entries:
   parameters:
   - id: pose_key_a
     required: true
+    description: Blackboard key holding the first stored pose, which sets the comparison
+      frame.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: pose_key_b
     required: true
+    description: Blackboard key holding the second stored pose.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: translation_threshold_m
     required: true
+    description: Largest allowed translation between the two poses in meters, inclusive.
     schema:
       type: float
       constraints:
         min_inclusive: 0.0
   - id: rotation_threshold_rad
     required: true
+    description: Largest allowed rotation between the two poses in radians, inclusive.
     schema:
       type: float
       constraints:
@@ -3343,10 +3908,9 @@ entries:
 - id: geometry.offset_pose
   name: Offset pose
   category: geometry
-  description: Apply a translation and RPY offset to one pose and write the result
-    in the pose's own frame. Without offset_frame the offset is measured along the
-    pose's own axes; with it, along that declared frame's axes (its orientation is
-    read once from the cell frame resolver when the frames differ).
+  description: Applies a translation and a roll-pitch-yaw rotation to a stored pose
+    and writes the result to a blackboard key. The result stays in the input pose's
+    frame. It fails when the offset frame cannot be related to the pose frame.
   stability: stable
   tags:
   - geometry
@@ -3360,15 +3924,21 @@ entries:
   parameters:
   - id: pose
     required: true
+    description: Stored pose to offset. Its frame is kept for the result.
     schema_ref: '#/schema_types/stored_pose'
   - id: offset
     required: true
+    description: Translation in meters and roll-pitch-yaw rotation in degrees applied
+      to the pose.
     schema_ref: '#/schema_types/pose_offset'
   - id: offset_frame
     required: false
+    description: Frame whose axes the offset follows. Omitted means the pose's own
+      axes.
     schema_ref: '#/schema_types/pose_frame_ref'
   - id: output_key
     required: true
+    description: Blackboard key that receives the offset pose.
     schema:
       type: string
       semantic_type: blackboard_key
@@ -3393,9 +3963,9 @@ entries:
 - id: geometry.check_pose_bounds
   name: Check pose bounds
   category: geometry
-  description: Succeed when one pose lies inside an axis-aligned box stated in frame_ref.
-    The pose is first expressed in frame_ref (read once from the cell frame resolver
-    when the frames differ), then compared.
+  description: Checks whether a stored pose lies inside an axis-aligned position box.
+    The pose is first expressed in the box frame. It succeeds when the position is
+    inside the box and fails otherwise.
   stability: stable
   tags:
   - geometry
@@ -3409,12 +3979,16 @@ entries:
   parameters:
   - id: pose
     required: true
+    description: Stored pose to test.
     schema_ref: '#/schema_types/stored_pose'
   - id: frame_ref
     required: true
+    description: Frame in which the box is stated. The pose is expressed in it before
+      the test.
     schema_ref: '#/schema_types/pose_frame_ref'
   - id: min_position_m
     required: true
+    description: Lower corner of the box as x, y and z in meters.
     schema:
       type: array
       items:
@@ -3422,6 +3996,7 @@ entries:
       length: 3
   - id: max_position_m
     required: true
+    description: Upper corner of the box as x, y and z in meters.
     schema:
       type: array
       items:
@@ -3429,6 +4004,7 @@ entries:
       length: 3
   - id: inclusive
     required: false
+    description: Whether positions on the box faces count as inside. Default true.
     default: true
     schema:
       type: bool
@@ -3448,7 +4024,8 @@ entries:
 - id: kernel.stop_operation
   name: Stop operation
   category: recovery
-  description: Request Stop for one exact runtime-selected operation scope.
+  description: Requests a Stop for the current operation of the target and succeeds
+    when that Stop is certified. It fails when the Stop is not certified.
   stability: stable
   tags:
   - kernel
@@ -3460,15 +4037,15 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target whose current operation is stopped.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: execution.stop.soft
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   owner_context:
     kind: current_operation
@@ -3488,7 +4065,8 @@ entries:
 - id: kernel.full_stop
   name: Full Stop
   category: recovery
-  description: Request one explicit cell-wide Full Stop.
+  description: Requests a Full Stop of the whole cell and succeeds when that Stop
+    is certified. It fails when the Stop is not certified.
   stability: stable
   tags:
   - kernel
@@ -3516,7 +4094,9 @@ entries:
 - id: kernel.reset_operation
   name: Reset operation
   category: recovery
-  description: Reset one exact terminal or recoverable operation scope.
+  description: Resets the current terminal or recoverable operation of the target
+    so that it is released. It succeeds when the operation is no longer resident and
+    fails otherwise.
   stability: stable
   tags:
   - kernel
@@ -3528,15 +4108,15 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target whose current operation is reset.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   required_capabilities:
   - capability_id: execution.reset
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
     effectful: true
   owner_context:
     kind: current_operation
@@ -3553,57 +4133,11 @@ entries:
       implementation_id: kernel_reset_operation_v1
   observability:
     event_family: manyforge.program.node
-- id: kernel.set_runtime_scale
-  name: Set runtime scale
-  category: motion
-  description: Set generation-fenced runtime scaling on one selected operation.
-  stability: stable
-  tags:
-  - kernel
-  - scaling
-  profiles:
-    min_program_profile: composable-cell-v1
-  kind: leaf
-  children:
-    min: 0
-    max: 0
-  parameters:
-  - id: target_role
-    required: true
-    schema:
-      type: string
-      semantic_type: target_role
-  - id: scale
-    required: true
-    schema:
-      type: float
-      constraints:
-        min_exclusive: 0.0
-        max_inclusive: 1.0
-  required_capabilities:
-  - capability_id: execution.runtime_scale.operation_scoped
-    scope: target_binding
-    target_parameter: target_role
-    effectful: true
-  owner_context:
-    kind: current_operation
-    required: true
-  execution:
-    blocking: true
-    cancellable: false
-    owner_api: kernel.runtime_scaling
-  outcomes:
-    success: scaling_applied
-    failure: scaling_failed
-  runners:
-    py_trees:
-      implementation_id: kernel_set_runtime_scale_v1
-  observability:
-    event_family: manyforge.program.node
 - id: simulation.reset
   name: Reset simulation
   category: simulation
-  description: Request a bounded reset from the cell-global simulator owner.
+  description: Requests a reset from the cell's simulator and waits for its result.
+    A run that includes this node is refused when no simulator is configured.
   stability: stable
   tags:
   - simulation
@@ -3633,7 +4167,8 @@ entries:
 - id: simulation.set_state
   name: Set simulation state
   category: simulation
-  description: Request simulator play or pause for one selected control domain.
+  description: Requests the simulator to play or pause and waits for its result. A
+    run that includes this node is refused when no simulator is configured.
   stability: stable
   tags:
   - simulation
@@ -3646,6 +4181,7 @@ entries:
   parameters:
   - id: state
     required: true
+    description: 'Requested simulator state: play or pause.'
     schema:
       type: enum
       values:
@@ -3672,7 +4208,8 @@ entries:
 - id: simulation.step
   name: Step simulation
   category: simulation
-  description: Advance one selected simulator domain by a bounded step count.
+  description: Requests the simulator to advance by a number of steps and waits for
+    its result. A run that includes this node is refused when no simulator is configured.
   stability: stable
   tags:
   - simulation
@@ -3685,6 +4222,7 @@ entries:
   parameters:
   - id: steps
     required: true
+    description: Number of simulator steps to advance, from 1 to 1000000.
     schema:
       type: int
       constraints:
@@ -3709,7 +4247,8 @@ entries:
 - id: simulation.set_entity_pose
   name: Set simulator entity pose
   category: simulation
-  description: Set one declared scene resource pose in a simulator domain.
+  description: Sets the simulator pose of one declared scene resource and waits for
+    its result. A run that includes this node is refused when no simulator is configured.
   stability: stable
   tags:
   - simulation
@@ -3723,11 +4262,14 @@ entries:
   parameters:
   - id: scene_resource_id
     required: true
+    description: Identifier of the declared scene resource whose simulator pose is
+      set.
     schema:
       type: string
       semantic_type: scene_resource
   - id: pose
     required: true
+    description: Position in meters and orientation, expressed in the frame it names.
     schema_ref: '#/schema_types/stored_pose'
   required_capabilities:
   - capability_id: simulator.entity_state.set
@@ -3748,7 +4290,10 @@ entries:
 - id: assistant.query_model
   name: Query model
   category: assistant
-  description: Submit a bounded model request using declared portable inputs.
+  description: Sends one bounded request to a model endpoint and stores the response
+    under output_key after its schema check passes. The node succeeds with model_response_valid
+    and fails when the request, parsing, schema or confidence check fails; the policy
+    parameters decide whether a failure pauses for an operator or fails the node.
   stability: stable
   tags:
   - assistant
@@ -3762,14 +4307,20 @@ entries:
   parameters:
   - id: model_endpoint_alias
     required: true
+    description: Name of a model endpoint in the assistant contract that the request
+      is sent to. Required.
     schema:
       type: string
   - id: prompt_template_id
     required: true
+    description: Name of a retained prompt template. Its declared variables must be
+      supplied in template_variables. Required.
     schema:
       type: string
   - id: template_variables
     required: false
+    description: 'Values for the template variables, keyed by variable id; every declared
+      variable must be given. Omitted: empty, which fails if variables are declared.'
     default: {}
     schema:
       type: object
@@ -3785,6 +4336,8 @@ entries:
         - string_list
   - id: scene_attachment
     required: false
+    description: 'Scene data sent with the prompt: none, state_json (cell state as
+      JSON) or snapshot_image (a captured image). Omitted: none.'
     default: none
     schema:
       type: enum
@@ -3794,18 +4347,24 @@ entries:
       - snapshot_image
   - id: output_key
     required: true
+    description: Blackboard key that receives the validated response; its declared
+      type defines the output schema. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: timeout_s
     required: false
-    default: 30.0
+    description: 'Seconds for the whole request, including the parse retry, above
+      0 up to 3600. Omitted: the endpoint''s default_timeout_s.'
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
+        max_inclusive: 3600.0
   - id: min_confidence
     required: false
+    description: 'Minimum confidence from 0 to 1, checked only when the output schema
+      declares a numeric confidence property. Omitted: 0.'
     default: 0.0
     schema:
       type: float
@@ -3814,6 +4373,8 @@ entries:
         max_inclusive: 1.0
   - id: model_runtime_failure_policy
     required: false
+    description: 'Policy for any failure other than low confidence: pause_for_operator
+      pauses for an operator, condition_failure fails the node. Omitted: pause_for_operator.'
     default: pause_for_operator
     schema:
       type: enum
@@ -3822,6 +4383,8 @@ entries:
       - condition_failure
   - id: model_low_confidence_policy
     required: false
+    description: 'Policy when confidence is below min_confidence, with the same two
+      values. Omitted: pause_for_operator.'
     default: pause_for_operator
     schema:
       type: enum
@@ -3830,11 +4393,15 @@ entries:
       - condition_failure
   - id: retry_on_parse_failure
     required: false
+    description: 'When true, one more request is sent with a retry instruction if
+      the response cannot be parsed. Omitted: false.'
     default: false
     schema:
       type: bool
   - id: scene_snapshot_transport
     required: false
+    description: 'How a snapshot_image is delivered: inline_data_url or http_url.
+      Used only with snapshot_image. Omitted: inline_data_url.'
     default: inline_data_url
     schema:
       type: enum
@@ -3843,6 +4410,8 @@ entries:
       - http_url
   - id: scene_snapshot_width
     required: false
+    description: 'Snapshot width in pixels, from 64 to 1920. Used only with snapshot_image.
+      Omitted: 640.'
     default: 640
     schema:
       type: int
@@ -3851,6 +4420,8 @@ entries:
         max_inclusive: 1920
   - id: scene_snapshot_height
     required: false
+    description: 'Snapshot height in pixels, from 64 to 1080. Used only with snapshot_image.
+      Omitted: 480.'
     default: 480
     schema:
       type: int
@@ -3859,13 +4430,17 @@ entries:
         max_inclusive: 1080
   - id: scene_snapshot_format
     required: false
+    description: 'Snapshot image format, jpeg or png. Used only with snapshot_image.
+      Omitted: jpeg.'
     default: jpeg
     schema:
       type: enum
       values:
       - jpeg
       - png
-  required_capabilities: []
+  required_capabilities:
+  - capability_id: assistant.model.query
+    scope: cell_global
   blackboard:
     reads: []
     writes:
@@ -3887,7 +4462,10 @@ entries:
 - id: assistant.build_scene_selection
   name: Build scene selection
   category: assistant
-  description: Build a bounded portable object-selection context.
+  description: Builds the scene-selection context, which holds the request text and
+    the candidate scene objects, and writes it to output_key. Candidates are every
+    scene object unless candidate_object_ids narrows them; an unavailable scene is
+    handled by unavailable_policy.
   stability: stable
   tags:
   - assistant
@@ -3901,15 +4479,19 @@ entries:
   parameters:
   - id: selection_request_text
     required: true
+    description: Text describing the object to select, bounded in size. Required.
     schema:
       type: string
   - id: output_key
     required: true
+    description: Blackboard key that receives the scene-selection context. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: object_source
     required: false
+    description: 'Only backend_scene, the authoritative scene, is accepted. Omitted:
+      backend_scene.'
     default: backend_scene
     schema:
       type: enum
@@ -3917,6 +4499,8 @@ entries:
       - backend_scene
   - id: candidate_object_ids
     required: false
+    description: 'Scene resource ids offered as candidates, without duplicates, up
+      to 4096. Omitted or empty: every scene object is a candidate.'
     default: []
     schema:
       type: array
@@ -3926,45 +4510,25 @@ entries:
         semantic_type: scene_resource
   - id: image_source
     required: false
+    description: 'Image sent with the context; only none, no image. Omitted: none.'
     default: none
     schema:
       type: enum
       values:
       - none
-      - viewer_snapshot
-  - id: image_snapshot_width
-    required: false
-    default: 640
-    schema:
-      type: int
-      constraints:
-        min_inclusive: 64
-        max_inclusive: 1920
-  - id: image_snapshot_height
-    required: false
-    default: 480
-    schema:
-      type: int
-      constraints:
-        min_inclusive: 64
-        max_inclusive: 1080
-  - id: image_snapshot_format
-    required: false
-    default: jpeg
-    schema:
-      type: enum
-      values:
-      - jpeg
-      - png
   - id: unavailable_policy
     required: false
+    description: 'Policy when candidates, object poses or the scene cannot be read:
+      pause_for_operator or condition_failure. Omitted: pause_for_operator.'
     default: pause_for_operator
     schema:
       type: enum
       values:
       - pause_for_operator
       - condition_failure
-  required_capabilities: []
+  required_capabilities:
+  - capability_id: assistant.model.query
+    scope: cell_global
   blackboard:
     reads: []
     writes:
@@ -3986,7 +4550,10 @@ entries:
 - id: assistant.validate_scene_selection
   name: Validate scene selection
   category: assistant
-  description: Validate a model selection against a retained scene context.
+  description: Checks a model's selection response against the scene-selection context
+    and writes the accepted result to output_key. A selected object must be one of
+    the context's candidates; no_match and ambiguous outcomes are accepted only when
+    their allow parameter is true.
   stability: stable
   tags:
   - assistant
@@ -4000,30 +4567,42 @@ entries:
   parameters:
   - id: selection_context_key
     required: true
+    description: Blackboard key holding the scene-selection context from the build
+      node. A missing key fails the node. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: selection_response_key
     required: true
+    description: Blackboard key holding the model response to check. A missing key
+      fails the node. Required.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: output_key
     required: true
+    description: 'Blackboard key that receives the accepted result: outcome, selected_object_id,
+      confidence, matched_attributes and reason. Required.'
     schema:
       type: string
       semantic_type: blackboard_key
   - id: allow_no_match
     required: false
+    description: 'When true, a no_match outcome is accepted; otherwise it fails the
+      node. Omitted: false.'
     default: false
     schema:
       type: bool
   - id: allow_ambiguous
     required: false
+    description: 'When true, an ambiguous outcome is accepted; otherwise it fails
+      the node. Omitted: false.'
     default: false
     schema:
       type: bool
-  required_capabilities: []
+  required_capabilities:
+  - capability_id: assistant.model.query
+    scope: cell_global
   blackboard:
     reads:
     - key_parameter: selection_context_key
@@ -4051,8 +4630,10 @@ entries:
 - id: planning.plan_pick_sequence
   name: Plan pick sequence
   category: motion
-  description: Produce a portable validated pick-sequence candidate for one target
-    role.
+  description: Plans and validates a pick sequence for one scene object, made of approach,
+    descend, gripper close and retreat legs. It writes the planned candidate to its
+    output key and does not move the robot. Without a feasible candidate it fails,
+    and by default it pauses the Run for the operator.
   stability: stable
   tags:
   - motion
@@ -4065,39 +4646,43 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target the planned moves run on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: tool_target_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: tool_target
     required: true
+    description: Gripper target that the planned gripper command runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that the planned poses are stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the planned moves use; omitted means current, the robot's Active
+      TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
-  - id: carrier_frame_role
+  - id: carrier_frame_ref
     required: true
+    description: Robot frame that carries the selected object during the sequence.
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: selected_object_id
     required: true
+    description: Scene object to pick.
     schema:
       type: string
       semantic_type: scene_resource
   - id: synthesis
     required: false
+    description: 'Pick geometry: offset envelopes and references, base tool orientation,
+      search steps, vertical pick, minimum TCP height and candidate search.'
     default:
       pick_offset_envelope:
         position_min_m:
@@ -4136,19 +4721,29 @@ entries:
     schema_ref: '#/schema_types/pick_synthesis'
   - id: planner
     required: false
+    description: Planner settings for the planned moves; only the fields set here
+      override the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: motion_options
     required: false
+    description: Settings for the approach, descend and retreat legs. Omitted values
+      use velocity 0.35 per leg, acceleration 1.0 and cache mode disable.
     default: {}
     schema_ref: '#/schema_types/pick_motion_options'
   - id: tool_position
     required: true
+    description: 'Gripper position for the gripper leg: an angle, a distance, or the
+      open or closed preset.'
     schema_ref: '#/schema_types/coordinate_position'
   - id: tool_max_effort
     required: false
+    description: Maximum gripper effort for the gripper leg, as a torque or a force.
+      Omitted sends none.
     schema_ref: '#/schema_types/coordinate_effort_limit'
   - id: tool_command_duration_s
     required: false
+    description: Duration in seconds passed to the gripper command as its command_duration
+      option; default 0.0.
     default: 0.0
     schema:
       type: float
@@ -4156,22 +4751,28 @@ entries:
         min_inclusive: 0.0
   - id: tool_completion_timeout_s
     required: false
-    default: 30.0
+    description: Seconds allowed after tool_command_duration_s for the gripper to
+      report done before its command fails; default 5.0.
+    default: 5.0
     schema:
       type: float
       constraints:
         min_exclusive: 0.0
   - id: output_key
     required: true
+    description: Blackboard key that receives the planning result.
     schema:
       type: string
       semantic_type: blackboard_key
   - id: contact_policy_id
     required: true
+    description: Contact-grasp policy for the descend leg. Required.
     schema:
       type: string
   - id: no_feasible_plan_policy
     required: false
+    description: pause_for_operator (default) holds the Run when no candidate is feasible.
+      condition_failure fails the node so that a fallback can run.
     default: pause_for_operator
     schema:
       type: enum
@@ -4181,30 +4782,30 @@ entries:
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: scene.edit.attach_detach
     scope: cell_global
   blackboard:
@@ -4228,7 +4829,10 @@ entries:
 - id: planning.plan_place_sequence
   name: Plan place sequence
   category: motion
-  description: Produce a portable validated place-sequence plan for one carried object.
+  description: Plans and validates a place sequence for one carried scene object,
+    made of approach, descend, gripper command and retreat legs. It writes the planned
+    candidate to its output key and does not move the robot. It fails when no feasible
+    candidate exists.
   stability: stable
   tags:
   - motion
@@ -4241,42 +4845,49 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target the planned moves run on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: tool_target_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: tool_target
     required: true
+    description: Gripper target that the planned gripper command runs on.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: base_frame
     required: true
+    description: Robot base frame that the planned poses are stated in.
     schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: tcp_endpoint
     required: false
+    description: TCP the planned moves use; omitted means current, the robot's Active
+      TCP.
     default:
       kind: current
     schema_ref: '#/schema_types/tcp_selector'
-  - id: carrier_frame_role
+  - id: carrier_frame_ref
     required: true
+    description: Robot frame that carries the object during the sequence.
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: selected_object_id
     required: true
+    description: Carried scene object to place.
     schema:
       type: string
       semantic_type: scene_resource
   - id: place_pose
     required: true
+    description: Gripper (TCP) pose at release, where the tool frame is when the gripper
+      opens; not the pose of the carried object. Its frame_ref sets the frame it is
+      stated in.
     schema_ref: '#/schema_types/motion_pose'
   - id: approach_offset_m
     required: false
+    description: Offset in meters from the place position to the approach pose. Default
+      is 0.05 m above the place position.
     default:
     - 0.0
     - 0.0
@@ -4288,46 +4899,76 @@ entries:
       length: 3
   - id: planner
     required: false
+    description: Planner settings for the planned moves; only the fields set here
+      override the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
   - id: motion_options
     required: false
+    description: Settings for the approach, descend and retreat legs. Omitted values
+      use velocity 0.35 per leg, acceleration 1.0 and cache mode disable.
     default: {}
     schema_ref: '#/schema_types/pick_motion_options'
   - id: tool_position
     required: true
+    description: 'Gripper position for the gripper leg: an angle, a distance, or the
+      open or closed preset.'
     schema_ref: '#/schema_types/coordinate_position'
+  - id: tool_max_effort
+    required: false
+    description: Maximum gripper effort for the gripper leg, as a torque or a force.
+      Omitted sends none.
+    schema_ref: '#/schema_types/coordinate_effort_limit'
+  - id: tool_command_duration_s
+    required: false
+    description: Duration in seconds passed to the gripper command as its command_duration
+      option; default 0.0.
+    default: 0.0
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+  - id: tool_completion_timeout_s
+    required: false
+    description: Seconds allowed after tool_command_duration_s for the gripper to
+      report done before its command fails; default 5.0.
+    default: 5.0
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
   - id: output_key
     required: true
+    description: Blackboard key that receives the planning result.
     schema:
       type: string
       semantic_type: blackboard_key
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: validation.trajectory.non_collision
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: collision.query.pre_execution
     scope: cell_global
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: tool.gripper.command
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: tool.gripper.feedback
     scope: target_binding
-    target_parameter: tool_target_role
+    target_parameter: tool_target
   - capability_id: scene.edit.attach_detach
     scope: cell_global
   blackboard:
@@ -4351,7 +4992,9 @@ entries:
 - id: recovery.apply_offered_action
   name: Apply offered recovery
   category: recovery
-  description: Submit one exact current owner-published recovery offer.
+  description: Submits one recovery action that the Kernel currently offers for the
+    operation of the target. It succeeds when the Kernel accepts the action and fails
+    when it rejects the action, including when the offer has changed.
   stability: stable
   tags:
   - recovery
@@ -4362,13 +5005,15 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Robot target whose operation the recovery action applies to.
     schema:
-      type: string
-      semantic_type: target_role
+      schema_ref: '#/schema_types/target_reference'
   - id: recovery_action
     required: true
+    description: Recovery action to submit. It must be one of the actions currently
+      offered for the operation.
     schema:
       type: enum
       values:
@@ -4395,8 +5040,9 @@ entries:
 - id: example.check_frame_height
   name: Check frame height
   category: model
-  description: 'Build-owned extension example: compare a freshly observed frame height
-    in the cell frame.'
+  description: Build-owned experimental example that checks the cell-frame height
+    of a component frame against an inclusive range. Fails when the height is outside
+    the range or the observed state is unavailable.
   stability: experimental
   tags:
   - example
@@ -4408,31 +5054,33 @@ entries:
     min: 0
     max: 0
   parameters:
-  - id: target_role
+  - id: target
     required: true
+    description: Component and command target whose frame height is read.
     schema:
-      type: string
-      semantic_type: target_role
-  - id: frame_role
+      schema_ref: '#/schema_types/target_reference'
+  - id: frame
     required: true
+    description: Component frame whose height in the cell frame is checked.
     schema:
-      type: string
-      semantic_type: frame_role
+      schema_ref: '#/schema_types/frame_reference'
   - id: minimum_height_m
     required: true
+    description: Lower bound of the allowed height in meters, inclusive.
     schema:
       type: float
   - id: maximum_height_m
     required: true
+    description: Upper bound of the allowed height in meters, inclusive.
     schema:
       type: float
   required_capabilities:
   - capability_id: model.kinematics.fk
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   - capability_id: state.observed.current
     scope: target_binding
-    target_parameter: target_role
+    target_parameter: target
   execution:
     blocking: true
     cancellable: false

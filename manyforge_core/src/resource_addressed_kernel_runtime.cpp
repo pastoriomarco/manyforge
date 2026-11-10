@@ -147,11 +147,53 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
                         "runtime_component_set_product_mismatch",
                         ErrorCode::kInvalidRequest);
   }
-  if (qualified_execution_engine_count(registrations) > prequalified_max_live_stop_participants_) {
+  const auto candidate_stop_participants = qualified_execution_engine_count(registrations);
+  if (candidate_stop_participants > prequalified_max_live_stop_participants_) {
     return Result<void>::Err(
         error(std::string(to_string(ErrorCode::kInvalidRequest)),
               "candidate runtime participants exceed prequalified Stop-stage isolation",
               "stop_stage_attempt_prequalification_exceeded"));
+  }
+  // The Stop-stage attempt pool follows the candidate cell. A resized pool is
+  // built (workers pre-started) here, before any Kernel lock; the commit
+  // swaps it in; whichever pool is left over (the retired one, or an unused
+  // candidate) is drained and joined by `stop_pool_release` after every
+  // Kernel lock below is released. These locals precede the locks, so their
+  // destructors run after the locks' destructors on every return path.
+  const auto required_stop_pool_participants =
+      std::max<std::size_t>(1U, candidate_stop_participants);
+  std::unique_ptr<BoundedStopStageAttemptExecutor> candidate_stop_pool;
+  std::unique_ptr<BoundedStopStageAttemptExecutor> stop_pool_to_release;
+  struct StopPoolRelease final {
+    std::unique_ptr<BoundedStopStageAttemptExecutor>& candidate;
+    std::unique_ptr<BoundedStopStageAttemptExecutor>& retired;
+    ~StopPoolRelease() {
+      for (auto* pool : {&retired, &candidate}) {
+        if (*pool == nullptr) continue;
+        (*pool)->CloseIngress();
+        WaitForDrain("kernel_runtime.retired_stop_stage_attempt_executor",
+                     std::chrono::seconds(5),
+                     [&](std::chrono::nanoseconds bound) { return (*pool)->DrainFor(bound); });
+        pool->reset();
+      }
+    }
+  } stop_pool_release{candidate_stop_pool, stop_pool_to_release};
+  if (stop_stage_attempt_pool_participants() != required_stop_pool_participants) {
+    try {
+      candidate_stop_pool = std::make_unique<BoundedStopStageAttemptExecutor>(
+          required_stop_pool_participants * kMaxStopEscalationStages,
+          required_stop_pool_participants,
+          static_cast<IStopStageAttemptCompletionReceiver&>(*this));
+      if (!candidate_stop_pool->prequalified_ready()) {
+        throw std::runtime_error("candidate Stop-stage attempt workers are not ready");
+      }
+    } catch (const std::exception& exception) {
+      return Result<void>::Err(error(
+          std::string(to_string(ErrorCode::kInternalError)),
+          std::string("candidate Stop-stage attempt pool construction failed: ") +
+              exception.what(),
+          "stop_stage_attempt_pool_construction_failed"));
+    }
   }
   std::optional<RuntimeParticipantRegistry> candidate_registry;
   try {
@@ -311,13 +353,17 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         continue;
       }
       auto* engine = registration.engine;
+      auto component_id = registration.binding.value().controllable_component_id.value();
+      if (next_engine_subscription_id_ == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("engine subscription identity exhausted");
+      const auto sequence_id = next_engine_subscription_id_++;
       auto ingress = engine_event_ingress_;
       const auto handle = engine->subscribe_events(
-          [ingress = std::move(ingress), engine](const KernelEvent& event) {
+          [ingress = std::move(ingress), engine, sequence_id](const KernelEvent& event) {
             auto entered = ingress->Enter();
-            if (auto* owner = entered.owner()) owner->on_engine_event(engine, event);
+            if (auto* owner = entered.owner()) owner->on_engine_event(engine, sequence_id, event);
           });
-      added_subscriptions.push_back(EngineSubscription{engine, handle});
+      added_subscriptions.push_back(EngineSubscription{engine, handle, sequence_id, std::move(component_id)});
     }
   } catch (const std::exception& exception) {
     for (const auto& subscription : added_subscriptions) {
@@ -334,6 +380,18 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
     return Result<void>::Err(error(std::string(to_string(ErrorCode::kInternalError)),
                                    "candidate runtime event subscription failed",
                                    "runtime_participant_subscription_failed"));
+  }
+
+  for (auto& registration : registrations) {
+    const auto existing = std::find_if(engine_subscriptions_.begin(), engine_subscriptions_.end(),
+        [&](const EngineSubscription& value) { return value.engine == registration.engine; });
+    if (existing != engine_subscriptions_.end()) {
+      registration.engine_subscription_id = existing->sequence_id;
+    } else {
+      const auto added = std::find_if(added_subscriptions.begin(), added_subscriptions.end(),
+          [&](const EngineSubscription& value) { return value.engine == registration.engine; });
+      registration.engine_subscription_id = added->sequence_id;
+    }
   }
 
   try {
@@ -439,8 +497,28 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
          (apply_scope->resources.empty() ||
           config_.operation_admission_gate->exact_fence_covers(
               *apply_fence_id, apply_scope->resources)));
+    // Swap the Stop-stage attempt pool only while no live Stop transaction
+    // owns an attempt of the current pool (its handles stay valid there).
+    // A busy current pool that is already large enough is kept.
+    bool swap_stop_pool = false;
+    bool stop_pool_busy = false;
+    if (candidate_stop_pool != nullptr) {
+      const auto current_participants =
+          stop_stage_attempt_executor_->prequalified_max_live_participants();
+      if (current_participants != required_stop_pool_participants) {
+        if (!stop_stage_attempts_owned_locked()) {
+          swap_stop_pool = true;
+        } else if (current_participants < required_stop_pool_participants) {
+          stop_pool_busy = true;
+        }
+      }
+    }
     auto table_result =
-        authority_current
+        stop_pool_busy
+            ? reject<void>("a live Stop holds the Stop-stage attempt pool the candidate cell "
+                           "must grow; retry after the Stop settles",
+                           "stop_stage_attempt_pool_busy", ErrorCode::kExecutionRejected)
+        : authority_current
             ? resource_slots_->reconfigure_runtime_inventory(
                   candidate_registry->resource_inventory(),
                   retain_unready_configuration_facts ? declared_candidate_configurations
@@ -541,6 +619,12 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
           config_.empty_runtime_graph_revision = *candidate_graph_revision;
         }
         stop_component_scope_ = std::move(candidate_stop_facts->components);
+        if (swap_stop_pool) {
+          // Pointer swap under state_mutex_, which every Stop-path user of
+          // the pool holds; the retired pool drains after the locks.
+          stop_pool_to_release = std::move(stop_stage_attempt_executor_);
+          stop_stage_attempt_executor_ = std::move(candidate_stop_pool);
+        }
         config_.participant_resolver = std::move(participant_resolver);
         engine_subscriptions_.insert(engine_subscriptions_.end(),
                                      std::make_move_iterator(added_subscriptions.begin()),
@@ -848,7 +932,7 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::component_command_refu
   // A component without motion of its own (e.g. a pose source) holds new
   // motion of every component.
   if (!cell_stream_holds_.empty()) return cell_stream_holds_.begin()->second;
-  // CONTRACTS §2/§6: a component accepts commands exactly while its own
+  // A component accepts commands exactly while its own
   // state reports `enabled`. A domain without route authority has no
   // component to consult; the route checks decide admission as before.
   const bool governed =
@@ -862,7 +946,7 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::component_command_refu
     refusal.details.emplace("controllable_component_id", binding.controllable_component_id.value());
     return refusal;
   }
-  // SIM-1: a simulated component whose simulation isn't playing stays
+  // A simulated component whose simulation isn't playing stays
   // enabled; its new commands are refused with that reason (never a fault).
   const auto state =
       std::find_if(component_states_.begin(), component_states_.end(), [&](const auto& row) {
@@ -894,6 +978,7 @@ bool ResourceAddressedExecutionKernel::participant_engine_in_use(
 
 bool ResourceAddressedExecutionKernel::operation_control_reconfiguration_busy_locked() const {
   return operation_control_reconfiguration_in_progress_ ||
+         runtime_scale_effect_calls_in_flight_ != 0U ||
          (operation_control_executor_ != nullptr &&
           operation_control_executor_->has_active_calls()) ||
          std::any_of(active_operations_.begin(), active_operations_.end(), [](const auto& item) {
@@ -924,6 +1009,28 @@ ResourceAddressedExecutionKernel::operation_control_engines_locked(
   return engines;
 }
 
+namespace {
+// Emit one JSON string without allocating or allowing a component identifier
+// to inject a second log line. This runs only on the retirement lane.
+void write_retired_component_id(std::string_view value) noexcept {
+  static constexpr char hex[] = "0123456789abcdef";
+  std::fputc('"', stderr);
+  for (const unsigned char ch : value) {
+    if (ch == '"' || ch == '\\') {
+      std::fputc('\\', stderr);
+      std::fputc(ch, stderr);
+    } else if (ch < 0x20U) {
+      std::fputs("\\u00", stderr);
+      std::fputc(hex[ch >> 4U], stderr);
+      std::fputc(hex[ch & 0x0fU], stderr);
+    } else {
+      std::fputc(ch, stderr);
+    }
+  }
+  std::fputc('"', stderr);
+}
+}  // namespace
+
 Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
     IResolvedParticipantExecutionEngine* engine) {
   if (engine == nullptr) {
@@ -931,7 +1038,7 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
                                    "retired participant engine is absent",
                                    "retired_participant_engine_absent"));
   }
-  std::lock_guard submit_lock(submission_mutex_);
+  std::unique_lock submit_lock(submission_mutex_);
   const auto subscription =
       std::find_if(engine_subscriptions_.begin(), engine_subscriptions_.end(),
                    [&](const EngineSubscription& item) { return item.engine == engine; });
@@ -988,7 +1095,16 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
     retired_control_executor.reset();
   }
   engine->unsubscribe_events(subscription->handle);
+  const auto sequence_id = subscription->sequence_id;
+  auto component_id = std::move(subscription->component_id);
   engine_subscriptions_.erase(subscription);
+  submit_lock.unlock();
+  flockfile(stderr);
+  std::fputs("{\"level\":\"info\",\"event\":\"retired_engine_subscription_release\",\"component_id\":", stderr);
+  write_retired_component_id(component_id);
+  std::fprintf(stderr, ",\"subscription_sequence_id\":%llu,\"result\":\"released\"}\n",
+               static_cast<unsigned long long>(sequence_id));
+  funlockfile(stderr);
   return Result<void>::Ok();
 }
 
@@ -1069,7 +1185,7 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
       !std::holds_alternative<MotionParticipantIntentDTO>(
           primary_motion.participants.front().payload)) {
     return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
-        "I6 preview requires one independent motion participant",
+        "preview requires one independent motion participant",
         "i6_preview_primary_motion_invalid", ErrorCode::kInvalidRequest);
   }
   {
@@ -1127,7 +1243,7 @@ ResourceAddressedExecutionKernel::preview_capability_command(const OperationInte
       intent.coordination_policy != OperationCoordinationPolicy::kIndependent ||
       !std::holds_alternative<CapabilityCommandIntentDTO>(intent.participants.front().payload)) {
     return reject<CapabilityCommandPreviewResultDTO>(
-        "I6 command preview requires one independent capability command",
+        "command preview requires one independent capability command",
         "i6_preview_capability_command_invalid", ErrorCode::kInvalidRequest);
   }
   auto resolved = resolve_registration(intent, 0U);
@@ -1223,6 +1339,9 @@ ResourceAddressedExecutionKernel::resolve_registration(const OperationIntentDTO&
         "product-backed participant selected an unpinned subordinate engine",
         "runtime_participant_engine_unpinned", ErrorCode::kInvariantViolation);
   }
+  const auto matching_registration = std::find_if(registrations_.begin(), registrations_.end(),
+      [&](const auto& item) { return item.engine == resolved.value().engine; });
+  resolved.value().engine_subscription_id = matching_registration->engine_subscription_id;
   const auto& inventory = registry_.resource_inventory();
   for (const auto& resource : resolved.value().binding.value().resources) {
     if (!std::binary_search(inventory.begin(), inventory.end(), resource.resource_id)) {
@@ -1285,7 +1404,7 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
       table_node->instance_id != selected->node_instance_id ||
       !std::any_of(table_node->target_effects.begin(), table_node->target_effects.end(),
           [&](const auto& effect) {
-            return effect.effectful && effect.target_role_id == participant.target_role_id &&
+            return effect.effectful && effect.target == participant.target &&
                    effect.capability_id == participant.required_capability_id;
           }))
     return reject<RuntimeParticipantExecutionRegistration>(
@@ -1294,16 +1413,14 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
   // This is a pure captured-product projection, also used by effect-free
   // preview. Execute retains its existing held-node and pre-effect checks.
   const auto& binding = registration.binding.value();
-  const auto target = std::find_if(capture->binding->target_role_bindings.begin(),
-      capture->binding->target_role_bindings.end(), [&](const auto& row) {
-        return row.target_role_id == semantics.target_role_id;
+  const auto target = std::find_if(capture->binding->target_bindings.begin(),
+      capture->binding->target_bindings.end(), [&](const auto& row) {
+        return row.target == semantics.target;
       });
-  if (target == capture->binding->target_role_bindings.end() ||
-      semantics.target_role_id != participant.target_role_id ||
-      binding.target_role_id != semantics.target_role_id ||
-      target->component_role_id != participant.component_role_id ||
-      target->controllable_component_id != binding.controllable_component_id ||
-      target->command_target_id != binding.command_target_id || !binding.control_path ||
+  if (target == capture->binding->target_bindings.end() ||
+      semantics.target != participant.target ||
+      target->target.component_id != binding.controllable_component_id ||
+      target->target.command_target_id != binding.command_target_id || !binding.control_path ||
       binding.capability_id != CapabilityId("execution.trajectory.execute") ||
       !registration.stop_readiness || semantics.priority < 0 || semantics.priority > 100)
     return reject<RuntimeParticipantExecutionRegistration>(
@@ -1377,6 +1494,13 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
   registration.io_motion_rule_policies = {std::move(policy)};
   registration.captured_node_interrupt_scope = std::move(scope);
   return Reply::Ok(std::move(registration));
+}
+
+std::size_t ResourceAddressedExecutionKernel::stop_stage_attempt_pool_participants() const {
+  std::lock_guard state_lock(state_mutex_);
+  return stop_stage_attempt_executor_ == nullptr
+             ? 0U
+             : stop_stage_attempt_executor_->prequalified_max_live_participants();
 }
 
 }  // namespace manyforge::core

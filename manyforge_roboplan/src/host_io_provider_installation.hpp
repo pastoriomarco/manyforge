@@ -7,6 +7,28 @@
 
 namespace manyforge::roboplan_backend::host_detail {
 
+struct CompositionIoOwnerRecoverySnapshot;
+struct CompositionIoOwnerRecoveryStage;
+[[nodiscard]] std::shared_ptr<CompositionIoOwnerRecoverySnapshot>
+CaptureCompositionIoOwnerRecovery(
+    std::span<const Composition *const> roots,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> failed);
+// Read-only: resolve outside host composition locks, then revalidate the
+// captured owner, publication and inventory under the host Apply authority.
+void ResolveCompositionIoOwnerRecoveryServed(
+    CompositionIoOwnerRecoverySnapshot &snapshot);
+[[nodiscard]] core::Result<void> CloseCompositionIoOwnerRecovery(
+    CompositionIoOwnerRecoverySnapshot &snapshot);
+[[nodiscard]] const std::vector<core::ControllableComponentId> &
+CompositionIoOwnerRecoveryServed(const CompositionIoOwnerRecoverySnapshot &snapshot);
+[[nodiscard]] core::Result<std::shared_ptr<CompositionIoOwnerRecoveryStage>>
+StageCompositionIoOwnerRecovery(
+    std::shared_ptr<CompositionIoOwnerRecoverySnapshot> snapshot,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> replacement);
+[[nodiscard]] core::Result<void>
+CommitCompositionIoOwnerRecovery(CompositionIoOwnerRecoveryStage &stage);
+void ActivateCompositionIoOwnerRecovery(CompositionIoOwnerRecoveryStage &stage) noexcept;
+
 // Call-local pins captured before an in-place publication-view refresh. The
 // exact held parent remains the authority; these values are not a registry.
 struct CompositionIoResourcePredecessor final {
@@ -27,6 +49,7 @@ CaptureCompositionIoResourcePredecessors(
 [[nodiscard]] core::Result<void> PrepareCompositionIoProviderResources(
     Composition &candidate, RetainedCellRuntime &cell,
     rclcpp::Node::SharedPtr generic_node,
-    std::span<const CompositionIoResourcePredecessor> actual_existing);
+    std::span<const CompositionIoResourcePredecessor> actual_existing,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner = {});
 
 } // namespace manyforge::roboplan_backend::host_detail

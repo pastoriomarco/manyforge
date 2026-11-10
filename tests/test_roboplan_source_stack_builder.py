@@ -43,7 +43,7 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
         assert "COPY .docker/nanoflann/ /tmp/nanoflann/" in source
         assert "-DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann" in source
         assert (
-            "COPY verification/composable_cell_e1/external_delta_ledger.v1.json"
+            "COPY third_party/external_delta_ledger.v1.json"
             in source
         )
         assert "bash /tmp/build-roboplan-source-closure.sh" in source
@@ -84,7 +84,7 @@ import json
 import os
 import sys
 
-with open(os.environ["E1_FAKE_CMAKE_LOG"], "a", encoding="utf-8") as stream:
+with open(os.environ["ROBOPLAN_FAKE_CMAKE_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps({
         "argv": sys.argv[1:],
         "cmake_prefix_path": os.environ.get("CMAKE_PREFIX_PATH", ""),
@@ -110,7 +110,7 @@ row = {
     "cmake_prefix_path": os.environ.get("CMAKE_PREFIX_PATH", ""),
     "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
 }
-with open(os.environ["E1_FAKE_CMAKE_LOG"], "a", encoding="utf-8") as stream:
+with open(os.environ["ROBOPLAN_FAKE_CMAKE_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(row, sort_keys=True) + "\\n")
 
 if "-S" in args and "-B" in args:
@@ -159,7 +159,7 @@ import json
 import os
 import sys
 
-with open(os.environ["E1_FAKE_VERIFIER_LOG"], "a", encoding="utf-8") as stream:
+with open(os.environ["ROBOPLAN_FAKE_VERIFIER_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(sys.argv[1:]) + "\\n")
 """,
         encoding="utf-8",
@@ -180,7 +180,7 @@ def _verification_environment(tmp_path: Path) -> dict[str, str]:
         "JRL_CMAKEMODULES_SOURCE_ID": "fixture_jrl_cmakemodules",
         "TOPPRA_SOURCE_ID": "fixture_toppra",
         "NANOFLANN_SOURCE_ID": "fixture_nanoflann",
-        "E1_FAKE_VERIFIER_LOG": str(tmp_path / "verifier.jsonl"),
+        "ROBOPLAN_FAKE_VERIFIER_LOG": str(tmp_path / "verifier.jsonl"),
     }
 
 
@@ -206,7 +206,7 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
         **os.environ,
         **_verification_environment(tmp_path),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "E1_FAKE_CMAKE_LOG": str(log),
+        "ROBOPLAN_FAKE_CMAKE_LOG": str(log),
         "ROBOPLAN_BUILD_ROOT": str(build),
         "ROBOPLAN_INSTALL_ROOT": str(install),
         "CMAKE_BUILD_PARALLEL_LEVEL": "2",
@@ -219,7 +219,7 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
             str(_SCRIPT),
             str(source),
             "-DBUILD_TESTING=OFF",
-            "-DE1_SENTINEL=ON",
+            "-DSOURCE_STACK_SENTINEL=ON",
             "-DCMAKE_INSTALL_PREFIX=/caller-must-not-win",
         ],
         check=True,
@@ -231,7 +231,7 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     verifier_rows = [
         json.loads(line)
-        for line in Path(environment["E1_FAKE_VERIFIER_LOG"])
+        for line in Path(environment["ROBOPLAN_FAKE_VERIFIER_LOG"])
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -259,7 +259,7 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
 
         assert configure["argv"] == [
             "-DBUILD_TESTING=OFF",
-            "-DE1_SENTINEL=ON",
+            "-DSOURCE_STACK_SENTINEL=ON",
             "-DCMAKE_INSTALL_PREFIX=/caller-must-not-win",
             "-S",
             str(source / project),
@@ -321,7 +321,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         **os.environ,
         **_verification_environment(tmp_path),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "E1_FAKE_CMAKE_LOG": str(log),
+        "ROBOPLAN_FAKE_CMAKE_LOG": str(log),
         "ROBOPLAN_CLOSURE_BUILD_ROOT": str(build),
         "ROBOPLAN_CLOSURE_INSTALL_ROOT": str(install),
         "ROBOPLAN_DEPENDENCY_BUILD_TESTING": "OFF",
@@ -336,7 +336,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
             str(_CLOSURE_SCRIPT),
             *sources,
             "-DBUILD_TESTING=OFF",
-            "-DE1_SENTINEL=ON",
+            "-DSOURCE_STACK_SENTINEL=ON",
         ],
         check=True,
         capture_output=True,
@@ -347,7 +347,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     verifier_rows = [
         json.loads(line)
-        for line in Path(environment["E1_FAKE_VERIFIER_LOG"])
+        for line in Path(environment["ROBOPLAN_FAKE_VERIFIER_LOG"])
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -421,7 +421,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
             "/ambient/prefix"
         )
 
-    verifier_log = Path(environment["E1_FAKE_VERIFIER_LOG"])
+    verifier_log = Path(environment["ROBOPLAN_FAKE_VERIFIER_LOG"])
     verifier_log.unlink()
     development_environment = {
         **environment,
@@ -500,7 +500,7 @@ def test_source_verifier_rejects_wrong_content_before_build(tmp_path: Path) -> N
     source.mkdir()
     _git(source, "init", "-q")
     _git(source, "config", "user.email", "e1@example.invalid")
-    _git(source, "config", "user.name", "E1 Qualification")
+    _git(source, "config", "user.name", "Source Stack Test")
     (source / "LICENSE").write_text("fixture license\n", encoding="utf-8")
     (source / "CMakeLists.txt").write_text("project(fixture)\n", encoding="utf-8")
     _git(source, "add", "LICENSE", "CMakeLists.txt")
@@ -571,7 +571,7 @@ def test_source_verifier_rejects_wrong_license_or_git_identity(tmp_path: Path) -
     source.mkdir()
     _git(source, "init", "-q")
     _git(source, "config", "user.email", "e1@example.invalid")
-    _git(source, "config", "user.name", "E1 Qualification")
+    _git(source, "config", "user.name", "Source Stack Test")
     (source / "LICENSE").write_text("fixture license\n", encoding="utf-8")
     _git(source, "add", "LICENSE")
     _git(source, "commit", "-q", "-m", "fixture")

@@ -18,7 +18,7 @@ import {
 } from '../state/composerSettings';
 
 /**
- * The one source of installation Composer settings (UA7W.11). Every control
+ * The one source of installation Composer settings. Every control
  * that shows a setting reads and writes it here, so toolbars and settings
  * panels can never disagree. Composer HTTP only: never the Headless control
  * connection, and no polling.

@@ -1,3 +1,4 @@
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include "host_io_output_channels.hpp"
 
 #include "../../manyforge_deployment/test/io_retained_fixture.hpp"
@@ -274,13 +275,11 @@ TEST_F(HostIoOutputChannelsTest,
   EXPECT_FALSE(CreateHostIoOutputChannels(aliases, {}, clock).ok());
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node = std::make_shared<rclcpp::Node>(
-      "manyforge_host_output_channel_test", options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "manyforge_host_output_channel_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
   {
-    auto channels = CreateHostIoOutputChannels(aliases, node, clock);
+    auto channels = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_TRUE(channels.ok());
     ASSERT_EQ(channels.value().size(), 1U);
     EXPECT_TRUE(
@@ -288,6 +287,8 @@ TEST_F(HostIoOutputChannelsTest,
             channels.value().front().provider));
   }
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   context->shutdown("host output channel test complete");
 }
 
@@ -295,18 +296,16 @@ TEST_F(HostIoOutputChannelsTest,
        TypedCatalogAliasesKeepTheCompleteAddress) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node =
-      std::make_shared<rclcpp::Node>("typed_host_output_channel_test", options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "typed_host_output_channel_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
   for (const auto profile : {"ros_set_bool", "ros2_control_gpio"}) {
     const auto aliases = Aliases(false, false, profile);
     ASSERT_EQ(aliases[0].row.descriptor.output_resource,
               aliases[1].row.descriptor.output_resource);
     EXPECT_FALSE(CreateHostIoOutputChannels(aliases, {}, clock).ok());
     {
-      auto channels = CreateHostIoOutputChannels(aliases, node, clock);
+      auto channels = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
       ASSERT_TRUE(channels.ok()) << channels.error().message;
       ASSERT_EQ(channels.value().size(), 1U);
       const auto provider = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
@@ -322,12 +321,14 @@ TEST_F(HostIoOutputChannelsTest,
       const auto distinct = Aliases(true, false, profile);
       ASSERT_NE(distinct[0].row.descriptor.output_resource,
                 distinct[1].row.descriptor.output_resource);
-      auto channels = CreateHostIoOutputChannels(distinct, node, clock);
+      auto channels = CreateHostIoOutputChannels(distinct, node, clock, {}, node_owner);
       ASSERT_TRUE(channels.ok()) << channels.error().message;
       ASSERT_EQ(channels.value().size(), 2U);
     }
   }
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   context->shutdown("typed host output channel test complete");
 }
 
@@ -335,41 +336,41 @@ TEST_F(HostIoOutputChannelsTest,
        TypedAddressBijectionAndClosedProfileFieldsRefuseBeforeConstruction) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node = std::make_shared<rclcpp::Node>("typed_host_output_conflict_test",
-                                             options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "typed_host_output_conflict_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
   for (const auto profile : {"ros_set_bool", "ros2_control_gpio"}) {
     auto aliases = Aliases(true, false, profile);
     aliases[1].row.descriptor.output_resource =
         aliases[0].row.descriptor.output_resource;
-    auto result = CreateHostIoOutputChannels(aliases, node, clock);
+    auto result = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_address_conflict");
     aliases = Aliases(false, false, profile);
     aliases[1].row.descriptor.output_resource =
         core::ResourceId("different.resource");
-    result = CreateHostIoOutputChannels(aliases, node, clock);
+    result = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_resource_conflict");
     aliases = Aliases(false, false, profile);
     aliases[0].row.provider.adapter_fields["pin"] =
         core::JsonValueDTO{1.0}; // No generic profile has adapter fields.
-    result = CreateHostIoOutputChannels(aliases, node, clock);
+    result = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_profile_unqualified");
     aliases = Aliases(false, false, profile);
     aliases[0].row.provider.channel = "extra.synthetic.channel";
-    result = CreateHostIoOutputChannels(aliases, node, clock);
+    result = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_profile_unqualified");
   }
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   context->shutdown("typed host output conflict test complete");
 }
 
@@ -377,16 +378,14 @@ TEST_F(HostIoOutputChannelsTest,
        GpioChannelsAcrossGroupsShareTheActualWholeTopicPin) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node =
-      std::make_shared<rclcpp::Node>("gpio_topic_channel_test", options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_topic_channel_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
   {
     const auto aliases = Aliases(true, false, "ros2_control_gpio", true);
     ASSERT_NE(aliases[0].row.provider.group, aliases[1].row.provider.group);
     ASSERT_EQ(aliases[0].row.provider.topic, aliases[1].row.provider.topic);
-    auto channels = CreateHostIoOutputChannels(aliases, node, clock);
+    auto channels = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_TRUE(channels.ok()) << channels.error().message;
     ASSERT_EQ(channels.value().size(), 2U);
     const auto first = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
@@ -398,30 +397,54 @@ TEST_F(HostIoOutputChannelsTest,
     EXPECT_NE(first.get(), second.get());
   }
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   context->shutdown("GPIO whole topic helper complete");
+}
+
+TEST_F(HostIoOutputChannelsTest, OwnedGpioTopicPinSurvivesChannelReplacement) {
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  auto transport = ros2_control_execution::Ros2TransportResources::create(
+      "owned_gpio_channels_test", "", 1U, [&] { return context; });
+  transport->start();
+  const auto aliases = Aliases(true, false, "ros2_control_gpio", true);
+  auto retained = CreateHostIoOutputChannels({aliases[0]}, transport->node(), clock, {}, transport);
+  ASSERT_TRUE(retained.ok());
+  auto pin = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
+                 retained.value().front().provider)->gpio_topic();
+  std::vector<HostIoGpioTopicPin> pins{{*aliases[0].row.provider.topic, pin}};
+  retained.value().clear();
+  auto added = CreateHostIoOutputChannels({aliases[1]}, transport->node(), clock, pins, transport);
+  ASSERT_TRUE(added.ok());
+  EXPECT_EQ(std::get<std::shared_ptr<RosBooleanOutputProvider>>(
+                added.value().front().provider)->gpio_topic(), pin);
+  added.value().clear();
+  transport->quiesce();
+  pins.clear();
+  pin.reset();
+  transport.reset();
+  context->shutdown("owned GPIO channel fixture complete");
 }
 
 TEST_F(HostIoOutputChannelsTest,
        CapturedGpioTopicPinsAreSharedExactlyAndConflictsRefuse) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node =
-      std::make_shared<rclcpp::Node>("gpio_topic_predecessor_test", options);
-  auto peer =
-      std::make_shared<rclcpp::Node>("gpio_topic_same_context", options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_topic_predecessor_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
+  auto peer_owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_topic_same_context", "", 1U, [context] { return context; });
+  auto peer = peer_owner->node();
   auto foreign_context = std::make_shared<rclcpp::Context>();
   foreign_context->init(0, nullptr);
-  rclcpp::NodeOptions foreign_options;
-  foreign_options.context(foreign_context);
-  foreign_options.use_global_arguments(false);
-  auto foreign = std::make_shared<rclcpp::Node>("gpio_topic_other_context",
-                                                foreign_options);
+  auto foreign_owner = ros2_control_execution::Ros2TransportResources::create(
+      "gpio_topic_other_context", "", 1U, [foreign_context] { return foreign_context; });
+  auto foreign = foreign_owner->node();
   {
     const auto aliases = Aliases(true, false, "ros2_control_gpio", true);
-    auto retained = CreateHostIoOutputChannels({aliases[0]}, node, clock);
+    auto retained = CreateHostIoOutputChannels({aliases[0]}, node, clock, {}, node_owner);
     ASSERT_TRUE(retained.ok()) << retained.error().message;
     const auto actual = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
                             retained.value().front().provider)
@@ -431,7 +454,7 @@ TEST_F(HostIoOutputChannelsTest,
         {*aliases[0].row.provider.topic, actual},
         {*aliases[0].row.provider.topic, actual}};
     // A different node in the SAME actual ROS context reuses the one pin.
-    auto added = CreateHostIoOutputChannels({aliases[1]}, peer, clock, pins);
+    auto added = CreateHostIoOutputChannels({aliases[1]}, peer, clock, pins, peer_owner);
     ASSERT_TRUE(added.ok()) << added.error().message;
     ASSERT_EQ(added.value().size(), 1U);
     EXPECT_EQ(std::get<std::shared_ptr<RosBooleanOutputProvider>>(
@@ -440,10 +463,10 @@ TEST_F(HostIoOutputChannelsTest,
               actual);
     // The label is not authority: the real leaf rejects another context.
     const auto wrong_context =
-        CreateHostIoOutputChannels({aliases[1]}, foreign, clock, pins);
+        CreateHostIoOutputChannels({aliases[1]}, foreign, clock, pins, foreign_owner);
     ASSERT_FALSE(wrong_context.ok());
     EXPECT_EQ(wrong_context.error().code, "io_ros_output_setup_failed");
-    auto unrelated = CreateHostIoOutputChannels({aliases[0]}, foreign, clock);
+    auto unrelated = CreateHostIoOutputChannels({aliases[0]}, foreign, clock, {}, foreign_owner);
     ASSERT_TRUE(unrelated.ok()) << unrelated.error().message;
     const auto other = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
                            unrelated.value().front().provider)
@@ -454,20 +477,26 @@ TEST_F(HostIoOutputChannelsTest,
         {*aliases[0].row.provider.topic, actual},
         {*aliases[0].row.provider.topic, other}};
     const auto refused =
-        CreateHostIoOutputChannels({aliases[1]}, node, clock, conflict);
+        CreateHostIoOutputChannels({aliases[1]}, node, clock, conflict, node_owner);
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"),
               "host_io_output_gpio_topic_conflict");
     const std::vector<HostIoGpioTopicPin> absent{
         {*aliases[0].row.provider.topic, {}}};
-    const auto no_pin = CreateHostIoOutputChannels({}, node, clock, absent);
+    const auto no_pin = CreateHostIoOutputChannels({}, node, clock, absent, node_owner);
     ASSERT_FALSE(no_pin.ok());
     EXPECT_EQ(no_pin.error().details.at("reason"),
               "host_io_output_gpio_topic_unqualified");
   }
   peer.reset();
+  peer_owner->quiesce();
+  peer_owner.reset();
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   foreign.reset();
+  foreign_owner->quiesce();
+  foreign_owner.reset();
   foreign_context->shutdown("GPIO foreign topic helper complete");
   context->shutdown("GPIO predecessor topic helper complete");
 }
@@ -476,10 +505,9 @@ TEST_F(HostIoOutputChannelsTest,
 TEST_F(HostIoOutputChannelsTest, UrSetIoProfileIsRefused) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
-  rclcpp::NodeOptions options;
-  options.context(context);
-  options.use_global_arguments(false);
-  auto node = std::make_shared<rclcpp::Node>("ur_profile_refused_test", options);
+  auto node_owner = ros2_control_execution::Ros2TransportResources::create(
+      "ur_profile_refused_test", "", 1U, [context] { return context; });
+  auto node = node_owner->node();
   {
     auto aliases = Single();
     auto &provider = aliases.front().row.provider;
@@ -488,12 +516,14 @@ TEST_F(HostIoOutputChannelsTest, UrSetIoProfileIsRefused) {
     provider.adapter_fields["service"] =
         core::JsonValueDTO{std::string("/io_and_status_controller/set_io")};
     provider.adapter_fields["pin"] = core::JsonValueDTO{1.0};
-    const auto result = CreateHostIoOutputChannels(aliases, node, clock);
+    const auto result = CreateHostIoOutputChannels(aliases, node, clock, {}, node_owner);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_profile_unqualified");
   }
   node.reset();
+  node_owner->quiesce();
+  node_owner.reset();
   context->shutdown("UR profile refusal checked");
 }
 

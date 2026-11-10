@@ -10,9 +10,9 @@
 namespace manyforge::roboplan_backend::detail {
 
 inline constexpr std::string_view kCellAdmissionCommandApiVersion =
-    "manyforge.execution_command.v1";
+    "manyforge.execution_command.v3";
 inline constexpr std::string_view kCellAdmissionResponseApiVersion =
-    "manyforge.execution_command_response.v1";
+    "manyforge.execution_command_response.v4";
 
 /// Strict decoders shared by descriptor-bound, read-only owner-journal
 /// settlement readers. They accept only the canonical private DTO spelling.

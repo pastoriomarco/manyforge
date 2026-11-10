@@ -24,6 +24,7 @@ import { parseProgramBindingTransport, ProgramBindingTransportError } from '../p
 import {
   StructuralContractError,
   allowedKeysAt,
+  arrayAt,
   booleanAt,
   boundedArrayAt,
   digestAt,
@@ -438,15 +439,9 @@ function parseAuthoringWorkspaceProjectFacts(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'document_path', 'read_only', 'document_id', 'document_name', 'document_description',
-    'source_diagnostics', 'source_document_digest', 'program_role_assignment',
+    'source_diagnostics', 'source_document_digest',
     'source_program_digest', 'source_deployment_digest',
   ], path);
-  const roleAssignment = record.program_role_assignment === null
-    ? null
-    : jsonRecordAt(
-        record.program_role_assignment,
-        `${path}.program_role_assignment`,
-      );
   return {
     documentPath: nullableStringAt(record.document_path, `${path}.document_path`),
     readOnly: booleanAt(record.read_only, `${path}.read_only`),
@@ -478,7 +473,6 @@ function parseAuthoringWorkspaceProjectFacts(
       record.source_document_digest,
       `${path}.source_document_digest`,
     ),
-    programRoleAssignment: roleAssignment,
     sourceProgramDigest: nullableStringAt(
       record.source_program_digest,
       `${path}.source_program_digest`,
@@ -511,10 +505,10 @@ export function parseAuthoringWorkspaceSnapshot(
     path,
   );
   const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
-  if (schemaVersion !== 'manyforge.composer_authoring_workspace_snapshot.v2') {
+  if (schemaVersion !== 'manyforge.composer_authoring_workspace_snapshot.v3') {
     return fail(
       `${path}.schemaVersion`,
-      'manyforge.composer_authoring_workspace_snapshot.v2',
+      'manyforge.composer_authoring_workspace_snapshot.v3',
     );
   }
   const workspaceEpoch = stringAt(record.workspaceEpoch, `${path}.workspaceEpoch`);
@@ -1091,6 +1085,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'preparation_digest',
       'program',
       'program_binding',
+      'program_frame_facts',
       'program_binding_id',
       'program_id',
       'program_revision',
@@ -1105,8 +1100,8 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.applied_program_selection.v3') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v3');
+  if (schemaVersion !== 'manyforge.applied_program_selection.v4') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v4');
   }
   const assistantMode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
   if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
@@ -1210,6 +1205,63 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   ) {
     return fail(path, 'content-identical Program and Program Binding identities');
   }
+  const factsPath = `${path}.program_frame_facts`;
+  const facts = objectAt(record.program_frame_facts, factsPath);
+  exactKeysAt(facts, [
+    'applied_record_digest', 'program_binding_id', 'program_revision',
+    'retained_bundle_id', 'graph_revision', 'components', 'frames',
+  ], factsPath);
+  const recordDigest = digestAt(source.record_digest, `${path}.source.record_digest`);
+  const factsIdentity = {
+    applied_record_digest: recordDigest,
+    program_binding_id: programBindingId,
+    program_revision: programRevision,
+    retained_bundle_id: retainedBundleId,
+    graph_revision: graphRevision,
+  };
+  for (const [field, expected] of Object.entries(factsIdentity)) {
+    if (stringAt(facts[field], `${factsPath}.${field}`) !== expected) {
+      return fail(`${factsPath}.${field}`, 'the captured Applied identity');
+    }
+  }
+  const components = arrayAt(facts.components, `${factsPath}.components`)
+    .map((value, index) => nonEmptyStringAt(value, `${factsPath}.components[${index}]`));
+  // Python's frame-facts reader orders strings by Unicode code point.
+  const compareCodePoints = (left: string, right: string): number => {
+    const a = Array.from(left, (value) => value.codePointAt(0)!);
+    const b = Array.from(right, (value) => value.codePointAt(0)!);
+    for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+      if (a[index] !== b[index]) return a[index] - b[index];
+    }
+    return a.length - b.length;
+  };
+  if (components.some((value, index) => index > 0 && compareCodePoints(value, components[index - 1]) <= 0)) {
+    return fail(`${factsPath}.components`, 'sorted unique component identities');
+  }
+  const componentSet = new Set(components);
+  const frames = arrayAt(facts.frames, `${factsPath}.frames`).map((value, index) => {
+    const rowPath = `${factsPath}.frames[${index}]`;
+    const row = objectAt(value, rowPath);
+    exactKeysAt(row, ['reference', 'match_count'], rowPath);
+    const reference = objectAt(row.reference, `${rowPath}.reference`);
+    exactKeysAt(reference, ['component_id', 'frame_id'], `${rowPath}.reference`);
+    const componentId = nonEmptyStringAt(reference.component_id, `${rowPath}.reference.component_id`);
+    const frameId = nonEmptyStringAt(reference.frame_id, `${rowPath}.reference.frame_id`);
+    const matchCount = integerAt(row.match_count, `${rowPath}.match_count`);
+    if (!componentSet.has(componentId) || (matchCount !== 1 && matchCount !== 2)) {
+      return fail(rowPath, 'a declared component and match count 1 or 2');
+    }
+    return { reference: { componentId, frameId }, matchCount: matchCount === 1 ? 1 as const : 2 as const };
+  });
+  if (frames.some((row, index) => {
+    if (index === 0) return false;
+    const previous = frames[index - 1].reference;
+    const componentOrder = compareCodePoints(row.reference.componentId, previous.componentId);
+    return componentOrder < 0
+      || (componentOrder === 0 && compareCodePoints(row.reference.frameId, previous.frameId) <= 0);
+  })) {
+    return fail(`${factsPath}.frames`, 'sorted unique frame references');
+  }
   return {
     schemaVersion,
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
@@ -1224,7 +1276,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     retainedBundleId,
     graphRevision,
     nodeEnvironmentDigest,
-    recordDigest: digestAt(source.record_digest, `${path}.source.record_digest`),
+    recordDigest,
     sourceOwnerId: stringAt(source.source_owner_id, `${path}.source.source_owner_id`),
     sourceOwnerEpoch: stringAt(
       source.source_owner_epoch,
@@ -1238,6 +1290,10 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     ownerIdentities,
     program,
     programBinding,
+    programFrameFacts: {
+      appliedRecordDigest: recordDigest, programBindingId, programRevision,
+      retainedBundleId, graphRevision, components, frames,
+    },
   };
 }
 

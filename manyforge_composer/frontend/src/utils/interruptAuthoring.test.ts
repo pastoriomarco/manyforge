@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type {
-  BlackboardKeyDeclaration, JsonValue, ProgramAuthoringDocument, ProgramBindingDocument, ProgramTreeNode,
+  BlackboardKeyDeclaration, JsonValue, ProgramAuthoringDocument, ProgramTreeNode,
 } from '../types/api';
 import {
   canonicalScope,
@@ -26,30 +26,15 @@ import {
   commonStopStages,
   operatorsFor,
   qualifiedStopStages,
-  stopStagesForTargetRole,
   successThroughStages,
   type GlobalInterruptRule,
 } from './interruptAuthoring';
 import { programBlackboardKeys } from './programAuthoring';
 
-const digest = `sha256:${'b'.repeat(64)}`;
-const binding = {
-  target_role_bindings: [
-    { target_role_id: 'arm', signal_role_bindings: [
-      { resource_role_id: 'lamp', signal_name: 'DO1', value_type: 'bool', direction: 'output',
-        transition_capability: 'sampled_only', signal_descriptor_digest: digest },
-      { resource_role_id: 'part_present', signal_name: 'DI0', value_type: 'bool', direction: 'input',
-        transition_capability: 'sampled_only', signal_descriptor_digest: digest },
-    ] },
-    { target_role_id: 'not_in_program', signal_role_bindings: [
-      { resource_role_id: 'x', signal_name: 'DI9', value_type: 'bool', direction: 'input',
-        transition_capability: 'sampled_only', signal_descriptor_digest: digest },
-    ] },
-  ],
-} as unknown as ProgramBindingDocument;
+const candidateSignals = [{ reference: { component_id: 'arm', signal_name: 'DI0' }, ambiguous: false,
+  value_type: 'bool', direction: 'input' as const }];
 
 const program = {
-  target_roles: { arm: {} },
   blackboard: {
     namespaces: [{ namespace_id: 'cell', owner: 'program' }],
     keys: [
@@ -64,15 +49,15 @@ const program = {
   ] }],
 } as unknown as ProgramAuthoringDocument;
 
-const signalOperand = { signal: { target_role: 'arm', resource_role: 'part_present' } };
+const signalOperand = { signal: { component_id: 'arm', signal_name: 'DI0' } };
 const compare = (operand: JsonValue, op: string, value: JsonValue): JsonValue => ({ compare: { operand, op, value } });
 
 describe('interrupt condition authoring', () => {
-  const choices = nodeConditionChoices(program, binding, ['part_lost']);
+  const choices = nodeConditionChoices(program, candidateSignals, ['part_lost']);
 
   it('offers bound input signals of Program targets and every declared scalar key', () => {
     expect(choices.map((choice) => choice.label)).toEqual([
-      'arm · part_present (DI0, input)',
+      'arm · DI0 (input)',
       'cell.count (int64)',
       'cell.label (string)',
       'part_lost (rule state)',
@@ -103,8 +88,8 @@ describe('interrupt condition authoring', () => {
     expect(conditionProblem(compare({ key: 'cell.count' }, '>=', 3), choices)).toBeNull();
     expect(conditionProblem(compare({ key: 'cell.count' }, '>=', 2.5), choices)).toContain('int64');
     expect(conditionProblem(compare({ key: 'cell.count' }, '>=', 2 ** 53), choices)).toContain('2^53');
-    expect(conditionProblem(compare({ key: 'cell.pose' }, '==', 1), choices)).toContain('not a bound');
-    expect(conditionProblem(compare({ key: 'missing' }, '==', 1), choices)).toContain('not a bound');
+    expect(conditionProblem(compare({ key: 'cell.pose' }, '==', 1), choices)).toContain('not a candidate');
+    expect(conditionProblem(compare({ key: 'missing' }, '==', 1), choices)).toContain('not a candidate');
     expect(conditionProblem({ all: [] }, choices)).toContain('at least one');
     expect(conditionProblem({ all: [], any: [] } as JsonValue, choices)).toContain('exactly one');
     expect(conditionProblem({ compare: { operand: signalOperand, op: '==', value: true, extra: 1 } }, choices))
@@ -113,7 +98,7 @@ describe('interrupt condition authoring', () => {
       { not: compare({ key: 'node_outcome.seek' }, '!=', 'completed') }] }, choices)).toBeNull();
   });
 
-  it('enforces the depth and node limits only (contract 137)', () => {
+  it('enforces the depth and node limits only', () => {
     let deep: JsonValue = compare(signalOperand, '==', true);
     for (let level = 0; level < 8; level += 1) deep = { not: deep };
     expect(conditionProblem(deep, choices)).toContain('deeper than 8');
@@ -135,7 +120,7 @@ describe('interrupt condition authoring', () => {
       .toEqual(['a', 'b']);
   });
 
-  it('offers success stages from the entry stage downwards (contract 70)', () => {
+  it('offers success stages from the entry stage downwards', () => {
     const stages = [{ id: 'one', label: 'A' }, { id: 'two', label: 'B' }, { id: 'three', label: 'C' }];
     expect(successThroughStages(stages, undefined).map((stage) => stage.id)).toEqual(['one', 'two', 'three']);
     expect(successThroughStages(stages, 'two').map((stage) => stage.id)).toEqual(['two', 'three']);
@@ -143,64 +128,16 @@ describe('interrupt condition authoring', () => {
   });
 });
 
-describe('generated carried-object-lost operands (DX-2574)', () => {
-  const systemSignal = {
-    controllableComponentId: 'robot', commandTargetId: 'gripper',
-    signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
-    direction: 'input', valueType: 'bool',
-  } as const;
-
-  it('offers the generated input to a required Program target role before a binding exists', () => {
-    const programWithGripper = {
-      ...program,
-      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
-    } as unknown as ProgramAuthoringDocument;
-    const assignment = {
-      component_roles: [{ component_role_id: 'tool', controllable_component_id: 'robot' }],
-      target_roles: [{ target_role_id: 'gripper', command_target_id: 'gripper' }],
-    } as unknown as Record<string, JsonValue>;
-    const choices = nodeConditionChoices(programWithGripper, null, [], null, assignment, [systemSignal]);
-
-    expect(choices.filter((choice) => choice.key === '').map((choice) => choice.label)).toEqual([
-      'gripper · carried_object_lost (carried_object_lost.gripper, input)',
-    ]);
-    expect(conditionProblem(compare({ signal: { target_role: 'gripper', resource_role: 'carried_object_lost' } }, '==', true), choices))
-      .toBeNull();
-    const appliedChoices = nodeConditionChoices(
-      programWithGripper, null, [], null, assignment, [{ ...systemSignal, provenance: 'last_apply' }],
-    );
-    expect(appliedChoices.find((choice) => choice.key === '')?.label)
-      .toContain('from last Apply');
-  });
-
-  it('offers the generated named signal to a global rule without change-only liveness refusal', () => {
-    const choices = globalRuleChoices({}, [], undefined, [systemSignal]);
-    const choice = choices.find((row) => row.label === 'robot · carried_object_lost.gripper (input)');
-    expect(choice?.operand).toEqual({ signal: {
-      controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
-    } });
-    expect(conditionProblem(compare(choice?.operand ?? null, '==', true), choices)).toBeNull();
-
-    const applied = globalRuleChoices({}, [], undefined, [{ ...systemSignal, provenance: 'last_apply' }]);
-    expect(applied.find((row) => row.id === choice?.id)?.label)
-      .toBe('robot · carried_object_lost.gripper (input) · from last Apply');
-  });
-
-  it('drops an Applied system row when the current Draft target identity changed', () => {
-    const programWithGripper = {
-      ...program,
-      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
-    } as unknown as ProgramAuthoringDocument;
-    const staleBinding = {
-      target_role_bindings: [{ target_role_id: 'gripper', controllable_component_id: 'old_robot',
-        command_target_id: 'old_gripper', signal_role_bindings: [{ resource_role_id: 'carried_object_lost',
-          signal_name: 'carried_object_lost.old_gripper', value_type: 'bool', direction: 'input' }] }],
-    } as unknown as ProgramBindingDocument;
-    const choices = nodeConditionChoices(programWithGripper, staleBinding, [], null, null, [systemSignal]);
-
-    expect(choices.some((choice) => choice.id === operandId({
-      signal: { target_role: 'gripper', resource_role: 'carried_object_lost' },
-    }))).toBe(false);
+describe('generated carried-object-lost operands', () => {
+  it('uses the exact candidate identity for node and global conditions', () => {
+    const candidate = { reference: { component_id: 'robot', signal_name: 'carried_object_lost.gripper' },
+      ambiguous: false, value_type: 'bool', direction: 'input' as const };
+    const choices = nodeConditionChoices(program, [candidate], []);
+    expect(conditionProblem(compare({ signal: candidate.reference }, '==', true), choices)).toBeNull();
+    const global = globalRuleChoices({}, [], undefined, [{ controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: candidate.reference.signal_name, direction: 'input', valueType: 'bool' }]);
+    expect(global.some((choice) => choice.id === operandId({ signal: {
+      controllable_component_id: 'robot', signal_name: candidate.reference.signal_name } }))).toBe(true);
   });
 });
 
@@ -232,19 +169,21 @@ describe('global interrupt rules', () => {
     const withRule = (patch: Record<string, JsonValue>) => ({ ...(rule as unknown as Record<string, JsonValue>), ...patch });
     expect(globalRuleProblem(valid, ['rule_2'], choices)).toContain('already uses');
     expect(globalRuleProblem(withRule({ priority: 101 }), [], choices)).toContain('0 to 100');
-    // CONTRACTS §8: on_trip stop | notify; gate, full_stop and the latch fields are gone.
+    // on_trip is stop | notify; gate, full_stop and the latch fields are gone.
     expect(globalRuleProblem(withRule({ on_trip: 'notify' }), [], choices)).toBeNull();
     expect(globalRuleProblem(withRule({ on_trip: 'gate' }), [], choices)).toContain('On trip');
     expect(globalRuleProblem(withRule({ on_trip: 'full_stop' }), [], choices)).toContain('On trip');
     expect(globalRuleProblem(withRule({ on_trip: 'never' }), [], choices)).toContain('On trip');
     const { on_trip: _onTrip, ...withoutOnTrip } = rule as unknown as Record<string, JsonValue>;
+    void _onTrip;
     expect(globalRuleProblem(withoutOnTrip, [], choices)).toContain('On trip');
     expect(globalRuleProblem(withRule({ idle_behaviour: 'latch' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ latch_release: 'operator' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ fallback_outcome: 'fail_node' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ success_through_stage_id: 'x' }), [], choices)).toContain('Unknown');
-    // Contract 73: all_motion | {execution_groups} | everything; priority omitted = 0.
+    // all_motion | {execution_groups} | everything; priority omitted = 0.
     const { priority: _omitted, ...withoutPriority } = rule as unknown as Record<string, JsonValue>;
+    void _omitted;
     expect(globalRuleProblem(withoutPriority, [], choices)).toBeNull();
     expect(globalRuleProblem(withRule({ scope: 'everything' }), [], choices)).toBeNull();
     expect(globalRuleProblem(withRule({ scope: 'all' }), [], choices)).toContain('Scope is');
@@ -272,7 +211,7 @@ describe('global interrupt rules', () => {
       .toContain('does not apply');
   });
 
-  it('nests "changed outside" under each output that holds one (V2-7)', () => {
+  it('nests "changed outside" under each output that holds one', () => {
     const eligible = changedOutsideOutputs([
       { signal_id: 'station/clamp' }, { signal_id: 'station/clamp.changed_outside' },
     ]);
@@ -308,7 +247,7 @@ describe('global interrupt rules', () => {
 });
 
 
-describe('contract 87: interrupt condition keys declare initial', () => {
+describe('interrupt condition keys declare initial', () => {
   const key = (name: string, initial?: JsonValue) => ({
     key: name, type: 'bool', access: 'read_write', persistence: 'run',
     ...(initial === undefined ? {} : { initial }),
@@ -324,7 +263,7 @@ describe('contract 87: interrupt condition keys declare initial', () => {
     expect(problem).toContain('cell.ready');
     // Signals and undeclared keys are not this check's concern.
     expect(interruptKeyInitialProblem(compare('cell.unknown'), keys)).toBeNull();
-    expect(interruptKeyInitialProblem({ compare: { operand: { signal: { target_role: 'a', resource_role: 'b' } },
+    expect(interruptKeyInitialProblem({ compare: { operand: { signal: { component_id: 'a', signal_name: 'b' } },
       op: '==', value: true } }, keys)).toBeNull();
   });
 
@@ -340,7 +279,7 @@ describe('contract 87: interrupt condition keys declare initial', () => {
   });
 });
 
-describe('qualified Stop chain pickers (SX-2167)', () => {
+describe('qualified Stop chain pickers', () => {
   const response = (ids: string[]) => ({
     controlBindingId: 'c', controlBindingRevision: 'r', controlRouteId: 'route', nominalStopMode: null,
     stages: ids.map((stageId, index) => ({
@@ -367,15 +306,6 @@ describe('qualified Stop chain pickers (SX-2167)', () => {
     expect(successThroughStages(stages, 'gone')).toEqual([]);
   });
 
-  it('finds the bound robot chain, else null (available after Apply)', () => {
-    const bindings = [{ target_role_id: 'robot', controllable_component_id: 'arm', command_target_id: 'tcp' }];
-    expect(stopStagesForTargetRole([arm], bindings, 'robot')?.map((stage) => stage.id)).toEqual(['s1', 's2', 's3']);
-    expect(stopStagesForTargetRole([{ ...arm, stopResponse: undefined }], bindings, 'robot')).toBeNull();
-    expect(stopStagesForTargetRole([arm], bindings, 'other')).toBeNull();
-    expect(stopStagesForTargetRole([arm], null, 'robot')).toBeNull();
-    expect(stopStagesForTargetRole([arm], bindings, undefined)).toBeNull();
-  });
-
   it('gives a global rule only the stages every published chain qualifies', () => {
     const other = { controllableComponentId: 'arm2', commandTargetId: 'tcp', stopResponse: response(['s1', 's3']) };
     expect(commonStopStages([arm, other])?.map((stage) => stage.id)).toEqual(['s1', 's3']);
@@ -384,7 +314,7 @@ describe('qualified Stop chain pickers (SX-2167)', () => {
   });
 });
 
-describe('signal liveness in interrupt conditions (contracts 76/81, SX-2194)', () => {
+describe('signal liveness in interrupt conditions', () => {
   const input = (signalName: string, roleId: string, provider: Record<string, JsonValue>) => ({
     controllable_component_id: 'station', command_target_id: 'io', resource_role_id: roleId, signal_name: signalName,
     source_id: signalName, value_type: 'bool', direction: 'input', transition_capability: 'sampled_only',
@@ -419,32 +349,19 @@ describe('signal liveness in interrupt conditions (contracts 76/81, SX-2194)', (
     expect(refused).toContain('cannot be an interrupt condition operand');
   });
 
-  it('joins the Draft liveness onto bound node-rule operands', () => {
-    const bound = {
-      target_role_bindings: [{ target_role_id: 'arm', controllable_component_id: 'station', command_target_id: 'io',
-        signal_role_bindings: [
-          { resource_role_id: 'door', signal_name: 'door', value_type: 'bool', direction: 'input',
-            transition_capability: 'sampled_only', signal_descriptor_digest: digest },
-          { resource_role_id: 'beam', signal_name: 'beam', value_type: 'bool', direction: 'input',
-            transition_capability: 'sampled_only', signal_descriptor_digest: digest },
-        ] }],
-    } as unknown as ProgramBindingDocument;
-    const choices = nodeConditionChoices(program, bound, [], document);
-    expect(choices.filter((choice) => choice.key === '').map((choice) => [choice.label, choice.liveness])).toEqual([
-      ['arm · door (door, input) · liveness unproven', 'change_only'],
-      ['arm · beam (beam, input)', 'periodic'],
-    ]);
-    expect(conditionProblem(compare({ signal: { target_role: 'arm', resource_role: 'door' } }, '==', true), choices))
-      .toContain('change-only source');
-    expect(conditionProblem(compare({ signal: { target_role: 'arm', resource_role: 'beam' } }, '==', true), choices))
-      .toBeNull();
-    // Without a Deployment Draft the liveness is unknown: no local refusal (Apply decides).
-    expect(nodeConditionChoices(program, bound, []).every((choice) => choice.liveness === undefined)).toBe(true);
+  it('uses candidate liveness for exact node-rule signals', () => {
+    const rows = [{ reference: { component_id: 'station', signal_name: 'door' }, ambiguous: false,
+      value_type: 'bool', direction: 'input' as const, liveness: 'change_only' as const },
+    { reference: { component_id: 'station', signal_name: 'beam' }, ambiguous: false,
+      value_type: 'bool', direction: 'input' as const, liveness: 'periodic' as const }];
+    const choices = nodeConditionChoices(program, rows, []);
+    expect(conditionProblem(compare({ signal: rows[0].reference }, '==', true), choices)).toContain('change-only source');
+    expect(conditionProblem(compare({ signal: rows[1].reference }, '==', true), choices)).toBeNull();
   });
 });
 
-describe('system keys and their values (contract 105)', () => {
-  const choices = nodeConditionChoices(program, binding, ['part_lost']);
+describe('system keys and their values', () => {
+  const choices = nodeConditionChoices(program, candidateSignals, ['part_lost']);
   const outcome = (key: string) => ({ key: `node_outcome.${key}` });
 
   it('picks node outcome values from a list that ends with none', () => {
@@ -473,7 +390,7 @@ describe('system keys and their values (contract 105)', () => {
   });
 });
 
-describe('global rules: user keys (contracts 106, 110) and no rule states (111)', () => {
+describe('global rules: user keys and no rule states', () => {
   const rule = (id: string, condition: JsonValue) => ({ rule_id: id, scope: 'all_motion', on_trip: 'stop', condition });
   const document = (rules: JsonValue[]) => ({ policies: { interrupt_rules: rules } }) as Record<string, JsonValue>;
   const doorOpen = compare({ key: 'cell.door_open' }, '==', true);

@@ -563,7 +563,7 @@ TEST(ApplyComponentDelta,
   EXPECT_NE(cell_context(*planning).value(), cell_context(*changed_planning).value());
 }
 
-// N17 R4: an arm's in-motion staleness budget (its Kernel participant's
+// An arm's in-motion staleness budget (its Kernel participant's
 // `controller_state_max_age_ns`) is its effective `measured_joints` budget,
 // which a `policies.component_streams` row overrides. The host bakes it into
 // the arm at construction, so an edit of the arm's own override must rebuild
@@ -600,14 +600,14 @@ TEST(ApplyComponentDelta, OwnMeasuredJointsOverrideEditReachesThatArmsInMotionBu
   EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
   EXPECT_TRUE(apply_component_delta_is_fenced(
       delta, derive_apply_configuration_fence_scope(*before, *after)));
-  // N17 S4: the host builds the arm's budget from its spec's own override.
+  // The host builds the arm's budget from its spec's own override.
   const auto spec = component_spec(*after, kNoSite, first_arm);
   ASSERT_EQ(spec.stream_overrides.size(), 1U);
   EXPECT_EQ(spec.stream_overrides.front().budget_ns, 150'000'000);
   EXPECT_TRUE(component_spec(*after, kNoSite, SecondArm()).stream_overrides.empty());
 }
 
-// -- CONTRACTS §11: one Draft -> Apply path for every structural change ------
+// -- One Draft -> Apply path for every structural change ------
 
 /// Two ROS arms on the shared host, as RosTwoArms(), with the first arm's lane
 /// and graph optionally changed the way a Draft edit changes them.
@@ -646,7 +646,7 @@ void MoveFirstArmBase(CanonicalValue::Object &graph) {
                    reason) != row.replacement_reasons.end();
 }
 
-// CONTRACTS §16: make the second arm a member of the first (its controller
+// Make the second arm a member of the first (its controller
 // profile names the owner and a role), as the compiler writes a machine's
 // members.
 void SecondArmMemberOfFirstAs(CanonicalValue::Object &graph, const std::string &role);
@@ -712,7 +712,7 @@ TEST(ApplyComponentDelta, ReplacingAnOwnerReplacesItsMembersWithTheOwnerReason) 
     EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
 }
 
-// CONTRACTS §11, §16: the second arm as the first's `arm` member.
+// The second arm as the first's `arm` member.
 void SecondArmIsTheArmOfFirst(CanonicalValue::Object &graph) {
   SecondArmMemberOfFirstAs(graph, "arm");
 }

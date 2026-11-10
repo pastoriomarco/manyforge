@@ -22,7 +22,7 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-/// Concrete closed adapter for the one I3-qualified retained POSIX reference
+/// Concrete closed adapter for the one qualified retained POSIX reference
 /// runtime product.
 ///
 /// The constructor accepts disjoint trusted, existing execution state and run

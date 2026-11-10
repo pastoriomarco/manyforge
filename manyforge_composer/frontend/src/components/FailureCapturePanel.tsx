@@ -94,7 +94,7 @@ export function FailureCapturePanel({ open }: { open: boolean }) {
       ...(beforeSequence === null ? {} : { beforeSequence }),
     }, request.signal).then((page) => {
       if (request.signal.aborted) return;
-      // One bounded page replaces the previous one (spec 450 §5.3); pages
+      // One bounded page replaces the previous one; pages
       // are never appended to an ever-growing mounted list.
       setEventPage({
         captureId,

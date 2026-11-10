@@ -131,7 +131,7 @@ struct SoftOnPathStopPlanDTO {
   /// an accepted path can visit the same pose more than once.
   double command_path_time_s = 0.0;
   double forward_stop_path_time_s = 0.0;
-  /// §3.3 cursor mapping: the accepted trajectory's path time of each
+  /// Cursor mapping: the accepted trajectory's path time of each
   /// `replacement_trajectory` waypoint (1:1), as the planner sampled it. It
   /// rises through braking, holds at rest and falls on a spring-back return.
   std::vector<double> replacement_path_time_s;

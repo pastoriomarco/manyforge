@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "host_component_runtime.hpp"
+#include "direct_control_target.hpp"
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
@@ -84,7 +86,7 @@ HostComponentRuntime::Hooks HooksFor(Recorder &recorder) {
       [&] {
         std::lock_guard lock(recorder.mutex);
         ++recorder.published;
-      }};
+      }, {}, {}, {}, {}, {}, {}, {}, {}};
 }
 
 void WaitForLastAction(HostComponentRuntime &runtime, const std::string &component_id) {
@@ -211,6 +213,148 @@ TEST(HostComponentRuntime, AnOwnerKeepsItsOwnerFlag) {
             "component_action_unsupported");
 }
 
+TEST(HostComponentRuntime, SharedTransportRecoveryUsesTheRecordedMemberAction) {
+  core::FakeClock clock;
+  Recorder recorder;
+  auto owner = std::make_shared<InstantAdapter>();
+  auto member = std::make_shared<InstantAdapter>();
+  owner->set(ComponentLifecycle::kFault, ComponentActivity::kUnknown);
+  member->set(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+  std::atomic<bool> faulted{true};
+  std::atomic<int> calls{0};
+  auto hooks = HooksFor(recorder);
+  hooks.shared_transport_fault = [&](const std::string &id) -> std::optional<core::Fault> {
+    if (id != "io" || !faulted.load()) return std::nullopt;
+    return core::Fault{core::FaultCode::kProcessExited,
+                       "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
+                       true, core::FaultOperatorAction::kRecover, std::nullopt,
+                       std::nullopt, {}, 0};
+  };
+  hooks.prepare_shared_transport_recovery = [&](const std::string &id)
+      -> core::IComponentAdapter::PreparedRecovery {
+    if (id != "io" || !faulted.load()) return {};
+    return [&](std::stop_token) {
+      ++calls;
+      owner->set(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+      faulted.store(false);
+      core::ActionResult result;
+      result.outcome = ActionOutcome::kSucceeded;
+      return result;
+    };
+  };
+  HostComponentRuntime runtime(clock, std::move(hooks));
+  static_cast<void>(runtime.SetComponents({{"machine", owner, std::nullopt, std::nullopt, true},
+                                           {"io", member, "machine", "io"}}));
+  ASSERT_TRUE(runtime.Submit("io", ComponentAction::kRecover).ok());
+  WaitForLastAction(runtime, "io");
+  const auto states = runtime.Read().states;
+  ASSERT_EQ(states.size(), 2U);
+  ASSERT_TRUE(states[1].last_action);
+  EXPECT_EQ(states[1].last_action->action, ComponentAction::kRecover);
+  EXPECT_EQ(states[1].last_action->outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(states[1].lifecycle, ComponentLifecycle::kPrepared);
+  EXPECT_EQ(calls.load(), 1);
+}
+
+TEST(HostComponentRuntime, SharedAdapterRecoveryPinsTheAddressedAdapterAtAcceptance) {
+  core::FakeClock clock;
+  Recorder recorder;
+  auto adapter = std::make_shared<InstantAdapter>();
+  adapter->set(ComponentLifecycle::kFault, ComponentActivity::kUnknown);
+  std::atomic<bool> captured{false};
+  auto hooks = HooksFor(recorder);
+  hooks.prepare_adapter_transport_recovery =
+      [&](const std::string &id, const std::shared_ptr<core::IComponentAdapter> &pinned)
+          -> core::IComponentAdapter::PreparedRecovery {
+    if (id != "sensor") return {};
+    captured.store(pinned == adapter);
+    return [pinned](std::stop_token stop) {
+      return pinned->Run(ComponentAction::kRecover, stop);
+    };
+  };
+  HostComponentRuntime runtime(clock, std::move(hooks));
+  static_cast<void>(runtime.SetComponents({{"sensor", adapter, std::nullopt, std::nullopt, true}}));
+  ASSERT_TRUE(runtime.Submit("sensor", ComponentAction::kRecover).ok());
+  WaitForLastAction(runtime, "sensor");
+  EXPECT_TRUE(captured.load());
+}
+
+TEST(HostComponentRuntime, SharedTransportFaultIsPublishedWithUnknownActivity) {
+  core::FakeClock clock;
+  Recorder recorder;
+  auto hooks = HooksFor(recorder);
+  hooks.shared_transport_fault = [](const std::string &id) -> std::optional<core::Fault> {
+    if (id != "io") return std::nullopt;
+    return core::Fault{core::FaultCode::kProcessExited,
+                       "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
+                       true, core::FaultOperatorAction::kRecover, std::nullopt,
+                       std::nullopt, {}, 0};
+  };
+  HostComponentRuntime runtime(clock, std::move(hooks));
+  auto io = std::make_shared<InstantAdapter>();
+  io->set(ComponentLifecycle::kEnabled, ComponentActivity::kIdle);
+  static_cast<void>(runtime.SetComponents({{"io", io}}));
+  const auto states = runtime.Read().states;
+  ASSERT_EQ(states.size(), 1U);
+  EXPECT_EQ(states[0].lifecycle, ComponentLifecycle::kFault);
+  EXPECT_EQ(states[0].activity, ComponentActivity::kUnknown);
+  ASSERT_TRUE(states[0].fault);
+  EXPECT_EQ(states[0].fault->code, core::FaultCode::kProcessExited);
+  EXPECT_NE(states[0].fault->message.find("/manyforge_generic_io"), std::string::npos);
+}
+
+TEST(HostComponentRuntime, BusyTransportRefusesBeforeOpeningRoutes) {
+  core::FakeClock clock;
+  Recorder recorder;
+  auto hooks = HooksFor(recorder);
+  hooks.enter_transport_effect = [](const std::string &, bool)
+      -> core::Result<std::shared_ptr<void>> {
+    return core::Result<std::shared_ptr<void>>::Err(
+        {"component_action_in_progress", "transport recovery in progress", {}});
+  };
+  HostComponentRuntime runtime(clock, std::move(hooks));
+  auto io = std::make_shared<InstantAdapter>();
+  io->set(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+  static_cast<void>(runtime.SetComponents({{"io", io}}));
+  ASSERT_TRUE(runtime.Submit("io", ComponentAction::kEnable).ok());
+  WaitForLastAction(runtime, "io");
+  const auto states = runtime.Read().states;
+  ASSERT_EQ(states.size(), 1U);
+  ASSERT_TRUE(states[0].last_action);
+  EXPECT_EQ(states[0].last_action->outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(states[0].last_action->error);
+  EXPECT_EQ(states[0].last_action->error->code, "component_action_in_progress");
+  EXPECT_EQ(states[0].lifecycle, ComponentLifecycle::kPrepared);
+  std::lock_guard lock(recorder.mutex);
+  EXPECT_TRUE(recorder.opened.empty());
+}
+
+TEST(HostComponentRuntime, EffectLookupPinsExactAdapterAndItsTransportDependency) {
+  core::FakeClock clock;
+  Recorder recorder;
+  auto hooks = HooksFor(recorder);
+  bool uses_transport = true;
+  hooks.uses_shared_transport = [&](const std::string &) { return uses_transport; };
+  hooks.uses_adapter_transport = [&](const std::string &) { return uses_transport; };
+  HostComponentRuntime runtime(clock, std::move(hooks));
+  auto first = std::make_shared<InstantAdapter>();
+  static_cast<void>(runtime.SetComponents({{"io", first}}));
+  auto pinned = runtime.AdapterForEffect("io");
+  ASSERT_EQ(pinned.adapter, first);
+  EXPECT_TRUE(pinned.uses_shared_transport);
+  EXPECT_TRUE(pinned.uses_adapter_transport);
+  uses_transport = false;
+  auto second = std::make_shared<InstantAdapter>();
+  static_cast<void>(runtime.SetComponents({{"io", second}}));
+  EXPECT_EQ(pinned.adapter, first);
+  EXPECT_TRUE(pinned.uses_shared_transport);
+  EXPECT_TRUE(pinned.uses_adapter_transport);
+  const auto current = runtime.AdapterForEffect("io");
+  EXPECT_EQ(current.adapter, second);
+  EXPECT_FALSE(current.uses_shared_transport);
+  EXPECT_FALSE(current.uses_adapter_transport);
+}
+
 TEST(HostComponentRuntime, RemovedComponentsActionsAreHandedBack) {
   core::FakeClock clock;
   Recorder recorder;
@@ -233,7 +377,7 @@ TEST(HostComponentRuntime, AdapterLookupReturnsTheComponentsOwnAdapter) {
   auto io = std::make_shared<InstantAdapter>();
   static_cast<void>(runtime.SetComponents({{"robot", robot}, {"io", io}}));
 
-  // CONTRACTS §7: the output write reaches the adapter itself, not the
+  // The output write reaches the adapter itself, not the
   // route-opening wrapper the coordinator runs.
   EXPECT_EQ(runtime.Adapter("io"), io);
   EXPECT_EQ(runtime.Adapter("robot"), robot);
@@ -286,7 +430,7 @@ core::DesiredControlConfigurationDTO CompiledRouteOf(const std::string &binding)
 }
 
 TEST(HostComponentRuntime, OnlyComponentsWithCompiledRoutesHaveRoutesToOpen) {
-  // CONTRACTS §6, §15: `open_routes` of a component without compiled routes
+  // `open_routes` of a component without compiled routes
   // (a gripper-only cell's I/O, a sensor, an owner) has nothing to open; a
   // component with one opens it whether or not the cell has an arm.
   const std::vector bindings{BindingOf("binding.gripper", "gripper"),
@@ -296,6 +440,42 @@ TEST(HostComponentRuntime, OnlyComponentsWithCompiledRoutesHaveRoutesToOpen) {
   EXPECT_FALSE(HasCompiledComponentRoutes(routes, bindings, core::ControllableComponentId{"io"}));
   EXPECT_FALSE(HasCompiledComponentRoutes(routes, bindings, core::ControllableComponentId{"sensor"}));
   EXPECT_FALSE(HasCompiledComponentRoutes({}, bindings, core::ControllableComponentId{"gripper"}));
+}
+
+TEST(DirectControlTarget, RetainsMountedToolAndSelectsExactRobot) {
+  const core::ProgramTargetReferenceDTO robot{core::ControllableComponentId{"robot"}, core::CommandTargetId{"arm"}};
+  const core::ProgramTargetReferenceDTO tool{core::ControllableComponentId{"tool"}, core::CommandTargetId{"gripper"}};
+  const core::ProgramCapabilityBindingDTO motion{core::CapabilityId{"execution.trajectory.execute"}, core::CapabilityDefinitionRevision{"r1"}, {}, {}, {}};
+  const core::ProgramCapabilityBindingDTO gripper{core::CapabilityId{"tool.gripper.command"}, core::CapabilityDefinitionRevision{"r2"}, {}, {}, {}};
+  std::vector<core::ProgramTargetBindingDTO> rows{
+      {tool, {}, {}, {}, {}, {gripper}, {}, {}, {}, {}},
+      {robot, {}, {}, {}, {}, {motion}, {}, {}, {}, {}}};
+  const auto selected = SelectDirectControlTarget(rows, robot, "execution.trajectory.execute");
+  ASSERT_EQ(selected.status, DirectControlTargetStatus::kFound);
+  EXPECT_EQ(selected.target->target, robot);
+  EXPECT_EQ(rows.front().target, tool);
+  const auto selected_tool = SelectDirectControlTarget(rows, tool, "tool.gripper.command");
+  ASSERT_EQ(selected_tool.status, DirectControlTargetStatus::kFound);
+  EXPECT_EQ(selected_tool.target->target, tool);
+}
+
+TEST(DirectControlTarget, RefusesMissingOrWrongCapability) {
+  const core::ProgramTargetReferenceDTO robot{core::ControllableComponentId{"robot"}, core::CommandTargetId{"arm"}};
+  std::vector<core::ProgramTargetBindingDTO> rows{{robot, {}, {}, {}, {}, {}, {}, {}, {}, {}}};
+  const core::ProgramTargetReferenceDTO absent{core::ControllableComponentId{"other"}, core::CommandTargetId{"arm"}};
+  EXPECT_EQ(SelectDirectControlTarget(rows, absent, "execution.trajectory.execute").status,
+            DirectControlTargetStatus::kMissing);
+  EXPECT_EQ(SelectDirectControlTarget(rows, robot, "execution.trajectory.execute").status,
+            DirectControlTargetStatus::kCapabilityMissing);
+}
+
+TEST(DirectControlTarget, RefusesDuplicateExactTarget) {
+  const core::ProgramTargetReferenceDTO robot{core::ControllableComponentId{"robot"}, core::CommandTargetId{"arm"}};
+  std::vector<core::ProgramTargetBindingDTO> rows{
+      {robot, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+      {robot, {}, {}, {}, {}, {}, {}, {}, {}, {}}};
+  EXPECT_EQ(SelectDirectControlTarget(rows, robot, "execution.trajectory.execute").status,
+            DirectControlTargetStatus::kAmbiguous);
 }
 
 }  // namespace

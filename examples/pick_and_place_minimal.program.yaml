@@ -1,13 +1,13 @@
-api_version: manyforge.program.v2
+api_version: manyforge.program.v3
 program_id: pick_and_place_minimal
-program_revision: sha256:a7ab2f7e0b33c819c950de178bc144a7b340e85582ef0de9164b7ab0b9138299
+program_revision: sha256:a0ef88c70239e2fd5263f4321ef5830c1e2960324917455164ae10765ac88b0e
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: 'Minimal smoke Program for the ur5-simple-pick-place scenario: one target-scoped source-joint
   move followed by removal of one declared scene resource.'
 catalog:
-  api_version: manyforge.node_catalog.v2
-  content_version: 2.9.0
+  api_version: manyforge.node_catalog.v3
+  content_version: 3.0.0
 compatibility:
   lanes:
   - manyforge-only
@@ -17,42 +17,6 @@ compatibility:
   - pick-and-place
   - smoke
   - ur5
-component_roles:
-  robot:
-    required_component_type_tags:
-    - articulated-arm
-    required_model_roles:
-    - arm_model
-target_roles:
-  arm:
-    component_role: robot
-    required_capabilities:
-    - capability_id: execution.feedback.phase_events
-      parameters: {}
-      disposition: required
-    - capability_id: execution.trajectory.execute
-      parameters: {}
-      disposition: required
-    - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.trajectory.time_parameterized
-      parameters: {}
-      disposition: required
-    - capability_id: state.observed.current
-      parameters: {}
-      disposition: required
-    - capability_id: validation.trajectory.non_collision
-      parameters: {}
-      disposition: required
-    required_frame_roles:
-    - base
-    required_resource_roles:
-    - arm_joints
-    required_collision_body_roles:
-    - arm_collision
-    required_model_roles:
-    - arm_model
 scene:
 - scene_resource_id: table
   shape:
@@ -64,9 +28,9 @@ scene:
   pose:
     frame_ref:
       kind: component_frame
-      component_role: robot
-      model_role: arm_model
-      frame_role: base
+      frame:
+        component_id: ur5_robot
+        frame_id: base
     position_m:
     - 1.2
     - 0.0
@@ -93,8 +57,12 @@ tree:
   - node_id: motion.move_to_joint_target
     instance_id: move_to_pick
     parameters:
-      target_role: arm
-      base_frame_role: base
+      target:
+        component_id: ur5_robot
+        command_target_id: arm
+      base_frame:
+        component_id: ur5_robot
+        frame_id: base
       tcp_endpoint:
         kind: current
       goal:

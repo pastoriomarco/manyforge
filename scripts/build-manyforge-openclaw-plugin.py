@@ -45,7 +45,7 @@ RESTORATION_ASSIGNMENTS: Final = (
     ),
     RestorationAssignment(
         "_sha256_bytes, _surface_hash, _write_reproducible_archive",
-        "H0 bounded artifact hashing and exclusive byte-reproducible archive "
+        "bounded artifact hashing and exclusive byte-reproducible archive "
         "publication after a qualified plugin producer exists",
     ),
 )

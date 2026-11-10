@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import manyforge_behavior.program as program_module
+from .v3_fixtures import frame, target
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     compute_content_identity,
@@ -50,7 +51,7 @@ _SCENE_PROGRAM = "examples/lite6_lite_gripper_pick_and_place.program.yaml"
 
 def _catalog() -> NodeCatalog:
     # The executable-environment manifest deliberately remains frozen until
-    # the complete N6-b source batch; this focused loader test consumes the
+    # the complete source batch; this focused loader test consumes the
     # same exact build-owned catalog directly.
     return NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
 
@@ -61,7 +62,7 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
         result,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v2",
+        api_version="manyforge.program.v3",
     )
     return result
 
@@ -111,7 +112,7 @@ def test_program_keeps_gripper_alias_symbolic_through_runtime_input_validation(a
     position = {"kind": "named_preset", "name": alias}
     source["tree"] = {
         "node_id": "gripper.command_position", "instance_id": "named-command",
-        "parameters": {"target_role": "gripper", "position": position}, "children": [],
+        "parameters": {"target": target("lite_gripper", "gripper"), "position": position}, "children": [],
     }
     program = Program.from_dict(_identified(source), catalog)
     assert program.to_dict()["tree"]["parameters"]["position"] == position
@@ -120,7 +121,7 @@ def test_program_keeps_gripper_alias_symbolic_through_runtime_input_validation(a
     )
     snapshot = resolver.snapshot(
         node_id="gripper.command_position", node_instance_id="named-command",
-        parameters={"target_role": "gripper", "position": position}, value_sources={},
+        parameters={"target": target("lite_gripper", "gripper"), "position": position}, value_sources={},
     )
     assert dict(snapshot.parameters["position"]) == position
 
@@ -130,11 +131,50 @@ def test_program_refuses_nonsemantic_gripper_preset_name_before_runtime() -> Non
     source["tree"] = {
         "node_id": "gripper.command_position", "instance_id": "named-command",
         "parameters": {
-            "target_role": "gripper", "position": {"kind": "named_preset", "name": "released"},
+            "target": target("lite_gripper", "gripper"), "position": {"kind": "named_preset", "name": "released"},
         }, "children": [],
     }
     with pytest.raises(ProgramValidationError):
         Program.from_dict(_identified(source), _catalog())
+
+
+def _gripper_effort_program(position: dict[str, Any], effort: dict[str, Any]) -> Program:
+    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    source["tree"] = {
+        "node_id": "gripper.command_position", "instance_id": "effort-command",
+        "parameters": {
+            "target": target("lite_gripper", "gripper"), "position": position, "max_effort": effort,
+        }, "children": [],
+    }
+    return Program.from_dict(_identified(source), _catalog())
+
+
+@pytest.mark.parametrize("alias", ["open", "closed"])
+@pytest.mark.parametrize("effort", [
+    {"kind": "linear_newton", "value_n": 40.0},
+    {"kind": "angular_newton_meter", "value_nm": 1.0},
+])
+def test_named_gripper_preset_accepts_max_effort_of_either_kind(alias, effort) -> None:
+    # OD-90: the gripper's own coordinate kind decides at run time.
+    program = _gripper_effort_program({"kind": "named_preset", "name": alias}, effort)
+    assert program.to_dict()["tree"]["parameters"]["max_effort"] == effort
+
+
+@pytest.mark.parametrize("position,effort", [
+    ({"kind": "linear_m", "value_m": 0.01}, {"kind": "linear_newton", "value_n": 40.0}),
+    ({"kind": "angular_rad", "value_rad": 0.5}, {"kind": "angular_newton_meter", "value_nm": 1.0}),
+])
+def test_numeric_gripper_position_accepts_matching_effort_kind(position, effort) -> None:
+    _gripper_effort_program(position, effort)
+
+
+@pytest.mark.parametrize("position,effort", [
+    ({"kind": "linear_m", "value_m": 0.01}, {"kind": "angular_newton_meter", "value_nm": 1.0}),
+    ({"kind": "angular_rad", "value_rad": 0.5}, {"kind": "linear_newton", "value_n": 40.0}),
+])
+def test_numeric_gripper_position_refuses_other_effort_kind(position, effort) -> None:
+    with pytest.raises(ProgramValidationError, match="unit kind does not match"):
+        _gripper_effort_program(position, effort)
 
 
 @pytest.mark.parametrize(
@@ -528,7 +568,7 @@ def test_program_stale_revision_does_not_hide_semantic_errors() -> None:
     document["program_revision"] = "sha256:" + "f" * 64
     document["tree"]["children"][0]["node_id"] = "motion.not_in_catalog"
 
-    with pytest.raises(ProgramNodeValidationError, match="absent from the active v2 catalog"):
+    with pytest.raises(ProgramNodeValidationError, match="absent from the active v3 catalog"):
         Program.from_dict(document, _catalog(), authoring_load=True)
 
 
@@ -556,16 +596,21 @@ def _with_catalog_version(document: dict[str, Any], version: str) -> dict[str, A
     return _identified(changed)
 
 
-def test_program_saved_under_older_catalog_minor_loads_as_active() -> None:
+def test_program_saved_under_older_catalog_minor_loads_as_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    import manyforge_behavior.catalog as catalog_module
+
     catalog = _catalog()
+    # The shipped v3 catalog starts at minor zero. Exercise the same
+    # compatibility boundary against a later synthetic active minor.
+    monkeypatch.setattr(catalog_module, "EXPECTED_CONTENT_VERSION", "3.1.0")
     major, minor, _patch = catalog.content_version.split(".")
     assert int(minor) > 0
-    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    source = _with_catalog_version(load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM), "3.1.0")
     active = Program.from_dict(source, catalog)
     older = _with_catalog_version(source, f"{major}.{int(minor) - 1}.0")
 
-    # Strict (Applied/runtime) reads keep M3: an older selector is refused.
-    with pytest.raises(ProgramValidationError, match="exact active v2 catalog"):
+    # Strict (Applied/runtime) reads keep the catalog-minor check: an older selector is refused.
+    with pytest.raises(ProgramValidationError, match="exact active v3 catalog"):
         Program.from_dict(older, catalog)
     program = Program.from_dict(older, catalog, authoring_load=True)
 
@@ -589,7 +634,7 @@ def test_program_incompatible_catalog_version_is_refused(offset: str) -> None:
     }[offset]
     source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
 
-    with pytest.raises(ProgramValidationError, match="compatible active v2 catalog"):
+    with pytest.raises(ProgramValidationError, match="compatible active v3 catalog"):
         Program.from_dict(
             _with_catalog_version(source, version), catalog, authoring_load=True
         )
@@ -651,8 +696,8 @@ def test_program_rejects_dynamic_target_selection() -> None:
         }
     )
     move = document["tree"]["children"][0]
-    del move["parameters"]["target_role"]
-    move["value_sources"]["target_role"] = {
+    del move["parameters"]["target"]
+    move["value_sources"]["target"] = {
         "kind": "program_parameter",
         "reference": "selected_target",
     }
@@ -712,18 +757,18 @@ def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ("catalog_version", "exact active v2 catalog"),
+        ("catalog_version", "catalog"),
         ("duplicate_scene", "unique.*scene_resource_id"),
         ("non_unit_quaternion", "unit quaternion"),
-        ("unknown_node", "absent from the active v2 catalog"),
+        ("unknown_node", "absent from the active v3 catalog"),
         ("leaf_with_child", "must contain 0-0 children"),
         ("missing_required_parameter", "missing required catalog parameter"),
         ("invalid_parameter_default", "default violates max_inclusive"),
         ("unexpanded_interpolation", "legacy.*interpolation.*value_sources"),
         ("undeclared_value_source", "names no Program parameter"),
         ("empty_blackboard_fields", "must not be empty"),
-        ("unknown_viewer_role", "does not name a declared role"),
-        ("unknown_viewer_scene_resource", "does not name a declared role"),
+        ("unknown_viewer_role", "is unavailable in Program v3"),
+        ("unknown_viewer_scene_resource", "does not name a declared scene resource"),
         ("removed_scene_policy_ids", r"contains unknown fields \['collision_policy_ids'\]"),
         ("inapplicable_constraint", "numeric constraints are unsupported"),
     ),
@@ -749,7 +794,7 @@ def test_translated_historical_program_negative_corpus(
         nested["instance_id"] = "nested_remove"
         move["children"] = [nested]
     elif mutation == "missing_required_parameter":
-        del move["parameters"]["target_role"]
+        del move["parameters"]["target"]
     elif mutation == "invalid_parameter_default":
         document["parameters"][0]["default"] = 2.0
     elif mutation == "unexpanded_interpolation":
@@ -795,41 +840,32 @@ def test_translated_historical_program_negative_corpus(
         Program.from_dict(_identified(document), catalog)
 
 
-def test_contact_selector_must_resolve_to_one_declared_target() -> None:
-    catalog = _catalog()
+def test_contact_selector_keeps_exact_direct_target() -> None:
     document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
-    document["target_roles"]["gripper_secondary"] = deepcopy(
-        document["target_roles"]["gripper"]
-    )
-
-    with pytest.raises(ProgramValidationError, match="exactly one.*target role"):
-        Program.from_dict(_identified(document), catalog)
+    parsed = Program.from_dict(_identified(document), _catalog())
+    pending = [parsed.to_dict()["tree"]]
+    selected = []
+    while pending:
+        node = pending.pop()
+        if "contact_policy_id" in node.get("parameters", {}):
+            selected.append(node["parameters"]["target"])
+        pending.extend(node.get("children", ()))
+    assert selected == [target("ur5_robot", "arm")]
+    assert "target_roles" not in parsed.to_dict()
 
 
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
-    (
-        ("carrier_frame_role", "base"),
-        ("touch_body_roles", ["arm_collision"]),
-    ),
+    (("carrier_frame_ref", {"frame_id": "tcp"}),
+     ("touch_bodies", [{"component_id": "lite_gripper"}])),
 )
-def test_carried_object_roles_are_scoped_to_selected_target(
-    field_name: str,
-    invalid_value: object,
-) -> None:
-    catalog = _catalog()
-    document = load_strict_json_yaml(
-        _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml"
-    )
-    attach = next(
-        child
-        for child in document["tree"]["children"]
-        if child["node_id"] == "scene.attach_carried_object"
-    )
+def test_carried_object_references_require_exact_identity(field_name, invalid_value) -> None:
+    document = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    attach = next(child for child in document["tree"]["children"]
+                  if child["node_id"] == "scene.attach_carried_object")
     attach["parameters"][field_name] = invalid_value
-
-    with pytest.raises(ProgramValidationError, match="required by target role 'gripper'"):
-        Program.from_dict(_identified(document), catalog)
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(document), _catalog())
 
 
 def test_pure_tree_helpers_remain_available_during_the_port() -> None:
@@ -995,11 +1031,9 @@ def test_blackboard_key_construction_is_bounded() -> None:
 
 
 def _logic_only_document() -> dict[str, Any]:
-    """A Program with no component or target role and only a timer."""
+    """A Program with no external references and only a timer."""
 
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
-    document["component_roles"] = {}
-    document["target_roles"] = {}
     document.pop("scene", None)
     document.pop("parameters", None)
     document["tree"] = {
@@ -1018,11 +1052,11 @@ def _logic_only_document() -> dict[str, Any]:
     return document
 
 
-def test_logic_only_program_parses_with_an_empty_component_role_map() -> None:
+def test_logic_only_program_parses_without_role_maps() -> None:
     program = Program.from_dict(_identified(_logic_only_document()), _catalog())
 
-    assert program.to_dict()["component_roles"] == {}
-    assert program.to_dict()["target_roles"] == {}
+    assert "component_roles" not in program.to_dict()
+    assert "target_roles" not in program.to_dict()
 
 
 def test_logic_only_declarations_accept_an_empty_component_role_map() -> None:
@@ -1034,19 +1068,15 @@ def test_logic_only_declarations_accept_an_empty_component_role_map() -> None:
     assert keys == {}
 
 
-def test_program_refuses_an_absent_component_role_map() -> None:
+def test_program_refuses_legacy_component_role_map() -> None:
     document = _logic_only_document()
-    del document["component_roles"]
+    document["component_roles"] = {}
 
     with pytest.raises(ProgramValidationError, match="component_roles"):
         Program.from_dict(_identified(document), _catalog())
-    with pytest.raises(ProgramValidationError, match="component_roles"):
-        program_module.program_value_declarations(
-            _identified(document), catalog=_catalog()
-        )
 
 
-def test_program_still_refuses_a_target_without_a_declared_component_role() -> None:
+def test_program_refuses_legacy_target_roles() -> None:
     document = _logic_only_document()
     document["target_roles"] = {
         "arm": {
@@ -1055,7 +1085,7 @@ def test_program_still_refuses_a_target_without_a_declared_component_role() -> N
         }
     }
 
-    with pytest.raises(ProgramValidationError, match="declared component role"):
+    with pytest.raises(ProgramValidationError, match="target_roles"):
         Program.from_dict(_identified(document), _catalog())
 
 
@@ -1107,7 +1137,7 @@ def _endpoint_motion_document():
         raise AssertionError('fixture has no pose motion')
     parameters = document['tree']['parameters']
     parameters.pop('tcp_frame_role', None)  # Build only the new fixture form.
-    parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}  # TCP migration: selector now needs kind (entry)
+    parameters['tcp_endpoint'] = {'kind': 'entry', 'target': target('lite_gripper', 'gripper'), 'frame': frame('lite_gripper', 'tcp')}  # TCP migration: selector now needs kind (entry)
     return document
 
 
@@ -1115,7 +1145,7 @@ def test_motion_endpoint_uses_qualified_declared_target_frame() -> None:
     document = _endpoint_motion_document()
     program = Program.from_dict(_identified(document), _catalog())
     assert program.to_dict()['tree']['parameters']['tcp_endpoint'] == {  # TCP migration: selector needs kind (entry)
-        'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp',
+        'kind': 'entry', 'target': target('lite_gripper', 'gripper'), 'frame': frame('lite_gripper', 'tcp'),
     }
     assert 'tcp_frame_role' not in program.to_dict()['tree']['parameters']
 
@@ -1130,15 +1160,15 @@ def test_motion_endpoint_rejects_ambiguous_or_uncaptured_selection(mutation) -> 
         parameters.pop('tcp_endpoint')
         parameters['tcp_frame_role'] = 'tcp'
     elif mutation == 'unknown_target':
-        parameters['tcp_endpoint']['target_role'] = 'missing'
+        parameters['tcp_endpoint']['target'] = {'component_id': 'missing'}
     elif mutation == 'wrong_frame':
-        parameters['tcp_endpoint']['frame_role'] = 'base'
+        parameters['tcp_endpoint']['frame'] = {'component_id': 'lite_gripper'}
     elif mutation == 'extra':
-        parameters['tcp_endpoint']['collision_body_role'] = 'gripper_collision'
+        parameters['tcp_endpoint']['unexpected_field'] = 'gripper_collision'
     elif mutation == 'null':
         parameters['tcp_endpoint'] = None
     else:
-        document['tree']['value_sources'] = {'tcp_endpoint.frame_role': {'kind': 'parameter', 'parameter_id': 'endpoint'}}
+        document['tree']['value_sources'] = {'tcp_endpoint.frame': {'kind': 'parameter', 'parameter_id': 'endpoint'}}
     with pytest.raises(ProgramValidationError):
         Program.from_dict(_identified(document), _catalog())
 
@@ -1150,7 +1180,7 @@ def test_contact_policy_motion_endpoint_is_one_exact_pair(reverse) -> None:
     for node in document['tree']['children']:
         parameters = node.get('parameters', {})
         if 'contact_policy_id' in parameters:
-            parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}  # TCP migration: selector now needs kind (entry)
+            parameters['tcp_endpoint'] = {'kind': 'entry', 'target': target('robotiq_2f_85', 'gripper'), 'frame': frame('robotiq_2f_85', 'tcp')}  # TCP migration: selector now needs kind (entry)
     policy = document['contact_policies'][0]
     old_pair = policy['zones'][0]['body_pairs'][0]
     runtime = next(value for value in old_pair.values() if value['kind'] == 'runtime_object')
@@ -1175,10 +1205,10 @@ def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, 
         document["tree"] = {
             "node_id": "motion.probe_search", "instance_id": "probe", "children": [],
             "parameters": {
-                "target_role": "arm", "base_frame_role": "base",
+                "target": target("ur5_robot", "arm"), "base_frame": frame("ur5_robot", "base"),
                 "tcp_endpoint": {"kind": "current"},  # TCP migration: the arm declares no tcp frame
                 "goal": {
-                    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                    "frame_ref": {"kind": "target_frame", "frame": frame("ur5_robot", "base")},
                     "position_m": [0.4, 0.0, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
                 },
                 "contact_policy_id": "selected_object_grasp",
@@ -1247,7 +1277,9 @@ def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
         if node['instance_id'] == 'end_rest':
             assert node['parameters']['contact_policy_id'] == 'withdrawal_contact_policy'
             assert node['parameters']['contact_scene_resource_id'] == 'probe_block'
-            assert node['parameters']['tcp_endpoint'] == {'kind': 'default_of_role', 'role': 'gripper'}  # TCP migration: withdrawal follows gripper default
+            assert node['parameters']['tcp_endpoint'] == {
+                'kind': 'default_of_target', 'target': target('lite_gripper', 'gripper')
+            }
             break
         pending.extend(node.get('children', ()))
 
@@ -1265,7 +1297,7 @@ def _contact_release_document(*, evidence="signed_penetration", pick=False):
         else:
             raise AssertionError("contact fixture has no pose move")
         document["tree"]["parameters"].update(
-            tcp_endpoint={"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},  # TCP migration: selector now needs kind (entry)
+            tcp_endpoint={"kind": "entry", "target": target("robotiq_2f_85", "gripper"), "frame": frame("robotiq_2f_85", "tcp")},  # TCP migration: selector now needs kind (entry)
             contact_policy_id=document["contact_policies"][0]["policy_id"],
             contact_scene_resource_id="cube_part",
         )
@@ -1308,7 +1340,7 @@ def test_contact_release_keeps_exact_endpoint_policy_and_authored_envelope(evide
     parsed = Program.from_dict(identified, _catalog())
     assert parsed.to_dict()["contact_policies"] == identified["contact_policies"]
     assert parsed.to_dict()["tree"]["parameters"]["tcp_endpoint"] == {  # TCP migration: selector needs kind (entry)
-        "kind": "entry", "target_role": "gripper", "frame_role": "tcp",
+        "kind": "entry", "target": target("robotiq_2f_85", "gripper"), "frame": frame("robotiq_2f_85", "tcp"),
     }
 
 
@@ -1389,8 +1421,8 @@ def test_tcp_entry_value_is_structured_and_preserves_dotted_ids() -> None:
 
 
 def test_active_tcp_namespace_is_reserved_for_system_keys() -> None:
-    assert program_module.active_tcp_key("arm.left") == "active_tcp.arm.left"
-    assert program_module.is_active_tcp_key("active_tcp.arm.left")
+    assert program_module.active_tcp_key("robot.left", "arm.left") == "active_tcp/robot.left/arm.left"
+    assert program_module.is_active_tcp_key("active_tcp/robot.left/arm.left")
     with pytest.raises(ProgramValidationError, match="reserved"):
         program_module._validate_blackboard(
             {"namespaces": [{"namespace_id": "active_tcp", "owner": "program"}], "keys": []},
@@ -1398,100 +1430,59 @@ def test_active_tcp_namespace_is_reserved_for_system_keys() -> None:
         )
 
 
-def test_motion_role_declares_read_only_active_tcp_key() -> None:
-    document = _logic_only_document()
-    document["component_roles"] = {"robot": {}}
-    document["target_roles"] = {
-        "arm": {
-            "component_role": "robot",
-            "required_capabilities": [{
-                "capability_id": "execution.trajectory.execute",
-                "parameters": {},
-                "disposition": "required",
-            }],
-        }
-    }
-    document["catalog"]["content_version"] = _catalog().content_version
+def test_motion_target_declares_read_only_active_tcp_key() -> None:
+    document = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
     program = Program.from_dict(_identified(document), _catalog())
-    key = program.blackboard_keys["active_tcp.arm"]
+    key_id = program_module.active_tcp_key("lite6_robot", "arm")
+    key = program.blackboard_keys[key_id]
     assert (key.type, key.access, key.persistence, key.has_initial) == (
         "tcp_entry", "read", "run", False
     )
     program.validate_key_value(
-        key.key,
-        {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tip"},
+        key.key, {"target": target("tool", "gripper"), "frame": frame("tool", "tip")},
         path="value",
     )
 
 
 def test_set_tcp_accepts_whole_tcp_entry_source() -> None:
     document = _logic_only_document()
-    document["component_roles"] = {"robot": {}}
-    document["target_roles"] = {
-        "arm": {
-            "component_role": "robot",
-            "required_capabilities": [{
-                "capability_id": "execution.trajectory.execute",
-                "parameters": {},
-                "disposition": "required",
-            }],
-        }
-    }
+    key = program_module.active_tcp_key("robot", "arm")
     document["catalog"]["content_version"] = _catalog().content_version
     document["tree"] = {
         "node_id": "motion.set_tcp", "instance_id": "choose_tcp",
-        "parameters": {"target_role": "arm"},
-        "value_sources": {"tcp": {"kind": "blackboard_key", "reference": "active_tcp.arm"}},
+        "parameters": {"target": target("robot", "arm")},
+        "value_sources": {"tcp": {"kind": "blackboard_key", "reference": key}},
         "children": [],
     }
     program = Program.from_dict(_identified(document), _catalog())
-    assert program.to_dict()["tree"]["value_sources"]["tcp"]["reference"] == "active_tcp.arm"
+    assert program.to_dict()["tree"]["value_sources"]["tcp"]["reference"] == key
 
 
 def test_active_tcp_declarations_follow_bound_target_presence() -> None:
-    document = _logic_only_document()
-    document["component_roles"] = {"robot": {}}
-    document["target_roles"] = {
-        "arm": {
-            "component_role": "robot",
-            "required_capabilities": [{
-                "capability_id": "execution.trajectory.execute",
-                "parameters": {}, "disposition": "required",
-            }],
-        },
-        "planner": {
-            "component_role": "robot",
-            "required_capabilities": [{
-                "capability_id": "planning.pick_sequence",
-                "parameters": {}, "disposition": "required",
-            }],
-        },
-    }
-    document["catalog"]["content_version"] = _catalog().content_version
+    document = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
     program = Program.from_dict(_identified(document), _catalog())
-    bound = program.with_active_tcp_binding({"target_role_bindings": [
-        {"target_role_id": "arm"},
-        {"target_role_id": "planner", "robot_tcps": []},
+    arm_key = program_module.active_tcp_key("lite6_robot", "arm")
+    planner_key = program_module.active_tcp_key("other_robot", "planner")
+    bound = program.with_active_tcp_binding({"target_bindings": [
+        {"target": target("lite6_robot", "arm")},
+        {"target": target("other_robot", "planner"), "robot_tcps": []},
     ]})
-    assert "active_tcp.arm" in program.blackboard_keys
-    assert "active_tcp.arm" not in bound.blackboard_keys
-    key = bound.blackboard_keys["active_tcp.planner"]
+    assert arm_key in program.blackboard_keys
+    assert arm_key not in bound.blackboard_keys
+    key = bound.blackboard_keys[planner_key]
     assert (key.type, key.access, key.persistence) == ("tcp_entry", "read", "run")
-    assert "active_tcp.planner" not in program.blackboard_keys
+    assert planner_key not in program.blackboard_keys
 
 
-def test_portable_active_tcp_key_is_declared_for_planning_role():
+def test_portable_active_tcp_key_is_declared_for_planning_target():
+    key = program_module.active_tcp_key("robot", "planner")
     keys = program_module._declare_active_tcp_selector_keys(
-        {}, [{
-            "node_id": "planning.plan_pick_sequence",
-            "parameters": {"target_role": "planner"},
-            "children": [],
-        }], {"planner": {}},
+        {}, [{"node_id": "planning.plan_pick_sequence",
+              "parameters": {"target": target("robot", "planner")}, "children": []}],
     )
-    assert keys["active_tcp.planner"].type == "tcp_entry"
-    assert keys["active_tcp.planner"].access == "read"
+    assert keys[key].type == "tcp_entry"
+    assert keys[key].access == "read"
     assert program_module._declare_active_tcp_selector_keys(
         {}, [{"node_id": "planning.plan_place_sequence",
-              "parameters": {"target_role": "missing"}, "children": []}],
-        {"planner": {}},
+              "parameters": {"target": {"component_id": "robot"}}, "children": []}],
     ) == {}

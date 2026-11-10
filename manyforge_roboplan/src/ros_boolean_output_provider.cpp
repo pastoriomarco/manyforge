@@ -13,11 +13,17 @@
 // limitations under the License.
 
 #include <manyforge_roboplan/ros_boolean_output_provider.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
+#include <manyforge_ros2_control_execution/graph_event_observer.hpp>
+#include <manyforge_ros2_control_execution/detail/leaf_timing.hpp>
+#include "cached_ros_context.hpp"
+#include <atomic>
+#include <manyforge_core/types/typed_error.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <future>
 #include <control_msgs/msg/dynamic_interface_group_values.hpp>
+#include <future>
 #include <manyforge_core/types/component_lifecycle.hpp>
 #include <map>
 #include <mutex>
@@ -44,11 +50,11 @@ using Wire = std::variant<std::shared_ptr<Service::Request>, GpioMessage>;
                                      std::nullopt}};
 }
 
+// The specific refusal code is the typed error code; it is not wrapped in a
+// generic umbrella code.
 template <class T>
 core::Result<T> reject(std::string reason, std::string message) {
-  return core::Result<T>::Err({"io_output_rejected",
-                               std::move(message),
-                               {{"reason", std::move(reason)}}});
+  return core::Result<T>::Err({std::move(reason), std::move(message), {}});
 }
 
 bool absolute_service(std::string_view service) {
@@ -131,6 +137,15 @@ struct RosBooleanOutputProvider::State final {
         [](const auto &a, const auto &b) { return a.signal_id < b.signal_id; });
     return core::Result<AliasTable>::Ok(std::move(table));
   }
+  struct ModelFacts final {
+    core::ActiveBundlePublicationGeneration publication;
+    bool retired;
+    std::vector<Gate> gates;
+  };
+  void RefreshModelFacts() {
+    model_facts.store(std::make_shared<const ModelFacts>(ModelFacts{publication, retired, gates}),
+                      std::memory_order_release);
+  }
   bool Matches(const std::vector<IoOutputAliasIdentity> &expected) const {
     if (aliases.size() != expected.size())
       return false;
@@ -165,39 +180,29 @@ struct RosBooleanOutputProvider::State final {
   bool Gpio() const {
     return std::holds_alternative<RosGpioOutputAddress>(address);
   }
-  bool TopicReady() const;
   std::unique_lock<std::mutex> LockTopic() const;
-  /// The wire of one write of `value` through `gate`: the service request,
-  /// or the GPIO group message with every other channel's written value
-  /// (`committed_model` is this channel's new one). The caller holds the
-  /// channel and topic locks; the pins keep every lifetime read here alive
-  /// past both. Throws when the wire can't be prepared (nothing was sent).
+  /// Build the aggregate under the exact publisher leaf from atomic channel
+  /// facts and that publisher's model. Lifetime pins outlive the leaf. Throws
+  /// before SDK entry when the wire cannot be prepared.
   static Wire BuildWire(const std::shared_ptr<State> &self, bool value, const Gate &gate,
+                        const std::shared_ptr<void> &publisher_leaf,
+                        const std::shared_ptr<const ModelFacts> &own_facts,
                         std::vector<std::shared_ptr<State>> &channel_pins,
                         std::vector<std::shared_ptr<const void>> &writer_pins,
                         std::optional<Written> &committed_model);
-  bool Ready() const {
-    if (Gpio())
-      return TopicReady();
-    return std::visit(
-        [](const auto &channel) {
-          using Channel = std::decay_t<decltype(channel)>;
-          if constexpr (std::is_same_v<Channel, GpioPublisher::SharedPtr>)
-            return bool(channel);
-          else
-            return channel && channel->service_is_ready();
-        },
-        transport);
-  }
   core::ActiveBundlePublicationGeneration publication;
   mutable std::mutex mutex;
+  std::atomic<std::shared_ptr<const ModelFacts>> model_facts;
   const RosBooleanOutputAddress address;
   const core::ResourceId resource;
   std::shared_ptr<GpioTopic> topic;
   std::variant<Client::SharedPtr, GpioPublisher::SharedPtr> transport;
+  std::atomic<std::shared_ptr<std::atomic<int>>> cached_service_ready;
+  std::atomic<std::shared_ptr<host_detail::CachedRosContext>> cached_context;
   std::vector<Gate> gates;
   std::vector<Alias> aliases;
   core::Duration ack_timeout_ns{};
+  std::weak_ptr<ros2_control_execution::Ros2TransportResources> owner;
   bool retired = false;
 };
 
@@ -208,16 +213,21 @@ struct RosBooleanOutputProvider::GpioTopic final {
     std::weak_ptr<State> channel;
     std::optional<State::Written> written;
   };
-  rclcpp::Node::SharedPtr node;
+  struct TopicEntities final {
+    rclcpp::Node::SharedPtr node;
+    GpioPublisher::SharedPtr publisher;
+    std::weak_ptr<ros2_control_execution::Ros2TransportResources> owner;
+    bool owner_required{false};
+    // Exact publisher leaf: aggregate and last-written model move together.
+    std::mutex send_mutex;
+    std::atomic<bool> accepting{true};
+    std::map<core::ResourceId, Model> written_model;
+  };
+  std::shared_ptr<TopicEntities> entities;
   std::string name;
-  GpioPublisher::SharedPtr publisher;
   std::mutex mutex;
   std::map<core::ResourceId, Model> model;
 };
-bool RosBooleanOutputProvider::State::TopicReady() const {
-  return topic && topic->publisher &&
-         topic->node->get_node_base_interface()->get_context()->is_valid();
-}
 std::unique_lock<std::mutex>
 RosBooleanOutputProvider::State::LockTopic() const {
   return topic ? std::unique_lock<std::mutex>(topic->mutex)
@@ -226,6 +236,8 @@ RosBooleanOutputProvider::State::LockTopic() const {
 
 Wire RosBooleanOutputProvider::State::BuildWire(
     const std::shared_ptr<State> &self, const bool value, const Gate &gate,
+    const std::shared_ptr<void> &publisher_leaf,
+    const std::shared_ptr<const ModelFacts> &own_facts,
     std::vector<std::shared_ptr<State>> &channel_pins,
     std::vector<std::shared_ptr<const void>> &writer_pins,
     std::optional<Written> &committed_model) {
@@ -234,29 +246,26 @@ Wire RosBooleanOutputProvider::State::BuildWire(
     message->data = value;
     return message;
   }
+  auto leaf = std::static_pointer_cast<GpioTopic::TopicEntities>(publisher_leaf);
+  if (!leaf) throw std::invalid_argument("GPIO publisher is unavailable");
   std::map<std::string, std::map<std::string, bool>> groups;
-  // Allocate capacity before obtaining any other actual lifetime pins.
-  // Every successful pin survives both locks, including ineligible owners
-  // and all exceptional wire-preparation paths.
-  channel_pins.reserve(self->topic->model.size());
-  writer_pins.reserve(self->topic->model.size());
-  for (auto row = self->topic->model.begin(); row != self->topic->model.end();) {
+  auto &model = leaf->written_model;
+  channel_pins.reserve(model.size());
+  writer_pins.reserve(model.size());
+  if (!own_facts) throw std::invalid_argument("GPIO channel retired");
+  for (auto row = model.begin(); row != model.end();) {
     auto actual = row->second.channel.lock();
-    if (!actual) {
-      row = self->topic->model.erase(row);
-      continue;
-    }
+    if (!actual) { row = model.erase(row); continue; }
     channel_pins.push_back(actual);
+    const auto facts = actual->model_facts.load(std::memory_order_acquire);
     std::optional<bool> written_value;
-    if (actual == self)
-      written_value = value;
-    else if (actual->publication == self->publication && !actual->retired &&
-             row->second.written) {
+    if (actual == self) written_value = value;
+    else if (facts && facts->publication == own_facts->publication &&
+             !facts->retired && row->second.written) {
       const auto &written = *row->second.written;
       writer_pins.push_back(written.actual_driver_owner.lock());
-      const bool permitted =
-          writer_pins.back() &&
-          std::any_of(actual->gates.begin(), actual->gates.end(), [&](const auto &candidate) {
+      const bool permitted = writer_pins.back() &&
+          std::any_of(facts->gates.begin(), facts->gates.end(), [&](const auto &candidate) {
             return candidate.accepting && !candidate.terminal &&
                    candidate.provider == written.provider &&
                    SameIoOutputDriverOwner(candidate.actual_driver_owner,
@@ -266,14 +275,13 @@ Wire RosBooleanOutputProvider::State::BuildWire(
     }
     if (written_value) {
       const auto &selected = std::get<RosGpioOutputAddress>(actual->address);
-      groups[selected.group].emplace(selected.interface_name, *written_value);
+      groups[selected.group].emplace(selected.interface_name,
+                                     *written_value);
     }
     ++row;
   }
-  const auto own = self->topic->model.find(self->resource);
-  if (own == self->topic->model.end() ||
-      !SameIoOutputDriverOwner(own->second.channel, std::weak_ptr<State>(self)))
-    throw std::invalid_argument("GPIO model channel is no longer installed");
+  const auto &own_address = std::get<RosGpioOutputAddress>(self->address);
+  groups[own_address.group][own_address.interface_name] = value;
   GpioMessage message;
   for (const auto &[group, interfaces] : groups) {
     message.interface_groups.push_back(group);
@@ -291,12 +299,209 @@ Wire RosBooleanOutputProvider::State::BuildWire(
 struct RosBooleanOutputProvider::Entities final {
   rclcpp::Node::SharedPtr node;
   rclcpp::CallbackGroup::SharedPtr callback_group;
+  Client::SharedPtr client;
+  std::weak_ptr<ros2_control_execution::Ros2TransportResources> owner;
+  bool owner_required{false};
+  std::atomic<bool> accepting{true};
+  std::mutex send_mutex;
+  std::shared_ptr<host_detail::CachedRosContext> context;
+  std::shared_ptr<std::atomic<int>> service_ready;
+  std::shared_ptr<ros2_control_execution::GraphEventObserver> service_observer;
+  void InstallServiceObserver(const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner) {
+    service_ready = std::make_shared<std::atomic<int>>(-1);
+    auto refresh = [weak = std::weak_ptr<Client>(client), ready = service_ready] {
+      try {
+        const auto selected = weak.lock();
+        ready->store(selected ? static_cast<int>(selected->service_is_ready()) : -1,
+                     std::memory_order_release);
+      } catch (...) {
+        ready->store(-1, std::memory_order_release);
+      }
+    };
+    auto observer = std::make_shared<ros2_control_execution::GraphEventObserver>(
+        node, callback_group, refresh);
+    service_observer = owner ? owner->retain_entity(std::move(observer)) : std::move(observer);
+    refresh();
+  }
 };
 
+struct RosBooleanOutputProvider::TransportRecoverySnapshot final {
+  std::shared_ptr<State> state;
+  std::shared_ptr<Entities> entities;
+  std::shared_ptr<GpioTopic> topic;
+  std::shared_ptr<GpioTopic::TopicEntities> topic_entities;
+};
+struct RosBooleanOutputProvider::GpioTransportRecoveryStage final {
+  std::shared_ptr<GpioTopic> topic;
+  std::shared_ptr<GpioTopic::TopicEntities> expected;
+  std::shared_ptr<GpioTopic::TopicEntities> entities;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner;
+  bool closed = false;
+  bool committed = false;
+  ~GpioTransportRecoveryStage() {
+    if (closed && !committed && expected)
+      expected->accepting.store(true, std::memory_order_release);
+  }
+};
+struct RosBooleanOutputProvider::TransportRecoveryStage final {
+  std::shared_ptr<const TransportRecoverySnapshot> snapshot;
+  std::shared_ptr<Entities> entities;
+  std::shared_ptr<GpioTransportRecoveryStage> gpio;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner;
+};
+
+std::shared_ptr<const RosBooleanOutputProvider::TransportRecoverySnapshot>
+RosBooleanOutputProvider::CaptureTransportRecovery() const {
+  std::lock_guard lock(state_->mutex);
+  auto topic_lock = state_->LockTopic();
+  return std::make_shared<TransportRecoverySnapshot>(TransportRecoverySnapshot{
+      state_, entities_, state_->topic,
+      state_->topic ? state_->topic->entities : nullptr});
+}
+bool RosBooleanOutputProvider::BelongsToTransport(
+    const std::shared_ptr<ros2_control_execution::Ros2TransportResources> &owner) const {
+  std::lock_guard lock(state_->mutex);
+  auto topic_lock = state_->LockTopic();
+  if (!owner)
+    return false;
+  if (state_->topic)
+    return state_->topic->entities &&
+           state_->topic->entities->node == owner->node();
+  return state_->owner.lock() == owner;
+}
+bool RosBooleanOutputProvider::MatchesTransportRecovery(
+    const TransportRecoverySnapshot &snapshot) const noexcept {
+  std::lock_guard lock(state_->mutex);
+  auto topic_lock = state_->LockTopic();
+  return state_ == snapshot.state && entities_ == snapshot.entities &&
+         state_->topic == snapshot.topic &&
+         (!state_->topic || state_->topic->entities == snapshot.topic_entities);
+}
+core::Result<
+    std::shared_ptr<RosBooleanOutputProvider::GpioTransportRecoveryStage>>
+RosBooleanOutputProvider::StageGpioTransportRecovery(
+    const std::shared_ptr<GpioTopic> &topic,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner) {
+  using Reply = core::Result<std::shared_ptr<GpioTransportRecoveryStage>>;
+  if (!topic || !owner || !owner->node())
+    return reject<std::shared_ptr<GpioTransportRecoveryStage>>(
+        "invalid_request", "GPIO recovery requires a topic and owner");
+  try {
+    auto stage = std::make_shared<GpioTransportRecoveryStage>();
+    stage->topic = topic;
+    stage->owner = std::move(owner);
+    {
+      std::lock_guard lock(topic->mutex);
+      stage->expected = topic->entities;
+    }
+    stage->owner->invoke_creation([&] {
+      auto entities = std::make_shared<GpioTopic::TopicEntities>();
+      entities->node = stage->owner->node();
+      entities->owner = stage->owner;
+      entities->owner_required = true;
+      if (entities->node->get_node_topics_interface()->resolve_topic_name(
+              topic->name) != topic->name)
+        throw std::invalid_argument(
+            "GPIO recovery topic differs from the sealed address");
+      entities->publisher = entities->node->create_publisher<GpioMessage>(
+          topic->name, rclcpp::SystemDefaultsQoS());
+      if (entities->publisher->get_topic_name() != topic->name)
+        throw std::invalid_argument(
+            "GPIO recovery publisher differs from the sealed address");
+      stage->entities = stage->owner->retain_entity(std::move(entities));
+    });
+    if (!stage->expected) throw std::invalid_argument("GPIO predecessor missing");
+    stage->expected->accepting.store(false, std::memory_order_release);
+    stage->closed = true;
+#ifdef MANYFORGE_LEAF_TIMING
+    ros2_control_execution::detail::gpio_recovery_closed.store(true, std::memory_order_release);
+#endif
+    {
+      // Lifecycle worker waits outside the owner callback and all facts locks.
+      MANYFORGE_LEAF_LOCK(leaf, stage->expected->send_mutex,
+          ros2_control_execution::detail::LeafEntity::kGpioRecoveryCopy);
+      stage->entities->written_model = stage->expected->written_model;
+    }
+    return Reply::Ok(std::move(stage));
+  } catch (const core::TypedError &error) {
+    return Reply::Err(error.error());
+  } catch (const std::exception &error) {
+    return Reply::Err({"io_ros_output_setup_failed", error.what(), {}});
+  }
+}
+core::Result<std::shared_ptr<RosBooleanOutputProvider::TransportRecoveryStage>>
+RosBooleanOutputProvider::StageTransportRecovery(
+    std::shared_ptr<const TransportRecoverySnapshot> snapshot,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner,
+    std::shared_ptr<GpioTransportRecoveryStage> gpio) {
+  using Reply = core::Result<std::shared_ptr<TransportRecoveryStage>>;
+  if (!snapshot || !owner || !owner->node() ||
+      (snapshot->topic &&
+       (!gpio || gpio->topic != snapshot->topic ||
+        gpio->expected != snapshot->topic_entities || gpio->owner != owner)) ||
+      (!snapshot->topic && gpio))
+    return reject<std::shared_ptr<TransportRecoveryStage>>(
+        "invalid_request", "Output recovery snapshot or topic does not match");
+  try {
+    auto stage = std::make_shared<TransportRecoveryStage>();
+    stage->snapshot = std::move(snapshot);
+    stage->owner = std::move(owner);
+    stage->gpio = std::move(gpio);
+    stage->owner->invoke_creation([&] {
+      auto entities = std::make_shared<Entities>();
+      entities->node = stage->owner->node();
+      entities->owner = stage->owner;
+      entities->owner_required = true;
+      entities->context = std::make_shared<host_detail::CachedRosContext>(
+          entities->node->get_node_base_interface()->get_context());
+      entities->callback_group = entities->node->create_callback_group(
+          rclcpp::CallbackGroupType::MutuallyExclusive);
+      if (!stage->gpio) {
+        const auto &address =
+            std::get<RosSetBoolOutputAddress>(stage->snapshot->state->address);
+        entities->client = entities->node->create_client<Service>(
+            address.service, rclcpp::ServicesQoS(), entities->callback_group);
+        if (entities->client->get_service_name() != address.service)
+          throw std::invalid_argument(
+              "Recovery service differs from the sealed address");
+        entities->InstallServiceObserver(stage->owner);
+      }
+      stage->entities = stage->owner->retain_entity(std::move(entities));
+    });
+    return Reply::Ok(std::move(stage));
+  } catch (const core::TypedError &error) {
+    return Reply::Err(error.error());
+  } catch (const std::exception &error) {
+    return Reply::Err({"io_ros_output_setup_failed", error.what(), {}});
+  }
+}
+void RosBooleanOutputProvider::CommitGpioTransportRecovery(
+    GpioTransportRecoveryStage &stage) noexcept {
+  std::lock_guard lock(stage.topic->mutex);
+  stage.topic->entities = stage.entities;
+  stage.committed = true;
+}
+void RosBooleanOutputProvider::CommitTransportRecovery(
+    TransportRecoveryStage &stage) noexcept {
+  std::lock_guard lock(state_->mutex);
+  auto topic_lock = state_->LockTopic();
+  entities_->accepting.store(false, std::memory_order_release);
+  entities_ = stage.entities;
+  state_->owner = stage.owner;
+  if (stage.gpio)
+    state_->transport = GpioPublisher::SharedPtr(
+        stage.gpio->entities, stage.gpio->entities->publisher.get());
+  else
+    state_->transport = Client::SharedPtr(entities_, entities_->client.get());
+  state_->cached_service_ready.store(entities_->service_ready, std::memory_order_release);
+  state_->cached_context.store(entities_->context, std::memory_order_release);
+}
+
 core::Result<std::unique_ptr<RosBooleanOutputProvider>>
-RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
-                                 RosBooleanOutputChannel channel,
-                                 std::shared_ptr<GpioTopic> topic) {
+RosBooleanOutputProvider::Create(
+    rclcpp::Node::SharedPtr node, RosBooleanOutputChannel channel,
+    std::shared_ptr<GpioTopic> topic,
+    std::shared_ptr<ros2_control_execution::Ros2TransportResources> owner) {
   using Reply = core::Result<std::unique_ptr<RosBooleanOutputProvider>>;
   const bool address_valid = std::visit(
       [](const auto &address) {
@@ -313,7 +518,7 @@ RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
           return absolute_service(address.service);
       },
       channel.address);
-  if (!node || channel.resource_id.empty() || !address_valid ||
+  if (!node || !owner || owner->node() != node || channel.resource_id.empty() || !address_valid ||
       (topic &&
        !std::holds_alternative<RosGpioOutputAddress>(channel.address)) ||
       channel.aliases.empty() ||
@@ -327,43 +532,76 @@ RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
     auto aliases = State::PrepareAliases(channel.aliases);
     if (!aliases.ok())
       return Reply::Err(aliases.error());
-    auto state =
-        std::make_shared<State>(channel.active_publication_generation,
-                                channel.address, channel.resource_id);
+    auto state = std::make_shared<State>(channel.active_publication_generation,
+                                         channel.address, channel.resource_id);
     state->gates = std::move(aliases.value().gates);
     state->aliases = std::move(aliases.value().aliases);
+    state->RefreshModelFacts();
     state->ack_timeout_ns = channel.ack_timeout_ns;
-    auto entities = std::make_unique<Entities>();
+    state->owner = owner;
+    auto entities = std::make_shared<Entities>();
     entities->node = std::move(node);
-    entities->callback_group = entities->node->create_callback_group(
-        rclcpp::CallbackGroupType::MutuallyExclusive);
+    entities->owner = owner;
+    entities->owner_required = static_cast<bool>(owner);
+    if (owner)
+      entities = owner->retain_entity(std::move(entities));
+    const auto invoke = [&](auto &&work) {
+      if (owner)
+        owner->invoke_creation(std::forward<decltype(work)>(work));
+      else
+        work();
+    };
+    invoke([&] {
+      entities->context = std::make_shared<host_detail::CachedRosContext>(
+          entities->node->get_node_base_interface()->get_context());
+      entities->callback_group = entities->node->create_callback_group(
+          rclcpp::CallbackGroupType::MutuallyExclusive);
+    });
     const bool exact_address = std::visit(
         [&](const auto &address) {
           using Address = std::decay_t<decltype(address)>;
           if constexpr (std::is_same_v<Address, RosGpioOutputAddress>) {
             if (!topic) {
               topic = std::make_shared<GpioTopic>();
-              topic->node = entities->node;
               topic->name = address.topic;
-              topic->publisher = entities->node->create_publisher<GpioMessage>(
-                  address.topic, rclcpp::SystemDefaultsQoS());
+              invoke([&] {
+                auto topic_entities =
+                    std::make_shared<GpioTopic::TopicEntities>();
+                topic_entities->node = entities->node;
+                topic_entities->owner = owner;
+                topic_entities->owner_required = static_cast<bool>(owner);
+                topic_entities->publisher =
+                    entities->node->create_publisher<GpioMessage>(
+                        address.topic, rclcpp::SystemDefaultsQoS());
+                topic->entities =
+                    owner ? owner->retain_entity(std::move(topic_entities))
+                          : std::move(topic_entities);
+              });
             }
             if (topic->name != address.topic ||
-                topic->node->get_node_base_interface()->get_context() !=
+                topic->entities->node->get_node_base_interface()
+                        ->get_context() !=
                     entities->node->get_node_base_interface()->get_context())
               throw std::invalid_argument(
                   "GPIO topic pin belongs to another context/address");
             state->topic = topic;
-            state->transport = topic->publisher;
-            return address.topic == topic->publisher->get_topic_name() &&
+            state->transport = GpioPublisher::SharedPtr(
+                topic->entities, topic->entities->publisher.get());
+            return address.topic ==
+                       topic->entities->publisher->get_topic_name() &&
                    entities->node->get_node_topics_interface()
                            ->resolve_topic_name(address.topic) == address.topic;
           } else {
-            auto client = entities->node->create_client<Service>(
-                address.service, rclcpp::ServicesQoS(),
-                entities->callback_group);
-            const bool exact = address.service == client->get_service_name();
-            state->transport = std::move(client);
+            bool exact = false;
+            invoke([&] {
+              entities->client = entities->node->create_client<Service>(
+                  address.service, rclcpp::ServicesQoS(),
+                  entities->callback_group);
+              entities->InstallServiceObserver(owner);
+              exact = address.service == entities->client->get_service_name();
+              state->transport =
+                  Client::SharedPtr(entities, entities->client.get());
+            });
             return exact;
           }
         },
@@ -393,15 +631,24 @@ RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
       topic->model.emplace(channel.resource_id,
                            GpioTopic::Model{state, std::nullopt});
     }
+    state->cached_service_ready.store(entities->service_ready, std::memory_order_release);
+    state->cached_context.store(entities->context, std::memory_order_release);
     return Reply::Ok(std::unique_ptr<RosBooleanOutputProvider>(
         new RosBooleanOutputProvider(std::move(state), std::move(entities))));
+  } catch (const core::TypedError &error) {
+    if (error.code() == "ros_transport_executor_failed" ||
+        (error.code() == "component_not_ready" &&
+         error.details().contains("reason") &&
+         error.details().at("reason") == "owner_closing"))
+      return Reply::Err(error.error());
+    return Reply::Err({"io_ros_output_setup_failed", error.what(), {}});
   } catch (const std::exception &error) {
     return Reply::Err({"io_ros_output_setup_failed", error.what(), {}});
   }
 }
 
 RosBooleanOutputProvider::RosBooleanOutputProvider(
-    std::shared_ptr<State> state, std::unique_ptr<Entities> entities)
+    std::shared_ptr<State> state, std::shared_ptr<Entities> entities)
     : state_(std::move(state)), entities_(std::move(entities)) {}
 std::shared_ptr<RosBooleanOutputProvider::GpioTopic>
 RosBooleanOutputProvider::gpio_topic() const noexcept {
@@ -410,18 +657,27 @@ RosBooleanOutputProvider::gpio_topic() const noexcept {
 
 RosBooleanOutputProvider::~RosBooleanOutputProvider() { Shutdown(); }
 
-SetOutputResult RosBooleanOutputProvider::WriteOutput(const core::IoSignalId &signal,
-                                                     const bool value,
-                                                     const std::stop_token stop) {
+SetOutputResult
+RosBooleanOutputProvider::WriteOutput(const core::IoSignalId &signal,
+                                      const bool value,
+                                      const std::stop_token stop) {
   std::shared_ptr<const void> driver_pin;
   std::vector<std::shared_ptr<State>> channel_pins;
   std::vector<std::shared_ptr<const void>> writer_pins;
+  Client::SharedPtr client_borrow;
+  std::shared_ptr<Entities> service_entities;
+  std::shared_ptr<ros2_control_execution::Ros2TransportResources> service_owner;
+  std::shared_ptr<ros2_control_execution::GraphEventObserver> observer_borrow;
   Wire wire;
+  std::shared_ptr<GpioTopic::TopicEntities> gpio_entities;
+  bool gpio_selected = false;
+  std::shared_ptr<const State::ModelFacts> own_facts;
+  std::optional<State::Gate> selected_gate;
   {
     std::lock_guard lock(state_->mutex);
     auto topic_lock = state_->LockTopic();
     const auto alias = std::find_if(state_->aliases.begin(), state_->aliases.end(),
-                                    [&](const auto &row) { return row.signal_id == signal; });
+        [&](const auto &row) { return row.signal_id == signal; });
     if (alias == state_->aliases.end())
       return write_failed("io_signal_unknown", "'" + signal.name + "' is not an output of this channel");
     const auto &gate = state_->gates[alias->gate];
@@ -429,35 +685,115 @@ SetOutputResult RosBooleanOutputProvider::WriteOutput(const core::IoSignalId &si
     if (state_->retired || !driver_pin || !gate.accepting)
       return write_failed("io_output_not_submitted",
                           "the output's I/O component is not enabled; nothing was sent");
-    if (!state_->Ready())
-      return write_failed("io_output_not_submitted",
-                          "the output's service is not available; nothing was sent");
-    std::optional<State::Written> committed_model;
-    try {
-      wire = State::BuildWire(state_, value, gate, channel_pins, writer_pins, committed_model);
-    } catch (const std::exception &) {
-      return write_failed("io_output_not_submitted",
-                          "the output write could not be prepared; nothing was sent");
-    }
-    if (auto *message = std::get_if<GpioMessage>(&wire)) {
-      // A GPIO publish has no acknowledgement or readback.
-      try {
-        std::get<GpioPublisher::SharedPtr>(state_->transport)->publish(*message);
-      } catch (const std::exception &) {
-        state_->topic->model.at(state_->resource).written.reset();
-        return write_failed("io_output_acceptance_unknown",
-                            "the output publish's outcome is unknown",
-                            core::ActionOutcome::kUnknown);
-      }
-      state_->topic->model.at(state_->resource).written = std::move(committed_model);
-      return {core::ActionOutcome::kSucceeded, std::nullopt};
+    if (!state_->Gpio()) {
+      service_owner = state_->owner.lock();
+      if (service_owner && service_owner->on_owner_thread())
+        return write_failed("io_output_not_submitted",
+                            "the output cannot wait on its ROS owner; nothing was sent");
+      client_borrow = std::get<Client::SharedPtr>(state_->transport);
+      service_entities = entities_;
+      own_facts = state_->model_facts.load(std::memory_order_acquire);
+      selected_gate = gate;
+      observer_borrow = entities_->service_observer;
+      auto request = std::make_shared<Service::Request>();
+      request->data = value;
+      wire = std::move(request);
+    } else {
+      gpio_selected = true;
+      gpio_entities = state_->topic->entities;
+      own_facts = state_->model_facts.load(std::memory_order_acquire);
+      selected_gate = gate;
     }
   }
+  if (gpio_selected) {
+    if (!gpio_entities || !gpio_entities->publisher ||
+        !gpio_entities->node->get_node_base_interface()->get_context()->is_valid())
+      return write_failed("io_output_not_submitted",
+                          "the output's service is not available; nothing was sent");
+    const auto gpio_owner = gpio_entities->owner.lock();
+    if (gpio_entities->owner_required && !gpio_owner)
+      return write_failed("io_output_not_submitted", "the output owner is unavailable; nothing was sent");
+    std::optional<State::Written> committed_model;
+    bool sent = false;
+    bool prepared = false;
+    {
+      MANYFORGE_LEAF_LOCK(leaf, gpio_entities->send_mutex,
+          ros2_control_execution::detail::LeafEntity::kGpioPublish);
+      try {
+        const auto current = state_->model_facts.load(std::memory_order_acquire);
+        const bool admitted = gpio_entities->accepting.load(std::memory_order_acquire) &&
+            (!gpio_owner || !gpio_owner->executor_failure_started()) &&
+            current && !current->retired && current->publication == own_facts->publication &&
+            std::any_of(current->gates.begin(), current->gates.end(), [&](const auto &gate) {
+              return gate.accepting && !gate.terminal &&
+                     gate.generation == selected_gate->generation &&
+                     gate.provider == selected_gate->provider &&
+                     SameIoOutputDriverOwner(gate.actual_driver_owner,
+                                             selected_gate->actual_driver_owner);
+            });
+        if (!admitted) throw std::invalid_argument("GPIO admission closed");
+        MANYFORGE_GPIO_ADMITTED_TEST_POINT();
+        wire = State::BuildWire(state_, value, *selected_gate, gpio_entities, own_facts,
+                                channel_pins, writer_pins, committed_model);
+        gpio_entities->written_model.try_emplace(
+            state_->resource, GpioTopic::Model{state_, std::nullopt});
+        prepared = true;
+        gpio_entities->publisher->publish(std::get<GpioMessage>(wire));
+        sent = true;
+      } catch (const std::exception &) {}
+      if (prepared) {
+        if (sent)
+          gpio_entities->written_model.at(state_->resource) = {state_, std::move(committed_model)};
+        else
+          gpio_entities->written_model.erase(state_->resource);
+      }
+    }
+    if (!prepared)
+      return write_failed("io_output_not_submitted",
+                          "the output write could not be prepared; nothing was sent");
+    if (!sent)
+      return write_failed("io_output_acceptance_unknown", "the output publish's outcome is unknown",
+                          core::ActionOutcome::kUnknown);
+    return {core::ActionOutcome::kSucceeded, std::nullopt};
+  }
+  // Check the exact captured client without holding the channel or topic lock.
+  if (!client_borrow || !client_borrow->service_is_ready())
+    return write_failed("io_output_not_submitted",
+                        "the output's service is not available; nothing was sent");
   // One request, its answer awaited outside the channel lock.
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::nanoseconds(state_->ack_timeout_ns);
   const auto await = [&](const auto &client, const auto &request) -> SetOutputResult {
-    auto future = client->async_send_request(request);
+    const auto &owner = service_owner;
+    if (service_entities->owner_required && !owner)
+      return write_failed("io_output_not_submitted", "the output owner is unavailable; nothing was sent");
+    using Pending = decltype(client->async_send_request(request));
+    std::optional<Pending> submitted;
+    {
+#ifdef MANYFORGE_LEAF_TIMING
+      ros2_control_execution::detail::io_service_waiting.store(true, std::memory_order_release);
+#endif
+      MANYFORGE_LEAF_LOCK(leaf, service_entities->send_mutex,
+          ros2_control_execution::detail::LeafEntity::kIoServiceSend);
+      const auto current = state_->model_facts.load(std::memory_order_acquire);
+      const bool admitted = service_entities->accepting.load(std::memory_order_acquire) &&
+          (!owner || !owner->executor_failure_started()) && current && !current->retired &&
+          current->publication == own_facts->publication &&
+          std::any_of(current->gates.begin(), current->gates.end(), [&](const auto &gate) {
+            return gate.accepting && !gate.terminal &&
+                   gate.generation == selected_gate->generation &&
+                   gate.provider == selected_gate->provider &&
+                   SameIoOutputDriverOwner(gate.actual_driver_owner,
+                                           selected_gate->actual_driver_owner);
+          });
+      if (!admitted)
+        return write_failed("io_output_not_submitted", "the output admission is closed; nothing was sent");
+      if (std::chrono::steady_clock::now() >= deadline)
+        return write_failed("io_output_not_submitted", "the output deadline expired; nothing was sent");
+      MANYFORGE_IO_SERVICE_ADMITTED_TEST_POINT();
+      submitted.emplace(client->async_send_request(request));
+    }
+    auto &future = *submitted;
     while (future.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
       if (stop.stop_requested() || std::chrono::steady_clock::now() >= deadline) {
         client->remove_pending_request(future);
@@ -477,21 +813,43 @@ SetOutputResult RosBooleanOutputProvider::WriteOutput(const core::IoSignalId &si
     return {core::ActionOutcome::kSucceeded, std::nullopt};
   };
   try {
-    return await(std::get<Client::SharedPtr>(state_->transport),
-                 std::get<std::shared_ptr<Service::Request>>(wire));
+    auto result = await(client_borrow,
+                        std::get<std::shared_ptr<Service::Request>>(wire));
+    if (observer_borrow) (void)observer_borrow->request_refresh();
+    return result;
   } catch (const std::exception &) {
+    if (observer_borrow) (void)observer_borrow->request_refresh();
     // A send that threw may still have left: unknown, never resent.
     return write_failed("io_output_acceptance_unknown",
                         "the output write's outcome is unknown", core::ActionOutcome::kUnknown);
   }
 }
 
+std::optional<bool> RosBooleanOutputProvider::CachedServiceReady() const noexcept {
+  const auto context = state_->cached_context.load(std::memory_order_acquire);
+  if (!context || !context->valid()) return false;
+  if (state_->Gpio()) return true;
+  const auto sample = state_->cached_service_ready.load(std::memory_order_acquire);
+  if (!sample) return std::nullopt;
+  const int value = sample->load(std::memory_order_acquire);
+  if (value < 0) return std::nullopt;
+  return value > 0;
+}
+
 bool RosBooleanOutputProvider::ServiceReady() const {
-  std::lock_guard lock(state_->mutex);
-  if (state_->retired)
-    return false;
+  Client::SharedPtr client;
+  std::shared_ptr<GpioTopic::TopicEntities> gpio;
+  {
+    std::lock_guard lock(state_->mutex);
+    auto topic_lock = state_->LockTopic();
+    if (state_->retired) return false;
+    if (state_->Gpio()) gpio = state_->topic->entities;
+    else client = std::get<Client::SharedPtr>(state_->transport);
+  }
   try {
-    return state_->Ready();
+    if (gpio)
+      return gpio->publisher && gpio->node->get_node_base_interface()->get_context()->is_valid();
+    return client && client->service_is_ready();
   } catch (const std::exception &) {
     return false;
   }
@@ -517,6 +875,7 @@ core::Result<void> RosBooleanOutputProvider::Pause(
                         "ROS output Disable is stale or retired");
   gate->generation = generation;
   gate->accepting = false;
+  state_->RefreshModelFacts();
   return core::Result<void>::Ok();
 }
 
@@ -540,6 +899,7 @@ core::Result<void> RosBooleanOutputProvider::Resume(
                         "ROS output Enable is stale or retired");
   gate->generation = generation;
   gate->accepting = true;
+  state_->RefreshModelFacts();
   return core::Result<void>::Ok();
 }
 
@@ -560,6 +920,7 @@ core::Result<void> RosBooleanOutputProvider::ShutdownOccurrence(
         "Terminal fence does not name a configured output occurrence");
   gate->accepting = false;
   gate->terminal = true;
+  state_->RefreshModelFacts();
   return core::Result<void>::Ok();
 }
 
@@ -625,6 +986,7 @@ core::Result<void> RosBooleanOutputProvider::RebindAliases(
   state_->gates.swap(table.gates);
   state_->aliases.swap(table.aliases);
   state_->publication = publication;
+  state_->RefreshModelFacts();
   return core::Result<void>::Ok();
 }
 
@@ -639,8 +1001,12 @@ void RosBooleanOutputProvider::Shutdown() {
       state_->topic->model.erase(own);
   }
   state_->retired = true;
+  entities_->accepting.store(false, std::memory_order_release);
+  state_->cached_service_ready.store({}, std::memory_order_release);
+  state_->cached_context.store({}, std::memory_order_release);
   for (auto &gate : state_->gates)
     gate.accepting = false;
+  state_->model_facts.store({}, std::memory_order_release);
 }
 
 } // namespace manyforge::roboplan_backend

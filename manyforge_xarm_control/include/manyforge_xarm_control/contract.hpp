@@ -76,8 +76,7 @@ inline constexpr std::int64_t kXArmOwnOperationSettleNs = 5'000'000'000LL;
 /// `lanes.real.joint_agreement_tolerance_rad`).
 inline constexpr double kXArmJointAgreementToleranceRad = 0.02;
 
-/// Controller modes and states (XARM_CONTROLLER_FACTS, "Controller states and
-/// modes").
+/// Controller modes and states.
 inline constexpr int kXArmJointServoMode = 1;
 inline constexpr int kXArmMovingState = 1;
 inline constexpr int kXArmReadyState = 2;
@@ -128,7 +127,7 @@ inline constexpr std::string_view kRobotControllerUnresponsiveCode =
 /// inputs, CO/DO outputs) and the tool's (TI inputs, TO outputs).
 enum class XArmIoBank : std::uint8_t { kController, kTool };
 
-/// `system_control` values (the fork's service, CONTRACTS §13).
+/// `system_control` values (the fork's service).
 inline constexpr int kXArmSystemShutdown = 1;
 inline constexpr int kXArmSystemReboot = 2;
 

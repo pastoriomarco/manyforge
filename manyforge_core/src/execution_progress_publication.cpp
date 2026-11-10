@@ -61,15 +61,19 @@ ExecutionProgressPublication::ExecutionProgressPublication(
 void ExecutionProgressPublication::store_locked() noexcept {
   const unsigned index = latest_slot_.load(std::memory_order_relaxed) ^ 1u;
   Slot& slot = slots_[index];
+  // Fence-free seqlock (Boehm, "Can Seqlocks Get Along with Programming
+  // Language Memory Models?", MSPC 2012): field stores are release and the
+  // reader's field loads acquire, so a reader that sees any new field value
+  // also sees the odd epoch. ThreadSanitizer models this; it does not model
+  // standalone fences (gcc 13 -Werror=tsan).
   slot.epoch.fetch_add(1, std::memory_order_relaxed);
-  std::atomic_thread_fence(std::memory_order_release);
-  slot.sequence.store(current_.sequence, std::memory_order_relaxed);
-  slot.execution_generation.store(current_.execution_generation, std::memory_order_relaxed);
-  slot.trajectory_time_ns.store(current_.trajectory_time_ns, std::memory_order_relaxed);
-  slot.source_timestamp_ns.store(current_.source_timestamp_ns, std::memory_order_relaxed);
-  slot.received_timestamp_ns.store(current_.received_timestamp_ns, std::memory_order_relaxed);
-  slot.valid.store(current_.valid, std::memory_order_relaxed);
-  slot.terminal.store(current_.terminal, std::memory_order_relaxed);
+  slot.sequence.store(current_.sequence, std::memory_order_release);
+  slot.execution_generation.store(current_.execution_generation, std::memory_order_release);
+  slot.trajectory_time_ns.store(current_.trajectory_time_ns, std::memory_order_release);
+  slot.source_timestamp_ns.store(current_.source_timestamp_ns, std::memory_order_release);
+  slot.received_timestamp_ns.store(current_.received_timestamp_ns, std::memory_order_release);
+  slot.valid.store(current_.valid, std::memory_order_release);
+  slot.terminal.store(current_.terminal, std::memory_order_release);
   slot.epoch.fetch_add(1, std::memory_order_release);
   latest_slot_.store(index, std::memory_order_release);
 }
@@ -185,14 +189,15 @@ ExecutionProgressCursorSnapshotDTO ExecutionProgressPublication::acquire() const
     if ((before & 1u) != 0u) {
       continue;
     }
-    snapshot.sequence = slot.sequence.load(std::memory_order_relaxed);
-    snapshot.execution_generation = slot.execution_generation.load(std::memory_order_relaxed);
-    snapshot.trajectory_time_ns = slot.trajectory_time_ns.load(std::memory_order_relaxed);
-    snapshot.source_timestamp_ns = slot.source_timestamp_ns.load(std::memory_order_relaxed);
-    snapshot.received_timestamp_ns = slot.received_timestamp_ns.load(std::memory_order_relaxed);
-    snapshot.valid = slot.valid.load(std::memory_order_relaxed);
-    snapshot.terminal = slot.terminal.load(std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_acquire);
+    // Acquire field loads pair with the writer's release field stores (see
+    // store_locked) and keep the epoch re-check below after every field load.
+    snapshot.sequence = slot.sequence.load(std::memory_order_acquire);
+    snapshot.execution_generation = slot.execution_generation.load(std::memory_order_acquire);
+    snapshot.trajectory_time_ns = slot.trajectory_time_ns.load(std::memory_order_acquire);
+    snapshot.source_timestamp_ns = slot.source_timestamp_ns.load(std::memory_order_acquire);
+    snapshot.received_timestamp_ns = slot.received_timestamp_ns.load(std::memory_order_acquire);
+    snapshot.valid = slot.valid.load(std::memory_order_acquire);
+    snapshot.terminal = slot.terminal.load(std::memory_order_acquire);
     if (slot.epoch.load(std::memory_order_relaxed) == before) {
       return snapshot;
     }

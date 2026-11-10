@@ -1,4 +1,4 @@
-"""Global-rule state mirror over the existing events reply (contract 64)."""
+"""Global-rule state mirror over the existing events reply."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def _proving_catalog(snapshot: dict[str, Any]) -> dict[str, Any]:
 class _Kernel:
     """The existing events command: one owner's ordered journal. Unless a
     test sets ``catalog``, the reply carries the catalog proving the latest
-    ready baseline's context (SX-2216: states need that proof)."""
+    ready baseline's context (states need that proof)."""
 
     def __init__(self) -> None:
         self.owner = "kernel-1"
@@ -329,7 +329,7 @@ def test_transport_reads_the_existing_events_command_whole() -> None:
     transport._exchange = lambda command: sent.append(command) or dict(reply)  # type: ignore[method-assign]  # noqa: SLF001
     assert transport.read_interrupt_rule_state_events("kernel-1", 7) == reply
     assert sent == [{
-        "api_version": "manyforge.execution_command.v1",
+        "api_version": "manyforge.execution_command.v3",
         "after_sequence": 7,
         "command": "events",
         "limit": 16,
@@ -613,7 +613,7 @@ _CATALOG_A = {**_CATALOG, "catalog_generation": "4"}  # Names _CONTEXT exactly.
 
 
 def test_context_change_proven_by_the_catalog_invalidates_until_its_ready_cut() -> None:
-    # SX-2207: catalog B with pending never keeps A's states current.
+    # Catalog B with pending never keeps A's states current.
     kernel = _Kernel()
     kernel.catalog = _CATALOG_A
     kernel.baseline = _ready(0, {"door": "inactive"})
@@ -657,7 +657,7 @@ def test_current_is_context_checked() -> None:
 
 
 def test_unknown_catalog_proves_no_retained_states() -> None:
-    # SX-2216: a null catalog with a ready cut cannot install it.
+    # A null catalog with a ready cut cannot install it.
     kernel = _Kernel()
     kernel.catalog = None
     kernel.baseline = _ready(0, {"door": "inactive"})
@@ -712,7 +712,7 @@ def test_seeding_is_context_checked() -> None:
 
 
 def test_known_to_unknown_catalog_makes_declared_keys_unavailable() -> None:
-    # SX-2208: an unreadable reply drops the catalog; the store's declared
+    # An unreadable reply drops the catalog; the store's declared
     # keys become unavailable (never clear, never another id declared).
     kernel = _Kernel()
     kernel.catalog = _CATALOG_A
@@ -736,7 +736,7 @@ def test_known_to_unknown_catalog_makes_declared_keys_unavailable() -> None:
             store.read(key)
 
 
-# Event subscription (contract §8.1) ------------------------------------------
+# Event subscription ----------------------------------------------------------
 
 
 def _stream(kind: str, owner: str = "kernel-1", **fields: Any) -> dict[str, Any]:
@@ -936,7 +936,7 @@ _LAST_LOSS = {"controllable_component_id": "robot", "command_target_id": "grippe
 
 
 def test_last_losses_come_with_every_snapshot_and_state() -> None:
-    # §10 "Coalescing": a loss cleared before any read (no row) still reaches
+    # Coalescing: a loss cleared before any read (no row) still reaches
     # the Runner through its last loss; a reconnect's snapshot carries it.
     mirror, _changes = _mirror(_Kernel())
     assert mirror.carried_object_last_losses() is None  # Unknown before a snapshot.
@@ -1005,7 +1005,7 @@ def test_rows_are_unknown_after_a_gap_or_a_lost_stream_until_the_next_snapshot()
 
 
 def test_no_lock_is_held_while_the_stream_waits() -> None:
-    # SX-191: a quiet stream (no rows, no heartbeat yet) blocks only its own
+    # A quiet stream (no rows, no heartbeat yet) blocks only its own
     # receive; the mirror's readers and Stop settlement stay responsive.
     import time
 
@@ -1107,7 +1107,7 @@ def test_malformed_stream_row_recaptures_and_raises() -> None:
 
 
 def test_pending_source_keeps_its_original_deadline(monkeypatch) -> None:
-    # SX-2209: watchdog retries never extend the same source's budget.
+    # Watchdog retries never extend the same source's budget.
     import manyforge_program_runner.runtime as runtime_module
 
     runtime = _hook_runtime(None)
@@ -1128,7 +1128,7 @@ def test_pending_source_keeps_its_original_deadline(monkeypatch) -> None:
     assert runtime._bbkey_pending == {}  # noqa: SLF001
 
 
-# Stop terminal detail through the existing events consumption (SX-2215) ----
+# Stop terminal detail through the existing events consumption ------------
 
 
 def _attempt(stage_id: str, index: int) -> dict[str, Any]:
@@ -1240,7 +1240,7 @@ def test_interrupt_reads_the_matching_stop_terminal_from_the_events_stream() -> 
 
 
 def test_recorded_reads_the_events_after_read_stop_to_the_record() -> None:
-    # SX-2226: the row committed after the last cadence read, more than one
+    # The row committed after the last cadence read, more than one
     # page later; it is read after observing recorded, to the record.
     late = [_other(sequence) for sequence in range(2, 40)] + [_stop_terminal_event(40)]
     result, terminal, pending, reads, kernel = _map_with_events(
@@ -1326,7 +1326,7 @@ _WAITING = {
 
 
 def test_waiting_for_program_catalog_parses_strictly() -> None:
-    # Decision 110: no catalog_generation, binding or source; baseline pending.
+    # No catalog_generation, binding or source; baseline pending.
     waiting = parse_catalog(_WAITING)
     assert waiting == RuleCatalog(
         "kernel-1", None, 3, "bundle-1", "graph-1", ("door", "zone"), (),
@@ -1355,7 +1355,7 @@ def test_waiting_for_program_catalog_parses_strictly() -> None:
 
 
 def test_waiting_catalog_requires_every_rule_waiting() -> None:
-    # Decision 110: Core waits the whole catalog; a subset is not this product.
+    # Core waits the whole catalog; a subset is not this product.
     rows = _WAITING["waiting_for_program"]
     for subset in ([rows[0]], [rows[1]]):
         with pytest.raises(InterruptStateWireError, match="every rule"):

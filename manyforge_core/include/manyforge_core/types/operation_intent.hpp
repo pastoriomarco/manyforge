@@ -61,8 +61,8 @@ struct CapabilityCommandIntentDTO final {
 
 struct MotionParticipantIntentDTO final {
   MoveId move_id;
-  FrameRoleId base_frame_role_id;
-  /// Active TCP (M7, T-MQ17): which TCP the move uses. Current is resolved
+  ProgramFrameReferenceDTO base_frame;
+  /// Active TCP: which TCP the move uses. Current is resolved
   /// to the robot's Active TCP, form 2 through the Program binding; the
   /// resolved entry is the binding's `motion_endpoint.entry`. Forms 2 and 3
   /// set the Active TCP to that entry before the move is sent.
@@ -78,7 +78,7 @@ struct MotionParticipantIntentDTO final {
   std::optional<ReferenceDTO> offset_reference;
   MotionSpecDTO motion;
   std::optional<ContactPolicyId> contact_policy_id;
-  /// Source-local URDF joint names scoped by `target_role_id`.
+  /// Source-local URDF joint names scoped by the participant target.
   std::map<std::string, JointDynamicsLimitDTO> per_joint_dynamics_limits;
   std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
   /// Public selection of one declared Program runtime-object key. Admission
@@ -98,7 +98,7 @@ struct MotionParticipantIntentDTO final {
                          const MotionParticipantIntentDTO&) = default;
 };
 
-/// Active TCP (M7, T-MQ15): set the robot's Active TCP. One participant on
+/// Active TCP: set the robot's Active TCP. One participant on
 /// the robot's motion target and capability, never Current. The Kernel runs
 /// it as an atomic step that a Stop does not end; see
 /// `ResourceAddressedExecutionKernel::execute`.
@@ -113,8 +113,7 @@ using OperationParticipantPayloadDTO =
                  SetTcpParticipantIntentDTO>;
 
 struct OperationParticipantIntentDTO final {
-  ComponentRoleId component_role_id;
-  TargetRoleId target_role_id;
+  ProgramTargetReferenceDTO target;
   CapabilityId required_capability_id;
   std::optional<ActionSpanDTO> action_span;
   OperationParticipantPayloadDTO payload;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <manyforge_core/execution_progress_publication.hpp>
@@ -20,17 +21,16 @@
 namespace manyforge::core {
 
 // ---------------------------------------------------------------------------
-// Core robot participant over `IExecutionPort` (shared execution design §2.2,
-// §3, §4.1, §7.4).
+// Core robot participant over `IExecutionPort`.
 //
 // The ROS-free execution engine the participant Kernel (`ExecutionKernel`)
 // drives through its existing `IExecutionBackend` seam on every lane. It owns
 // the execution policy that today's native and ROS backends each implement:
 // prepared membership and replay protection, dispatch (Submit with complete
 // P/V/A in path time), the progress cursor from controller samples, the
-// tracking-error policy (item 13), completion per state authority (§4.1),
-// controller-result mapping, the speed-factor ramp (Q11), timing
-// observation (Q4) and the arbitration of completion against a runtime
+// tracking-error policy, completion per state authority,
+// controller-result mapping, the speed-factor ramp, timing
+// observation and the arbitration of completion against a runtime
 // collision hazard (through `ExecutionProgressPublication`). Stop stages are
 // delegated to the one Core Stop-stage helper. Transport, goal UUIDs,
 // callback retirement and observed-state publication stay with the adapter
@@ -41,7 +41,7 @@ namespace manyforge::core {
 // epochs are never combined.
 // ---------------------------------------------------------------------------
 
-/// `main`'s host tracking monitor (item 13, Q10): the controller-reported
+/// `main`'s host tracking monitor: the controller-reported
 /// position error compared against the tolerance; a breach lasting the timeout
 /// ends the motion with `tracking_error_exceeded`. Isaac and real lanes only.
 struct ExecutionTrackingPolicy final {
@@ -55,8 +55,7 @@ struct ExecutionTrackingPolicy final {
 /// the deployment.
 struct ExecutionPortParticipantConfig final {
   /// Stop-stage helper inputs. `stop.trip_authority` is also the completion
-  /// authority (§4.1): kMeasured on real robots, kCommanded on Isaac (item
-  /// 20) and offline.
+  /// authority: kMeasured on real robots, kCommanded on Isaac and offline.
   StopStageHelperConfig stop;
   /// Measured authority only (`main`'s terminal state gate): the lane's
   /// arrival tolerance (also the controller's JTC `goal` constraint). The
@@ -66,17 +65,17 @@ struct ExecutionPortParticipantConfig final {
   /// the check is `robot_at_target`.
   std::optional<double> final_tolerance_rad;
   Duration completion_state_timeout_ns{0};
-  /// Measured authority only (`main`'s start-state check, §2.2): before the
+  /// Measured authority only (`main`'s start-state check): before the
   /// goal is sent, a fresh complete measured sample (received within
   /// `progress_freshness_budget_ns`, `main`'s `joint_state_max_age_s`, waited
   /// for up to `completion_state_timeout_ns`) must lie within this tolerance
   /// of the trajectory's first waypoint. Commanded authority has no measured
   /// start check (as `main`'s commanded simulation).
   std::optional<double> start_tolerance_rad;
-  /// Item 13: present on Isaac and real lanes, absent offline.
+  /// Present on Isaac and real lanes, absent offline.
   std::optional<ExecutionTrackingPolicy> tracking;
-  /// Q4/item 16: the per-lane controller period margin. A controller period
-  /// beyond it is a critical fault (Q52): the Kernel's lane hard stop, then
+  /// The per-lane controller period margin. A controller period
+  /// beyond it is a critical fault: the Kernel's lane hard stop, then
   /// InterventionRequired with `late_control_cycle`. Required; no default
   /// exists until live qualification fixes it.
   double late_cycle_margin_s{0.0};
@@ -89,11 +88,11 @@ struct ExecutionPortParticipantConfig final {
   // Observation only: failures must never change dispatch or authorization.
   std::function<void(const ExecutionGoalKey&, const PreparedOperationParticipantDTO&,
                      ExecutionBindingEpoch)> observe_goal_context{};
-  /// TOOLCTX (M6b: the separate apply-tool-context action, `ApplyToolContext`):
+  /// The separate apply-tool-context action (`ApplyToolContext`):
   /// run before a new goal is sent and before it counts as running, with no
   /// goal or Stop in flight (the robot at rest), never for a replacement. It
   /// runs without the participant lock; a Stop that starts meanwhile refuses
-  /// the goal (`execution_port_stop_in_flight`). Active TCP (M7): the lane
+  /// the goal (`execution_port_stop_in_flight`). Active TCP: the lane
   /// sets the robot's Active TCP to the move's TCP entry,
   /// `prepared_motion_tcp_entry(participant)`: nothing when it already is,
   /// otherwise its confirmed TCP step, then the commit. An error refuses the
@@ -110,7 +109,7 @@ struct ExecutionPortParticipantStateAuthority final {
   std::function<Result<void>()> sync_before_planning;
 };
 
-/// Timing observation (Q4): controller lateness and telemetry loss are kept
+/// Timing observation: controller lateness and telemetry loss are kept
 /// apart. Counts are of `ReadTiming()` windows, not of controller cycles.
 struct ExecutionPortTimingMetrics final {
   std::uint64_t windows{0U};
@@ -118,7 +117,7 @@ struct ExecutionPortTimingMetrics final {
   double max_period_s{0.0};
   double max_state_stamp_gap_s{0.0};
   std::uint64_t received_samples{0U};
-  /// Q50 "measure": recognition delay of dispatched goals (dispatch to their
+  /// Recognition delay of dispatched goals (dispatch to their
   /// first anchor, local clock). Stop goals report theirs in the Stop evidence.
   std::uint64_t goals_recognized{0U};
   Duration last_recognition_delay_ns{0};
@@ -140,6 +139,8 @@ class ExecutionPortParticipant final : public IExecutionBackend {
                            ExecutionPortParticipantStateAuthority state_authority,
                            ExecutionPortParticipantConfig config);
   ~ExecutionPortParticipant() override;
+  [[nodiscard]] Result<void> DetachSchedulerForHostShutdown(
+      std::chrono::steady_clock::time_point deadline);
 
   ExecutionPortParticipant(const ExecutionPortParticipant&) = delete;
   ExecutionPortParticipant& operator=(const ExecutionPortParticipant&) = delete;
@@ -149,6 +150,30 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   /// every fact read from it are dropped.
   [[nodiscard]] Result<void> RebindPort(std::shared_ptr<IExecutionPort> port);
 
+  /// Rebind at the validated fault-owner commit. Observations already begun
+  /// before this boundary cannot qualify the retired goal's recovery.
+  [[nodiscard]] Result<void> RebindPortAfterOwnerRebuild(std::shared_ptr<IExecutionPort> port);
+
+  /// Staged fault-owner rebind. The host retains the locked stage through all
+  /// companion owner swaps. Retire the exact old timer only after the host has
+  /// verified and closed that failed owner; no scheduler work occurs during
+  /// the combined owner publication.
+  struct OwnerRebindStage;
+  [[nodiscard]] Result<std::shared_ptr<OwnerRebindStage>> StageOwnerRebind(
+      std::shared_ptr<IExecutionPort> port);
+  [[nodiscard]] Result<void> RetireOwnerRebindTimer(const std::shared_ptr<OwnerRebindStage>& stage);
+  [[nodiscard]] Result<void> LockOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage);
+  /// Read the validated retained-motion fact only while the stage is locked.
+  [[nodiscard]] bool LockedOwnerRebindNeedsMotionProof(
+      const std::shared_ptr<OwnerRebindStage>& stage) const noexcept;
+  void CommitLockedOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage) noexcept;
+  void UnlockOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage) noexcept;
+  std::optional<std::pair<std::uint64_t, std::uint64_t>>
+  owner_rebuild_observation() const override;
+  void record_owner_rebuild_rest(std::uint64_t execution_id) noexcept override;
+  bool owner_rebuild_unknown_candidate(std::uint64_t source_id,
+                                       std::uint64_t candidate_id) const override;
+
   /// Publish a verified route binding (and its Program-scoped aliases) while
   /// the owning Kernel fence is held; refused while motion or Stop is active.
   [[nodiscard]] Result<void> RebindRoute(RuntimeParticipantBinding binding,
@@ -156,9 +181,9 @@ class ExecutionPortParticipant final : public IExecutionBackend {
 
   [[nodiscard]] ExecutionPortTimingMetrics timing_metrics() const;
 
-  /// Item 44 / Q41: a fault of the bound mechanism observed by the host (the
+  /// A fault of the bound mechanism observed by the host (the
   /// Isaac command-age guard trip). Motion in flight ends through the Kernel's
-  /// item-17 path (the lane hard stop, then InterventionRequired with
+  /// critical-fault path (the lane hard stop, then InterventionRequired with
   /// `error`); without motion in flight nothing happens here (the host keeps
   /// motion gated until its Reset sequence).
   void ReportCriticalFault(ErrorDTO error);
@@ -184,7 +209,8 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id,
       const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor_goal,
-      std::int64_t preparation_deadline_ns) override;
+      std::int64_t preparation_deadline_ns,
+      const ReplacementSendRecheck& recheck_before_send = {}) override;
   Result<PreparedMotionReplacementObservationDTO> ObserveReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id) const override;
   Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& source,
@@ -200,7 +226,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   /// The lane's hard-stop primitive for the Kernel's own paths (execution
   /// timeout, worker exception, teardown): `main`'s goal cancel, never waits.
   StopResultDTO stop() override;
-  /// Reset belongs to the Kernel (Q27: its Stop stages, then motion-free
+  /// Reset belongs to the Kernel (its Stop stages, then motion-free
   /// retirement); the backend Reset is refused.
   ResetResultDTO reset() override;
   ExecutionSnapshot get_execution_snapshot() const override;
@@ -217,7 +243,10 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
       std::uint64_t execution_generation) noexcept override;
   void set_runtime_velocity_scale(double scale) override;
+  void apply_runtime_velocity_scale(double scale, std::uint64_t sequence) override;
   RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override;
+  [[nodiscard]] RuntimeScaleMechanismAvailability runtime_velocity_scale_availability()
+      const noexcept override;
 
   [[nodiscard]] ParticipantStopStageResultDTO TranslateStopStage(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
@@ -233,10 +262,14 @@ class ExecutionPortParticipant final : public IExecutionBackend {
       std::stop_token cancellation, IStopStageSpringReturnObserver* observer);
 
   struct Execution;
+  struct PendingDispatch;
+  [[nodiscard]] Result<void> RebindPortImpl(std::shared_ptr<IExecutionPort> port,
+                                           bool owner_rebuilt);
   struct Replacement;
   [[nodiscard]] bool SourceMatchesLocked(const PreparedMotionReplacementSourceDTO& source) const;
   [[nodiscard]] PreparedMotionReplacementObservationDTO ObserveReplacementLocked() const;
-  [[nodiscard]] ExecutionPortCommandResultDTO CancelExecution(Execution& execution);
+  [[nodiscard]] ExecutionPortCommandResultDTO CancelExecution(Execution& execution,
+      std::unique_lock<std::mutex>& lock, std::chrono::steady_clock::time_point deadline);
   [[nodiscard]] bool ReplacementScaleCompatibleLocked(const ExecutionControllerSampleDTO& sample,
                                                       const TrajectoryDTO& candidate) const;
   struct PreparedGoalRecord {
@@ -262,7 +295,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
       const TrajectoryDTO& trajectory) const;
   /// One evaluation of the port's facts for `execution` (the Kernel worker
   /// drives it through the handle).
-  void Evaluate(Execution& execution);
+  void Evaluate(Execution& execution, std::unique_lock<std::mutex>& lock);
   void Finish(Execution& execution, ExecutionState state, std::optional<ErrorDTO> error);
   /// Progress and snapshot from one associated sample at `original_cursor_s`.
   void ObserveSample(Execution& execution, const ExecutionControllerSampleDTO& sample,
@@ -270,16 +303,16 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   [[nodiscard]] bool WaitForCompletion(const std::shared_ptr<Execution>& execution,
                                        std::int64_t timeout_ns);
   /// Records one timing window; returns the controller period when it is
-  /// beyond the lane margin (Q52).
+  /// beyond the lane margin.
   std::optional<double> ObserveTiming(IExecutionPort& port, ExecutionBindingEpoch epoch);
   void RecordRecognition(Execution& execution);
-  /// Speed ramp (Q11): publish one value now and schedule the next tick while
+  /// Speed ramp: publish one value now and schedule the next tick while
   /// the ramp runs. Caller holds `scale_mutex_`.
-  void PublishScaleLocked(double value);
   void ScheduleRampTickLocked();
   void RampTick(std::uint64_t ramp_generation);
-  /// The Stop-stage helper's speed freeze (Q17/Q35/Q38).
-  double FreezeSpeedFactor();
+  /// The Stop-stage helper's speed freeze.
+  std::optional<double> FreezeSpeedFactor(IExecutionPort& port,
+                                          std::chrono::steady_clock::time_point deadline);
   [[nodiscard]] std::shared_ptr<ParticipantStopStageHelper> MakeHelper(IExecutionPort& port);
 
   const IClock& clock_;
@@ -293,9 +326,24 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   RuntimeParticipantBinding binding_;
   std::vector<RuntimeParticipantBinding> program_aliases_;
   std::shared_ptr<IExecutionPort> port_;
+  /// Lock-free view of the current port and lane scale fact, republished at
+  /// every rebind, for the owner's availability reads under its own lock.
+  struct ScaleAvailabilityView final {
+    std::shared_ptr<IExecutionPort> port;
+    bool supports_scale{};
+  };
+  std::atomic<std::shared_ptr<const ScaleAvailabilityView>> scale_availability_view_;
+  std::shared_ptr<PendingDispatch> pending_dispatch_;
   std::shared_ptr<ParticipantStopStageHelper> helper_;
+  // Preserve the retired owner's bounded goal records until their prepared
+  // memberships retire; the helper borrows this exact port.
+  std::shared_ptr<IExecutionPort> retired_owner_port_;
+  std::shared_ptr<ParticipantStopStageHelper> retired_owner_helper_;
   PreparedExecutionMembership prepared_membership_;
   std::optional<PreparedGoalRecord> prepared_goal_;
+  std::optional<std::pair<std::uint64_t, std::uint64_t>> owner_rebuild_observation_;
+  std::optional<std::uint64_t> retired_unknown_candidate_;
+  bool retired_owner_rest_qualified_{false};
   std::shared_ptr<Execution> execution_;
   std::unique_ptr<Replacement> replacement_;
   std::uint64_t next_execution_generation_{1U};
@@ -303,16 +351,19 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   /// Stop stages ever entered: compared across the unlocked tool-context
   /// action up to Dispatch, so a Stop that started (and maybe ended) meanwhile wins.
   std::uint64_t stop_stages_started_{0U};
-  /// M6b: the Stop count when the latest tool-context action started; the
+  /// The Stop count when the latest tool-context action started; the
   /// next Dispatch refuses its goal when a Stop started since.
   std::optional<std::uint64_t> tool_context_stops_before_;
-  /// M6b: the goal a Stop stage found unsent and contained; Dispatch refuses it.
+  /// The goal a Stop stage found unsent and contained; Dispatch refuses it.
   std::optional<ExecutionGoalKey> stopped_before_dispatch_;
   ExecutionPortTimingMetrics timing_{};
   ExecutionLaneFactsDTO lane_;
 
   mutable std::mutex scale_mutex_;
   double target_scale_{1.0};
+  /// OD-72: the sequence of the latest applied speed value (guarded by
+  /// `scale_mutex_`); an older value arriving later is superseded.
+  std::uint64_t applied_scale_sequence_{0U};
   std::optional<double> last_sent_scale_;
   bool scale_frozen_{false};
   struct PreparationScaleHold {
@@ -323,7 +374,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   };
   std::optional<PreparationScaleHold> preparation_scale_hold_;
 
-  /// Item 28/Q11: the factor moves linearly toward its target.
+  /// The factor moves linearly toward its target.
   struct ScaleRamp {
     double value;
     double target;
@@ -333,6 +384,8 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   TimePoint last_ramp_tick_{0};
   std::uint64_t ramp_generation_{0U};
   ScheduleHandle ramp_handle_{0U};
+  bool scheduler_detach_started_{false};
+  bool scheduler_detach_complete_{false};
 };
 
 }  // namespace manyforge::core

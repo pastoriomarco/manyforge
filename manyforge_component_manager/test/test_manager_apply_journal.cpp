@@ -834,7 +834,7 @@ TEST(ManagerApplyIntent, ValidityRejectsMissingRequiredIdentity) {
   intent.candidate_retained_bundle_id = RetainedBundleId("");
   EXPECT_FALSE(intent.valid());
 
-  // The exact UA2A prepared activation is part of the operation identity: an
+  // The exact prepared activation is part of the operation identity: an
   // intent without it cannot name the input it accepted.
   intent = Intent();
   intent.prepared_activation.captured_input_digest = ContentDigest("");
@@ -1209,9 +1209,9 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
   EXPECT_EQ(reopened.VerifyIntegrity().terminal_outcome_count, 1);
 }
 
-// UA7W.5: a direct Manager claim settles only after a known refusal at the
+// A direct Manager claim settles only after a known refusal at the
 // accepted phase; any later or uncertain failure keeps it held until the
-// cold-restart recovery (UA7W.R).
+// cold-restart recovery.
 TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) {
   const auto settlement = [](const ManagerApplyPhase phase,
                              const ManagerApplyEffectDisposition disposition,
@@ -1288,7 +1288,7 @@ TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) 
                           ManagerApplyEffectDisposition::kKnown, false));
 }
 
-// Q118: exact terminal proof is passive; a LIVE holder is never inferred dead.
+// Exact terminal proof is passive; a LIVE holder is never inferred dead.
 TEST(ManagerApplyJournal,
      ConfigurationSuccessorRequiresExactTerminalOldClaims) {
   for (const auto disposition : {ManagerApplyEffectDisposition::kKnown,
@@ -1812,7 +1812,7 @@ TEST(ManagerApplyJournalIntegrity,
     value.prepared_activation.program_binding_id =
         core::ProgramBindingId(std::string(kDigestThree));
   });
-  // A non-executable Program outcome is its own durable identity (H1a).
+  // A non-executable Program outcome is its own durable identity.
   add([](auto &value) {
     value.prepared_activation.program_binding_id = std::nullopt;
   });
@@ -2545,7 +2545,7 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
                                     CellId("cell-1"));
-  // N7: an unknown-effect failure that still holds its accepted fence.
+  // An unknown-effect failure that still holds its accepted fence.
   const ApplyId held("held-0");
   const auto held_intent =
       journal.EnsureIntent(Intent("held-0", 1U, "request-held-0")).record;

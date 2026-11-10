@@ -9,7 +9,7 @@ const context = {
   claim_generation: 1, selection_revision: 0,
 };
 const reply = {
-  api_version: 'manyforge.execution_command_response.v1', command: 'read_manual_handover',
+  api_version: 'manyforge.execution_command_response.v4', command: 'read_manual_handover',
   ok: true, request_id: 'query.1', request_owner_epoch: 'execution-owner-1',
   intent_digest: `sha256:${'a'.repeat(64)}`,
   availability: { available: true, cleanup_required: true, unavailable_reason: null },

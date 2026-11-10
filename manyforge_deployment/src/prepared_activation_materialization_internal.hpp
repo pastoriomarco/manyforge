@@ -7,6 +7,8 @@
 #include <vector>
 
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/scenario_program_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -19,11 +21,7 @@ class RetainedBundle;
 
 namespace detail {
 
-struct PreparedActivationArtifact final {
-  core::ContentAddressedStoreKey content_addressed_store_key;
-  core::ContentDigest content_digest;
-  std::string bytes;
-};
+using PreparedActivationArtifact = ::manyforge::deployment::PreparedActivationArtifact;
 
 struct PreparedActivationMaterialization final {
   core::DeploymentArtifactId deployment_artifact_id;
@@ -35,6 +33,15 @@ struct PreparedActivationMaterialization final {
   std::vector<PreparedActivationArtifact> raw_artifacts;
   std::vector<PreparedActivationArtifact> catalog_artifacts;
 };
+
+[[nodiscard]] std::shared_ptr<const PreparedActivationMaterialization>
+build_prepared_activation_candidate(
+    const std::filesystem::path &capability_root,
+    const CanonicalValue &deployment_value,
+    const CanonicalValue &model_source_closure,
+    const CanonicalValue &prepared_model_closure,
+    const core::CellId &runtime_cell_id,
+    bool prepare_canonical_empty = false);
 
 [[nodiscard]] PreparedActivationMaterialization materialize_prepared_activation(
     const std::filesystem::path &capability_root,

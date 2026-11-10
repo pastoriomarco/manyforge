@@ -170,7 +170,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     });
   };
   const parseTargets = (key: 'targets' | 'measured_targets'): ExecutionObservationTarget[] => {
-    // H1a-IF.2: a cell may have no observable coordinate at all.
+    // A cell may have no observable coordinate at all.
     const raw = record[key];
     if (!Array.isArray(raw) || raw.length > 64) {
       throw new Error('Execution observation target count is invalid.');
@@ -521,7 +521,7 @@ export function sceneRuntimeViewerKey(
 
 /**
  * Delivery diagnostics that never change what the shell shows as status,
- * command enablement or freshness class (spec 450: receiver times, transport
+ * command enablement or freshness class (receiver times, transport
  * sequence counters and computed ages do not trigger shell publication).
  * Pose-source freshness (``fresh``/``payload_quality``) is not among them.
  */
@@ -854,7 +854,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     return () => this.operationProgressListeners.delete(listener);
   };
   readonly subscribeGlobalRules = this.subscribeOperationProgress;
-  // The pushed cell facts (CONTRACTS §1, §5, §7, §10); they share the
+  // The pushed cell facts; they share the
   // progress listeners (all are event-pump facts beside the shell).
   private cellState: CellState = EMPTY_CELL_STATE;
   readonly getCellState = () => this.cellState;
@@ -2548,7 +2548,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 }
 
 const EMPTY_CELL_STATE: CellState = { components: null, latch: null, io: null, readiness: null };
-/** `/ws/control` event names (CONTRACTS §1, §5, §7, §10), carried as shell facts. */
+/** `/ws/control` event names, carried as shell facts. */
 const CELL_FACT_KEYS = ['component_state', 'cell_latch', 'io_signals', 'run_readiness'] as const;
 
 /** Each cell fact the message carries; a null value means "not known". */

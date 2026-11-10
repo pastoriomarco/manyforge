@@ -1,19 +1,17 @@
 {
-  "api_version": "manyforge.scenario.project.v2",
+  "api_version": "manyforge.scenario.project.v3",
   "content": {
-    "assignment_present": true,
     "deployment_present": true,
     "program_present": true
   },
   "description": "Mock pneumatic Lite6 pick and place. The separate Mock I/O device echoes the valve command to a synthetic workpiece input after 100 ms; this is not physical grasp evidence.",
   "members": {
-    "assignment.yaml": "sha256:93bdcf8158dba12c73f5703fd35335a0aaf83a240e71a6296aa87e7431659d17",
-    "deployment.yaml": "sha256:8b4d30aac422330b461c05955e738e33cd02ffda7adf95893eedbaf0bbd8c96e",
-    "program.yaml": "sha256:6fb70d2dabf659a7677f5d8bfaf991481674832cc210db83b5f1156d070b7589"
+    "deployment.yaml": "sha256:d8798d628974e29a57447a91a5aa45fcbfe959e47691074cd01910d90910be52",
+    "program.yaml": "sha256:1e4e2c4a639d7d653bc33b9d3e7b1e52aaf4086037ad3a1f363e9cbf7b34eced"
   },
   "name": "mock_lite6_pneumatic_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:a79798db9ab5d82bc51c2256e73c85620da90347a0b734c42f4e848b41d48cc8",
+    "checked_content_digest": "sha256:f04d872955b76bcc96a57fabfd12d0c9669127e86b3a5c428f1e69185b92e696",
     "last_known_status": "unknown",
     "manyforge_version": "0.2.0"
   },

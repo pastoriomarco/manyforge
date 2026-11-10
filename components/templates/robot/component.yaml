@@ -35,11 +35,12 @@ lanes:
     adapter: mock
     controller: <TODO>              # the arm's JointTrajectoryController, e.g. acme_r6_traj_controller
     arrival_tolerance_rad: 0.01     # Mock arrival: every arm joint's JTC goal
+    runtime_scale: supported        # supported when the arm's JTC claims `position` only (it then
+                                    # accepts runtime speed scaling), else unsupported
     controllers_file: mock_controllers.yaml   # in this folder; fill in from the vendor's controller file
     # A model of a vendor with an adapter (xArm) names it instead of the file:
     # `vendor: xarm` and `vendor_model: <model>` (its controllers, as on the real lane).
     hard_stop_completion_timeout_s: 1.5
-    gripper_result_timeout_s: 5.0
 defaults:
   initial_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # one per arm joint
   maximum_tcp_linear_speed_mps: 0.15

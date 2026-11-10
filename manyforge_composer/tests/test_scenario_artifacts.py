@@ -91,7 +91,6 @@ def _document(name: str = "cell_fixture", *, version: str = "1.0.0") -> dict:
         description="Editable Scenario fixture",
         program_draft=deepcopy(_PROGRAM_FIXTURE),
         deployment_draft=_deployment_intent(),
-        program_role_assignment={"component_roles": [], "target_roles": []},
         manyforge_version=version,
         last_known_status="ready",
     )
@@ -192,7 +191,7 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
     assert state.current_drafts_match_remembered_scenario()
     assert state.authoring_workspace.snapshot().deployment["differsFromSaved"] is False
     assert sorted(path.name for path in target.iterdir()) == [
-        "assignment.yaml", "deployment.yaml", "program.yaml", "scenario.yaml"
+        "deployment.yaml", "program.yaml", "scenario.yaml"
     ]
 
     # Save As changes the project location, not the referenced model. A later
@@ -383,7 +382,7 @@ def _scenario_client(state: ComposerState) -> TestClient:
 
 
 class _ManagerStub:
-    """The Headless reads of an orchestrated Load (CONTRACTS §11): an idle
+    """The Headless reads of an orchestrated Load: an idle
     Program cycle, an empty cell, admission generation 1, and a Manager Apply
     that succeeds."""
 
@@ -582,7 +581,6 @@ def test_save_load_and_discovery_preserve_one_editable_project(
 
     assert saved_path == str((tmp_path / "cell.scenario").resolve())
     assert sorted(path.name for path in Path(saved_path).iterdir()) == [
-        "assignment.yaml",
         "deployment.yaml",
         "program.yaml",
         "scenario.yaml",
@@ -624,12 +622,9 @@ def test_listing_reports_history_not_current_content_validation(tmp_path: Path) 
             overwrite=False,
         )
     )
-    (target / "assignment.yaml").write_text(
-        json.dumps({"component_roles": [], "target_roles": [
-            {"command_target_id": "arm", "target_role_id": "picker"}
-        ]}),
-        encoding="utf-8",
-    )
+    edited = deepcopy(_document("cell")["program_draft"])
+    edited["description"] = "Edited outside"
+    (target / "program.yaml").write_text(json.dumps(edited), encoding="utf-8")
 
     _, changed = discover_scenario_artifacts(
         str(tmp_path),
@@ -923,7 +918,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             (intent["expected_admission_generation"], acquired_generation)
         )
         candidate = {
-            "schema_version": "manyforge.prepared_activation_input.v6",
+            "schema_version": "manyforge.prepared_activation_input.v7",
             "prepared_activation_id": "prepared-load-test",
             "origin": {
                 "kind": "scenario",
@@ -1010,7 +1005,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     # identity.
     assert response.json()["authoringWorkspace"] == loaded
     assert loaded["schemaVersion"] == (
-        "manyforge.composer_authoring_workspace_snapshot.v2"
+        "manyforge.composer_authoring_workspace_snapshot.v3"
     )
     assert loaded["program"]["saved"]["matchesDraft"] is True
     assert loaded["program"]["saved"]["path"] == str(target / "program.yaml")
@@ -1049,7 +1044,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
     before = state.authoring_workspace.snapshot()
 
     candidate = {
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "prepared_activation_id": "prepared-load-test",
         "origin": {
             "kind": "scenario",
@@ -1186,7 +1181,7 @@ def test_scenario_load_partial_contained_install_keeps_the_claim(
 
     # The contained workspace refuses every later read, the Load's own
     # result included; the refusal names the install failure.
-    # CONTRACTS §11: the body is the failed ApplyResult; the status stays 503.
+    # The body is the failed ApplyResult; the status stays 503.
     assert response.status_code == 503, response.text
     result = response.json()
     assert result["outcome"] == "failed"
@@ -1219,7 +1214,6 @@ def test_untitled_scenario_resource_is_the_canonical_empty_project(tmp_path: Pat
     document = build_scenario_document(
         scenario_id="Untitled", name="Untitled", description="",
         program_draft=authoring, deployment_draft=deepcopy(_UNTITLED_DEPLOYMENT),
-        program_role_assignment={"component_roles": [], "target_roles": []},
         manyforge_version="0.2.0", last_known_status="incomplete",
     )
     members, manifest = scenario_artifacts._project_payload(document, source_snapshot={
@@ -1279,7 +1273,6 @@ def test_new_loads_the_read_only_untitled_scenario_and_save_as_places_it(
     assert intent["project_path"] == str(UNTITLED_SCENARIO_PATH)
     assert intent["program"] is None and intent["program_authoring"]["forest"] == []
     assert intent["deployment"] == _UNTITLED_DEPLOYMENT
-    assert intent["program_role_assignment"] == {"component_roles": [], "target_roles": []}
     project = state.authoring_workspace.snapshot().as_dict()["project"]
     assert (project["document_path"], project["read_only"]) == (str(UNTITLED_SCENARIO_PATH), True)
     assert state.startup_scenario_notice is None
@@ -1318,10 +1311,11 @@ class _RunnerKernelCell:
 
     As live, the Kernel learns the Runner's cycle through the Manager's
     readiness update: its admission reopens ``lag`` admission reads after the
-    Runner reports Idle. Activation preparation and authoring claims need the
-    open admission (``authoring_not_ready`` otherwise), as Headless and the
-    Kernel refuse them. The Manager adopts each accepted Apply's claim and
-    releases it once the Apply has succeeded.
+    Runner reports Idle. Activation preparation waits for the open admission,
+    as Headless does, and refuses ``authoring_not_ready`` only when it
+    stays closed; authoring claims need it open, as the Kernel refuses them.
+    The Manager adopts each accepted Apply's claim and releases it once the
+    Apply has succeeded.
     """
 
     current = {"retained_bundle_id": _sha("c"), "graph_revision": _sha("d")}
@@ -1388,11 +1382,15 @@ class _RunnerKernelCell:
 
     # Activation preparer and Manager
     def prepare_activation(self, request: dict) -> dict:
+        # Headless waits for a momentarily closed admission (bounded).
+        for _ in range(8):
+            if self.authoring_admission()["authoring_allowed"] is True:
+                break
         self._require_admission()
         self.prepared.append(request["scenario_id"])
         program = request["program"] is not None
         return {"prepared_activation": {
-            "schema_version": "manyforge.prepared_activation_input.v6",
+            "schema_version": "manyforge.prepared_activation_input.v7",
             "prepared_activation_id": _sha("1"),
             "origin": {"kind": "scenario", "scenario_id": request["scenario_id"],
                        "source_document_digest": request["source_document_digest"],
@@ -1433,9 +1431,13 @@ class _RunnerKernelCell:
 
     def manager_apply_status(self, _apply_id, _generation) -> dict:
         if self.apply_failure is not None:
-            # An Apply that ended after it started changing the cell: the
-            # Manager keeps its adopted claim (CONTRACTS §15).
             failure, self.apply_failure = self.apply_failure, None
+            if failure.get("effect_boundary") == "before_effect":
+                # Refused before any effect: the Manager releases the claim.
+                self.claimed = False
+                return {"ok": True, "state": "failed", "failure": failure}
+            # An Apply that ended after it started changing the cell: the
+            # Manager keeps its adopted claim.
             self.held_by_failed_apply = True
             return {"ok": True, "state": "unknown_effect", "failure": failure}
         self.claimed = False  # the Manager releases the adopted claim
@@ -1475,8 +1477,8 @@ def _runner_kernel_client(
 def test_load_after_a_finished_or_held_run_resets_it_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, motion_held: bool
 ) -> None:
-    # CONTRACTS §11: a finished run awaiting Reset, or a run whose motion is
-    # all held, is Reset first, as part of the Load (R3); the Load proceeds
+    # A finished run awaiting Reset, or a run whose motion is
+    # all held, is Reset first, as part of the Load; the Load proceeds
     # once the Kernel admission has reopened after that Reset.
     target = save_scenario_artifact(
         _document("loaded-project"), str(tmp_path / "loaded-project.scenario"),
@@ -1512,7 +1514,7 @@ def test_new_after_a_finished_run_resets_it_first(
 def test_new_releases_an_unknown_effect_apply_and_load_works_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # R3, N7 (CONTRACTS §15): an Apply that failed after it started changing
+    # An Apply that failed after it started changing
     # the cell leaves its claim held, so authoring is refused; New releases
     # it and empties the cell, and Load (New plus Apply) works again.
     target = save_scenario_artifact(
@@ -1549,6 +1551,61 @@ def test_new_releases_an_unknown_effect_apply_and_load_works_again(
     assert loaded.json()["scenario_id"] == "loaded-project"
     # Its New found nothing left to release.
     assert len(cell.release_requests) == 3 and len(cell.applies) == applies + 2
+
+
+@pytest.mark.parametrize("boundary", ["before_effect", "unknown"])
+def test_load_failed_before_any_effect_restores_the_previous_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    # OD-87: the Load commits its workspace before the Manager submission. A
+    # Manager Apply that then fails before any effect leaves the cell running
+    # the previous Scenario, so the previous Drafts come back and the typed
+    # failure is the Load's result. An unknown effect restores nothing.
+    target = save_scenario_artifact(
+        _document("loaded-project"), str(tmp_path / "loaded-project.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    cell = _RunnerKernelCell("idle_after_reset")
+    state = ComposerState(allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
+    state.authoring_admission = AuthoringAdmissionCoordinator(cell)  # type: ignore[arg-type]
+    state.headless_client = cell  # type: ignore[assignment]
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+    from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
+
+    monkeypatch.setattr(HeadlessApplyPorts, "_POLL_SECONDS", 0.0)
+    client = _scenario_client(state)
+    loaded = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    assert loaded.json()["outcome"] == "succeeded", loaded.json()
+
+    def drafts() -> tuple[dict, dict, dict]:
+        program = state.draft_session.retained_state()
+        deployment = state.deployment_draft_session.retained_state()
+        program.pop("draft_id")
+        deployment.pop("draft_id")
+        return program, deployment, state.authoring_workspace.project_facts()
+
+    before = drafts()
+    assert before[2]["document_id"] == "loaded-project"
+    cell.apply_failure = {
+        "code": "apply_fence_evidence_failed", "effect_boundary": boundary,
+        "message": "Managed Kernel Apply-fence owner: no reconciled active configuration",
+        "cause_details": {"cause_code": "kernel_apply_fence_request_failed",
+                          "cause": "the execution owner has no reconciled active configuration"},
+    }
+    failed = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    assert failed.status_code == 200, failed.text
+    result = failed.json()
+    assert result["outcome"] == "failed"
+    assert result["error"]["code"] == "kernel_apply_fence_request_failed"
+    if boundary == "before_effect":
+        assert drafts() == before
+        assert result["authoringWorkspace"]["project"]["document_id"] == "loaded-project"
+        assert cell.authoring_admission()["authoring_allowed"] is True
+    else:
+        assert drafts() != before
+        assert state.authoring_workspace.project_facts()["document_id"] != "loaded-project"
 
 
 class _FailedStopKernel:
@@ -1594,7 +1651,7 @@ class _FailedStopRunnerCell(_RunnerKernelCell):
 def test_new_and_load_succeed_after_a_failed_program_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
 ) -> None:
-    # R3: a failed Stop leaves the cell latch to block execution; the Reset
+    # A failed Stop leaves the cell latch to block execution; the Reset
     # that New (and Load, New plus Apply) makes first still completes.
     cell = _FailedStopRunnerCell()
     client = _runner_kernel_client(tmp_path, monkeypatch, cell)
@@ -1675,7 +1732,6 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
         description="",
         program_draft=None,
         deployment_draft=None,
-        program_role_assignment=None,
         manyforge_version="1.0.0",
         last_known_status="incomplete",
     )
@@ -1685,7 +1741,6 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
         description="replacement",
         program_draft=None,
         deployment_draft=None,
-        program_role_assignment=None,
         manyforge_version="1.0.0",
         last_known_status="incomplete",
     )
@@ -1916,15 +1971,14 @@ def test_valid_hand_edit_is_loaded_without_rechecking_during_discovery(tmp_path:
             overwrite=False,
         )
     )
-    edited = {"component_roles": [], "target_roles": [
-        {"command_target_id": "arm", "target_role_id": "picker"}
-    ]}
-    (target / "assignment.yaml").write_text(json.dumps(edited) + "\n", encoding="utf-8")
+    edited = deepcopy(_document("edited")["program_draft"])
+    edited["description"] = "Edited outside"
+    (target / "program.yaml").write_text(json.dumps(edited) + "\n", encoding="utf-8")
 
     loaded, _ = load_scenario_artifact(
         str(target), allowed_roots=[str(tmp_path)]
     )
-    assert loaded["program_role_assignment"] == edited
+    assert loaded["program_draft"] == edited
     _, entries = discover_scenario_artifacts(
         str(tmp_path),
         allowed_roots=[str(tmp_path)],
@@ -2112,7 +2166,7 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     current = {"retained_bundle_id": "bundle-current", "graph_revision": "graph-current"}
     source_document_digest = "sha256:" + "1" * 64
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v6",
+        "schema_version": "manyforge.prepared_activation_input.v7",
         "prepared_activation_id": "prepared-1",
         "origin": {"kind": "scenario", "scenario_id": "cell",
                    "source_document_digest": source_document_digest,
@@ -2708,7 +2762,7 @@ def test_save_as_writes_one_name_and_requires_overwrite_confirmation(
     (tmp_path / "cells" / "model.urdf").write_text('<robot name="fixture"/>\n')
     body = {
         **_fence(state), "directory": str(tmp_path / "cells"), "name": "Pick_Cell-1",
-        "description": "R5 trial (a) automatic retry", "confirmOverwrite": False,
+        "description": "Trial (a) automatic retry", "confirmOverwrite": False,
     }
 
     response = client.post("/api/scenario-documents/save", json=body)
@@ -2719,7 +2773,7 @@ def test_save_as_writes_one_name_and_requires_overwrite_confirmation(
     assert response.json()["scenario_id"] == "Pick_Cell-1"
     manifest = json.loads((target / "scenario.yaml").read_text(encoding="utf-8"))
     assert (manifest["scenario_id"], manifest["name"], manifest["description"]) == (
-        "Pick_Cell-1", "Pick_Cell-1", "R5 trial (a) automatic retry",
+        "Pick_Cell-1", "Pick_Cell-1", "Trial (a) automatic retry",
     )
 
     # Another project at the same name is replaced only on explicit request.
@@ -2730,7 +2784,7 @@ def test_save_as_writes_one_name_and_requires_overwrite_confirmation(
     assert refused.status_code == 409, refused.text
     assert json.loads((target / "scenario.yaml").read_text(encoding="utf-8"))[
         "description"
-    ] == "R5 trial (a) automatic retry"
+    ] == "Trial (a) automatic retry"
     replaced = other_client.post("/api/scenario-documents/save", json={
         **body, **_fence(other), "description": "second", "confirmOverwrite": True,
     })
@@ -2941,11 +2995,6 @@ def test_grasp_confirmed_example_requires_confirmation_on_its_mounted_tool() -> 
         "controllable_component_id": "gripper_io",
         "signal_name": "workpiece_grasped",
     }
-    assert {
-        "component_role_id": "tool",
-        "controllable_component_id": "lite_gripper",
-    } in document["program_role_assignment"]["component_roles"]
-
     # Apart from the policy and its names, the cell is the plain Mock example.
     expected = deepcopy(base["deployment_draft"])
     expected_tool = next(
@@ -2957,7 +3006,6 @@ def test_grasp_confirmed_example_requires_confirmation_on_its_mounted_tool() -> 
     for field in ("deployment_artifact_id", "name", "description"):
         expected[field] = deployment[field]
     assert deployment == expected
-    assert document["program_role_assignment"] == base["program_role_assignment"]
 
     (close,) = _gripper_closes(document["program_draft"]["forest"])
     assert "required_inputs" not in close

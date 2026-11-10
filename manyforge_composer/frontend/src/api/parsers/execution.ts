@@ -12,6 +12,7 @@ import type {
   ExecutionIdentity,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
+  MotionPreviewPath,
   ObservedGripperTarget,
   ObservedMotionTarget,
   OperationObservation,
@@ -171,21 +172,42 @@ function manualControlContractsAt(
   };
 }
 
+function directFrameAt(value: unknown, path: string): { componentId: string; frameId: string } {
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['component_id', 'frame_id'], path);
+  return { componentId: nonEmptyStringAt(row.component_id, `${path}.component_id`), frameId: nonEmptyStringAt(row.frame_id, `${path}.frame_id`) };
+}
+function directTargetAt(value: unknown, path: string): { componentId: string; targetId: string } {
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['component_id', 'command_target_id'], path);
+  return { componentId: nonEmptyStringAt(row.component_id, `${path}.component_id`), targetId: nonEmptyStringAt(row.command_target_id, `${path}.command_target_id`) };
+}
+function tcpEntryAt(value: unknown, path: string): TcpEntryIdentity {
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['target', 'frame'], path);
+  const target = directTargetAt(row.target, `${path}.target`);
+  const frame = directFrameAt(row.frame, `${path}.frame`);
+  return { componentId: target.componentId, targetId: target.targetId, frameComponentId: frame.componentId, frameRoleId: frame.frameId };
+}
+
 function manualControlMotionDescriptorAt(
   value: unknown,
   path: string,
 ): ManualControlMotionDescriptor {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'command_target_id', 'component_role_id', 'contracts',
+    'command_target_id', 'target', 'contracts',
     'controllable_component_id', 'end_effector_component_id', 'frames', 'joints',
     'operational_joint_limits',
-    'operational_limit', 'ordinary_jerk', 'schema_version', 'target_role_id', 'tcps',
+    'operational_limit', 'ordinary_jerk', 'schema_version', 'tcps',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v6') {
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v8') {
     return fail(`${path}.schema_version`, 'the supported motion descriptor');
   }
+  const target = directTargetAt(record.target, `${path}.target`);
+  if (target.componentId !== record.controllable_component_id || target.targetId !== record.command_target_id)
+    return fail(`${path}.target`, 'the exact descriptor target');
   const operationalLimit = record.operational_limit === null
     ? null
     : (() => {
@@ -202,17 +224,18 @@ function manualControlMotionDescriptorAt(
   const frames = boundedArrayAt(record.frames, `${path}.frames`, 256).map((item, index) => {
     const itemPath = `${path}.frames[${index}]`;
     const frame = objectAt(item, itemPath);
-    exactKeysAt(frame, ['compiled_frame_name', 'frame_role_id', 'model_instance_id', 'model_revision'], itemPath);
+    exactKeysAt(frame, ['compiled_frame_name', 'reference', 'model_instance_id', 'model_revision'], itemPath);
+    const reference = directFrameAt(frame.reference, `${itemPath}.reference`);
     return {
       compiledFrameName: stringAt(frame.compiled_frame_name, `${itemPath}.compiled_frame_name`),
-      frameRoleId: stringAt(frame.frame_role_id, `${itemPath}.frame_role_id`),
+      frameRoleId: reference.frameId, frameComponentId: reference.componentId,
       modelInstanceId: stringAt(frame.model_instance_id, `${itemPath}.model_instance_id`),
       modelRevision: digestAt(frame.model_revision, `${itemPath}.model_revision`),
     };
   });
   if (
     frames.length === 0
-    || new Set(frames.map((frame) => frame.frameRoleId)).size !== frames.length
+    || new Set(frames.map((frame) => JSON.stringify([frame.frameComponentId, frame.frameRoleId]))).size !== frames.length
   ) {
     return fail(`${path}.frames`, 'non-empty unique frame roles');
   }
@@ -222,37 +245,20 @@ function manualControlMotionDescriptorAt(
   const tcps = boundedArrayAt(record.tcps, `${path}.tcps`, MAX_DIRECT_CONTROL_TCP_ROWS).map((item, index) => {
     const itemPath = `${path}.tcps[${index}]`;
     const tcp = objectAt(item, itemPath);
-    allowedKeysAt(tcp, [
-      'default', 'display', 'entry', 'frame', 'mounted_elsewhere', 'mounted_here',
-    ], ['target_role_id'], itemPath);
-    const entryPath = `${itemPath}.entry`;
-    const entryRecord = objectAt(tcp.entry, entryPath);
-    exactKeysAt(entryRecord, ['component_id', 'target_id', 'frame_role_id'], entryPath);
-    const entry: TcpEntryIdentity = {
-      componentId: stringAt(entryRecord.component_id, `${entryPath}.component_id`),
-      targetId: stringAt(entryRecord.target_id, `${entryPath}.target_id`),
-      frameRoleId: stringAt(entryRecord.frame_role_id, `${entryPath}.frame_role_id`),
-    };
+    exactKeysAt(tcp, ['default', 'display', 'entry', 'frame', 'contact_body_role_ids', 'mounted_elsewhere', 'mounted_here'], itemPath);
+    const entry = tcpEntryAt(tcp.entry, `${itemPath}.entry`);
     const framePath = `${itemPath}.frame`;
     const frame = objectAt(tcp.frame, framePath);
-    allowedKeysAt(frame, [
-      'compiled_frame_name', 'frame_role_id', 'model_instance_id', 'model_revision',
-    ], ['contact_body_role_ids'], framePath);
-    const frameRoleId = stringAt(frame.frame_role_id, `${framePath}.frame_role_id`);
-    if (entry.frameRoleId !== frameRoleId) {
-      return fail(itemPath, 'a TCP entry whose frame role matches its frame');
-    }
-    const contactBodyRoleIds = frame.contact_body_role_ids === undefined
-      ? []
-      : arrayAt(frame.contact_body_role_ids, `${framePath}.contact_body_role_ids`)
-        .map((role, roleIndex) => stringAt(role, `${framePath}.contact_body_role_ids[${roleIndex}]`));
+    exactKeysAt(frame, ['compiled_frame_name', 'reference', 'model_instance_id', 'model_revision'], framePath);
+    const reference = directFrameAt(frame.reference, `${framePath}.reference`);
+    if (entry.frameRoleId !== reference.frameId || entry.frameComponentId !== reference.componentId)
+      return fail(itemPath, 'a TCP entry whose frame matches its retained frame');
+    const contactBodyRoleIds = stringArrayAt(tcp.contact_body_role_ids, `${itemPath}.contact_body_role_ids`);
     if (new Set(contactBodyRoleIds).size !== contactBodyRoleIds.length) {
       return fail(`${framePath}.contact_body_role_ids`, 'unique contact-body roles');
     }
     return {
       entry,
-      targetRoleId: tcp.target_role_id === undefined
-        ? null : stringAt(tcp.target_role_id, `${itemPath}.target_role_id`),
       controllableComponentId: entry.componentId,
       commandTargetId: entry.targetId,
       frameRoleId: entry.frameRoleId,
@@ -438,8 +444,6 @@ function manualControlMotionDescriptorAt(
       `${path}.end_effector_component_id`,
     ),
     commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
-    componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
-    targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
     frames,
     tcps,
     joints,
@@ -458,21 +462,24 @@ function manualControlGripperDescriptorAt(
   allowedKeysAt(record, [
     'actuation_kind', 'attach_frame', 'auxiliary_frames', 'closed_state_ref',
     'command_duration_s', 'command_kind', 'command_target_id',
-    'component_role_id', 'completion_policy', 'contracts',
+    'target', 'completion_policy', 'contracts',
     'control_interface_contract_id', 'controllable_component_id',
     'coordinate_kind', 'description', 'grasp_confirmation_policy',
     'max_position', 'mimic_followers', 'min_position', 'mount_frame',
     'named_presets', 'open_state_ref', 'output_mode', 'schema_version',
     'source_coordinate_name', 'source_group_name', 'source_kind',
-    'state_authority_class', 'state_authority_id', 'target_role_id',
+    'state_authority_class', 'state_authority_id',
     'tcp_frame', 'touch_links', 'transport_kind', 'unit',
   ], ['grasp_confirmation', 'pneumatic_outputs'], path);
+  const target = directTargetAt(record.target, `${path}.target`);
+  if (target.componentId !== record.controllable_component_id || target.targetId !== record.command_target_id)
+    return fail(`${path}.target`, 'the exact descriptor target');
   // Opt-in typed grasp confirmation; present only as `required`.
   if (record.grasp_confirmation !== undefined && record.grasp_confirmation !== 'required') {
     return fail(`${path}.grasp_confirmation`, 'required when present');
   }
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v3') {
+  if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v5') {
     return fail(`${path}.schema_version`, 'the supported gripper descriptor');
   }
   const coordinateKind = stringAt(record.coordinate_kind, `${path}.coordinate_kind`);
@@ -661,8 +668,6 @@ function manualControlGripperDescriptorAt(
     schemaVersion,
     controllableComponentId: stringAt(record.controllable_component_id, `${path}.controllable_component_id`),
     commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
-    componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
-    targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
     description,
     commandKind,
     actuationKind: actuationKind as ManualControlGripperDescriptor['actuationKind'],
@@ -697,7 +702,7 @@ function manualControlGripperDescriptorAt(
 }
 
 function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
-  // execution_identity.v2 (H1a-IF.2): runtime identity only. No primary
+  // execution_identity.v2: runtime identity only. No primary
   // target roles and no Program fields: a manual target's direct-control
   // binding lives in that target, the authored Program outcome elsewhere.
   const identity = objectAt(value, path);
@@ -749,7 +754,7 @@ export function parseExecutionIdentity(value: unknown): ExecutionIdentity {
   );
   if (
     stringAt(envelope.api_version, 'executionIdentity.api_version')
-      !== 'manyforge.execution_command_response.v1'
+      !== 'manyforge.execution_command_response.v4'
     || booleanAt(envelope.ok, 'executionIdentity.ok') !== true
     || stringAt(envelope.command, 'executionIdentity.command') !== 'identity'
   ) {
@@ -770,7 +775,7 @@ export function parseExecutionControlStatus(
   );
   if (
     stringAt(targetsEnvelope.api_version, 'executionTargets.api_version')
-      !== 'manyforge.execution_command_response.v1'
+      !== 'manyforge.execution_command_response.v4'
     || booleanAt(targetsEnvelope.ok, 'executionTargets.ok') !== true
     || stringAt(targetsEnvelope.command, 'executionTargets.command') !== 'targets'
   ) {
@@ -784,7 +789,7 @@ export function parseExecutionControlStatus(
   );
   if (
     stringAt(controlEnvelope.api_version, 'executionControlState.api_version')
-      !== 'manyforge.execution_command_response.v1'
+      !== 'manyforge.execution_command_response.v4'
     || booleanAt(controlEnvelope.ok, 'executionControlState.ok') !== true
     || stringAt(controlEnvelope.command, 'executionControlState.command')
       !== 'control_state'
@@ -802,7 +807,7 @@ export function parseExecutionControlStatus(
   if (JSON.stringify(targetIdentity) !== JSON.stringify(controlIdentity)) {
     return fail('executionControlStatus', 'matching owner/product identities');
   }
-  // execution_targets.v3 + execution_control_state.v6 (H1a-IF.2): every
+  // execution_targets.v3 + execution_control_state.v6: every
   // managed cell uses one component-based shape; no primary target exists.
   const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
   allowedKeysAt(targets, ['components', 'schema_version'], ['io_signal_bindings', 'system_signals'], 'executionTargets.targets');
@@ -815,8 +820,8 @@ export function parseExecutionControlStatus(
     ? []
     : systemSignalsAt(targets.system_signals, 'executionTargets.targets.system_signals');
   if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
-    !== 'manyforge.execution_targets.v3') {
-    return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v3');
+    !== 'manyforge.execution_targets.v4') {
+    return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v4');
   }
   const control = objectAt(
     controlEnvelope.control_state,
@@ -832,10 +837,10 @@ export function parseExecutionControlStatus(
   if (stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  ) !== 'manyforge.execution_control_state.v6') {
+  ) !== 'manyforge.execution_control_state.v7') {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v6',
+      'manyforge.execution_control_state.v7',
     );
   }
   const rowKey = (componentId: unknown, targetId: unknown, capabilityId: unknown) => (
@@ -943,9 +948,9 @@ export function parseExecutionControlStatus(
         };
         if (presentation === 'motion') {
           allowedKeysAt(command, [
-            'base_frame_role_id', 'component_role_id', 'frame_role_ids', 'joints',
+            'base_frame', 'frames', 'joints',
             'manual_control', 'planning_capability_ids', 'target_descriptor',
-            'target_role_id', 'tcp_frame_role_id',
+            'target', 'tcp_frame',
           ], ['stop_response', 'stop_response_error'], `${targetPath}.command`);
           // The execution host publishes `stop_response: null` with the
           // owner's error when it cannot read the target's Stop metadata.
@@ -976,8 +981,8 @@ export function parseExecutionControlStatus(
           });
         } else if (presentation === 'gripper') {
           exactKeysAt(command, [
-            'command_schema_id', 'command_schema_revision', 'component_role_id',
-            'manual_control', 'resource', 'target_descriptor', 'target_role_id',
+            'command_schema_id', 'command_schema_revision', 'target',
+            'manual_control', 'resource', 'target_descriptor',
           ], `${targetPath}.command`);
           gripperRows.push({
             ...addressed,
@@ -1058,7 +1063,7 @@ export function parseExecutionControlStatus(
     );
   }
   const status = normalizedOwnerStatusAt({
-    api_version: 'manyforge.execution_command_response.v1',
+    api_version: 'manyforge.execution_command_response.v4',
     command: 'status',
     ok: true,
     status: {
@@ -1092,8 +1097,8 @@ export function parseExecutionControlStatus(
     const selector = runtimeScaleControl.selector;
     if (!status.directControlTargets.some((target) => (
       selector.programBindingId === target.programBindingId
-      && selector.componentRoleId === target.componentRoleId
-      && selector.targetRoleId === target.targetRoleId
+      && selector.componentId === target.controllableComponentId
+      && selector.commandTargetId === target.commandTargetId
     ))) {
       return fail(
         'executionControlState.control_state.runtime_scale_control.selector',
@@ -1119,7 +1124,7 @@ export function parseExecutionControlStatus(
 }
 
 /**
- * The optional `target.command.stop_response` (SX-2167): strict, with its
+ * The optional `target.command.stop_response`: strict, with its
  * stages in qualified chain order and unique stage ids.
  */
 export function targetStopResponseAt(value: unknown, path: string): TargetStopResponse {
@@ -1169,11 +1174,10 @@ function directControlMotionAt(value: unknown): {
   );
   exactKeysAt(direct, [
     'active_tcp',
-    'base_frame_role_id',
+    'base_frame',
     'command_target_id',
-    'component_role_id',
     'controllable_component_id',
-    'frame_role_ids',
+    'frames',
     'joints',
     'observed_state',
     'operation_capability_id',
@@ -1182,9 +1186,9 @@ function directControlMotionAt(value: unknown): {
     'program_id',
     'program_revision',
     'program_run_id',
-    'target_role_id',
+    'target',
     'target_descriptor',
-    'tcp_frame_role_id',
+    'tcp_frame',
   ], 'executionStatus.status.direct_control');
   const motionDescriptor = manualControlMotionDescriptorAt(
     direct.target_descriptor,
@@ -1257,14 +1261,7 @@ function directControlMotionAt(value: unknown): {
       const rowPath = `executionStatus.observedMotion.tcp_poses[${index}]`;
       const row = objectAt(item, rowPath);
       exactKeysAt(row, ['entry', 'pose'], rowPath);
-      const entryPath = `${rowPath}.entry`;
-      const entryRecord = objectAt(row.entry, entryPath);
-      exactKeysAt(entryRecord, ['component_id', 'target_id', 'frame_role_id'], entryPath);
-      const entry: TcpEntryIdentity = {
-        componentId: stringAt(entryRecord.component_id, `${entryPath}.component_id`),
-        targetId: stringAt(entryRecord.target_id, `${entryPath}.target_id`),
-        frameRoleId: stringAt(entryRecord.frame_role_id, `${entryPath}.frame_role_id`),
-      };
+      const entry = tcpEntryAt(row.entry, `${rowPath}.entry`);
       const key = tcpEntryIdentityKey(entry);
       const descriptorTcp = tcpByKey.get(key);
       if (descriptorTcp === undefined || !descriptorTcp.mountedHere || tcpPoses[key] !== undefined) {
@@ -1299,10 +1296,6 @@ function directControlMotionAt(value: unknown): {
       );
     }
     observedMotion = {
-      targetRoleId: stringAt(
-        direct.target_role_id,
-        'executionStatus.status.direct_control.target_role_id',
-      ),
       controllableComponentId: componentId,
       commandTargetId: targetId,
       sequence: integerAt(
@@ -1326,10 +1319,13 @@ function directControlMotionAt(value: unknown): {
       tcpPoses,
     };
   }
-  const frameRoleIds = stringArrayAt(
-    direct.frame_role_ids,
-    'executionStatus.status.direct_control.frame_role_ids',
-  );
+  const frameReferences = arrayAt(direct.frames, 'executionStatus.status.direct_control.frames')
+    .map((frame, index) => directFrameAt(frame, `executionStatus.status.direct_control.frames[${index}]`));
+  const frameRoleIds = frameReferences.map((frame) => frame.frameId);
+  const baseFrame = directFrameAt(direct.base_frame, 'executionStatus.status.direct_control.base_frame');
+  const directTarget = directTargetAt(direct.target, 'executionStatus.status.direct_control.target');
+  if (directTarget.componentId !== componentId || directTarget.targetId !== targetId)
+    return fail('executionStatus.status.direct_control.target', 'the exact addressed target');
   const planningCapabilityIds = stringArrayAt(
     direct.planning_capability_ids,
     'executionStatus.status.direct_control.planning_capability_ids',
@@ -1342,11 +1338,10 @@ function directControlMotionAt(value: unknown): {
   if (
     motionDescriptor.controllableComponentId !== componentId
     || motionDescriptor.commandTargetId !== targetId
-    || motionDescriptor.componentRoleId !== direct.component_role_id
-    || motionDescriptor.targetRoleId !== direct.target_role_id
     || motionDescriptor.contracts.operationCapabilityId !== direct.operation_capability_id
     || frameRoleIds.length !== descriptorFrameRoleIds.length
-    || frameRoleIds.some((role, index) => role !== descriptorFrameRoleIds[index])
+    || frameRoleIds.some((role, index) => role !== descriptorFrameRoleIds[index]
+       || frameReferences[index].componentId !== motionDescriptor.frames[index].frameComponentId)
     || planningCapabilityIds.length !== descriptorSupportingCapabilityIds.length
     || planningCapabilityIds.some(
       (capability, index) => capability !== descriptorSupportingCapabilityIds[index],
@@ -1369,15 +1364,10 @@ function directControlMotionAt(value: unknown): {
     const path = 'executionStatus.status.direct_control.active_tcp';
     const active = objectAt(direct.active_tcp, path);
     exactKeysAt(active, ['entry', 'display', 'owner_epoch', 'registration_generation', 'sequence'], path);
-    const entry = active.entry === null ? null : objectAt(active.entry, `${path}.entry`);
-    if (entry !== null) exactKeysAt(entry, ['component_id', 'target_id', 'frame_role_id'], `${path}.entry`);
+    const entry = active.entry === null ? null : tcpEntryAt(active.entry, `${path}.entry`);
     if ((entry === null) !== (active.display === null)) return fail(path, 'entry and display both present or both null');
     activeTcp = {
-      entry: entry === null ? null : {
-        componentId: stringAt(entry.component_id, `${path}.entry.component_id`),
-        targetId: stringAt(entry.target_id, `${path}.entry.target_id`),
-        frameRoleId: stringAt(entry.frame_role_id, `${path}.entry.frame_role_id`),
-      },
+      entry,
       display: active.display === null ? null : stringAt(active.display, `${path}.display`),
       ownerEpoch: nonEmptyStringAt(active.owner_epoch, `${path}.owner_epoch`),
       registrationGeneration: positiveIntegerAt(active.registration_generation, `${path}.registration_generation`),
@@ -1390,22 +1380,9 @@ function directControlMotionAt(value: unknown): {
       activeTcp,
       controllableComponentId: componentId,
       commandTargetId: targetId,
-      componentRoleId: stringAt(
-        direct.component_role_id,
-        'executionStatus.status.direct_control.component_role_id',
-      ),
-      targetRoleId: stringAt(
-        direct.target_role_id,
-        'executionStatus.status.direct_control.target_role_id',
-      ),
-      baseFrameRoleId: stringAt(
-        direct.base_frame_role_id,
-        'executionStatus.status.direct_control.base_frame_role_id',
-      ),
-      tcpFrameRoleId: nullableStringAt(
-        direct.tcp_frame_role_id,
-        'executionStatus.status.direct_control.tcp_frame_role_id',
-      ),
+      baseFrame,
+      baseFrameRoleId: baseFrame.frameId,
+      tcpFrameRoleId: direct.tcp_frame === null ? null : directFrameAt(direct.tcp_frame, 'executionStatus.status.direct_control.tcp_frame').frameId,
       operationCapabilityId: stringAt(
         direct.operation_capability_id,
         'executionStatus.status.direct_control.operation_capability_id',
@@ -1453,7 +1430,6 @@ function directControlGripperAt(value: unknown): {
     'command_schema_id',
     'command_schema_revision',
     'command_target_id',
-    'component_role_id',
     'controllable_component_id',
     'observed_state',
     'operation_capability_id',
@@ -1462,9 +1438,12 @@ function directControlGripperAt(value: unknown): {
     'program_revision',
     'program_run_id',
     'resource',
-    'target_role_id',
+    'target',
     'target_descriptor',
   ], 'executionStatus.status.direct_control_gripper');
+  const target = directTargetAt(directGripper.target, 'executionStatus.status.direct_control_gripper.target');
+  if (target.componentId !== directGripper.controllable_component_id || target.targetId !== directGripper.command_target_id)
+    return fail('executionStatus.status.direct_control_gripper.target', 'the exact addressed target');
   const gripperDescriptor = manualControlGripperDescriptorAt(
     directGripper.target_descriptor,
     'executionStatus.status.direct_control_gripper.target_descriptor',
@@ -1578,10 +1557,6 @@ function directControlGripperAt(value: unknown): {
       );
     }
     observedGripper = {
-      targetRoleId: stringAt(
-        directGripper.target_role_id,
-        'executionStatus.status.direct_control_gripper.target_role_id',
-      ),
       controllableComponentId: stringAt(
         directGripper.controllable_component_id,
         'executionStatus.status.direct_control_gripper.controllable_component_id',
@@ -1613,8 +1588,6 @@ function directControlGripperAt(value: unknown): {
   if (
     gripperDescriptor.controllableComponentId !== directGripper.controllable_component_id
     || gripperDescriptor.commandTargetId !== directGripper.command_target_id
-    || gripperDescriptor.componentRoleId !== directGripper.component_role_id
-    || gripperDescriptor.targetRoleId !== directGripper.target_role_id
     || gripperDescriptor.sourceCoordinateName !== gripperSourceName
     || gripperDescriptor.sourceKind !== sourceKind
     || gripperDescriptor.coordinateKind !== coordinateKind
@@ -1638,14 +1611,6 @@ function directControlGripperAt(value: unknown): {
       commandTargetId: stringAt(
         directGripper.command_target_id,
         'executionStatus.status.direct_control_gripper.command_target_id',
-      ),
-      componentRoleId: stringAt(
-        directGripper.component_role_id,
-        'executionStatus.status.direct_control_gripper.component_role_id',
-      ),
-      targetRoleId: stringAt(
-        directGripper.target_role_id,
-        'executionStatus.status.direct_control_gripper.target_role_id',
       ),
       operationCapabilityId: stringAt(
         directGripper.operation_capability_id,
@@ -1687,7 +1652,7 @@ function directControlGripperAt(value: unknown): {
 }
 
 /**
- * Aggregate status/diagnostics (`manyforge.execution_status.v2`, H1a-IF.2):
+ * Aggregate status/diagnostics (`manyforge.execution_status.v3`):
  * a pure composition of one owner snapshot's identity.v2, targets.v3 and
  * control_state.v6 payloads, normalized exactly like the separate commands.
  */
@@ -1696,7 +1661,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
   exactKeysAt(envelope, ['api_version', 'command', 'ok', 'status'], 'executionStatus');
   if (
     stringAt(envelope.api_version, 'executionStatus.api_version')
-      !== 'manyforge.execution_command_response.v1'
+      !== 'manyforge.execution_command_response.v4'
     || booleanAt(envelope.ok, 'executionStatus.ok') !== true
     || stringAt(envelope.command, 'executionStatus.command') !== 'status'
   ) {
@@ -1707,17 +1672,17 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     'control_state', 'identity', 'schema_version', 'targets',
   ], 'executionStatus.status');
   if (stringAt(status.schema_version, 'executionStatus.status.schema_version')
-    !== 'manyforge.execution_status.v2') {
-    return fail('executionStatus.status.schema_version', 'manyforge.execution_status.v2');
+    !== 'manyforge.execution_status.v3') {
+    return fail('executionStatus.status.schema_version', 'manyforge.execution_status.v3');
   }
   return parseExecutionControlStatus({
-    api_version: 'manyforge.execution_command_response.v1',
+    api_version: 'manyforge.execution_command_response.v4',
     command: 'targets',
     identity: status.identity,
     ok: true,
     targets: status.targets,
   }, {
-    api_version: 'manyforge.execution_command_response.v1',
+    api_version: 'manyforge.execution_command_response.v4',
     command: 'control_state',
     control_state: status.control_state,
     identity: status.identity,
@@ -1735,7 +1700,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     return fail('executionStatus', 'a successful status response');
   }
   const status = objectAt(envelope.status, 'executionStatus.status');
-  // Null exactly for a component without motion capability (H1a-IF.2).
+  // Null exactly for a component without motion capability.
   const motion = status.direct_control === null
     ? null
     : directControlMotionAt(status.direct_control);
@@ -2032,12 +1997,61 @@ function poseAt(value: unknown, path: string): MotionPreviewReceipt['finalTcpPos
   };
 }
 
+function motionPreviewResolvedTcpAt(
+  value: unknown,
+  path: string,
+): MotionPreviewReceipt['resolvedTcp'] {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'entry', 'owner_epoch', 'registration_generation', 'sequence', 'source',
+  ], path);
+  const entry = objectAt(record.entry, `${path}.entry`);
+  exactKeysAt(entry, ['frame', 'target'], `${path}.entry`);
+  const target = objectAt(entry.target, `${path}.entry.target`);
+  exactKeysAt(target, ['command_target_id', 'component_id'], `${path}.entry.target`);
+  const frame = objectAt(entry.frame, `${path}.entry.frame`);
+  exactKeysAt(frame, ['component_id', 'frame_id'], `${path}.entry.frame`);
+  const source = stringAt(record.source, `${path}.source`);
+  if (source !== 'active_tcp' && source !== 'joint_flange_fallback'
+    && source !== 'explicit_entry') {
+    return fail(`${path}.source`, 'active_tcp, joint_flange_fallback, or explicit_entry');
+  }
+  return {
+    entry: {
+      target: {
+        componentId: nonEmptyStringAt(
+          target.component_id,
+          `${path}.entry.target.component_id`,
+        ),
+        commandTargetId: nonEmptyStringAt(
+          target.command_target_id,
+          `${path}.entry.target.command_target_id`,
+        ),
+      },
+      frame: {
+        componentId: nonEmptyStringAt(
+          frame.component_id,
+          `${path}.entry.frame.component_id`,
+        ),
+        frameId: nonEmptyStringAt(frame.frame_id, `${path}.entry.frame.frame_id`),
+      },
+    },
+    source,
+    ownerEpoch: nonEmptyStringAt(record.owner_epoch, `${path}.owner_epoch`),
+    registrationGeneration: positiveIntegerAt(
+      record.registration_generation,
+      `${path}.registration_generation`,
+    ),
+    sequence: integerAt(record.sequence, `${path}.sequence`),
+  };
+}
+
 export function parseManualControlAvailability(value: unknown): ManualControlAvailability {
   const path = 'manualControlAvailability';
   const envelope = objectAt(value, path);
   exactKeysAt(envelope, ['api_version', 'command', 'ok', 'request_id',
     'request_owner_epoch', 'intent_digest', 'availability', 'manual_handover'], path);
-  if (envelope.api_version !== 'manyforge.execution_command_response.v1'
+  if (envelope.api_version !== 'manyforge.execution_command_response.v4'
     || envelope.command !== 'read_manual_handover' || envelope.ok !== true) {
     return fail(path, 'a successful manual availability response');
   }
@@ -2090,8 +2104,8 @@ export function parseProgramNodeCorrectionPreview(
     'preview',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_node_correction_preview.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.program_node_correction_preview.v1');
+  if (schemaVersion !== 'manyforge.program_node_correction_preview.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.program_node_correction_preview.v2');
   }
   const proposedPaths = stringArrayAt(record.proposed_paths, `${path}.proposed_paths`);
   if (
@@ -2111,18 +2125,10 @@ export function parseProgramNodeCorrectionPreview(
   let target: ProgramNodeCorrectionPreview['target'] = null;
   if (record.target !== null) {
     const row = objectAt(record.target, `${path}.target`);
-    exactKeysAt(row, [
-      'target_role_id', 'component_role_id', 'controllable_component_id',
-      'command_target_id',
-    ], `${path}.target`);
+    exactKeysAt(row, ['component_id', 'command_target_id'], `${path}.target`);
     target = {
-      targetRoleId: stringAt(row.target_role_id, `${path}.target.target_role_id`),
-      componentRoleId: stringAt(row.component_role_id, `${path}.target.component_role_id`),
-      controllableComponentId: stringAt(
-        row.controllable_component_id,
-        `${path}.target.controllable_component_id`,
-      ),
-      commandTargetId: stringAt(row.command_target_id, `${path}.target.command_target_id`),
+      componentId: nonEmptyStringAt(row.component_id, `${path}.target.component_id`),
+      commandTargetId: nonEmptyStringAt(row.command_target_id, `${path}.target.command_target_id`),
     };
   }
   let unavailableReason: ProgramNodeCorrectionPreview['unavailableReason'] = null;
@@ -2147,9 +2153,13 @@ export function parseProgramNodeCorrectionPreview(
         receipt.requestId !== request.request_id
         || receipt.programRunId !== request.program_run_id
         || receipt.programBindingId !== request.program_binding_id
+        || receipt.programId !== request.program_id
+        || receipt.programRevision !== request.program_revision
+        || receipt.retainedBundleId !== record.retained_bundle_id
+        || receipt.graphRevision !== record.graph_revision
         || target === null
-        || receipt.componentRoleId !== target.componentRoleId
-        || receipt.targetRoleId !== target.targetRoleId
+        || receipt.target.componentId !== target.componentId
+        || receipt.target.commandTargetId !== target.commandTargetId
       ) {
         return fail(`${path}.preview`, 'a receipt for the previewed node target');
       }
@@ -2193,6 +2203,131 @@ export function parseProgramNodeCorrectionPreview(
   };
 }
 
+/** Parse display-only path data without granting receipt or approval authority. */
+export function parseMotionPreviewPath(value: unknown, diagnostic = false): MotionPreviewPath {
+  const path = 'motionPreview.path';
+  const record = objectAt(value, path);
+  exactKeysAt(record, diagnostic ? ['schema_version', 'kind', 'reason', 'source_joint_names', 'pairs', 'samples'] : ['source_joint_names', 'pairs', 'samples'], path);
+  let kind: MotionPreviewPath['kind'];
+  let reason: string | undefined;
+  if (diagnostic) {
+    if (record.schema_version !== 'manyforge.motion_preview_diagnostic.v2') return fail(path, 'diagnostic v2');
+    if (record.kind !== 'validated_path' && record.kind !== 'collision_disabled_path'
+        && record.kind !== 'collision_disabled_ik_pose' && record.kind !== 'collision_disabled_ik_path') return fail(path, 'known diagnostic kind');
+    kind = record.kind;
+    reason = nonEmptyStringAt(record.reason, `${path}.reason`);
+  }
+  const sourceJointNames = stringArrayAt(record.source_joint_names, `${path}.source_joint_names`);
+  if (!sourceJointNames.length || sourceJointNames.length > 256
+      || sourceJointNames.some((name) => !name)
+      || new Set(sourceJointNames).size !== sourceJointNames.length) {
+    return fail(`${path}.source_joint_names`, '1 to 256 unique nonempty names');
+  }
+  const pairs = boundedArrayAt(record.pairs, `${path}.pairs`, 64).map((item, index) => {
+    const itemPath = `${path}.pairs[${index}]`;
+    const pair = objectAt(item, itemPath);
+    exactKeysAt(pair, ['body_a', 'body_b'], itemPath);
+    const bodyA = nonEmptyStringAt(pair.body_a, `${itemPath}.body_a`);
+    const bodyB = nonEmptyStringAt(pair.body_b, `${itemPath}.body_b`);
+    const bytesA = new TextEncoder().encode(bodyA);
+    const bytesB = new TextEncoder().encode(bodyB);
+    const compare = bytesA.findIndex((byte, i) => i >= bytesB.length || byte !== bytesB[i]);
+    if ([bodyA, bodyB].some((body) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(body))
+        || (compare < 0 ? bytesA.length >= bytesB.length : bytesA[compare] >= (bytesB[compare] ?? -1))) {
+      return fail(itemPath, 'valid UTF-8 canonical distinct body identities');
+    }
+    return { bodyA, bodyB };
+  });
+  if (pairs.length > 64 || new Set(pairs.map(({ bodyA, bodyB }) => JSON.stringify([bodyA, bodyB]))).size !== pairs.length) {
+    return fail(`${path}.pairs`, 'at most 64 unique canonical pairs');
+  }
+  if (diagnostic) {
+    const compareUtf8 = (a: string, b: string): number => {
+      const left = new TextEncoder().encode(a); const right = new TextEncoder().encode(b);
+      for (let i = 0; i < Math.min(left.length, right.length); i += 1) {
+        if (left[i] !== right[i]) return left[i] - right[i];
+      }
+      return left.length - right.length;
+    };
+    if (pairs.some((pair, i) => i > 0 && (compareUtf8(pairs[i - 1].bodyA, pair.bodyA) > 0
+      || (pairs[i - 1].bodyA === pair.bodyA && compareUtf8(pairs[i - 1].bodyB, pair.bodyB) >= 0)))) {
+      return fail(`${path}.pairs`, 'sorted unique canonical pairs');
+    }
+  }
+  const samples = boundedArrayAt(record.samples, `${path}.samples`, 32).map((item, index): MotionPreviewPath['samples'][number] => {
+    const itemPath = `${path}.samples[${index}]`;
+    const sample = objectAt(item, itemPath);
+    exactKeysAt(sample, diagnostic ? ['time_from_start_s', 'positions_rad', 'contacts', 'status', 'clearance_violations'] : ['time_from_start_s', 'positions_rad', 'contacts', 'status'], itemPath);
+    const timeFromStartS = numberAt(sample.time_from_start_s, `${itemPath}.time_from_start_s`);
+    const positionsRad = boundedArrayAt(sample.positions_rad, `${itemPath}.positions_rad`, 256)
+      .map((position, i) => numberAt(position, `${itemPath}.positions_rad[${i}]`));
+    if (timeFromStartS < 0 || positionsRad.length !== sourceJointNames.length) {
+      return fail(itemPath, 'nonnegative time and positions matching the joint names');
+    }
+    const contacts = boundedArrayAt(sample.contacts, `${itemPath}.contacts`, pairs.length).map((contactValue, i): MotionPreviewPath['samples'][number]['contacts'][number] => {
+      const contactPath = `${itemPath}.contacts[${i}]`;
+      const contact = objectAt(contactValue, contactPath);
+      exactKeysAt(contact, ['pair_index', 'disposition'], contactPath);
+      const pairIndex = integerAt(contact.pair_index, `${contactPath}.pair_index`);
+      const disposition = stringAt(contact.disposition, `${contactPath}.disposition`);
+      if (pairIndex < 0 || pairIndex >= pairs.length) return fail(contactPath, 'valid pair index');
+      if (disposition !== 'allowed' && disposition !== 'refused' && disposition !== 'unknown') {
+        return fail(contactPath, 'allowed, refused or unknown');
+      }
+      return { pairIndex, disposition };
+    });
+    if (new Set(contacts.map((contact) => contact.pairIndex)).size !== contacts.length) {
+      return fail(`${itemPath}.contacts`, 'unique pair indices');
+    }
+    const status = stringAt(sample.status, `${itemPath}.status`);
+    if (status !== 'checked' && status !== 'unknown') return fail(`${itemPath}.status`, 'checked or unknown');
+    const clearanceViolations = diagnostic ? boundedArrayAt(sample.clearance_violations, `${itemPath}.clearance_violations`, pairs.length).map((value, i) => {
+      const violationPath = `${itemPath}.clearance_violations[${i}]`;
+      const violation = objectAt(value, violationPath);
+      exactKeysAt(violation, ['pair_index', 'distance_m', 'required_clearance_m'], violationPath);
+      const pairIndex = integerAt(violation.pair_index, `${violationPath}.pair_index`);
+      const distanceM = numberAt(violation.distance_m, `${violationPath}.distance_m`);
+      const requiredClearanceM = numberAt(violation.required_clearance_m, `${violationPath}.required_clearance_m`);
+      if (pairIndex < 0 || pairIndex >= pairs.length || !(distanceM > 0 && distanceM < requiredClearanceM)) return fail(violationPath, 'valid pair and positive distance below clearance');
+      return { pairIndex, distanceM, requiredClearanceM };
+    }) : undefined;
+    if (clearanceViolations && new Set(clearanceViolations.map((v) => v.pairIndex)).size !== clearanceViolations.length) return fail(itemPath, 'unique clearance pair indices');
+    return { timeFromStartS, positionsRad, contacts, status, ...(diagnostic ? { clearanceViolations } : {}) };
+  });
+  if (!samples.length || samples.length > 32
+      || samples.some((sample, index) => index > 0 && sample.timeFromStartS <= samples[index - 1].timeFromStartS)) {
+    return fail(`${path}.samples`, '1 to 32 time-ordered samples');
+  }
+  if (kind === 'collision_disabled_ik_pose' && samples.length !== 1) return fail(path, 'one IK pose sample');
+  if (kind === 'collision_disabled_ik_path' && samples.length < 2) return fail(path, '2 to 32 IK path samples');
+  return { sourceJointNames, pairs, samples, ...(diagnostic ? { schemaVersion: 'manyforge.motion_preview_diagnostic.v2' as const, kind, reason } : {}) };
+}
+
+/** Optional refusal evidence is never an approval receipt. Malformed evidence is omitted. */
+export function parseMotionPreviewDiagnostic(value: unknown): MotionPreviewPath | null {
+  try {
+    if (new TextEncoder().encode(JSON.stringify(value)).length > 48 * 1024) return null;
+    const envelope = objectAt(value, 'motionPreviewFailure');
+    exactKeysAt(envelope, ['detail'], 'motionPreviewFailure');
+    const detail = objectAt(envelope.detail, 'motionPreviewFailure.detail');
+    allowedKeysAt(detail, ['code', 'message', 'details', 'diagnostic_preview'], ['producer', 'request_id'], 'motionPreviewFailure.detail');
+    nonEmptyStringAt(detail.code, 'motionPreviewFailure.detail.code');
+    stringAt(detail.message, 'motionPreviewFailure.detail.message');
+    if (detail.details !== null) objectAt(detail.details, 'motionPreviewFailure.detail.details');
+    if (detail.producer !== undefined) nonEmptyStringAt(detail.producer, 'motionPreviewFailure.detail.producer');
+    if (detail.request_id !== undefined) nonEmptyStringAt(detail.request_id, 'motionPreviewFailure.detail.request_id');
+    const containsAuthority = (item: unknown): boolean => {
+      if (Array.isArray(item)) return item.some(containsAuthority);
+      if (item === null || typeof item !== 'object') return false;
+      return Object.entries(item).some(([key, nested]) => /token|receipt|digest/i.test(key) || containsAuthority(nested));
+    };
+    if (containsAuthority(detail.details)) return null;
+    return parseMotionPreviewPath(detail.diagnostic_preview, true);
+  } catch {
+    return null;
+  }
+}
+
 export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt {
   const envelope = objectAt(value, 'motionPreview');
   if (
@@ -2205,10 +2340,14 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     envelope.preview_receipt,
     'motionPreview.preview_receipt',
   );
+  const schemaVersion = stringAt(receipt.schema_version, 'motionPreview.preview_receipt.schema_version');
+  if (schemaVersion !== 'manyforge.direct_control_motion_preview.v4') {
+    return fail('motionPreview.preview_receipt.schema_version', 'v4 motion preview');
+  }
   exactKeysAt(receipt, [
+    'path_preview',
     'collision_world_revision',
     'commit_eligible',
-    'component_role_id',
     'final_positions_rad',
     'final_tcp_pose',
     'graph_revision',
@@ -2220,22 +2359,27 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     'receipt_digest',
     'request_id',
     'request_owner_epoch',
+    'resolved_tcp',
     'required_capability_id',
     'retained_bundle_id',
     'scene_revision',
     'schema_version',
     'source_joint_names',
     'start_positions_rad',
-    'target_role_id',
+    'target',
   ], 'motionPreview.preview_receipt');
-  const schemaVersion = stringAt(
-    receipt.schema_version,
-    'motionPreview.preview_receipt.schema_version',
+  const requestOwnerEpoch = stringAt(
+    receipt.request_owner_epoch,
+    'motionPreview.preview_receipt.request_owner_epoch',
   );
-  if (schemaVersion !== 'manyforge.direct_control_motion_preview.v1') {
+  const resolvedTcp = motionPreviewResolvedTcpAt(
+    receipt.resolved_tcp,
+    'motionPreview.preview_receipt.resolved_tcp',
+  );
+  if (resolvedTcp.ownerEpoch !== requestOwnerEpoch) {
     return fail(
-      'motionPreview.preview_receipt.schema_version',
-      'manyforge.direct_control_motion_preview.v1',
+      'motionPreview.preview_receipt.resolved_tcp.owner_epoch',
+      'the same owner epoch as the motion preview receipt',
     );
   }
   const sourceJointNames = stringArrayAt(
@@ -2266,6 +2410,11 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       'motionPreview.preview_receipt',
       'equal non-empty unique joint arrays',
     );
+  }
+  const pathPreview = parseMotionPreviewPath(receipt.path_preview);
+  if (pathPreview !== undefined && (pathPreview.sourceJointNames.length !== sourceJointNames.length
+      || pathPreview.sourceJointNames.some((name, index) => name !== sourceJointNames[index]))) {
+    return fail('motionPreview.preview_receipt.path_preview', 'matching source joint identities');
   }
   const collision = objectAt(
     receipt.collision_world_revision,
@@ -2302,6 +2451,7 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
   }
   return {
     schemaVersion,
+    pathPreview,
     receiptDigest: stringAt(
       receipt.receipt_digest,
       'motionPreview.preview_receipt.receipt_digest',
@@ -2314,10 +2464,7 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       receipt.request_id,
       'motionPreview.preview_receipt.request_id',
     ),
-    requestOwnerEpoch: stringAt(
-      receipt.request_owner_epoch,
-      'motionPreview.preview_receipt.request_owner_epoch',
-    ),
+    requestOwnerEpoch,
     programId: stringAt(
       receipt.program_id,
       'motionPreview.preview_receipt.program_id',
@@ -2346,14 +2493,15 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       receipt.scene_revision,
       'motionPreview.preview_receipt.scene_revision',
     ),
-    componentRoleId: stringAt(
-      receipt.component_role_id,
-      'motionPreview.preview_receipt.component_role_id',
-    ),
-    targetRoleId: stringAt(
-      receipt.target_role_id,
-      'motionPreview.preview_receipt.target_role_id',
-    ),
+    target: (() => {
+      const target = objectAt(receipt.target, 'motionPreview.preview_receipt.target');
+      exactKeysAt(target, ['component_id', 'command_target_id'], 'motionPreview.preview_receipt.target');
+      return {
+        componentId: nonEmptyStringAt(target.component_id, 'motionPreview.preview_receipt.target.component_id'),
+        commandTargetId: nonEmptyStringAt(target.command_target_id, 'motionPreview.preview_receipt.target.command_target_id'),
+      };
+    })(),
+    resolvedTcp,
     requiredCapabilityId: stringAt(
       receipt.required_capability_id,
       'motionPreview.preview_receipt.required_capability_id',
@@ -2400,7 +2548,6 @@ export function parseCapabilityCommandPreviewResponse(
     'command_schema_id',
     'command_schema_revision',
     'commit_eligible',
-    'component_role_id',
     'coordinate_kind',
     'graph_revision',
     'intent_digest',
@@ -2419,7 +2566,7 @@ export function parseCapabilityCommandPreviewResponse(
     'source_coordinate_name',
     'source_kind',
     'target_position',
-    'target_role_id',
+    'target',
   ], 'capabilityCommandPreview.preview_receipt');
   const schemaVersion = stringAt(
     receipt.schema_version,
@@ -2427,11 +2574,11 @@ export function parseCapabilityCommandPreviewResponse(
   );
   if (
     schemaVersion
-    !== 'manyforge.direct_control_capability_command_preview.v1'
+    !== 'manyforge.direct_control_capability_command_preview.v2'
   ) {
     return fail(
       'capabilityCommandPreview.preview_receipt.schema_version',
-      'manyforge.direct_control_capability_command_preview.v1',
+      'manyforge.direct_control_capability_command_preview.v2',
     );
   }
   const coordinateKind = stringAt(
@@ -2526,14 +2673,14 @@ export function parseCapabilityCommandPreviewResponse(
       receipt.retained_bundle_id,
       'capabilityCommandPreview.preview_receipt.retained_bundle_id',
     ),
-    componentRoleId: stringAt(
-      receipt.component_role_id,
-      'capabilityCommandPreview.preview_receipt.component_role_id',
-    ),
-    targetRoleId: stringAt(
-      receipt.target_role_id,
-      'capabilityCommandPreview.preview_receipt.target_role_id',
-    ),
+    target: (() => {
+      const target = objectAt(receipt.target, 'capabilityCommandPreview.preview_receipt.target');
+      exactKeysAt(target, ['component_id', 'command_target_id'], 'capabilityCommandPreview.preview_receipt.target');
+      return {
+        componentId: nonEmptyStringAt(target.component_id, 'capabilityCommandPreview.preview_receipt.target.component_id'),
+        commandTargetId: nonEmptyStringAt(target.command_target_id, 'capabilityCommandPreview.preview_receipt.target.command_target_id'),
+      };
+    })(),
     requiredCapabilityId: stringAt(
       receipt.required_capability_id,
       'capabilityCommandPreview.preview_receipt.required_capability_id',
@@ -2674,8 +2821,6 @@ export function parseOperationObservation(value: unknown): OperationObservation 
         'operationObservation.operation.active_stop_generation',
     ),
     terminalError,
-    componentRoleId: optionalParticipantText('component_role_id'),
-    targetRoleId: optionalParticipantText('target_role_id'),
     controllableComponentId: optionalParticipantText('controllable_component_id'),
     commandTargetId: optionalParticipantText('command_target_id'),
   };

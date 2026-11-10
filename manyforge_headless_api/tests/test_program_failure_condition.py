@@ -115,7 +115,7 @@ def _cycle(
     )
     failed = run_state != "running"
     run = {
-        "schema_version": "manyforge.program_run_status.v3",
+        "schema_version": "manyforge.program_run_status.v4",
         "owner_id": "runner",
         "owner_epoch": epoch,
         "run_revision": run_revision,
@@ -584,7 +584,7 @@ def test_malformed_operation_provenance_is_refused_as_a_bad_source(
 def test_raw_co_participant_facts_never_suppress_the_selected_failure(
     source_and_observer, facts
 ) -> None:
-    # SX-1985: every participant's raw terminal fact is kept; a co-participant
+    # Every participant's raw terminal fact is kept; a co-participant
     # that succeeded or ended differently does not hide the selected cause.
     source, observer = source_and_observer
     _accept(source, _cycle(control=5, run_state="failed", rows=[_failure_row(facts=facts)]))

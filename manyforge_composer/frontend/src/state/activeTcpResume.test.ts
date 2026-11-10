@@ -3,28 +3,32 @@ import type { ProgramBindingDocument } from '../types/programBindingTransport.ge
 import type { ExecutionOwnerStatus } from '../types/robotControl';
 import { ActiveTcpHoldHistory, activeTcpSnapshot } from './activeTcpResume';
 
-const binding = { target_role_bindings: [
-  { controllable_component_id: 'robot-a', command_target_id: 'arm', robot_tcps: [] },
-  { controllable_component_id: 'robot-b', command_target_id: 'arm', robot_tcps: [] },
-  { controllable_component_id: 'tool', command_target_id: 'gripper' },
+const binding = { target_bindings: [
+  { target: { component_id: 'robot-a', command_target_id: 'arm' }, robot_tcps: [] },
+  { target: { component_id: 'robot-b', command_target_id: 'arm' }, robot_tcps: [] },
+  { target: { component_id: 'tool', command_target_id: 'gripper' } },
 ] } as unknown as ProgramBindingDocument;
 
-function status(a: string | null | undefined, b: string | null | undefined): ExecutionOwnerStatus {
+function status(a: string | null | undefined, b: string | null | undefined,
+  frameComponentA = 'robot-a', frameComponentB = 'robot-b'): ExecutionOwnerStatus {
   return {
     ownerEpoch: 'owner', graphRevision: 'graph', retainedBundleId: 'bundle',
     directControlTargets: [['robot-a', a], ['robot-b', b]].map(([robot, role]) => ({
       controllableComponentId: robot, commandTargetId: 'arm',
       operationCapabilityId: 'execution.trajectory.execute',
       activeTcp: role === undefined ? null : { entry: role === null ? null : {
-        componentId: robot, targetId: 'arm', frameRoleId: role,
-      }, display: role === null ? null : `${robot}.${role}`, ownerEpoch: 'owner',
+        componentId: robot, targetId: 'arm',
+        frameComponentId: robot === 'robot-a' ? frameComponentA : frameComponentB,
+        frameRoleId: role,
+      }, display: role === null ? null : `${robot === 'robot-a' ? frameComponentA : frameComponentB}.${role}`, ownerEpoch: 'owner',
       registrationGeneration: 1, sequence: 1 },
     })),
   } as unknown as ExecutionOwnerStatus;
 }
 
-const snap = (a: string | null | undefined, b: string | null | undefined) => (
-  activeTcpSnapshot(binding, status(a, b), 'graph', 'bundle')
+const snap = (a: string | null | undefined, b: string | null | undefined,
+  frameComponentA?: string, frameComponentB?: string) => (
+  activeTcpSnapshot(binding, status(a, b, frameComponentA, frameComponentB), 'graph', 'bundle')
 );
 
 describe('held-run Active TCP history', () => {
@@ -110,5 +114,17 @@ describe('held-run Active TCP history', () => {
     ]);
     const invalid = activeTcpSnapshot(binding, status('one', 'one'), 'other-graph', 'bundle');
     expect(history.changes('full', invalid)).toEqual([]);
+  });
+
+  it('distinguishes equal frame IDs owned by different components', () => {
+    const history = new ActiveTcpHoldHistory();
+    const baseline = snap('shared', 'shared', 'frame-owner-a', 'frame-owner-b');
+    history.observe('run', [], baseline);
+    history.observe('run', ['group:a'], baseline);
+
+    expect(history.changes('group:a', baseline)).toEqual([]);
+    expect(history.changes('group:a', snap('shared', 'shared', 'frame-owner-b', 'frame-owner-b'))).toEqual([
+      { robot: 'robot-a', oldDisplay: 'frame-owner-a.shared', newDisplay: 'frame-owner-b.shared' },
+    ]);
   });
 });

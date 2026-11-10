@@ -12,9 +12,11 @@ namespace manyforge::roboplan_backend {
 /// What a ros2_control component's controller manager and controllers report
 /// right now (ROS-free; `RetainedRos2ControlRuntimeHandle::ReadObservation`
 /// fills it). Nothing here is inferred by ManyForge: it is the controller's
-/// own report (plan, "What each adapter does", ros2_control).
+/// own report.
 struct Ros2ControlObservation final {
-  /// The component's launch exited, or its ROS executor failed (Q80).
+  /// The exact owner and task of a latched ROS owner stall, if any.
+  std::optional<std::string> owner_stalled;
+  /// The component's launch exited, or its ROS executor failed.
   std::optional<std::string> process_fault;
   /// A lane guard's fault awaiting Recover (the Isaac command-age guard).
   std::optional<std::string> guard_fault;
@@ -36,6 +38,8 @@ struct Ros2ControlObservation final {
   bool local_owner_enabled{};
   /// The controller reports a goal (or a gripper command) not yet finished.
   bool goal_running{};
+  /// An exact goal's required late cancellation could not be scheduled.
+  bool goal_outcome_unknown{};
   /// The last goal was cancelled and the controller's reference still moves
   /// (JTC reports a cancelled goal finished before it brakes).
   bool decelerating{};
@@ -55,11 +59,11 @@ struct Ros2ControlObservation final {
   bool simulated{};
 };
 
-/// CONTRACTS §1 from one observation, in order:
+/// The component state from one observation, in order:
 /// - an exited launch is `fault` (`fault_process_exited`);
 /// - a guard or tool-context fault is `fault`, cleared by Recover;
 /// - a stale own stream is `fault` (`fault_stream_stale`), except in a
-///   simulator (SIM-1);
+///   simulator;
 /// - an unreachable controller manager is `offline`;
 /// - the controller active on active hardware is `enabled`; loaded on active
 ///   hardware `prepared`; otherwise `not_prepared`;

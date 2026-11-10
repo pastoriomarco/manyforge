@@ -22,7 +22,7 @@ if [[ "${TSAN_OPTIONS}" != *"suppressions="* ]]; then
 fi
 export TSAN_OPTIONS
 
-sanitizer_flags="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=array-bounds"
+sanitizer_flags="-fsanitize=thread -fno-omit-frame-pointer -g"
 
 run_package() {
   local package="$1"

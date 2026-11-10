@@ -124,7 +124,7 @@ COPY third_party/roboplan/ /tmp/roboplan-manifest/
 COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
 COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
-COPY verification/composable_cell_e1/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
+COPY third_party/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
 RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname $(dirname $(dirname $PINOCCHIO_CMAKE_DIR))) \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \

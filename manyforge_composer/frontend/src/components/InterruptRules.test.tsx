@@ -6,10 +6,8 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { BlackboardKeyDeclaration, JsonValue } from '../types/api';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
 import type { ConditionOperandChoice } from '../utils/interruptAuthoring';
-import { globalRuleChoices } from '../utils/interruptAuthoring';
+import { globalRuleChoices, STOP_STAGES_UNAVAILABLE_HINT } from '../utils/interruptAuthoring';
 import {
-  draftCarriedObjectLostSignals,
-  resolveCarriedObjectLostSignalChoices,
   type CarriedObjectLostSignalChoice,
 } from '../utils/systemSignalAuthoring';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
@@ -22,9 +20,9 @@ const choice = (key: string, valueType: ConditionOperandChoice['valueType'], val
   id: JSON.stringify({ key }), operand: { key }, label: key, key, valueType, ...(values ? { values } : {}),
 });
 const signal: ConditionOperandChoice = {
-  id: JSON.stringify({ signal: { resource_role: 'part_present', target_role: 'arm' } }),
-  operand: { signal: { target_role: 'arm', resource_role: 'part_present' } },
-  label: 'arm · part_present', key: '', valueType: 'bool',
+  id: JSON.stringify({ signal: { component_id: 'station', signal_name: 'part_present' } }),
+  operand: { signal: { component_id: 'station', signal_name: 'part_present' } },
+  label: 'station · part_present', key: '', valueType: 'bool',
 };
 const choices = [signal, choice('cell.count', 'int64'), choice('node_outcome.seek', 'string', ['completed', 'signal_trip'])];
 
@@ -89,11 +87,11 @@ describe('InterruptConditionEditor', () => {
       disabled={false} onCommit={vi.fn()} onInvalidChange={onInvalid} />);
     try {
       expect(options(mounted.control('condition operand'))[0]).toBe('');
-      expect(onInvalid).toHaveBeenLastCalledWith(expect.stringContaining('not a bound'));
+      expect(onInvalid).toHaveBeenLastCalledWith(expect.stringContaining('{"key":"gone"} is not a candidate signal or a declared scalar key'));
     } finally { await mounted.unmount(); }
   });
 
-  it('hints when a != node outcome test is not guarded against none (contract 105)', async () => {
+  it('hints when a != node outcome test is not guarded against none', async () => {
     const outcome = choice('node_outcome.pick', 'string', ['completed', 'failed', 'none']);
     const notCompleted = { compare: { operand: outcome.operand, op: '!=', value: 'completed' } };
     const hinted = await render(<InterruptConditionEditor label="c" value={notCompleted} choices={[outcome]}
@@ -111,14 +109,14 @@ describe('InterruptConditionEditor', () => {
 });
 
 describe('StopStagePicker', () => {
-  it('shows the three stage labels as available after Apply and never invents an id', async () => {
+  it('shows the three stage labels as unavailable until qualified and never invents an id', async () => {
     const onChange = vi.fn();
     const mounted = await render(<StopStagePicker label="Stop entry stage" value="software_hard" stages={null}
       omittedLabel="First" disabled={false} onChange={onChange} />);
     try {
       const labels = mounted.all((props) => props['aria-disabled'] === 'true').map((props) => props.children);
       expect(labels).toEqual(['Controlled stop (incl. spring-back)', 'Controller goal cancel', 'Software hard stop']);
-      expect(mounted.all((props) => typeof props.children === 'string' && props.children.includes('available after Apply')))
+      expect(mounted.all((props) => typeof props.children === 'string' && props.children === STOP_STAGES_UNAVAILABLE_HINT))
         .toHaveLength(1);
       await mounted.click('Clear');
       expect(onChange).toHaveBeenCalledWith(undefined);
@@ -206,7 +204,7 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
       rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
     }] }, ['right', 'left']);
     try {
-      // A stored row without on_trip shows stop, and any edit writes it (CONTRACTS §8).
+      // A stored row without on_trip shows stop, and any edit writes it.
       expect(edited.control('part_lost on trip').value).toBe('stop');
       // Until the backend reports the effective values the select shows "default".
       expect(edited.control('part_lost after stop').value).toBe('');
@@ -216,7 +214,7 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
         rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
         after_stop: 'fail_node', on_trip: 'stop',
       }]);
-      // Contract 73: execution groups come from the Applied Program; or `everything`.
+      // Execution groups come from the Applied Program; or `everything`.
       await edited.type('part_lost scope', 'execution_groups');
       expect((edited.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2][0].scope)
         .toEqual({ execution_groups: ['left'] });
@@ -255,98 +253,38 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('keeps last-Apply choices across Draft edits and hides rows from a stale owner', async () => {
-    const systemSignal = {
-      controllableComponentId: 'robot', commandTargetId: 'gripper',
-      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
-      direction: 'input', valueType: 'bool',
-    } as const;
-    const appliedOwner = { graphRevision: 'graph.1', retainedBundleId: 'bundle.1' };
-    const appliedRows = [systemSignal];
-    const initialDraft = {
-      api_version: 'manyforge.deployment_intent.v2', components: [station], attachments: [], policies: {},
-    } as unknown as Record<string, JsonValue>;
-    const initial = resolveCarriedObjectLostSignalChoices(
-      draftCarriedObjectLostSignals(initialDraft), appliedRows,
-      'manyforge.deployment_intent.v2', true, appliedOwner, appliedOwner,
-    );
-    const mounted = await mountDeployment({}, null, [], initial.choices, initial.needApply);
+  it('uses the exact qualified candidate system signal', async () => {
+    const signal = { controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', direction: 'input', valueType: 'bool' } as const;
+    const mounted = await mountDeployment({}, null, [], [signal], false);
     try {
       await mounted.click('Add global rule');
       const created = (mounted.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2] as JsonValue[];
       expect(created).toHaveLength(1);
-      const workspace = mounted.controller.workspace;
-      if (workspace === null) throw new Error('Deployment test workspace is missing.');
-      const changedDraft = {
-        ...initialDraft,
-        policies: { interrupt_rules: created },
-      };
-      (workspace as unknown as { draft: { document: Record<string, JsonValue> | null } }).draft.document = changedDraft;
-      const changed = resolveCarriedObjectLostSignalChoices(
-        draftCarriedObjectLostSignals(changedDraft), appliedRows,
-        'manyforge.deployment_intent.v2', false, appliedOwner, appliedOwner,
-      );
-      expect(changed.needApply).toBe(false);
-      await mounted.rerenderSignals(changed.choices, changed.needApply);
-
-      const optionId = JSON.stringify({ signal: {
-        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
-      } });
-      const labels = mounted.all((props) => typeof props['aria-label'] === 'string')
-        .map((props) => String(props['aria-label']));
-      expect(labels).toContain('condition operand');
-      const renderedAppliedOption = mounted.all((props) => props.value === optionId
-        && typeof props.children === 'string');
-      expect(renderedAppliedOption).toHaveLength(1);
-      expect(renderedAppliedOption[0].children).toContain('from last Apply');
-      const displayedChoice = globalRuleChoices(
-        changedDraft,
-        [],
-        created[0] !== null && typeof created[0] === 'object' && !Array.isArray(created[0])
-          ? created[0].condition : undefined,
-        changed.choices,
-      ).find((item) => item.id === optionId);
-      expect(displayedChoice?.label).toContain('from last Apply');
-      // The mounted select's handler only commits values from its current choices.
-      // Selecting the applied candidate here verifies the full add/edit path.
-      await mounted.type('condition operand', optionId);
+      // The Draft now holds the created rule; render it with the same candidate signal.
+      const draft = (mounted.controller.workspace as unknown as { draft: { document: Record<string, JsonValue> } }).draft;
+      draft.document = { ...draft.document, policies: { interrupt_rules: created } };
+      await mounted.rerenderSignals([signal], false);
+      const id = JSON.stringify({ signal: { controllable_component_id: 'robot', signal_name: signal.signalName } });
+      // The option renders its label plus an (empty) reason suffix.
+      expect(mounted.all((props) => props.value === id && Array.isArray(props.children)
+        && props.children.join('') === 'robot · carried_object_lost.gripper (input)')).toHaveLength(1);
+      await mounted.type('condition operand', id);
       const rules = (mounted.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2] as JsonValue[];
-      expect((rules[0] as { condition: { compare: { operand: JsonValue } } }).condition.compare.operand).toEqual({ signal: {
-        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
-      } });
+      expect((rules[0] as { condition: { compare: { operand: JsonValue } } }).condition.compare.operand)
+        .toEqual({ signal: { controllable_component_id: 'robot', signal_name: signal.signalName } });
     } finally { await mounted.unmount(); }
-
-    const changedDraft = {
-      api_version: 'manyforge.deployment_intent.v2', components: [station], attachments: [], policies: {},
-    } as unknown as Record<string, JsonValue>;
-    const staleOwner = resolveCarriedObjectLostSignalChoices(
-      draftCarriedObjectLostSignals(changedDraft), appliedRows,
-      'manyforge.deployment_intent.v2', false,
-      { graphRevision: 'graph.2', retainedBundleId: 'bundle.1' }, appliedOwner,
-    );
-    expect(staleOwner).toEqual({ choices: [], needApply: true });
-    const stale = await mountDeployment({}, null, [], staleOwner.choices, staleOwner.needApply);
-    try {
-      await stale.click('Add global rule');
-      const optionId = JSON.stringify({ signal: {
-        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
-      } });
-      expect(stale.all((props) => props.value === optionId
-        && typeof props.children === 'string')).toHaveLength(0);
-      expect(stale.all((props) => typeof props.children === 'string'
-        && props.children.includes('Apply to list system signals.'))).toHaveLength(1);
-    } finally { await stale.unmount(); }
   });
 
   it('shows the Apply hint when system signals cannot be derived from this Draft', async () => {
     const mounted = await mountDeployment({}, null, [], [], true);
     try {
       expect(mounted.all((props) => typeof props.children === 'string'
-        && props.children.includes('Apply to list system signals.'))).toHaveLength(1);
+        && props.children.includes('Qualified Draft system signals are unavailable.'))).toHaveLength(1);
     } finally { await mounted.unmount(); }
   });
 
-  it('shows the effective after-Stop and active-at-start values and resets them to default (CONTRACTS §11)', async () => {
+  it('shows the effective after-Stop and active-at-start values and resets them to default', async () => {
     const effective = vi.spyOn(api.cellApply, 'effective').mockResolvedValue({ fields: {
       'policies.interrupt_rules.0.after_stop': { value: 'fail_node', default: 'hold', set: true },
       'policies.interrupt_rules.0.active_at_start': { value: false, default: false, set: false },
@@ -467,7 +405,7 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     } finally { await grouped.unmount(); }
   });
 
-  it('flags a global rule reading a key without initial (contract 87)', async () => {
+  it('flags a global rule reading a key without initial', async () => {
     const keyRule = (key: string) => ({ rule_id: 'armed', scope: 'all_motion',
       condition: { compare: { operand: { key }, op: '==', value: true } } });
     const keys = [
@@ -559,7 +497,7 @@ describe('Deployment motion takeover timing', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('shows the planning budget default the backend reports (CONTRACTS §11)', async () => {
+  it('shows the planning budget default the backend reports', async () => {
     const effective = vi.spyOn(api.cellApply, 'effective').mockResolvedValue({ fields: {
       'policies.motion_takeover_planning_budget_s': { value: 0.4, default: 0.4, set: false },
     } });

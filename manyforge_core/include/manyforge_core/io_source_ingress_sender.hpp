@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace manyforge::core {
@@ -45,16 +46,20 @@ struct IoSourceIngressAcquisitionReceipt final {
 /// selected callbacks before releasing the clock. Ingress may briefly lock.
 class IoSourceIngressSender final {
  public:
-  IoSourceIngressSender(std::shared_ptr<IIoSignalIngress> ingress, IClock& clock,
+  IoSourceIngressSender(std::shared_ptr<IIoSignalIngress> ingress,
+                        std::shared_ptr<IClock> clock,
                         InterruptSourceId source, IoSourceIncarnation incarnation,
                         std::optional<std::uint64_t> prepared_driver_generation = std::nullopt)
       : ingress_(std::move(ingress)),
-        clock_(clock),
+        clock_(std::move(clock)),
         source_(std::move(source)),
         incarnation_(std::move(incarnation)),
         accepting_(!prepared_driver_generation),
         enabled_(!prepared_driver_generation),
-        driver_generation_(prepared_driver_generation.value_or(0U)) {}
+        driver_generation_(prepared_driver_generation.value_or(0U)) {
+    if (!clock_)
+      throw std::invalid_argument("I/O ingress sender requires its shared clock");
+  }
 
   IoSourceIngressAcquisitionReceipt CaptureAcquisition(
       const IoSourceIncarnation& callback_incarnation,
@@ -62,7 +67,7 @@ class IoSourceIngressSender final {
     // The subscription captures its actual owner-issued generation immutably.
     // Even an old buffered callback first entering after Resume cannot adopt
     // the new channel's token. Stamp before decoding or enqueue work.
-    return {clock_.now(), subscription_generation, callback_incarnation};
+    return {clock_->now(), subscription_generation, callback_incarnation};
   }
 
   void Receive(std::vector<IoSignalUpdateDTO> updates, IoSourceIngressAcquisitionReceipt receipt) {
@@ -105,7 +110,7 @@ class IoSourceIngressSender final {
     if (!accepting_ || expected_incarnation != incarnation_ ||
         expected_ingress_source_sequence != ingress_sequence_)
       return false;
-    Lose(IoIngressLossReason::kDisconnected, clock_.now());
+    Lose(IoIngressLossReason::kDisconnected, clock_->now());
     return true;
   }
 
@@ -125,7 +130,7 @@ class IoSourceIngressSender final {
     if (retired_ || !ingress || incarnation.empty() || generation == 0U) return false;
     if (incarnation == incarnation_) return ingress == ingress_ && generation == current;
     if (generation <= current) return false;
-    if (accepting_) Lose(IoIngressLossReason::kDisconnected, clock_.now());
+    if (accepting_) Lose(IoIngressLossReason::kDisconnected, clock_->now());
     ingress_ = std::move(ingress);
     incarnation_ = std::move(incarnation);
     ingress_sequence_ = 0U;
@@ -149,7 +154,7 @@ class IoSourceIngressSender final {
     accepting_ = false;
     enabled_ = false;
     driver_generation_.store(generation, std::memory_order_release);
-    if (was_accepting) Lose(IoIngressLossReason::kDisconnected, clock_.now());
+    if (was_accepting) Lose(IoIngressLossReason::kDisconnected, clock_->now());
     return true;
   }
 
@@ -180,7 +185,7 @@ class IoSourceIngressSender final {
     accepting_ = false;
     enabled_ = false;
     if (was_accepting)
-      Lose(IoIngressLossReason::kDisconnected, clock_.now());
+      Lose(IoIngressLossReason::kDisconnected, clock_->now());
     return true;
   }
 
@@ -189,7 +194,7 @@ class IoSourceIngressSender final {
     retired_ = true;
     enabled_ = false;
     if (!accepting_) return;
-    const auto received_at_ns = clock_.now();
+    const auto received_at_ns = clock_->now();
     accepting_ = false;
     Lose(IoIngressLossReason::kDisconnected, received_at_ns);
   }
@@ -208,7 +213,7 @@ class IoSourceIngressSender final {
   }
 
   std::shared_ptr<IIoSignalIngress> ingress_;
-  IClock& clock_;
+  std::shared_ptr<IClock> clock_;
   const InterruptSourceId source_;
   IoSourceIncarnation incarnation_;
   mutable std::mutex mutex_;

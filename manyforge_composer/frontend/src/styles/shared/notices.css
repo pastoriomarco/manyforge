@@ -1,4 +1,4 @@
-/* shared/notices: one look per message kind and severity (UI6-I-VC VC4).
+/* shared/notices: one look per message kind and severity.
    Approved on frontend/design/shared-looks.html. Surface classes on the same
    element keep only layout (position, grid placement, width).
 
@@ -119,7 +119,7 @@ ul.inline-message {
   line-height: 1.45;
 }
 
-/* A Program run's end reason (CONTRACTS §9): colour is severity only. */
+/* A Program run's end reason: colour is severity only. */
 .run-end.tone-warning {
   color: var(--mf-text-warning-79);
 }

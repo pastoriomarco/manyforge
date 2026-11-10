@@ -159,7 +159,7 @@ struct AssetSpec final {
   std::vector<std::pair<std::string, std::vector<std::string>>> bodies{
       {"arm_collision", {"base_link", "tip_link"}}};
   std::vector<SourceArtifactSpec> source_artifacts{};
-  // TCP-A: frame roles that are offset frames (`pose_in_source_link`).
+  // Frame roles that are offset frames (`pose_in_source_link`).
   std::map<std::string, core::PlacementPoseDTO, std::less<>> frame_offsets{};
 };
 
@@ -516,7 +516,7 @@ struct TypeSpec final {
   std::vector<std::string> accepts_tags{"robot-tool"};
   std::uint64_t max_attachments = 1U;
   std::optional<core::ComponentTypeModelMountDTO> mount{std::nullopt};
-  // TCP-A: the target's `tcp` frame role is a TCP and its default.
+  // The target's `tcp` frame role is a TCP and its default.
   bool tcp_target = false;
   // The target's frame role id (its default TCP with `tcp_target`), and
   // further untagged frame roles {role, asset frame role}.
@@ -774,7 +774,7 @@ struct ModelSpec final {
   std::string instance_id;
   const QualifiedSource* source;
   bool passive = false;
-  // TCP-A: the occurrence's Deployment custom TCPs (graph rows).
+  // The occurrence's Deployment custom TCPs (graph rows).
   std::vector<core::ModelCustomTcpDTO> custom_tcps{};
 };
 
@@ -791,7 +791,7 @@ struct AttachmentSpec final {
   std::string parent_interface;
   std::string child_component;
   std::string child_interface;
-  // B5: the primary tool among several on one parent interface.
+  // The primary tool among several on one parent interface.
   bool primary = false;
   // Authored {child_link, parent_link} pairs that never touch.
   std::vector<std::pair<std::string, std::string>> collision_exclusions{};
@@ -1730,7 +1730,7 @@ TEST(CellStructure,
   EXPECT_EQ(attachment->child_component_id.value(), "tool");
 }
 
-// Merge 6 tool split: the rigid link groups meeting at an attachment mount
+// Tool split: the rigid link groups meeting at an attachment mount
 // (the parent interface link with its fixed neighbours, the child root with
 // its fixed neighbours) get Adjacent disabled-collision pairs; moving links
 // beyond either group do not.
@@ -1935,7 +1935,7 @@ TEST(CellComposition, AttachmentCollisionExclusionsDisableAuthoredPairs) {
   EXPECT_NE(refusal("finger", "finger").find("parent link 'finger'"), std::string::npos);
 }
 
-// TCP-A: a descriptor offset frame and a Deployment custom TCP each compose
+// A descriptor offset frame and a Deployment custom TCP each compose
 // as one generated massless link on one generated fixed joint, so the TCP's
 // frame path is its parent's plus that joint (FK = parent * pose).
 TEST(CellComposition, OffsetFramesAndCustomTcpsComposeAsMasslessFixedLinks) {
@@ -2062,7 +2062,7 @@ TEST(CellComposition, OffsetFramesAndCustomTcpsComposeAsMasslessFixedLinks) {
                CellCompositionError);
 }
 
-// D1 (item 42): a TCP may have any name. A mounted tool whose default TCP is
+// A TCP may have any name. A mounted tool whose default TCP is
 // `cup_center` on a target that is not `gripper` exposes it as `tcp` too, and
 // the robot's `tcp` (Robot Control's default) resolves to it.
 namespace any_tcp {
@@ -2154,9 +2154,9 @@ struct Cell final {
 
 }  // namespace any_tcp
 
-// C-RQ8: every frame has one name. A tool's default TCP named otherwise
+// Every frame has one name. A tool's default TCP named otherwise
 // (`cup_center`, a tool `flange`) gets no `tcp` row, and a robot target's
-// `tcp` is its own frame only: no mounted tool's default stands in (D1 gone).
+// `tcp` is its own frame only: no mounted tool's default stands in.
 TEST(CellComposition, EveryFrameHasOneNameAndNoTcpAlias) {
   const auto cell = any_tcp::make_cell("cup_center");
   const auto graph = any_tcp::mounted_graph(cell);
@@ -2257,7 +2257,7 @@ TEST(CellComposition, TcpIsAnOrdinaryNameNextToAnyDefault) {
   EXPECT_NE(tcp->frame, cup_center->frame);
 }
 
-// B5 (C-P1): two or more tools (components tagged `tool`) on one parent
+// Two or more tools (components tagged `tool`) on one parent
 // interface need exactly one primary, on a tool (`mount_primary_tool_required`);
 // a single tool needs none, and a component without the `tool` tag (a
 // camera) sharing the interface neither needs nor counts as a primary.
@@ -2344,7 +2344,7 @@ TEST(CellStructure, SeveralToolsOnOneInterfaceNeedExactlyOnePrimary) {
       {.with_nozzle = true, .nozzle_primary = true, .with_camera = true, .camera_primary = true}));
 }
 
-// TCP-A: an offset frame role's parent is a source link, never another
+// An offset frame role's parent is a source link, never another
 // offset frame, and its generated link names no existing link.
 TEST(CellStructure, OffsetFrameRolesAreValidatedAgainstTheSource) {
   const core::PlacementPoseDTO pose{{0.0, 0.0, 0.1}, {0.0, 0.0, 0.0, 1.0}};
@@ -2993,7 +2993,7 @@ TEST(CellComposition,
     EXPECT_TRUE(represented_joints.contains(joint.name));
   }
 
-  // Bind this frozen C0.2m aggregate/mixed-vendor witness to the actual
+  // Bind this frozen aggregate/mixed-vendor witness to the actual
   // checked-in Lite6/Lite-gripper and UR10e/Robotiq source closures.
   expect_checked_in_lite6_and_ur_mixed_composition_matrix();
 }

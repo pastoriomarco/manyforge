@@ -1,9 +1,10 @@
-import type { ProgramViewerMetadata } from '../types/api';
+import type { ProgramFrameReference, ProgramViewerMetadata } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 
 export interface ViewerPresentationDraft {
-  frameRoleVisibility: Record<string, boolean>;
-  resourceRoleVisibility: Record<string, boolean>;
+  frameVisibility: { frame: ProgramFrameReference; visible: boolean }[];
+  cellFrameVisible: boolean;
+  sceneResourceVisibility: Record<string, boolean>;
   sceneResourceAxesVisibility: Record<string, boolean>;
   frameGizmoSizeM: number;
   objectAxesGizmoSizeM: number;
@@ -12,15 +13,17 @@ export interface ViewerPresentationDraft {
 }
 
 export type ViewerPresentationDraftAction =
-  | { type: 'set_frame_visibility'; frameId: string; visible: boolean }
-  | { type: 'set_resource_visibility'; resourceRoleId: string; visible: boolean }
+  | { type: 'set_frame_visibility'; frame: ProgramFrameReference; visible: boolean }
+  | { type: 'set_cell_frame_visibility'; visible: boolean }
+  | { type: 'set_resource_visibility'; sceneResourceId: string; visible: boolean }
   | { type: 'set_scene_resource_axes_visibility'; sceneResourceId: string; visible: boolean }
   | { type: 'set_frame_gizmo_size'; sizeM: number }
   | { type: 'set_object_axes_gizmo_size'; sizeM: number };
 
 export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
-  frameRoleVisibility: {},
-  resourceRoleVisibility: {},
+  frameVisibility: [],
+  cellFrameVisible: true,
+  sceneResourceVisibility: {},
   sceneResourceAxesVisibility: {},
   frameGizmoSizeM: 0.1,
   objectAxesGizmoSizeM: 0.1,
@@ -61,16 +64,23 @@ function orderedVisibility(
   visibility: Record<string, boolean>,
 ): Record<string, boolean> {
   return Object.fromEntries(
-    Object.entries(visibility).sort(([left], [right]) => left.localeCompare(right)),
+    Object.entries(visibility).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
   );
+}
+
+function compareFrames(left: ProgramFrameReference, right: ProgramFrameReference): number {
+  if (left.component_id !== right.component_id) return left.component_id < right.component_id ? -1 : 1;
+  if (left.frame_id !== right.frame_id) return left.frame_id < right.frame_id ? -1 : 1;
+  return 0;
 }
 
 export function viewerPresentationDraftFromProgram(
   viewer: ProgramViewerMetadata | undefined,
 ): ViewerPresentationDraft {
   return {
-    frameRoleVisibility: { ...(viewer?.frame_role_visibility ?? {}) },
-    resourceRoleVisibility: { ...(viewer?.resource_role_visibility ?? {}) },
+    frameVisibility: (viewer?.frame_visibility ?? []).map(({ frame, visible }) => ({ frame: { ...frame }, visible })),
+    cellFrameVisible: viewer?.cell_frame_visible ?? true,
+    sceneResourceVisibility: { ...(viewer?.scene_resource_visibility ?? {}) },
     sceneResourceAxesVisibility: {
       ...(viewer?.scene_resource_axes_visibility ?? {}),
     },
@@ -86,9 +96,11 @@ export function programViewerMetadata(
   draft: ViewerPresentationDraft,
 ): ProgramViewerMetadata {
   return {
-    frame_role_visibility: orderedVisibility(draft.frameRoleVisibility),
+    frame_visibility: draft.frameVisibility.map(({ frame, visible }) => ({ frame: { ...frame }, visible }))
+      .sort((left, right) => compareFrames(left.frame, right.frame)),
+    cell_frame_visible: draft.cellFrameVisible,
     frame_gizmo_size_m: draft.frameGizmoSizeM,
-    resource_role_visibility: orderedVisibility(draft.resourceRoleVisibility),
+    scene_resource_visibility: orderedVisibility(draft.sceneResourceVisibility),
     scene_resource_axes_visibility: orderedVisibility(
       draft.sceneResourceAxesVisibility,
     ),
@@ -105,7 +117,7 @@ function validGizmoSize(value: number): boolean {
 
 /**
  * Local viewer-authoring reducer extracted from the old mixed Scene controls.
- * I6 owns persistence in the qualified Program artifact; live state is never
+ * Persistence belongs to the qualified Program artifact; live state is never
  * mutated by this reducer.
  */
 export function viewerPresentationDraftReducer(
@@ -116,17 +128,19 @@ export function viewerPresentationDraftReducer(
     case 'set_frame_visibility':
       return {
         ...state,
-        frameRoleVisibility: {
-          ...state.frameRoleVisibility,
-          [action.frameId]: action.visible,
-        },
+        frameVisibility: [
+          ...state.frameVisibility.filter(({ frame }) => compareFrames(frame, action.frame) !== 0),
+          { frame: { ...action.frame }, visible: action.visible },
+        ].sort((left, right) => compareFrames(left.frame, right.frame)),
       };
+    case 'set_cell_frame_visibility':
+      return { ...state, cellFrameVisible: action.visible };
     case 'set_resource_visibility':
       return {
         ...state,
-        resourceRoleVisibility: {
-          ...state.resourceRoleVisibility,
-          [action.resourceRoleId]: action.visible,
+        sceneResourceVisibility: {
+          ...state.sceneResourceVisibility,
+          [action.sceneResourceId]: action.visible,
         },
       };
     case 'set_scene_resource_axes_visibility':

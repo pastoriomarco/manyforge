@@ -6,20 +6,17 @@ import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
 import {
   componentManagerRows,
   mountParents,
-  roleFeedback,
   type ComponentManagerTab,
 } from '../utils/componentManager';
 import {
   ComponentManagerChanges,
   ComponentManagerSummary,
   ComponentManagerTabs,
-  RoleFeedbackCard,
 } from './ComponentManager';
 import { useManagerApplyStatus } from '../hooks/useManagerApplyStatus';
 import type { ControlTransportStatus } from '../hooks/useHeadlessState';
 import type {
   BlackboardKeyDeclaration,
-  JsonValue,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
@@ -58,7 +55,7 @@ interface DeploymentCompositionPanelProps {
   componentOverview: ComponentOverviewInput;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
-  /** Published motion targets' qualified Stop chains (SX-2167). */
+  /** Published motion targets' qualified Stop chains. */
   stopChains?: TargetStopChain[];
   gripperDescriptors: ManualControlGripperDescriptor[];
   /** Keys a global interrupt rule may read (the Program Draft's keys). */
@@ -74,10 +71,6 @@ interface DeploymentCompositionPanelProps {
   /** The workbench's single observation of the advertised maintenance
    * operation; this panel observes only an inventory-selected operation. */
   maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
-  /** The Program Draft's component roles; null without a Program. */
-  programComponentRoles?: Record<string, JsonValue> | null;
-  /** The Scenario's Program role assignment; null when none is loaded. */
-  programRoleAssignment?: Record<string, JsonValue> | null;
 }
 
 interface DeploymentReadModel {
@@ -117,8 +110,6 @@ export function DeploymentCompositionPanel({
   systemSignalsNeedApply = false,
   changedOutsideOutputs,
   maintenanceStatus: advertisedStatus,
-  programComponentRoles = null,
-  programRoleAssignment = null,
 }: DeploymentCompositionPanelProps) {
   const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
@@ -193,9 +184,6 @@ export function DeploymentCompositionPanel({
     [appliedIds, catalog, draftDocument],
   );
   const mounts = useMemo(() => mountParents(draftDocument), [draftDocument]);
-  const feedback = useMemo(() => roleFeedback(
-    programComponentRoles, programRoleAssignment, rows, catalog?.componentProfiles ?? {},
-  ), [catalog, programComponentRoles, programRoleAssignment, rows]);
   const pendingChanges = rows.some((row) => row.change !== 'applied')
     || deploymentController.workspace?.runAdmission.ready === false;
   const maintenanceMessage = maintenanceStatus.reason ?? (
@@ -351,7 +339,6 @@ export function DeploymentCompositionPanel({
         tab={tab}
         onTab={setTab}
         pendingChanges={pendingChanges}
-        roleIssues={feedback.filter((role) => role.status !== 'satisfied').length}
       />
 
       {tab === 'overview' && (
@@ -360,7 +347,6 @@ export function DeploymentCompositionPanel({
           <ComponentManagerSummary
             controller={deploymentController}
             rows={rows}
-            feedback={feedback}
             graph={readModel?.graph ?? null}
             diff={readModel?.diff ?? null}
             onNavigate={setTab}
@@ -370,9 +356,8 @@ export function DeploymentCompositionPanel({
         </div>
       )}
 
-      {tab === 'roles' && (
-        <div id="component-manager-roles" role="tabpanel" className="dpanel">
-          <RoleFeedbackCard feedback={feedback} />
+      {tab === 'binding' && (
+        <div id="component-manager-binding" role="tabpanel" className="dpanel">
           {deploymentController.workspace !== null && (
             <DeploymentBindingProjection workspace={deploymentController.workspace} />
           )}

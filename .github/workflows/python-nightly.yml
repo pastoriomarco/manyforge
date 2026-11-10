@@ -1,7 +1,7 @@
 name: python-nightly
 
 # Heavy tier: nightly (on dev), on demand, and on release tags. Not on PRs.
-# - bindings: the ROS-free I2 compiler bindings (scripts/ci/run-core-bindings.sh)
+# - bindings: the ROS-free core compiler bindings (scripts/ci/run-core-bindings.sh)
 #   inside the development image.
 # - slow: the Python tests marked `slow`, which python-tests.yml deselects.
 on:
@@ -19,8 +19,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dev-changed:
+    uses: ./.github/workflows/nightly-dev-changed.yml
+    permissions:
+      contents: read
+      actions: read
+
   bindings:
-    name: I2 compiler bindings (AMD64 Docker)
+    name: Core compiler bindings (AMD64 Docker)
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -44,7 +52,7 @@ jobs:
           cache-from: type=gha,scope=manyforge-dev
           cache-to: type=gha,scope=manyforge-dev,mode=max,ignore-error=true
 
-      - name: Run I2 bindings in immutable image
+      - name: Run core bindings in immutable image
         shell: bash
         run: |
           set -euo pipefail
@@ -65,6 +73,8 @@ jobs:
 
   slow:
     name: Python tests marked slow
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -103,10 +113,12 @@ jobs:
           path: .ccache
           key: ccache-headless-py-${{ github.run_id }}
           restore-keys: ccache-headless-py-
+      # Same configuration as python-tests.yml (no C++ unit tests, no GTest).
       - name: Build the expression binding (manyforge_headless_py)
         run: |
           cmake -S manyforge_headless -B "$HEADLESS_BUILD" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
             -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
             -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"

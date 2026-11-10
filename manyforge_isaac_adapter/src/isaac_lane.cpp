@@ -151,7 +151,7 @@ roboplan_backend::LaunchContribution isaac_launch_contribution(
     parameters += "    " + name + ": " + value + "\n";
   yaml.insert(at + kManager.size(), parameters);
   contribution.world_parent_frame = settings.world_parent_frame;
-  // RP-1b: an arm's `reset_position` is Mock's stock writer; the topic-based
+  // An arm's `reset_position` is Mock's stock writer; the topic-based
   // hardware publishes its position commands every cycle (threshold -1), so
   // the write is acknowledged on Isaac's joint commands topic.
   if (arm) {
@@ -184,7 +184,6 @@ IsaacGripperFacts isaac_gripper_facts(const roboplan_backend::ModelLaneRow &row,
   facts.open_effort = number(row, "open_effort");
   facts.close_effort = number(row, "close_effort");
   facts.publish_nominal_position = boolean(row, "publish_nominal_position");
-  facts.result_timeout_s = positive(row, "gripper_result_timeout_s");
   const bool has_bridge = row.adapter_keys.contains("gripper_bridge");
   if (facts.transport_kind == kGripperCommandTransport) {
     if (!has_bridge) fail("a ros_gripper_command tool needs its gripper_bridge");

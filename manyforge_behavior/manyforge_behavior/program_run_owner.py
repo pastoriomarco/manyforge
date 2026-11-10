@@ -44,6 +44,7 @@ from manyforge_behavior.program import (
     ProgramValidationError,
     require_exact_program_binding_node_policies,
 )
+from manyforge_behavior.program_frame_facts import ProgramFrameFacts
 from manyforge_behavior.program_clock import ProgramClock
 from manyforge_behavior.program_runtime import (
     ExecutableProgramRun,
@@ -54,10 +55,10 @@ from manyforge_behavior.program_runtime import (
 from manyforge_behavior.orchestration_values import ProgramValueError, ProgramValueStore
 
 
-PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v3"
-PROGRAM_DIAGNOSTIC_API: Final = "manyforge.program_diagnostic.v3"
-PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v2"
-APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v3"
+PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v4"
+PROGRAM_DIAGNOSTIC_API: Final = "manyforge.program_diagnostic.v4"
+PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v3"
+APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v4"
 _MAX_RETAINED_RUNS: Final = 4_096
 _MAX_NODE_STATUSES: Final = 100_000
 _NODE_STATUSES: Final = frozenset(
@@ -150,25 +151,23 @@ def _runtime_scale_selector_for_group(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Project one captured group to the exact runtime-scale selector."""
 
-    target_roles = run.execution_selection_motion_target_roles(group_id)
-    bindings = {
-        row.get("target_role_id"): row
-        for row in program_binding.get("target_role_bindings", ())
-        if isinstance(row, Mapping) and isinstance(row.get("target_role_id"), str)
-    }
+    selected_targets = run.execution_selection_motion_targets(group_id)
+    bindings = program_binding.get("target_bindings", ())
     targets: set[tuple[str, str]] = set()
-    for target_role in target_roles:
-        binding = bindings.get(target_role)
-        if not isinstance(binding, Mapping):
+    for component, command_target in selected_targets:
+        matches = [
+            row for row in bindings if isinstance(row, Mapping)
+            and row.get("target") == {
+                "component_id": component, "command_target_id": command_target
+            }
+        ]
+        if len(matches) != 1:
             return None, "captured_motion_target_binding_unavailable"
-        component_role = binding.get("component_role_id")
-        if not isinstance(component_role, str) or not component_role:
-            return None, "captured_motion_target_binding_invalid"
-        targets.add((component_role, target_role))
+        targets.add((component, command_target))
     if not targets:
         return None, "selection_has_no_motion_targets"
     ordered = [
-        {"component_role_id": component, "target_role_id": target}
+        {"component_id": component, "command_target_id": target}
         for component, target in sorted(targets)
     ]
     selector: dict[str, Any] = {
@@ -188,16 +187,19 @@ def _selection_resource_ids(
 ) -> list[str]:
     """The exact resources the Kernel reserves for one selection's release.
 
-    The Kernel's rule (spec 450 §5.2): every effectful target effect of the
+    The Kernel's rule: every effectful target effect of the
     selection's nodes, resolved through the sealed Program Binding. Composer
     tests operator-alarm motion attention against this set; the Kernel stays
     the enforcement point.
     """
 
-    roles = set(run.execution_selection_effect_target_roles(group_id))
+    selected_targets = set(run.execution_selection_effect_targets(group_id))
     resources: set[str] = set()
-    for target in program_binding.get("target_role_bindings", ()):
-        if not isinstance(target, Mapping) or target.get("target_role_id") not in roles:
+    for target in program_binding.get("target_bindings", ()):
+        if not isinstance(target, Mapping) or not isinstance(target.get("target"), Mapping):
+            continue
+        identity = target["target"]
+        if (identity.get("component_id"), identity.get("command_target_id")) not in selected_targets:
             continue
         for resource_role in target.get("resource_role_bindings", ()):
             if isinstance(resource_role, Mapping):
@@ -365,7 +367,7 @@ def _rule_stop(value: Any) -> str | None:
 
 
 def program_run_end(snapshot: "ProgramRunSnapshot") -> dict[str, Any] | None:
-    """``ProgramRunEnd`` (CONTRACTS §9) of a terminal run, else None.
+    """``ProgramRunEnd`` of a terminal run, else None.
 
     ``completed`` when the root succeeded; ``failed`` names the node and its
     error; ``stopped`` names the operator or the rule whose Stop held the run.
@@ -418,7 +420,7 @@ class ProgramRunSnapshot:
     # Operator-facing operation failures (held, or of a failed/stopped run
     # until Reset): node attempt, operation and the Kernel's own facts.
     operation_failures: tuple[Mapping[str, Any], ...] = ()
-    # AUD-6: the global rule whose `hold` holds the run (the Kernel scope's
+    # The global rule whose `hold` holds the run (the Kernel scope's
     # `stopped_by: rule`); a stopped run's end names it.
     stopped_by_rule_id: str | None = None
 
@@ -502,7 +504,7 @@ class _RunEntry:
     program_binding: Mapping[str, Any]
     state: ProgramRunState = ProgramRunState.RUNNING
     revision: int = 1
-    # Decision 138: the held-node mask last carried by a run_revision.
+    # The held-node mask last carried by a run_revision.
     mock_held: tuple[str, ...] = ()
     tree_status: str = "invalid"
     node_status_revision: int = 1
@@ -576,7 +578,7 @@ class ProgramRunOwner:
             raise TypeError("program_clock_source must be a monotonic clock")
         self._program_clock_source = program_clock_source
         # The Runner's execution transport timeout: bounds a stopped node's
-        # failed state reads (CONTRACTS §9).
+        # failed state reads.
         self._transport_timeout_s = transport_timeout_s
         self._ports = ports
         self._scope = ports.program_run_scope
@@ -606,7 +608,7 @@ class ProgramRunOwner:
 
     @staticmethod
     def _mock_paused(entry: _RunEntry) -> bool:
-        """Under the owner lock: the Run is Halted (decision 135), so a
+        """Under the owner lock: the Run is Halted, so a
         mask-only snapshot keeps the Mock paused."""
 
         return entry.state in {ProgramRunState.FULL_STOPPING, ProgramRunState.FULL_STOPPED}
@@ -614,7 +616,7 @@ class ProgramRunOwner:
     @staticmethod
     def _note_mock_held(entry: _RunEntry) -> tuple[str, ...] | None:
         """Under the owner lock, with a revision just taken: the Run's new
-        held-node mask if it changed (decision 138), else None."""
+        held-node mask if it changed, else None."""
 
         held = entry.run.mock_held_nodes()
         if held == entry.mock_held:
@@ -629,9 +631,9 @@ class ProgramRunOwner:
         paused: bool,
         held: tuple[str, ...] = (),
     ) -> None:
-        """Decision 135: the Run's Halt state for its nodes' Mock timers,
+        """The Run's Halt state for its nodes' Mock timers,
         outside the owner lock; best effort. The port only records it until
-        the Run's first Mock START (SX-2416): a Run without Mock nodes makes
+        the Run's first Mock START: a Run without Mock nodes makes
         no Mock call and needs no I/O service."""
 
         notify = getattr(self._ports.mock_simulation, "set_run_paused", None)
@@ -874,6 +876,7 @@ class ProgramRunOwner:
                     program=admission.program.with_active_tcp_binding(admission.program_binding),
                     environment=admission.environment,
                     capture=capture,
+                    program_binding=admission.program_binding,
                     project_path=admission.project_path,
                     readiness=admission.readiness,
                     ports=self._ports,
@@ -1057,7 +1060,7 @@ class ProgramRunOwner:
         if intervention is None or intervention.owner_task_id is None:
             raise ProgramRunOwnerError("held attempt has no owner task")
         owner_port = getattr(self._ports, intervention.owner_port_name or "", None)
-        # A fresh owner read (SX-655), never the task's cached terminal.
+        # A fresh owner read, never the task's cached terminal.
         read = getattr(owner_port, "current_recovery_assessment", None)
         port = self._ports.program_interventions
         if not callable(read) or port is None:
@@ -1104,7 +1107,7 @@ class ProgramRunOwner:
         """No-effect Kernel check of operator-alarm attention for the held node
         a motion-producing recovery would move, before any effect.
 
-        Only that node's target resources are tested (spec 450 §5.2): an alarm
+        Only that node's target resources are tested: an alarm
         on disjoint resources does not block this recovery, just as disjoint
         operations continue.
         """
@@ -1126,7 +1129,7 @@ class ProgramRunOwner:
         return run.operator_stop_scope()
 
     def note_runtime_control_change(self, program_run_id: str) -> ProgramRunSnapshot:
-        """Advance the run projection after one non-tree C2 state change."""
+        """Advance the run projection after one non-tree runtime-control state change."""
 
         with self._lock:
             entry = self._entry(program_run_id)
@@ -1561,7 +1564,7 @@ class ProgramRunOwner:
                 selection_error = accepted.get("selection_error")
                 snapshot = self._snapshot(entry)
             if held is not None:
-                # Decision 138: the new mask under this command's revision.
+                # The new mask under this command's revision.
                 self._notify_mock_run_paused(
                     program_run_id, held_revision, held_paused, held
                 )
@@ -1838,7 +1841,7 @@ class ProgramRunOwner:
         """Recover one frozen selected batch, then release its Kernel hold.
 
         Fenced on the selection revision, not the run revision: tree ticks
-        raise the run revision without changing the selection (N8).
+        raise the run revision without changing the selection.
         """
         return self._recover_motion_selection(
             program_run_id,
@@ -1985,8 +1988,8 @@ class ProgramRunOwner:
 
         A hold whose node is in no named group owns every named group that no
         other active hold names ("all" when it is the only hold) and, while
-        other holds are active, releases its own node by node_instance_id
-        (SX-2020); while it is active, another hold releases only its own
+        other holds are active, releases its own node by node_instance_id;
+        while it is active, another hold releases only its own
         groups.
         """
         node = failure.identity.node_instance_id
@@ -2049,7 +2052,7 @@ class ProgramRunOwner:
         request_id: str,
         reason: str | None,
     ) -> ProgramRunSnapshot:
-        """Continue (contract item 40): close the held operation and release
+        """Continue: close the held operation and release
         the hold's groups like Retry. The caller then resolves the hold with a
         failure, so the held node returns FAILURE to the tree."""
         return self._release_failure_hold(
@@ -2137,7 +2140,7 @@ class ProgramRunOwner:
             ) - kept
             # A hold in no named group is only in "all": while other holds
             # are active it releases its own node by node_instance_id
-            # (contract 43, SX-2020) next to the free groups.
+            # next to the free groups.
             node = failure.identity.node_instance_id
             node_release = (
                 release != "all"
@@ -2433,7 +2436,7 @@ class ProgramRunOwner:
                     else:
                         held = None
                 if held is not None:
-                    # Decision 138: the released mask under this revision.
+                    # The released mask under this revision.
                     self._notify_mock_run_paused(
                         program_run_id, held_revision, held_paused, held
                     )
@@ -2712,7 +2715,7 @@ class ProgramRunOwner:
                 snapshot = self._snapshot(entry)
             # Resume continues the pending Mock changes. A node START that
             # reaches the host before this arrives is applied paused by the
-            # host (decision 135B); the Runner does not defer it.
+            # host; the Runner does not defer it.
             self._notify_mock_run_paused(program_run_id, snapshot.run_revision, False, held)
             return snapshot
 
@@ -2922,7 +2925,7 @@ class ProgramRunOwner:
     def _stop_motion_for_simulation(
         self, program_run_id: str, snapshot: ProgramRunSnapshot
     ) -> ProgramRunSnapshot:
-        """SIM-1 (N4b): a command refused because its simulation isn't
+        """A command refused because its simulation isn't
         playing is handled as the operator's Stop on the refused nodes' motion
         groups (all groups for a node in none): the same Kernel selection
         Stop, never a node failure. The run stays held until the operator's
@@ -3074,7 +3077,7 @@ class ProgramRunOwner:
 
             try:
                 run.refresh_pending_stop_settlement()
-                # Decision 138: a changed held-node mask takes its own run
+                # A changed held-node mask takes its own run
                 # revision and reaches the Mock port before this tick can
                 # START anything (the port settles it before a START).
                 with self._lock:
@@ -3327,6 +3330,7 @@ def build_program_run_admission(
         "owner_identities",
         "program",
         "program_binding",
+        "program_frame_facts",
         "program_binding_id",
         "program_id",
         "program_revision",
@@ -3407,6 +3411,12 @@ def build_program_run_admission(
         field="program_revision",
     )
     program_id = _text(selection.get("program_id"), field="program_id")
+    try:
+        frame_facts = ProgramFrameFacts.from_capture(selection.get("program_frame_facts"), selection)
+    except ValueError as error:
+        raise ProgramRunOwnerError(f"scenario frame facts are invalid: {error}") from error
+    program = program.with_program_frame_facts(frame_facts)
+
     binding_environment = binding_value.get("node_environment")
     if not isinstance(binding_environment, dict) or set(binding_environment) != {
         "catalog_id",
@@ -3540,6 +3550,7 @@ def build_applied_program_run_admission(
         "preparation_digest",
         "program",
         "program_binding",
+        "program_frame_facts",
         "program_binding_id",
         "program_id",
         "program_revision",
@@ -3584,6 +3595,7 @@ def build_applied_program_run_admission(
         "owner_identities": deepcopy(owner_identities),
         "program": deepcopy(applied["program"]),
         "program_binding": deepcopy(applied["program_binding"]),
+        "program_frame_facts": deepcopy(applied["program_frame_facts"]),
         "program_binding_id": applied["program_binding_id"],
         "program_id": applied["program_id"],
         "program_revision": applied["program_revision"],

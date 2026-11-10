@@ -475,7 +475,8 @@ TEST(EventHistorian, ProgramDiagnosticValuesAreNeitherSearchTextNorOwnerIdentiti
                            {"operation_id", CanonicalValue("operation.foreign")},
                            {"program_run_id", CanonicalValue("run.foreign")}})},
     };
-    if (version != "manyforge.program_diagnostic.v3") {
+    if (version == "manyforge.program_diagnostic.v1" ||
+        version == "manyforge.program_diagnostic.v2") {
       // Retained v1/v2 rows also carry the withdrawn runtime-override section.
       payload.emplace_back("runtime_overrides",
                            CanonicalValue(CanonicalValue::Object{
@@ -2166,7 +2167,7 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
   next_phase("cleanup");
 }
 
-// Live finding (M5 session 10): incident cause and closure codes were not
+// Live finding: incident cause and closure codes were not
 // search text, while the incident id was.
 TEST(EventHistorian, IncidentCauseClosureAndVendorCodesAreSearchable) {
   TemporaryDirectory directory;

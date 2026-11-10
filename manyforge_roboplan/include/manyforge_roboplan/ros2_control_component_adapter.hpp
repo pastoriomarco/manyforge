@@ -13,7 +13,7 @@
 
 namespace manyforge::roboplan_backend {
 
-/// The ros2_control lane adapter (CONTRACTS §6): one ros2_control component
+/// The ros2_control lane adapter: one ros2_control component
 /// (an arm, or a tool's gripper) over its runtime handle. Mock runs it as it
 /// is; a simulator or vendor adapter may compose it. State comes from the
 /// controller manager and the controllers; goal identity, binding epochs and

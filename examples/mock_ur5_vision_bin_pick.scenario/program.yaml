@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "blackboard": {
     "keys": [
       {
@@ -190,8 +190,8 @@
     ]
   },
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -207,21 +207,6 @@
       "vision-pick"
     ]
   },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    },
-    "tool": {
-      "required_component_type_tags": [
-        "gripper"
-      ]
-    }
-  },
   "contact_policies": [
     {
       "api_version": "manyforge.contact_policy.v1",
@@ -229,14 +214,16 @@
       "mode": "contact_grasp",
       "policy_id": "selected_object_grasp",
       "sensing_mode": "geometry_only",
-      "version": "sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c",
+      "version": "sha256:cdd5cd17bdd43f72582cbc09806d1ebbe2e658b8ad896b3ce040e5a842a79977",
       "zones": [
         {
           "body_pairs": [
             {
               "body_a": {
-                "collision_body_role_id": "gripper_collision",
-                "component_role_id": "tool",
+                "body": {
+                  "collision_body_id": "gripper_collision",
+                  "component_id": "robotiq_2f_85"
+                },
                 "kind": "component_model_body"
               },
               "body_b": {
@@ -297,8 +284,14 @@
                       "instance_id": "pick_left_part.plan",
                       "node_id": "planning.plan_pick_sequence",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "carrier_frame_role": "tcp",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
                         "contact_policy_id": "selected_object_grasp",
                         "motion_options": {
                           "approach_velocity_scale": 0.4,
@@ -360,7 +353,10 @@
                           },
                           "search_strategy": "first_feasible"
                         },
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -368,7 +364,11 @@
                           "kind": "named_preset",
                           "name": "closed"
                         },
-                        "tool_target_role": "gripper"
+                        "tool_target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "tool_completion_timeout_s": 15.0
                       }
                     },
                     {
@@ -376,8 +376,14 @@
                       "instance_id": "pick_left_part.approach",
                       "node_id": "motion.move_to_pose",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -396,9 +402,15 @@
                       "instance_id": "pick_left_part.descend",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
                         "contact_policy_id": "selected_object_grasp",
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -422,7 +434,11 @@
                       "instance_id": "pick_left_part.close",
                       "node_id": "gripper.command_position",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "completion_timeout_s": 15.0
                       },
                       "value_sources": {
                         "position": {
@@ -437,10 +453,19 @@
                       "instance_id": "pick_left_part.attach",
                       "node_id": "scene.attach_carried_object",
                       "parameters": {
-                        "carrier_frame_role": "tcp",
-                        "target_role": "gripper",
-                        "touch_body_roles": [
-                          "gripper_collision"
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "touch_bodies": [
+                          {
+                            "collision_body_id": "gripper_collision",
+                            "component_id": "robotiq_2f_85"
+                          }
                         ]
                       },
                       "value_sources": {
@@ -456,8 +481,14 @@
                       "instance_id": "pick_left_part.retreat",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -488,8 +519,14 @@
                           0,
                           0.08
                         ],
-                        "base_frame_role": "base",
-                        "carrier_frame_role": "tcp",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
                         "motion_options": {
                           "approach_velocity_scale": 0.4,
                           "descend_velocity_scale": 0.4,
@@ -498,9 +535,11 @@
                         "output_key": "pick_place.place_left_part",
                         "place_pose": {
                           "frame_ref": {
-                            "frame_role": "base",
-                            "kind": "target_frame",
-                            "target_role": "arm"
+                            "frame": {
+                              "component_id": "ur5_robot",
+                              "frame_id": "base"
+                            },
+                            "kind": "target_frame"
                           },
                           "orientation": {
                             "rpy_deg": [
@@ -516,7 +555,10 @@
                           ]
                         },
                         "selected_object_id": "left_part",
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -524,7 +566,11 @@
                           "kind": "named_preset",
                           "name": "open"
                         },
-                        "tool_target_role": "gripper"
+                        "tool_target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "tool_completion_timeout_s": 15.0
                       }
                     },
                     {
@@ -532,8 +578,14 @@
                       "instance_id": "place_left_part.approach",
                       "node_id": "motion.move_to_pose",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -552,8 +604,14 @@
                       "instance_id": "place_left_part.descend",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -572,7 +630,11 @@
                       "instance_id": "place_left_part.open",
                       "node_id": "gripper.command_position",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "completion_timeout_s": 15.0
                       },
                       "value_sources": {
                         "position": {
@@ -587,7 +649,10 @@
                       "instance_id": "place_left_part.detach",
                       "node_id": "scene.detach_carried_object",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        }
                       },
                       "value_sources": {
                         "scene_resource_id": {
@@ -602,8 +667,14 @@
                       "instance_id": "place_left_part.retreat",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -648,8 +719,14 @@
                       "instance_id": "pick_right_part.plan",
                       "node_id": "planning.plan_pick_sequence",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "carrier_frame_role": "tcp",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
                         "contact_policy_id": "selected_object_grasp",
                         "motion_options": {
                           "approach_velocity_scale": 0.4,
@@ -711,7 +788,10 @@
                           },
                           "search_strategy": "first_feasible"
                         },
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -719,7 +799,11 @@
                           "kind": "named_preset",
                           "name": "closed"
                         },
-                        "tool_target_role": "gripper"
+                        "tool_target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "tool_completion_timeout_s": 15.0
                       }
                     },
                     {
@@ -727,8 +811,14 @@
                       "instance_id": "pick_right_part.approach",
                       "node_id": "motion.move_to_pose",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -747,9 +837,15 @@
                       "instance_id": "pick_right_part.descend",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
                         "contact_policy_id": "selected_object_grasp",
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -773,7 +869,11 @@
                       "instance_id": "pick_right_part.close",
                       "node_id": "gripper.command_position",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "completion_timeout_s": 15.0
                       },
                       "value_sources": {
                         "position": {
@@ -788,10 +888,19 @@
                       "instance_id": "pick_right_part.attach",
                       "node_id": "scene.attach_carried_object",
                       "parameters": {
-                        "carrier_frame_role": "tcp",
-                        "target_role": "gripper",
-                        "touch_body_roles": [
-                          "gripper_collision"
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "touch_bodies": [
+                          {
+                            "collision_body_id": "gripper_collision",
+                            "component_id": "robotiq_2f_85"
+                          }
                         ]
                       },
                       "value_sources": {
@@ -807,8 +916,14 @@
                       "instance_id": "pick_right_part.retreat",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -839,8 +954,14 @@
                           0,
                           0.08
                         ],
-                        "base_frame_role": "base",
-                        "carrier_frame_role": "tcp",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "carrier_frame_ref": {
+                          "component_id": "robotiq_2f_85",
+                          "frame_id": "tcp"
+                        },
                         "motion_options": {
                           "approach_velocity_scale": 0.4,
                           "descend_velocity_scale": 0.4,
@@ -849,9 +970,11 @@
                         "output_key": "pick_place.place_right_part",
                         "place_pose": {
                           "frame_ref": {
-                            "frame_role": "base",
-                            "kind": "target_frame",
-                            "target_role": "arm"
+                            "frame": {
+                              "component_id": "ur5_robot",
+                              "frame_id": "base"
+                            },
+                            "kind": "target_frame"
                           },
                           "orientation": {
                             "rpy_deg": [
@@ -867,7 +990,10 @@
                           ]
                         },
                         "selected_object_id": "right_part",
-                        "target_role": "arm",
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -875,7 +1001,11 @@
                           "kind": "named_preset",
                           "name": "open"
                         },
-                        "tool_target_role": "gripper"
+                        "tool_target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "tool_completion_timeout_s": 15.0
                       }
                     },
                     {
@@ -883,8 +1013,14 @@
                       "instance_id": "place_right_part.approach",
                       "node_id": "motion.move_to_pose",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -903,8 +1039,14 @@
                       "instance_id": "place_right_part.descend",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -923,7 +1065,11 @@
                       "instance_id": "place_right_part.open",
                       "node_id": "gripper.command_position",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        },
+                        "completion_timeout_s": 15.0
                       },
                       "value_sources": {
                         "position": {
@@ -938,7 +1084,10 @@
                       "instance_id": "place_right_part.detach",
                       "node_id": "scene.detach_carried_object",
                       "parameters": {
-                        "target_role": "gripper"
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "robotiq_2f_85"
+                        }
                       },
                       "value_sources": {
                         "scene_resource_id": {
@@ -953,8 +1102,14 @@
                       "instance_id": "place_right_part.retreat",
                       "node_id": "motion.follow_cartesian_path",
                       "parameters": {
-                        "base_frame_role": "base",
-                        "target_role": "arm",
+                        "base_frame": {
+                          "component_id": "ur5_robot",
+                          "frame_id": "base"
+                        },
+                        "target": {
+                          "command_target_id": "arm",
+                          "component_id": "ur5_robot"
+                        },
                         "tcp_endpoint": {
                           "kind": "current"
                         },
@@ -997,10 +1152,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
-          "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "rpy_deg": [
@@ -1015,9 +1171,6 @@
           0.009
         ]
       },
-      "resource_roles": [
-        "pick_candidate"
-      ],
       "scene_resource_id": "left_part",
       "shape": {
         "box_dimensions_m": [
@@ -1031,10 +1184,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
-          "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "rpy_deg": [
@@ -1049,9 +1203,6 @@
           0.009
         ]
       },
-      "resource_roles": [
-        "pick_candidate"
-      ],
       "scene_resource_id": "right_part",
       "shape": {
         "box_dimensions_m": [
@@ -1065,10 +1216,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
-          "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "xyzw": [
@@ -1095,93 +1247,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.cartesian_path",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    },
-    "gripper": {
-      "component_role": "tool",
-      "required_capabilities": [
-        {
-          "capability_id": "model.kinematics.fk",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.command",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "tool.gripper.feedback",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "gripper_collision"
-      ],
-      "required_frame_roles": [
-        "tcp"
-      ],
-      "required_resource_roles": [
-        "fingers"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

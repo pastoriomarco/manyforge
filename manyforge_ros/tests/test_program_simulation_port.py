@@ -1,12 +1,13 @@
-"""Focused task, context, translation, and recovery tests for I9."""
+"""Focused task, context, translation, and recovery tests for the simulation port."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from threading import Event
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from manyforge_ros.program_simulation_port import (
     SimulationProgramTaskPort,
     load_simulation_program_site_config,
 )
+import manyforge_ros.program_simulation_port as simulation_port
 
 
 _DIGEST_A = "sha256:" + "a" * 64
@@ -77,15 +79,10 @@ def _context(
             "program_revision": _DIGEST_B,
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_B,
-            "target_role_bindings": [
+            "frame_bindings": [
                 {
-                    "target_role_id": "arm",
-                    "frame_role_bindings": [
-                        {
-                            "frame_role_id": "base",
-                            "compiled_frame_name": "retained_arm_base",
-                        }
-                    ],
+                    "reference": {"component_id": "robot", "frame_id": "base"},
+                    "compiled_frame_name": "retained_arm_base",
                 }
             ],
         },
@@ -192,8 +189,7 @@ def test_program_tasks_translate_all_four_nodes_without_blocking_ticks() -> None
                 "pose": {
                     "frame_ref": {
                         "kind": "target_frame",
-                        "target_role": "arm",
-                        "frame_role": "base",
+                        "frame": {"component_id": "robot", "frame_id": "base"},
                     },
                     "position_m": [0.25, -0.5, 0.75],
                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
@@ -253,8 +249,46 @@ def test_program_tasks_translate_all_four_nodes_without_blocking_ticks() -> None
 
 
 
+def test_pose_frames_resolve_robot_cell_and_scene_resource_references() -> None:
+    client = _ControlClient()
+    port = SimulationProgramTaskPort(client, _site())
+    port.bind(_context())
+    cases = (
+        (
+            {"kind": "target_frame", "frame": {"component_id": "robot", "frame_id": "base"}},
+            "retained_arm_base",
+        ),
+        ({"kind": "cell_frame"}, "world"),
+        ({"kind": "scene_resource", "scene_resource_id": "part"}, "/World/retained_part"),
+    )
+    for index, (frame_ref, expected_frame) in enumerate(cases, start=1):
+        identity = _identity(index)
+        started = port.start(
+            "simulation.set_entity_pose",
+            identity,
+            _entity_pose("part", frame_ref),
+        )
+        assert started.state is OwnerTaskState.ACTIVE
+        terminal = _settled(port, started.task_id)
+        assert terminal.state is OwnerTaskState.SUCCEEDED
+        port.acknowledge(started.task_id, identity)
+        assert client.calls[-1] == (
+            "set_entity_state",
+            (
+                "/World/retained_part",
+                {
+                    "frame_id": expected_frame,
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+            ),
+        )
+    port.unbind("run.simulation")
+    port.close()
+
+
 def test_task_retention_evicts_the_oldest_finished_task_at_its_bound() -> None:
-    # R3: a long Run keeps starting node attempts; the bound evicts settled
+    # A long Run keeps starting node attempts; the bound evicts settled
     # tasks instead of refusing, and only in-flight work can fill it.
     client = _ControlClient()
     port = SimulationProgramTaskPort(client, _site(), maximum_retained_tasks=2)
@@ -271,6 +305,71 @@ def test_task_retention_evicts_the_oldest_finished_task_at_its_bound() -> None:
         port.start("simulation.step", _identity(6), OwnerNodeInputs(parameters={"steps": 9}))
     port.unbind("run.simulation")
     port.close()
+
+
+def test_ros_port_disables_external_ros_file_logging(monkeypatch) -> None:
+    init_calls: list[tuple[list[str], object]] = []
+
+    class FakeContext:
+        def ok(self) -> bool:
+            return True
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakeNode:
+        def destroy_node(self) -> None:
+            pass
+
+    class FakeExecutor:
+        def __init__(self, *, context: FakeContext) -> None:
+            self.context = context
+
+        def add_node(self, node: FakeNode) -> None:
+            self.node = node
+
+        def spin(self) -> None:
+            pass
+
+        def shutdown(self, *, timeout_sec: float) -> None:
+            pass
+
+    fake_rclpy = ModuleType("rclpy")
+    fake_rclpy.__path__ = []
+
+    def init(*, args: list[str], context: FakeContext) -> None:
+        init_calls.append((args, context))
+
+    fake_rclpy.init = init
+    fake_rclpy.create_node = lambda name, *, context: FakeNode()
+    context_module = ModuleType("rclpy.context")
+    context_module.Context = FakeContext
+    executor_module = ModuleType("rclpy.executors")
+    executor_module.SingleThreadedExecutor = FakeExecutor
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "rclpy.context", context_module)
+    monkeypatch.setitem(sys.modules, "rclpy.executors", executor_module)
+    monkeypatch.setattr(simulation_port.sys, "argv", ["runner", "--site-arg"])
+    monkeypatch.setattr(
+        simulation_port,
+        "SimulationControlClient",
+        lambda node, **kwargs: _ControlClient(),
+    )
+
+    port = simulation_port.RosSimulationProgramTaskPort(_site())
+    try:
+        assert len(init_calls) == 1
+        args, context = init_calls[0]
+        assert args == [
+            "runner",
+            "--site-arg",
+            "--ros-args",
+            "--disable-external-lib-logs",
+        ]
+        assert isinstance(context, FakeContext)
+    finally:
+        port.close()
+
 
 class _BlockingControlClient(_ControlClient):
     def __init__(self) -> None:
@@ -365,7 +464,10 @@ def test_cell_frame_without_simulation_links_fails_the_node_typed() -> None:
             _identity(2),
             _entity_pose(
                 "part",
-                {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                {
+                    "kind": "target_frame",
+                    "frame": {"component_id": "robot", "frame_id": "base"},
+                },
             ),
         )
     assert client.calls == []

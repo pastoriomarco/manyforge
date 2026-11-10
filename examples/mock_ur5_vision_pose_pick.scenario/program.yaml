@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v2",
+  "api_version": "manyforge.program.v3",
   "blackboard": {
     "keys": [
       {
@@ -46,8 +46,8 @@
     ]
   },
   "catalog": {
-    "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.9.0"
+    "api_version": "manyforge.node_catalog.v3",
+    "content_version": "3.0.0"
   },
   "compatibility": {
     "assistant": "required",
@@ -61,16 +61,6 @@
       "ur5",
       "vision-pick"
     ]
-  },
-  "component_roles": {
-    "robot": {
-      "required_component_type_tags": [
-        "articulated-arm"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ]
-    }
   },
   "description": "Preview Program for the typed vision-guided pose dataflow. A model response supplies bounded approach and grasp poses in the target base frame; motion nodes consume those fields directly. It remains intentionally fail-closed when a single-image model invents unreachable metric coordinates rather than grounding them in an authoritative pose source.",
   "forest": [
@@ -97,8 +87,14 @@
           "instance_id": "move_to_approach_pose",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
-            "target_role": "arm",
+            "base_frame": {
+              "component_id": "ur5_robot",
+              "frame_id": "base"
+            },
+            "target": {
+              "component_id": "ur5_robot",
+              "command_target_id": "arm"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -117,8 +113,14 @@
           "instance_id": "move_to_grasp_pose",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
-            "target_role": "arm",
+            "base_frame": {
+              "component_id": "ur5_robot",
+              "frame_id": "base"
+            },
+            "target": {
+              "component_id": "ur5_robot",
+              "command_target_id": "arm"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -146,7 +148,10 @@
           "instance_id": "retreat_after_grasp",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "ur5_robot",
+              "frame_id": "base"
+            },
             "goal": {
               "orientation": {
                 "rpy_deg": [
@@ -162,15 +167,24 @@
               ]
             },
             "offset_reference": {
-              "frame_role_id": "base",
-              "type": "frame_role"
+              "type": "component_frame",
+              "frame": {
+                "component_id": "ur5_robot",
+                "frame_id": "base"
+              }
             },
             "target_mode": "relative",
             "target_reference": {
-              "frame_role_id": "tcp",
-              "type": "frame_role"
+              "type": "component_frame",
+              "frame": {
+                "component_id": "ur5_robot",
+                "frame_id": "tcp"
+              }
             },
-            "target_role": "arm",
+            "target": {
+              "component_id": "ur5_robot",
+              "command_target_id": "arm"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -182,12 +196,17 @@
           "instance_id": "move_to_place_pose",
           "node_id": "motion.move_to_pose",
           "parameters": {
-            "base_frame_role": "base",
+            "base_frame": {
+              "component_id": "ur5_robot",
+              "frame_id": "base"
+            },
             "goal": {
               "frame_ref": {
-                "frame_role": "base",
                 "kind": "target_frame",
-                "target_role": "arm"
+                "frame": {
+                  "component_id": "ur5_robot",
+                  "frame_id": "base"
+                }
               },
               "orientation": {
                 "rpy_deg": [
@@ -202,7 +221,10 @@
                 0.3
               ]
             },
-            "target_role": "arm",
+            "target": {
+              "component_id": "ur5_robot",
+              "command_target_id": "arm"
+            },
             "tcp_endpoint": {
               "kind": "current"
             },
@@ -232,10 +254,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
           "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          }
         },
         "orientation": {
           "rpy_deg": [
@@ -266,10 +289,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
           "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          }
         },
         "orientation": {
           "rpy_deg": [
@@ -300,10 +324,11 @@
     {
       "pose": {
         "frame_ref": {
-          "component_role": "robot",
-          "frame_role": "base",
           "kind": "component_frame",
-          "model_role": "arm_model"
+          "frame": {
+            "component_id": "ur5_robot",
+            "frame_id": "base"
+          }
         },
         "orientation": {
           "xyzw": [
@@ -330,55 +355,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1",
-  "target_roles": {
-    "arm": {
-      "component_role": "robot",
-      "required_capabilities": [
-        {
-          "capability_id": "execution.feedback.phase_events",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "execution.trajectory.execute",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.motion.pose_goal",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "planning.trajectory.time_parameterized",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "state.observed.current",
-          "disposition": "required",
-          "parameters": {}
-        },
-        {
-          "capability_id": "validation.trajectory.non_collision",
-          "disposition": "required",
-          "parameters": {}
-        }
-      ],
-      "required_collision_body_roles": [
-        "arm_collision"
-      ],
-      "required_frame_roles": [
-        "base",
-        "tcp"
-      ],
-      "required_model_roles": [
-        "arm_model"
-      ],
-      "required_resource_roles": [
-        "arm_joints"
-      ]
-    }
-  }
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

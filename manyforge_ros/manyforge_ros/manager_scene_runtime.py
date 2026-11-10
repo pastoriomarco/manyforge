@@ -22,11 +22,13 @@ import unicodedata
 
 import rfc8785
 
+from manyforge_behavior.reference_validation import validate_reference_refusal
+
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
-# Stays v1 for the coordinated unreleased 128/130 cut (agreed with Track 2).
+# Stays v1: the command protocol version is unchanged.
 MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v1"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v2"
 MAX_MANAGER_REQUEST_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 MAX_OBSERVATION_PAYLOAD_BYTES = 64 * 1024
@@ -736,9 +738,16 @@ class ManagerSceneRuntimeClient:
         error = failure["error"]
         # `{code, message}` plus the Manager's `details` and `producer`.
         if not isinstance(error, dict) or not (
-            {"code", "message"} <= set(error) <= {"code", "details", "message", "producer"}
+            {"code", "message"} <= set(error) <= {
+                "code", "details", "message", "producer", "reference_validation"
+            }
         ):
             raise _response_invalid("Manager owner error has an unknown or missing field")
+        if "reference_validation" in error and (
+            error["code"] != "program_reference_validation_failed"
+            or validate_reference_refusal(error["reference_validation"]) is None
+        ):
+            raise _response_invalid("Manager reference validation error is invalid")
         try:
             code = _bounded_text(error["code"], label="owner error code")
             message = _bounded_text(

@@ -17,7 +17,7 @@ struct ApplicabilityOutputCardinality final {
                          const ApplicabilityOutputCardinality&) = default;
 };
 
-/// Allocation-free production budget used before C0.2n output materialization.
+/// Allocation-free production budget used before applicability output materialization.
 ///
 /// Every rejected charge leaves the accumulator unchanged. Keeping this seam
 /// private lets the exact million-row boundaries be qualified without

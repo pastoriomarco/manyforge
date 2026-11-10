@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The xArm adapter family `xarm` (CONTRACTS §6 "What a family exports",
-// §16): one library, registered in the ament resource index
+// The xArm adapter family `xarm`: one library, registered in the ament resource index
 // `manyforge_component_adapters`. One factory call per component, by role:
 // - the machine's owner (`machine_owner`): the owner adapter with the driver
 //   services, the controller's report and the I/O subscriptions; its handle
@@ -23,7 +22,7 @@
 //   driver's own `joint_states`, `JointSampleUse`);
 // - the I/O members (`controller_io`, `tool_io`): one I/O adapter each, with
 //   the signals of its row.
-// An xArm arm is always a machine's member (AUD-5).
+// An xArm arm is always a machine's member.
 // Members register with their owner, which names them in its faults'
 // `concerns` (the core disables them before the owner's power actions). The family also exports
 // the launch contribution and takes the host's measured joints,
@@ -33,6 +32,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -45,6 +45,7 @@
 #include <manyforge_roboplan/component_adapter_registry.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_roboplan/ros2_control_component_adapter.hpp>
+#include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include <manyforge_xarm_control/xarm_adapters.hpp>
 #include <manyforge_xarm_control/xarm_launch_contribution.hpp>
 
@@ -61,7 +62,7 @@ using manyforge::roboplan_backend::ToolContextHook;
 namespace xarm = manyforge::xarm_control;
 namespace core = manyforge::core;
 
-/// Between reads of the arm's waits (M7: 20 ms).
+/// Between reads of the arm's waits (20 ms).
 constexpr std::chrono::milliseconds kXArmPollInterval{20};
 
 /// How long the driver takes to reactivate its controllers after the re-arm
@@ -96,10 +97,77 @@ std::string xarm_controllers(const ModelLaneRow &row) {
 
 /// The machine: the owner adapter and everything it runs on (the clock,
 /// the transports, the driver services); members keep it alive.
-struct Machine final {
+struct Machine final : manyforge::roboplan_backend::AdapterTransportConsumer {
   std::shared_ptr<core::IClock> clock;
   xarm::XArmVendorSettings settings;
   xarm::XArmMachine parts;
+  std::string driver_namespace;
+  std::weak_ptr<Owner> transport_owner;
+  mutable std::mutex mutex;
+
+  struct Rebind final {
+    std::shared_ptr<Owner> old_owner;
+    std::shared_ptr<Owner> new_owner;
+    Gate gate;
+    std::shared_ptr<xarm::XArmRobotStatesTransport> robot;
+    std::shared_ptr<xarm::XArmDriverServices> driver;
+    std::shared_ptr<xarm::XArmIoStatesTransport> io;
+  };
+
+  std::shared_ptr<void> Stage(const std::shared_ptr<Owner> &expected,
+                              const std::shared_ptr<Owner> &replacement,
+                              Gate gate) override {
+    if (!expected || !replacement || !gate || gate->load(std::memory_order_acquire))
+      throw std::invalid_argument("xArm ROS rebind requires an inactive gate and owner");
+    {
+      std::lock_guard lock(mutex);
+      if (transport_owner.lock() != expected)
+        throw std::invalid_argument("xArm ROS rebind owner changed");
+    }
+    xarm::XArmRosOwner ros;
+    ros.node = replacement->node();
+    ros.clock = clock;
+    ros.active = gate;
+    ros.invoke = [replacement](std::function<void()> work) {
+      replacement->invoke_creation(std::move(work));
+    };
+    ros.retain = [replacement](std::shared_ptr<void> entity) {
+      return replacement->retain_entity(std::move(entity));
+    };
+    ros.time_critical_group = [replacement] {
+      return replacement->create_time_critical_callback_group();
+    };
+    ros.retain_time_critical = [replacement](std::shared_ptr<void> entity,
+                                             rclcpp::CallbackGroup::SharedPtr group) {
+      return replacement->retain_entity(std::move(entity), std::move(group));
+    };
+    auto next = std::make_shared<Rebind>();
+    next->old_owner = expected;
+    next->new_owner = replacement;
+    next->gate = std::move(gate);
+    next->robot = std::make_shared<xarm::XArmRobotStatesTransport>(
+        *ros.node, driver_namespace, *clock, &ros);
+    next->driver = std::make_shared<xarm::XArmDriverServices>(
+        *ros.node, driver_namespace, &ros);
+    next->io = std::make_shared<xarm::XArmIoStatesTransport>(
+        *ros.node, driver_namespace, *clock, parts.owner, &ros);
+    return next;
+  }
+  bool Validate(const std::shared_ptr<void> &staged) const override {
+    auto next = std::static_pointer_cast<Rebind>(staged);
+    if (!next || next->gate->load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(mutex);
+    return transport_owner.lock() == next->old_owner;
+  }
+  void Commit(const std::shared_ptr<void> &staged) noexcept override {
+    auto next = std::static_pointer_cast<Rebind>(staged);
+    std::lock_guard lock(mutex);
+    parts.robot_states->SwapRosState(*next->robot);
+    parts.owner->ForgetMemberEstops();
+    parts.driver->SwapRosState(*next->driver);
+    parts.io_states.swap(next->io);
+    transport_owner = next->new_owner;
+  }
 };
 
 /// One member adapter and the machine it runs on.
@@ -125,10 +193,32 @@ std::shared_ptr<Machine> make_machine(const ComponentAdapterContext &context) {
     throw std::invalid_argument("an xArm machine runs on its ros2_control lane");
   auto machine = std::make_shared<Machine>();
   machine->clock = context.clock;
+  machine->transport_owner = context.ros_entity_owner;
+  machine->driver_namespace = context.ros_namespace + "/xarm";
   machine->settings = value_or_throw(xarm::load_xarm_vendor_settings(vendor_dir()));
+  // The callbacks are used only while constructing the family entities. The
+  // retirement handle does not retain the transport owner.
+  xarm::XArmRosOwner ros_owner;
+  if (context.ros_entity_owner) {
+    ros_owner.node = context.node;
+    ros_owner.clock = context.clock;
+    ros_owner.invoke = [&context](std::function<void()> work) {
+      context.ros_entity_owner->invoke_creation(std::move(work));
+    };
+    ros_owner.retain = [&context](std::shared_ptr<void> entity) {
+      return context.ros_entity_owner->retain_entity(std::move(entity));
+    };
+    ros_owner.time_critical_group = [&context] {
+      return context.ros_entity_owner->create_time_critical_callback_group();
+    };
+    ros_owner.retain_time_critical = [&context](std::shared_ptr<void> entity,
+                                                rclcpp::CallbackGroup::SharedPtr group) {
+      return context.ros_entity_owner->retain_entity(std::move(entity), std::move(group));
+    };
+  }
   machine->parts = xarm::make_xarm_machine(
       *context.node, *context.clock,
-      xarm::XArmMachineInputs{context.ros_namespace + "/xarm", context.address, machine->settings,
+      xarm::XArmMachineInputs{machine->driver_namespace, context.address, machine->settings,
                               context.lane_adapter, context.restart_driver, context.io_updates,
                               context.lifecycle_command_timeout,
                               context.ros2_control
@@ -137,7 +227,8 @@ std::shared_ptr<Machine> make_machine(const ComponentAdapterContext &context) {
                                           const auto locked = handle.lock();
                                           return locked && locked->ControllerLaunchSettling();
                                         })
-                                  : std::function<bool()>{}});
+                                  : std::function<bool()>{}},
+      context.ros_entity_owner ? &ros_owner : nullptr);
   return machine;
 }
 
@@ -160,10 +251,16 @@ std::shared_ptr<xarm::XArmArmAdapter> make_arm(const ComponentAdapterContext &co
                 handle->SwitchArmHardware(active, stop));
           },
           [handle = context.ros2_control] { return handle->arm_activity().hardware_active; },
-          // M7's poll of the waits after a re-arm and a TCP offset send.
+          // The poll of the waits after a re-arm and a TCP offset send.
           [] { std::this_thread::sleep_for(kXArmPollInterval); }, context.measured_joints,
           machine.clock.get(),
-          [handle = context.ros2_control] { return handle->arm_activity().broadcaster_active; }});
+          [handle = context.ros2_control] { return handle->arm_activity().broadcaster_active; },
+          [handle = context.ros2_control] {
+            const auto activity = handle->arm_activity();
+            return activity.controller_manager_present && activity.observed &&
+                   activity.controller_loaded && activity.broadcaster_loaded &&
+                   !activity.controller_active && !activity.broadcaster_active;
+          }});
 }
 
 /// The component's adapters with the arm's hook and display joints: they
@@ -188,7 +285,7 @@ ComponentAdapters with_arm_hooks(std::shared_ptr<core::IComponentAdapter> compon
                                          xarm::XArmToolContextBound{deadline, stop});
       },
       kXArmRearmBound};
-  // XARM_CONTROLLER_FACTS "The vendor joint topic": the driver publishes its
+  // The driver publishes its
   // own joint states on every hardware read, in every mode.
   made.display_joints = DisplayJointSource{
       context.ros_namespace + "/xarm/joint_states",
@@ -214,7 +311,8 @@ ComponentAdapters make_xarm(const ComponentAdapterContext &context) {
   if (context.machine_owner) {
     auto machine = make_machine(context);
     const std::shared_ptr<core::IComponentAdapter> owner(machine, machine->parts.owner.get());
-    return {owner, machine, std::nullopt, std::nullopt};
+    return {owner, machine, std::nullopt, std::nullopt,
+            context.ros_entity_owner ? machine : nullptr};
   }
   if (!context.owner)
     throw std::invalid_argument("an xArm member needs its machine's owner");
@@ -223,7 +321,9 @@ ComponentAdapters make_xarm(const ComponentAdapterContext &context) {
   if (context.role == xarm::kXArmArmRole) {
     const auto arm = member_of(machine, make_arm(context, *machine));
     owner.AddMember({context.role, id, arm, {}, arm});
-    return with_arm_hooks(arm, context, arm);
+    auto result = with_arm_hooks(arm, context, arm);
+    if (context.ros_entity_owner) result.ros_transport_consumer = machine;
+    return result;
   }
   if (context.role == xarm::kXArmControllerIoRole || context.role == xarm::kXArmToolIoRole) {
     if (!context.clock) throw std::invalid_argument("an xArm I/O member needs the host clock");
@@ -240,7 +340,8 @@ ComponentAdapters make_xarm(const ComponentAdapterContext &context) {
             },
             *machine->clock));
     owner.AddMember({context.role, id, io, io, {}});
-    return {io, nullptr, std::nullopt, std::nullopt};
+    return {io, nullptr, std::nullopt, std::nullopt,
+            context.ros_entity_owner ? machine : nullptr};
   }
   throw std::invalid_argument("an xArm machine has no member role '" + context.role + "'");
 }

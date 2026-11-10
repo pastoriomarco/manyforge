@@ -358,7 +358,7 @@ def _status(code: str) -> int:
             "persistent_key_request_replayed",
             "stale_generation",
         }
-        # RunReadiness reasons and run refusals (CONTRACTS §10).
+        # RunReadiness reasons and run refusals.
         or code in RUN_REFUSAL_CODES
     ):
         return 409
@@ -423,7 +423,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.2.0",
+        version="0.2.1",
         lifespan=lifespan,
     )
     app.add_middleware(

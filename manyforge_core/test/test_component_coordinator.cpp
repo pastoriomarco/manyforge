@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <manyforge_core/component_coordinator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <memory>
@@ -17,6 +19,12 @@ namespace manyforge::core {
 namespace {
 
 using namespace std::chrono_literals;
+
+TEST(ComponentFaultCode, OwnerStalledRoundTripsWithItsTypedWireName) {
+  EXPECT_EQ(to_string(FaultCode::kOwnerStalled), "component_owner_stalled");
+  ASSERT_TRUE(parse_fault_code("component_owner_stalled"));
+  EXPECT_EQ(*parse_fault_code("component_owner_stalled"), FaultCode::kOwnerStalled);
+}
 
 ActionResult Outcome(ActionOutcome outcome, std::optional<ActionError> error = std::nullopt) {
   ActionResult result;
@@ -41,8 +49,8 @@ ComponentState Observed(ComponentLifecycle lifecycle, ComponentActivity activity
   return state;
 }
 
-/// The lifecycle a compliant adapter shows once `action` succeeded
-/// (CONTRACTS §6); none for actions without a lifecycle target.
+/// The lifecycle a compliant adapter shows once `action` succeeded;
+/// none for actions without a lifecycle target.
 std::optional<ComponentLifecycle> ResultingLifecycle(const ComponentAction action) {
   switch (action) {
     case ComponentAction::kEnable:
@@ -98,6 +106,24 @@ class FakeAdapter final : public IComponentAdapter {
 
   std::vector<Capability> capabilities() const override { return capabilities_; }
 
+  bool CanRecoverSharedOwner() const override {
+    std::lock_guard lock(mutex_);
+    return shared_owner_recovery_;
+  }
+
+  void set_shared_owner_recovery(bool enabled) {
+    std::lock_guard lock(mutex_);
+    shared_owner_recovery_ = enabled;
+    prepared_recovery_ = enabled ? PreparedRecovery{[this](std::stop_token stop) {
+      return Run(ComponentAction::kRecover, stop);
+    }} : PreparedRecovery{};
+  }
+
+  PreparedRecovery PrepareSharedOwnerRecovery() const override {
+    std::lock_guard lock(mutex_);
+    return prepared_recovery_;
+  }
+
   void set_state(ComponentState state) {
     std::lock_guard lock(mutex_);
     state_ = std::move(state);
@@ -119,6 +145,10 @@ class FakeAdapter final : public IComponentAdapter {
     std::unique_lock lock(mutex_);
     return changed_.wait_for(lock, 5s, [&] { return running_; });
   }
+  bool wait_runs(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, 5s, [&] { return runs_.size() >= count && running_; });
+  }
   std::vector<ComponentAction> runs() const {
     std::lock_guard lock(mutex_);
     return runs_;
@@ -135,6 +165,8 @@ class FakeAdapter final : public IComponentAdapter {
       Outcome(ActionOutcome::kFailed, Error("adapter_stopped", "stopped", "C2", "e-stop"));
   bool running_{};
   bool follows_{true};
+  bool shared_owner_recovery_{};
+  PreparedRecovery prepared_recovery_;
 };
 
 class Publications final {
@@ -190,6 +222,21 @@ struct Fixture {
 
 ActionResult Succeeded() { return Outcome(ActionOutcome::kSucceeded); }
 
+TEST(ComponentCoordinator, RecoverCannotSucceedWhileStopRemainsObserved) {
+  Fixture f;
+  auto stopped = Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+  stopped.stop = ComponentStop{StopCode::kEstop, "E-stop", "C2", std::nullopt, 0};
+  f.robot->set_state(std::move(stopped));
+  ASSERT_TRUE(f.coordinator.Submit("robot", ComponentAction::kRecover).ok());
+  ASSERT_TRUE(f.robot->wait_running());
+  f.robot->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(result->error);
+  EXPECT_EQ(result->error->code, "component_action_result_not_observed");
+}
+
 TEST(ComponentCoordinator, RunsAnActionAndKeepsItsResultAsLastAction) {
   Fixture f;
   f.clock.set(100);
@@ -211,10 +258,69 @@ TEST(ComponentCoordinator, RunsAnActionAndKeepsItsResultAsLastAction) {
   EXPECT_FALSE(f.coordinator.States()[0].action);
 }
 
+TEST(ComponentCoordinator, CloseAndDrainWaitsForActionAndRefusesNewActions) {
+  Fixture f;
+  ASSERT_TRUE(f.coordinator.Submit("robot", ComponentAction::kDisable).ok());
+  ASSERT_TRUE(f.robot->wait_running());
+  EXPECT_FALSE(f.coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 10ms));
+  const auto refused = f.coordinator.Submit("robot", ComponentAction::kPrepare);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_not_ready");
+  f.robot->finish(Succeeded());
+  EXPECT_TRUE(f.coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 2s));
+  EXPECT_TRUE(f.coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 2s));
+}
+
+TEST(ComponentCoordinator, DrainWaitsForPreparedRecoveryCaptureDestruction) {
+  struct Capture final {
+    std::promise<void>& entered;
+    std::shared_future<void> release;
+    ~Capture() { entered.set_value(); release.wait(); }
+  };
+  struct CaptureAdapter final : IComponentAdapter {
+    std::promise<void>& entered;
+    std::shared_future<void> release;
+    CaptureAdapter(std::promise<void>& entered_value, std::shared_future<void> release_value)
+        : entered(entered_value), release(std::move(release_value)) {}
+    ComponentState State(std::int64_t) const override {
+      return Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+    }
+    ActionResult Run(ComponentAction, std::stop_token) override { return Succeeded(); }
+    std::vector<Capability> capabilities() const override { return {}; }
+    PreparedRecovery PrepareSharedOwnerRecovery() const override {
+      auto capture = std::shared_ptr<Capture>(new Capture{entered, release});
+      return [capture = std::move(capture)](std::stop_token) {
+        static_cast<void>(capture);
+        return Succeeded();
+      };
+    }
+  };
+  FakeClock clock;
+  Publications publications;
+  ComponentCoordinator coordinator{clock, publications.sink()};
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  auto adapter = std::make_shared<CaptureAdapter>(entered, release.get_future().share());
+  static_cast<void>(coordinator.SetComponents({{"io", adapter}}));
+  const bool accepted = coordinator.Submit("io", ComponentAction::kRecover).ok();
+  const bool cleanup_entered = entered_future.wait_for(2s) == std::future_status::ready;
+  const bool drained_early = coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 10ms);
+  release.set_value();
+  const bool drained_after = coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 2s);
+  EXPECT_TRUE(accepted);
+  EXPECT_TRUE(cleanup_entered);
+  EXPECT_FALSE(drained_early);
+  EXPECT_TRUE(drained_after);
+}
+
 TEST(ComponentCoordinator, RunsOneActionAtATimePerComponent) {
   Fixture f;
+  std::vector<std::string> reserved;
   ASSERT_TRUE(f.coordinator.Submit("robot", ComponentAction::kPrepare).ok());
   ASSERT_TRUE(f.robot->wait_running());
+  EXPECT_EQ(f.coordinator.ReserveForApply({"gripper", "robot"}, reserved),
+            std::optional<std::string>("robot"));
 
   const auto refused = f.coordinator.Submit("robot", ComponentAction::kEnable);
   ASSERT_FALSE(refused.ok());
@@ -224,9 +330,50 @@ TEST(ComponentCoordinator, RunsOneActionAtATimePerComponent) {
 
   f.robot->finish(Succeeded());
   ASSERT_TRUE(f.publications.wait_last_action("robot"));
+  EXPECT_FALSE(f.coordinator.ReserveForApply({"robot"}, reserved).has_value());
+  f.coordinator.ReleaseApplyReservation(reserved);
   EXPECT_TRUE(f.coordinator.Submit("robot", ComponentAction::kEnable).ok());
   f.robot->finish(Succeeded());
   f.gripper->finish(Succeeded());
+}
+
+TEST(ComponentCoordinator, ApplyReservationBlocksOnlyAffectedAndSurvivesReplacement) {
+  Fixture f;
+  std::vector<std::string> reserved;
+  ASSERT_FALSE(f.coordinator.ReserveForApply({"robot"}, reserved).has_value());
+  const auto blocked = f.coordinator.Submit("robot", ComponentAction::kPrepare);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "component_action_in_progress");
+  ASSERT_TRUE(f.coordinator.Submit("gripper", ComponentAction::kPrepare).ok());
+  f.gripper->finish(Succeeded());
+  ASSERT_TRUE(f.publications.wait_last_action("gripper"));
+  auto replacement = std::make_shared<FakeAdapter>();
+  auto retired = f.coordinator.SetComponents({{"robot", replacement}, {"gripper", f.gripper}});
+  EXPECT_FALSE(f.coordinator.Submit("robot", ComponentAction::kPrepare).ok());
+  f.coordinator.ReleaseApplyReservation(reserved);
+  ASSERT_TRUE(f.coordinator.Submit("robot", ComponentAction::kPrepare).ok());
+  replacement->finish(Succeeded());
+  ASSERT_TRUE(f.publications.wait_last_action("robot"));
+}
+
+TEST(ComponentCoordinator, ReleasingApplyDoesNotClearAReservationForANewComponent) {
+  Fixture f;
+  std::vector<std::string> reserved;
+  ASSERT_FALSE(f.coordinator.ReserveForApply({"robot", "new"}, reserved));
+  ASSERT_EQ(reserved, (std::vector<std::string>{"robot"}));
+  auto added = std::make_shared<FakeAdapter>();
+  auto retired = f.coordinator.SetComponents({{"robot", f.robot}, {"gripper", f.gripper},
+                                               {"new", added}});
+  std::vector<std::string> other_reservation;
+  ASSERT_FALSE(f.coordinator.ReserveForApply({"new"}, other_reservation));
+  f.coordinator.ReleaseApplyReservation(reserved);
+  const auto blocked = f.coordinator.Submit("new", ComponentAction::kPrepare);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "component_action_in_progress");
+  f.coordinator.ReleaseApplyReservation(other_reservation);
+  ASSERT_TRUE(f.coordinator.Submit("new", ComponentAction::kPrepare).ok());
+  added->finish(Succeeded());
+  ASSERT_TRUE(f.publications.wait_last_action("new"));
 }
 
 TEST(ComponentCoordinator, StopInterruptsTheActionInProgress) {
@@ -279,7 +426,7 @@ TEST(ComponentCoordinator, RefusesUnsupportedActionsBeforeDispatch) {
   f.robot->finish(Succeeded());
 }
 
-// SIM-1 (RP-1b): a robot whose simulation isn't playing keeps its lifecycle
+// A robot whose simulation isn't playing keeps its lifecycle
 // with that reason; its position reset is refused before dispatch, its other
 // actions are not.
 TEST(ComponentCoordinator, RefusesAResetPositionWhileTheSimulationIsNotPlaying) {
@@ -401,14 +548,16 @@ TEST(ComponentCoordinator, RemovedActionsAreJoinedByTheCallerAfterItsLocks) {
     // wait for it here.
     removed = coordinator.SetComponents({});
     EXPECT_TRUE(coordinator.States().empty());
+    EXPECT_FALSE(coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 10ms));
   }
   ASSERT_EQ(removed.size(), 1U);
   EXPECT_TRUE(removed[0].joinable());
   removed.clear();  // the action ends; its result is dropped
+  EXPECT_TRUE(coordinator.CloseAndDrainActions(std::chrono::steady_clock::now() + 2s));
   EXPECT_TRUE(coordinator.States().empty());
 }
 
-/// CONTRACTS §16: a machine `lite6` with its arm and controller I/O members.
+/// A machine `lite6` with its arm and controller I/O members.
 struct MachineFixture {
   FakeClock clock;
   Publications publications;
@@ -425,9 +574,244 @@ struct MachineFixture {
   }
 };
 
+TEST(ComponentCoordinator, ApplyAndOwnerRecoverExcludeEachOtherForAffectedMember) {
+  MachineFixture f;
+  std::vector<std::string> reserved;
+  ASSERT_TRUE(f.coordinator.Submit("lite6", ComponentAction::kRecover).ok());
+  ASSERT_TRUE(f.owner->wait_running());
+  EXPECT_EQ(f.coordinator.ReserveForApply({"lite6_robot"}, reserved),
+            std::optional<std::string>("lite6_robot"));
+  f.owner->finish(Succeeded());
+  ASSERT_TRUE(f.publications.wait_last_action("lite6"));
+
+  ASSERT_FALSE(f.coordinator.ReserveForApply({"lite6_robot"}, reserved));
+  const auto blocked = f.coordinator.Submit("lite6", ComponentAction::kRecover);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "component_action_in_progress");
+  f.coordinator.ReleaseApplyReservation(reserved);
+  ASSERT_TRUE(f.coordinator.Submit("lite6", ComponentAction::kRecover).ok());
+  f.owner->finish(Succeeded());
+  ASSERT_TRUE(f.publications.wait_last_action("lite6"));
+}
+
 Fault EstopFault() {
   return Fault{FaultCode::kEstop, "e-stop pressed", true, FaultOperatorAction::kRecover,
                "C2", "emergency IO", {"lite6_robot", "lite6_io"}, 0};
+}
+
+TEST(ComponentCoordinator, RecoveryPreflightReadsMemberCauseWithoutOwnerMask) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  Fault member_fault{FaultCode::kStreamStale, "measured joints stale", true,
+                     FaultOperatorAction::kRecover, std::nullopt, std::nullopt, {}, 0};
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, member_fault));
+  f.coordinator.Refresh();
+  ASSERT_FALSE(f.publications.last()[1].fault);
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok()) << preflight.error().message;
+  ASSERT_TRUE(preflight.value().owner);
+  ASSERT_TRUE(preflight.value().owner->fault);
+  EXPECT_EQ(preflight.value().owner->fault->vendor_code, std::optional<std::string>("C2"));
+  ASSERT_TRUE(preflight.value().member.fault);
+  EXPECT_EQ(preflight.value().member.fault->code, FaultCode::kStreamStale);
+  EXPECT_EQ(RecoveryFact(preflight.value().owner.value()).eligibility, "recover");
+  EXPECT_EQ(RecoveryFact(preflight.value().member).eligibility, "recover");
+  EXPECT_TRUE(f.owner->runs().empty());
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
+TEST(ComponentCoordinator, RecoveryFactsExcludeSimulatorAndUnknownState) {
+  auto state = Observed(ComponentLifecycle::kOffline, ComponentActivity::kUnknown);
+  state.component_id = "sim";
+  EXPECT_EQ(RecoveryFact(state).eligibility, "unknown");
+  state.capabilities = {Capability::kSimReset};
+  EXPECT_EQ(RecoveryFact(state).eligibility, "excluded");
+  state.capabilities.clear();
+  state.lifecycle = ComponentLifecycle::kFault;
+  state.fault = EstopFault();
+  state.fault->clearable = false;
+  EXPECT_EQ(RecoveryFact(state).eligibility, "blocked");
+  state.fault->clearable = true;
+  state.stop = ComponentStop{StopCode::kEstop, "E-stop", "C2", std::nullopt, 0};
+  const auto both = RecoveryFact(state);
+  EXPECT_EQ(both.eligibility, "recover");
+  EXPECT_EQ(both.stop_code, std::optional<std::string>("estop"));
+  EXPECT_EQ(both.stop_vendor_code, std::optional<std::string>("C2"));
+}
+
+TEST(ComponentCoordinator, ConfirmedRecoveryEnableRunsOrderedPhasesOnce) {
+  MachineFixture f;
+  std::vector<std::string> reserved;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  Fault fault{FaultCode::kStreamStale, "stale", true, FaultOperatorAction::kRecover,
+              std::nullopt, std::nullopt, {}, 0};
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, fault));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  std::atomic<bool> resnapshotted{false};
+  const auto accepted = f.coordinator.SubmitRecoveryEnable(
+      "lite6_robot", confirmed, [] { return true; }, [&] { resnapshotted.store(true); return true; });
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  EXPECT_EQ(f.coordinator.ReserveForApply({"lite6"}, reserved), std::optional<std::string>("lite6"));
+  EXPECT_EQ(f.coordinator.ReserveForApply({"lite6_robot"}, reserved), std::optional<std::string>("lite6_robot"));
+  f.owner->finish(Succeeded());
+  ASSERT_TRUE(f.arm->wait_runs(1));
+  f.arm->finish(Succeeded());
+  ASSERT_TRUE(f.arm->wait_runs(2));
+  f.arm->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(resnapshotted.load());
+  EXPECT_EQ(result->started_at_ns, accepted.value().started_at_ns);
+  EXPECT_EQ(result->outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(result->phases.size(), 3U);
+  EXPECT_EQ(result->phases[0].component_id, "lite6");
+  EXPECT_EQ(result->phases[0].action, ComponentAction::kRecover);
+  EXPECT_EQ(result->phases[1].action, ComponentAction::kRecover);
+  EXPECT_EQ(result->phases[2].action, ComponentAction::kEnable);
+  EXPECT_EQ(f.owner->runs().size(), 1U);
+  EXPECT_EQ(f.arm->runs().size(), 2U);
+}
+
+TEST(ComponentCoordinator, ChangedPublicationAfterOwnerRecoverStopsBeforeMember) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  ASSERT_TRUE(f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; },
+                                               [] { return false; }).ok());
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  f.owner->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(result->error);
+  EXPECT_EQ(result->error->code, "stale_generation");
+  ASSERT_EQ(result->phases.size(), 1U);
+  EXPECT_EQ(result->phases.front().outcome, ActionOutcome::kSucceeded);
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
+TEST(ComponentCoordinator, UnknownOwnerRecoveryNeverEnablesMember) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  ASSERT_TRUE(f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; }).ok());
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  f.owner->finish(Outcome(ActionOutcome::kUnknown));
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kUnknown);
+  ASSERT_EQ(result->phases.size(), 1U);
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
+TEST(ComponentCoordinator, PlainEnableRefusesAStoppedMachine) {
+  MachineFixture f;
+  auto stopped = Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+  stopped.stop = ComponentStop{StopCode::kEstop, "E-stop", "C2", std::nullopt, 0};
+  f.owner->set_state(std::move(stopped));
+  const auto accepted = f.coordinator.Submit("lite6_robot", ComponentAction::kEnable);
+  ASSERT_FALSE(accepted.ok());
+  EXPECT_EQ(accepted.error().code, "owner_estop_active");
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
+// 2026-11-08 (maintainer): an e-stop is normal: it gates motion only. A
+// member of a machine that reports one still prepares (Load works with the
+// e-stop pressed).
+TEST(ComponentCoordinator, AStoppedMachinesMemberStillPrepares) {
+  MachineFixture f;
+  auto stopped = Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+  stopped.stop = ComponentStop{StopCode::kEstop, "E-stop", "C2", std::nullopt, 0};
+  f.owner->set_state(std::move(stopped));
+  const auto accepted = f.coordinator.Submit("lite6_robot", ComponentAction::kPrepare);
+  EXPECT_TRUE(accepted.ok()) << accepted.error().code;
+}
+
+TEST(ComponentCoordinator, UnknownMemberCanEnableOnlyAfterOwnerRecoveryRevealsNoCause) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  f.arm->set_state(Observed(ComponentLifecycle::kOffline, ComponentActivity::kUnknown));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  ASSERT_EQ(confirmed.back().eligibility, "unknown");
+  ASSERT_TRUE(f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; }).ok());
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  f.arm->set_state(Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle));
+  f.owner->finish(Succeeded());
+  ASSERT_TRUE(f.arm->wait_runs(1));
+  EXPECT_EQ(f.arm->runs().front(), ComponentAction::kEnable);
+  f.arm->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(result->phases.size(), 2U);
+  EXPECT_EQ(result->phases[0].action, ComponentAction::kRecover);
+  EXPECT_EQ(result->phases[1].action, ComponentAction::kEnable);
+}
+
+TEST(ComponentCoordinator, CompositeRefusesWhileSiblingActionIsRunning) {
+  MachineFixture f;
+  ASSERT_TRUE(f.coordinator.Submit("lite6_io", ComponentAction::kEnable).ok());
+  ASSERT_TRUE(f.io->wait_running());
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  const auto accepted = f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; });
+  ASSERT_FALSE(accepted.ok());
+  EXPECT_EQ(accepted.error().code, "component_action_in_progress");
+  EXPECT_TRUE(f.arm->runs().empty());
+  f.io->finish(Succeeded());
+}
+
+TEST(ComponentCoordinator, ChangedMemberCauseAfterOwnerRecoveryNeverRunsMember) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  ASSERT_TRUE(f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; }).ok());
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  Fault changed{FaultCode::kStreamStale, "stale", true, FaultOperatorAction::kRecover,
+                std::nullopt, std::nullopt, {}, 0};
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, changed));
+  f.owner->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(result->error);
+  EXPECT_EQ(result->error->code, "stale_generation");
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
+TEST(ComponentCoordinator, MemberCauseClearedByOwnerRecoveryNeedsNoMemberRecover) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, EstopFault()));
+  Fault fault{FaultCode::kStreamStale, "stale", true, FaultOperatorAction::kRecover,
+              std::nullopt, std::nullopt, {}, 0};
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, fault));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  ASSERT_TRUE(f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; }).ok());
+  ASSERT_TRUE(f.owner->wait_runs(1));
+  f.arm->set_state(Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle));
+  f.owner->finish(Succeeded());
+  ASSERT_TRUE(f.arm->wait_runs(1));
+  EXPECT_EQ(f.arm->runs().front(), ComponentAction::kEnable);
+  f.arm->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(result->phases.size(), 2U);
+  EXPECT_EQ(result->phases[1].action, ComponentAction::kEnable);
 }
 
 TEST(ComponentCoordinator, MembersCarryTheirOwnerAndRole) {
@@ -498,6 +882,87 @@ TEST(ComponentCoordinator, MemberActionsWaitForAPreparedOwner) {
   f.owner->set_state(Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle));
   ASSERT_TRUE(f.coordinator.Submit("lite6_robot", ComponentAction::kEnable).ok());
   f.arm->finish(Succeeded());
+}
+
+TEST(ComponentCoordinator, SharedOwnerRecoverKeepsNormalActionBookkeeping) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kNotPrepared, ComponentActivity::kIdle));
+  const auto ordinary = f.coordinator.Submit("lite6_robot", ComponentAction::kRecover);
+  ASSERT_FALSE(ordinary.ok());
+  EXPECT_EQ(ordinary.error().code, "owner_not_prepared");
+
+  f.arm->set_shared_owner_recovery(true);
+  const auto enable = f.coordinator.Submit("lite6_robot", ComponentAction::kEnable);
+  ASSERT_FALSE(enable.ok());
+  EXPECT_EQ(enable.error().code, "owner_not_prepared");
+
+  const auto accepted = f.coordinator.Submit("lite6_robot", ComponentAction::kRecover);
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(f.arm->wait_running());
+  const auto duplicate = f.coordinator.Submit("lite6_robot", ComponentAction::kRecover);
+  ASSERT_FALSE(duplicate.ok());
+  EXPECT_EQ(duplicate.error().code, "component_action_in_progress");
+  f.arm->finish(Succeeded());
+  const auto result = f.publications.wait_last_action("lite6_robot");
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->action, ComponentAction::kRecover);
+  EXPECT_EQ(result->outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(result->started_at_ns, accepted.value().started_at_ns);
+  EXPECT_EQ(f.arm->runs(), std::vector{ComponentAction::kRecover});
+}
+
+TEST(ComponentCoordinator, SharedOwnerRecoverStillRequiresItsDeclaredOwner) {
+  MachineFixture f;
+  f.io->set_shared_owner_recovery(true);
+  static_cast<void>(f.coordinator.SetComponents({{"io", f.io, "missing", "io"}}));
+  const auto refused = f.coordinator.Submit("io", ComponentAction::kRecover);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "owner_not_prepared");
+  EXPECT_TRUE(f.io->runs().empty());
+}
+
+TEST(ComponentCoordinator, RecoverableSharedOwnerFaultRemainsVisibleOnItsMember) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kNotPrepared, ComponentActivity::kIdle));
+  auto fault = EstopFault();
+  fault.code = FaultCode::kProcessExited;
+  fault.message = "shared owner failed";
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, fault));
+  f.arm->set_shared_owner_recovery(true);
+  f.coordinator.Refresh();
+  auto states = f.publications.last();
+  ASSERT_EQ(states.size(), 3U);
+  EXPECT_EQ(states[1].lifecycle, ComponentLifecycle::kFault);
+  ASSERT_TRUE(states[1].fault);
+  EXPECT_EQ(states[1].fault->code, FaultCode::kProcessExited);
+  EXPECT_EQ(states[2].lifecycle, ComponentLifecycle::kOffline);
+
+  f.arm->set_shared_owner_recovery(false);
+  f.coordinator.Refresh();
+  states = f.publications.last();
+  EXPECT_EQ(states[1].lifecycle, ComponentLifecycle::kOffline);
+  EXPECT_FALSE(states[1].fault);
+}
+
+TEST(ComponentCoordinator, StalledMemberKeepsItsOwnFaultWhenOwnerIsAlsoStalled) {
+  MachineFixture f;
+  auto owner_fault = EstopFault();
+  owner_fault.code = FaultCode::kOwnerStalled;
+  owner_fault.message = "owner /machine stalled in task one";
+  auto member_fault = owner_fault;
+  member_fault.message = "owner /epoch stalled in task two";
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, owner_fault));
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, member_fault));
+  f.arm->set_shared_owner_recovery(false);
+  f.coordinator.Refresh();
+  const auto states = f.publications.last();
+  const auto arm = std::find_if(states.begin(), states.end(),
+      [](const auto &state) { return state.component_id == "lite6_robot"; });
+  ASSERT_NE(arm, states.end());
+  ASSERT_TRUE(arm->fault);
+  EXPECT_EQ(arm->lifecycle, ComponentLifecycle::kFault);
+  EXPECT_EQ(arm->fault->code, FaultCode::kOwnerStalled);
+  EXPECT_EQ(arm->fault->message, member_fault.message);
 }
 
 TEST(ComponentCoordinator, OwnersOfferNoEnableOrDisable) {
@@ -594,7 +1059,7 @@ TEST(ComponentCoordinator, AnOwnersPowerActionWaitsForItsMembersActions) {
   f.io->finish(Succeeded());
 }
 
-// CONTRACTS §6: an action's result is the component's state; the
+// An action's result is the component's state; the
 // coordinator publishes last_action together with that state.
 TEST(ComponentCoordinator, ASucceededActionIsPublishedWithItsResultingState) {
   Fixture f;
@@ -757,6 +1222,92 @@ TEST(CellLatchCauses, OfflineByTheOperatorsPowerActionIsNoCause) {
   const auto causes = cell_latch_causes({lost});
   ASSERT_EQ(causes.size(), 1U);
   EXPECT_EQ(causes[0].kind, CellLatchCauseKind::kOffline);
+}
+
+TEST(CellLatchCauses, SimResetCapabilityExemptsOnlyTheSimulatorState) {
+  for (const auto lifecycle : {ComponentLifecycle::kPrepared, ComponentLifecycle::kEnabled,
+                               ComponentLifecycle::kOffline, ComponentLifecycle::kFault}) {
+    SCOPED_TRACE(std::string(to_string(lifecycle)));
+    auto simulator = Observed(lifecycle, ComponentActivity::kUnknown);
+    simulator.component_id = "isaac_sim";
+    simulator.capabilities = {Capability::kSimReset};
+    if (lifecycle == ComponentLifecycle::kOffline)
+      simulator.reason = ComponentStateReason{"simulator_unreachable", "The simulator doesn't answer."};
+    if (lifecycle == ComponentLifecycle::kFault) {
+      Fault fault;
+      fault.code = FaultCode::kProcessExited;
+      fault.message = "The simulator process exited.";
+      simulator.fault = fault;
+    }
+    EXPECT_TRUE(latch_exempt(simulator, {simulator}));
+    EXPECT_TRUE(cell_latch_causes({simulator}).empty());
+  }
+  for (const auto* reason : {"simulation_paused", "simulation_stopped"}) {
+    auto simulator = Observed(ComponentLifecycle::kPrepared, ComponentActivity::kIdle);
+    simulator.component_id = "isaac_sim";
+    simulator.capabilities = {Capability::kSimReset};
+    simulator.reason = ComponentStateReason{reason, "The simulation isn't playing."};
+    EXPECT_TRUE(cell_latch_causes({simulator}).empty());
+  }
+
+  auto owner = Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle);
+  owner.component_id = "robot_owner";
+  owner.fault = EstopFault();
+  auto arm = Observed(ComponentLifecycle::kOffline, ComponentActivity::kIdle);
+  arm.component_id = "robot_arm";
+  arm.owner_id = "robot_owner";
+  arm.reason = ComponentStateReason{std::string(kOwnerUnavailableReason), "through robot_owner: C2"};
+  auto simulator = Observed(ComponentLifecycle::kOffline, ComponentActivity::kIdle);
+  simulator.component_id = "isaac_sim";
+  simulator.capabilities = {Capability::kSimReset};
+  simulator.reason = ComponentStateReason{"simulator_unreachable", "The simulator doesn't answer."};
+
+  const std::vector states{simulator, arm, owner};
+  EXPECT_TRUE(latch_exempt(simulator, states));
+  EXPECT_FALSE(latch_exempt(arm, states));
+  const auto causes = cell_latch_causes(states);
+  ASSERT_EQ(causes.size(), 1U);
+  EXPECT_EQ(causes[0].component_id, "robot_owner");
+  EXPECT_EQ(causes[0].kind, CellLatchCauseKind::kFault);
+}
+
+TEST(CellLatchCauses, SimulatorExemptionDoesNotExemptOtherMembersOfSharedOwner) {
+  for (const auto lifecycle : {ComponentLifecycle::kFault,
+                               ComponentLifecycle::kOffline}) {
+    SCOPED_TRACE(std::string(to_string(lifecycle)));
+    auto owner = Observed(lifecycle, ComponentActivity::kIdle);
+    owner.component_id = "robot_owner";
+    if (lifecycle == ComponentLifecycle::kFault) {
+      owner.fault = EstopFault();
+    } else {
+      owner.reason = ComponentStateReason{"process_exited", "The owner exited."};
+    }
+
+    auto simulator = Observed(ComponentLifecycle::kOffline,
+                              ComponentActivity::kIdle);
+    simulator.component_id = "isaac_sim";
+    simulator.owner_id = owner.component_id;
+    simulator.capabilities = {Capability::kSimReset};
+    simulator.reason = ComponentStateReason{
+        std::string(kOwnerUnavailableReason), "through robot_owner: unavailable"};
+
+    auto arm = Observed(ComponentLifecycle::kOffline, ComponentActivity::kIdle);
+    arm.component_id = "isaac_arm";
+    arm.owner_id = owner.component_id;
+    arm.reason = ComponentStateReason{
+        std::string(kOwnerUnavailableReason), "through robot_owner: unavailable"};
+
+    const std::vector states{simulator, arm, owner};
+    EXPECT_TRUE(latch_exempt(simulator, states));
+    EXPECT_FALSE(latch_exempt(arm, states));
+    const auto causes = cell_latch_causes(states);
+    ASSERT_EQ(causes.size(), 1U);
+    EXPECT_EQ(causes[0].component_id, "robot_owner");
+    EXPECT_EQ(causes[0].kind,
+              lifecycle == ComponentLifecycle::kFault
+                  ? CellLatchCauseKind::kFault
+                  : CellLatchCauseKind::kOffline);
+  }
 }
 
 TEST(ComponentCoordinator, MapsTheEightLifecycleStatesToFive) {

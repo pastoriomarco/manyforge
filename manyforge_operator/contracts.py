@@ -1,13 +1,13 @@
-"""Frozen O1.2 operator-launch machine contracts for ManyForge.
+"""Frozen operator-launch machine contracts for ManyForge.
 
-This module is the strict, side-effect-free contract layer of the O1
+This module is the strict, side-effect-free contract layer of the
 operator-launch correction: bounded identity, configuration, status, and
 command DTOs plus the pure lifecycle and start decisions.  It records
 machine facts only.  It owns no runtime semantics and performs no I/O:
 no launcher, persistence, subprocess, container, socket, HTTP, timing,
 or process-inspection behavior lives here.  Manager, Headless, Program
 runner, Kernel, provider, and simulator adapters retain their qualified
-semantic ownership; the common orchestration (O1.3+) consumes these DTOs
+semantic ownership; the common orchestration consumes these DTOs
 and owns locking, persistence, and exact fallback policy.
 """
 
@@ -249,7 +249,7 @@ def _bounded_install_root(value: str, *, label: str) -> str:
 
 
 class StrictOperatorContract(BaseModel):
-    """Frozen, strict, extra-forbidding base for O1.2 operator DTOs."""
+    """Frozen, strict, extra-forbidding base for operator DTOs."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
@@ -268,10 +268,10 @@ def source_identity_fingerprint(
 ) -> str:
     """Frame and hash one ``manyforge.source_identity.v1`` identity.
 
-    The framing is byte-identical to the live qualification collector
-    (``scripts/qualification/source_identity.py``) so the product-side
-    validator accepts exactly the identities that collector mints.  Only
-    this small framing is reused; the collector's Git walk is deliberately
+    The framing is byte-identical to the source identity helper
+    (``scripts/lib/source_identity.py``) so the product-side
+    validator accepts exactly the identities that helper mints.  Only
+    this small framing is reused; the helper's Git walk is deliberately
     not imported or duplicated here.
     """
     digest = hashlib.sha256()
@@ -1107,9 +1107,9 @@ def _as_instance_state(
 
 def can_transition(
     previous: LaunchInstanceState | str,
-    next: LaunchInstanceState | str,  # noqa: A002 - frozen O1.2 signature
+    next: LaunchInstanceState | str,  # noqa: A002 - frozen signature
 ) -> bool:
-    """Pure lifecycle gate for the O1 operator-launch state machine.
+    """Pure lifecycle gate for the operator-launch state machine.
 
     Self-transitions are always permitted.  ``stopping -> stopped`` is
     only lawful when the status DTO proves every recorded resource
@@ -1223,7 +1223,7 @@ def _contract_vocabulary() -> dict[str, Any]:
 
 
 def operator_launch_contract_schema() -> dict[str, Any]:
-    """Return the closed, deterministic O1.2 operator-launch JSON Schema.
+    """Return the closed, deterministic operator-launch JSON Schema.
 
     One TypeAdapter emits the complete discriminated document graph, so
     its top-level ``oneOf``, discriminator, definitions, and local refs

@@ -65,7 +65,7 @@ class IIoSignalService {
   virtual Result<std::optional<TimePoint>> NextRuleExpiry() const {
     return Result<std::optional<TimePoint>>::Err(RuleUnsupported());
   }
-  /// CONTRACTS §7: clears one output's core-held `changed_outside` signal
+  /// Clears one output's core-held `changed_outside` signal
   /// (node `io.clear_outside_change`); refused for an output without it.
   virtual Result<void> ClearOutsideChange(const IoSignalId&) {
     return Result<void>::Err(ChangedOutsideUnsupported());

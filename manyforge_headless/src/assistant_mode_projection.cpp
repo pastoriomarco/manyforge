@@ -63,7 +63,7 @@ CanonicalValue ModelRequestContract(
   for (const auto transport : contract.supported_image_transports) {
     transports.emplace_back(std::string(core::to_string(transport)));
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"default_timeout_s", CanonicalValue(contract.default_timeout_s)},
       {"max_output_tokens", CanonicalValue(static_cast<double>(contract.max_output_tokens))},
       {"supported_image_transports", CanonicalValue(std::move(transports))},
@@ -72,26 +72,37 @@ CanonicalValue ModelRequestContract(
       {"supports_response_tools", CanonicalValue(contract.supports_response_tools)},
       {"tool_call_family",
        CanonicalValue(std::string(core::to_string(contract.tool_call_family)))},
-  });
-}
-
-CanonicalValue InputSchema(const core::AssistantToolDescriptorDTO& tool) {
-  try {
-    return deployment::parse_strict_json_model_yaml(tool.canonical_input_schema).root();
-  } catch (const std::exception& error) {
-    Fail("assistant_mode_projection_invalid",
-         "build-qualified input schema failed strict decoding for " + tool.tool_id + ": " +
-             error.what());
+  };
+  if (contract.reasoning.has_value()) {
+    // EXPERIMENTAL: the model server's reasoning (thinking) switch. The
+    // object constructor puts members in canonical order.
+    result.emplace_back("reasoning",
+                        CanonicalValue(std::string(*contract.reasoning ? "on" : "off")));
   }
+  if (contract.sampling.has_value()) {
+    // Only the set fields; the bridge sends exactly these upstream.
+    CanonicalValue::Object sampling;
+    if (contract.sampling->temperature.has_value()) {
+      sampling.emplace_back("temperature", CanonicalValue(*contract.sampling->temperature));
+    }
+    if (contract.sampling->top_k.has_value()) {
+      sampling.emplace_back("top_k", CanonicalValue(static_cast<double>(*contract.sampling->top_k)));
+    }
+    if (contract.sampling->top_p.has_value()) {
+      sampling.emplace_back("top_p", CanonicalValue(*contract.sampling->top_p));
+    }
+    result.emplace_back("sampling", CanonicalValue(std::move(sampling)));
+  }
+  return CanonicalValue(std::move(result));
 }
 
-deployment::QualifiedAssistantSettings VerifyAssistantSettings(
+/// The verified assistant settings, or none when the bundle has none.
+std::optional<deployment::QualifiedAssistantSettings> VerifyAssistantSettings(
     const deployment::RetainedBundle& active_bundle) {
   const auto& bundle = active_bundle.value();
   const auto* retained_assistant = active_bundle.normalized_root().find_object_member("assistant");
   if (retained_assistant == nullptr || !bundle.assistant.has_value()) {
-    Fail("assistant_mode_projection_unavailable",
-         "the selected bundle has no assistant projection");
+    return std::nullopt;
   }
   try {
     return deployment::verify_retained_assistant_projection(*retained_assistant);
@@ -100,6 +111,23 @@ deployment::QualifiedAssistantSettings VerifyAssistantSettings(
          "retained assistant settings failed independent verification: " +
              std::string(error.what()));
   }
+}
+
+/// Whether the bundle has an assistant component: it provides the chat's
+/// `assistant.bridge.request`.
+bool HasAssistantComponent(const deployment::RetainedBundle& active_bundle) {
+  const auto& bindings = active_bundle.value().capability_provider_bindings;
+  return std::any_of(bindings.begin(), bindings.end(), [](const auto& binding) {
+    return binding.capability_id.value() == "assistant.bridge.request";
+  });
+}
+
+CanonicalValue RunsIn(const core::AssistantModeDTO& mode) {
+  CanonicalValue::Array result;
+  for (const auto state : mode.runs_in) {
+    result.emplace_back(std::string(core::to_string(state)));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 /// The AI model component serving one model alias: the row named by the
@@ -124,7 +152,11 @@ std::optional<deployment::RetainedAiModelConfiguration> AiModel(
 CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bundle,
                                     const std::string_view mode_id) {
   const auto& bundle = active_bundle.value();
-  const auto qualified = VerifyAssistantSettings(active_bundle);
+  const auto verified = VerifyAssistantSettings(active_bundle);
+  if (!verified.has_value() || !HasAssistantComponent(active_bundle)) {
+    Fail("assistant_component_absent", "the selected bundle has no assistant component");
+  }
+  const auto& qualified = *verified;
   const auto& settings = qualified.value();
   const auto* mode = Find(settings.modes, mode_id,
                           [](const auto& row) -> const std::string& { return row.mode_id; });
@@ -136,13 +168,10 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
          "the requested mode is disabled in the selected bundle");
   }
 
-  const auto* provider =
-      Find(settings.provider_aliases, mode->provider_alias,
-           [](const auto& row) -> const std::string& { return row.provider_alias; });
   const auto* model =
       Find(settings.model_endpoint_aliases, mode->model_endpoint_alias,
            [](const auto& row) -> const std::string& { return row.model_endpoint_alias; });
-  if (provider == nullptr || model == nullptr) {
+  if (model == nullptr) {
     Fail("assistant_mode_projection_invalid",
          "verified mode aliases are not closed over retained settings");
   }
@@ -163,24 +192,8 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
     }
     visible_tool_ids.insert(tool_id);
     tools.emplace_back(CanonicalValue::Object{
-        {"description", CanonicalValue(tool->description)},
         {"effect", CanonicalValue(std::string(core::to_string(tool->effect)))},
-        {"input_schema", InputSchema(*tool)},
-        {"input_schema_hash", CanonicalValue(tool->input_schema_digest.value())},
         {"tool_id", CanonicalValue(tool->tool_id)},
-    });
-  }
-
-  CanonicalValue::Array nodes;
-  nodes.reserve(mode->catalog.node_ids.size());
-  for (const auto& node_id : mode->catalog.node_ids) {
-    const auto* node = Find(registry.nodes, node_id,
-                            [](const auto& row) -> const std::string& { return row.node_id; });
-    if (node == nullptr) {
-      Fail("assistant_mode_projection_invalid", "verified mode names an absent node");
-    }
-    nodes.emplace_back(CanonicalValue::Object{
-        {"node_id", CanonicalValue(node->node_id)},
     });
   }
 
@@ -205,25 +218,16 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
     });
   }
 
-  const auto grant_policy = GrantPolicy(mode->grant_policy);
-  const CanonicalValue catalog(CanonicalValue::Object{
-      {"grant_policy", grant_policy},
-      {"mode", CanonicalValue(mode->mode_id)},
-      {"nodes", CanonicalValue(nodes)},
-      {"skills", CanonicalValue(skills)},
-      {"tools", CanonicalValue(tools)},
-  });
-  const auto catalog_hash = content_identity::framed_sha256(
-      "assistant-mode-catalog", kAssistantModeCatalogApiVersion, catalog);
   const auto& environment = bundle.catalogs.node_environment;
 
   CanonicalValue result(CanonicalValue::Object{
+      {"assistant_component_id", CanonicalValue(mode->assistant_component_id)},
       {"assistant_projection_digest", CanonicalValue(qualified.projection_digest().value())},
-      {"catalog_hash", CanonicalValue(catalog_hash)},
+      {"compact_history", CanonicalValue(mode->compact_history)},
+      {"constrained_regeneration", CanonicalValue(mode->constrained_regeneration)},
       {"description", CanonicalValue(mode->description)},
-      {"grant_policy", grant_policy},
+      {"grant_policy", GrantPolicy(mode->grant_policy)},
       {"graph_revision", CanonicalValue(bundle.cell_graph.graph_revision.value())},
-      {"instrument_registry_digest", CanonicalValue(registry.registry_digest.value())},
       {"mode", CanonicalValue(mode->mode_id)},
       {"model_endpoint",
        CanonicalValue(CanonicalValue::Object{
@@ -244,15 +248,11 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
            {"content_version", CanonicalValue(environment.content_version)},
            {"environment_digest", CanonicalValue(environment.environment_digest.value())},
        })},
-      {"nodes", CanonicalValue(std::move(nodes))},
-      {"provider",
-       CanonicalValue(CanonicalValue::Object{
-           {"provider_alias", CanonicalValue(provider->provider_alias)},
-           {"provider_kind", CanonicalValue(std::string(core::to_string(provider->provider_kind)))},
-       })},
       {"retained_bundle_id", CanonicalValue(active_bundle.retained_bundle_id().value())},
+      {"runs_in", RunsIn(*mode)},
       {"schema_version", CanonicalValue(std::string(kAssistantModeProjectionApiVersion))},
       {"skills", CanonicalValue(std::move(skills))},
+      {"stuck_loop_recovery", CanonicalValue(mode->stuck_loop_recovery)},
       {"tools", CanonicalValue(std::move(tools))},
   });
   if (content_identity::canonical_json(result).size() > kMaximumAssistantModeProjectionBytes) {
@@ -263,39 +263,48 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
 
 CanonicalValue ProjectAssistantModeIndex(const deployment::RetainedBundle& active_bundle) {
   const auto& bundle = active_bundle.value();
-  const auto qualified = VerifyAssistantSettings(active_bundle);
-  const auto& settings = qualified.value();
+  const auto verified = VerifyAssistantSettings(active_bundle);
+  // Without an assistant component the index has no mode.
+  const bool chat = verified.has_value() && HasAssistantComponent(active_bundle);
 
   CanonicalValue::Array modes;
-  modes.reserve(settings.modes.size());
-  for (const auto& mode : settings.modes) {
-    if (!mode.enabled) {
-      continue;
+  std::optional<std::string> assistant_component_id;
+  if (chat) {
+    for (const auto& mode : verified->value().modes) {
+      if (!mode.enabled) {
+        continue;
+      }
+      assistant_component_id = mode.assistant_component_id;
+      modes.emplace_back(CanonicalValue::Object{
+          {"description", CanonicalValue(mode.description)},
+          {"grant_policy", GrantPolicy(mode.grant_policy)},
+          {"mode", CanonicalValue(mode.mode_id)},
+          {"runs_in", RunsIn(mode)},
+      });
     }
-    modes.emplace_back(CanonicalValue::Object{
-        {"description", CanonicalValue(mode.description)},
-        {"grant_policy", GrantPolicy(mode.grant_policy)},
-        {"mode", CanonicalValue(mode.mode_id)},
-    });
   }
 
   const auto& environment = bundle.catalogs.node_environment;
   // The chat alias's component, when the bundle retains it.
-  const auto* chat = Find(settings.model_endpoint_aliases, "assistant_model",
-                          [](const auto& row) -> const std::string& {
-                            return row.model_endpoint_alias;
-                          });
-  const auto ai_model =
-      chat == nullptr ? std::optional<deployment::RetainedAiModelConfiguration>{}
-                      : AiModel(active_bundle, *chat);
+  const auto* chat_alias =
+      verified.has_value()
+          ? Find(verified->value().model_endpoint_aliases, "assistant_model",
+                 [](const auto& row) -> const std::string& { return row.model_endpoint_alias; })
+          : nullptr;
+  const auto ai_model = chat_alias == nullptr
+                            ? std::optional<deployment::RetainedAiModelConfiguration>{}
+                            : AiModel(active_bundle, *chat_alias);
   CanonicalValue result(CanonicalValue::Object{
       {"ai_model_component_id",
        ai_model.has_value() ? CanonicalValue(ai_model->controllable_component_id.value())
                             : CanonicalValue(nullptr)},
-      {"assistant_projection_digest", CanonicalValue(qualified.projection_digest().value())},
+      {"assistant_component_id", assistant_component_id.has_value()
+                                     ? CanonicalValue(*assistant_component_id)
+                                     : CanonicalValue(nullptr)},
+      {"assistant_projection_digest",
+       verified.has_value() ? CanonicalValue(verified->projection_digest().value())
+                            : CanonicalValue(nullptr)},
       {"graph_revision", CanonicalValue(bundle.cell_graph.graph_revision.value())},
-      {"instrument_registry_digest",
-       CanonicalValue(qualified.instruments().registry_digest.value())},
       {"modes", CanonicalValue(std::move(modes))},
       {"node_environment",
        CanonicalValue(CanonicalValue::Object{

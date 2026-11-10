@@ -16,6 +16,8 @@
 
 #include <array>
 #include <chrono>
+#include <memory>
+#include <mutex>
 #include <stop_token>
 #include <string_view>
 
@@ -29,6 +31,7 @@
 #include <xarm_msgs/srv/set_tcp_load.hpp>
 
 #include <manyforge_xarm_control/contract.hpp>
+#include <manyforge_xarm_control/xarm_ros_owner.hpp>
 
 namespace manyforge::xarm_control {
 
@@ -37,7 +40,8 @@ namespace manyforge::xarm_control {
 /// answer on the node's executor; a call blocks its caller only.
 class XArmDriverServices final : public IXArmDriver {
 public:
-  XArmDriverServices(rclcpp::Node &node, std::string_view driver_namespace);
+  XArmDriverServices(rclcpp::Node &node, std::string_view driver_namespace,
+                     const XArmRosOwner *ros_owner = nullptr);
 
   [[nodiscard]] XArmServiceCallResult CleanError(std::chrono::nanoseconds timeout,
                                                  std::stop_token cancellation) const override;
@@ -61,7 +65,15 @@ public:
   [[nodiscard]] XArmServiceCallResult SystemControl(int value, std::chrono::nanoseconds timeout,
                                                     std::stop_token cancellation) const override;
 
+  /// Preserve this driver object's identity while rebinding all clients.
+  void SwapRosState(XArmDriverServices &replacement) noexcept;
+
 private:
+  template <class T> std::shared_ptr<T> Snapshot(const std::shared_ptr<T> &client) const {
+    std::lock_guard lock(mutex_);
+    return client;
+  }
+  mutable std::mutex mutex_;
   rclcpp::Logger logger_;
   rclcpp::Client<xarm_msgs::srv::Call>::SharedPtr clean_error_;
   rclcpp::Client<xarm_msgs::srv::Call>::SharedPtr clean_warn_;

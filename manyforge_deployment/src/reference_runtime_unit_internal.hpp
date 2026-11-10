@@ -52,7 +52,7 @@ inline constexpr std::size_t kMaxReferenceRuntimeLaunchableBytes = 4U * 1024U;
 
 /// Fixed qualification process artifact consumed by the selected adapter.
 ///
-/// This is a real bounded POSIX-shell process contract used to qualify I4
+/// This is a real bounded POSIX-shell process contract used to qualify
 /// lifecycle mechanics. It is not a planner, robot owner, or supported lane.
 [[nodiscard]] const std::string& reference_runtime_launchable_script();
 
@@ -72,7 +72,7 @@ inline constexpr std::size_t kMaxReferenceRuntimeLaunchableBytes = 4U * 1024U;
 [[nodiscard]] CanonicalValue parse_and_verify_reference_runtime_manifest(
     std::string_view canonical_bytes);
 
-/// Require exact equality with the projection derived from final I2 IR.
+/// Require exact equality with the projection derived from final compiler IR.
 void require_reference_runtime_manifest_matches(std::string_view canonical_bytes,
                                                 const CompilerQualifiedCellIr& compiler_ir,
                                                 const core::RuntimeUnitId& runtime_unit_id);

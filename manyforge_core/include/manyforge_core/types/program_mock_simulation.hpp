@@ -8,8 +8,8 @@
 
 namespace manyforge::core {
 
-/// Node-local literal simulation data. These portable roles never assert a
-/// physical signal identity. Mock providers publish the values unconditionally;
+/// Node-local literal simulation data. The direct reference is checked against
+/// the sealed Program and retained signal descriptor. Mock providers publish the values unconditionally;
 /// no provider evaluates a condition or selects an expected/trip value.
 struct ProgramMockSimulationChangeDTO final {
   std::uint64_t after_ms;
@@ -18,8 +18,7 @@ struct ProgramMockSimulationChangeDTO final {
                          const ProgramMockSimulationChangeDTO&) = default;
 };
 struct ProgramMockSimulationSignalDTO final {
-  TargetRoleId target_role_id;
-  ResourceRoleId resource_role_id;
+  ProgramSignalReferenceDTO signal;
   bool start_value;
   std::optional<ProgramMockSimulationChangeDTO> change;
   friend bool operator==(const ProgramMockSimulationSignalDTO&,
@@ -81,8 +80,7 @@ enum class ProgramMockSimulationSignalDisposition : std::uint8_t {
   kInactive,
 };
 struct ProgramMockSimulationSignalReceiptDTO final {
-  TargetRoleId target_role_id;
-  ResourceRoleId resource_role_id;
+  ProgramSignalReferenceDTO signal;
   ProgramMockSimulationSignalDisposition disposition;
   friend bool operator==(const ProgramMockSimulationSignalReceiptDTO&,
                          const ProgramMockSimulationSignalReceiptDTO&) = default;
