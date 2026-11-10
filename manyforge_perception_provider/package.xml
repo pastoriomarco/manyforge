@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>manyforge_perception_provider</name>
-  <version>0.2.0</version>
+  <version>0.2.1</version>
   <description>Request-driven single-owner multi-instance pose provider.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>

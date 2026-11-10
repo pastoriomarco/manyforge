@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_program_runner"
-version = "0.2.0"
+version = "0.2.1"
 description = "Independently restartable ManyForge Program orchestration owner"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]

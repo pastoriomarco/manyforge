@@ -62,8 +62,8 @@ GitHub Actions runs in two tiers. Superseded runs on the same ref are cancelled.
   `manyforge-local`. It starts on release tags and on demand only, never on
   pull requests.
 
-The ROS-backed TSan job in `local-ci` is staged with an explicit hold until
-the v0.2.1 workflows are re-enabled. It runs the ROS execution backend,
+The ROS-backed TSan job in `local-ci` is staged with an explicit hold; a later
+release removes it after one manual run on the local runner. It runs the ROS execution backend,
 gripper backend, kernel-stop integration and retained-runtime-handle binaries
 once each in separate processes, without suppressions. For each TSan report,
 the first relevant frame in each conflicting access and allocation stack is
@@ -94,10 +94,11 @@ without explicit authorization.
 3. Check the companion pins: the xArm driver fork commit
    (`XARM_SOURCE_COMMIT` in `Dockerfile.ros-lyrical-full`, the same commit in
    `manyforge_xarm_control/vendor/driver.yaml`) is on the fork's
-   `lyrical-no-gazebo` branch. For `v0.2.0`:
-   `46aa1147d99963a8357b89744633db428746667b`.
+   `lyrical-no-gazebo` branch. For `v0.2.1`:
+   `3654c9afef9c51c3bd6723d65ccecca166bc38b0`.
 4. Run the applicable gates, squash-merge `dev` into `main` and tag
-   `vX.Y.Z` (for this release `v0.2.0`; `v0.1.0` is `main` at `8ae05265`).
+   `vX.Y.Z` (for this release `v0.2.1`; `v0.2.0` is `main` at `3cc3e5d5`,
+   `v0.1.0` is `main` at `8ae05265`).
 5. Tag the maintainer's private specification repository with the same `vX.Y.Z`
    at the commit that matches the release.
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_deployment VERSION 0.2.0 LANGUAGES CXX)
+project(manyforge_deployment VERSION 0.2.1 LANGUAGES CXX)
 
 if(CMAKE_CONFIGURATION_TYPES)
   message(FATAL_ERROR

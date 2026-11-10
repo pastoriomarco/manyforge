@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>manyforge_ros_bringup</name>
-  <version>0.2.0</version>
+  <version>0.2.1</version>
   <description>ROS 2 bringup helpers for ManyForge integration targets.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>

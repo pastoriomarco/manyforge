@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_operator"
-version = "0.2.0"
+version = "0.2.1"
 description = "ManyForge O1 operator contracts and native operator-launch boundary"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]

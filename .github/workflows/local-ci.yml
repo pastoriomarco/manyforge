@@ -154,8 +154,8 @@ jobs:
               bash -lc 'rm -rf /target' 2>/dev/null || rm -rf "${worktree}"
           fi
 
-  # OD-25 is staged for the cumulative gate; remove this explicit hold when
-  # the v0.2.1 workflows are re-enabled before the PR.
+  # OD-25 is staged for the cumulative gate; remove this explicit hold in a
+  # later release, after one manual run of this job on the local runner.
   ros-backed-tsan:
     name: ROS-backed ThreadSanitizer
     if: ${{ false }}

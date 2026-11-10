@@ -189,7 +189,7 @@ def test_environment_digest_changes_when_covered_source_changes(
 def test_source_package_version_comes_from_project_metadata() -> None:
     assert (
         generate_builtin_node_environment_manifest().executable_packages[0].package_version
-        == "0.2.0"
+        == "0.2.1"
     )
 
 

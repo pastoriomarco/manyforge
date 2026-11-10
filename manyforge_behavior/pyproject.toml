@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_behavior"
-version = "0.2.0"
+version = "0.2.1"
 description = "ManyForge orchestration runner (py_trees-based)"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
 requires-python = ">=3.11"
 dependencies = [
-    "manyforge_example_nodes==0.2.0",
+    "manyforge_example_nodes==0.2.1",
     "py_trees==2.4.0",
     "pyyaml>=6.0",
     "rfc8785==0.1.4",

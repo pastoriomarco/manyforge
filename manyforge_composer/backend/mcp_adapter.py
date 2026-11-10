@@ -333,7 +333,7 @@ class ComposerMcpAdapter:
             for route in app.routes
             if isinstance(route, Route)
         }
-        server = Server("ManyForge", version="0.2.0")
+        server = Server("ManyForge", version="0.2.1")
         contracts = [types.Tool.model_validate(value) for value in tool_contracts(app)]
 
         @server.list_tools()

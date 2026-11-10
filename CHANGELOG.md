@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
-## Unreleased
+## 0.2.1 – 2026-11-10
+
+### Breaking changes
+
+- **The AI assistant is a Deployment component.** The chat bridge runs only as
+  the process of an `assistant` component that references an `ai_model`; the
+  workbench and operator launcher no longer start it, port 8100 and
+  Composer's `--assistant-bridge-url` are gone. A Deployment needs an
+  assistant component for the AI tab. See the assistant cookbook.
+- **Assistant formats:** `maintained_assistant_profiles.v2.json`,
+  `manyforge.assistant_mode_projection.v2`, `manyforge.assistant_mode_index.v2`,
+  `manyforge.assistant.bridge_health.v2`,
+  `manyforge.composer_assistant_profile_aliases.v2` and
+  `manyforge.retained_assistant.v3`. A Deployment applied by an earlier build
+  is refused until it is loaded again.
+- **Motion defaults bind by name.** A motion field inherits the Program
+  parameter of the same name; a renamed parameter (for example
+  `cycle_velocity`) is no longer a motion default.
+- **Component types without `.fixed_scale` variants**, a required
+  `runtime_scale` on every robot lane row, and the removed
+  `kernel.set_runtime_scale` node and `set_operation_runtime_scale` command.
+- **Removed Deployment keys:** `gripper_result_timeout_s` (lane) and
+  `delivery_result_timeout_s` (gripper target); a Deployment that sets them is
+  refused.
+- **Reference validation request** is
+  `manyforge.program_reference_validation_request.v3`.
+- **Error codes:** `response_rejected` and `composer_draft_stale` are retired
+  (an unknown assistant tool is the per-call `unknown_tool`; stale Drafts are
+  `composer_draft_revision_stale` or `composer_workspace_stale`).
 
 ### Added
 
@@ -162,7 +190,7 @@ formats; such changes are listed explicitly.
   prompt template. The palette, the AI assistant and Program validation
   derive it like any other capability; the palette reason
   `model_not_configured` is replaced by `capability_not_offered`.
-- Retained assistant settings are `manyforge.retained_assistant.v2`; a
+- Retained assistant settings are `manyforge.retained_assistant.v3`; a
   Deployment applied by an earlier build is refused until it is loaded again.
 - **A robot's lane row declares `runtime_scale: supported | unsupported`**
   (required in every robot `lanes.<lane>` row; a tool row has none): whether

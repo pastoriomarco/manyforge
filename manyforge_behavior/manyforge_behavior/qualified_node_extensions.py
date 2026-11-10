@@ -21,7 +21,7 @@ def descriptor():
     expected = {
         "api_version": "manyforge.node_extension.v1",
         "extension_id": PACKAGE_ID,
-        "version": "0.2.0",
+        "version": "0.2.1",
         "catalog_api_version": "manyforge.node_catalog.v3",
         "catalog_content_version": EXPECTED_CONTENT_VERSION,
         "dependencies": ["manyforge_behavior"],
