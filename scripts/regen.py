@@ -50,6 +50,7 @@ NODE_CATALOG = f"{BEHAVIOR}/resources/node_catalog.yaml"
 SCHEMA_ROOT = "manyforge_deployment/resources/closed_schema"
 ALARM_CATALOG = "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 SOURCES_CHECKER = "manyforge_deployment/tools/check_maintained_deployment_sources.py"
+NATIVE_BINDING_FIXTURE = "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 PROJECT_SNAPSHOTS = (
     (f"{BEHAVIOR}/pyproject.toml",
      f"{BEHAVIOR}/manyforge_behavior/_retained_source/manyforge_behavior.pyproject.toml"),
@@ -234,6 +235,20 @@ def step_catalog_pin(ctx: Context) -> None:
     if match is None or DIGEST.match(candidate) is None:
         raise RuntimeError("cannot read the catalog acceptance pin or candidate digest")
     repin(ctx, match.group(1), DIGEST.match(candidate).group(1))
+    # The native Binding fixture holds the catalog pins inside its own content
+    # identity, so its id moves with them.
+    import json  # noqa: PLC0415
+    from manyforge_behavior.canonical_artifact import compute_content_identity  # noqa: PLC0415
+
+    text = (ROOT / NATIVE_BINDING_FIXTURE).read_text(encoding="utf-8")
+    for old, new in ctx.pending.items():
+        text = text.replace(old, new)
+    binding = json.loads(text)
+    computed = compute_content_identity(
+        binding, own_field="program_binding_id", identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v3")
+    repin(ctx, DIGEST.match(binding["program_binding_id"]).group(1),
+          DIGEST.match(computed).group(1))
 
 
 def step_node_catalog(ctx: Context) -> None:

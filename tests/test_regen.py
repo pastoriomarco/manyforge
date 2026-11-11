@@ -122,3 +122,32 @@ def test_scenario_pins_refresh_v3_and_clear_stale_ready(tmp_path, monkeypatch):
     assert set(manifest["members"]) == {"program.yaml", "deployment.yaml"}
     assert manifest["saved_status"]["last_known_status"] == "unknown"
     assert not (project / "assignment.yaml").exists()
+
+
+def test_catalog_pin_reports_a_stale_native_binding_fixture_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from manyforge_behavior.canonical_artifact import compute_content_identity
+
+    regen = _module()
+    monkeypatch.setattr(regen, "ROOT", tmp_path)
+    monkeypatch.setattr(regen, "python", lambda *args, **kwargs: f"sha256:{OLD}\n")
+    catalog = tmp_path / regen.CATALOG_PY
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(f'EXPECTED_BUILTIN_CATALOG_DIGEST = (\n    "sha256:{OLD}"\n)\n')
+    binding = {"api_version": "manyforge.program_binding.v3",
+               "node_environment": {"catalog_digest": f"sha256:{OLD}"},
+               "program_binding_id": f"sha256:{'c' * 64}"}
+    fixture = tmp_path / regen.NATIVE_BINDING_FIXTURE
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(json.dumps(binding))
+    # The catalog pin is current; the fixture's own id is stale.
+    with pytest.raises(regen.Stale):
+        regen.step_catalog_pin(regen.Context(update=False, tools={}))
+    binding["program_binding_id"] = compute_content_identity(
+        binding, own_field="program_binding_id", identity_domain="program-binding-id",
+        api_version="manyforge.program_binding.v3")
+    fixture.write_text(json.dumps(binding))
+    regen.step_catalog_pin(regen.Context(update=False, tools={}))

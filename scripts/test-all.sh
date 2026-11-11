@@ -550,7 +550,8 @@ run_headless_python_tests() {
         return
     fi
     # The dual-robot cell is a ros2_control mock cell: its process tests need the
-    # ROS image and run in the `ros-e2e` suite, never here.
+    # ROS image and run in the `ros-e2e` suite, never here. The run gets its own
+    # ROS domain, as in that suite (Fast DDS #6599).
     if AMENT_PREFIX_PATH="$BUILD_DIR/roboplan/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
         MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
@@ -566,6 +567,8 @@ run_headless_python_tests() {
         MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host" \
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
         MANYFORGE_ROBOPLAN_FAKE_WORKER="$BUILD_DIR/roboplan/fake_process_candidate_worker" \
+        ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+        "/opt/ros/${ROS_DISTRO:-lyrical}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
