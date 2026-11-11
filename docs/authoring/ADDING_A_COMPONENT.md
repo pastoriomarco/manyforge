@@ -277,6 +277,9 @@ The per-instance fields of a Deployment signal (`controllable_component_id`,
 `command_target_id`, `resource_role_id`, `source_id`) are not part of the
 descriptor. Apply checks each provider's own fields.
 
+A `mock` input can be set by hand from the viewer's Tool & I/O panel while
+the cell runs; see [Setting a Mock input](INTERRUPTS.md#signals).
+
 **Health of a provider-form device.** Its ROS inputs (`ros_bool`,
 `ros2_control_gpio`) are watched for their senders: once an input topic has
 had a publisher, losing every publisher of all its ROS input topics is the

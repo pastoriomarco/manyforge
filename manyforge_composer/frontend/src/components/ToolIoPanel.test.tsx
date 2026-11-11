@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
+
 import { act } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { IoSignalReading } from '../api/parsers/ioSignals';
+import type { IoSignalBinding, IoSignalReading } from '../api/parsers/ioSignals';
 import {
   ioSignalBindingsAt,
   ioSignalBindingsFromProgramBinding,
@@ -11,7 +13,8 @@ import {
   type MockIoInputReceipt,
   type SystemSignalProjection,
 } from '../api/parsers/ioSignals';
-import type { ProgramBindingDocument } from '../types/api';
+import type { JsonValue, ProgramBindingDocument } from '../types/api';
+import { declaredIoInputs, declaredIoOutputs } from '../utils/ioSignalConfiguration';
 import type { CellState, ComponentState, SignalSample } from '../types/components';
 import { reactPropsHost } from '../test/reactPropsHost';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
@@ -333,6 +336,68 @@ describe('ToolIoPanel', () => {
     expect(renderToStaticMarkup(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1" />))
       .toContain('No applied Program binding');
     expect(ioSignalBindingsFromProgramBinding(binding)).toHaveLength(1);
+  });
+});
+
+describe('ToolIoPanel on a shipped Mock example', () => {
+  // The workspace exactly as the backend serves a loaded Scenario: its
+  // Deployment document carries no revision; the document comparison
+  // (run admission) says Draft equals Applied.
+  async function mount(document: Record<string, JsonValue>, bindings: IoSignalBinding[]) {
+    api.getWorkspace.mockResolvedValue({
+      draft: { deploymentRevision: null, document },
+      managerApplied: { deploymentRevision: REVISION },
+      runAdmission: { ready: true, reason: null },
+      binding: null,
+    });
+    const { host, find, all } = reactPropsHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(async () => {
+      root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1" ioSignalBindings={bindings}
+        controlSource={cellSource({ components: null, readiness: null, latch: { latched: false, causes: [] }, io: [] })} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+    return { root, find, all };
+  }
+
+  it.each([
+    'mock_lite6_light_curtain_rule',
+    'mock_lite6_io_nodes',
+    'mock_lite6_pneumatic_pick_and_place',
+    'mock_lite6_pneumatic_grasp_confirmation',
+    'mock_lite6_intervention_hold',
+  ])('offers the Mock toggle for every Mock input of %s', async (example) => {
+    const document = JSON.parse(readFileSync(
+      new URL(`../../../../examples/${example}.scenario/deployment.yaml`, import.meta.url), 'utf8',
+    )) as Record<string, JsonValue>;
+    const mockInputs = declaredIoInputs(document).filter((draft) => draft.profile === 'mock');
+    expect(mockInputs.length).toBeGreaterThan(0);
+    // The owner's io_signal_bindings rows for every declared signal: one row
+    // per controllable target, as the host publishes them.
+    const targets = new Map<string, IoSignalBinding>();
+    const rows = [
+      ...declaredIoInputs(document).map((draft) => ({ draft, direction: 'input' as const })),
+      ...declaredIoOutputs(document).map((draft) => ({ draft, direction: 'output' as const })),
+    ];
+    for (const { draft: { componentId, targetId, signalName }, direction } of rows) {
+      const key = JSON.stringify([componentId, targetId]);
+      const target = targets.get(key) ?? { programBindingId: BINDING_ID, componentId, commandTargetId: targetId, signals: [] };
+      target.signals.push({ componentId, signalName, valueType: 'bool', direction,
+        transitionCapability: 'sampled_only', signalDescriptorDigest: REVISION });
+      targets.set(key, target);
+    }
+    const { root, find, all } = await mount(document, [...targets.values()]);
+    try {
+      expect(all((props) => typeof props.children === 'string'
+        && props.children.startsWith('The Deployment Draft differs from Applied'))).toHaveLength(0);
+      for (const input of mockInputs) {
+        // No sample yet: the toggle offers true.
+        expect(find((props) => props['aria-label'] === `Set ${input.signalName} true`).disabled).toBe(false);
+      }
+    } finally {
+      await act(() => root.unmount());
+    }
   });
 });
 

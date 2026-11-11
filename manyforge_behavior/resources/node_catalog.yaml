@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v3
 content_version: 3.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:59fa3d425937116723fbb04ae19c8775fae761ae3061d5da5eac5f328889fef5
+catalog_digest: sha256:7794f5c2c483e713113143b08316b5dd5b70dfcdc10e5a6eaeea6fdc2c318797
 schema_types:
   tcp_selector:
     type: object
@@ -3625,7 +3625,11 @@ entries:
   category: gripper
   description: Reads the gripper target's current command state once and compares
     it with expected_state. Succeeds on a match and fails without waiting when the
-    state differs.
+    state differs. This is the state of the last gripper command, not proof that a
+    part is held. Reached means the controller reported the goal reached (position
+    gripper) or the valve output was delivered and the dwell elapsed (pneumatic gripper
+    with a valve output). A pneumatic gripper that is display-only or switches its
+    valves through mapped I/O has no command state; Apply refuses the node.
   stability: stable
   tags:
   - gripper
@@ -3695,7 +3699,11 @@ entries:
   category: gripper
   description: Waits until the captured gripper command reaches expected_state. Fails
     on timeout, when the command or its source is replaced or unavailable, or when
-    the command reports failed.
+    the command reports failed. This is the command state, not proof that a part is
+    held. Reached means the controller reported the goal reached (position gripper)
+    or the valve output was delivered and the dwell elapsed (pneumatic gripper with
+    a valve output). A pneumatic gripper that is display-only or switches its valves
+    through mapped I/O has no command state; Apply refuses the node.
   stability: stable
   tags:
   - gripper

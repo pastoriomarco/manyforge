@@ -473,7 +473,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
           refuse("current_route_unqualified", route.ok() ? nullptr : &route.error());
           return;
         }
-        representatives.push_back(physical);
+        // A gripper running as its own component: its current registrations
+        // are the command binding and its feedback alias.
+        for (const auto &registration : candidate.gripper_runtime->registrations())
+          representatives.push_back(registration.binding);
       }
       const auto resolved =
           composition.target_resolver->ResolveObservationTarget(
@@ -1047,10 +1050,16 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     const auto &binding = observed_binding.value();
     const auto* gripper_backend =
         selected.gripper_runtime ? selected.gripper_runtime->backend() : nullptr;
-    if (gripper_backend && gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
-            core::GripperActuationKind::kPneumatic)
-      return ErrorResponse("gripper_state_unavailable",
-          "Pneumatic finger coordinates are display-only, not qualified gripper state");
+    // A pneumatic gripper reports its command state, never a finger position:
+    // its coordinates are display-only. A logical-only command (display-only,
+    // or valves written as mapped I/O) has no command state to report.
+    const bool pneumatic = gripper_backend &&
+        gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
+            core::GripperActuationKind::kPneumatic;
+    if (pneumatic && gripper_backend->gripper_output_mode(binding.command_target_id.value()) ==
+                         core::GripperOutputMode::kNone)
+      return ErrorResponse("gripper_status_unavailable",
+          "The pneumatic gripper's owner has no command state");
     const auto observed = channel->current_state(
         selected.cell_runtime != nullptr ? selected.cell_runtime->clock()->now()
                                          : selected.runtime->clock->now());
@@ -1168,7 +1177,8 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                ? CanonicalValue(status.grasp_evidence->observation.confirmed)
                : CanonicalValue(nullptr)},
           {"observed_position",
-           CoordinatePositionValue(state.positions.front())},
+           pneumatic ? CanonicalValue(nullptr)
+                     : CoordinatePositionValue(state.positions.front())},
           {"revision", CanonicalValue(static_cast<double>(status.revision))},
           {"state",
            CanonicalValue(core::gripper_command_state_name(status.state))},

@@ -484,7 +484,9 @@ export function ProgramWorkspace({
 
   return (
     <section className="panel program-workspace" aria-label="Program authoring workspace">
-      {authoring !== null && (
+      {/* Presentation 2026-11-10: shown only when there is a reference issue;
+          placement to evaluate before the next release. */}
+      {authoring !== null && (referenceUnavailable || (referenceAttention?.total ?? 0) > 0) && (
         <div className="program-reference-attention">
           <button type="button" aria-expanded={attentionOpen}
             onClick={() => setAttentionOpen((open) => !open)}>

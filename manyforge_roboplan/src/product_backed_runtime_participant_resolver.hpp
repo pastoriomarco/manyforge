@@ -194,7 +194,7 @@ private:
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBinding>
   LoadProgramBinding(const core::ProgramBindingId &program_binding_id) const;
   /// Active TCP: the selector's row of `rows`, the `carries` check and
-  /// the endpoint (labelled with `role`, the owner's contact bodies).
+  /// the endpoint: the row's frame and its owner's contact bodies.
   [[nodiscard]] core::Result<core::RuntimeMotionEndpointBindingDTO>
   ResolveRobotTcp(const core::TcpSelectorDTO &selector,
                   const core::ControllableComponentId &robot,
@@ -202,8 +202,6 @@ private:
                   const std::optional<core::TcpEntryReferenceDTO> &active,
                   const std::function<std::optional<core::TcpEntryReferenceDTO>(
                       const core::ProgramTargetReferenceDTO &)> &default_tcp_of_target,
-                  const std::function<std::optional<std::vector<core::CollisionBodyRoleId>>(
-                      const core::TcpEntryReferenceDTO &)> &contact_roles_of,
                   bool joint_goal = false) const;
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBindingContract>
   LoadProgram(const core::ProgramId &program_id,

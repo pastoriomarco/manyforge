@@ -15,6 +15,7 @@ import {
   SIGNAL_SOURCE_LABELS,
   signalValueText,
 } from '../state/componentPresentation';
+import { deploymentMatchesApplied } from '../state/documentStates';
 import type { JsonValue } from '../types/api';
 import {
   CHANGED_OUTSIDE_SUFFIX,
@@ -479,8 +480,10 @@ function useDeploymentIoFacts(enabled: boolean, retainedBundleId: string | null)
     const abort = new AbortController();
     api.deploymentWorkspace.get(abort.signal).then((workspace) => {
       const draft = workspace.draft;
-      const applied = workspace.managerApplied.deploymentRevision;
-      const current = draft.deploymentRevision !== null && draft.deploymentRevision === applied;
+      // The same Draft-equals-Applied rule as the Deployment actions: a
+      // Scenario Deployment carries no revision, so the backend's document
+      // comparison decides then.
+      const current = deploymentMatchesApplied(workspace);
       const binding = workspace.binding;
       setFacts({
         sources: current ? declaredIoSources(draft.document as Record<string, JsonValue> | null) : null,

@@ -623,6 +623,7 @@ inline constexpr std::string_view kCycleRecoveryActionRejected{"cycle_recovery_a
 inline constexpr std::string_view kCycleRecoveryOfferStale{"cycle_recovery_offer_stale"};
 inline constexpr std::string_view kDeadlineExhausted{"deadline_exhausted"};
 inline constexpr std::string_view kDecelerationTimeNotLargerThanHandoff{"deceleration_time_not_larger_than_handoff"};
+inline constexpr std::string_view kDefaultTcpUnavailable{"default_tcp_unavailable"};
 inline constexpr std::string_view kDefaultTcpUnknown{"default_tcp_unknown"};
 inline constexpr std::string_view kDeploymentActivationClassificationUnavailable{"deployment_activation_classification_unavailable"};
 inline constexpr std::string_view kDeploymentAppliedChanged{"deployment_applied_changed"};
@@ -973,6 +974,7 @@ inline constexpr std::string_view kGripperResultFailed{"gripper_result_failed"};
 inline constexpr std::string_view kGripperResultTimeout{"gripper_result_timeout"};
 inline constexpr std::string_view kGripperStateNotFinite{"gripper_state_not_finite"};
 inline constexpr std::string_view kGripperStateUnavailable{"gripper_state_unavailable"};
+inline constexpr std::string_view kGripperStatusUnavailable{"gripper_status_unavailable"};
 inline constexpr std::string_view kGripperStopBackendCommandMismatch{"gripper_stop_backend_command_mismatch"};
 inline constexpr std::string_view kGripperStopCancelledBeforeEffect{"gripper_stop_cancelled_before_effect"};
 inline constexpr std::string_view kGripperStopCommandMismatch{"gripper_stop_command_mismatch"};

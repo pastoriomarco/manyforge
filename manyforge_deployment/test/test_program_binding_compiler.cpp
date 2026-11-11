@@ -1116,6 +1116,92 @@ TEST(ProgramBindingCompilerTest, TcpFrameNotCarriedBySelectedTargetIsRefusedBefo
   }
 }
 
+namespace tcp_validation {
+
+// Diagnostics of one authored tree on a maintained Deployment, as code@node.
+std::multiset<std::string> Diagnose(const std::filesystem::path &root,
+                                    const std::filesystem::path &scenario,
+                                    std::string_view tree, bool unmounted_tool = false) {
+  const auto product = unmounted_tool
+      ? manyforge::deployment::test::MaterializeMaintainedLite6WithUnmountedTool(root)
+      : manyforge::deployment::test::MaterializeMaintainedInterruptDeployment(
+            root, CanonicalValue(CanonicalValue::Object{}), scenario);
+  manyforge::deployment::test::ProgramOptions options;
+  options.catalog_content_version = product.bundle->value().catalogs.node_environment.content_version;
+  auto fields = manyforge::deployment::test::make_program_root(options).as_object();
+  for (auto &[name, value] : fields)
+    if (name == "tree") value = manyforge::deployment::parse_strict_json_model_yaml(std::string(tree)).root();
+  const auto program = manyforge::deployment::test::with_program_revision(
+      manyforge::deployment::normalize_program_authoring(CanonicalValue(std::move(fields))));
+  FilesystemCatalogArtifactStore catalog(root);
+  std::multiset<std::string> codes;
+  for (const auto &row : manyforge::deployment::validate_program_references(
+           program, false, *product.bundle, product.model_map, catalog))
+    codes.insert(row.code + "@" + row.location.node_instance_id.value_or(""));
+  return codes;
+}
+
+std::string SetTcp(std::string_view instance, std::string_view selector) {
+  return R"({"node_id":"motion.set_tcp","instance_id":")" + std::string(instance) +
+         R"(","children":[],"parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"tcp":)" +
+         std::string(selector) + "}}";
+}
+
+std::string Sequence(std::initializer_list<std::string> children) {
+  std::string tree = R"({"node_id":"sequence","instance_id":"root","parameters":{},"children":[)";
+  bool first = true;
+  for (const auto &child : children) {
+    if (!first) tree += ",";
+    tree += child;
+    first = false;
+  }
+  return tree + "]}";
+}
+
+std::string CheckStatus(std::string_view instance) {
+  return R"({"node_id":"gripper.check_status","instance_id":")" + std::string(instance) +
+         R"(","children":[],"parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},"expected_state":"reached"}})";
+}
+
+}  // namespace tcp_validation
+
+// The run-time TCP rule applied at validation: each selector the Program
+// writes is checked against the moving robot's TCP list.
+TEST(ProgramBindingCompilerTest, TcpSelectorsFollowTheRunTimeRuleAtValidation) {
+  using namespace tcp_validation;
+  ScopedTrustedRoot root;
+  // The signal-moves Deployment: the Lite6 with its gripper and a Mock I/O
+  // device, which has no TCP and so no default TCP.
+  const auto codes = Diagnose(root.path(), "examples/mock_lite6_signal_moves.scenario", Sequence({
+      SetTcp("tool_entry", R"({"kind":"entry","target":{"component_id":"lite_gripper","command_target_id":"gripper"},"frame":{"component_id":"lite_gripper","frame_id":"tcp"}})"),
+      SetTcp("tool_default", R"({"kind":"default_of_target","target":{"component_id":"lite_gripper","command_target_id":"gripper"}})"),
+      SetTcp("robot_default", R"({"kind":"default_of_target","target":{"component_id":"lite6_robot","command_target_id":"arm"}})"),
+      SetTcp("not_a_tcp", R"({"kind":"entry","target":{"component_id":"lite6_robot","command_target_id":"arm"},"frame":{"component_id":"lite6_robot","frame_id":"base"}})"),
+      SetTcp("no_default", R"({"kind":"default_of_target","target":{"component_id":"station_io","command_target_id":"io"}})"),
+  }));
+  EXPECT_EQ(codes, (std::multiset<std::string>{"active_tcp_unknown@not_a_tcp",
+                                              "default_tcp_unavailable@no_default"}));
+
+  ScopedTrustedRoot unmounted_root;
+  const auto unmounted = Diagnose(unmounted_root.path(), {}, SetTcp("unmounted",
+      R"({"kind":"entry","target":{"component_id":"lite_gripper","command_target_id":"gripper"},"frame":{"component_id":"lite_gripper","frame_id":"tcp"}})"),
+      true);
+  EXPECT_EQ(unmounted, (std::multiset<std::string>{"tcp_tool_not_mounted@unmounted"}));
+}
+
+// Gripper status reads the owner's command state: a valve-only pneumatic
+// gripper has one; one whose valves are mapped I/O writes has none.
+TEST(ProgramBindingCompilerTest, GripperStatusNeedsAnOwnerCommandState) {
+  using namespace tcp_validation;
+  ScopedTrustedRoot valve_root;
+  EXPECT_TRUE(Diagnose(valve_root.path(), "examples/mock_lite6_pick_and_place.scenario",
+                       CheckStatus("valve")).empty());
+  ScopedTrustedRoot mapped_root;
+  EXPECT_EQ(Diagnose(mapped_root.path(), "examples/mock_lite6_pneumatic_pick_and_place.scenario",
+                     CheckStatus("mapped")),
+            (std::multiset<std::string>{"gripper_status_unavailable@mapped"}));
+}
+
 TEST(ProgramBindingCompilerTest, MaintainedSignalAndProbeUseBuiltinInterruptCapabilities) {
   ScopedTrustedRoot root;
   constexpr std::string_view scenario = "examples/mock_lite6_signal_moves.scenario";

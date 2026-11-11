@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
+## Unreleased
+
+### Fixed
+
+- **Mock inputs can be set from the Tool & I/O panel again.** With a Scenario
+  loaded, the panel took the Deployment Draft for unapplied (a Scenario
+  Deployment carries no revision), so it offered no **Set true** / **Set
+  false** button and no declared-source hint, for example for
+  `curtain_blocked` in `mock_lite6_light_curtain_rule`. It now uses the same
+  Draft-equals-Applied check as the Deployment actions.
+- **A move at a mounted tool's TCP no longer needs the Program to name the
+  tool.** A Program that never referenced the robot's mounted gripper (or only
+  commanded it) failed its first **Current** move with "TCP target/frame
+  association is absent or ambiguous" (`runtime_motion_endpoint_unresolved`),
+  for example `mock_lite6_motion_preemption`, `mock_lite6_motion_retry`,
+  `mock_lite6_intervention_hold` and `mock_lite6_light_curtain_rule`. A move's
+  TCP, in every selector form, now resolves its frame and contact bodies from
+  the moving robot's TCP list, on every lane. The dual-arm examples use
+  **Current** again.
+- **Apply checks TCP selectors.** A specific TCP that is not on the moving
+  robot's list (`active_tcp_unknown`), whose tool is not mounted on that robot
+  (`tcp_tool_not_mounted`) or whose frame matches several entries
+  (`runtime_motion_endpoint_ambiguous`), and **Default TCP of** a component
+  without a default TCP (`default_tcp_unavailable`), are reported by reference
+  validation and refuse Apply, instead of failing only when the move runs.
+- **Gripper status nodes work on a gripper running as its own component.**
+  **Check gripper status** and **Wait for gripper status** failed with "target
+  has no unique qualified observation owner"
+  (`execution_target_observation_unavailable`), and a pneumatic gripper was
+  always refused. They now report the command state: for a position gripper,
+  reached is the controller's result; for a pneumatic gripper with a valve
+  output, reached is the delivered output plus the dwell, without a finger
+  position. A pneumatic gripper that is display-only or switches its valves
+  through mapped I/O has no command state: Apply refuses the node
+  (`gripper_status_unavailable`). `mock_lite6_pick_and_place` and
+  `mock_ur10e_pick_and_place` check the gripper's status after opening it.
+- A **Default TCP of** a component without a default TCP now fails with
+  `default_tcp_unavailable` instead of `end_effector_tcp_unavailable`.
+
 ## 0.2.1 – 2026-11-10
 
 ### Breaking changes

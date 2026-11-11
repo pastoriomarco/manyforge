@@ -31,12 +31,31 @@ tooltip reads "Useful only once tool change is implemented: today a TCP whose
 tool is on another robot is refused when used." The pickers only change what
 is shown, not what a Program may name.
 
-TCP selectors are not checked against the robot's list when a Program is
-applied. At run time a selected entry must resolve to a declared TCP and its
-owner must be the robot or a tool it currently carries. An unmounted tool's
-TCP can therefore be named in a Program but is refused before motion with
-"Tool not mounted on this robot." (`tcp_tool_not_mounted`). A picker
-checkbox changes visibility only; it does not change this run-time rule.
+A move resolves its TCP from the moving robot's TCP list: the entry's
+frame and the contact bodies of the component that owns it. The Program
+does not need to name the tool otherwise; an arm-only Program can move at
+the gripper's TCP.
+
+Apply checks each TCP selector written in the Program (a move's TCP, Set
+TCP, the planning nodes) against the moving robot's list with the same rule.
+Apply is refused, and Composer marks the node as needing attention, when:
+
+| Problem | Reason |
+| --- | --- |
+| A specific TCP is not one of the robot's TCPs | `active_tcp_unknown` |
+| The TCP's tool is not mounted on the moving robot | `tcp_tool_not_mounted` |
+| **Default TCP of** a component that has no default TCP | `default_tcp_unavailable` |
+| The TCP's frame matches more than one entry of the list | `runtime_motion_endpoint_ambiguous` |
+
+A frame that is not one of the named component's frames is reported as for
+any other frame reference (`frame_missing`, `frame_not_mounted`).
+
+**Current** and a TCP read from a `tcp_entry` key are resolved when the node
+runs. Current is the robot's Active TCP, which is always one of its own TCPs
+or a TCP of a tool it carries; a robot without an Active TCP is described
+[below](#the-active-tcp). A key's value is checked like a specific TCP at
+that moment. The picker checkbox changes visibility only; it does not change
+these rules.
 
 ## The Active TCP
 
@@ -71,7 +90,8 @@ ManyForge's selection only; Enable sends offset 0 if the controller reports
 another offset.
 
 The Active TCP of each robot is also the read-only system key
-`active_tcp.<target_role>` (see [Blackboard keys](BLACKBOARD_KEYS.md#7-system-keys)).
+`active_tcp/<component_id>/<command_target_id>`, for example
+`active_tcp/lite6_robot/arm` (see [Blackboard keys](BLACKBOARD_KEYS.md#7-system-keys)).
 
 ## TCPs in Programs
 
@@ -81,7 +101,7 @@ of three forms:
 | Form | Meaning |
 | --- | --- |
 | **Current** | The robot's Active TCP. New moves start with it. |
-| **Default TCP of <role>** | The default TCP of the component assigned to that role, for example the gripper's. It follows the Deployment: another gripper brings its own default. If the component has no default, using it is refused with a typed reason. |
+| **Default TCP of <component>** | The default TCP of that component, for example the gripper's. It follows the Deployment: another gripper brings its own default. If the component has no default, Apply refuses it (`default_tcp_unavailable`). |
 | A specific TCP | One TCP entry, for example `gripper · cup_edge` or the robot's flange. |
 
 A move with the second or third form also makes that TCP the robot's Active
@@ -89,8 +109,8 @@ TCP, so later **Current** moves use it. **Use current robot pose** captures
 the pose of the move's TCP. Planning nodes use their own selector and do not
 change the Active TCP.
 
-**Set TCP** (Motion) sets a robot's Active TCP without moving, from a default
-TCP of a role, a specific TCP, or **Current**. A specific entry may be supplied
+**Set TCP** (Motion) sets a robot's Active TCP without moving, from the
+default TCP of a component, a specific TCP, or **Current**. A specific entry may be supplied
 directly from a `tcp_entry` key. **Current** uses the current Active TCP; it
 does not select a different one. The node completes when the selected Active
 TCP is reflected in the Program's key.
@@ -132,7 +152,7 @@ ambiguous. If the same robot uses another TCP too, Load is refused with a
 typed reason naming each affected move and asking you to choose its TCP. The
 converter makes no guess. The same per-robot rule applies to old planning
 nodes and pick-and-place selectors. An old `{tool, tcp}` becomes **Default TCP
-of <that tool's role>**, resolved from the Deployment; a converted move to a
+of <that tool>**, resolved from the Deployment; a converted move to a
 tool TCP uses the tool's contact bodies. The legacy-attach conversion uses
 the Deployment's composed holder frames (type and custom frames) for a
 non-robot holder. A real holder `tcp` stays named; if no composed `tcp` exists,

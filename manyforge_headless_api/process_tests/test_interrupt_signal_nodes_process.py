@@ -582,3 +582,160 @@ def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
         assert selected_after["deploymentRevision"] != selected_before["deploymentRevision"]
         assert motion_after["lifecycle"] == "prepared", motion_after
         assert io_after["lifecycle"] == "prepared", io_after
+
+
+RETRY_SCENARIO = "mock_lite6_motion_retry"
+RETRY_SCENARIO_ID = "mock_lite6_motion_retry_process"
+
+
+def _write_retry_scenario(directory: Path) -> Path:
+    """The shipped motion-retry example: an arm-only Program whose moves use
+    the Current TCP on a Lite6 carrying its gripper. Only the ROS ``plc_io``
+    peer and the global rule, which the Program does not use, are left out."""
+
+    from manyforge_composer.backend.scenario_artifacts import (
+        build_scenario_document,
+        load_scenario_artifact,
+        save_scenario_artifact,
+    )
+
+    examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
+    source = examples / f"{RETRY_SCENARIO}.scenario"
+    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    deployment = deepcopy(trial["deployment_draft"])
+    deployment["components"] = [
+        row for row in deployment["components"] if row["component_id"] != "plc_io"
+    ]
+    deployment["policies"]["interrupt_rules"] = []
+    target = directory / f"{RETRY_SCENARIO_ID}.scenario"
+    scenario = build_scenario_document(
+        scenario_id=RETRY_SCENARIO_ID,
+        name=RETRY_SCENARIO_ID,
+        description="mock_lite6_motion_retry without the unused ROS plc_io peer and rule.",
+        program_draft=deepcopy(trial["program_draft"]),
+        deployment_draft=deployment,
+        manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        last_known_status="unknown",
+    )
+    save_scenario_artifact(
+        scenario, str(target), allowed_roots=[str(directory), str(examples)], overwrite=False,
+        source_project_path=str(source),
+    )
+    return target
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+def test_arm_only_program_moves_at_the_mounted_gripper_current_tcp() -> None:
+    """0.2.1 regression: a Program that never references the mounted gripper
+    failed its first Current move with runtime_motion_endpoint_unresolved."""
+
+    with _signal_stack(_write_retry_scenario) as (stack, project):
+        applied = _load(stack, project, scenario_id=RETRY_SCENARIO_ID)
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            binding = headless.program_applied()["program_binding"]
+        # The Program never names the gripper: only the robot's TCP list does.
+        assert {row["target"]["component_id"] for row in binding["target_bindings"]} == {
+            "lite6_robot"
+        }, binding
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=RETRY_SCENARIO_ID,
+                source_document_digest=applied["source_document_digest"],
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id="retry.motion-start")
+            terminal_run = _wait_run_state(
+                client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
+            )
+        assert terminal_run["state"] == "succeeded", terminal_run
+        operations = _node_operations(stack, program_run_id)
+        assert operations.get("start_rest") and operations.get("end_rest"), operations
+
+
+def _status_scenario_writer(source_scenario: str, scenario_id: str, gripper: str, command: str):
+    """The source example's Deployment with a Program that opens its gripper
+    and then checks and waits for the command state `reached`."""
+
+    def write(directory: Path) -> Path:
+        from manyforge_composer.backend.scenario_artifacts import (
+            build_scenario_document,
+            load_scenario_artifact,
+            save_scenario_artifact,
+        )
+
+        examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
+        source = examples / f"{source_scenario}.scenario"
+        trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+        program = deepcopy(trial["program_draft"])
+        (root,) = program["forest"]
+        (opened,) = [row for row in root["children"] if row["instance_id"] == command]
+        target = {"component_id": gripper, "command_target_id": "gripper"}
+        root["children"] = [
+            opened,
+            {"children": [], "instance_id": "check_reached", "node_id": "gripper.check_status",
+             "parameters": {"target": target, "expected_state": "reached"}},
+            {"children": [], "instance_id": "wait_reached", "node_id": "gripper.wait_for_status",
+             "parameters": {"target": target, "expected_state": "reached", "timeout_s": 5.0}},
+        ]
+        target_path = directory / f"{scenario_id}.scenario"
+        scenario = build_scenario_document(
+            scenario_id=scenario_id,
+            name=scenario_id,
+            description=f"{source_scenario}: open the gripper, then check its command state.",
+            program_draft=program,
+            deployment_draft=deepcopy(trial["deployment_draft"]),
+            manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            last_known_status="unknown",
+        )
+        save_scenario_artifact(
+            scenario, str(target_path), allowed_roots=[str(directory), str(examples)],
+            overwrite=False, source_project_path=str(source),
+        )
+        return target_path
+
+    return write
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+@pytest.mark.parametrize("source_scenario,gripper,command", [
+    # Pneumatic, valve-only (Mock Lite gripper): reached = delivered + dwell.
+    ("mock_lite6_pick_and_place", "lite_gripper", "open_gripper_start"),
+    # Position gripper with controller feedback.
+    ("mock_ur10e_pick_and_place", "robotiq_2f_140", "command_gripper"),
+])
+def test_gripper_status_reports_the_command_state_of_a_standalone_gripper(
+    source_scenario: str, gripper: str, command: str,
+) -> None:
+    """The gripper runs as its own component; its status owner resolves
+    through its feedback binding and reports the command state."""
+
+    scenario_id = f"{source_scenario}_status_process"
+    writer = _status_scenario_writer(source_scenario, scenario_id, gripper, command)
+    with _signal_stack(writer) as (stack, project):
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            loaded = client.request("POST", "/api/scenario/load", body={"path": str(project)})
+            assert loaded["outcome"] == "succeeded", loaded
+            component_ids = _activate_loaded_components(stack)
+            assert gripper in component_ids, component_ids
+            stack.wait_authoring_admission(expected_allowed=True)
+            applied = client.program_applied()
+            assert applied["scenario_id"] == scenario_id, applied
+            started = _start_run(
+                stack,
+                scenario_id=scenario_id,
+                source_document_digest=applied["source_document_digest"],
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id=f"{scenario_id}.motion-start")
+            terminal_run = _wait_run_state(
+                client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
+            )
+        assert terminal_run["state"] == "succeeded", terminal_run
+        statuses = terminal_run["node_statuses"]
+        for node in (command, "check_reached", "wait_reached"):
+            assert statuses[node] == "success", (node, terminal_run)

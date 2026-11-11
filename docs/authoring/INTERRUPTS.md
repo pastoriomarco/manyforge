@@ -32,6 +32,19 @@ You can use a signal in several places:
 - the GUI shows its current value and source (Tool & I/O panel);
 - interrupt rules watch it.
 
+**Setting a Mock input.** On a running cell, each input declared with the
+`mock` profile has a **Set true** / **Set false** button in the viewer's
+Tool & I/O panel, under its value, source and age and the hint "Declared
+source: Mock · <source_id>". The button sets the input to the opposite of its
+current value, the same as a device would, so rules and Program nodes see the
+change; it is offered in every run state. The line under it says whether the
+value was delivered, or not delivered yet because the source is not publishing
+(it is delivered once the source is enabled). The button is not offered while
+the Deployment Draft differs from Applied: the top of the panel then says "The
+Deployment Draft differs from Applied, so declared sources are not shown and
+Mock inputs cannot be set here. Apply or discard the Deployment edits." Other
+input profiles are read-only in the panel.
+
 **I/O** is the physical part of the signals: the digital inputs and outputs
 of devices. Not every signal is I/O. A `geometric_contact` input works this way:
 

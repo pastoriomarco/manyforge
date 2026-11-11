@@ -1,6 +1,8 @@
 #include "program_reference_probe_internal.hpp"
 #include "program_binding_internal.hpp"
 #include "manyforge_deployment/cell_kinematic_index.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 #include <tuple>
 
@@ -927,6 +929,59 @@ resolve_target_frame_associations(
 
 namespace manyforge::deployment {
 using namespace reference_probe;
+core::Result<const RobotTcp*> select_robot_tcp(
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot, std::span<const RobotTcp> rows,
+    const core::TcpEntryReferenceDTO& entry) {
+  using Selected = core::Result<const RobotTcp*>;
+  const auto& index = retained_model_map.kinematic_index();
+  const auto* target = retained_model_map.find_target(entry.target.component_id,
+                                                      entry.target.command_target_id);
+  const bool qualified = target != nullptr &&
+      std::any_of(target->frames.begin(), target->frames.end(), [&](const auto& frame) {
+        const auto* model = std::get_if<CompositionComponentModelFrame>(&frame.frame);
+        return model && model->controllable_component_id == entry.frame.component_id &&
+               frame.frame_role_id == entry.frame.frame_id;
+      }) &&
+      index.carries(entry.target.component_id, entry.frame.component_id);
+  if (!qualified) return Selected::Err(core::active_tcp_unknown_error(robot, entry));
+  const RobotTcp* row = nullptr;
+  for (const auto& candidate : rows)
+    if (candidate.entry == entry) { row = &candidate; break; }
+  if (!row) {
+    for (const auto& candidate : rows) {
+      if (candidate.frame.reference != entry.frame) continue;
+      if (row)
+        return Selected::Err({std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+                              "TCP frame maps to multiple retained entries",
+                              {{"reason", "runtime_motion_endpoint_ambiguous"}}});
+      row = &candidate;
+    }
+  }
+  if (!row) return Selected::Err(core::active_tcp_unknown_error(robot, entry));
+  if (!index.carries(robot, entry.frame.component_id))
+    return Selected::Err(core::tcp_tool_not_mounted_error(robot, entry));
+  return Selected::Ok(row);
+}
+
+bool gripper_status_unavailable(const core::CellGraphDTO& graph,
+                                const core::ProgramTargetReferenceDTO& target) {
+  for (const auto& unit : graph.runtime_units) {
+    if (unit.runtime_profile_id.value() != ros2_control_execution_runtime_contract::kRuntimeProfileId)
+      continue;
+    const auto rows = unit.configuration.find("gripper_target_configurations");
+    if (rows == unit.configuration.end()) continue;
+    const auto* array = std::get_if<core::JsonValueDTO::Array>(&rows->second.value);
+    if (!array) fail("retained gripper configuration is not an array");
+    for (const auto& row : detail::decode_ros2_control_execution_gripper_target_configurations(*array))
+      if (row.controllable_component_id == target.component_id &&
+          row.command_target_id == target.command_target_id)
+        return row.actuation_kind == "pneumatic" &&
+               (row.output_mode == core::GripperOutputMode::kNone || row.pneumatic_io);
+  }
+  return false;
+}
+
 std::optional<ProgramBindingUnresolvedReason> probe_program_target(
     const core::ControllableComponentId& component_id,
     const core::CommandTargetId& target_id,

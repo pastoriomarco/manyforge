@@ -617,6 +617,7 @@ cycle_recovery_action_rejected	Program recovery action refused	The selected reco
 cycle_recovery_offer_stale	Recovery offer no longer current	The recovery offer or held Program step changed before this action arrived. Review the current offer and choose again.
 deadline_exhausted	Lifecycle deadline expired	The component lifecycle deadline expired before the controller switch was sent, so nothing was changed. Try the action again.
 deceleration_time_not_larger_than_handoff	Stop deceleration time too short	The Stop's deceleration time must be longer than its trajectory handoff time, so the path-following Stop cannot be planned and the planner recommends a hard Stop. Set a longer deceleration time in the Stop profile.
+default_tcp_unavailable	No default TCP	The move or Set TCP names the default TCP of a component that has no default TCP. Mark one of its TCPs as default, or choose a TCP explicitly.
 default_tcp_unknown	Default TCP not set	The component must name exactly one of its TCPs as default. Correct its TCP list.
 deployment_activation_classification_unavailable	Deployment not classifiable	This Deployment document is malformed or in the old compiled format, so its edit cannot be checked for component changes. Nothing was changed. Correct the document or open its Scenario.
 deployment_applied_changed	Applied Deployment changed	The Applied Deployment changed before Discard completed. Review the current state and try again.
@@ -967,6 +968,7 @@ gripper_result_failed	Gripper reported the command failed	The gripper controller
 gripper_result_timeout	Gripper result timed out	The gripper controller did not report the result of the gripper command in time, so the command was aborted.
 gripper_state_not_finite	Gripper state value invalid	The gripper reported a state with a value that is not a finite number, so the gripper command was aborted. Check the gripper's state publisher.
 gripper_state_unavailable	Gripper state could not be read	The gripper state could not be read, so the gripper command was refused. Check that the gripper is connected and reporting.
+gripper_status_unavailable	Gripper status not available	This pneumatic gripper is display-only or switches its valves through mapped I/O, so its owner has no command state for a status node. Remove the status node, or check the gripper's inputs with the I/O nodes.
 gripper_stop_backend_command_mismatch	Gripper Stop names another command	An internal check failed: the gripper Stop targets a different gripper command than the one dispatched. Collect the logs and report it.
 gripper_stop_cancelled_before_effect	Gripper Stop cancelled before it acted	The gripper Stop was cancelled before it took effect.
 gripper_stop_command_mismatch	Gripper Stop names another prepared command	An internal check failed: the gripper Stop names a different prepared command. Collect the logs and report it.

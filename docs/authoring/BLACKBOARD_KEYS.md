@@ -156,8 +156,8 @@ The system writes three families of read-only keys: `node_outcome.<node>`
 (each motion node's last outcome, `none` until it ends in this Run),
 `interrupt_state.<rule_id>` (each Deployment global rule's state: `inactive`,
 `clear` or `tripped`; no value while the rule can't watch its signals) and
-`active_tcp.<target_role>` (the [Active TCP](TCPS.md#the-active-tcp) of the
-robot bound to that role, as a `tcp_entry`). You never declare or write
+`active_tcp/<component_id>/<command_target_id>` (the
+[Active TCP](TCPS.md#the-active-tcp) of that robot target, as a `tcp_entry`). You never declare or write
 these keys, and no key, namespace or Program parameter may use the names
 `node_outcome`, `interrupt_state` or `active_tcp`. The first two values are
 listed in [Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).

@@ -215,13 +215,18 @@ CanonicalValue prepared_selector_facts(const PreparedActivationMaterialization& 
         throw std::logic_error("candidate capability probe size mismatch");
       V::Array capabilities;
       bool motion = false;
+      // Gripper status reports the owner's command state; some grippers have none.
+      const bool no_status = gripper_status_unavailable(bundle.value().cell_graph, target);
       for (std::size_t i = 0; i < requirements.size(); ++i) {
         if (requirements[i].capability_id.value() == "execution.trajectory.execute" && !statuses[i])
           motion = true;
+        const bool status_refused =
+            no_status && requirements[i].capability_id.value() == "tool.gripper.feedback";
         capabilities.emplace_back(V::Object{
             {"capability_id", V(requirements[i].capability_id.value())},
-            {"available", V(!statuses[i].has_value())},
-            {"reason", statuses[i] ? V(std::string(to_string(*statuses[i]))) : V(nullptr)}});
+            {"available", V(!statuses[i].has_value() && !status_refused)},
+            {"reason", statuses[i] ? V(std::string(to_string(*statuses[i])))
+                       : status_refused ? V("gripper_status_unavailable") : V(nullptr)}});
       }
       target_facts.push_back({target, V(std::move(capabilities)), source_joint_names(target, model), motion});
     }

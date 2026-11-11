@@ -43,6 +43,18 @@
         },
         {
           "children": [],
+          "instance_id": "gripper_open_reached",
+          "node_id": "gripper.check_status",
+          "parameters": {
+            "expected_state": "reached",
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "lite_gripper"
+            }
+          }
+        },
+        {
+          "children": [],
           "instance_id": "move_to_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {

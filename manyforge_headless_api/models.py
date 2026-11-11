@@ -2383,7 +2383,8 @@ class GripperCommandObservation(StrictRequest):
 
 
 class GripperFeedbackObservation(GripperCommandObservation):
-    observed_position: CoordinatePositionRequest
+    # None for a pneumatic gripper: its finger coordinates are display-only.
+    observed_position: CoordinatePositionRequest | None
     grasp_confirmed: bool | None
 
 
