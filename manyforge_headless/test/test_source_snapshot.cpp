@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -305,6 +306,28 @@ TEST(AtomicSourceSnapshotChannel,
   const auto final = writer.Read();
   ASSERT_TRUE(final.has_value());
   EXPECT_EQ(final->source_generation, 100U);
+}
+
+TEST(AtomicSourceSnapshotChannel,
+     UnchangedRepublishGivesReadersAFreshCompleteRecord) {
+  // The periodic rewrite is the publisher's heartbeat: readers judge
+  // freshness by the file's modification time, without any sync.
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel writer(directory.path(), "manager.json");
+  AtomicSourceSnapshotChannel reader(directory.path(), "manager.json");
+  static_cast<void>(writer.Publish("component_manager", "manager.cell-a",
+                                   "epoch-a", 1000, Payload("alpha")));
+  const auto first = reader.ReadObserved();
+  ASSERT_TRUE(first.has_value());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto pulse = writer.Publish("component_manager", "manager.cell-a",
+                                    "epoch-a", 2000, Payload("alpha"));
+  const auto second = reader.ReadObserved();
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->snapshot, pulse);
+  EXPECT_EQ(second->snapshot.source_generation,
+            first->snapshot.source_generation);
+  EXPECT_GT(second->file_modified_at_unix_ns, first->file_modified_at_unix_ns);
 }
 
 TEST(AtomicSourceSnapshotChannel, RejectsSymlinkPublicationAndIgnoresTemps) {

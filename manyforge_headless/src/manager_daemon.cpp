@@ -3278,6 +3278,17 @@ public:
         scene_owner_id_("logical-scene." + admission_.cell_id().value()),
         scene_runtime_owner_id_("scene-runtime." +
                                 admission_.cell_id().value()) {
+    // The status files are written without fsync, so a power loss can leave
+    // one torn. All are rebuilt below; a torn one is replaced, not fatal.
+    for (const auto *channel : {&manager_channel_, &scene_channel_,
+                                &scene_runtime_channel_,
+                                &viewer_pose_sessions_channel_}) {
+      try {
+        static_cast<void>(channel->Read());
+      } catch (const SourceSnapshotIntegrityError &) {
+        std::filesystem::remove(channel->directory() / channel->file_name());
+      }
+    }
     RequireCurrentPackageGeneration();
     EnsureBootstrap();
     RequireCurrentPackageGeneration();

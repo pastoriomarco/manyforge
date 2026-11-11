@@ -80,9 +80,10 @@ public:
 
 /// Atomic one-file publication channel for a single semantic source owner.
 ///
-/// Publication uses same-directory temporary write, file fsync, atomic rename,
-/// and directory fsync. Readers open the selected inode with O_NOFOLLOW and
-/// validate the complete closed record. The channel owns no source semantics;
+/// Publication uses a same-directory temporary write and an atomic rename,
+/// without fsync: readers always see one complete record, but a power loss may
+/// leave a torn file, which the publisher replaces at start-up. Readers open
+/// the selected inode with O_NOFOLLOW and validate the complete closed record. The channel owns no source semantics;
 /// it advances generation by comparing verified semantic digests only.
 ///
 /// Each read still opens, stats and reads the complete selected file. Only

@@ -1963,6 +1963,42 @@ TEST(ManagerDaemonProcess,
   EXPECT_FALSE(std::filesystem::exists(directory.execution_socket_path()));
 }
 
+TEST(ManagerDaemonProcess, StartupReplacesTornStatusFiles) {
+  // The status files are written without fsync; a power loss can leave one
+  // empty, truncated or garbage. Start-up replaces each and starts.
+  DaemonDirectory directory;
+  const auto root = directory.publication_root();
+  { std::ofstream empty(root / "manager-source.json"); }
+  {
+    AtomicSourceSnapshotChannel previous(root, "logical-scene-source.json");
+    static_cast<void>(previous.Publish(
+        "logical_scene", "logical-scene.previous", "epoch-previous", 1,
+        content_identity::CanonicalValue(
+            content_identity::CanonicalValue::Object{})));
+    const auto path = root / "logical-scene-source.json";
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2U);
+  }
+  for (const auto *name :
+       {"scene-runtime-source.json", "viewer-pose-sessions.json"}) {
+    std::ofstream garbage(root / name, std::ios::binary);
+    garbage << "{\"api_version\":\"manyforge.source_snapshot.v1\",\"pay";
+  }
+
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  const std::pair<const char *, const char *> rebuilt[]{
+      {"manager-source.json", "component_manager"},
+      {"logical-scene-source.json", "logical_scene"},
+      {"scene-runtime-source.json", "scene_runtime"}};
+  for (const auto &[name, owner_kind] : rebuilt) {
+    const auto snapshot = AtomicSourceSnapshotChannel(root, name).Read();
+    ASSERT_TRUE(snapshot.has_value()) << name;
+    EXPECT_EQ(snapshot->source_owner_kind, owner_kind);
+  }
+  EXPECT_NO_THROW(static_cast<void>(
+      AtomicSourceSnapshotChannel(root, "viewer-pose-sessions.json").Read()));
+}
+
 TEST(ManagerDaemonProcess, ProcessStopDecoderPreservesActualMultilineLaunchIdentity) {
   using content_identity::CanonicalValue;
   DaemonDirectory directory;

@@ -35,6 +35,13 @@ formats; such changes are listed explicitly.
   operation's per-operation scale status stays `pending` until the next status
   poll. With eight speed changes already waiting, the next is refused with
   `execution_runtime_scale_lane_busy` (before: `execution_submission_lane_busy`).
+- **The Manager's status files no longer wait for the disk.** The Manager
+  still rewrites `manager-source.json`, `logical-scene-source.json` and
+  `scene-runtime-source.json` every 500 ms (its heartbeat to the Headless),
+  and `viewer-pose-sessions.json` on change, but no longer syncs them or their
+  directory. Readers still see one complete record. After a power loss a torn
+  status file is replaced at start-up instead of stopping the Manager from
+  starting.
 
 ### Fixed
 

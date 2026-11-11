@@ -334,25 +334,18 @@ void PublishAt(const int directory_fd, const std::string &file_name,
     ThrowIo("create source snapshot temporary publication");
   }
   FileDescriptor file(descriptor);
-  bool renamed = false;
   try {
     WriteAll(file.get(), bytes);
-    if (::fsync(file.get()) != 0) {
-      ThrowIo("fsync source snapshot temporary publication");
-    }
     file.Close("close source snapshot temporary publication");
+    // No fsync: the rename alone makes every reader see the old or the new
+    // complete inode. These are status files rebuilt at every start; a torn
+    // file left by a power loss is replaced then (manager_daemon.cpp).
     if (::renameat(directory_fd, temporary.c_str(), directory_fd,
                    file_name.c_str()) != 0) {
       ThrowIo("atomically select source snapshot publication");
     }
-    renamed = true;
-    if (::fsync(directory_fd) != 0) {
-      ThrowIo("fsync source snapshot publication directory");
-    }
   } catch (...) {
-    if (!renamed) {
-      static_cast<void>(::unlinkat(directory_fd, temporary.c_str(), 0));
-    }
+    static_cast<void>(::unlinkat(directory_fd, temporary.c_str(), 0));
     throw;
   }
 }
