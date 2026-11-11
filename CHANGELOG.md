@@ -85,6 +85,12 @@ formats; such changes are listed explicitly.
   could wait on each other for good. The cancel that becomes due on acceptance
   is now sent from the Stop lane, never from the acceptance callback; if it
   cannot be scheduled, the component reports a fault.
+- **A Program Stop is no longer delayed by the disk, and is sent even if its
+  record cannot be written.** The Program runner wrote "stopping" to its cycle
+  journal and waited for the disk before it sent the Stop of a running
+  Program, and a failed write meant the Stop was not sent at all. It now
+  sends the Stop first and records it afterwards, as Program Full Stop
+  already did; a failed record is logged and does not affect the Stop.
 
 ## 0.2.1 – 2026-11-10
 

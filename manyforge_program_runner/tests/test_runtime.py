@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -2736,7 +2737,8 @@ def test_loss_writes_during_stopping_and_terminal_until_reset(
         def stop_while_loss_arrives(
             program_run_id: str, *, reason: str | None, stop_request_id: str | None = None
         ) -> _Snapshot:
-            assert journal.read().state == "stopping"
+            # The Stop is sent before its stopping record (OD-113).
+            assert journal.read().state == "running"
             state["last_losses"] = (during_stop,)
             runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
             assert [write[:2] for write in store.writes] == [("part_lost", True)]
@@ -6376,6 +6378,162 @@ def test_stop_bypasses_transition_lock_and_full_ordinary_inflight_bound(
         runtime.stop_run("program-run.1", request)["state"] == "terminal_awaiting_reset"
     )
     assert host.stop_calls == [("program-run.1", "contain")]
+    runtime.shutdown()
+
+
+def _running_cycle_runtime(tmp_path) -> tuple[ProgramRuntime, ProgramCycleJournal, _Host]:
+    tmp_path.mkdir(exist_ok=True)
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    journal.transition(
+        expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="running",
+        program_run_id="program-run.1",
+        claim={"claim_generation": 1},
+    )
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime._host.shutdown()
+    owner = _Owner()
+    owner.rows["program-run.1"] = _Snapshot(
+        "program-run.1",
+        owner_id=runtime.owner_id,
+        owner_epoch=runtime.owner_epoch,
+        state="running",
+        revision=1,
+    )
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner = owner  # type: ignore[assignment]
+    runtime._host = host  # type: ignore[assignment]
+    runtime.start()
+    return runtime, journal, host
+
+
+def _stop_request(command: str) -> ProgramRunStopRequest | ProgramSelectionStopRequest:
+    model = ProgramRunStopRequest if command == "stop_run" else ProgramSelectionStopRequest
+    return model.model_validate(
+        {
+            "request_id": f"{command}.1",
+            "request_owner_epoch": "caller.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": "program-run.1",
+            "expected_owner_epoch": "runner.1",
+            "reason": "contain",
+        }
+    )
+
+
+def _host_stop_calls(host: _Host, command: str) -> list[tuple[str, str | None]]:
+    return host.stop_calls if command == "stop_run" else host.motion_stop_calls
+
+
+@pytest.mark.parametrize("command", ["stop_run", "stop_motion"])
+def test_program_stop_is_sent_and_replied_even_when_the_journal_cannot_write(
+    tmp_path, command
+) -> None:
+    expected_runtime, _journal, _host = _running_cycle_runtime(tmp_path / "expected")
+    expected = getattr(expected_runtime, command)("program-run.1", _stop_request(command))
+    expected_runtime.shutdown()
+
+    runtime, journal, host = _running_cycle_runtime(tmp_path / "failing")
+
+    @contextmanager
+    def unwritable():
+        raise OSError("disk I/O error")
+        yield
+
+    journal._transaction = unwritable  # type: ignore[method-assign]  # noqa: SLF001
+    reply = getattr(runtime, command)("program-run.1", _stop_request(command))
+    assert _host_stop_calls(host, command) == [("program-run.1", "contain")]
+    assert reply == expected
+    assert reply["state"] == ("stopped" if command == "stop_run" else "running")
+    assert journal.read().state == "running"
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize("command", ["stop_run", "stop_motion"])
+def test_program_stop_reaches_the_host_before_and_without_waiting_for_its_record(
+    tmp_path, command
+) -> None:
+    runtime, journal, host = _running_cycle_runtime(tmp_path)
+    calls: list[str] = []
+    entered = Event()
+    release = Event()
+    transaction = journal._transaction  # noqa: SLF001
+
+    @contextmanager
+    def stalled_disk():
+        calls.append("record")
+        entered.set()
+        assert release.wait(timeout=5)
+        with transaction():
+            yield
+
+    journal._transaction = stalled_disk  # type: ignore[method-assign]  # noqa: SLF001
+    host_stop = getattr(host, command)
+
+    def observed_stop(program_run_id: str, **kwargs: Any) -> _Snapshot:
+        calls.append("stop")
+        return host_stop(program_run_id, **kwargs)
+
+    setattr(host, command, observed_stop)
+    replies: list[dict[str, Any]] = []
+    thread = Thread(
+        target=lambda: replies.append(
+            getattr(runtime, command)("program-run.1", _stop_request(command))
+        )
+    )
+    thread.start()
+    if command == "stop_run":
+        assert entered.wait(timeout=1)
+        # The Stop is out while the record is stalled; the runner itself
+        # starts nothing in between (the owner's stopping state refuses
+        # Resume and tree ticks, pinned in manyforge_behavior).
+        assert calls == ["stop", "record"]
+        assert journal.read().state == "running"
+        assert host.scheduled == []
+        assert host.motion_start_calls == []
+        release.set()
+        thread.join(timeout=5)
+        assert replies[0]["state"] == "stopped"
+        cycle = journal.read()
+        assert cycle.state == "terminal_awaiting_reset"
+        assert cycle.current_command_kind == "program_stop"
+    else:
+        # Motion Stop has no cycle record at all.
+        thread.join(timeout=5)
+        assert calls == ["stop"]
+        assert replies[0]["state"] == "running"
+        release.set()
+    assert not thread.is_alive()
+    runtime.shutdown()
+
+
+def test_failed_program_stop_is_recorded_afterwards_and_latches_reconciliation(
+    tmp_path,
+) -> None:
+    runtime, journal, host = _running_cycle_runtime(tmp_path)
+
+    def unknown_stop(program_run_id: str, **_kwargs: Any) -> _Snapshot:
+        host.stop_calls.append((program_run_id, "unknown"))
+        raise RuntimeError("Stop reply lost")
+
+    host.stop_run = unknown_stop  # type: ignore[method-assign]
+    with pytest.raises(ProgramRunnerError) as failed:
+        runtime.stop_run("program-run.1", _stop_request("stop_run"))
+    assert failed.value.code == "program_cycle_recovery_required"
+    assert failed.value.details == {"cause_code": "program_run_scheduling_failed"}
+    assert host.stop_calls == [("program-run.1", "unknown")]
+    cycle = journal.read()
+    assert cycle.state == "recovery_required"
+    assert cycle.reconciliation_required
+    assert cycle.current_command_kind == "program_stop"
     runtime.shutdown()
 
 

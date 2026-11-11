@@ -4264,6 +4264,30 @@ def test_stop_cannot_race_a_tick_and_dispatch_after_the_kernel_stop_request() ->
     assert task.starts == 1
 
 
+def test_program_stop_refuses_new_work_before_the_runner_records_it() -> None:
+    """The Program runner records `stopping` only after this Stop returns."""
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()
+    starts = task.starts
+    stopped = host.stop_run(run_id, reason="operator stop")
+    assert stopped.state is not ProgramRunState.RUNNING
+    for command in (host.resume_motion, host.start_motion):
+        with pytest.raises(ProgramRunOwnerError):
+            command(
+                run_id,
+                expected_selection_revision=scope.selection_revision,
+                request_id="after-stop",
+                reason=None,
+            )
+    host.advance_ready_once()
+    assert task.starts == starts
+    host.shutdown()
+
+
 def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> None:
     owner, admission, _task, scope, _events = _fixture(
         initial_task_state=OwnerTaskState.FAILED

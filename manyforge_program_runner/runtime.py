@@ -6395,6 +6395,17 @@ class ProgramRuntime:
             )
 
         stopping_committed = False
+        stop_sent = False
+
+        def record_stopping() -> None:
+            journal.mark_stopping(
+                expected_generation=cycle.cycle_generation,
+                program_run_id=program_run_id,
+                correlation_id=request.correlation_id or request.request_id,
+                session_id=request.session_id,
+                client_sequence=request.client_sequence,
+            )
+
         try:
             _admission, journal = self._require_cycle_owner()
             cycle = journal.read()
@@ -6409,14 +6420,10 @@ class ProgramRuntime:
 
             state_before = cycle.state
             recovery_stop = self._current_cycle_recovery_stop(cycle)
-            if state_before in {"starting", "running"} or recovery_stop:
-                journal.mark_stopping(
-                    expected_generation=cycle.cycle_generation,
-                    program_run_id=program_run_id,
-                    correlation_id=request.correlation_id or request.request_id,
-                    session_id=request.session_id,
-                    client_sequence=request.client_sequence,
-                )
+            if state_before == "starting":
+                # No tree ticks before the Running CAS: this record is the
+                # Stop the Start path observes, so it comes first here.
+                record_stopping()
                 stopping_committed = True
                 cycle = journal.read()
             elif state_before in {
@@ -6431,7 +6438,7 @@ class ProgramRuntime:
                     "state": cycle.state,
                     "execution_control_revision": (cycle.execution_control_revision),
                 }
-            else:
+            elif not (state_before == "running" or recovery_stop):
                 raise ProgramRunnerError(
                     "program_run_not_found",
                     "Program cycle is already Idle",
@@ -6458,6 +6465,9 @@ class ProgramRuntime:
                     "execution_control_revision": (cycle.execution_control_revision),
                 }
             elif state_before == "running" or recovery_stop:
+                # The Stop first, its record afterwards (as Full Stop): the
+                # owner's own stopping state already closes the tree.
+                stop_sent = True
                 snapshot = self._host.stop_run(
                     program_run_id,
                     reason=request.reason,
@@ -6479,29 +6489,21 @@ class ProgramRuntime:
                 str(error) or type(error).__name__,
             )
         else:
-            if result.get("schema_version") != ("manyforge.program_stop_acceptance.v1"):
+            if stop_sent:
                 # Journal projection is subordinate to recognized
                 # containment. It must neither gate the owner call nor turn
                 # success into failure.
                 try:
-                    _admission, journal = self._require_cycle_owner()
+                    record_stopping()
+                except Exception:
+                    _LOGGER.warning(
+                        "Program Stop was sent; its stopping record failed",
+                        exc_info=True,
+                    )
+                try:
                     journal.retain_run_snapshot(result)
-                    cycle = journal.read()
                     if result.get("state") in {"stopped", "succeeded", "failed"}:
                         self._record_terminal_snapshot(result)
-                    elif cycle.program_run_id == program_run_id and cycle.state in {
-                        "running",
-                        "stopping",
-                    }:
-                        journal.mark_stopping(
-                            expected_generation=cycle.cycle_generation,
-                            program_run_id=program_run_id,
-                            correlation_id=(
-                                request.correlation_id or request.request_id
-                            ),
-                            session_id=request.session_id,
-                            client_sequence=request.client_sequence,
-                        )
                 except Exception:
                     pass
             if retained is not None:
@@ -6511,7 +6513,15 @@ class ProgramRuntime:
                     self._inflight_stops.pop(key, None)
             return result
 
-        if stopping_committed:
+        if stop_sent:
+            try:
+                record_stopping()
+            except Exception:
+                _LOGGER.warning(
+                    "Program Stop failed; its stopping record failed",
+                    exc_info=True,
+                )
+        if stopping_committed or stop_sent:
             try:
                 journal.require_reconciliation(
                     expected_generation=cycle.cycle_generation

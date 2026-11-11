@@ -1970,7 +1970,8 @@ class ProgramCycleJournal:
         session_id: str | None = None,
         client_sequence: str | None = None,
     ) -> None:
-        """Close current work before containment, retaining any uncertainty."""
+        """Record Stopping, retaining any uncertainty: a Start not yet Running
+        is closed by this record; a Running cycle records its sent Stop."""
         with self._transaction():
             row = self._database.execute(
                 """
