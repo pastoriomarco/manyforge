@@ -160,7 +160,12 @@ TEST(NativeSchedulerTest, LaneRunsByDeadlineThenScheduleOrderAndCancelRemovesOne
   EXPECT_TRUE(scheduler.cancel_before_dequeue(cancelled));
   EXPECT_FALSE(scheduler.cancel_before_dequeue(cancelled));
   release.store(true);
-  ASSERT_TRUE(scheduler.drain_all_for(std::chrono::seconds(5)));
+  // A drain waits only for a running callback, not for queued tasks: wait for
+  // the five that remain (the cancelled one never runs).
+  ASSERT_TRUE(wait_until_true([&] {
+    std::lock_guard lock(order_mutex);
+    return order.size() == 5U;
+  }));
   std::lock_guard lock(order_mutex);
   EXPECT_EQ(order, (std::vector<int>{5, 11, 12, 21, 30}));
 }
