@@ -172,22 +172,29 @@ std::vector<OperationId> ResourceAddressedExecutionKernel::durable_operation_ret
   if (manual_operation_claim_.has_value()) {
     retained.emplace_back(manual_operation_claim_->intent.owner_transaction_id);
   }
-  for (const auto& operation : historical_operations_) {
-    const bool replaced_before_settlement = std::any_of(
-        operation.participants.begin(), operation.participants.end(), [](const auto& participant) {
-          return participant.terminal_error.has_value() &&
-                 participant.terminal_error->code == "execution_host_replaced";
-        });
-    const bool references_unresolved_resource = std::any_of(
-        operation.participants.begin(), operation.participants.end(), [&](const auto& participant) {
-          return std::any_of(participant.resources.begin(), participant.resources.end(),
-                             [&](const auto& resource) {
-                               return std::binary_search(unresolved_resources.begin(),
-                                                         unresolved_resources.end(), resource);
-                             });
-        });
-    if (replaced_before_settlement && references_unresolved_resource) {
-      retained.push_back(operation.operation_id);
+  // Only a historical operation that references an unresolved resource is
+  // retained, so with none unresolved the walk is skipped. Otherwise it reads
+  // at most request_replay_capacity operations.
+  if (!unresolved_resources.empty()) {
+    for (const auto& operation : historical_operations_) {
+      const bool replaced_before_settlement = std::any_of(
+          operation.participants.begin(), operation.participants.end(),
+          [](const auto& participant) {
+            return participant.terminal_error.has_value() &&
+                   participant.terminal_error->code == "execution_host_replaced";
+          });
+      const bool references_unresolved_resource = std::any_of(
+          operation.participants.begin(), operation.participants.end(),
+          [&](const auto& participant) {
+            return std::any_of(participant.resources.begin(), participant.resources.end(),
+                               [&](const auto& resource) {
+                                 return std::binary_search(unresolved_resources.begin(),
+                                                           unresolved_resources.end(), resource);
+                               });
+          });
+      if (replaced_before_settlement && references_unresolved_resource) {
+        retained.push_back(operation.operation_id);
+      }
     }
   }
   std::sort(retained.begin(), retained.end());
@@ -207,10 +214,10 @@ bool ResourceAddressedExecutionKernel::evict_oldest_historical_operation_locked(
   }
   const auto retired_id = compactable->operation_id;
   historical_operations_.erase(compactable);
-  std::erase_if(replay_ledger_, [&](const ReplayEntry& entry) {
+  replay_ledger_.erase_if([&](const ReplayEntry& entry) {
     return entry.accepted.operation_id == retired_id;
   });
-  std::erase_if(control_replay_ledger_, [&](const ControlReplayEntry& entry) {
+  control_replay_ledger_.erase_if([&](const ControlReplayEntry& entry) {
     return entry.accepted.operation_id == retired_id;
   });
   std::erase_if(operation_recovery_replay_ledger_, [&](const OperationRecoveryReplayEntry& entry) {
@@ -329,14 +336,16 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       runtime_route_configuration_publication_required_.insert(configuration.control_domain_id);
     }
   }
+  runtime_scale_control_settings_.reserve(registrations_.size());
+  operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
+  // Slots and index nodes for every bounded ledger, allocated once here.
   replay_ledger_.reserve(config_.request_replay_capacity);
   control_replay_ledger_.reserve(config_.request_replay_capacity);
   stop_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_control_replay_ledger_.reserve(config_.request_replay_capacity);
-  runtime_scale_control_settings_.reserve(registrations_.size());
-  operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
+  historical_operations_.reserve(config_.request_replay_capacity);
   program_run_stop_fences_.reserve(config_.request_replay_capacity);
-  global_io_rule_projection_queue_.reserve(config_.request_replay_capacity);
+  global_io_rule_projection_queue_.resize(config_.request_replay_capacity);
   stop_terminal_history_.reserve(kMaximumResidentStopTerminalRecords);
   for (std::size_t index = 0U; index < stop_transactions_.size(); ++index) {
     stop_transactions_[index] = std::make_unique<StopTransaction>();
@@ -393,7 +402,9 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     throw std::runtime_error("addressed Kernel durable owner admission failed: " +
                              recovery.error().code + ": " + recovery.error().message);
   }
-  historical_operations_ = std::move(recovery.value().historical_operations);
+  historical_operations_.clear();
+  for (auto& operation : recovery.value().historical_operations)
+    historical_operations_.push_back(std::move(operation));
   cell_admission_owner_ = std::make_unique<KernelCellAdmissionOwner>(
       config_.request_owner_epoch,
       std::min(config_.request_replay_capacity, config_.cell_admission_claim_capacity), clock_,

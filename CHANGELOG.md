@@ -9,6 +9,20 @@ formats; such changes are listed explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **Bounded work on the time-critical paths.** The request replay ledgers,
+  Program-run fences and operation history are indexed by id in slots
+  allocated once, so a Stop finds, adds and evicts entries without scanning or
+  moving them and without new allocations. The global I/O rule projection
+  queue is a fixed ring; scheduler lanes pick the next task without a scan;
+  the gripper late-cancel prune no longer runs under the gripper authority a
+  Stop takes; repeated Stop-path collision facts are recorded once. The
+  runtime-scale replay ledger is now capped at the request replay capacity:
+  the oldest entry is evicted, and a repeat of an evicted request id counts as
+  a new request. An I/O signal's `ingress_depth` above 1024 is refused at
+  Apply (`io_signal_configuration_invalid`), and Composer accepts at most 1024.
+
 ### Fixed
 
 - **Mock inputs can be set from the Tool & I/O panel again.** With a Scenario

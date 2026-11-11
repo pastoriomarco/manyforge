@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -106,9 +107,13 @@ class SimpleScheduler final : public core::IScheduler {
   void contain_safety_path_fault(std::string_view reason_code) noexcept override;
 
  private:
-  struct ScheduledTask {
-    core::TimePoint deadline = 0;
-    std::function<void()> callback;
+  /// Tasks run by deadline, then by handle (the order a scan for the earliest
+  /// deadline picked before), so the next task is always `tasks.begin()`.
+  using TaskKey = std::pair<core::TimePoint, core::ScheduleHandle>;
+  using TaskMap = std::map<TaskKey, std::function<void()>>;
+  struct RegisteredTask {
+    core::SchedulerPriority priority;
+    core::TimePoint deadline;
   };
 
   /// One worker pool. Each priority lane owns one of these.
@@ -117,7 +122,9 @@ class SimpleScheduler final : public core::IScheduler {
     std::mutex mutex;
     std::condition_variable_any cv;
     std::condition_variable drain_cv;
-    std::map<core::ScheduleHandle, ScheduledTask> tasks;
+    // Live scheduled work only (each user keeps at most a Deployment-scoped
+    // number of handles outstanding); every operation is O(log n).
+    TaskMap tasks;
     std::jthread thread;
     std::size_t callbacks_in_flight = 0;
     std::uint64_t queue_generation = 0;
@@ -147,7 +154,7 @@ class SimpleScheduler final : public core::IScheduler {
   /// without locking both workers.
   std::mutex registry_mutex_;
   bool admission_closed_ = false;
-  std::map<core::ScheduleHandle, core::SchedulerPriority> handle_to_priority_;
+  std::map<core::ScheduleHandle, RegisteredTask> handle_to_priority_;
 
   /// Held while the sink runs so clearing it cannot race a containment.
   /// Declared before the workers, which join first on destruction.

@@ -10,7 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <iostream>
 #include <map>
+#include <new>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -27,6 +29,45 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+
+
+// Counts this thread's allocations while enabled (rule 4: a time-critical
+// path's allocation count may not grow).
+namespace {
+thread_local bool count_allocations = false;
+thread_local std::size_t counted_allocations = 0U;
+void* CountedAllocate(const std::size_t size) {
+  if (count_allocations) ++counted_allocations;
+  if (void* memory = std::malloc(size == 0U ? 1U : size); memory != nullptr) return memory;
+  throw std::bad_alloc();
+}
+// Out of line: see test_bounded_stop_control_executor.cpp.
+[[gnu::noinline]] void CountedDeallocate(void* memory) noexcept { std::free(memory); }
+template <typename Call>
+std::size_t AllocationsDuring(Call&& call) {
+  counted_allocations = 0U;
+  count_allocations = true;
+  call();
+  count_allocations = false;
+  return counted_allocations;
+}
+}  // namespace
+void* operator new(const std::size_t size) { return CountedAllocate(size); }
+void* operator new[](const std::size_t size) { return CountedAllocate(size); }
+void* operator new(const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void* operator new[](const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void operator delete(void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
 
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
@@ -88,6 +129,59 @@ TEST(NativeSchedulerTest, CancelReleasesCapturedOwnerOutsideWorkerLock) {
   owner.reset();
   EXPECT_TRUE(scheduler.cancel_before_dequeue(handle));
   EXPECT_TRUE(released);
+  scheduler.close_admission_and_discard();
+}
+
+TEST(NativeSchedulerTest, LaneRunsByDeadlineThenScheduleOrderAndCancelRemovesOneTask) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  ReleaseOnExit release_on_exit{release};
+  std::mutex order_mutex;
+  std::vector<int> order;
+  const auto record = [&](int value) {
+    return [&, value] {
+      std::lock_guard lock(order_mutex);
+      order.push_back(value);
+    };
+  };
+  // Park the lane so every task below is queued before the worker picks one.
+  scheduler.schedule(0, [&] {
+    parked.store(true);
+    while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  ASSERT_TRUE(wait_until_true([&] { return parked.load(); }));
+  scheduler.schedule(30, record(30));
+  scheduler.schedule(10, record(11));
+  const auto cancelled = scheduler.schedule(20, record(20));
+  scheduler.schedule(10, record(12));
+  scheduler.schedule(20, record(21));
+  scheduler.schedule(5, record(5));
+  EXPECT_TRUE(scheduler.cancel_before_dequeue(cancelled));
+  EXPECT_FALSE(scheduler.cancel_before_dequeue(cancelled));
+  release.store(true);
+  ASSERT_TRUE(scheduler.drain_all_for(std::chrono::seconds(5)));
+  std::lock_guard lock(order_mutex);
+  EXPECT_EQ(order, (std::vector<int>{5, 11, 12, 21, 30}));
+}
+
+TEST(NativeSchedulerTest, ScheduleAndCancelAllocationCount) {
+  SimpleScheduler scheduler;
+  const auto future = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      (std::chrono::steady_clock::now() + std::chrono::hours(1)).time_since_epoch()).count();
+  // Start the lane first so only the queue work is counted.
+  scheduler.cancel(scheduler.schedule(future, [] {}));
+  for (int round = 0; round < 3; ++round) {
+    std::function<void()> callback = [] {};
+    ScheduleHandle handle{};
+    const auto scheduled =
+        AllocationsDuring([&] { handle = scheduler.schedule(future, std::move(callback)); });
+    const auto cancelled = AllocationsDuring([&] { scheduler.cancel(handle); });
+    // Reported for the before/after comparison.
+    std::cout << "schedule allocations " << scheduled << " cancel allocations " << cancelled
+              << '\n';
+    EXPECT_EQ(cancelled, 0U);
+  }
   scheduler.close_admission_and_discard();
 }
 

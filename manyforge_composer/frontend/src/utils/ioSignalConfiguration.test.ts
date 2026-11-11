@@ -330,6 +330,7 @@ describe('io_signals configuration', () => {
     [{ sourceId: 'a b' }, 'source'],
     [{ resourceRoleId: 'x'.repeat(129) }, 'resource role'],
     [{ ingressDepth: '0' }, 'ingress depth'],
+    [{ ingressDepth: '1025' }, 'ingress depth'],
     [{ ingressDepth: '9007199254740992' }, 'ingress depth'],
     [{ ingressDepth: '1.5' }, 'ingress depth'],
     [{ profile: 'ros_bool', topic: ' ', maximumAgeMs: '10' }, 'topic'],
@@ -345,6 +346,7 @@ describe('io_signals configuration', () => {
 
   it('accepts the bounds exactly', () => {
     expect(validateIoSignalRows([input({ ingressDepth: '1' })])).toBeNull();
+    expect(validateIoSignalRows([input({ ingressDepth: '1024' })])).toBeNull();
     expect(validateIoSignalRows([input({ profile: 'ros_bool', topic: '/t', maximumAgeMs: '0.000001' })])).toBeNull();
     // A change-only ROS Bool has no sample age to validate.
     expect(validateIoSignalRows([input({ profile: 'ros_bool', topic: '/t', liveness: 'change_only', maximumAgeMs: '' })])).toBeNull();

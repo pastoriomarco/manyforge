@@ -630,9 +630,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   {
     std::lock_guard state_lock(state_mutex_);
     const auto replay =
-        std::find_if(replay_ledger_.begin(), replay_ledger_.end(), [&](const ReplayEntry& entry) {
-          return entry.intent.request_context.request_id == intent.request_context.request_id;
-        });
+        replay_ledger_.find(intent.request_context.request_id);
     if (replay != replay_ledger_.end()) {
       if (replay->intent != intent) {
         return Result<OperationAcceptedDTO>::Err(
@@ -660,26 +658,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           error("request_id_conflict", "operation request ID is retained by emergency Stop",
                 "request_id_conflict"));
     }
-    const auto control_request = std::find_if(
-        control_replay_ledger_.begin(), control_replay_ledger_.end(),
-        [&](const ControlReplayEntry& entry) {
-          return entry.request.request_context.request_id == intent.request_context.request_id;
-        });
+    const auto control_request = control_replay_ledger_.find(intent.request_context.request_id);
     if (control_request != control_replay_ledger_.end()) {
       return Result<OperationAcceptedDTO>::Err(error(
           "request_id_conflict", "operation request ID was already used by an operation control",
           "request_id_conflict"));
     }
-    if (std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                    [&](const StopReplayEntry& entry) {
-                      return entry.request_id() == intent.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    })) {
+    if (stop_replay_ledger_.contains(intent.request_context.request_id) ||
+        runtime_scale_control_replay_ledger_.contains(intent.request_context.request_id)) {
       return Result<OperationAcceptedDTO>::Err(error(
           "request_id_conflict", "operation request ID was already used by another Kernel command",
           "request_id_conflict"));
@@ -1219,26 +1205,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         std::any_of(active_operations_.begin(), active_operations_.end(),
                     [&](const auto& item) { return item.second->participant_for(engine) != nullptr; });
     const bool request_id_used =
-        std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                    [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
-        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                    [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
-        std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                    [&](const StopReplayEntry& entry) {
-                      return entry.request_id() == intent.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    });
+        replay_ledger_.contains(intent.request_context.request_id) ||
+        control_replay_ledger_.contains(intent.request_context.request_id) ||
+        stop_replay_ledger_.contains(intent.request_context.request_id) ||
+        runtime_scale_control_replay_ledger_.contains(intent.request_context.request_id);
     if (request_id_used) {
       return Result<OperationAcceptedDTO>::Err(
           error("request_id_conflict", "operation request ID was used during admission",
@@ -2033,26 +2003,10 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
               [&](const auto* engine) { return item.second->participant_for(engine) != nullptr; });
         });
     const bool request_id_used =
-        std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                    [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
-        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                    [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    }) ||
-        std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                    [&](const StopReplayEntry& entry) {
-                      return entry.request_id() == intent.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             intent.request_context.request_id;
-                    });
+        replay_ledger_.contains(intent.request_context.request_id) ||
+        control_replay_ledger_.contains(intent.request_context.request_id) ||
+        stop_replay_ledger_.contains(intent.request_context.request_id) ||
+        runtime_scale_control_replay_ledger_.contains(intent.request_context.request_id);
     if (request_id_used) {
       return Result<OperationAcceptedDTO>::Err(
           error("request_id_conflict", "operation request ID was used during admission",
@@ -2415,11 +2369,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
           error("request_id_conflict", "operation control request ID is retained by emergency Stop",
                 "request_id_conflict"));
     }
-    const auto replay = std::find_if(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                                     [&](const ControlReplayEntry& entry) {
-                                       return entry.request.request_context.request_id ==
-                                              request.request_context.request_id;
-                                     });
+    const auto replay = control_replay_ledger_.find(request.request_context.request_id);
     if (replay != control_replay_ledger_.end()) {
       if (replay->request != request || replay->accepted.control != control) {
         return Result<OperationControlAcceptedDTO>::Err(error(
@@ -2435,23 +2385,13 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
       return Result<OperationControlAcceptedDTO>::Ok(std::move(accepted));
     }
-    if (std::any_of(replay_ledger_.begin(), replay_ledger_.end(), [&](const ReplayEntry& entry) {
-          return entry.intent.request_context.request_id == request.request_context.request_id;
-        })) {
+    if (replay_ledger_.contains(request.request_context.request_id)) {
       return Result<OperationControlAcceptedDTO>::Err(
           error("request_id_conflict", "operation control request ID was already used by Execute",
                 "request_id_conflict"));
     }
-    if (std::any_of(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                    [&](const StopReplayEntry& entry) {
-                      return entry.request_id() == request.request_context.request_id;
-                    }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id ==
-                             request.request_context.request_id;
-                    })) {
+    if (stop_replay_ledger_.contains(request.request_context.request_id) ||
+        runtime_scale_control_replay_ledger_.contains(request.request_context.request_id)) {
       return Result<OperationControlAcceptedDTO>::Err(
           error("request_id_conflict",
                 "operation control request ID was already used by another Kernel command",
@@ -2597,7 +2537,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                                                                 false,
                                                                 false,
                                                                 request.execution_scope};
-    std::erase_if(control_replay_ledger_, [&](const ControlReplayEntry& entry) {
+    control_replay_ledger_.erase_if([&](const ControlReplayEntry& entry) {
       return entry.accepted.operation_id == request.operation_id;
     });
     control_replay_ledger_.push_back(ControlReplayEntry{request, accepted, false});
@@ -2613,10 +2553,8 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
         "control_accepted", durable_acceptance.error(), &*accepted_state,
         request.request_context.request_id);
     const auto replay =
-        std::find_if(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                     [&](const ControlReplayEntry& entry) {
-                       return entry.accepted.request_id == accepted.request_id && !entry.durable;
-                     });
+        control_replay_ledger_.find_if(
+            accepted.request_id, [](const ControlReplayEntry& entry) { return !entry.durable; });
     if (replay != control_replay_ledger_.end()) {
       control_replay_ledger_.erase(replay);
     }
@@ -2633,10 +2571,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
   bool defer_effects_to_stop = false;
   {
     std::lock_guard state_lock(state_mutex_);
-    const auto replay = std::find_if(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                                     [&](const ControlReplayEntry& entry) {
-                                       return entry.accepted.request_id == accepted.request_id;
-                                     });
+    const auto replay = control_replay_ledger_.find(accepted.request_id);
     if (replay == control_replay_ledger_.end()) {
       return Result<OperationControlAcceptedDTO>::Ok(accepted);
     }
@@ -3278,9 +3213,7 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
     }
     if (!program_cycle_claim_run_) return Reply::Ok(std::nullopt);
     const auto& parent = *program_cycle_claim_run_;
-    const auto fence = std::find_if(
-        program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-        [&](const auto& item) { return item.program_run_id == parent.program_run_id; });
+    const auto fence = program_run_stop_fences_.find(parent.program_run_id);
     if (!parent.capture || !parent.capture->binding || fence == program_run_stop_fences_.end()) {
       return reject<std::optional<ResolvedManualProgramHandover>>(
           "Program target mapping or hold is unavailable", "manual_handover_capture_unavailable");
@@ -3346,9 +3279,7 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
 
 Result<void> ResourceAddressedExecutionKernel::validate_manual_program_handover_locked(
     const ResolvedManualProgramHandover& result) const {
-  const auto fence = std::find_if(
-      program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-      [&](const auto& item) { return item.program_run_id == result.capture.program_run_id; });
+  const auto fence = program_run_stop_fences_.find(result.capture.program_run_id);
   if (motion_admission_closed_locked() || motion_admission_unreconciled_ ||
       !program_cycle_claim_run_ ||
       program_cycle_claim_run_->claim_generation != result.capture.claim_generation ||
@@ -3526,9 +3457,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
                             "program_execution_capture_late", ErrorCode::kInvalidStateTransition);
       }
       // A Stop overtaking registration still fences every later effect.
-      auto fence = std::find_if(
-          program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-          [&](const auto& row) { return row.program_run_id == capture.program_run_id; });
+      auto fence = program_run_stop_fences_.find(capture.program_run_id);
       if (fence == program_run_stop_fences_.end()) {
         if (program_run_stop_fences_.size() >= config_.request_replay_capacity) {
           return reject<void>("Program execution scope capacity is exhausted",
@@ -3589,8 +3518,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_node_claim(
                         "program_execution_scope_unknown", ErrorCode::kInvalidRequest);
   }
   const auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == evidence.program_run_id; });
+      program_run_stop_fences_.find(evidence.program_run_id);
   const auto index = static_cast<std::size_t>(node - nodes.begin());
   if (fence == program_run_stop_fences_.end() || index >= fence->node_states.size()) {
     return reject<void>("node transaction has no current execution scope",
@@ -3613,8 +3541,7 @@ bool ResourceAddressedExecutionKernel::program_node_effectively_running_locked(
   if (!program_cycle_claim_run_ || program_cycle_claim_run_->program_run_id != run ||
       !program_cycle_claim_run_->capture || !program_cycle_claim_run_->capture->table) return false;
   const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
-  const auto fence = std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-      [&](const auto& row) { return row.program_run_id == run; });
+  const auto fence = program_run_stop_fences_.find(run);
   if (fence == program_run_stop_fences_.end() || index >= nodes.size() ||
       fence->node_states.size() != nodes.size()) return false;
   const auto state = fence->node_states[index];
@@ -3712,10 +3639,10 @@ void ResourceAddressedExecutionKernel::fence_held_prepared_program_commands_lock
 Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_locked(
     const OperationIntentDTO& intent, const std::optional<bool> non_motion_only,
     const bool intrinsic_direct_control) const {
-  const bool run_stopped = std::any_of(program_run_stop_fences_.begin(),
-      program_run_stop_fences_.end(), [&](const auto& fence) {
-        return fence.program_run_id == intent.program_run_id && fence.stop_id.has_value();
-      });
+  const bool run_stopped =
+      program_run_stop_fences_.find_if(intent.program_run_id, [](const auto& fence) {
+        return fence.stop_id.has_value();
+      }) != program_run_stop_fences_.end();
   // The first pass precedes product resolution; the reservation pass repeats
   // this check with independently resolved kind/readiness for every participant.
   if (run_stopped && non_motion_only.has_value() && !*non_motion_only)
@@ -3767,8 +3694,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_
     const auto index = static_cast<std::size_t>(node - capture.table->nodes.begin());
     scoped_node_indices.push_back(static_cast<std::uint32_t>(index));
     const auto fence =
-        std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                     [&](const auto& row) { return row.program_run_id == intent.program_run_id; });
+        program_run_stop_fences_.find(intent.program_run_id);
     if (fence == program_run_stop_fences_.end() || index >= fence->node_states.size() ||
         !program_node_effectively_running_locked(intent.program_run_id, index) ||
         (fence->node_states[index] != ProgramNodeHoldStateDTO::kRunning &&
@@ -3842,10 +3768,7 @@ Result<void> ResourceAddressedExecutionKernel::release_program_run_stop_fence(
   std::lock_guard state_lock(state_mutex_);
   // A cell latch refuses Program resume.
   if (auto refusal = cell_latch_refusal_locked()) return Result<void>::Err(std::move(*refusal));
-  const auto fence = std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                                  [&](const ProgramRunStopFence& candidate) {
-                                    return candidate.program_run_id == program_run_id;
-                                  });
+  const auto fence = program_run_stop_fences_.find(program_run_id);
   if (fence == program_run_stop_fences_.end()) {
     return Result<void>::Ok();
   }
@@ -3981,8 +3904,7 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::get_prog
     const ProgramRunId& program_run_id) const {
   std::lock_guard state_lock(state_mutex_);
   const auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == program_run_id; });
+      program_run_stop_fences_.find(program_run_id);
   if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
       program_cycle_claim_run_->program_run_id != program_run_id ||
       fence == program_run_stop_fences_.end()) {
@@ -4019,8 +3941,7 @@ ResourceAddressedExecutionKernel::stop_program_selection_locked(
         {std::nullopt, {}, {}, std::move(stopped.value()), selection.error()});
   }
   auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == request.program_run_id; });
+      program_run_stop_fences_.find(request.program_run_id);
   // A resolved captured selection always has its fence installed. If that
   // invariant is lost, recognized Stop must still contain through the
   // existing conservative path rather than return before taking effect.
@@ -4040,9 +3961,7 @@ ResourceAddressedExecutionKernel::stop_program_selection_locked(
                "program_selection_owner_missing")});
   }
   const auto& table = *program_cycle_claim_run_->capture->table;
-  const auto replay = std::find_if(
-      stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-      [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
+  const auto replay = stop_replay_ledger_.find(request.request_context.request_id);
   if (replay != stop_replay_ledger_.end() ||
       ordinary_request_id_retained_locked(request.request_context.request_id) ||
       emergency_stop_reserve_.find(request.request_context.request_id.value()).has_value()) {
@@ -4278,14 +4197,12 @@ ResourceAddressedExecutionKernel::stop_program_selection_locked(
   StopReplayEntry receipt{request,
                           StopReplayEntry::SelectionReceipt{accepted.widened_node_indices,
                                                             accepted.fresh_containment}};
-  const auto physical_receipt = std::find_if(
-      stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-      [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
+  const auto physical_receipt = stop_replay_ledger_.find(request.request_context.request_id);
   if (physical_receipt != stop_replay_ledger_.end())
     *physical_receipt = std::move(receipt);
   else {
     if (stop_replay_ledger_.size() >= config_.request_replay_capacity)
-      stop_replay_ledger_.erase(stop_replay_ledger_.begin());
+      stop_replay_ledger_.pop_front();
     stop_replay_ledger_.push_back(std::move(receipt));
   }
   accepted.state = program_execution_scope_locked(*fence);
@@ -4361,8 +4278,7 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
   auto selection = resolve_program_selection_locked(request, true);
   if (!selection.ok()) return Result<ProgramExecutionScopeStateDTO>::Err(selection.error());
   auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == request.program_run_id; });
+      program_run_stop_fences_.find(request.program_run_id);
   if (fence == program_run_stop_fences_.end() ||
       fence->selection_revision != expected_selection_revision ||
       fence->selection_revision >= kMaximumKernelJsonInteger) {
@@ -4508,22 +4424,10 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     }
     const auto request_id = request.request_context.request_id;
     const bool used_elsewhere =
-        std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                    [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                    [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(
-            stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-            [&](const StopReplayEntry& entry) { return entry.request_id() == request_id; }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id == request_id;
-                    });
+        replay_ledger_.contains(request_id) ||
+        control_replay_ledger_.contains(request_id) ||
+        stop_replay_ledger_.contains(request_id) ||
+        runtime_scale_control_replay_ledger_.contains(request_id);
     if (used_elsewhere) {
       return Result<RuntimeScaleAcceptedDTO>::Err(
           error("request_id_conflict",
@@ -4795,11 +4699,8 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
   std::unique_lock submit_lock(submission_mutex_);
   {
     std::lock_guard state_lock(state_mutex_);
-    const auto replay = std::find_if(
-        runtime_scale_control_replay_ledger_.begin(), runtime_scale_control_replay_ledger_.end(),
-        [&](const RuntimeScaleControlReplayEntry& entry) {
-          return entry.request.request_context.request_id == request.request_context.request_id;
-        });
+    const auto replay =
+        runtime_scale_control_replay_ledger_.find(request.request_context.request_id);
     if (replay != runtime_scale_control_replay_ledger_.end()) {
       if (replay->request != request) {
         return Result<RuntimeScaleControlAcceptedDTO>::Err(
@@ -4814,17 +4715,9 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     const auto request_id = request.request_context.request_id;
     const bool used_elsewhere =
         emergency_stop_reserve_.find(request_id.value()).has_value() ||
-        std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                    [&](const ReplayEntry& entry) {
-                      return entry.intent.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                    [&](const ControlReplayEntry& entry) {
-                      return entry.request.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(
-            stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-            [&](const StopReplayEntry& entry) { return entry.request_id() == request_id; });
+        replay_ledger_.contains(request_id) ||
+        control_replay_ledger_.contains(request_id) ||
+        stop_replay_ledger_.contains(request_id);
     if (used_elsewhere) {
       return Result<RuntimeScaleControlAcceptedDTO>::Err(
           error("request_id_conflict",
@@ -5048,11 +4941,15 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     std::sort(live_requests.begin(), live_requests.end(), [](const auto& left, const auto& right) {
       return left.operation_id < right.operation_id;
     });
-    std::erase_if(runtime_scale_control_replay_ledger_,
-                  [&](const RuntimeScaleControlReplayEntry& entry) {
-                    return entry.accepted.selector == request.selector ||
-                           entry.scope.same_control_scope(resolved.value());
-                  });
+    runtime_scale_control_replay_ledger_.erase_if(
+        [&](const RuntimeScaleControlReplayEntry& entry) {
+          return entry.accepted.selector == request.selector ||
+                 entry.scope.same_control_scope(resolved.value());
+        });
+    // At most request_replay_capacity entries; the oldest leaves first, as in
+    // the Stop ledger. A replay of an evicted id is a new request.
+    if (runtime_scale_control_replay_ledger_.size() >= config_.request_replay_capacity)
+      runtime_scale_control_replay_ledger_.pop_front();
     runtime_scale_control_replay_ledger_.push_back(
         RuntimeScaleControlReplayEntry{request, accepted, resolved.value()});
   }
@@ -5086,11 +4983,8 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     accepted.active_operation_revision = only_live_acceptance->operation_revision;
     accepted.active_operation_scale_generation = only_live_acceptance->runtime_scale_generation;
     std::lock_guard state_lock(state_mutex_);
-    const auto replay = std::find_if(
-        runtime_scale_control_replay_ledger_.begin(), runtime_scale_control_replay_ledger_.end(),
-        [&](const auto& entry) {
-          return entry.request.request_context.request_id == request.request_context.request_id;
-        });
+    const auto replay =
+        runtime_scale_control_replay_ledger_.find(request.request_context.request_id);
     if (replay != runtime_scale_control_replay_ledger_.end()) replay->accepted = accepted;
   }
   return Result<RuntimeScaleControlAcceptedDTO>::Ok(std::move(accepted));

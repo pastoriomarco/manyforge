@@ -8,6 +8,7 @@
 #include <manyforge_core/bounded_stop_control_executor.hpp>
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
+#include <manyforge_core/indexed_ledger.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
@@ -1232,8 +1233,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<GlobalIoRuleRuntime> global_io_rules_;
   std::set<InterruptSourceId> planned_disabled_io_sources_;
   std::unique_ptr<StagedGlobalIoRuleCatalog> staged_global_io_rule_catalog_;
-  // Existing bounded forensic history budget; no second event cursor.
-  std::vector<IoRuleStateChangeDTO> global_io_rule_projection_queue_;
+  // Existing bounded forensic history budget; no second event cursor. A ring
+  // of request_replay_capacity slots, allocated once: the oldest change is at
+  // the head, and taking it moves no other entry.
+  std::vector<std::optional<IoRuleStateChangeDTO>> global_io_rule_projection_queue_;
+  std::size_t global_io_rule_projection_head_{};
+  std::size_t global_io_rule_projection_size_{};
   bool global_io_rule_projection_in_flight_{};
   bool global_io_rule_projection_gap_{};
   std::optional<ErrorDTO> global_io_rule_projection_error_;
@@ -1324,15 +1329,48 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] bool program_node_effectful_locked(const ProgramRunId& program_run_id,
                                                    std::size_t index) const;
   void reduce_program_selection_stop_locked(const StopCertificateDTO& certificate);
-  std::vector<ReplayEntry> replay_ledger_;
-  std::vector<ControlReplayEntry> control_replay_ledger_;
-  std::vector<StopReplayEntry> stop_replay_ledger_;
-  std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
+  // The request replay ledgers, indexed by request id. Each holds at most
+  // `request_replay_capacity` entries: the Stop and runtime-scale ledgers evict
+  // their oldest entry at capacity, the other two leave with the historical
+  // operation they belong to.
+  struct ReplayRequestIndex final {
+    using Key = RequestId;
+    static const RequestId& key(const ReplayEntry& entry);
+  };
+  struct ControlReplayRequestIndex final {
+    using Key = RequestId;
+    static const RequestId& key(const ControlReplayEntry& entry);
+  };
+  struct StopReplayRequestIndex final {
+    using Key = RequestId;
+    static const RequestId& key(const StopReplayEntry& entry);
+  };
+  struct RuntimeScaleControlReplayRequestIndex final {
+    using Key = RequestId;
+    static const RequestId& key(const RuntimeScaleControlReplayEntry& entry);
+  };
+  IndexedLedger<ReplayEntry, ReplayRequestIndex> replay_ledger_;
+  IndexedLedger<ControlReplayEntry, ControlReplayRequestIndex> control_replay_ledger_;
+  IndexedLedger<StopReplayEntry, StopReplayRequestIndex> stop_replay_ledger_;
+  IndexedLedger<RuntimeScaleControlReplayEntry, RuntimeScaleControlReplayRequestIndex>
+      runtime_scale_control_replay_ledger_;
   std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
   struct OperationRecoveryReplayEntry;
   std::vector<OperationRecoveryReplayEntry> operation_recovery_replay_ledger_;
-  std::vector<OperationStateDTO> historical_operations_;
-  std::vector<ProgramRunStopFence> program_run_stop_fences_;
+  struct HistoricalOperationIndex final {
+    using Key = OperationId;
+    static const OperationId& key(const OperationStateDTO& state) { return state.operation_id; }
+  };
+  struct ProgramRunStopFenceIndex final {
+    using Key = ProgramRunId;
+    static const ProgramRunId& key(const ProgramRunStopFence& fence) {
+      return fence.program_run_id;
+    }
+  };
+  // Oldest first; at most `request_replay_capacity` operations (resident plus
+  // historical) and `request_replay_capacity` fences.
+  IndexedLedger<OperationStateDTO, HistoricalOperationIndex> historical_operations_;
+  IndexedLedger<ProgramRunStopFence, ProgramRunStopFenceIndex> program_run_stop_fences_;
   std::optional<ProgramRunId> pending_program_run_admission_;
   // Program-cycle acquisition is synchronous and precedes all Run effects.
   // Its transaction identity is the exact ProgramRunId, so Stop never waits

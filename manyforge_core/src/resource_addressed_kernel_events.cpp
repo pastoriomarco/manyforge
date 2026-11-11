@@ -2326,10 +2326,20 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
                   escalation_wakeup = (*transaction)->token;
                 }
               } else if (!(*transaction)->participant_work_initialized) {
-                (*transaction)
-                    ->pending_stop_path_collisions.emplace_back(
-                        operation->state.operation_id, participant->slot_owner.participant_id,
-                        std::move(stop_error));
+                // One entry per (operation, participant): the consumer keeps
+                // only the first error, so the list is bounded by the Stop's
+                // participants, not by how many collision events arrive.
+                auto& pending = (*transaction)->pending_stop_path_collisions;
+                const bool recorded = std::any_of(
+                    pending.begin(), pending.end(), [&](const auto& entry) {
+                      return std::get<0>(entry) == operation->state.operation_id &&
+                             std::get<1>(entry) == participant->slot_owner.participant_id;
+                    });
+                if (!recorded) {
+                  pending.emplace_back(operation->state.operation_id,
+                                       participant->slot_owner.participant_id,
+                                       std::move(stop_error));
+                }
                 escalation_wakeup = (*transaction)->token;
               }
               if (escalation_wakeup.has_value()) {

@@ -465,7 +465,7 @@ std::optional<IoRuleStateProjectionDTO>
 ResourceAddressedExecutionKernel::ReadInterruptRuleStateBaseline() const {
   std::lock_guard lock(state_mutex_);
   const bool projecting =
-      global_io_rule_projection_in_flight_ || !global_io_rule_projection_queue_.empty();
+      global_io_rule_projection_in_flight_ || global_io_rule_projection_size_ != 0U;
   if (projecting && stop_projection_worker_) stop_projection_worker_->PublishGlobalRuleStates();
   if (global_io_rule_waiting_for_program_)
     return IoRuleStateProjectionDTO{IoRuleStateProjectionStatusDTO::kPending, std::nullopt,
@@ -518,13 +518,15 @@ void ResourceAddressedExecutionKernel::set_global_io_rule_state_locked(
                             std::move(unavailable_reason)};
   if (row.state == next) return;
   row.state = next;
-  if (global_io_rule_projection_queue_.size() == config_.request_replay_capacity) {
+  if (global_io_rule_projection_size_ == config_.request_replay_capacity) {
     // The bounded forensic queue cannot block Stop. An omitted transition is
     // covered by the next ready baseline after older work drains.
     global_io_rule_projection_gap_ = true;
   } else {
-    global_io_rule_projection_queue_.push_back(
-        {global_io_rule_catalog_->context, next, clock_.now()});
+    global_io_rule_projection_queue_[(global_io_rule_projection_head_ +
+                                      global_io_rule_projection_size_++) %
+                                     config_.request_replay_capacity] =
+        IoRuleStateChangeDTO{global_io_rule_catalog_->context, next, clock_.now()};
   }
   stop_projection_worker_->PublishGlobalRuleStates();
   execution_event_change_signal().Notify();  // State key and readiness changed.
@@ -551,12 +553,12 @@ void ResourceAddressedExecutionKernel::ProjectGlobalIoRuleStates() noexcept {
     std::optional<IoRuleStateChangeDTO> change;
     {
       std::lock_guard lock(state_mutex_);
-      if (global_io_rule_projection_queue_.empty()) {
+      if (global_io_rule_projection_size_ == 0U) {
         global_io_rule_projection_gap_ = false;
         return;
       }
       global_io_rule_projection_in_flight_ = true;
-      change = global_io_rule_projection_queue_.front();
+      change = global_io_rule_projection_queue_[global_io_rule_projection_head_];
     }
     auto recorded = Result<std::uint64_t>::Err(
         global_rule_error("io_global_rule_projection_exception"));
@@ -570,22 +572,25 @@ void ResourceAddressedExecutionKernel::ProjectGlobalIoRuleStates() noexcept {
       global_io_rule_projection_error_ = recorded.error();
       return;  // Existing events cadence retries; never spin on failed storage.
     }
-    if (global_io_rule_projection_queue_.empty() ||
-        global_io_rule_projection_queue_.front() != *change ||
+    if (global_io_rule_projection_size_ == 0U ||
+        global_io_rule_projection_queue_[global_io_rule_projection_head_] != change ||
         recorded.value() <= global_io_rule_through_sequence_ ||
         recorded.value() > kMaximumKernelJsonInteger) {
       global_io_rule_projection_error_ = global_rule_error("io_global_rule_projection_conflict");
       return;
     }
     global_io_rule_through_sequence_ = recorded.value();
-    global_io_rule_projection_queue_.erase(global_io_rule_projection_queue_.begin());
+    global_io_rule_projection_queue_[global_io_rule_projection_head_].reset();
+    global_io_rule_projection_head_ =
+        (global_io_rule_projection_head_ + 1U) % config_.request_replay_capacity;
+    --global_io_rule_projection_size_;
     global_io_rule_projection_error_.reset();
     // The baseline may now be ready: event streams re-read it (the journal
     // commit above signalled before this cut moved).
     execution_event_change_signal().Notify();
   }
   std::lock_guard lock(state_mutex_);
-  if (!global_io_rule_projection_queue_.empty())
+  if (global_io_rule_projection_size_ != 0U)
     stop_projection_worker_->PublishGlobalRuleStates();
 }
 
@@ -1100,8 +1105,7 @@ Result<void> ResourceAddressedExecutionKernel::hold_program_run_for_rule_locked(
   if (!held.ok()) return Result<void>::Err(held.error());
   // The run end names the rule (stopped_by: rule) until Resume releases it.
   const auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == hold.program_run_id; });
+      program_run_stop_fences_.find(hold.program_run_id);
   if (fence != program_run_stop_fences_.end()) fence->held_by_rule = policy.policy_id;
   return Result<void>::Ok();
 }

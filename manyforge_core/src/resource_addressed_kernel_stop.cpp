@@ -313,18 +313,8 @@ void ResourceAddressedExecutionKernel::publish_stop_work(const StopWorkHandoff& 
 
 bool ResourceAddressedExecutionKernel::ordinary_request_id_retained_locked(
     const RequestId& request_id) const {
-  return std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                     [&](const auto& row) {
-                       return row.intent.request_context.request_id == request_id;
-                     }) ||
-         std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                     [&](const auto& row) {
-                       return row.request.request_context.request_id == request_id;
-                     }) ||
-         std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                     runtime_scale_control_replay_ledger_.end(), [&](const auto& row) {
-                       return row.request.request_context.request_id == request_id;
-                     });
+  return replay_ledger_.contains(request_id) || control_replay_ledger_.contains(request_id) ||
+         runtime_scale_control_replay_ledger_.contains(request_id);
 }
 
 Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
@@ -554,9 +544,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   {
     // The caller retains state_mutex_ through selection and acceptance.
     if (ordinary != nullptr && malformed_ingress == nullptr) {
+      // An exact match carries the request id, so only that id's entries are read.
       const auto replay =
-          std::find_if(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                       [&](const StopReplayEntry& entry) { return entry.matches(*ordinary); });
+          stop_replay_ledger_.find_if(ordinary->request_context.request_id,
+                                      [&](const StopReplayEntry& entry) {
+                                        return entry.matches(*ordinary);
+                                      });
       if (replay != stop_replay_ledger_.end()) {
         auto replayed = std::get<StopAcceptedDTO>(replay->accepted);
         replayed.replay_status = RequestReplayStatusDTO::kReplayedExact;
@@ -566,12 +559,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     if (program_run_targets != nullptr) {
       std::size_t missing_fences = 0U;
       for (const auto& target : *program_run_targets) {
-        const auto retained =
-            std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                         [&](const ProgramRunStopFence& fence) {
-                           return fence.program_run_id == target.program_run_id;
-                         });
-        missing_fences += retained == program_run_stop_fences_.end() ? 1U : 0U;
+        missing_fences += program_run_stop_fences_.contains(target.program_run_id) ? 0U : 1U;
       }
       if (missing_fences >
           config_.request_replay_capacity -
@@ -779,9 +767,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         ordinary_request_id_retained_locked(context.request_id);
     const bool request_id_used_by_prior_stop =
         ordinary != nullptr && malformed_ingress == nullptr &&
-        std::any_of(
-            stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-            [&](const StopReplayEntry& entry) { return entry.request_id() == context.request_id; });
+        stop_replay_ledger_.contains(context.request_id);
     if (request_id_used_by_ordinary_command || request_id_used_by_prior_stop) {
       auto retained_diagnostics = std::move(resolution.value().stale_diagnostics);
       resolution = full_resolution;
@@ -1877,11 +1863,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     if (program_run_targets != nullptr && accepted.has_value() && !outcome.full_stop &&
         accepted->resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull) {
       for (const auto& target : *program_run_targets) {
-        const auto retained =
-            std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                         [&](const ProgramRunStopFence& fence) {
-                           return fence.program_run_id == target.program_run_id;
-                         });
+        const auto retained = program_run_stop_fences_.find(target.program_run_id);
         ProgramRunStopFence* installed = nullptr;
         if (retained == program_run_stop_fences_.end()) {
           program_run_stop_fences_.push_back(ProgramRunStopFence{
@@ -1911,15 +1893,13 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       }
     }
     if (ordinary != nullptr && malformed_ingress == nullptr && accepted.has_value()) {
-      const auto retained =
-          std::find_if(stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-                       [&](const StopReplayEntry& entry) { return entry.matches(*ordinary); });
-      if (retained == stop_replay_ledger_.end()) {
-        if (stop_replay_ledger_.size() >= config_.request_replay_capacity) {
-          stop_replay_ledger_.erase(stop_replay_ledger_.begin());
-        }
-        stop_replay_ledger_.push_back(StopReplayEntry{*ordinary, *accepted});
+      // No exact match exists: one would have returned the replay above, and
+      // nothing since then adds to the ledger. At most request_replay_capacity
+      // entries; the oldest leaves first.
+      if (stop_replay_ledger_.size() >= config_.request_replay_capacity) {
+        stop_replay_ledger_.pop_front();
       }
+      stop_replay_ledger_.push_back(StopReplayEntry{*ordinary, *accepted});
     }
   }
 

@@ -1551,6 +1551,27 @@ struct ResourceAddressedExecutionKernel::RuntimeScaleControlReplayEntry final {
   RuntimeScaleControlScope scope;
 };
 
+inline const RequestId& ResourceAddressedExecutionKernel::ReplayRequestIndex::key(
+    const ReplayEntry& entry) {
+  return entry.intent.request_context.request_id;
+}
+
+inline const RequestId& ResourceAddressedExecutionKernel::ControlReplayRequestIndex::key(
+    const ControlReplayEntry& entry) {
+  return entry.request.request_context.request_id;
+}
+
+inline const RequestId& ResourceAddressedExecutionKernel::StopReplayRequestIndex::key(
+    const StopReplayEntry& entry) {
+  return entry.request_id();
+}
+
+inline const RequestId&
+ResourceAddressedExecutionKernel::RuntimeScaleControlReplayRequestIndex::key(
+    const RuntimeScaleControlReplayEntry& entry) {
+  return entry.request.request_context.request_id;
+}
+
 struct ResourceAddressedExecutionKernel::OperationRecoveryReplayEntry final {
   OperationId operation_id;
   OperationRevision operation_revision{0U};

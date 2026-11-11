@@ -70,9 +70,7 @@ Result<OperationReadProjectionDTO> ResourceAddressedExecutionKernel::get_operati
     return Result<OperationReadProjectionDTO>::Ok(
         operation_projection_locked(pending->state, true, pending->pending_control.has_value()));
   }
-  const auto historical = std::find_if(
-      historical_operations_.begin(), historical_operations_.end(),
-      [&](const OperationStateDTO& state) { return state.operation_id == operation_id; });
+  const auto historical = historical_operations_.find(operation_id);
   if (historical != historical_operations_.end()) {
     return Result<OperationReadProjectionDTO>::Ok(
         operation_projection_locked(*historical, false, false));

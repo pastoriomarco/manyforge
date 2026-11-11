@@ -286,14 +286,12 @@ void ResourceAddressedExecutionKernel::refresh_execution_claims() {
   }
   // An exact still-held claim retains its immutable capture and all holds.
   if (retired.has_value()) {
-    const auto fence = std::find_if(
-        program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-        [&](const auto& row) { return row.program_run_id == retired->program_run_id; });
+    const auto fence = program_run_stop_fences_.find(retired->program_run_id);
     if (fence != program_run_stop_fences_.end()) {
       retired_fence = std::move(*fence);
       program_run_stop_fences_.erase(fence);
     }
-    std::erase_if(stop_replay_ledger_, [&](const auto& row) {
+    stop_replay_ledger_.erase_if([&](const auto& row) {
       const auto* selection = std::get_if<ProgramExecutionSelectionRequestDTO>(&row.intent);
       return selection != nullptr && selection->program_run_id == retired->program_run_id;
     });
@@ -323,8 +321,7 @@ ResourceAddressedExecutionKernel::manual_operation_settlement_locked(
     }
   }
   const auto operation =
-      std::find_if(historical_operations_.begin(), historical_operations_.end(),
-                   [&](const auto& row) { return row.operation_id == operation_id; });
+      historical_operations_.find(operation_id);
   const bool no_effect = operation == historical_operations_.end();
   // Absence is proof only within this still-live Kernel incarnation. Its
   // admission guard runs after the pending Execute drains, and a held claim

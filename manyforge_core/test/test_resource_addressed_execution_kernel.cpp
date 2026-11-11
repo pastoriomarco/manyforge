@@ -54,6 +54,46 @@
 #include <vector>
 
 #include "../src/program_stop_projection_internal.hpp"
+#include <iostream>
+#include <new>
+
+// Counts this thread's allocations while enabled (rule 4: a time-critical
+// path's allocation count may not grow).
+namespace {
+thread_local bool count_allocations = false;
+thread_local std::size_t counted_allocations = 0U;
+void* CountedAllocate(const std::size_t size) {
+  if (count_allocations) ++counted_allocations;
+  if (void* memory = std::malloc(size == 0U ? 1U : size); memory != nullptr) return memory;
+  throw std::bad_alloc();
+}
+// Out of line: see test_bounded_stop_control_executor.cpp.
+[[gnu::noinline]] void CountedDeallocate(void* memory) noexcept { std::free(memory); }
+template <typename Call>
+std::size_t AllocationsDuring(Call&& call) {
+  counted_allocations = 0U;
+  count_allocations = true;
+  call();
+  count_allocations = false;
+  return counted_allocations;
+}
+}  // namespace
+void* operator new(const std::size_t size) { return CountedAllocate(size); }
+void* operator new[](const std::size_t size) { return CountedAllocate(size); }
+void* operator new(const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void* operator new[](const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void operator delete(void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
 #include "../src/resource_addressed_execution_kernel_internal.hpp"
 
 namespace manyforge::core {
@@ -35309,6 +35349,235 @@ TEST(ResourceAddressedExecutionKernelTest, PreemptNamingAnotherTcpIsRefusedAndCu
   EXPECT_EQ(
       kernel.get_operation_state(original.value().operation_id).value().preemption->by.operation_id,
       current.value().operation_id);
+}
+
+
+// The replay ledgers (rule 4): oldest-first order, the oldest of equal keys
+// first, eviction from the front, and removal that keeps the others' order.
+struct TestLedgerIndex final {
+  using Key = int;
+  static const int& key(const std::pair<int, int>& entry) { return entry.first; }
+};
+
+TEST(IndexedLedgerTest, SteadyStateAddAndEvictAllocateNoMoreThanTheReservedVector) {
+  // Entries own heap strings, like the replay ledgers' request ids. Building
+  // an entry allocates the same either way; only the ledger's own work counts.
+  struct Row {
+    std::string id;
+  };
+  struct RowIndex {
+    using Key = std::string;
+    static const std::string& key(const Row& row) { return row.id; }
+  };
+  const auto row = [](int number) {
+    return Row{"request.identity.long.enough.to.leave.the.small.buffer." + std::to_string(number)};
+  };
+  constexpr std::size_t kCapacity = 8U;
+  IndexedLedger<Row, RowIndex> ledger;
+  ledger.reserve(kCapacity);
+  std::vector<Row> vector;
+  vector.reserve(kCapacity);
+  for (int number = 0; number < static_cast<int>(kCapacity); ++number) {
+    ledger.push_back(row(number));
+    vector.push_back(row(number));
+  }
+  for (int number = 8; number < 40; ++number) {
+    auto ledger_row = row(number);
+    auto vector_row = row(number);
+    const auto key = row(number).id;
+    const auto ledger_allocations = AllocationsDuring([&] {
+      ledger.pop_front();
+      ledger.push_back(std::move(ledger_row));
+      EXPECT_TRUE(ledger.contains(key));
+    });
+    const auto vector_allocations = AllocationsDuring([&] {
+      vector.erase(vector.begin());
+      vector.push_back(std::move(vector_row));
+    });
+    EXPECT_EQ(ledger_allocations, 0U) << number;
+    EXPECT_EQ(vector_allocations, 0U) << number;
+  }
+  EXPECT_EQ(ledger.size(), kCapacity);
+  EXPECT_EQ(ledger.begin()->id, row(32).id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, AcceptedStopAllocationsAtLedgerCapacity) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 4U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto operation = kernel.execute(motion_operation());
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  std::vector<StopIntentDTO> intents;
+  for (int number = 1; number <= 8; ++number)
+    intents.push_back(stop_request("stop.allocation.request." + std::to_string(number),
+                                   operation.value(), 1U));
+  for (std::size_t index = 0U; index < intents.size(); ++index) {
+    std::optional<Result<StopAcceptedDTO>> accepted;
+    const auto allocations = AllocationsDuring([&] { accepted.emplace(kernel.stop(intents[index])); });
+    ASSERT_TRUE(accepted->ok()) << accepted->error().message;
+    // Reported for the before/after comparison; entries 5..8 evict.
+    std::cout << "accepted Stop " << index + 1U << " allocations " << allocations << '\n';
+  }
+}
+
+TEST(IndexedLedgerTest, KeepsInsertionOrderAndFindsTheOldestEntryOfAKey) {
+  IndexedLedger<std::pair<int, int>, TestLedgerIndex> ledger;
+  for (const auto& entry : std::vector<std::pair<int, int>>{{7, 0}, {3, 1}, {7, 2}, {5, 3}})
+    ledger.push_back(entry);
+  ASSERT_EQ(ledger.size(), 4U);
+  EXPECT_EQ(ledger.find(7)->second, 0);
+  EXPECT_EQ(ledger.find_if(7, [](const auto& entry) { return entry.second > 0; })->second, 2);
+  EXPECT_EQ(ledger.find(4), ledger.end());
+  EXPECT_FALSE(ledger.contains(4));
+  ledger.pop_front();
+  EXPECT_EQ(ledger.find(7)->second, 2);
+  ledger.erase_if([](const auto& entry) { return entry.second == 1; });
+  EXPECT_FALSE(ledger.contains(3));
+  std::vector<int> order;
+  for (const auto& entry : ledger) order.push_back(entry.second);
+  EXPECT_EQ(order, (std::vector<int>{2, 3}));
+  ledger.erase(ledger.find(5));
+  ledger.push_back({5, 4});
+  EXPECT_EQ(ledger.find(5)->second, 4);
+  EXPECT_EQ(ledger.back().second, 4);
+  ledger.clear();
+  EXPECT_TRUE(ledger.empty());
+  EXPECT_FALSE(ledger.contains(7));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, StopReplayAnswersAreUnchangedAtAndBeyondLedgerCapacity) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 4U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto operation = kernel.execute(motion_operation());
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  std::map<std::string, StopId> stop_ids;
+  const auto stop = [&](const std::string& id) {
+    return kernel.stop(stop_request(id, operation.value(), 1U));
+  };
+  for (const auto* id : {"stop.1", "stop.2", "stop.3", "stop.4"}) {
+    const auto accepted = stop(id);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_NE(accepted.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    stop_ids.emplace(id, accepted.value().stop_id);
+  }
+  // At capacity every entry still replays exactly.
+  for (const auto& [id, stop_id] : stop_ids) {
+    const auto replay = stop(id);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact) << id;
+    EXPECT_EQ(replay.value().stop_id, stop_id) << id;
+  }
+  // A fifth Stop evicts the oldest ledger entry (stop.1). The Stop reserve's
+  // own correlation (64 entries) still answers its exact repeat with the same
+  // Stop, so beyond capacity every answer is unchanged; a different intent
+  // under a retained id is still a request-identity conflict.
+  const auto fifth = stop("stop.5");
+  ASSERT_TRUE(fifth.ok()) << fifth.error().message;
+  stop_ids.emplace("stop.5", fifth.value().stop_id);
+  for (const auto& [id, stop_id] : stop_ids) {
+    const auto replay = stop(id);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact) << id;
+    EXPECT_EQ(replay.value().stop_id, stop_id) << id;
+  }
+  for (const auto* id : {"stop.3", "stop.4", "stop.5"}) {
+    auto intent = stop_request(id, operation.value(), 1U);
+    intent.reason = "a different intent under the same request id";
+    const auto accepted = kernel.stop(intent);
+    ASSERT_TRUE(accepted.ok()) << id << ": " << accepted.error().message;
+    EXPECT_EQ(accepted.value().resolution_reason,
+              StopScopeResolutionReasonDTO::kRequestIdentityConflict)
+        << id;
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest, StopReplayLedgerKeepsBothIntentsOfAReusedRequestId) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto operation = kernel.execute(motion_operation());
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  const auto first_intent = stop_request("stop.shared", operation.value(), 1U);
+  auto second_intent = first_intent;
+  second_intent.reason = "a different intent under the same request id";
+  const auto first = kernel.stop(first_intent);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  const auto second = kernel.stop(second_intent);
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  EXPECT_NE(second.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(second.value().resolution_reason,
+            StopScopeResolutionReasonDTO::kRequestIdentityConflict);
+  EXPECT_NE(second.value().stop_id, first.value().stop_id);
+  const auto first_replay = kernel.stop(first_intent);
+  const auto second_replay = kernel.stop(second_intent);
+  ASSERT_TRUE(first_replay.ok() && second_replay.ok());
+  EXPECT_EQ(first_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(first_replay.value().stop_id, first.value().stop_id);
+  EXPECT_EQ(second_replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(second_replay.value().stop_id, second.value().stop_id);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleReplayLedgerEvictsItsOldestEntryAtCapacity) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine first_engine, second_engine, third_engine;
+  const auto first =
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine),
+       registration(coordinated_occurrence(first, "3"), third_engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 2U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto request_for = [](std::string id, std::string robot) {
+    auto request = runtime_scale_control_request(std::move(id), 0U, 0.5);
+    request.selector = runtime_scale_control_selector(std::move(robot), "arm");
+    return request;
+  };
+  const auto a = request_for("scale.a", "robot.1");
+  const auto b = request_for("scale.b", "robot.2");
+  const auto c = request_for("scale.c", "robot.3");
+  for (const auto* request : {&a, &b}) {
+    const auto accepted = kernel.set_runtime_scale_control(*request);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  }
+  // At capacity both replay exactly.
+  for (const auto* request : {&a, &b}) {
+    const auto replay = kernel.set_runtime_scale_control(*request);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  }
+  // A third evicts the oldest (scale.a). Its replay is a new request: its
+  // expected generation 0 is now stale, as for a superseded request id.
+  ASSERT_TRUE(kernel.set_runtime_scale_control(c).ok());
+  for (const auto* request : {&b, &c}) {
+    const auto replay = kernel.set_runtime_scale_control(*request);
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  }
+  const auto evicted = kernel.set_runtime_scale_control(a);
+  EXPECT_FALSE(evicted.ok() &&
+               evicted.value().replay_status == RequestReplayStatusDTO::kReplayedExact);
 }
 
 }  // namespace

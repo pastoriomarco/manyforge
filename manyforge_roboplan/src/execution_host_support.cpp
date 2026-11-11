@@ -471,12 +471,12 @@ core::ScheduleHandle SimpleScheduler::schedule(
   Worker& w = worker_for(priority);
   std::unique_lock<std::mutex> registry_lock(registry_mutex_);
   if (admission_closed_) throw std::runtime_error("scheduler admission is closed");
-  handle_to_priority_[handle] = priority;
+  handle_to_priority_[handle] = RegisteredTask{priority, deadline};
   try {
     std::lock_guard<std::mutex> lock(w.mutex);
     w.ensure_started_locked(&w);
     ++w.queue_generation;
-    w.tasks.emplace(handle, ScheduledTask{deadline, std::move(callback)});
+    w.tasks.emplace(TaskKey{deadline, handle}, std::move(callback));
   } catch (...) {
     // A strict worker can reject construction before accepting a callback, and
     // allocation can fail while inserting the task. Neither path may leave a
@@ -490,8 +490,7 @@ core::ScheduleHandle SimpleScheduler::schedule(
 }
 
 void SimpleScheduler::close_admission_and_discard() {
-  std::array<std::map<core::ScheduleHandle, ScheduledTask>, core::kSchedulerPriorityCount>
-      discarded;
+  std::array<TaskMap, core::kSchedulerPriorityCount> discarded;
   {
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     admission_closed_ = true;
@@ -512,24 +511,24 @@ void SimpleScheduler::cancel(core::ScheduleHandle handle) {
 }
 
 bool SimpleScheduler::cancel_before_dequeue(core::ScheduleHandle handle) {
-  core::SchedulerPriority priority;
+  RegisteredTask registered;
   {
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     auto it = handle_to_priority_.find(handle);
     if (it == handle_to_priority_.end()) {
       return false;  // already fired or never scheduled
     }
-    priority = it->second;
+    registered = it->second;
     handle_to_priority_.erase(it);
   }
-  Worker& w = worker_for(priority);
+  Worker& w = worker_for(registered.priority);
   decltype(w.tasks)::node_type removed;
   {
     std::lock_guard<std::mutex> lock(w.mutex);
     ++w.queue_generation;
     // Zero when the worker already dequeued it (the registry entry is erased
     // only after the dequeue), so a running callback is never reported removed.
-    removed = w.tasks.extract(handle);
+    removed = w.tasks.extract(TaskKey{registered.deadline, handle});
   }
   w.cv.notify_all();
   return !removed.empty();
@@ -646,27 +645,24 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
         return;
       }
 
-      const auto next_it = std::min_element(
-          tasks.begin(), tasks.end(),
-          [](const auto& lhs, const auto& rhs) {
-            return lhs.second.deadline < rhs.second.deadline;
-          });
+      const auto next_it = tasks.begin();
+      const auto deadline = next_it->first.first;
 
       const auto now = steady_now_ns();
-      if (next_it->second.deadline > now) {
+      if (deadline > now) {
         const auto observed_generation = queue_generation;
         (void)cv.wait_for(
             lock,
             st,
-            std::chrono::nanoseconds(next_it->second.deadline - now),
+            std::chrono::nanoseconds(deadline - now),
             [this, observed_generation]() {
               return queue_generation != observed_generation;
             });
         continue;
       }
 
-      callback = std::move(next_it->second.callback);
-      fired_handle = next_it->first;
+      callback = std::move(next_it->second);
+      fired_handle = next_it->first.second;
       tasks.erase(next_it);
       ++callbacks_in_flight;
     }

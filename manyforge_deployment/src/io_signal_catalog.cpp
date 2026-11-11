@@ -411,10 +411,7 @@ ResolveRetainedIoSignalCatalog(
         } else {
           throw InvalidConfiguration("io_signal_provider_unsupported");
         }
-        const auto depth = counter(
-            provider, "ingress_depth",
-            std::min<std::uint64_t>(9007199254740991ULL,
-                                    std::numeric_limits<std::size_t>::max()));
+        const auto depth = counter(provider, "ingress_depth", kMaximumIoIngressDepth);
         if (depth == 0U)
           throw InvalidConfiguration("io_signal_configuration_invalid");
         address.ingress_depth = static_cast<std::size_t>(depth);
