@@ -774,7 +774,12 @@ class ProgramRunnerLivenessReceiver:
         ):
             raise ProgramRunnerLivenessError("invalid reconciliation digest")
 
-        with self._lock:
+        # Lock order: the Runner's transition lock before this lock, never
+        # the reverse. The reconciliation takes the transition lock, so it
+        # runs with this lock released; a change meanwhile (only the
+        # watchdog's expiry can make one) refuses this heartbeat.
+        self._lock.acquire()
+        try:
             incoming_manager = request["manager_runtime_epoch"]
             needs_reconciliation = self._state != "current"
             if self._manager_runtime_epoch is not None:
@@ -805,11 +810,20 @@ class ProgramRunnerLivenessReceiver:
                     "receiver status sequence is exhausted"
                 )
             if needs_reconciliation and reconciliation is not None:
-                self._on_reconciliation(
-                    reconciliation,
-                    incoming_manager,
-                    request["manager_owner_epoch"],
-                )
+                decided = self._reconciliation_basis()
+                self._lock.release()
+                try:
+                    self._on_reconciliation(
+                        reconciliation,
+                        incoming_manager,
+                        request["manager_owner_epoch"],
+                    )
+                finally:
+                    self._lock.acquire()
+                if self._reconciliation_basis() != decided:
+                    raise ProgramRunnerLivenessError(
+                        "liveness changed during reconciliation"
+                    )
             self._manager_runtime_epoch = incoming_manager
             self._manager_owner_epoch = request["manager_owner_epoch"]
             self._manager_runtime_unit_id = request["manager_runtime_unit_id"]
@@ -825,6 +839,8 @@ class ProgramRunnerLivenessReceiver:
             elif needs_reconciliation:
                 self._state = "unreconciled"
                 self._fenced = True
+        finally:
+            self._lock.release()
         status = self.status()
         return {
             **status,
@@ -835,6 +851,17 @@ class ProgramRunnerLivenessReceiver:
             "required_runtime_set_digest": request["required_runtime_set_digest"],
             "receiver_status_digest": self._status_digest(status),
         }
+
+    def _reconciliation_basis(self) -> tuple[Any, ...]:
+        """What a heartbeat decided on; only `check_expiry` changes it."""
+        return (
+            self._state,
+            self._predecessor_expired,
+            self._manager_runtime_epoch,
+            self._manager_owner_epoch,
+            self._last_sequence,
+            self._last_accepted_ns,
+        )
 
     def _watchdog(self) -> None:
         while not self._stop.wait(RENEWAL_INTERVAL_NS / 1_000_000_000 / 4):

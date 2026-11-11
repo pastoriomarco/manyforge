@@ -91,6 +91,14 @@ formats; such changes are listed explicitly.
   Program, and a failed write meant the Stop was not sent at all. It now
   sends the Stop first and records it afterwards, as Program Full Stop
   already did; a failed record is logged and does not affect the Stop.
+- **The Program runner can no longer hang for good when the Manager's
+  heartbeat returns after a pause while a command is in progress.** The
+  heartbeat that reconciles the runner with the Manager waited for the
+  running command while holding the runner's liveness state, and a second
+  waiting command then waited for that state: neither could go on, and no
+  further command, heartbeat or Manager-loss Stop was handled. The heartbeat
+  now waits without holding that state; if the runner's liveness changed
+  meanwhile, the heartbeat is refused and the Manager's next one reconciles.
 
 ## 0.2.1 – 2026-11-10
 

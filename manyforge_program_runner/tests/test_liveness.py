@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import socket
+from threading import Thread
 
 import pytest
 
@@ -210,6 +211,37 @@ def test_fake_clock_expiry_fences_and_allows_new_manager_only_after_loss(
     receiver._handle(_heartbeat(manager="manager-2"))  # noqa: SLF001
     assert receiver.status()["manager_runtime_epoch"] == "manager-2"
     assert receiver.status()["state"] == "current"
+
+
+def test_reconciliation_runs_without_the_liveness_lock_and_refuses_a_raced_expiry(
+    tmp_path: Path,
+):
+    receiver, clock, losses, reconciliations = _receiver(tmp_path)
+    receiver._handle({**_heartbeat(), "reconciliation_digest": None})
+    clock.now += EXPIRY_TIMEOUT_NS + 1
+    expired: list[bool] = []
+
+    def reconcile_while_the_watchdog_expires(digest, runtime, owner):
+        reconciliations.append((digest, runtime, owner))
+        if len(reconciliations) == 1:
+            # The watchdog thread must not wait for this heartbeat.
+            watchdog = Thread(target=lambda: expired.append(receiver.check_expiry()))
+            watchdog.start()
+            watchdog.join(timeout=5)
+            assert not watchdog.is_alive()
+
+    receiver._on_reconciliation = reconcile_while_the_watchdog_expires
+    with pytest.raises(ProgramRunnerLivenessError, match="changed during"):
+        receiver._handle(_heartbeat(sequence=2))
+    assert expired == [True] and len(losses) == 1
+    status = receiver.status()
+    assert status["state"] == "expired" and status["command_fenced"]
+    assert status["last_accepted_heartbeat_sequence"] == 1
+
+    # The Manager's next renewal reconciles once more and is accepted.
+    result = receiver._handle(_heartbeat(sequence=3))
+    assert result["state"] == "current" and not result["command_fenced"]
+    assert len(reconciliations) == 2
 
 
 def test_listener_is_mode_0600_and_removes_only_owned_socket(tmp_path: Path):
