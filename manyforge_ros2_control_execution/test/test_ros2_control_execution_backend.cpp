@@ -164,7 +164,7 @@ public:
       std::function<void()> task;
       {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [&] { return closing_ || !tasks_.empty(); });
+        cv_.wait(lock, [&] { return closing_ || (!paused_ && !tasks_.empty()); });
         if (tasks_.empty() && closing_) return;
         task = std::move(tasks_.front());
         tasks_.pop_front();
@@ -189,12 +189,23 @@ public:
     return handle;
   }
   void cancel(ScheduleHandle) override {}
+  // Holds accepted tasks queued (not run) until resume(); closing runs them.
+  void pause() { std::lock_guard lock(mutex_); paused_ = true; }
+  void resume() {
+    { std::lock_guard lock(mutex_); paused_ = false; }
+    cv_.notify_all();
+  }
+  std::size_t queued() {
+    std::lock_guard lock(mutex_);
+    return tasks_.size();
+  }
   std::atomic<bool> reject{false};
 private:
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::function<void()>> tasks_;
   bool closing_{false};
+  bool paused_{false};
   ScheduleHandle next_{0};
   std::thread worker_;
 };
@@ -397,6 +408,32 @@ public:
   std::vector<rclcpp_action::GoalUUID> cancel_ids() {
     std::lock_guard lock(cancel_ids_mutex_);
     return cancel_ids_;
+  }
+  // Publishes one controller state sample and reports whether the adapter
+  // received it within `bound`. The state subscription runs on the epoch's
+  // time-critical thread, with the action client's callbacks: its arrival
+  // shows that thread is not blocked.
+  bool state_arrives_within(std::uint32_t nanosecond,
+                            std::chrono::milliseconds bound) {
+    if (!wait_until([&] { return state_pub_->get_subscription_count() > 0; }))
+      return false;
+    control_msgs::msg::JointTrajectoryControllerState sample;
+    sample.header.stamp.sec = 10;
+    sample.header.stamp.nanosec = nanosecond;
+    sample.joint_names = {"b", "a"};
+    sample.reference.positions = {0.2, 0.1};
+    sample.output.positions = {0.21, 0.11};
+    sample.feedback.positions = {0.19, 0.09};
+    sample.error.positions = {0.01, 0.01};
+    state_pub_->publish(sample);
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto observed = adapter->ReadSample();
+      if (observed && observed->source_stamp_ns == 10'000'000'000 + nanosecond)
+        return true;
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
   }
   void state(double factor = 0.25, std::uint32_t nanosecond = 0) {
     EXPECT_TRUE(
@@ -848,9 +885,11 @@ TEST(JtcExecutionPort, RejectedLossCancelScheduleReportsUnknownActivity) {
   EXPECT_EQ(goal->result, ExecutionGoalResult::kEndedUnknown);
 }
 
-// A cancel requested before acceptance is sent from the goal-response
-// callback itself: a refusing scheduler cannot stop it, and it is sent once.
-TEST(JtcExecutionPort, PendingCancelIsSentFromResponseWithoutSchedulerHop) {
+// OD-111: a cancel requested before acceptance leaves through the
+// StopControl lane, never from the goal-response callback. A refused schedule
+// is not retried: that exact goal's late cancel is recorded as not issued,
+// which raises the component's typed fault (ReadGoalActivity).
+TEST(JtcExecutionPort, RefusedPendingCancelScheduleIsRecordedNotIssued) {
   Rig rig;
   rig.delay_next_response = true;
   ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
@@ -859,7 +898,70 @@ TEST(JtcExecutionPort, PendingCancelIsSentFromResponseWithoutSchedulerHop) {
             ExecutionPortDispatch::kEffectUncertain);
   rig.scheduler.reject.store(true);
   rig.release_response();
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_TRUE(wait_until(
+      [&] { return rig.adapter->ReadGoalActivity().late_cancel_not_issued; }));
+  const auto unresolved = rig.adapter->ReadUnresolvedLateCancels();
+  ASSERT_EQ(unresolved.size(), 1U);
+  EXPECT_EQ(unresolved.front().key, key(1));
+  EXPECT_EQ(unresolved.front().reason,
+            Ros2ControlExecutionBackend::LateCancelUnresolvedReason::kNotIssued);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp);
+}
+
+// The same refusal for a shutdown-tracked attempt completes that tracking at
+// once: close does not wait for its deadline.
+TEST(JtcExecutionPort, RefusedLateCancelScheduleCompletesTrackedShutdown) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  rig.scheduler.reject.store(true);
+  // Close tracks the sent, unaccepted goal; its acceptance arrives during
+  // close's wait and claims the late cancel, whose schedule is refused.
+  std::jthread responder([&] {
+    (void)wait_until([&] { return !rig.adapter->ReadReadiness().controller_active; });
+    rig.release_response();
+  });
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_TRUE(rig.adapter->close_admission(started + 6s));
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 3s);
+  responder.join();
+  EXPECT_TRUE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
+  const auto unresolved = rig.adapter->ReadUnresolvedLateCancels();
+  ASSERT_EQ(unresolved.size(), 1U);
+  EXPECT_EQ(unresolved.front().key, key(1));
+  EXPECT_EQ(unresolved.front().reason,
+            Ros2ControlExecutionBackend::LateCancelUnresolvedReason::kNotIssued);
+  EXPECT_FALSE(rig.adapter->loss_cancel_shutdown_settled());
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+}
+
+// A Stop arriving while the deferred cancel is queued joins it: one cancel
+// request with the exact goal id; the Stop reports it dispatched and the
+// deferred cancel records its send and acknowledgement.
+TEST(JtcExecutionPort, StopJoinsQueuedPendingCancelExactlyOnce) {
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kEffectUncertain);
+  rig.scheduler.pause();
+  struct ResumeOnExit {
+    TestStopScheduler &scheduler;
+    ~ResumeOnExit() { scheduler.resume(); }
+  } resume{rig.scheduler};
+  rig.release_response();
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_TRUE(wait_until([&] { return rig.scheduler.queued() == 1U; }));
   const auto accepted = rig.handle();
+  EXPECT_EQ(rig.adapter->Cancel(key(1)).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  EXPECT_EQ(rig.scheduler.queued(), 1U);
+  EXPECT_EQ(rig.cancel_count.load(), 0U);
+  rig.scheduler.resume();
   ASSERT_TRUE(wait_until([&] {
     return rig.adapter->ReadGoal(key(1))
         ->cancel_ack_local_receipt_stamp.has_value();
@@ -867,9 +969,8 @@ TEST(JtcExecutionPort, PendingCancelIsSentFromResponseWithoutSchedulerHop) {
   EXPECT_EQ(rig.cancel_count.load(), 1U);
   EXPECT_EQ(rig.cancel_ids(),
             (std::vector<rclcpp_action::GoalUUID>{accepted->get_goal_id()}));
-  EXPECT_FALSE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
   EXPECT_TRUE(rig.adapter->ReadGoal(key(1))->cancel_sent_local_stamp);
-  EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->result);
+  EXPECT_FALSE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
 }
 
 TEST(JtcExecutionPort, RejectedPendingCancelSendsNothing) {

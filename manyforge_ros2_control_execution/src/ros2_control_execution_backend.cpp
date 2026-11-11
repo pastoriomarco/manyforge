@@ -319,7 +319,9 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   // OD-66: controller state and the action client's goal response, feedback,
   // result and cancel responses run on the epoch's time-critical thread, one
   // group each. Their handlers take only the facts mutex and make non-waiting
-  // calls (scheduler admission, retain_entity). The subscription's matched
+  // calls (scheduler admission, retain_entity); they never take a leaf lock
+  // (OD-111): a cancel due on acceptance goes to the StopControl lane. The
+  // subscription's matched
   // event joins its group (rclcpp adds event handlers to the subscription's
   // group). Both entities live until this epoch's owner has joined.
   rclcpp::SubscriptionOptions options;
@@ -1340,6 +1342,11 @@ void Ros2ControlExecutionBackend::SendAutomaticCancel(
     {
       MANYFORGE_LEAF_DEFERRED_LOCK(leaf, state->action_send_mutex,
                                   detail::LeafEntity::kMotionAutomaticCancel);
+      // Runs only on the StopControl lane (QueueAutomaticCancel), never in a
+      // ROS callback (OD-111), so no rclcpp lock is held here. Every leaf
+      // holder makes one non-waiting SDK call, and the rclcpp locks it takes
+      // are held only by callbacks that never take a leaf: the wait is bounded
+      // by that call.
       if (deadline)
         expired = !leaf.try_lock_until(*deadline) ||
                   std::chrono::steady_clock::now() >= *deadline;
@@ -1493,7 +1500,8 @@ void Ros2ControlExecutionBackend::ReceiveResponse(
     const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
     const GoalHandle::SharedPtr &handle,
     const std::shared_ptr<CancelAttempt> &attempt) {
-  // Claim a shared automatic attempt under facts and send outside the lock.
+  // Claim a shared automatic attempt under facts; it is sent on the
+  // StopControl lane, never from this callback.
   const auto response_id = handle ? mechanism_id(handle->get_goal_id()) : MechanismGoalId{std::string{}};
   auto retained_handle = handle ? state->epoch_resources->retain_entity(handle)
                                 : GoalHandle::SharedPtr{};
@@ -1580,17 +1588,12 @@ void Ros2ControlExecutionBackend::ReceiveResponse(
   }
   if (!send_cancel)
     return;
-  // Cancel requested before acceptance: send the exact cancel now, from this
-  // callback, under the action leaf (one non-waiting SDK call, nothing else
-  // acquired under it). No scheduler hop. The owner is alive while it runs
-  // this callback; it is checked only so an unavailable owner or client keeps
-  // its not-issued report, which QueueAutomaticCancel records unchanged.
-  const auto client = attempt->client.lock();
-  if (!client || state->epoch_owner.expired()) {
-    QueueAutomaticCancel(state, key, retained_handle, attempt);
-    return;
-  }
-  SendAutomaticCancel(state, key, retained_handle, attempt, client);
+  // OD-111: a ROS callback never takes a leaf lock. rclcpp holds its
+  // goal-request lock while it runs this callback, and a goal send holds the
+  // action leaf while it takes that lock, so the exact cancel claimed above
+  // is handed to the StopControl lane, which may wait for the leaf. A refused
+  // schedule records this goal's late cancel as not issued.
+  QueueAutomaticCancel(state, key, retained_handle, attempt);
 }
 void Ros2ControlExecutionBackend::ReceiveFeedback(
     const std::shared_ptr<State> &state, const ExecutionGoalKey &key,

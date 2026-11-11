@@ -45,6 +45,12 @@ formats; such changes are listed explicitly.
   `mock_ur10e_pick_and_place` check the gripper's status after opening it.
 - A **Default TCP of** a component without a default TCP now fails with
   `default_tcp_unavailable` instead of `end_effector_tcp_unavailable`.
+- **A Stop during a goal send can no longer hang an arm's motion.** When a
+  Stop reached a goal before the controller accepted it, and the acceptance
+  arrived while another goal was being sent to the same controller, the two
+  could wait on each other for good. The cancel that becomes due on acceptance
+  is now sent from the Stop lane, never from the acceptance callback; if it
+  cannot be scheduled, the component reports a fault.
 
 ## 0.2.1 – 2026-11-10
 

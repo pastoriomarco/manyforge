@@ -1,7 +1,8 @@
 #pragma once
 
 // This instrumentation exists only in the separately compiled timing test.
-// Product builds expand the macros to ordinary standard-library locks.
+// Product builds expand the macros to ordinary standard-library locks
+// (ThreadSanitizer builds annotate the timed acquisition; see below).
 #include <mutex>
 
 #ifdef MANYFORGE_LEAF_TIMING
@@ -197,8 +198,49 @@ template <class Mutex> class TimedLeafLock final {
 #define MANYFORGE_GRIPPER_REBIND_ROLLBACK_RESULT(success) (::manyforge::ros2_control_execution::detail::gripper_rebind_rollback_cas_failed.store(!(success)))
 #define MANYFORGE_GRIPPER_PUBLISH_ENTERED() (::manyforge::ros2_control_execution::detail::gripper_publish_sdk_entries.fetch_add(1, std::memory_order_relaxed))
 #else
+#if defined(__SANITIZE_THREAD__)
+#define MANYFORGE_TSAN_LEAF_LOCKS 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MANYFORGE_TSAN_LEAF_LOCKS 1
+#endif
+#endif
 #define MANYFORGE_LEAF_LOCK(name, mutex, entity) std::lock_guard name(mutex)
+#ifdef MANYFORGE_TSAN_LEAF_LOCKS
+// ThreadSanitizer builds only. libstdc++'s steady-clock try_lock_until calls
+// pthread_mutex_clocklock, which libtsan does not intercept: a timed leaf
+// acquisition was invisible to TSan's lock-order (deadlock) detector, and its
+// intercepted unlock looked unpaired. Annotate that acquisition on the
+// mutex's own address (the pthread mutex libtsan sees for lock() and unlock(),
+// which stay intercepted). A timed acquisition is a try-lock to TSan.
+#include <chrono>
+#include <sanitizer/tsan_interface.h>
+namespace manyforge::ros2_control_execution::detail {
+template <class Mutex> class TsanLeafLock final {
+ public:
+  TsanLeafLock(Mutex& mutex, std::defer_lock_t) : lock_(mutex, std::defer_lock) {}
+  void lock() { lock_.lock(); }
+  template <class Clock, class Duration>
+  bool try_lock_until(const std::chrono::time_point<Clock, Duration>& deadline) {
+    void* const address = static_cast<void*>(lock_.mutex());
+    __tsan_mutex_pre_lock(address, __tsan_mutex_try_lock);
+    const bool acquired = lock_.try_lock_until(deadline);
+    __tsan_mutex_post_lock(
+        address,
+        acquired ? __tsan_mutex_try_lock : __tsan_mutex_try_lock | __tsan_mutex_try_lock_failed,
+        0);
+    return acquired;
+  }
+  bool owns_lock() const noexcept { return lock_.owns_lock(); }
+ private:
+  std::unique_lock<Mutex> lock_;
+};
+}  // namespace manyforge::ros2_control_execution::detail
+#define MANYFORGE_LEAF_DEFERRED_LOCK(name, mutex, entity) \
+  ::manyforge::ros2_control_execution::detail::TsanLeafLock name(mutex, std::defer_lock)
+#else
 #define MANYFORGE_LEAF_DEFERRED_LOCK(name, mutex, entity) std::unique_lock name(mutex, std::defer_lock)
+#endif
 #define MANYFORGE_GOAL_ADMITTED_TEST_POINT() ((void)0)
 #define MANYFORGE_GPIO_ADMITTED_TEST_POINT() ((void)0)
 #define MANYFORGE_IO_SERVICE_ADMITTED_TEST_POINT() ((void)0)

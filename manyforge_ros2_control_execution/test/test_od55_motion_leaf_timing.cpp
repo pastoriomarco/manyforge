@@ -385,10 +385,6 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
     (void)rig.adapter->Cancel(key(1),
         std::chrono::steady_clock::now() + std::chrono::seconds(5));
   });
-  std::atomic<bool> owner_progress{false};
-  // Declared before the release guard so failure releases the barrier before
-  // the probe thread is joined.
-  std::optional<std::jthread> owner_probe;
   struct ReleaseOnExit {
     ~ReleaseOnExit() {
       detail::release_stop_barrier.store(true);
@@ -397,8 +393,8 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
   } release;
   ASSERT_TRUE(wait_until([] { return detail::stop_barrier_entered.load(); }));
   rig.release_response();
-  // Acceptance must be processed on the owner while the action leaf is held;
-  // the scheduled cancel may wait, but the ROS callback must not.
+  // Acceptance must be processed on the time-critical thread while the action
+  // leaf is held; the queued cancel may wait, but the ROS callback must not.
   const auto callback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   bool accepted = false;
   while (std::chrono::steady_clock::now() < callback_deadline) {
@@ -407,17 +403,12 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ASSERT_TRUE(accepted);
-  owner_probe.emplace([&] {
-    rig.epoch_resources->invoke([&] { owner_progress.store(true); });
-  });
-  const auto progress_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (!owner_progress.load() && std::chrono::steady_clock::now() < progress_deadline)
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  ASSERT_TRUE(owner_progress.load()) << "owner could not run another callback";
-  owner_probe->join();
+  ASSERT_TRUE(rig.state_arrives_within(1, std::chrono::seconds(1)))
+      << "time-critical thread could not run another callback";
   ASSERT_FALSE(detail::stop_barrier_expired.load());
   ASSERT_FALSE(detail::release_stop_barrier.load());
   ASSERT_EQ(rig.cancel_count.load(), 0U);
+  const auto first = rig.handle(0)->get_goal_id();
   detail::release_stop_barrier.store(true);
   stop.join();
   ASSERT_TRUE(wait_until([&] {
@@ -425,6 +416,7 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
     return goal && goal->cancel_ack_local_receipt_stamp.has_value();
   }));
   ASSERT_EQ(rig.cancel_count.load(), 1U);
+  ASSERT_EQ(rig.cancel_ids(), (std::vector<rclcpp_action::GoalUUID>{first}));
 }
 
 TEST(Od55LeafTiming, LateAcceptanceReturnsWhileStopBarrierHeld) {
@@ -440,6 +432,99 @@ TEST(Od55LeafTiming, LateAcceptanceReturnsWhileStopBarrierHeld1000) {
     if (::testing::Test::HasFatalFailure()) return;
   }
   ReportEntity(detail::LeafEntity::kMotionStopBarrier, "late_accept_barrier", iterations);
+}
+
+// OD-111 / DX-4018: k1's acceptance, with a retained cancel, arrives while
+// Submit(k2) holds the action leaf. The goal-response callback returns at once
+// on the time-critical thread; the cancel waits on the StopControl lane and
+// is sent once, for k1, after the leaf is released.
+TEST(Od55LeafTiming, LateAcceptanceReturnsWhileGoalSendHoldsLeaf) {
+  IterationWatchdog watchdog("late_accept_goal_leaf", 0);
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kEffectUncertain);
+  detail::motion_goal_entered.store(false);
+  detail::release_motion_goal.store(false);
+  detail::block_motion_goal.store(true);
+  std::atomic<bool> dispatched{false};
+  std::jthread submit([&] {
+    const auto result = rig.adapter->Submit(key(2), trajectory());
+    dispatched.store(result.dispatch == ExecutionPortDispatch::kDispatched);
+  });
+  struct ReleaseOnExit {
+    ~ReleaseOnExit() {
+      detail::release_motion_goal.store(true);
+      detail::block_motion_goal.store(false);
+    }
+  } release;
+  ASSERT_TRUE(wait_until([] { return detail::motion_goal_entered.load(); }));
+  rig.release_response();
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_TRUE(rig.state_arrives_within(1, std::chrono::seconds(1)))
+      << "goal-response callback did not return while the leaf was held";
+  ASSERT_FALSE(detail::release_motion_goal.load());
+  ASSERT_EQ(rig.cancel_count.load(), 0U);
+  const auto first = rig.handle(0)->get_goal_id();
+  detail::release_motion_goal.store(true);
+  submit.join();
+  ASSERT_TRUE(dispatched.load());
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  ASSERT_TRUE(rig.accepted(key(2)));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_EQ(rig.cancel_ids(), (std::vector<rclcpp_action::GoalUUID>{first}));
+  EXPECT_FALSE(rig.adapter->ReadGoalActivity().late_cancel_not_issued);
+}
+
+// The confirmed cycle at the backend interface: Submit(k2) is admitted and
+// holds the leaf just before its SDK send while k1's acceptance (retained
+// cancel) is delivered; then k2's send enters rclcpp. Before OD-111 the
+// callback held rclcpp's goal-request lock waiting for the leaf, and k2's
+// send waited for that lock. Now neither hangs: k2 is sent and k1 is
+// cancelled exactly once.
+TEST(Od55LeafTiming, LateAcceptanceDuringAdmittedGoalSendDoesNotDeadlock) {
+  IterationWatchdog watchdog("late_accept_admitted_send", 0);
+  Rig rig;
+  rig.delay_next_response = true;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
+  ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kEffectUncertain);
+  detail::goal_admitted_entered.store(false);
+  detail::goal_admitted_timed_out.store(false);
+  detail::release_goal_admitted.store(false);
+  detail::block_goal_admitted.store(true);
+  std::atomic<bool> dispatched{false};
+  std::jthread submit([&] {
+    const auto result = rig.adapter->Submit(key(2), trajectory());
+    dispatched.store(result.dispatch == ExecutionPortDispatch::kDispatched);
+  });
+  struct ReleaseOnExit {
+    ~ReleaseOnExit() {
+      detail::release_goal_admitted.store(true);
+      detail::block_goal_admitted.store(false);
+    }
+  } release;
+  ASSERT_TRUE(wait_until([] { return detail::goal_admitted_entered.load(); }));
+  rig.release_response();
+  ASSERT_TRUE(rig.accepted(key(1)));
+  // Let a callback that would wait for the leaf reach that wait.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto first = rig.handle(0)->get_goal_id();
+  detail::release_goal_admitted.store(true);
+  submit.join();
+  ASSERT_FALSE(detail::goal_admitted_timed_out.load());
+  ASSERT_TRUE(dispatched.load());
+  ASSERT_TRUE(rig.accepted(key(2)));
+  ASSERT_TRUE(wait_until([&] {
+    const auto goal = rig.adapter->ReadGoal(key(1));
+    return goal && goal->cancel_ack_local_receipt_stamp.has_value();
+  }));
+  EXPECT_EQ(rig.cancel_count.load(), 1U);
+  EXPECT_EQ(rig.cancel_ids(), (std::vector<rclcpp_action::GoalUUID>{first}));
 }
 }  // namespace
 }  // namespace manyforge::ros2_control_execution
