@@ -22,9 +22,29 @@ formats; such changes are listed explicitly.
   the oldest entry is evicted, and a repeat of an evicted request id counts as
   a new request. An I/O signal's `ingress_depth` above 1024 is refused at
   Apply (`io_signal_configuration_invalid`), and Composer accepts at most 1024.
+- **Speed changes no longer wait for planning, Submit or the disk.** The
+  execution host runs speed changes on their own lane (thread
+  `mf_scale_lane`), fed from both its sockets; the Headless sends them on the
+  control socket beside Stop. The new value reaches every arm before the
+  reply; the operation's `runtime_scale_accepted` record is written
+  afterwards, after any pending Stop record, and only the latest value per
+  operation is recorded when values arrive faster than they are written. The
+  reply no longer names the active operation (`active_operation_id`,
+  `active_operation_revision`, `active_operation_scale_generation` are
+  `null`); the runtime-scale status and an exact replay still show them. An
+  operation's per-operation scale status stays `pending` until the next status
+  poll. With eight speed changes already waiting, the next is refused with
+  `execution_runtime_scale_lane_busy` (before: `execution_submission_lane_busy`).
 
 ### Fixed
 
+- **The assistant can be enabled again.** The ROS overlay's installed scripts
+  ran under the image's system Python instead of the application's virtual
+  environment, so the assistant host started its bridge without a module the
+  bridge needs and Enable failed with "controller launch exited with status
+  0". The point-cloud source's observer bridge had the same defect. The
+  overlay is now built with colcon running under the virtual environment's
+  Python.
 - **Mock inputs can be set from the Tool & I/O panel again.** With a Scenario
   loaded, the panel took the Deployment Draft for unapplied (a Scenario
   Deployment carries no revision), so it offered no **Set true** / **Set
