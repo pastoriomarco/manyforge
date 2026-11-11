@@ -36,6 +36,7 @@ endif()
 # Core library
 add_library(manyforge_core
   src/stuck_drain_wait.cpp
+  src/pi_mutex.cpp
   src/addressed_observed_state_publication.cpp
   src/configured_robot_measured_state.cpp
   src/component_lifecycle.cpp
@@ -294,6 +295,11 @@ if(BUILD_TESTING)
   add_executable(test_stop_timing test/test_stop_timing.cpp)
   target_link_libraries(test_stop_timing PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_stop_timing
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_pi_mutex test/test_pi_mutex.cpp)
+  target_link_libraries(test_pi_mutex PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_pi_mutex
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_coordinate_state
