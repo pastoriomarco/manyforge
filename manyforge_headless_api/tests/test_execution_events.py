@@ -24,6 +24,7 @@ from manyforge_headless_api.models import (
     ProgramRunStopIntentRequest,
     StopIntentRequest,
     RecoveryPreflightConfirmation,
+    RuntimeScaleControlRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
 
@@ -533,6 +534,40 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
 
 def _ordinary_lane_forbidden(command: dict[str, Any]) -> dict[str, Any]:
     raise AssertionError(f"{command['command']} reached the ordinary socket")
+
+
+def test_execution_client_sends_runtime_scale_on_the_control_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    captured: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.append(command)
+        return {"ok": True, "command": "set_runtime_scale_control", "accepted": {}}
+
+    # Speed scaling travels beside Stop, never on the ordinary socket.
+    monkeypatch.setattr(client, "_exchange", _ordinary_lane_forbidden)
+    monkeypatch.setattr(client, "_exchange_control", exchange)
+    request = RuntimeScaleControlRequest.model_validate(
+        {
+            "request_context": {
+                "request_id": "scale.1",
+                "request_owner_epoch": "epoch.1",
+                "source_label": "test",
+            },
+            "selector": {
+                "program_binding_id": "binding-1",
+                "component_id": "robot",
+                "command_target_id": "arm",
+            },
+            "expected_control_generation": 0,
+            "scale": 0.4,
+        }
+    )
+    assert client.set_runtime_scale_control(request, trusted_principal_id=None)["ok"] is True
+    assert [command["command"] for command in captured] == ["set_runtime_scale_control"]
+    assert captured[0]["request"] == request.model_dump(mode="json")
 
 
 def test_execution_client_reads_one_exact_internal_stop_status(

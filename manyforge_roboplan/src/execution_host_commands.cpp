@@ -1046,7 +1046,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// ordering for its whole planning transaction, so these commands run on the
 /// submission-ordered lane, FIFO in host enqueue order, and never occupy the
 /// ordinary lane that serves Stop status, Reset, events, cell admission and
-/// operator-alarm attention.
+/// operator-alarm attention. Speed scaling takes no submission ordering: it
+/// runs on its own lane.
 [[nodiscard]] bool IsSubmissionOrdered(const CommandKind kind) noexcept {
   switch (kind) {
   case CommandKind::kPreviewMotion:
@@ -1055,7 +1056,6 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   case CommandKind::kPreviewCapabilityCommand:
   case CommandKind::kReadManualHandover:
   case CommandKind::kSubmit:
-  case CommandKind::kSetRuntimeScaleControl:
   case CommandKind::kResetRobotPosition:
   case CommandKind::kResetActiveTcp:
   case CommandKind::kReadActiveTcpOrdered:

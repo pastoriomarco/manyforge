@@ -16,6 +16,27 @@ namespace {
   return last.fetch_add(1U, std::memory_order_relaxed) + 1U;
 }
 
+/// Writes the seed read in the inserting section into a motion request built
+/// with a placeholder.
+void reseed_runtime_scale(std::optional<ExecuteRequestDTO>& request, const double scale,
+                          const std::uint64_t value_sequence) {
+  if (!request.has_value() || !request->initial_runtime_scale.has_value()) return;
+  request->initial_runtime_scale->requested_scale = scale;
+  request->initial_runtime_scale->value_sequence = value_sequence;
+}
+
+/// The initial status of an operation seeded with `scale` (initial_scale_status).
+void reseed_runtime_scale_status(std::optional<RuntimeScaleStatusDTO>& status,
+                                 const double scale) {
+  if (!status.has_value()) return;
+  status->requested_scale = scale;
+  status->effective_scale = scale;
+  for (auto& participant : status->participants) {
+    participant.commanded_scale = scale;
+    participant.applied_scale = scale;
+  }
+}
+
 }  // namespace
 
 Result<ResourceAddressedExecutionKernel::RuntimeScaleControlResolution>
@@ -567,10 +588,11 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   // Lock scope (OD-67, point 5): submission_mutex_ orders admission only:
   // validation, the durable manual claim, resource reservation and
   // registration in active_operations_, durable acceptance plus the replay
-  // entry. It linearizes that with runtime-scale settings (read at admission
-  // with their value sequence), the replay ledgers, route/registration
+  // entry. It linearizes that with the replay ledgers, route/registration
   // reconfiguration, I/O-rule staging, blackboard writes and Reset/Apply
-  // settled-work checks, which all take it too. end_admission() releases it
+  // settled-work checks, which all take it too. Speed scaling does not take
+  // it: the speed setting and its value sequence are read in the state_mutex_
+  // section that inserts the operation. end_admission() releases it
   // before a motion's subordinate Prepare (a later speed change reaches its
   // participant's ramp target, latest value wins, OD-72), before a motion
   // takeover's cancel and advance (try_accept_motion_takeover), and before a
@@ -918,11 +940,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           "the motion's controller is not listening for runtime scale input",
           kRuntimeScaleControllerNotListening, ErrorCode::kUnsupportedCapability);
     }
+    // A placeholder: the seed and its order are read in the section that
+    // inserts the operation (reseed_runtime_scale), so a speed change either
+    // lands before it and seeds it, or selects the resident operation
+    // (OD-72). A takeover candidate is parked before that section and keeps
+    // the value read here.
     double initial_runtime_scale = 1.0;
     std::uint64_t initial_runtime_scale_sequence = 0U;
-    {
-      // The seed and its order are taken together: a speed change after
-      // this read has a later sequence and wins at the participant (OD-72).
+    if (engine_already_in_use) {
       std::lock_guard state_lock(state_mutex_);
       initial_runtime_scale = runtime_scale_setting_for_binding_locked(binding);
       initial_runtime_scale_sequence = next_runtime_scale_value_sequence();
@@ -1262,6 +1287,16 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     if (!reservation.ok()) {
       return Result<OperationAcceptedDTO>::Err(reservation.error());
     }
+    if (motion_request.has_value() && motion_request->initial_runtime_scale.has_value()) {
+      // The seed and its order are taken together with the insert: a speed
+      // change after this section selects the resident operation (OD-72).
+      const auto seed = runtime_scale_setting_for_binding_locked(binding);
+      const auto seed_sequence = next_runtime_scale_value_sequence();
+      auto& operation = *prepared_operation.mapped();
+      reseed_runtime_scale(motion_request, seed, seed_sequence);
+      reseed_runtime_scale(operation.participants.front().motion_request, seed, seed_sequence);
+      reseed_runtime_scale_status(operation.runtime_scale_status, seed);
+    }
     const auto inserted = active_operations_.insert(std::move(prepared_operation));
     if (!inserted.inserted) {
       const auto released = resource_slots_->release(slot_owner, resources);
@@ -1301,6 +1336,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   }
 
   bool dispatch_allowed = false;
+  bool runtime_scale_pending = false;
   {
     std::lock_guard state_lock(state_mutex_);
     auto* active_operation = find_active_operation_locked(operation_id);
@@ -1310,6 +1346,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     }
     active_operation->ordinary_acceptance_pending = false;
     active_operation->ordinary_acceptance_durable = true;
+    // A speed change that arrived before acceptance was durable waited.
+    runtime_scale_pending = active_operation->pending_runtime_scale.has_value();
     replay_ledger_.push_back(std::move(prepared_replay));
     auto& participant = active_operation->participants.front();
     dispatch_allowed = !participant.stop_owns_reconciliation() &&
@@ -1318,6 +1356,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       participant.prepare_in_flight = true;
     }
   }
+  if (runtime_scale_pending) stop_projection_worker_->PublishRuntimeScale();
   admission_commit.release();
   if (!dispatch_allowed) {
     return Result<OperationAcceptedDTO>::Ok(accepted);
@@ -1553,8 +1592,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
   std::vector<ResourceSlotReservationOwnerDTO> reservation_rows;
   std::set<IResolvedParticipantExecutionEngine*> selected_engines;
   std::set<ResourceId> selected_resources;
-  double coordinated_initial_runtime_scale = 1.0;
-  std::uint64_t coordinated_initial_runtime_scale_sequence = 0U;
   const bool all_motion = std::all_of(
       intent.participants.begin(), intent.participants.end(), [](const auto& participant) {
         return std::holds_alternative<MotionParticipantIntentDTO>(participant.payload);
@@ -1568,15 +1605,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     std::lock_guard state_lock(state_mutex_);
     auto scope = resolve_runtime_scale_control_locked(selector);
     if (!scope.ok()) return Result<OperationAcceptedDTO>::Err(scope.error());
-    const auto setting =
-        std::find_if(runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
-                     [&](const auto& candidate) {
-                       return candidate.resolution.same_control_scope(scope.value());
-                     });
-    if (setting != runtime_scale_control_settings_.end())
-      coordinated_initial_runtime_scale = setting->requested_scale;
-    // Taken with the seed it orders (OD-72).
-    coordinated_initial_runtime_scale_sequence = next_runtime_scale_value_sequence();
+    // The group seed is read where the operation is inserted (below).
   }
   admissions.reserve(intent.participants.size());
   assignments.reserve(intent.participants.size());
@@ -1686,15 +1715,10 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             "a motion's controller is not listening for runtime scale input",
             kRuntimeScaleControllerNotListening, ErrorCode::kUnsupportedCapability);
       }
-      double initial_runtime_scale = 1.0;
-      std::uint64_t initial_runtime_scale_sequence = 0U;
-      {
-        std::lock_guard state_lock(state_mutex_);
-        initial_runtime_scale = all_motion ? coordinated_initial_runtime_scale
-                                           : runtime_scale_setting_for_binding_locked(binding);
-        initial_runtime_scale_sequence = all_motion ? coordinated_initial_runtime_scale_sequence
-                                                    : next_runtime_scale_value_sequence();
-      }
+      // Placeholders: the seed and its order are read in the section that
+      // inserts the operation (OD-72).
+      const double initial_runtime_scale = 1.0;
+      const std::uint64_t initial_runtime_scale_sequence = 0U;
       auto request =
           build_motion_request(intent, participant_intent, motion, binding, operation_id,
                                operation_revision, participant_id, controller_goal_id,
@@ -2022,6 +2046,41 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
           error("operation_capacity_full", "active operation capacity reached its fixed bound",
                 "operation_capacity_full"));
     }
+    // The seed and its order are taken together with the insert: one value
+    // and one sequence for a group of motions, a speed change after this
+    // section finds the resident operation (OD-72).
+    std::optional<double> group_seed;
+    std::uint64_t group_seed_sequence = 0U;
+    if (all_motion) {
+      RuntimeScaleControlSelectorDTO selector{intent.program_binding_id,
+                                              ControllableComponentId(""), CommandTargetId("")};
+      for (const auto& participant : intent.participants)
+        selector.group_targets.push_back(
+            {participant.target.component_id, participant.target.command_target_id});
+      auto scope = resolve_runtime_scale_control_locked(selector);
+      if (!scope.ok()) return Result<OperationAcceptedDTO>::Err(scope.error());
+      const auto setting = std::find_if(
+          runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+          [&](const auto& candidate) { return candidate.resolution.same_control_scope(scope.value()); });
+      group_seed = setting != runtime_scale_control_settings_.end() ? setting->requested_scale : 1.0;
+      group_seed_sequence = next_runtime_scale_value_sequence();
+    }
+    auto& seeded_operation = *prepared_operation.mapped();
+    for (std::size_t index = 0U; index < admissions.size(); ++index) {
+      auto& admission = admissions[index];
+      if (!admission.motion_request.has_value() ||
+          !admission.motion_request->initial_runtime_scale.has_value())
+        continue;
+      const auto seed = group_seed.value_or(
+          runtime_scale_setting_for_binding_locked(admission.registration.binding.value()));
+      const auto seed_sequence =
+          group_seed.has_value() ? group_seed_sequence : next_runtime_scale_value_sequence();
+      reseed_runtime_scale(admission.motion_request, seed, seed_sequence);
+      reseed_runtime_scale(seeded_operation.participants[index].motion_request, seed,
+                           seed_sequence);
+    }
+    if (group_seed.has_value())
+      reseed_runtime_scale_status(seeded_operation.runtime_scale_status, *group_seed);
     auto reservation =
         config_.operation_admission_gate != nullptr
             ? config_.operation_admission_gate->reserve_batch(*resource_slots_, reservation_rows)
@@ -2067,6 +2126,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
   }
 
   bool prepare_allowed = false;
+  bool runtime_scale_pending = false;
   {
     std::lock_guard state_lock(state_mutex_);
     auto* operation = find_active_operation_locked(operation_id);
@@ -2076,6 +2136,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     }
     operation->ordinary_acceptance_pending = false;
     operation->ordinary_acceptance_durable = true;
+    // A speed change that arrived before acceptance was durable waited.
+    runtime_scale_pending = operation->pending_runtime_scale.has_value();
     replay_ledger_.push_back(std::move(prepared_replay));
     prepare_allowed = std::all_of(operation->participants.begin(), operation->participants.end(),
                                   [](const auto& participant) {
@@ -2083,6 +2145,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                                            participant.slot_state == ResourceSlotState::kReserved;
                                   });
   }
+  if (runtime_scale_pending) stop_projection_worker_->PublishRuntimeScale();
   admission_commit.release();
   // The coordinated operation is resident, durable and replayable: release
   // submission ordering before any participant Prepare or dispatch (OD-67).
@@ -4386,7 +4449,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::recognized_malformed_s
 }
 
 Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_scale_impl(
-    const RuntimeScaleRequestDTO& request, const std::uint64_t value_sequence) {
+    OperationCommitGuard& commit, const RuntimeScaleRequestDTO& request,
+    const std::uint64_t value_sequence, const std::optional<RequestId>& control_request_id_if_sole) {
   if (request.request_context.request_id.empty() ||
       request.request_context.request_owner_epoch.empty() ||
       request.request_context.source_label.empty() || request.operation_id.empty() ||
@@ -4415,8 +4479,17 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                                    RuntimeScaleGeneration(0U),
                                    0};
   {
-    OperationCommitGuard commit(*this, request.operation_id);
+    // The caller holds this operation's commit guard (try-locked).
     std::unique_lock state_lock(state_mutex_);
+    if (auto* operation = find_active_operation_locked(request.operation_id);
+        operation != nullptr && operation->pending_runtime_scale.has_value() &&
+        operation->pending_runtime_scale->value_sequence == value_sequence) {
+      // Taken: a newer value has a later sequence and stays pending.
+      operation->pending_runtime_scale->request.reset();
+      operation->pending_runtime_scale->control_request_id_if_sole.reset();
+      if (!operation->pending_runtime_scale->failure.has_value())
+        operation->pending_runtime_scale.reset();
+    }
     if (emergency_stop_reserve_.find(request.request_context.request_id.value()).has_value()) {
       return Result<RuntimeScaleAcceptedDTO>::Err(
           error("request_id_conflict", "runtime-scale request ID is retained by emergency Stop",
@@ -4529,6 +4602,16 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
           request.request_context.request_id);
       return Result<RuntimeScaleAcceptedDTO>::Err(durable_acceptance.error());
     }
+    if (control_request_id_if_sole.has_value()) {
+      // The sole live operation of its control request: an exact replay
+      // reports it (the reply itself was sent before this record).
+      const auto replay = runtime_scale_control_replay_ledger_.find(*control_request_id_if_sole);
+      if (replay != runtime_scale_control_replay_ledger_.end()) {
+        replay->accepted.active_operation_id = accepted.operation_id;
+        replay->accepted.active_operation_revision = accepted.operation_revision;
+        replay->accepted.active_operation_scale_generation = accepted.runtime_scale_generation;
+      }
+    }
     active_operation = find_active_operation_locked(request.operation_id);
     if (active_operation == nullptr ||
         active_operation->state.journal_capture_order != prior_state.journal_capture_order ||
@@ -4573,6 +4656,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     }
     // Lifetime borrow of the captured engines until their calls return.
     if (!effect_targets.empty()) ++runtime_scale_effect_calls_in_flight_;
+    state_lock.unlock();
+    commit.release();
   }
   const ScopeExit release_effect_borrow([&] {
     if (effect_targets.empty()) return;
@@ -4580,31 +4665,25 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     --runtime_scale_effect_calls_in_flight_;
   });
 
+  // No blocking guard on this worker: a refused or mismatched effect is kept
+  // as the operation's pending failure and recorded by a later unit.
   const auto mark_failed = [&](IResolvedParticipantExecutionEngine* engine, ErrorDTO failure,
                                const char* reason) {
-    OperationCommitGuard commit(*this, request.operation_id);
-    std::unique_lock state_lock(state_mutex_);
-    auto* active_operation = find_active_operation_locked(request.operation_id);
-    if (active_operation == nullptr || !active_operation->runtime_scale_status.has_value() ||
-        active_operation->state.operation_revision != accepted.operation_revision ||
-        active_operation->runtime_scale_status->runtime_scale_generation !=
-            accepted.runtime_scale_generation)
-      return;
-    auto status = *active_operation->runtime_scale_status;
-    status.state = RuntimeScaleApplicationState::kFailed;
-    status.updated_at_ns = clock_.now();
-    const auto participant = active_operation->participant_for(engine);
-    const auto row = std::find_if(
-        status.participants.begin(), status.participants.end(), [&](const auto& candidate) {
-          return participant != nullptr &&
-                 candidate.participant_id == participant->slot_owner.participant_id;
-        });
-    if (row != status.participants.end()) {
-      row->state = RuntimeScaleApplicationState::kFailed;
-      row->error = std::move(failure);
+    {
+      std::lock_guard state_lock(state_mutex_);
+      auto* active_operation = find_active_operation_locked(request.operation_id);
+      if (active_operation == nullptr || !active_operation->runtime_scale_status.has_value() ||
+          active_operation->state.operation_revision != accepted.operation_revision ||
+          active_operation->runtime_scale_status->runtime_scale_generation !=
+              accepted.runtime_scale_generation)
+        return;
+      if (!active_operation->pending_runtime_scale.has_value())
+        active_operation->pending_runtime_scale.emplace();
+      active_operation->pending_runtime_scale->failure = ActiveOperation::PendingRuntimeScaleFailure{
+          engine, accepted.operation_revision, accepted.runtime_scale_generation,
+          std::move(failure), reason};
     }
-    (void)retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
-                                                  reason);
+    stop_projection_worker_->PublishRuntimeScale();
   };
   for (const auto& target : effect_targets) {
     const auto commanded = [&]() -> Result<ResolvedRuntimeScaleAcceptedDTO> {
@@ -4653,15 +4732,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                         "participant engine returned mismatched runtime-scale acceptance",
                         "runtime_scale_acceptance_mismatch"),
                   "runtime_scale_acceptance_mismatch");
-      continue;
     }
-    const auto observed = target.engine->runtime_scale_status(resolved_command.operation_id,
-                                                              resolved_command.control_binding_id);
-    if (!observed.ok()) {
-      mark_failed(target.engine, observed.error(), "runtime_scale_status_unavailable");
-      continue;
-    }
-    (void)apply_runtime_scale_status(target.engine, observed.value());
+    // Status follows from the reconcile poll (apply_runtime_scale_status).
   }
   return Result<RuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
 }
@@ -4686,17 +4758,30 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
               "stale_request_owner_epoch"));
   }
 
-  // Linearize the persistent setting with new operation admission: Execute
-  // reads the setting (with its value sequence) and registers its operation
-  // under this mutex, so an operation either is admitted later and seeded
-  // with the new setting, or is already resident and collected below. Its
-  // participant takes the value as its ramp target either way, ordered by the
-  // value sequence (latest wins, OD-72), so a motion still preparing reads it
-  // when it registers its ramp. Held only until the setting, the targets and
-  // the replay entry are recorded; the effects run without it (audit 3.8).
-  // Emergency Stop never takes this mutex and therefore never waits for this
-  // path.
-  std::unique_lock submit_lock(submission_mutex_);
+  // Lock scope: state_mutex_ only, one section. Execute reads the setting
+  // (with its value sequence) in the same section that inserts its
+  // operation, so an operation is either inserted later and seeded with the
+  // new setting, or is already resident and selected below; either way every
+  // participant reaches the latest value, ordered by the value sequence
+  // (latest value wins, OD-72). The setting stores, the per-operation
+  // bookkeeping (StopProjectionWorker) and the SetScale publishes run
+  // without it. Neither submission_mutex_ nor a journal write is on this
+  // path; emergency Stop never waits for it.
+  RuntimeScaleControlAcceptedDTO accepted{
+      request.request_context.request_id,
+      RequestReplayStatusDTO::kAcceptedNew,
+      request.selector,
+      request.scale,
+      RuntimeScaleControlGeneration(0U),  // the next generation, below
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      0};
+  // OD-72: every participant of the scope gets the value as its ramp target,
+  // idle or moving (a starting motion reads it when it registers its ramp).
+  std::vector<IResolvedParticipantExecutionEngine*> setting_targets;
+  std::uint64_t value_sequence = 0U;
+  bool runtime_scale_pending = false;
   {
     std::lock_guard state_lock(state_mutex_);
     const auto replay =
@@ -4795,52 +4880,16 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
           "runtime-scale control setting capacity is exhausted",
           "runtime_scale_control_capacity_exhausted", ErrorCode::kInvalidStateTransition);
     }
-  }
-
-  const auto projected = get_runtime_scale_control(request.selector);
-  if (!projected.ok()) {
-    return Result<RuntimeScaleControlAcceptedDTO>::Err(projected.error());
-  }
-  if (!projected.value().supported || projected.value().frozen) {
-    return Result<RuntimeScaleControlAcceptedDTO>::Err(projected.value().reason.value_or(error(
-        std::string(to_string(ErrorCode::kInvalidStateTransition)),
-        "runtime-scale control is not currently available", "runtime_scale_control_unavailable")));
-  }
-
-  RuntimeScaleControlAcceptedDTO accepted{
-      request.request_context.request_id,
-      RequestReplayStatusDTO::kAcceptedNew,
-      request.selector,
-      request.scale,
-      RuntimeScaleControlGeneration(0U),  // the next generation, below
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      clock_.now()};
-  std::vector<RuntimeScaleRequestDTO> live_requests;
-  // OD-72: every participant of the scope gets the value as its ramp target,
-  // idle or moving (a starting motion reads it when it registers its ramp).
-  std::vector<IResolvedParticipantExecutionEngine*> setting_targets;
-  std::uint64_t value_sequence = 0U;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    const auto resolved = resolve_runtime_scale_control_locked(request.selector);
-    if (!resolved.ok()) {
-      return Result<RuntimeScaleControlAcceptedDTO>::Err(resolved.error());
+    const auto projected = runtime_scale_control_locked(request.selector, false);
+    if (!projected.ok()) {
+      return Result<RuntimeScaleControlAcceptedDTO>::Err(projected.error());
     }
-    auto setting =
-        std::find_if(runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
-                     [&](const RuntimeScaleControlSetting& candidate) {
-                       return candidate.resolution.same_control_scope(resolved.value());
-                     });
-    const auto current_generation = setting == runtime_scale_control_settings_.end()
-                                        ? RuntimeScaleControlGeneration(0U)
-                                        : setting->generation;
-    if (current_generation.value() == std::numeric_limits<std::uint64_t>::max()) {
-      return reject<RuntimeScaleControlAcceptedDTO>(
-          "runtime-scale control generation space is exhausted",
-          "runtime_scale_control_generation_exhausted", ErrorCode::kInternalError);
+    if (!projected.value().supported || projected.value().frozen) {
+      return Result<RuntimeScaleControlAcceptedDTO>::Err(projected.value().reason.value_or(error(
+          std::string(to_string(ErrorCode::kInvalidStateTransition)),
+          "runtime-scale control is not currently available", "runtime_scale_control_unavailable")));
     }
+    accepted.accepted_at_ns = clock_.now();
     accepted.control_generation = RuntimeScaleControlGeneration(current_generation.value() + 1U);
     value_sequence = next_runtime_scale_value_sequence();
     const auto upsert_setting = [&](RuntimeScaleControlScope resolution,
@@ -4916,15 +4965,22 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     }
     // Lifetime borrow of these engines until the store calls below return.
     if (!setting_targets.empty()) ++runtime_scale_effect_calls_in_flight_;
-    for (const auto& [operation_id, operation] : active_operations_) {
-      if (terminal(operation->state.state) || !operation->runtime_scale_status) continue;
-      const bool selected = std::any_of(
-          operation->participants.begin(), operation->participants.end(),
-          [&](const auto& participant) {
-            return participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
-                   matches_scope(participant.binding.value());
-          });
-      if (!selected) continue;
+    // Per-operation bookkeeping is written behind by the StopProjectionWorker
+    // (ProjectRuntimeScale): the latest value overwrites a pending one.
+    const auto selected_live = [&](const ActiveOperation& operation) {
+      return !terminal(operation.state.state) && operation.runtime_scale_status.has_value() &&
+             std::any_of(operation.participants.begin(), operation.participants.end(),
+                         [&](const auto& participant) {
+                           return participant.payload_kind ==
+                                      OperationParticipantPayloadKind::kMotion &&
+                                  matches_scope(participant.binding.value());
+                         });
+    };
+    const auto live_count =
+        std::count_if(active_operations_.begin(), active_operations_.end(),
+                      [&](const auto& item) { return selected_live(*item.second); });
+    for (auto& [operation_id, operation] : active_operations_) {
+      if (!selected_live(*operation)) continue;
       auto context = request.request_context;
       std::string member_request_material("manyforge.runtime-scale-group-member.v1");
       member_request_material.push_back('\0');
@@ -4933,14 +4989,18 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
       member_request_material.append(operation_id.value());
       context.request_id =
           RequestId(manyforge::content_identity::sha256_digest(member_request_material));
-      live_requests.push_back(RuntimeScaleRequestDTO{
+      if (!operation->pending_runtime_scale.has_value()) operation->pending_runtime_scale.emplace();
+      auto& pending = *operation->pending_runtime_scale;
+      pending.request = RuntimeScaleRequestDTO{
           std::move(context), operation_id, operation->state.operation_revision,
           operation->runtime_scale_status->runtime_scale_generation, request.scale,
-          request.attribution});
+          request.attribution};
+      pending.value_sequence = value_sequence;
+      pending.control_request_id_if_sole =
+          live_count == 1 ? std::optional<RequestId>(request.request_context.request_id)
+                          : std::nullopt;
+      runtime_scale_pending = true;
     }
-    std::sort(live_requests.begin(), live_requests.end(), [](const auto& left, const auto& right) {
-      return left.operation_id < right.operation_id;
-    });
     runtime_scale_control_replay_ledger_.erase_if(
         [&](const RuntimeScaleControlReplayEntry& entry) {
           return entry.accepted.selector == request.selector ||
@@ -4953,12 +5013,6 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     runtime_scale_control_replay_ledger_.push_back(
         RuntimeScaleControlReplayEntry{request, accepted, resolved.value()});
   }
-  // The setting and its live targets are recorded: release submission
-  // ordering before the journal writes, engine calls and SetScale publishes
-  // below. Per-operation ordering stays with OperationCommitGuard and the
-  // runtime-scale generation captured in each live request.
-  submit_lock.unlock();
-
   if (!setting_targets.empty()) {
     const ScopeExit release_setting_borrow([&] {
       std::lock_guard state_lock(state_mutex_);
@@ -4967,27 +5021,79 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     for (auto* engine : setting_targets)
       engine->store_runtime_scale_setting(request.scale, value_sequence);
   }
-
-  // Independent group members keep their ordinary operation ownership. The
-  // group command simply applies the accepted setting through each existing
-  // exact operation-scale path. A concurrent Stop may make a member no longer
-  // applicable; the retained setting is still authoritative.
-  std::optional<RuntimeScaleAcceptedDTO> only_live_acceptance;
-  for (auto& exact : live_requests) {
-    auto applied = set_runtime_scale_impl(exact, value_sequence);
-    if (applied.ok() && live_requests.size() == 1U)
-      only_live_acceptance = std::move(applied.value());
-  }
-  if (only_live_acceptance) {
-    accepted.active_operation_id = only_live_acceptance->operation_id;
-    accepted.active_operation_revision = only_live_acceptance->operation_revision;
-    accepted.active_operation_scale_generation = only_live_acceptance->runtime_scale_generation;
-    std::lock_guard state_lock(state_mutex_);
-    const auto replay =
-        runtime_scale_control_replay_ledger_.find(request.request_context.request_id);
-    if (replay != runtime_scale_control_replay_ledger_.end()) replay->accepted = accepted;
-  }
+  // After the stores, so a live operation's engine acknowledgement never
+  // precedes its setting.
+  if (runtime_scale_pending) stop_projection_worker_->PublishRuntimeScale();
   return Result<RuntimeScaleControlAcceptedDTO>::Ok(std::move(accepted));
+}
+
+bool ResourceAddressedExecutionKernel::ProjectRuntimeScale() noexcept {
+  // One unit, one operation, at most one journal write. The worker runs it
+  // only when no Stop projection is pending and never blocks on a commit
+  // guard: a busy guard republishes when it is released.
+  const auto ready_locked = [this] {
+    return std::any_of(active_operations_.begin(), active_operations_.end(),
+                       [](const auto& item) {
+                         return item.second->pending_runtime_scale.has_value() &&
+                                item.second->ordinary_acceptance_durable;
+                       });
+  };
+  try {
+    OperationId operation_id{std::string{}};
+    ActiveOperation::PendingRuntimeScale entry;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto found =
+          std::find_if(active_operations_.begin(), active_operations_.end(), [](const auto& item) {
+            return item.second->pending_runtime_scale.has_value() &&
+                   item.second->ordinary_acceptance_durable;
+          });
+      if (found == active_operations_.end()) return false;
+      operation_id = found->first;
+      entry = *found->second->pending_runtime_scale;
+    }
+    OperationCommitGuard commit(*this, operation_id, std::try_to_lock);
+    if (!commit.claimed()) {
+      std::lock_guard state_lock(state_mutex_);
+      // Busy: its holder's release republishes. Gone: look at the others.
+      return find_active_operation_locked(operation_id) == nullptr && ready_locked();
+    }
+    if (entry.failure.has_value()) {
+      std::unique_lock state_lock(state_mutex_);
+      auto* operation = find_active_operation_locked(operation_id);
+      if (operation == nullptr || !operation->pending_runtime_scale.has_value()) return ready_locked();
+      auto failure = std::move(operation->pending_runtime_scale->failure);
+      operation->pending_runtime_scale->failure.reset();
+      if (!operation->pending_runtime_scale->request.has_value())
+        operation->pending_runtime_scale.reset();
+      if (failure.has_value() && operation->runtime_scale_status.has_value() &&
+          operation->state.operation_revision == failure->revision &&
+          operation->runtime_scale_status->runtime_scale_generation == failure->generation) {
+        auto status = *operation->runtime_scale_status;
+        status.state = RuntimeScaleApplicationState::kFailed;
+        status.updated_at_ns = clock_.now();
+        const auto* participant = operation->participant_for(failure->engine);
+        const auto row = std::find_if(
+            status.participants.begin(), status.participants.end(), [&](const auto& candidate) {
+              return participant != nullptr &&
+                     candidate.participant_id == participant->slot_owner.participant_id;
+            });
+        if (row != status.participants.end()) {
+          row->state = RuntimeScaleApplicationState::kFailed;
+          row->error = std::move(failure->error);
+        }
+        (void)retain_runtime_scale_observation_locked(state_lock, *operation, std::move(status),
+                                                      failure->reason);
+      }
+      return ready_locked();
+    }
+    (void)set_runtime_scale_impl(commit, *entry.request, entry.value_sequence,
+                                 entry.control_request_id_if_sole);
+    std::lock_guard state_lock(state_mutex_);
+    return ready_locked();
+  } catch (...) {
+    return false;
+  }
 }
 
 Result<void> ResourceAddressedExecutionKernel::retain_runtime_scale_observation_locked(

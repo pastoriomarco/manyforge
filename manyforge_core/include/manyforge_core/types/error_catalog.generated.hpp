@@ -857,6 +857,7 @@ inline constexpr std::string_view kExecutionPortSubmitRefused{"execution_port_su
 inline constexpr std::string_view kExecutionProgramDraftUnapplied{"execution_program_draft_unapplied"};
 inline constexpr std::string_view kExecutionRejected{"execution_rejected"};
 inline constexpr std::string_view kExecutionRequestAttributionInvalid{"execution_request_attribution_invalid"};
+inline constexpr std::string_view kExecutionRuntimeScaleLaneBusy{"execution_runtime_scale_lane_busy"};
 inline constexpr std::string_view kExecutionTargetBindingUnavailable{"execution_target_binding_unavailable"};
 inline constexpr std::string_view kExecutionTargetFrameStateUnavailable{"execution_target_frame_state_unavailable"};
 inline constexpr std::string_view kExecutionTargetFrameUnavailable{"execution_target_frame_unavailable"};

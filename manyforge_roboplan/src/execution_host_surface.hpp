@@ -414,6 +414,7 @@ private:
   std::exception_ptr reconciliation_lane_failure_;
   DeferredLane submission_ordered_lane_{"execution_submission_lane_busy"};
   DeferredLane scene_read_lane_{"execution_scene_read_lane_busy"};
+  DeferredLane runtime_scale_lane_{"execution_runtime_scale_lane_busy"};
   // Event subscriptions: own socket, acceptor and one writer per subscriber.
   CommandSocket event_stream_socket_;
   ExecutionEventStream event_stream_{ExecutionEventStreamSource{

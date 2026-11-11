@@ -369,6 +369,29 @@ describe('persistent runtime-scale transport cadence', () => {
     }, 'scale-request-1', 0.25)).toThrow(/does not match/);
   });
 
+  it('keeps the projected active operation when the acceptance carries none', () => {
+    const projected = {
+      ...status,
+      activeOperationId: 'operation-1',
+      activeOperationRevision: 8,
+      activeOperationScaleGeneration: 2,
+    };
+    expect(acceptedRuntimeScaleStatus(projected, {
+      requestId: 'scale-request-1',
+      selector: status.selector,
+      requestedScale: 0.25,
+      controlGeneration: projected.controlGeneration + 1,
+      activeOperationId: null,
+      activeOperationRevision: null,
+      activeOperationScaleGeneration: null,
+    }, 'scale-request-1', 0.25)).toMatchObject({
+      requestedScale: 0.25,
+      activeOperationId: 'operation-1',
+      activeOperationRevision: 8,
+      activeOperationScaleGeneration: 2,
+    });
+  });
+
   it('rejects a delayed projection older than the accepted owner generation', () => {
     const accepted = {
       ...status,

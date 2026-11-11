@@ -2277,7 +2277,9 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        response = self._exchange(
+        # Beside Stop on the control socket: the execution host queues it on
+        # its speed-scaling lane, never behind planning or Submit.
+        response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(trusted_principal_id),

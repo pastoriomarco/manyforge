@@ -1028,6 +1028,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
                                                                    bool output_write) const;
   [[nodiscard]] Result<void> set_global_io_rule_active_locked(std::size_t index, bool active);
   void ProjectGlobalIoRuleStates() noexcept;
+  /// One per-operation speed bookkeeping unit on the StopProjectionWorker;
+  /// true when another unit is ready.
+  bool ProjectRuntimeScale() noexcept;
   void retire_all_io_rules_locked();
   [[nodiscard]] bool has_active_io_rules_locked() const;
   struct StopWorkHandoff;
@@ -1128,10 +1131,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
       std::unique_lock<std::mutex>& state_lock, ActiveOperation& operation,
       RuntimeScaleStatusDTO status, const char* reason);
-  /// Applies the control setting to one live operation (`set_runtime_scale_control`).
-  /// `value_sequence`: the order of this value at the participant (OD-72).
+  /// Records the accepted value of one live operation and acknowledges it at
+  /// its engine (ProjectRuntimeScale, under the operation's try-locked
+  /// `commit`, which it releases before the engine call). `value_sequence`:
+  /// the order of this value at the participant (OD-72).
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
-      const RuntimeScaleRequestDTO& request, std::uint64_t value_sequence);
+      OperationCommitGuard& commit, const RuntimeScaleRequestDTO& request,
+      std::uint64_t value_sequence, const std::optional<RequestId>& control_request_id_if_sole);
   [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_target_locked(
       const RuntimeScaleControlSelectorDTO& selector) const;
   [[nodiscard]] Result<RuntimeScaleControlScope> resolve_runtime_scale_control_locked(
@@ -1269,11 +1275,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::unique_ptr<KernelCellAdmissionOwner> cell_admission_owner_;
 
   // Serializes public Execute admission (through registration, durable
-  // acceptance and the subordinate Prepare) with runtime-scale settings,
-  // reconfiguration and the other ordered submissions, while permitting
-  // synchronous engine callbacks to take state_mutex_. Not held across
-  // operation dispatch or a runtime-scale live effect (OD-67, audit 3.8);
-  // motion takeover acceptance still advances under it.
+  // acceptance and the subordinate Prepare) with reconfiguration and the
+  // other ordered submissions, while permitting synchronous engine callbacks
+  // to take state_mutex_. Not held across operation dispatch (OD-67, audit
+  // 3.8); motion takeover acceptance still advances under it. Speed scaling
+  // never takes it: Execute reads the speed setting in the state_mutex_
+  // section that inserts its operation.
   mutable std::mutex submission_mutex_;
   mutable std::mutex operation_recovery_mutex_;
   mutable std::mutex state_mutex_;

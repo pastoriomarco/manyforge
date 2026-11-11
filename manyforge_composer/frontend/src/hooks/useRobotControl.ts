@@ -289,13 +289,16 @@ export function acceptedRuntimeScaleStatus(
   ) {
     throw new Error('Runtime velocity acceptance does not match its submitted command.');
   }
+  // The owner replies before it records the value on the live operation, so
+  // a reply carries no active operation: keep the projected one.
   return {
     ...submitted,
     controlGeneration: accepted.controlGeneration,
     requestedScale: accepted.requestedScale,
-    activeOperationId: accepted.activeOperationId,
-    activeOperationRevision: accepted.activeOperationRevision,
-    activeOperationScaleGeneration: accepted.activeOperationScaleGeneration,
+    activeOperationId: accepted.activeOperationId ?? submitted.activeOperationId,
+    activeOperationRevision: accepted.activeOperationRevision ?? submitted.activeOperationRevision,
+    activeOperationScaleGeneration:
+      accepted.activeOperationScaleGeneration ?? submitted.activeOperationScaleGeneration,
   };
 }
 

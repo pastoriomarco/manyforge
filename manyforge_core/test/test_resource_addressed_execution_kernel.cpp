@@ -145,6 +145,20 @@ class StopControlExecutorTestAccess final {
     auto* source = kernel.find_active_operation_locked(id);
     if (source) source->takeover_advance_in_flight = active;
   }
+  /// Waits until the StopProjectionWorker has nothing ready (Stop slots,
+  /// global rule flag, speed bookkeeping).
+  static bool DrainProjections(ResourceAddressedExecutionKernel& kernel) {
+    return kernel.stop_projection_worker_->DrainFor(std::chrono::seconds(10));
+  }
+  /// Holds one operation's ordinary commit gate like any ordinary writer.
+  static auto HoldCommit(ResourceAddressedExecutionKernel& kernel, const OperationId& id) {
+    return std::make_unique<ResourceAddressedExecutionKernel::OperationCommitGuard>(kernel, id);
+  }
+  static bool RuntimeScalePending(ResourceAddressedExecutionKernel& kernel, const OperationId& id) {
+    std::lock_guard lock(kernel.state_mutex_);
+    const auto* operation = kernel.find_active_operation_locked(id);
+    return operation != nullptr && operation->pending_runtime_scale.has_value();
+  }
 };
 
 }  // namespace manyforge::core
@@ -224,6 +238,12 @@ bool wait_until(Predicate&& predicate,
     std::this_thread::yield();
   }
   return true;
+}
+
+/// Speed scaling on its own lane: the value reaches the participants at once;
+/// per-operation bookkeeping is written behind by the StopProjectionWorker.
+bool drain_runtime_scale(ResourceAddressedExecutionKernel& kernel) {
+  return StopControlExecutorTestAccess::DrainProjections(kernel);
 }
 
 /// One component's state as an adapter publishes it.
@@ -4248,6 +4268,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   request.selector = projected.value().selector;
   const auto accepted = kernel.set_runtime_scale_control(request);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(drain_runtime_scale(kernel));
   EXPECT_EQ(first_engine.runtime_scale_calls, first_calls + 1);
   EXPECT_EQ(second_engine.runtime_scale_calls, second_calls + 1);
   const auto first_scale_command = first_engine.RuntimeScaleCommandSnapshot();
@@ -17788,6 +17809,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           runtime_scale_control_request("journal.scale.failed", 0U, 0.5));
       ASSERT_TRUE(scaled.ok()) << scaled.error().message;
       EXPECT_FALSE(scaled.value().active_operation_id.has_value());
+      ASSERT_TRUE(drain_runtime_scale(kernel));  // the record is written behind
     } else {
       EXPECT_FALSE(kernel.acknowledge_completed(
           control_request("journal.control.failed", operation.value(), 1U)).ok());
@@ -17952,7 +17974,12 @@ TEST(ResourceAddressedExecutionKernelTest,
       held.Release();
       const auto changed = changing.get();
       ASSERT_TRUE(changed.ok()) << changed.error().message;
-      EXPECT_EQ(changed.value().active_operation_id, operation.value().operation_id);
+      EXPECT_FALSE(changed.value().active_operation_id.has_value());
+      // The record is written behind; an exact replay then names the operation.
+      ASSERT_TRUE(drain_runtime_scale(kernel));
+      const auto replayed = kernel.set_runtime_scale_control(scale);
+      ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+      EXPECT_EQ(replayed.value().active_operation_id, operation.value().operation_id);
     } else {
       engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kInterventionRequired);
       engine.recovery_action_hook = held.Blocker();
@@ -19291,13 +19318,20 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
 
-  const auto accepted = kernel.set_runtime_scale_control(
-      runtime_scale_control_request("request.scale.control.live", 0U, 0.25));
+  const auto live_request = runtime_scale_control_request("request.scale.control.live", 0U, 0.25);
+  const auto accepted = kernel.set_runtime_scale_control(live_request);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  EXPECT_EQ(accepted.value().active_operation_id, executed.value().operation_id);
+  // The reply precedes the per-operation record and names no operation.
+  EXPECT_FALSE(accepted.value().active_operation_id.has_value());
   EXPECT_EQ(accepted.value().control_generation, RuntimeScaleControlGeneration(1U));
-  ASSERT_TRUE(accepted.value().active_operation_scale_generation.has_value());
-  EXPECT_EQ(*accepted.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  const auto replayed = kernel.set_runtime_scale_control(live_request);
+  ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+  EXPECT_EQ(replayed.value().active_operation_id, executed.value().operation_id);
+  ASSERT_TRUE(replayed.value().active_operation_scale_generation.has_value());
+  EXPECT_EQ(*replayed.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
+  // The status poll records the applied value.
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   const auto scale_command = engine.RuntimeScaleCommandSnapshot();
   ASSERT_TRUE(scale_command.has_value());
   EXPECT_DOUBLE_EQ(scale_command->requested_scale, 0.25);
@@ -19315,6 +19349,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       runtime_scale_control_request("request.scale.control.stale", 0U, 0.5));
   ASSERT_TRUE(outdated.ok()) << outdated.error().message;
   EXPECT_EQ(outdated.value().control_generation, RuntimeScaleControlGeneration(2U));
+  ASSERT_TRUE(drain_runtime_scale(kernel));
   const auto latest = engine.RuntimeScaleCommandSnapshot();
   ASSERT_TRUE(latest.has_value());
   EXPECT_DOUBLE_EQ(latest->requested_scale, 0.5);
@@ -19400,7 +19435,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto retimed = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.control.shared.live", 1U, 0.25));
   ASSERT_TRUE(retimed.ok()) << retimed.error().message;
-  EXPECT_EQ(retimed.value().active_operation_id, executed.value().operation_id);
+  EXPECT_FALSE(retimed.value().active_operation_id.has_value());
+  ASSERT_TRUE(drain_runtime_scale(kernel));
   const auto scale_command = engine.RuntimeScaleCommandSnapshot();
   ASSERT_TRUE(scale_command.has_value());
   EXPECT_DOUBLE_EQ(scale_command->requested_scale, 0.25);
@@ -19602,8 +19638,10 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleControlZeroHoldsTheOperat
   const auto held =
       kernel.set_runtime_scale_control(runtime_scale_control_request("request.scale.hold", 0U, 0.0));
   ASSERT_TRUE(held.ok()) << held.error().message;
-  EXPECT_EQ(held.value().active_operation_id, executed.value().operation_id);
-  EXPECT_EQ(held.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
+  EXPECT_FALSE(held.value().active_operation_id.has_value());
+  // Per-operation record behind the reply; status from the next poll.
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
   EXPECT_EQ(engine.stop_calls, 0);
   const auto state = kernel.get_operation_state(executed.value().operation_id);
   ASSERT_TRUE(state.ok());
@@ -21711,6 +21749,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto accepted = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.failure", 0U, 0.5));
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  // The refused acknowledgement is recorded by a later bookkeeping unit.
+  ASSERT_TRUE(drain_runtime_scale(kernel));
   const auto failed = kernel.get_runtime_scale(executed.value().operation_id);
   ASSERT_TRUE(failed.ok());
   EXPECT_EQ(failed.value().state, RuntimeScaleApplicationState::kFailed);
@@ -21860,6 +21900,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto scaled = kernel.set_runtime_scale_control(
       runtime_scale_control_request("request.scale.ordered", 0U, 0.5));
   ASSERT_TRUE(scaled.ok()) << scaled.error().message;
+  // Stored before the reply; the record and acknowledgement follow on the
+  // StopProjectionWorker: store, reply, journal, engine.
+  EXPECT_DOUBLE_EQ(engine.StoredRuntimeScaleSettings().back().first, 0.5);
+  ASSERT_TRUE(drain_runtime_scale(kernel));
   {
     std::lock_guard lock(timeline_mutex);
     ASSERT_GE(timeline.size(), 2U);
@@ -35578,6 +35622,307 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleReplayLedgerEvictsItsOlde
   const auto evicted = kernel.set_runtime_scale_control(a);
   EXPECT_FALSE(evicted.ok() &&
                evicted.value().replay_status == RequestReplayStatusDTO::kReplayedExact);
+}
+
+// A coordinated Execute and a speed change on one of its arms never leave the
+// arm with an older value than the operation was seeded with: the seed is
+// read where the operation is inserted. The change runs on the admitting
+// thread itself, inside execute(): the scale path takes no submission_mutex_.
+// (Synchronized multi-motion is refused at admission, so the coordinated
+// operation here is one arm and one gripper command.)
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleDuringCoordinatedAdmissionNeverLeavesAnArmBehind) {
+  for (const bool after_insert : {false, true}) {
+    SCOPED_TRACE(after_insert);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeOperationJournal journal;
+    FakeParticipantEngine arm, output;
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    const auto motion =
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto command = coordinated_occurrence(
+        make_binding("gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema),
+        "2");
+    output.gripper_status.gripper_id = command.value().command_target_id.value();
+    auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(motion, arm), LogicalGripperRegistration(command, output)}, clock,
+        scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+    auto& kernel = *owner;
+    ASSERT_TRUE(
+        kernel.set_runtime_scale_control(runtime_scale_control_request("scale.seed", 0U, 0.7))
+            .ok());
+    std::optional<Result<RuntimeScaleControlAcceptedDTO>> raced;
+    const auto race = [&] {
+      if (raced) return;
+      raced = kernel.set_runtime_scale_control(
+          runtime_scale_control_request("scale.race", 1U, 0.3));
+    };
+    // Between the arm's former seed point and the insert, outside any
+    // Kernel lock; or during the durable acceptance after the insert.
+    if (after_insert)
+      journal.operation_acceptance_hook = race;
+    else
+      output.validate_command_hook = race;
+    const auto stores_before = arm.StoredRuntimeScaleSettings().size();
+    const auto accepted = kernel.execute(coordinated_motion_command_operation("mixed.scale.race"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(raced.has_value());
+    const auto dispatched = arm.LastExecuteSnapshot();
+    ASSERT_TRUE(dispatched.has_value());
+    ASSERT_TRUE(dispatched->initial_runtime_scale.has_value());
+    const auto stores = arm.StoredRuntimeScaleSettings();
+    if (after_insert) {
+      // The arm belongs to a resident coordinated operation now: the single
+      // arm's control is refused, no store reaches it, and its seed is the
+      // value before the change.
+      ASSERT_FALSE(raced->ok());
+      EXPECT_EQ(raced->error().details.at("reason"), "runtime_scale_group_control_required");
+      EXPECT_EQ(stores.size(), stores_before);
+      EXPECT_DOUBLE_EQ(dispatched->initial_runtime_scale->requested_scale, 0.7);
+    } else {
+      ASSERT_TRUE(raced->ok()) << raced->error().message;
+      // The value with the highest sequence at the arm is the latest one.
+      ASSERT_EQ(stores.size(), stores_before + 1U);
+      EXPECT_DOUBLE_EQ(stores.back().first, 0.3);
+      EXPECT_DOUBLE_EQ(dispatched->initial_runtime_scale->requested_scale, 0.3);
+      EXPECT_GT(dispatched->initial_runtime_scale->value_sequence, stores.back().second);
+    }
+    EXPECT_EQ(arm.runtime_scale_calls.load(), 1);  // the initial command only
+  }
+}
+
+// The single-motion seed is read where the operation is inserted, so its
+// initial command and status carry the setting with a sequence later than
+// every store.
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleSeedIsReadWhereTheOperationIsInserted) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *owner;
+  ASSERT_TRUE(
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.seed", 0U, 0.45)).ok());
+  const auto accepted = kernel.execute(motion_operation("request.seeded"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto dispatched = engine.LastExecuteSnapshot();
+  ASSERT_TRUE(dispatched.has_value() && dispatched->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(dispatched->initial_runtime_scale->requested_scale, 0.45);
+  EXPECT_GT(dispatched->initial_runtime_scale->value_sequence,
+            engine.StoredRuntimeScaleSettings().back().second);
+  const auto status = kernel.get_runtime_scale(accepted.value().operation_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_DOUBLE_EQ(status.value().requested_scale, 0.45);
+  EXPECT_DOUBLE_EQ(status.value().participants.front().commanded_scale, 0.45);
+}
+
+// A speed change never waits for the disk or for Submit: with an Execute
+// stalled in its durable acceptance (holding submission ordering and its
+// commit gate), the change is stored and replies; the operation's record
+// follows once acceptance is durable.
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleRepliesDuringAStalledAcceptanceAndRecordsAfterIt) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *owner;
+  HeldSettlementCall acceptance;
+  journal.operation_acceptance_hook = acceptance.Blocker();
+  auto execution = std::async(std::launch::async,
+                              [&] { return kernel.execute(motion_operation("request.stalled")); });
+  ASSERT_TRUE(acceptance.Entered());
+  auto scaled = std::async(std::launch::async, [&] {
+    return kernel.set_runtime_scale_control(
+        runtime_scale_control_request("scale.during.stall", 0U, 0.4));
+  });
+  ASSERT_EQ(scaled.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  const auto reply = scaled.get();
+  ASSERT_TRUE(reply.ok()) << reply.error().message;
+  EXPECT_FALSE(reply.value().active_operation_id.has_value());
+  ASSERT_FALSE(engine.StoredRuntimeScaleSettings().empty());
+  EXPECT_DOUBLE_EQ(engine.StoredRuntimeScaleSettings().back().first, 0.4);
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "runtime_scale_accepted"), 0);
+  }
+  acceptance.Release();
+  const auto executed = execution.get();
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  // The waiting entry is taken once acceptance is durable: it is recorded
+  // after operation_accepted, or dropped as today when the operation is not
+  // yet in a scalable state (still resolving before its Prepare).
+  std::lock_guard lock(journal.mutex);
+  const auto accepted_at =
+      std::find(journal.calls.begin(), journal.calls.end(), "operation_accepted");
+  const auto scale_at =
+      std::find(journal.calls.begin(), journal.calls.end(), "runtime_scale_accepted");
+  ASSERT_NE(accepted_at, journal.calls.end());
+  EXPECT_TRUE(scale_at == journal.calls.end() || accepted_at < scale_at);
+  EXPECT_LE(std::count(journal.calls.begin(), journal.calls.end(), "runtime_scale_accepted"), 1);
+  EXPECT_FALSE(StopControlExecutorTestAccess::RuntimeScalePending(kernel, executed.value().operation_id));
+  // The arm runs at the new value either way: its seed or the stored setting.
+  const auto dispatched = engine.LastExecuteSnapshot();
+  ASSERT_TRUE(dispatched.has_value() && dispatched->initial_runtime_scale.has_value());
+  EXPECT_DOUBLE_EQ(dispatched->initial_runtime_scale->requested_scale, 1.0);
+  EXPECT_LT(dispatched->initial_runtime_scale->value_sequence,
+            engine.StoredRuntimeScaleSettings().back().second);
+}
+
+// A stalled runtime_scale_accepted write (on the worker) never delays the
+// next speed change: it is stored and replies; its record follows.
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleRepliesDuringAStalledScaleRecord) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *owner;
+  const auto executed = kernel.execute(motion_operation("request.live"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  HeldSettlementCall record;
+  const auto blocker = record.Blocker();
+  journal.record_hook = [blocker](std::string_view kind) {
+    if (kind == "runtime_scale_accepted") blocker();
+  };
+  ASSERT_TRUE(
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.first", 0U, 0.6)).ok());
+  ASSERT_TRUE(record.Entered());
+  auto second = std::async(std::launch::async, [&] {
+    return kernel.set_runtime_scale_control(
+        runtime_scale_control_request("scale.second", 1U, 0.2));
+  });
+  ASSERT_EQ(second.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  ASSERT_TRUE(second.get().ok());
+  EXPECT_DOUBLE_EQ(engine.StoredRuntimeScaleSettings().back().first, 0.2);
+  record.Release();
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "runtime_scale_accepted"), 2);
+  }
+  const auto command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_DOUBLE_EQ(command->requested_scale, 0.2);
+  EXPECT_EQ(command->requested_runtime_scale_generation, RuntimeScaleGeneration(2U));
+}
+
+// Latest value wins on the worker: values arriving faster than it writes
+// leave one record for the newest; the worker never waits for a busy commit
+// gate, and its release republishes the pending entry.
+TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleBookkeepingKeepsOnlyTheLatestValue) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *owner;
+  const auto executed = kernel.execute(motion_operation("request.live"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto& id = executed.value().operation_id;
+  const auto scale_calls = engine.runtime_scale_calls.load();
+  auto held = StopControlExecutorTestAccess::HoldCommit(kernel, id);
+  for (const auto& [name, value] :
+       std::vector<std::pair<std::string, double>>{{"a", 0.6}, {"b", 0.4}, {"c", 0.2}}) {
+    ASSERT_TRUE(kernel
+                    .set_runtime_scale_control(
+                        runtime_scale_control_request("scale.latest." + name, 0U, value))
+                    .ok());
+  }
+  ASSERT_TRUE(drain_runtime_scale(kernel));  // never blocks on the held gate
+  EXPECT_TRUE(StopControlExecutorTestAccess::RuntimeScalePending(kernel, id));
+  EXPECT_EQ(engine.runtime_scale_calls.load(), scale_calls);
+  EXPECT_DOUBLE_EQ(engine.StoredRuntimeScaleSettings().back().first, 0.2);
+  held.reset();
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  EXPECT_FALSE(StopControlExecutorTestAccess::RuntimeScalePending(kernel, id));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "runtime_scale_accepted"), 1);
+  }
+  EXPECT_EQ(engine.runtime_scale_calls.load(), scale_calls + 1);
+  const auto command = engine.RuntimeScaleCommandSnapshot();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_DOUBLE_EQ(command->requested_scale, 0.2);
+  const auto status = kernel.get_runtime_scale(id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().runtime_scale_generation, RuntimeScaleGeneration(1U));
+  EXPECT_DOUBLE_EQ(status.value().requested_scale, 0.2);
+  // An exact replay of the latest request names the operation once recorded.
+  const auto replay =
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.latest.c", 0U, 0.2));
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().active_operation_id, id);
+  EXPECT_EQ(replay.value().active_operation_scale_generation, RuntimeScaleGeneration(1U));
+}
+
+// A Stop projection is always written before pending speed bookkeeping.
+TEST(ResourceAddressedExecutionKernelTest, StopProjectionIsWrittenBeforePendingScaleBookkeeping) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first = make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  auto& kernel = *owner;
+  const auto scaled_operation = kernel.execute(motion_operation("request.scaled"));
+  ASSERT_TRUE(scaled_operation.ok()) << scaled_operation.error().message;
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  auto other = motion_operation("request.stopped");
+  retarget(other.participants.front(), ControllableComponentId("robot.2"), CommandTargetId("arm"));
+  const auto stopped_operation = kernel.execute(other);
+  ASSERT_TRUE(stopped_operation.ok()) << stopped_operation.error().message;
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  // Keep the worker inside a first scale unit's journal write.
+  HeldSettlementCall record;
+  const auto blocker = record.Blocker();
+  journal.record_hook = [blocker](std::string_view kind) {
+    if (kind == "runtime_scale_accepted") blocker();
+  };
+  ASSERT_TRUE(
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.first", 0U, 0.6)).ok());
+  ASSERT_TRUE(record.Entered());
+  // Both pending while the worker is busy: a newer value and a Stop projection.
+  ASSERT_TRUE(
+      kernel.set_runtime_scale_control(runtime_scale_control_request("scale.second", 1U, 0.3)).ok());
+  const auto revision =
+      kernel.get_operation_state(stopped_operation.value().operation_id).value().operation_revision;
+  ASSERT_TRUE(kernel
+                  .stop(stop_request("request.stop.other", stopped_operation.value(),
+                                     revision.value()))
+                  .ok());
+  record.Release();
+  ASSERT_TRUE(drain_runtime_scale(kernel));
+  std::lock_guard lock(journal.mutex);
+  std::vector<std::string> order;
+  for (const auto& call : journal.calls)
+    if (call == "runtime_scale_accepted" || call == "stop_accepted") order.push_back(call);
+  EXPECT_EQ(order, (std::vector<std::string>{"runtime_scale_accepted", "stop_accepted",
+                                             "runtime_scale_accepted"}));
 }
 
 }  // namespace

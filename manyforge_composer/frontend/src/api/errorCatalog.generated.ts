@@ -854,6 +854,7 @@ export const ERROR_CATALOG: Readonly<Record<string, readonly [string, string]>> 
   execution_program_draft_unapplied: ["Program Draft not applied", "The Program Draft has unapplied changes. Apply or Discard them first."],
   execution_rejected: ["Motion refused", "The motion was refused before it started."],
   execution_request_attribution_invalid: ["Request origin not accepted", "An internal check failed: a request came from a sender that is not allowed to make it. Collect the logs and report it."],
+  execution_runtime_scale_lane_busy: ["Too many speed changes waiting", "Too many speed changes are waiting in the execution host, so this one was refused. Wait a moment and move the slider again."],
   execution_target_binding_unavailable: ["Program target not available", "The Program target has no current robot or tool in the active configuration. Check that the Program and its configuration are Applied and the components are Active."],
   execution_target_frame_state_unavailable: ["Frame depends on unobserved positions", "The requested frame depends on positions that are not part of the current robot observation, so it cannot be computed."],
   execution_target_frame_unavailable: ["Frame not available for this target", "The requested frame is not declared for this target, or the target has no kinematic model to compute it."],

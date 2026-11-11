@@ -962,4 +962,11 @@ TEST(ActiveTcpCommandCodecTest, OrderedReadRoutesOnlyExplicitTrueToSubmissionLan
   EXPECT_THROW((void)decode({{"ordered", Value(true)}, {"extra", Value(true)}}), std::exception);
 }
 
+TEST(RuntimeScaleCommandRoutingTest, SpeedScalingTakesNoSubmissionOrdering) {
+  // It runs on its own lane, never behind planning or Submit.
+  EXPECT_FALSE(IsSubmissionOrdered(CommandKind::kSetRuntimeScaleControl));
+  EXPECT_FALSE(PreemptsPlanning(CommandKind::kSetRuntimeScaleControl));
+  EXPECT_TRUE(IsSubmissionOrdered(CommandKind::kSubmit));
+}
+
 }  // namespace manyforge::roboplan_backend::host_detail

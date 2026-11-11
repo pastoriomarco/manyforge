@@ -1845,6 +1845,25 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   bool ordinary_acceptance_durable{};
   bool coordinated_dispatch_barrier_released{};
   std::optional<RuntimeScaleStatusDTO> runtime_scale_status;
+  /// A refused or mismatched engine acknowledgement, recorded by a later
+  /// bookkeeping unit.
+  struct PendingRuntimeScaleFailure final {
+    IResolvedParticipantExecutionEngine* engine{};
+    OperationRevision revision;
+    RuntimeScaleGeneration generation;
+    ErrorDTO error;
+    const char* reason{};
+  };
+  /// Per-operation speed bookkeeping written behind the stored value by the
+  /// StopProjectionWorker (latest value wins: a newer value overwrites the
+  /// request). `request` is empty when only a failure is left to record.
+  struct PendingRuntimeScale final {
+    std::optional<RuntimeScaleRequestDTO> request;
+    std::uint64_t value_sequence{};
+    std::optional<RequestId> control_request_id_if_sole;
+    std::optional<PendingRuntimeScaleFailure> failure;
+  };
+  std::optional<PendingRuntimeScale> pending_runtime_scale{};
   // Ordinary captures serialize only capture/write/publication, never provider
   // work. Stop has its own authoritative linearization and bypasses this gate.
   std::shared_ptr<std::mutex> commit_mutex{std::make_shared<std::mutex>()};
@@ -2036,6 +2055,28 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
       mutex_ = operation->commit_mutex;
     }
     lock_ = std::unique_lock(*mutex_);
+    claim();
+  }
+  /// Never waits: `claimed()` is false when another writer holds the gate.
+  /// That writer's release() republishes pending speed bookkeeping.
+  OperationCommitGuard(ResourceAddressedExecutionKernel& owner, const OperationId& id,
+                       std::try_to_lock_t)
+      : owner_(owner), id_(id) {
+    {
+      std::lock_guard state_lock(owner_.state_mutex_);
+      const auto* operation = owner_.find_active_operation_locked(id_);
+      if (operation == nullptr) return;
+      mutex_ = operation->commit_mutex;
+    }
+    lock_ = std::unique_lock(*mutex_, std::try_to_lock);
+    if (lock_.owns_lock()) claim();
+  }
+  [[nodiscard]] bool claimed() const noexcept { return claimed_; }
+  ~OperationCommitGuard() { release(); }
+  void release() noexcept;
+
+ private:
+  void claim() {
     std::lock_guard state_lock(owner_.state_mutex_);
     auto* operation = owner_.find_active_operation_locked(id_);
     if (operation != nullptr && operation->commit_mutex == mutex_) {
@@ -2043,27 +2084,7 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
       claimed_ = true;
     }
   }
-  [[nodiscard]] bool claimed() const noexcept { return claimed_; }
-  ~OperationCommitGuard() { release(); }
-  void release() noexcept {
-    if (!lock_.owns_lock()) return;
-    try {
-      std::lock_guard state_lock(owner_.state_mutex_);
-      auto* operation = owner_.find_active_operation_locked(id_);
-      if (claimed_ && operation != nullptr && operation->commit_mutex == mutex_) {
-        operation->ordinary_commit_in_flight = false;
-        // A cleanup callback may have completed during durable I/O. Retire
-        // only after the last ordinary writer no longer references its row.
-        owner_.settle_completed_control_locked(id_);
-      }
-    } catch (...) {
-      // Destruction must still release the ordinary gate during exception
-      // unwinding. No provider call or storage retry belongs in this guard.
-    }
-    lock_.unlock();
-  }
 
- private:
   ResourceAddressedExecutionKernel& owner_;
   OperationId id_;
   std::shared_ptr<std::mutex> mutex_;
@@ -2964,6 +2985,14 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
     Wake();
   }
 
+  /// Latest-wins trigger for per-operation speed bookkeeping; runs only in a
+  /// pass where no Stop slot and no global rule flag made progress.
+  void PublishRuntimeScale() noexcept {
+    if (!accepting_.load(std::memory_order_acquire)) return;
+    runtime_scale_requested_.store(true, std::memory_order_release);
+    Wake();
+  }
+
   void Close() noexcept {
     accepting_.store(false, std::memory_order_release);
     Wake();
@@ -2975,7 +3004,8 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
       std::unique_lock lock(drain_mutex_);
       return drain_changed_.wait_for(lock, timeout, [this] {
         if (callback_in_flight_.load(std::memory_order_acquire) ||
-            global_requested_.load(std::memory_order_acquire)) {
+            global_requested_.load(std::memory_order_acquire) ||
+            runtime_scale_requested_.load(std::memory_order_acquire)) {
           return false;
         }
         if (api_calls_in_flight_.load(std::memory_order_acquire) != 0U) {
@@ -3036,6 +3066,18 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
       if (progressed) {
         continue;
       }
+      // Extension rule: a later trigger gets one atomic flag and one owner
+      // callback doing one bounded unit that returns whether more is ready,
+      // placed here after the Stop slots in a fixed order, with `continue`
+      // after each unit so the Stop slots are checked again.
+      if (runtime_scale_requested_.exchange(false, std::memory_order_acq_rel)) {
+        callback_in_flight_.store(true, std::memory_order_release);
+        const bool more = owner_.ProjectRuntimeScale();
+        callback_in_flight_.store(false, std::memory_order_release);
+        if (more) runtime_scale_requested_.store(true, std::memory_order_release);
+        NotifyDrainState();
+        continue;
+      }
       const auto current_wake = wake_sequence_.load(std::memory_order_acquire);
       if (current_wake != observed_wake) {
         observed_wake = current_wake;
@@ -3055,12 +3097,35 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
   std::atomic_bool ready_{};
   std::atomic_bool callback_in_flight_{};
   std::atomic_bool global_requested_{};
+  std::atomic_bool runtime_scale_requested_{};
   std::atomic_size_t api_calls_in_flight_{};
   std::atomic_uint64_t wake_sequence_{};
   std::mutex drain_mutex_;
   std::condition_variable drain_changed_;
   std::jthread worker_;
 };
+
+// Defined after StopProjectionWorker: release() republishes speed bookkeeping.
+inline void ResourceAddressedExecutionKernel::OperationCommitGuard::release() noexcept {
+  if (!lock_.owns_lock()) return;
+  bool runtime_scale_pending = false;
+  try {
+    std::lock_guard state_lock(owner_.state_mutex_);
+    auto* operation = owner_.find_active_operation_locked(id_);
+    if (claimed_ && operation != nullptr && operation->commit_mutex == mutex_) {
+      operation->ordinary_commit_in_flight = false;
+      runtime_scale_pending = operation->pending_runtime_scale.has_value();
+      // A cleanup callback may have completed during durable I/O. Retire
+      // only after the last ordinary writer no longer references its row.
+      owner_.settle_completed_control_locked(id_);
+    }
+  } catch (...) {
+    // Destruction must still release the ordinary gate during exception
+    // unwinding. No provider call or storage retry belongs in this guard.
+  }
+  lock_.unlock();
+  if (runtime_scale_pending) owner_.stop_projection_worker_->PublishRuntimeScale();
+}
 
 struct ResourceAddressedExecutionKernel::EngineSubscription final {
   IResolvedParticipantExecutionEngine* engine{};

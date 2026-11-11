@@ -35,6 +35,7 @@ from manyforge_headless_api.execution import (
 from manyforge_headless_api.models import (
     OperationIntentRequest,
     ProgramRunStopIntentRequest,
+    RuntimeScaleControlRequest,
     TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
@@ -1000,6 +1001,98 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
             if preview_thread is not None:
                 preview_thread.join(timeout=3.0)
             raw_api.close()
+
+
+def test_runtime_scale_is_answered_on_its_own_lane_while_a_preview_blocks_submission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Speed changes from both sockets reach the scale lane, never the
+    submission lane that a blocked preview holds.
+
+    The full-lane refusal itself (`execution_runtime_scale_lane_busy` for the
+    ninth waiting request) needs the lane worker held, which only an Apply's
+    exclusive composition section does; a process test cannot hold it, so this
+    checks the routing.
+    """
+
+    marker = tmp_path / "blocked-preview-worker"
+    with _managed_cell(monkeypatch, fake_worker_marker=marker) as stack:
+        run_root = stack.execution_run_root
+        execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+        internal = ExecutionCommandClient(run_root, timeout_seconds=2.0,
+                                          attribution_transport="internal")
+        planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+        preview_thread: threading.Thread | None = None
+        try:
+            status = execution.diagnostics()["status"]
+            identity = status["identity"]
+            _, target = _status_target(status, presentation="motion")
+            positions = list(_status_observation(status, presentation="motion")["positions_rad"])
+            positions[0] = 0.03
+            motion = _direct_control_joint_operation(identity, target,
+                                                     request_id="scale-lane-preview",
+                                                     positions_rad=positions)
+            preview_thread = threading.Thread(
+                target=lambda: planning.preview_motion(
+                    OperationIntentRequest.model_validate(motion), trusted_principal_id=None),
+                daemon=True)
+            preview_thread.start()
+            deadline = time.monotonic() + 2.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert marker.exists()
+
+            binding = _program_binding(stack)
+            selector = {"program_binding_id": binding["program_binding_id"],
+                        **_arm_binding(binding)["target"]}
+
+            def request(request_id: str, scale: float) -> dict[str, Any]:
+                return {
+                    "request_context": {"request_id": request_id,
+                                        "request_owner_epoch": identity["owner_epoch"],
+                                        "source_label": "test"},
+                    "selector": selector,
+                    "expected_control_generation": 0,
+                    "scale": scale,
+                }
+
+            def reached_the_kernel(response: dict[str, Any]) -> bool:
+                # Accepted, or refused by the Kernel itself: never a lane or
+                # socket refusal, never a timeout behind the blocked preview.
+                return response["ok"] is True or response["error"]["code"] not in {
+                    "execution_submission_lane_busy",
+                    "execution_runtime_scale_lane_busy",
+                    "execution_control_command_unsupported",
+                    "execution_ordinary_command_unsupported",
+                }
+
+            # Control socket (the Headless route).
+            control = execution.set_runtime_scale_control(
+                RuntimeScaleControlRequest.model_validate(request("scale-lane-control", 0.5)),
+                trusted_principal_id=None)
+            assert reached_the_kernel(control), control
+            if control["ok"]:
+                assert control["accepted"]["active_operation_id"] is None
+            # Ordinary socket: the same lane, no new refusal.
+            ordinary = execution._exchange({
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": {"transport": "http", "assurance": "unverified",
+                                "principal_id": None},
+                "command": "set_runtime_scale_control",
+                "request": request("scale-lane-ordinary", 0.4),
+            })
+            assert reached_the_kernel(ordinary), ordinary
+            assert preview_thread.is_alive()
+            assert internal.stop_program_run(ProgramRunStopIntentRequest.model_validate({
+                "request_context": {"request_id": "scale-lane-stop",
+                                    "request_owner_epoch": identity["owner_epoch"],
+                                    "source_label": "test"},
+                "program_run_id": "program-run.scale-lane",
+                "reason": "release blocked preview",
+            }))["ok"] is True
+        finally:
+            if preview_thread is not None:
+                preview_thread.join(timeout=3.0)
 
 
 def test_ordered_active_tcp_read_waits_for_queued_set_tcp(

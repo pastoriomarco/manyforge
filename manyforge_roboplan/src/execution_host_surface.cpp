@@ -19,6 +19,7 @@
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -187,6 +188,11 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     const std::stop_callback wake_on_stop(stop_token, [this] { WakeLanes(); });
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
+    // Speed changes from both sockets; never behind planning, Submit or disk.
+    std::jthread runtime_scale_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_scale_lane");
+      RunDeferredLane(runtime_scale_lane_, stop_token);
+    });
     std::jthread observation_thread(
         [this](std::stop_token stop_token) { RunObservationLane(stop_token); });
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
@@ -235,10 +241,12 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     observation_thread.request_stop();
     submission_ordered_thread.request_stop();
     scene_read_thread.request_stop();
+    runtime_scale_thread.request_stop();
     event_stream_thread.request_stop();
     event_stream_thread.join();
     submission_ordered_thread.join();
     scene_read_thread.join();
+    runtime_scale_thread.join();
     reconciliation_thread.join();
     control_thread.join();
     observation_thread.join();
@@ -4272,7 +4280,10 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                   PreemptsPlanning(command.kind)) {
                 PreemptPlanning();
               }
-              if (lane == CommandLane::kStop) {
+              if (lane == CommandLane::kStop &&
+                  command.kind == CommandKind::kSetRuntimeScaleControl) {
+                deferred.emplace(&runtime_scale_lane_, command);
+              } else if (lane == CommandLane::kStop) {
                 // Stop and its in-memory progression reads reach the stable
                 // Kernel without the composition lock. It owns exact scope
                 // resolution, journal fences and unavailable evidence, also
@@ -4363,6 +4374,9 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                 std::shared_lock composition_lock(composition_access_.mutex);
                 if (composition_access_.product() == nullptr) {
                   response = OwnerNotReadyResponse(command);
+                } else if (ordinary &&
+                           command.kind == CommandKind::kSetRuntimeScaleControl) {
+                  deferred.emplace(&runtime_scale_lane_, command);
                 } else if (composition_access_.current == nullptr) {
                   if (ordinary && IsSubmissionOrdered(command.kind))
                     deferred.emplace(&submission_ordered_lane_, command);
