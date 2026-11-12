@@ -468,7 +468,7 @@ it('sends a motion Stop and a Full Stop while another Stop or a Reset is still p
   expect(test.send).toHaveBeenCalledTimes(5);
 });
 
-it('repeats a Full Stop while the run is Full stopping or stopping, but no motion Stop the owner would refuse', async () => {
+it('repeats a motion Stop and a Full Stop while the run is Full stopping or stopping', async () => {
   const test = await mount();
   const run = heldRun();
   for (const [step, state] of (['full_stopping', 'stopping'] as const).entries()) {
@@ -483,11 +483,14 @@ it('repeats a Full Stop while the run is Full stopping or stopping, but no motio
     });
     expect(test.runtime.state.run?.state).toBe(state);
     test.send.mockClear();
-    await act(async () => { expect(await test.runtime.stopMotion(['all'])).toBe(false); });
+    await act(async () => { expect(await test.runtime.stopMotion(['all'])).toBe(true); });
     await act(async () => { await test.runtime.fullStop(); });
-    // The owner joins a Full Stop to a running one, answers it with no
-    // effect while a Program Stop ends the run, and refuses a motion Stop
-    // (program_motion_stop_invalid) once the run is no longer running.
-    expect(test.send.mock.calls.map((call) => call[0])).toEqual(['program_full_stop']);
+    // The owner joins a Full Stop to a running one and answers the other
+    // repeats with no effect.
+    expect(test.send.mock.calls.map((call) => call[0]))
+      .toEqual(['program_motion_stop', 'program_full_stop']);
+    // Run and Resume stay closed while the run is stopping.
+    await act(async () => { expect(await test.runtime.resumeMotion('all')).toBe(false); });
+    expect(test.send).toHaveBeenCalledTimes(2);
   }
 });

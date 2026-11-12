@@ -1127,8 +1127,13 @@ export function useProgramRuntime(
       ((start || resume) && composerRefusalReason !== null)
       || groupIds.length === 0
       || !state.run
-      || !['running', 'intervention_required'].includes(state.run.state)
-      // A motion Stop needs only a run to stop: nothing in progress holds it back.
+      // A motion Stop needs only a run to stop: nothing in progress holds it
+      // back. While a Stop or Full Stop ends the run, the owner answers a
+      // repeat with no effect.
+      || !(start || resume
+        ? ['running', 'intervention_required']
+        : ['running', 'intervention_required', 'stopping', 'full_stopping'])
+        .includes(state.run.state)
       || ((start || resume) && (!state.runnerAvailable
         || ['stop', 'full-stop', 'reset'].includes(state.pending ?? '')))
       || ((start || resume) && (state.selectionPending.length > 0 || state.controlPending !== null

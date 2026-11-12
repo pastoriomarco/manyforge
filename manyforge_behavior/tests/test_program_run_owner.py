@@ -6005,3 +6005,43 @@ def test_a_mask_change_during_a_halt_keeps_the_mock_paused():
     assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
     resumed = owner.resume_full_stop(run_id, request_id="execute-after-halt")
     assert mock.calls[-1] == ("pause", run_id, resumed.run_revision, False, ("move_to_pick",))
+
+
+def test_motion_stop_has_no_effect_while_a_stop_or_full_stop_contains_the_run():
+    """A repeated Stop is never refused: once the run is stopping or Full
+    stopping, a motion Stop answers the unchanged snapshot, like a Full Stop."""
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    halting = owner.full_stop(run_id)
+    assert halting.state is ProgramRunState.FULL_STOPPING
+    scope.last_selection_stop = None
+    repeated = owner.stop_motion(run_id, reason="repeated Stop during Halt")
+    assert repeated.state is ProgramRunState.FULL_STOPPING
+    assert repeated.run_revision == halting.run_revision
+    assert scope.last_selection_stop is None
+
+    # A finished Full Stop is not stopping: the motion Stop keeps its refusal.
+    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
+    with pytest.raises(ProgramRunOwnerError, match="current running Program"):
+        owner.stop_motion(run_id)
+
+
+def test_motion_stop_has_no_effect_while_a_program_stop_ends_the_run():
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.ACTIVE
+    stopping = owner.stop(run_id)
+    assert stopping.state is ProgramRunState.STOPPING
+    scope.last_selection_stop = None
+    repeated = owner.stop_motion(run_id, group_id=["all"])
+    assert repeated.state is ProgramRunState.STOPPING
+    assert repeated.run_revision == stopping.run_revision
+    assert scope.last_selection_stop is None

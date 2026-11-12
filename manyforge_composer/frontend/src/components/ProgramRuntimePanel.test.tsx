@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ASSISTANT_TURN_IN_PROGRESS, type ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
@@ -42,6 +42,26 @@ import { api } from '../api/client';
 import { initialSceneNotice } from '../state/initialSceneNotice';
 import type { ActivateExecuteController } from '../hooks/useActivateExecute';
 import { ActivateExecuteDialog } from './ActivateExecuteDialog';
+
+// Lets a test turn Halt confirmation off; null keeps the installation value.
+const composerSettingsOverride = vi.hoisted(() => ({ confirmHalt: null as boolean | null }));
+vi.mock('../hooks/useComposerSettings', async (original) => {
+  const actual = await original<typeof import('../hooks/useComposerSettings')>();
+  return {
+    ...actual,
+    useComposerSettings: () => {
+      const controller = actual.useComposerSettings();
+      const { confirmHalt } = composerSettingsOverride;
+      return confirmHalt === null ? controller : {
+        ...controller,
+        settings: {
+          ...controller.settings,
+          motionPanel: { ...controller.settings.motionPanel, confirmHalt },
+        },
+      };
+    },
+  };
+});
 
 /** A minimal Applied binding row for one direct `component/target` reference. */
 function targetBinding(
@@ -2212,52 +2232,59 @@ describe('Halt', () => {
     } finally { await open.unmount(); }
   });
 
-  it('repeats a Halt while the run is Full stopping, without a motion Stop the owner would refuse', async () => {
+  it.each(['full_stopping', 'stopping'] as const)('repeats Stop and Halt while the run is %s (the owner answers with no effect or joins)', async (runState) => {
     const program = runningProgram();
-    program.state.run!.state = 'full_stopping';
+    program.state.run!.state = runState;
+    if (runState === 'stopping') program.cycleState = 'stopping';
     program.state.controls!.executionSelections.groups[0].state = 'stopping';
+    vi.mocked(program.stopMotion).mockResolvedValue(true);
     const open = await mountTransport(program);
     try {
-      expect(open.mounted((props) => haltButton(props) && !props.disabled
-        && props.children === 'Halting')).toBe(true);
-      // Group Stop is not offered: the owner refuses a motion Stop while Full stopping.
-      expect(open.mounted((props) => String(props.className) === 'danger-button transport-group-stop'
-        && props.disabled === true)).toBe(true);
+      expect(open.mounted((props) => haltButton(props) && !props.disabled)).toBe(true);
+      await open.press((props) => String(props.className) === 'danger-button transport-group-stop'
+        && !props.disabled);
+      expect(program.stopMotion).toHaveBeenCalledWith(['all']);
       await open.press(haltButton);
-      expect(program.stopMotion).not.toHaveBeenCalled();
+      // Motion is not yet stopped: Halt sends its motion Stop, then asks.
+      expect(program.stopMotion).toHaveBeenCalledTimes(2);
       expect(open.mounted(dialogOpen)).toBe(true);
       await open.press(confirmButton);
       expect(program.fullStop).toHaveBeenCalledTimes(1);
     } finally { await open.unmount(); }
   });
 
-  it('offers Halt but not group Stop while a Program Stop ends the run', async () => {
+  it('keeps group Stop unavailable for a held group while the run is stopping', () => {
     const program = runningProgram();
     program.state.run!.state = 'stopping';
     program.cycleState = 'stopping';
+    program.state.controls!.executionSelections.groups[0].state = 'held';
     const markup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={program} robot={robotController()} />,
     );
-    // The owner refuses a motion Stop here and answers a Full Stop with no effect.
-    expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""/);
+    expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/);
     expect(markup).toMatch(/class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/);
-    const open = await mountTransport(program);
-    try {
-      await open.press(haltButton);
-      expect(program.stopMotion).not.toHaveBeenCalled();
-      expect(open.mounted(dialogOpen)).toBe(true);
-      await open.press(confirmButton);
-      expect(program.fullStop).toHaveBeenCalledTimes(1);
-    } finally { await open.unmount(); }
   });
 
-  it('keeps the unconfirmed Halt as before: motion Stop, then Full Stop once motion has stopped', () => {
-    const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
-    const start = source.indexOf('const requestProgramHalt');
-    const flow = source.slice(start, source.indexOf('const nativeStatus', start));
-    expect(flow).toMatch(/if \(preferences\.confirmHalt\) \{[\s\S]*setHaltIntent\('confirm'\);\s*return;\s*\}\s*if \(!allMotionQuiesced\) \{\s*setHaltIntent\('stopping'\);/);
-    expect(flow).toMatch(/setHaltIntent\('stopping'\);\s*const accepted = await program\.stopMotion\(\['all'\]\);\s*if \(!accepted\) \{\s*setHaltIntent\(null\);\s*return;\s*\}\s*\}\s*setHaltIntent\('automatic'\);/);
-    expect(source).toMatch(/if \(haltIntent !== 'automatic' \|\| !allMotionQuiesced\) return;\s*setHaltIntent\(null\);\s*void program\.fullStop\(\);/);
+  describe('without confirmation', () => {
+    afterEach(() => { composerSettingsOverride.confirmHalt = null; });
+
+    it.each([true, false])('sends the Full Stop once motion has stopped, or at once if the motion Stop fails (accepted=%s)', async (accepted) => {
+      composerSettingsOverride.confirmHalt = false;
+      const program = runningProgram();
+      vi.mocked(program.stopMotion).mockResolvedValue(accepted);
+      const open = await mountTransport(program);
+      try {
+        await open.press(haltButton);
+        await open.rerender();
+        expect(program.stopMotion).toHaveBeenCalledWith(['all']);
+        expect(open.mounted(dialogOpen)).toBe(false);
+        // Accepted: the Full Stop waits until all motion has stopped.
+        expect(program.fullStop).toHaveBeenCalledTimes(accepted ? 0 : 1);
+        program.state.controls!.executionSelections.groups[0].state = 'held';
+        await open.rerender();
+        expect(program.fullStop).toHaveBeenCalledTimes(1);
+      } finally { await open.unmount(); }
+    });
   });
 });
 

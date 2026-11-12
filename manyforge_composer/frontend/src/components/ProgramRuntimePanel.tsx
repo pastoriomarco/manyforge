@@ -1776,10 +1776,11 @@ export function ProgramTransportControls({
   // Halt, like every Stop, is available whenever there is a run to stop:
   // nothing in progress (starting, another command, an earlier Stop or Halt,
   // a connection that is not current) holds it back. While the run is Full
-  // stopping the owner joins a repeat; while a Program Stop ends it, the
-  // owner answers that it has no effect.
-  const programRunStopping = state.run?.state === 'stopping';
-  const canProgramHalt = programMotionRunning || programFullStopping || programRunStopping;
+  // stopping the owner joins a repeated Full Stop; while a Program Stop ends
+  // it, the owner answers a Full Stop or motion Stop with no effect.
+  const runToStop = programMotionRunning || programFullStopping
+    || state.run?.state === 'stopping';
+  const canProgramHalt = runToStop;
 
   useEffect(() => {
     if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
@@ -1866,12 +1867,10 @@ export function ProgramTransportControls({
       // The motion Stop goes out at once, unconfirmed; the question that
       // follows is only about the Full Stop. A refused motion Stop does not
       // end the Halt: the question still follows and says so. Cancel leaves
-      // the Program held, ready for Resume. While a Full Stop or Program
-      // Stop runs, it already contains all motion (the owner refuses a motion
-      // Stop then).
+      // the Program held, ready for Resume.
       const request = ++haltRequest.current;
       setHaltMotionStopFailed(false);
-      if (!allMotionQuiesced && !programFullStopping && !programRunStopping) {
+      if (!allMotionQuiesced) {
         void program.stopMotion(['all']).then((accepted) => {
           if (!accepted && haltRequest.current === request) setHaltMotionStopFailed(true);
         });
@@ -1879,11 +1878,15 @@ export function ProgramTransportControls({
       setHaltIntent('confirm');
       return;
     }
+    // Unconfirmed: once the motion Stop is accepted, wait until all motion has
+    // stopped, then send the Full Stop. A refused or failed motion Stop does
+    // not end the Halt: the Full Stop goes out at once.
     if (!allMotionQuiesced) {
       setHaltIntent('stopping');
       const accepted = await program.stopMotion(['all']);
       if (!accepted) {
         setHaltIntent(null);
+        void program.fullStop();
         return;
       }
     }
@@ -2052,10 +2055,10 @@ export function ProgramTransportControls({
             const releasePending = selectionGroupPending(group.groupId, 'start-motion')
               || selectionGroupPending(group.groupId, 'resume-motion');
             const selectionTransitionPending = state.selectionPending.length > 0;
-            // Stop is available whenever the run has motion to stop; a group
+            // Stop is available whenever there is a run to stop; a group
             // already held, or not yet started, has none. A repeated press
             // sends another Stop.
-            const canGroupStop = programMotionRunning
+            const canGroupStop = runToStop
               && group.state !== 'held'
               && group.state !== 'ready';
             // A rule hold whose scope meets this group gates its Run/Resume,

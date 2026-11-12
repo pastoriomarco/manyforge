@@ -1521,6 +1521,13 @@ class ProgramRunOwner:
         with motion_stop_lock:
             with self._lock:
                 entry = self._entry(program_run_id)
+                if entry.state in {
+                    ProgramRunState.STOPPING,
+                    ProgramRunState.FULL_STOPPING,
+                }:
+                    # A Stop or Full Stop already contains this run: like a
+                    # Full Stop here, a motion Stop has no effect.
+                    return self._snapshot(entry)
                 if entry.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,

@@ -11,13 +11,20 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **A motion Stop while the Program run is already stopping or Full
+  stopping has no effect instead of being refused.** The Program-run owner
+  answered it with `program_motion_stop_invalid` ("motion Stop requires a
+  current running Program"); like a Full Stop there, it now returns the
+  unchanged run (receipt `received`, `program_motion_stop_received`). Every
+  other case keeps its answer.
 - **Composer never refuses a Stop.** Group Stop, Halt and Stop operation are
   available whenever there is a run or an operation to stop. Nothing else in
   progress disables them: not a starting Execute, another pending command
   (such as an unconfirmed speed change), an earlier Stop or Reset still
   pending, a runner projection not yet loaded, or a control connection that
   is delayed, stale or synchronizing. A group Stop stays unavailable only for
-  a group that is already held (or not started). A repeated press sends
+  a group that is already held (or not started), also while a Stop or Full
+  Stop ends the run. A repeated press sends
   another Stop, which the owner joins to the running Stop or answers with no
   effect; the button keeps its Stopping/Halting label. A Stop is sent
   whenever the control WebSocket is open, also while the heartbeat is late
@@ -37,8 +44,10 @@ formats; such changes are listed explicitly.
   *Halt Program* is always clickable and sends the Full Stop; Cancel leaves
   the Program held, ready for Resume. Halt can also be pressed while a Full
   Stop runs (the repeat joins it) or while a Program Stop ends the run (the
-  owner answers with no effect); then it sends only the Full Stop, without a
-  motion Stop. With that setting off, Halt behaves as before.
+  owner answers with no effect). With that setting off, Halt still waits
+  until all motion has stopped before its Full Stop once the motion Stop is
+  accepted; a refused or failed motion Stop no longer cancels the Halt but
+  sends the Full Stop at once.
 - **Bounded work on the time-critical paths.** The request replay ledgers,
   Program-run fences and operation history are indexed by id in slots
   allocated once, so a Stop finds, adds and evicts entries without scanning or
