@@ -10237,6 +10237,49 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionUnknownContainsThroug
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 }
 
+// The Program runner composes its motion Stop id as motion:<epoch>:<request
+// id>; with long parts it exceeds the 128-byte Stop id rule. The Stop still
+// stops: it is promoted to a Full Stop under an id of the Kernel's own.
+TEST(ResourceAddressedExecutionKernelTest, ProgramMotionStopWithOverlongComposedIdStillStops) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
+  ASSERT_TRUE(kernel.execute(scoped_motion_operation("active.arm")).ok());
+  const auto composed =
+      "motion:" + std::string(64U, 'e') + ":" + std::string(64U, 'r');
+  ASSERT_GT(composed.size(), kMaximumStopIdentityBytes);
+  const auto stopped = kernel.stop_program_selection(program_selection_request(composed, "arm"));
+  std::cout << "overlong motion Stop id (" << composed.size() << " bytes): "
+            << (stopped.ok() ? std::string("accepted")
+                             : "refused " + stopped.error().code + " reason=" +
+                                   (stopped.error().details.contains("reason")
+                                        ? stopped.error().details.at("reason")
+                                        : std::string("-")))
+            << '\n';
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(stopped.value().fresh_containment.has_value());
+  EXPECT_EQ(stopped.value().fresh_containment->resolution_disposition,
+            StopResolutionDispositionDTO::kPromotedToFull);
+  EXPECT_EQ(stopped.value().fresh_containment->request_id.value().rfind("malformed-stop:", 0U), 0U);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().fresh_containment->stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      ProgramSelectionAdoptsStopAndContainsOnlyFreshIndependentWork) {
   FakeClock clock;
@@ -20291,25 +20334,79 @@ TEST(ResourceAddressedExecutionKernelTest, StopWithInvalidFieldPromotesToFullSto
   }
 }
 
-// A request identity that cannot name a Stop is still refused: the promoted
-// Full Stop has no identity to replay or journal under.
-TEST(ResourceAddressedExecutionKernelTest, StopWithUnusableRequestIdentityIsStillRefused) {
-  FakeClock clock;
-  ManualScheduler scheduler;
-  FakeParticipantEngine engine;
-  FakeOperationJournal journal;
-  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
-      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
-                    engine)},
-      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
-  auto& kernel = *owner;
-  const auto operation = kernel.execute(motion_operation("request.unusable-identity.execute"));
-  ASSERT_TRUE(operation.ok()) << operation.error().message;
-  auto intent = stop_request(std::string(129U, 'r'), operation.value(), 1U);
-  const auto refused = kernel.stop(intent);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("reason"), "normalized_stop_intent_invalid");
-  EXPECT_EQ(engine.stop_calls.load(), 0);
+// A Stop whose id or attribution cannot key it is promoted to a Full Stop
+// under an id of the Kernel's own. Its repeat cannot be recognised: while
+// the first Full Stop runs it joins it as a new acceptance.
+TEST(ResourceAddressedExecutionKernelTest, StopWithUnusableIdentityPromotesToKernelKeyedFullStop) {
+  const auto empty_principal =
+      RequestAttributionDTO{RequestTransportDTO::kHttp, RequestAssuranceDTO::kExternallyAuthenticated,
+                            std::string{}};
+  const std::vector<std::pair<std::string, std::pair<std::string, RequestAttributionDTO>>> cases{
+      {"empty_id", {std::string{}, RequestAttributionDTO{}}},
+      {"oversized_id", {std::string(129U, 'r'), RequestAttributionDTO{}}},
+      {"nul_in_id", {std::string("request\0id", 10U), RequestAttributionDTO{}}},
+      {"space_in_id", {"operator stop 1", RequestAttributionDTO{}}},
+      {"non_ascii_id", {"stopp-\xc3\xa4", RequestAttributionDTO{}}},
+      {"invalid_attribution", {"request.invalid-attribution", empty_principal}},
+  };
+  for (const auto& [name, identity] : cases) {
+    SCOPED_TRACE(name);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    clock.set(100);
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular),
+                      engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *owner;
+    const auto operation = kernel.execute(motion_operation("request.unusable-identity.execute"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    HeldSettlementCall stage;
+    engine.translate_stop_stage_hook = stage.Blocker();
+    auto intent = stop_request(identity.first, operation.value(), 1U);
+    intent.attribution = identity.second;
+
+    const auto stopped = kernel.stop(intent);
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_EQ(stopped.value().resolution_disposition,
+              StopResolutionDispositionDTO::kPromotedToFull);
+    EXPECT_EQ(stopped.value().resolution_reason,
+              StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent);
+    if (name == "invalid_attribution") {
+      EXPECT_EQ(stopped.value().request_id, RequestId(identity.first));
+    } else {
+      EXPECT_EQ(stopped.value().request_id.value().rfind("malformed-stop:", 0U), 0U)
+          << stopped.value().request_id.value();
+    }
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+
+    const auto repeat = kernel.stop(intent);
+    ASSERT_TRUE(repeat.ok()) << repeat.error().message;
+    EXPECT_EQ(repeat.value().resolution_disposition,
+              StopResolutionDispositionDTO::kPromotedToFull);
+    EXPECT_EQ(repeat.value().stop_id, stopped.value().stop_id);
+
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() >= 1; }));
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(state.ok()) << state.error().message;
+    EXPECT_EQ(state.value().state, OperationStateKind::kStopped);
+    if (name == "invalid_attribution") {
+      std::lock_guard lock(journal.mutex);
+      ASSERT_TRUE(journal.last_stop_acceptance.has_value());
+      EXPECT_EQ(journal.last_stop_acceptance->attribution.assurance,
+                RequestAssuranceDTO::kUnverified);
+      EXPECT_FALSE(journal.last_stop_acceptance->attribution.principal_id.has_value());
+    }
+  }
 }
 
 [[nodiscard]] bool stop_terminal_recorded(const ResourceAddressedExecutionKernel& kernel,

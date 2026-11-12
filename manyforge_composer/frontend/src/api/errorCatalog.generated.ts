@@ -3623,7 +3623,6 @@ export const ERROR_CATALOG: Readonly<Record<string, readonly [string, string]>> 
   stop_readiness_retained_timing_mismatch: ["Stop readiness configuration mismatch", "An internal check failed: Stop readiness was built for a different applied configuration than its Stop plan. Collect the logs and report it."],
   stop_replacement_start_invalid: ["Stop replacement start invalid", "An internal check failed: the controller start of the Stop replacement cannot be represented. Collect the logs and report it."],
   stop_replay_result_missing: ["Stop replay result missing", "An internal check failed: a replayed Stop reserve has no retained result. Collect the logs and report it."],
-  stop_request_attribution_invalid: ["Stop attribution invalid", "The attribution of the Stop request is invalid, so it was refused. Send a Stop with a valid source."],
   stop_scope_snapshot_invalid: ["Stop scope snapshot invalid", "An internal check failed: the Stop scope snapshot is not a complete owner capture. Collect the logs and report it."],
   stop_stage_attempt_infrastructure_failure: ["Stop stage lane failed", "An internal check failed: the Stop-stage execution lane failed without a result. Collect the logs and report it."],
   stop_stage_attempt_pool_busy: ["Stop in progress", "A live Stop holds the Stop-stage pool that the new configuration must grow. Retry after the Stop settles."],

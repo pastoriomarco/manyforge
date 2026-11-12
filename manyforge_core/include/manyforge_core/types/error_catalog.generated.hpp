@@ -3626,7 +3626,6 @@ inline constexpr std::string_view kStopProjectionStateInvalid{"stop_projection_s
 inline constexpr std::string_view kStopReadinessRetainedTimingMismatch{"stop_readiness_retained_timing_mismatch"};
 inline constexpr std::string_view kStopReplacementStartInvalid{"stop_replacement_start_invalid"};
 inline constexpr std::string_view kStopReplayResultMissing{"stop_replay_result_missing"};
-inline constexpr std::string_view kStopRequestAttributionInvalid{"stop_request_attribution_invalid"};
 inline constexpr std::string_view kStopScopeSnapshotInvalid{"stop_scope_snapshot_invalid"};
 inline constexpr std::string_view kStopStageAttemptInfrastructureFailure{"stop_stage_attempt_infrastructure_failure"};
 inline constexpr std::string_view kStopStageAttemptPoolBusy{"stop_stage_attempt_pool_busy"};

@@ -106,6 +106,18 @@ def _bounded_nfc(value: str, *, label: str, maximum_bytes: int) -> str:
     return value
 
 
+_STOP_REQUEST_ID = re.compile(r"[A-Za-z0-9_.:-]{1,%d}" % MAX_STOP_IDENTITY_BYTES)
+
+
+def _stop_request_id(value: str) -> str:
+    """The one Stop request id rule: 1-128 characters of [A-Za-z0-9_.:-]."""
+    if _STOP_REQUEST_ID.fullmatch(value) is None:
+        raise ValueError(
+            f"request_id must be 1-{MAX_STOP_IDENTITY_BYTES} characters of [A-Za-z0-9_.:-]"
+        )
+    return value
+
+
 def decode_runtime_scale_selector_query(value: str) -> Any:
     """Decode the grouped selector query using the public JSON strictness rules."""
     if len(value.encode("utf-8")) > MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES:
@@ -3573,8 +3585,8 @@ class StopIntentRequest(StrictRequest):
         if identities != sorted(identities) or len(set(identities)) != len(identities):
             raise ValueError("Stop selector rows must be sorted and unique")
         context = self.request_context
+        _stop_request_id(context.request_id)
         for label, value, maximum in (
-            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
             (
                 "request_owner_epoch",
                 context.request_owner_epoch,
@@ -3616,8 +3628,8 @@ class ProgramRunStopIntentRequest(StrictRequest):
     @model_validator(mode="after")
     def validate_context(self) -> ProgramRunStopIntentRequest:
         context = self.request_context
+        _stop_request_id(context.request_id)
         for label, value, maximum in (
-            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
             (
                 "request_owner_epoch",
                 context.request_owner_epoch,
@@ -3636,11 +3648,7 @@ class FullStopIntentRequest(StrictRequest):
     @model_validator(mode="after")
     def validate_context(self) -> FullStopIntentRequest:
         context = self.request_context
-        _bounded_nfc(
-            context.request_id,
-            label="request_id",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
+        _stop_request_id(context.request_id)
         _bounded_nfc(
             context.request_owner_epoch,
             label="request_owner_epoch",

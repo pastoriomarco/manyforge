@@ -485,6 +485,23 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   std::optional<FullStopIntentDTO> malformed_full;
   if (malformed_ingress != nullptr) {
     if (malformed_stop_ingress_field_error(*malformed_ingress).has_value()) {
+      // An id or attribution that cannot key the Stop must not refuse it: the
+      // promoted Full Stop is keyed by an id of the Kernel's own instead, and
+      // an attribution that cannot be kept is recorded as unverified.
+      auto keyed = *malformed_ingress;
+      if (malformed_stop_ingress_field_error(keyed) == "malformed_stop_ingress_identity_invalid") {
+        keyed.request_id = RequestId("malformed-stop:" + std::to_string(next_stop_id_) + ":" +
+                                     std::to_string(accepted_at_ns));
+      }
+      if (malformed_stop_ingress_field_error(keyed) ==
+          "malformed_stop_ingress_attribution_invalid") {
+        keyed.attribution = RequestAttributionDTO{keyed.attribution.transport,
+                                                  RequestAssuranceDTO::kUnverified, std::nullopt};
+      }
+      if (keyed != *malformed_ingress && !malformed_stop_ingress_field_error(keyed).has_value()) {
+        return accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                  accepted_at_ns, nullptr, &keyed);
+      }
       return reject<StopAcceptedDTO>("recognized malformed Stop ingress is invalid",
                                      "malformed_stop_ingress_invalid", ErrorCode::kInvalidRequest);
     }
@@ -514,27 +531,20 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   const auto& context = ordinary != nullptr ? ordinary->request_context : full->request_context;
   const bool runtime_collision_containment = runtime_monitor_containment_stop(ordinary);
   const auto& attribution = ordinary != nullptr ? ordinary->attribution : full->attribution;
-  if (!attribution.locally_valid()) {
-    return reject<StopAcceptedDTO>("Stop ingress attribution is invalid",
-                                   "stop_request_attribution_invalid", ErrorCode::kInvalidRequest);
-  }
   std::optional<ContentDigest> normalized_digest;
   if (malformed_ingress == nullptr) {
     const auto computed = ordinary != nullptr ? ComputeNormalizedStopIntentDigest(*ordinary)
                                               : ComputeNormalizedStopIntentDigest(*full);
     if (!computed.ok()) {
-      // A parsed Stop with an invalid field is promoted to a Full Stop, the
-      // same way as a Stop body the transport could not parse. Only a request
-      // identity that cannot name the Stop is still refused.
+      // A parsed Stop with an invalid field (its id and attribution
+      // included) is promoted to a Full Stop, the same way as a Stop body
+      // the transport could not parse.
       const MalformedStopIngressDTO invalid{
           context.request_id, config_.request_owner_epoch, attribution,
           ordinary != nullptr ? "/api/execution/stops" : "/api/execution/full-stop",
           "recognized_stop_payload_invalid"};
-      if (!malformed_stop_ingress_field_error(invalid).has_value()) {
-        return accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
-                                  accepted_at_ns, nullptr, &invalid);
-      }
-      return Result<StopAcceptedDTO>::Err(computed.error());
+      return accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                accepted_at_ns, nullptr, &invalid);
     }
     normalized_digest = computed.value();
   }

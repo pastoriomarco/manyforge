@@ -47,6 +47,13 @@ namespace {
          });
 }
 
+// A Stop is keyed by its request id in the emergency reserve, which takes the
+// portable token only; any other id is a field error, so the Stop is promoted.
+[[nodiscard]] bool stop_context_valid(const PublicRequestContextDTO& context) noexcept {
+  return context_valid(context) &&
+         portable_token(context.request_id.value(), kMaximumStopIdentityBytes);
+}
+
 template <typename StrongId>
 [[nodiscard]] bool bounded_identity(const StrongId& identity) noexcept {
   return !identity.empty() && identity.value().size() <= kMaximumStopIdentityBytes &&
@@ -68,7 +75,7 @@ template <typename Targets, typename Key>
 }  // namespace
 
 std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& intent) noexcept {
-  if (!context_valid(intent.request_context)) {
+  if (!stop_context_valid(intent.request_context)) {
     return "stop_request_context_invalid";
   }
   if (!attribution_valid(intent.attribution)) {
@@ -134,7 +141,7 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
 
 std::optional<std::string_view> full_stop_intent_field_error(
     const FullStopIntentDTO& intent) noexcept {
-  if (!context_valid(intent.request_context)) {
+  if (!stop_context_valid(intent.request_context)) {
     return "full_stop_request_context_invalid";
   }
   if (!attribution_valid(intent.attribution)) {

@@ -134,9 +134,19 @@ formats; such changes are listed explicitly.
   as a Stop body the API cannot parse: the reply carries
   `resolution_disposition: promoted_to_full` and `resolution_reason:
   malformed_ordinary_intent`, and repeating the same request while that Stop
-  runs returns its exact replay. A request id that cannot name a Stop (empty,
-  over 128 bytes, or with characters other than letters, digits and `_.:-`)
-  is still refused.
+  runs returns its exact replay.
+- **A Stop is no longer refused because of how its request id is written.**
+  A Stop request id now follows one rule everywhere: 1 to 128 characters of
+  `A-Z a-z 0-9 _ . : -`. A Stop whose id breaks it (empty, longer, or with
+  any other character, such as a space or a non-ASCII letter), or whose
+  attribution is invalid, was refused and stopped nothing. It is now
+  accepted as a Full Stop (`promoted_to_full`, `malformed_ordinary_intent`):
+  on the Stop HTTP routes as an invalid body, and in the Kernel under an id
+  of its own (`malformed-stop:…`, given in the reply's `request_id`) with an
+  invalid attribution recorded as unverified. Such a repeat cannot be
+  recognized as a replay: while the first Full Stop runs it joins it,
+  afterwards it is a new Full Stop. The error code
+  `stop_request_attribution_invalid` no longer exists.
 - **The assistant can be enabled again.** The ROS overlay's installed scripts
   ran under the image's system Python instead of the application's virtual
   environment, so the assistant host started its bridge without a module the

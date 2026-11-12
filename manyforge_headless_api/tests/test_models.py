@@ -33,6 +33,7 @@ from manyforge_headless_api.models import (
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
     SceneTransactionRequest,
+    FullStopIntentRequest,
     StopIntentRequest,
 )
 
@@ -2129,3 +2130,32 @@ def test_run_failure_details_accept_qualified_signal_without_truncation() -> Non
     details["reference"]["signal_name"] += "x"
     with pytest.raises(ValueError):
         validate_failure_details_and_origin(details, origin)
+
+
+def test_stop_request_ids_follow_the_one_stop_id_rule() -> None:
+    """1-128 characters of [A-Za-z0-9_.:-]; the Kernel and its reserve key the
+    same ids. Any other id makes the body invalid, which is a Full Stop."""
+    context = _caller()
+    target = {
+        "operation_id": "operation-1",
+        "expected_operation_revision": 1,
+        "expected_stop_generation": 0,
+    }
+    for request_id in ("Az09_.:-", "r", "r" * 128):
+        stop_context = {**context, "request_id": request_id}
+        StopIntentRequest.model_validate(
+            {"request_context": stop_context, "operations": [target]}
+        )
+        FullStopIntentRequest.model_validate(
+            {"request_context": stop_context, "expected_stop_generation": 0}
+        )
+    for request_id in ("", "request\x00id", "r" * 129, "operator stop 1", "stopp-\u00e4"):
+        stop_context = {**context, "request_id": request_id}
+        with pytest.raises(ValidationError):
+            StopIntentRequest.model_validate(
+                {"request_context": stop_context, "operations": [target]}
+            )
+        with pytest.raises(ValidationError):
+            FullStopIntentRequest.model_validate(
+                {"request_context": stop_context, "expected_stop_generation": 0}
+            )
