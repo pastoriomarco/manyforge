@@ -268,7 +268,16 @@ describe('Headless owner-frame admission', () => {
       programPayload,
       null,
     )).toBe(programPayload);
-    expect(() => executionCommandPayload('operation_stop', {}, null))
+    // A Stop is never refused for a missing owner epoch: it goes unfenced.
+    const stopPayload = { reason: 'operator Stop' };
+    expect(executionCommandPayload('operation_stop', stopPayload, null)).toBe(stopPayload);
+    expect(executionCommandPayload('cell_full_stop', stopPayload, undefined)).toBe(stopPayload);
+    expect(executionCommandPayload('operation_stop', stopPayload, 'kernel.epoch.4')).toEqual({
+      reason: 'operator Stop', expected_execution_owner_epoch: 'kernel.epoch.4',
+    });
+    expect(() => executionCommandPayload('operation_start', {}, null))
+      .toThrow('Execution owner identity is unavailable.');
+    expect(() => executionCommandPayload('runtime_scale', {}, ''))
       .toThrow('Execution owner identity is unavailable.');
   });
 
@@ -1304,7 +1313,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connection lost')));
     await expect(source.sendExecutionCommand(
       'program_run', { scenario_id: 'lite6' }, 'run.http.unknown',
-    )).rejects.toThrow('Command delivery is unconfirmed');
+    )).rejects.toThrow('Command delivery is unconfirmed; commands other than Stop are disabled.');
     expect(FakeWebSocket.shell.readyState).toBe(3);
     source.dispose();
   });
@@ -2657,7 +2666,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(450);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
-      error: 'Control connection is delayed; commands are disabled.',
+      error: 'Control connection is delayed; commands other than Stop are disabled.',
       transportStatus: 'delayed',
       semanticStatus: 'current',
     });
@@ -2674,7 +2683,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
-      error: 'Control connection is stale; commands are disabled.',
+      error: 'Control connection is stale; commands other than Stop are disabled.',
       transportStatus: 'stale',
       semanticStatus: 'current',
     });
@@ -2771,6 +2780,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     expect(source.getShellSnapshot()).toMatchObject({
       transportStatus: 'connected', semanticStatus: 'unavailable',
+      error: 'Control state is unavailable (owner_unavailable); commands other than Stop are disabled.',
     });
     expect(source.getGlobalRulesCurrent()).toBe(false);
     expect(source.getGlobalRules()).toBe(rows);
@@ -3052,7 +3062,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       challenge_sequence: '3',
     });
     expect(source.getShellSnapshot().error).toBe(
-      'Control state is synchronizing; commands are disabled.',
+      'Control state is synchronizing; commands other than Stop are disabled.',
     );
     expect(source.getShellSnapshot()).toMatchObject({
       transportStatus: 'connected',
@@ -3119,7 +3129,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: null,
-      error: 'Control connection is stale; commands are disabled.',
+      error: 'Control connection is stale; commands other than Stop are disabled.',
     });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
@@ -3575,6 +3585,148 @@ describe('HeadlessStateSource delivery scheduling', () => {
     await scaleRejected;
     await resetRejected;
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('Stop is never refused on an open control socket', () => {
+  function mountOpenSession() {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    const socket = FakeWebSocket.shell;
+    const sentCommands = () => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'command') as Array<{
+        command: {
+          command_envelope: { command_kind: string; correlation_id: string };
+          payload: Record<string, unknown>;
+        };
+      }>;
+    const sentKinds = () => sentCommands().map((value) => value.command.command_envelope.command_kind);
+    const internal = source as unknown as {
+      latest: { executionControlStatus: { ownerEpoch: string } | null } | null;
+      controlTransportError: string | null;
+    };
+    const pending: Array<Promise<unknown>> = [];
+    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0], id: string) => {
+      const promise = source.sendExecutionCommand(kind, { reason: id }, id);
+      pending.push(promise.catch(() => undefined));
+      return promise;
+    };
+    const dispose = async () => {
+      source.dispose();
+      await Promise.all(pending);
+    };
+    return { source, socket, sentCommands, sentKinds, internal, send, dispose };
+  }
+
+  it('sends every Stop kind while the heartbeat is delayed or stale; other commands stay refused', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.internal.latest!.executionControlStatus = { ownerEpoch: 'execution.epoch.1' };
+    vi.advanceTimersByTime(500);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('delayed');
+    await expect(session.send('program_reset', 'reset.delayed')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('program_motion_stop', 'motion-stop.delayed');
+    session.send('operation_stop', 'operation-stop.delayed');
+    vi.advanceTimersByTime(500);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('stale');
+    await expect(session.send('runtime_scale', 'scale.stale')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('program_full_stop', 'full-stop.stale');
+    session.send('cell_full_stop', 'cell-stop.stale');
+    expect(session.sentKinds()).toEqual([
+      'program_motion_stop', 'operation_stop', 'program_full_stop', 'cell_full_stop',
+    ]);
+    await session.dispose();
+  });
+
+  it('sends a Stop despite a latched transport error or another pending command', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.send('program_reset', 'reset.pending');
+    session.send('program_motion_stop', 'motion-stop.during-reset');
+    // A repeated press sends another Stop; the owner joins it.
+    session.send('program_motion_stop', 'motion-stop.repeated');
+    session.internal.controlTransportError = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
+    await expect(session.send('program_resume_full_stop', 'resume.latched')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('program_full_stop', 'full-stop.latched');
+    expect(session.sentKinds()).toEqual([
+      'program_reset', 'program_motion_stop', 'program_motion_stop', 'program_full_stop',
+    ]);
+    await session.dispose();
+  });
+
+  it('leaves a latched transport error untouched when a Stop goes through it', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    const latched = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
+    session.internal.controlTransportError = latched;
+    const before = session.source.getShellSnapshot();
+    session.send('program_motion_stop', 'motion-stop.through-latch');
+    session.send('operation_stop', 'operation-stop.through-latch');
+    expect(session.sentKinds()).toEqual(['program_motion_stop', 'operation_stop']);
+    // The Stop neither clears nor changes the latch or the published condition.
+    expect(session.internal.controlTransportError).toBe(latched);
+    expect(session.source.getShellSnapshot()).toBe(before);
+    // The latch still gates every other command afterwards.
+    await expect(session.send('program_reset', 'reset.after-stop')).rejects
+      .toThrow('Control connection is not synchronized.');
+    await expect(session.send('runtime_scale', 'scale.after-stop')).rejects
+      .toThrow('Control connection is not synchronized.');
+    expect(session.sentKinds()).toEqual(['program_motion_stop', 'operation_stop']);
+    expect(session.internal.controlTransportError).toBe(latched);
+    await session.dispose();
+  });
+
+  it('sends an owner-fenced Stop without the owner epoch when it is unknown', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.internal.latest!.executionControlStatus = null;
+    session.send('operation_stop', 'operation-stop.no-epoch');
+    await expect(session.send('runtime_scale', 'scale.no-epoch')).rejects
+      .toThrow('Execution owner identity is unavailable.');
+    const [stop] = session.sentCommands();
+    expect(stop.command.command_envelope.command_kind).toBe('operation_stop');
+    expect(stop.command.payload).toEqual({ reason: 'operation-stop.no-epoch' });
+    await session.dispose();
+  });
+
+  it('refuses a Stop only when the control socket is not open', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.socket.readyState = 3;
+    await expect(session.send('program_motion_stop', 'motion-stop.closed')).rejects
+      .toThrow('Control connection is not synchronized.');
+    expect(session.sentKinds()).toEqual([]);
+    await session.dispose();
   });
 });
 

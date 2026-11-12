@@ -11,6 +11,34 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **Composer never refuses a Stop.** Group Stop, Halt and Stop operation are
+  available whenever there is a run or an operation to stop. Nothing else in
+  progress disables them: not a starting Execute, another pending command
+  (such as an unconfirmed speed change), an earlier Stop or Reset still
+  pending, a runner projection not yet loaded, or a control connection that
+  is delayed, stale or synchronizing. A group Stop stays unavailable only for
+  a group that is already held (or not started). A repeated press sends
+  another Stop, which the owner joins to the running Stop or answers with no
+  effect; the button keeps its Stopping/Halting label. A Stop is sent
+  whenever the control WebSocket is open, also while the heartbeat is late
+  or after an earlier command's delivery was unconfirmed; other commands keep
+  their gates, and the connection and control-state notices (delayed,
+  stale, synchronizing, unavailable, delivery unconfirmed) now say
+  "commands other than Stop are disabled". An `operation_stop` or `cell_full_stop` is sent without
+  `expected_execution_owner_epoch` when Composer does not know the owner
+  epoch. Robot Control keeps an active operation's panel, and its Stop,
+  while the connection is not current.
+- **Halt sends its motion Stop at once and asks only about the Full Stop.**
+  With *Confirm before halting the Program* on (the default), Halt sends the
+  motion Stop without waiting and opens the confirmation at once; a refused
+  motion Stop no longer cancels the Halt, and the confirmation says "Motion
+  Stop not confirmed". It says "Motion is stopped." only once all motion has
+  stopped, and shows "Waiting for all motion groups to stop…" until then.
+  *Halt Program* is always clickable and sends the Full Stop; Cancel leaves
+  the Program held, ready for Resume. Halt can also be pressed while a Full
+  Stop runs (the repeat joins it) or while a Program Stop ends the run (the
+  owner answers with no effect); then it sends only the Full Stop, without a
+  motion Stop. With that setting off, Halt behaves as before.
 - **Bounded work on the time-critical paths.** The request replay ledgers,
   Program-run fences and operation history are indexed by id in slots
   allocated once, so a Stop finds, adds and evicts entries without scanning or

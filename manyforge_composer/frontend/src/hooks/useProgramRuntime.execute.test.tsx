@@ -433,3 +433,61 @@ it('reverts a refused value and re-reads every row after a refusal', async () =>
       draft: 0.2, pending: false, status: { controlGeneration: 5 } });
   }
 });
+
+it('sends a motion Stop and a Full Stop while another Stop or a Reset is still pending', async () => {
+  const test = await mount();
+  const run = heldRun();
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle,
+      state: 'running',
+      programRunId: run.capture.programRunId,
+      runRevision: run.runRevision,
+      run,
+      allowedCommands: [{ commandKind: 'program_reset', allowed: true,
+        disabledReason: null, semanticTarget: {} }],
+    };
+  });
+  // No receipt arrives: every command stays pending.
+  test.send.mockImplementation(() => new Promise<never>(() => undefined));
+  await act(async () => {
+    void test.runtime.reset({ expected: { programRunId: run.capture.programRunId, cycleGeneration: 1 } });
+  });
+  expect(test.runtime.state.pending).toBe('reset');
+  await act(async () => { void test.runtime.stopMotion(['all']); });
+  // A repeated press sends another Stop; the owner joins it.
+  await act(async () => { void test.runtime.stopMotion(['all']); });
+  await act(async () => { void test.runtime.fullStop(); });
+  await act(async () => { void test.runtime.fullStop(); });
+  expect(test.send.mock.calls.map((call) => call[0])).toEqual([
+    'program_reset', 'program_motion_stop', 'program_motion_stop',
+    'program_full_stop', 'program_full_stop',
+  ]);
+  // Run and Resume keep their gates while a Stop is pending.
+  await act(async () => { expect(await test.runtime.resumeMotion('all')).toBe(false); });
+  expect(test.send).toHaveBeenCalledTimes(5);
+});
+
+it('repeats a Full Stop while the run is Full stopping or stopping, but no motion Stop the owner would refuse', async () => {
+  const test = await mount();
+  const run = heldRun();
+  for (const [step, state] of (['full_stopping', 'stopping'] as const).entries()) {
+    await test.observe(({ snapshot }) => {
+      snapshot.programCycle = {
+        ...snapshot.programCycle,
+        state: state === 'stopping' ? 'stopping' : 'running',
+        programRunId: run.capture.programRunId,
+        runRevision: run.runRevision + step,
+        run: { ...run, state, runRevision: run.runRevision + step },
+      };
+    });
+    expect(test.runtime.state.run?.state).toBe(state);
+    test.send.mockClear();
+    await act(async () => { expect(await test.runtime.stopMotion(['all'])).toBe(false); });
+    await act(async () => { await test.runtime.fullStop(); });
+    // The owner joins a Full Stop to a running one, answers it with no
+    // effect while a Program Stop ends the run, and refuses a motion Stop
+    // (program_motion_stop_invalid) once the run is no longer running.
+    expect(test.send.mock.calls.map((call) => call[0])).toEqual(['program_full_stop']);
+  }
+});

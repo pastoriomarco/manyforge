@@ -1171,7 +1171,7 @@ describe('Program runtime projection', () => {
     expect(allowed).toMatch(/class="transport-run"(?![^>]*disabled)[^>]*>Activate and execute<\/button>/);
   });
 
-  it('keeps paired commands disabled through Execute and selected-Stop transitions', () => {
+  it('keeps paired commands disabled through Execute; a pending Stop stays clickable', () => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
     const startingMarkup = renderToStaticMarkup(
@@ -1206,15 +1206,16 @@ describe('Program runtime projection', () => {
     const stoppingMarkup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
+    // The first press shows as Stopping; a repeated press sends another Stop.
     expect(stoppingMarkup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stopping<\/button>/,
     );
     expect(stoppingMarkup).toMatch(
       /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
     );
   });
 
-  it.each(['stopping', 'mixed'] as const)('reflects selected group %s without redundant Stop or blocking active motion', (state) => {
+  it.each(['stopping', 'mixed'] as const)('reflects selected group %s and keeps its Stop clickable', (state) => {
     const running = controller('running');
     running.state.controls = ordinaryMotionStopControls();
     const group = running.state.controls.executionSelections!.groups[0];
@@ -1225,7 +1226,7 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     if (state === 'stopping') {
-      expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/);
+      expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stopping<\/button>/);
     } else {
       expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/);
     }
@@ -1339,6 +1340,55 @@ describe('Program runtime projection', () => {
     expect(markup).not.toMatch(
       /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Run<\/button>/,
     );
+  });
+
+  it('keeps Stop and Halt available whenever a run is running, whatever else is in progress', () => {
+    const groupStop = /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>(Stop|Stopping)<\/button>/;
+    const halt = /class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>(Halt|Halting)<\/button>/;
+    const busy = (configure: (program: ProgramRuntimeController) => void) => {
+      const program = controller('running');
+      const controls = ordinaryMotionStopControls();
+      controls.recoveryOffer = null;
+      controls.executionSelections.groups[0].state = 'running';
+      controls.executionSelections.groups[0].stopAllowed = true;
+      program.state.controls = controls;
+      configure(program);
+      return renderToStaticMarkup(
+        <ProgramTransportControls enabled={false} program={program} robot={robotController()} />,
+      );
+    };
+    const cases: Array<[string, (program: ProgramRuntimeController) => void]> = [
+      // The connection is not current (delayed, stale, synchronizing).
+      ['connection not current', () => undefined],
+      ['cycle still starting', (program) => { program.cycleState = 'starting'; }],
+      ['cycle stopping', (program) => { program.cycleState = 'stopping'; }],
+      ['runner projection not loaded', (program) => { program.state.runnerAvailable = false; }],
+      ['Run pending', (program) => { program.state.pending = 'run'; }],
+      ['Reset pending', (program) => { program.state.pending = 'reset'; }],
+      ['Full Stop pending', (program) => { program.state.pending = 'full-stop'; }],
+      ['unconfirmed speed change', (program) => { program.state.controlPending = 'runtime-scale'; }],
+      ['Stop pending', (program) => {
+        program.state.selectionPending = [{
+          kind: 'motion-stop', groupIds: ['all'], requestId: 'stop-request.1',
+          ownerEpoch: 'program-runner.epoch.1', programRunId: 'program-run.1',
+        }];
+      }],
+      ['owner Stop admission not projected', (program) => {
+        program.runnerAllows = vi.fn(() => false);
+        program.state.controls!.executionSelections.groups[0].stopAllowed = false;
+      }],
+    ];
+    for (const [name, configure] of cases) {
+      const markup = busy(configure);
+      expect(markup, name).toMatch(groupStop);
+      expect(markup, name).toMatch(halt);
+    }
+    // The only Group Stop gate: the group is already held (or not started).
+    const held = busy((program) => {
+      program.state.controls!.executionSelections.groups[0].state = 'held';
+    });
+    expect(held).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/);
+    expect(held).toMatch(halt);
   });
 
   it('keeps motion Stop disabled while Program Execute is still starting', () => {
@@ -2069,6 +2119,145 @@ describe('Reset confirmation and persistent keys', () => {
         await open.unmount();
       }
     }
+  });
+});
+
+describe('Halt', () => {
+  const runningProgram = () => {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'running';
+    controls.executionSelections.groups[0].stopAllowed = true;
+    program.state.controls = controls;
+    return program;
+  };
+  const haltButton = (props: Record<string, unknown>) => String(props.className)
+    .startsWith('danger-button transport-full-stop');
+  const dialogOpen = (props: Record<string, unknown>) => props.id === 'program-halt-confirmation-title';
+  const confirmButton = (props: Record<string, unknown>) => props.children === 'Halt Program';
+  const text = (props: Record<string, unknown>) => [props.children].flat()
+    .filter((child) => typeof child === 'string').join('');
+  const waiting = (props: Record<string, unknown>) => props.role === 'status'
+    && props.children === 'Waiting for all motion groups to stop…';
+  const motionStopped = (props: Record<string, unknown>) => text(props).includes('Motion is stopped. ');
+  const stopNotConfirmed = (props: Record<string, unknown>) => props.className === 'inline-message severity-error'
+    && props.role === 'alert' && text(props).includes('Motion Stop not confirmed');
+
+  it.each([true, false])('sends the motion Stop at once and then asks only about the Full Stop (motion Stop accepted=%s)', async (accepted) => {
+    const program = runningProgram();
+    // Even with another command pending, Halt is not refused.
+    program.state.pending = 'reset';
+    program.state.controlPending = 'runtime-scale';
+    vi.mocked(program.stopMotion).mockResolvedValue(accepted);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.rerender();
+      expect(program.stopMotion).toHaveBeenCalledTimes(1);
+      expect(program.stopMotion).toHaveBeenCalledWith(['all']);
+      // A refused motion Stop does not end the Halt: the question follows
+      // and says so in the panel's error style.
+      expect(open.mounted(dialogOpen)).toBe(true);
+      expect(open.mounted(stopNotConfirmed)).toBe(!accepted);
+      // Motion is still moving: the dialog says it is waiting, never that it stopped.
+      expect(open.mounted(waiting)).toBe(true);
+      expect(open.mounted(motionStopped)).toBe(false);
+      expect(program.fullStop).not.toHaveBeenCalled();
+      // The confirm button is clickable before all motion has stopped.
+      expect(open.mounted((props) => confirmButton(props) && !props.disabled)).toBe(true);
+      await open.press(confirmButton);
+      expect(program.fullStop).toHaveBeenCalledTimes(1);
+    } finally { await open.unmount(); }
+  });
+
+  it('Cancel leaves the Program held after its motion Stop; a repeated Halt sends another', async () => {
+    const program = runningProgram();
+    vi.mocked(program.stopMotion).mockResolvedValue(true);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.press((props) => props.children === 'Cancel');
+      expect(program.fullStop).not.toHaveBeenCalled();
+      await open.press(haltButton);
+      expect(program.stopMotion).toHaveBeenCalledTimes(2);
+      expect(program.fullStop).not.toHaveBeenCalled();
+    } finally { await open.unmount(); }
+  });
+
+  it('asks at once when all motion is already stopped', async () => {
+    const program = controller('intervention_required');
+    program.state.controls = ordinaryMotionStopControls();
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      expect(program.stopMotion).not.toHaveBeenCalled();
+      expect(open.mounted(dialogOpen)).toBe(true);
+      expect(open.mounted(motionStopped)).toBe(true);
+      expect(open.mounted(waiting)).toBe(false);
+    } finally { await open.unmount(); }
+  });
+
+  it('names the refusal of the motion Stop in the dialog', async () => {
+    const program = runningProgram();
+    program.state.error = 'Owner refused the Stop.';
+    vi.mocked(program.stopMotion).mockResolvedValue(false);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.rerender();
+      expect(open.mounted((props) => stopNotConfirmed(props)
+        && text(props).includes('Owner refused the Stop.'))).toBe(true);
+      expect(open.mounted((props) => confirmButton(props) && !props.disabled)).toBe(true);
+    } finally { await open.unmount(); }
+  });
+
+  it('repeats a Halt while the run is Full stopping, without a motion Stop the owner would refuse', async () => {
+    const program = runningProgram();
+    program.state.run!.state = 'full_stopping';
+    program.state.controls!.executionSelections.groups[0].state = 'stopping';
+    const open = await mountTransport(program);
+    try {
+      expect(open.mounted((props) => haltButton(props) && !props.disabled
+        && props.children === 'Halting')).toBe(true);
+      // Group Stop is not offered: the owner refuses a motion Stop while Full stopping.
+      expect(open.mounted((props) => String(props.className) === 'danger-button transport-group-stop'
+        && props.disabled === true)).toBe(true);
+      await open.press(haltButton);
+      expect(program.stopMotion).not.toHaveBeenCalled();
+      expect(open.mounted(dialogOpen)).toBe(true);
+      await open.press(confirmButton);
+      expect(program.fullStop).toHaveBeenCalledTimes(1);
+    } finally { await open.unmount(); }
+  });
+
+  it('offers Halt but not group Stop while a Program Stop ends the run', async () => {
+    const program = runningProgram();
+    program.state.run!.state = 'stopping';
+    program.cycleState = 'stopping';
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    // The owner refuses a motion Stop here and answers a Full Stop with no effect.
+    expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""/);
+    expect(markup).toMatch(/class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      expect(program.stopMotion).not.toHaveBeenCalled();
+      expect(open.mounted(dialogOpen)).toBe(true);
+      await open.press(confirmButton);
+      expect(program.fullStop).toHaveBeenCalledTimes(1);
+    } finally { await open.unmount(); }
+  });
+
+  it('keeps the unconfirmed Halt as before: motion Stop, then Full Stop once motion has stopped', () => {
+    const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
+    const start = source.indexOf('const requestProgramHalt');
+    const flow = source.slice(start, source.indexOf('const nativeStatus', start));
+    expect(flow).toMatch(/if \(preferences\.confirmHalt\) \{[\s\S]*setHaltIntent\('confirm'\);\s*return;\s*\}\s*if \(!allMotionQuiesced\) \{\s*setHaltIntent\('stopping'\);/);
+    expect(flow).toMatch(/setHaltIntent\('stopping'\);\s*const accepted = await program\.stopMotion\(\['all'\]\);\s*if \(!accepted\) \{\s*setHaltIntent\(null\);\s*return;\s*\}\s*\}\s*setHaltIntent\('automatic'\);/);
+    expect(source).toMatch(/if \(haltIntent !== 'automatic' \|\| !allMotionQuiesced\) return;\s*setHaltIntent\(null\);\s*void program\.fullStop\(\);/);
   });
 });
 

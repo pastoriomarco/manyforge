@@ -258,7 +258,7 @@ export type RobotControlAction =
   | { type: 'approve_rejected'; generation: number; error: string; errorRefusal?: StructuredError | null }
   | { type: 'retry_preview' }
   | { type: 'operation_observed'; operation: OperationObservation }
-  | { type: 'operation_control_failed'; ownerEpoch: string; operationId: string; error: string; errorRefusal?: StructuredError | null }
+  | { type: 'operation_control_failed'; ownerEpoch: string | null; operationId: string; error: string; errorRefusal?: StructuredError | null }
   | { type: 'dismiss_error' }
   | { type: 'revert' }
   | { type: 'clear' };
@@ -1560,7 +1560,7 @@ export function robotControlReducer(
         errorLocal: action.operation.terminalError === null ? state.errorLocal : false,
       };
     case 'operation_control_failed':
-      return state.status?.ownerEpoch === action.ownerEpoch
+      return (state.status?.ownerEpoch ?? null) === action.ownerEpoch
         && state.operation?.operationId === action.operationId
         ? { ...state, error: action.error, errorRefusal: action.errorRefusal ?? null, errorLocal: false }
         : state;

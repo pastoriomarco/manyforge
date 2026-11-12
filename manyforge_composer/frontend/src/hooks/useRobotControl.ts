@@ -463,7 +463,7 @@ export function useRobotControl(
     setAuthoringPending(pendingAuthoringInputs.current.size > 0);
   }, []);
   const pendingOperationControl = useRef<{
-    control: 'stop' | 'reset'; ownerEpoch: string; operationId: string;
+    control: 'stop' | 'reset'; ownerEpoch: string | null; operationId: string;
   } | null>(null);
   const runtimeScaleStatusRef = useRef<RuntimeScaleControlStatus | null>(null);
   const runtimeScaleQueued = useRef<number | null>(null);
@@ -990,7 +990,7 @@ export function useRobotControl(
 
   useEffect(() => {
     const pending = pendingOperationControl.current;
-    if (pending !== null && (pending.ownerEpoch !== state.status?.ownerEpoch
+    if (pending !== null && (pending.ownerEpoch !== (state.status?.ownerEpoch ?? null)
       || pending.operationId !== state.operation?.operationId)) {
       pendingOperationControl.current = null;
       setControlPending(null);
@@ -1010,8 +1010,11 @@ export function useRobotControl(
     kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0],
     payload: Record<string, unknown>,
   ) => {
-    if (state.status === null || state.operation === null) return;
-    const pending = { control, ownerEpoch: state.status.ownerEpoch, operationId: state.operation.operationId };
+    // The owner status is not a Stop prerequisite: an operation to stop is enough.
+    if (state.operation === null) return;
+    const pending = {
+      control, ownerEpoch: state.status?.ownerEpoch ?? null, operationId: state.operation.operationId,
+    };
     pendingOperationControl.current = pending;
     try {
       if (controlSource === null) throw new Error('Control connection is not synchronized.');
@@ -1374,10 +1377,9 @@ export function useRobotControl(
 
   const stop = useCallback(async () => {
     const operation = state.operation;
-    const pending = pendingOperationControl.current;
-    if (state.status === null || operation === null || !robotControlHasActiveOperation(state)
-      || (pending?.control === 'stop' && pending.ownerEpoch === state.status.ownerEpoch
-        && pending.operationId === operation.operationId)) return;
+    // A repeated press sends another Stop; the owner joins it to the running
+    // Stop or answers that it has no effect.
+    if (operation === null || !robotControlHasActiveOperation(state)) return;
     clearRuntimeScaleQueue();
     await sendOperationControl('stop', 'operation_stop', {
       operations: [{

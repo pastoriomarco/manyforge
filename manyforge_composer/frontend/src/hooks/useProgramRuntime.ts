@@ -1128,9 +1128,9 @@ export function useProgramRuntime(
       || groupIds.length === 0
       || !state.run
       || !['running', 'intervention_required'].includes(state.run.state)
-      || !state.runnerAvailable
-      || ['stop', 'full-stop', 'reset']
-        .includes(state.pending ?? '')
+      // A motion Stop needs only a run to stop: nothing in progress holds it back.
+      || ((start || resume) && (!state.runnerAvailable
+        || ['stop', 'full-stop', 'reset'].includes(state.pending ?? '')))
       || ((start || resume) && (state.selectionPending.length > 0 || state.controlPending !== null
         || !controlsMatchRun(controls, state.run)
         || !groupIds.every((id) => controls.executionSelections.groups.some(
@@ -1517,12 +1517,13 @@ export function useProgramRuntime(
   }, []);
 
   const fullStop = useCallback(async () => {
+    // A Full Stop needs only a run to stop: nothing in progress holds it back.
+    // A repeat while the run is Full stopping joins the running Full Stop;
+    // while a Program Stop ends the run the owner answers with no effect.
     if (
       !state.run
-      || !['running', 'intervention_required'].includes(state.run.state)
-      || !state.runnerAvailable
-      || ['stop', 'full-stop', 'reset']
-        .includes(state.pending ?? '')
+      || !['running', 'intervention_required', 'full_stopping', 'stopping']
+        .includes(state.run.state)
     ) return;
     const requestId = identity('program-full-stop');
     if (controlSource === null) return;
@@ -1548,8 +1549,7 @@ export function useProgramRuntime(
     }
   }, [
     beginProgramCommand, controlSource,
-    recordCommandFailure,
-    state.pending, state.run, state.runnerAvailable,
+    recordCommandFailure, state.run,
   ]);
 
   const resumeFullStop = useCallback(async () => {

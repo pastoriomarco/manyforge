@@ -278,6 +278,13 @@ export type ExecutionControlCommandKind =
   | 'execution_recovery'
   | 'runtime_scale';
 
+// Stop kinds are sent whenever the control socket is open: a late heartbeat,
+// a latched transport error or another pending command never holds one back.
+const STOP_COMMANDS = new Set<ExecutionControlCommandKind>([
+  'program_motion_stop', 'program_full_stop', 'program_stop',
+  'operation_stop', 'cell_full_stop',
+]);
+
 const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'operation_start',
   'operation_stop',
@@ -294,6 +301,9 @@ export function executionCommandPayload(
 ): Record<string, unknown> {
   if (!EXECUTION_OWNER_FENCED_COMMANDS.has(commandKind)) return payload;
   if (typeof executionOwnerEpoch !== 'string' || executionOwnerEpoch === '') {
+    // A Stop is never refused locally: without the owner epoch it is sent
+    // unfenced and the owner treats it as an ordinary Stop.
+    if (STOP_COMMANDS.has(commandKind)) return payload;
     throw new Error('Execution owner identity is unavailable.');
   }
   return {
@@ -945,19 +955,18 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const socket = this.socket;
     const sessionId = this.controlSessionId;
     const control = this.executionControl;
-    const stop = [
-      'program_motion_stop', 'program_full_stop', 'program_stop',
-      'operation_stop', 'cell_full_stop',
-    ].includes(commandKind);
+    const stop = STOP_COMMANDS.has(commandKind);
     const runtimeScale = commandKind === 'runtime_scale';
     if (
       socket === null
       || socket.readyState !== WebSocket.OPEN
       || sessionId === null
       || control === null
-      || !this.controlHeartbeatConfirmed
-      || this.controlTransportError !== null
-      || (!stop && !this.controlProjectionIsCurrent())
+      || (!stop && (
+        !this.controlHeartbeatConfirmed
+        || this.controlTransportError !== null
+        || !this.controlProjectionIsCurrent()
+      ))
     ) {
       return Promise.reject(new Error('Control connection is not synchronized.'));
     }
@@ -1077,7 +1086,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           };
         } catch (error: unknown) {
           if (!acknowledged) {
-            this.controlTransportError = 'Command delivery is unconfirmed; commands are disabled.';
+            this.controlTransportError = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
             this.commandDeliveryFaultSessionId = sessionId;
             this.reportClientIncident(
               'command_delivery_unconfirmed', true, 'http_response_unconfirmed', 5_000_000_000,
@@ -1147,7 +1156,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             this.runtimeScaleControlPending = null;
           }
           const error = new CommandDeliveryUnconfirmedError(
-            'Command delivery is unconfirmed; commands are disabled.',
+            'Command delivery is unconfirmed; commands other than Stop are disabled.',
           );
           pending.reject(error);
           this.controlTransportError = error.message;
@@ -2032,14 +2041,14 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       // must not briefly re-enable commands.
       this.lastControlEchoSequence = this.controlClientSequence + 1;
       this.controlTransportStatus = 'delayed';
-      this.controlTransportError = 'Control connection is delayed; commands are disabled.';
+      this.controlTransportError = 'Control connection is delayed; commands other than Stop are disabled.';
       this.refreshControlCondition();
       this.controlHeartbeatTimer = setTimeout(() => {
         if (serial !== this.serial || this.socket !== socket) return;
         this.controlHeartbeatTimer = null;
         this.controlHeartbeatConfirmed = false;
         this.controlTransportStatus = 'stale';
-        this.controlTransportError = 'Control connection is stale; commands are disabled.';
+        this.controlTransportError = 'Control connection is stale; commands other than Stop are disabled.';
         this.refreshControlCondition();
         // Keep the live transport. The server keeps one challenge
         // outstanding and can recover the session without reconnect churn;
@@ -2317,10 +2326,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     let error = this.enabled ? this.controlTransportError : null;
     const semantic = this.semanticCondition();
     if (this.enabled && error === null && semantic.status === 'synchronizing') {
-      error = 'Control state is synchronizing; commands are disabled.';
+      error = 'Control state is synchronizing; commands other than Stop are disabled.';
     } else if (this.enabled && error === null && semantic.status === 'unavailable') {
       error = `Control state is unavailable (${semantic.reason
-        ?? 'owner unavailable'}); commands are disabled.`;
+        ?? 'owner unavailable'}); commands other than Stop are disabled.`;
     }
     if (
       error === this.latestError

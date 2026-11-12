@@ -1100,7 +1100,7 @@ describe('Apply while a run exists', () => {
 
   it('reconciles a lost Reset reply from observation: unknown, no Apply, no resend', async () => {
     transport.sendExecutionCommand.mockRejectedValue(
-      new CommandDeliveryUnconfirmedError('Command delivery is unconfirmed; commands are disabled.'),
+      new CommandDeliveryUnconfirmedError('Command delivery is unconfirmed; commands other than Stop are disabled.'),
     );
     const render = await mount(HELD);
     expect(await confirm()).toBeNull();

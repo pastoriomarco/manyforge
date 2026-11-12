@@ -559,6 +559,31 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.tcpApplying).toBe(false);
   });
 
+  it('sends another operation Stop on a repeated press while the first is pending', async () => {
+    const status = statusFixture();
+    status.manualOperations = [{ programRunId: status.directControl!.programRunId,
+      controllableComponentId: status.directControl!.controllableComponentId,
+      commandTargetId: status.directControl!.commandTargetId,
+      operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing',
+      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null }];
+    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
+    // No receipt arrives: the first Stop stays pending.
+    const send = vi.fn(() => new Promise<never>(() => undefined));
+    const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
+    function StopHarness() {
+      const result = useRobotControl(true, false, false, snapshot, source);
+      useEffect(() => { latest = result; }, [result]);
+      return null;
+    }
+    await act(async () => root.render(createElement(StopHarness)));
+    expect(latest.state.phase).toBe('executing');
+    await act(async () => { void latest.stop(); });
+    expect(latest.controlPending).toBe('stop');
+    await act(async () => { void latest.stop(); });
+    expect(send.mock.calls.map((call) => (call as unknown[])[0])).toEqual(['operation_stop', 'operation_stop']);
+  });
+
   it('submits Set TCP once and keeps the owner value until the result', async () => {
     const status = statusFixture();
     const row = status.directControl!.targetDescriptor.tcps[0];

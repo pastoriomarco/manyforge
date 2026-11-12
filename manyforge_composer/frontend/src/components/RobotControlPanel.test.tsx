@@ -733,6 +733,30 @@ describe('RobotControlPanel layout', () => {
     }
   });
 
+  it('keeps an active operation\'s Stop clickable while the connection is not current', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    const previous = { phase: state.phase, operation: state.operation };
+    try {
+      // No operation: the not-connected panel state, no Stop.
+      const idle = renderToStaticMarkup(<RobotControlPanel enabled={false} />);
+      expect(idle).toContain('Headless execution is not connected.');
+      expect(idle).not.toContain('>Stop operation</button>');
+      Object.assign(state, { phase: 'executing', operation: {
+        operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing', progress: 0,
+        activeStopId: null, activeStopGeneration: null, terminalError: null,
+      } });
+      const moving = renderToStaticMarkup(<RobotControlPanel enabled={false} />);
+      expect(moving).toContain('Headless execution is not connected.');
+      expect(moving).toMatch(/class="stop-button"(?![^>]*disabled)[^>]*>Stop operation<\/button>/);
+      // A pending Stop keeps it clickable: a repeated press sends another.
+      Object.assign(state, { phase: 'stopping' });
+      expect(renderToStaticMarkup(<RobotControlPanel enabled={false} />))
+        .toMatch(/class="stop-button"(?![^>]*disabled)[^>]*>Stop operation<\/button>/);
+    } finally {
+      Object.assign(state, previous);
+    }
+  });
+
   it('keeps the candidate actions outside the bounded editor scroll region', () => {
     const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     const editor = markup.indexOf('data-testid="robot-control-editor-scroll"');

@@ -828,7 +828,9 @@ export function RobotControlPanelView({
         </div>
       )}
 
-      {enabled && status !== null && displayedTarget !== undefined && displayedTarget !== null && (
+      {/* An active operation keeps its panel, and so its Stop, while the
+          connection is not current: Stop is never refused locally. */}
+      {(enabled || canStop) && status !== null && displayedTarget !== undefined && displayedTarget !== null && (
         <>
           {programActive && !controller.manualControlAllowed && !state.operation?.resident && (
             <p className="central-inspector-notice notice severity-info notice-strip" role="status">

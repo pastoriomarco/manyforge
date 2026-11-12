@@ -1535,6 +1535,9 @@ export function ProgramTransportControls({
     };
   }, [robot.controlSource]);
   const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  // The confirmed Halt's motion Stop was refused or failed (the dialog says so).
+  const [haltMotionStopFailed, setHaltMotionStopFailed] = useState(false);
+  const haltRequest = useRef(0);
   // Reset during execution ends the run and restarts the tree, so it is
   // confirmed like Halt: motion stops first, the question comes after.
   const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
@@ -1637,10 +1640,6 @@ export function ProgramTransportControls({
   };
   const motionActive = robotControlHasActiveOperation(robot.state);
   const programMotionRunning = ['running', 'intervention_required'].includes(state.run?.state ?? '');
-  // The command receipt can precede the next owner projection. Treat that
-  // short accepted-Run interval as starting so Stop remains available and
-  // the owner-scoped velocity controls do not flicker off.
-  const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
   const programFullStopped = state.run?.state === 'full_stopped';
   // Execute and Resume follow the backend's RunReadiness. The
@@ -1654,8 +1653,6 @@ export function ProgramTransportControls({
     && program.composerRefusalReason === null
     && program.runnerAllows('program_run')
     && readiness?.can_execute === true;
-  const stopCommandPending = ['stop', 'full-stop', 'reset']
-    .includes(state.pending ?? '');
   const canResumeFullStop = enabled
     && programFullStopped
     && state.pending === null
@@ -1776,18 +1773,13 @@ export function ProgramTransportControls({
       setDetailsOpen(false);
     }
   };
-  const canProgramHalt = enabled
-    && state.runnerAvailable
-    && cycleState === 'running'
-    && ['running', 'intervention_required'].includes(state.run?.state ?? '')
-    && state.controls !== null
-    && allGroup !== undefined
-    && allGroup.state !== 'unavailable'
-    && state.pending === null
-    && state.selectionPending.length === 0
-    && state.controlPending === null
-    && !programFullStopping
-    && program.runnerAllows('program_full_stop');
+  // Halt, like every Stop, is available whenever there is a run to stop:
+  // nothing in progress (starting, another command, an earlier Stop or Halt,
+  // a connection that is not current) holds it back. While the run is Full
+  // stopping the owner joins a repeat; while a Program Stop ends it, the
+  // owner answers that it has no effect.
+  const programRunStopping = state.run?.state === 'stopping';
+  const canProgramHalt = programMotionRunning || programFullStopping || programRunStopping;
 
   useEffect(() => {
     if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
@@ -1870,6 +1862,23 @@ export function ProgramTransportControls({
 
   const requestProgramHalt = async () => {
     if (!canProgramHalt) return;
+    if (preferences.confirmHalt) {
+      // The motion Stop goes out at once, unconfirmed; the question that
+      // follows is only about the Full Stop. A refused motion Stop does not
+      // end the Halt: the question still follows and says so. Cancel leaves
+      // the Program held, ready for Resume. While a Full Stop or Program
+      // Stop runs, it already contains all motion (the owner refuses a motion
+      // Stop then).
+      const request = ++haltRequest.current;
+      setHaltMotionStopFailed(false);
+      if (!allMotionQuiesced && !programFullStopping && !programRunStopping) {
+        void program.stopMotion(['all']).then((accepted) => {
+          if (!accepted && haltRequest.current === request) setHaltMotionStopFailed(true);
+        });
+      }
+      setHaltIntent('confirm');
+      return;
+    }
     if (!allMotionQuiesced) {
       setHaltIntent('stopping');
       const accepted = await program.stopMotion(['all']);
@@ -1878,7 +1887,7 @@ export function ProgramTransportControls({
         return;
       }
     }
-    setHaltIntent(preferences.confirmHalt ? 'confirm' : 'automatic');
+    setHaltIntent('automatic');
   };
   const nativeStatus = robot.currentStatus;
   const {
@@ -2043,18 +2052,12 @@ export function ProgramTransportControls({
             const releasePending = selectionGroupPending(group.groupId, 'start-motion')
               || selectionGroupPending(group.groupId, 'resume-motion');
             const selectionTransitionPending = state.selectionPending.length > 0;
-            const canGroupStop = enabled
-              && state.runnerAvailable
-              && !stopCommandPending
-              && !programStopping
-              && programMotionRunning
-              && group.stopAllowed
-              && !selectionTransitionPending
-              && !stopPending
+            // Stop is available whenever the run has motion to stop; a group
+            // already held, or not yet started, has none. A repeated press
+            // sends another Stop.
+            const canGroupStop = programMotionRunning
               && group.state !== 'held'
-              && group.state !== 'ready'
-              && group.state !== 'stopping'
-              && program.runnerAllows('program_motion_stop');
+              && group.state !== 'ready';
             // A rule hold whose scope meets this group gates its Run/Resume,
             // Retry and Continue (the kernel refuses them with `rule_holds`).
             const ruleHold = ruleHoldMeeting(readiness?.blocked_reasons ?? [],
@@ -2248,7 +2251,7 @@ export function ProgramTransportControls({
             ref={haltButton}
             type="button"
             className="danger-button transport-full-stop transport-unique-control"
-            disabled={!canProgramHalt || haltIntent !== null}
+            disabled={!canProgramHalt}
             title={canProgramHalt
               ? 'Stop all Program motion, then halt Program execution.'
               : 'Halt is available only while a Program is executing.'}
@@ -2647,10 +2650,15 @@ export function ProgramTransportControls({
         returnFocusRef={haltButton}
       >
         <div className="dialog-copy transport-confirmation">
+          {haltMotionStopFailed && (
+            <p className="inline-message severity-error" role="alert">
+              Motion Stop not confirmed{state.error === null ? '.' : `: ${state.error}`}
+            </p>
+          )}
           <p>
-            Motion is stopped. Halt also pauses the Program tree; Execute
-            resumes it later, with motion still stopped until Run or Resume.
-            Choose Cancel if you only meant to stop motion.
+            {allMotionQuiesced ? 'Motion is stopped. ' : ''}Halt also pauses the
+            Program tree; Execute resumes it later, with motion still stopped
+            until Run or Resume. Choose Cancel if you only meant to stop motion.
           </p>
           {!allMotionQuiesced && (
             <p role="status">Waiting for all motion groups to stop…</p>
@@ -2660,7 +2668,6 @@ export function ProgramTransportControls({
             <button
               type="button"
               className="danger-button"
-              disabled={!allMotionQuiesced}
               onClick={() => {
                 setHaltIntent(null);
                 void program.fullStop();
