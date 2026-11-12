@@ -7141,3 +7141,32 @@ def test_motion_planner_override_carries_only_its_set_members() -> None:
 
     assert _planner_override({"search": "rrt", "n": None}) == {"search": "rrt"}
     assert _planner_override({}) == {}
+
+
+def test_a_stop_for_a_run_the_port_never_bound_leaves_no_stop_entry() -> None:
+    """The runner forwards a Stop for an unknown run id to the Kernel (a Full
+    Stop). Nothing will ever settle it, so the port keeps no entry for it,
+    whereas a bound run keeps its Stop until settlement."""
+
+    class _UnknownRunTransport(_Transport):
+        def stop_program_run(self, body: Mapping[str, Any]):
+            reply = super().stop_program_run(body)
+            if body["program_run_id"] != "program-run.1":
+                reply["accepted"]["resolution_reason"] = "unknown_program_run"
+            return reply
+
+    transport = _UnknownRunTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    for index in range(3):
+        snapshot = port.scope.request_stop(
+            f"program-run.never-seen-{index}", f"stop.unknown-{index}", "stale id"
+        )
+        assert snapshot.state is ProgramRunScopeState.ACTIVE
+    assert [control[1] for control in transport.controls] == [
+        f"program-run.never-seen-{index}" for index in range(3)
+    ]
+    assert not port._scope_stops  # noqa: SLF001
+
+    port.scope.request_stop("program-run.1", "stop.bound", "operator Stop")
+    assert set(port._scope_stops) == {"program-run.1"}  # noqa: SLF001

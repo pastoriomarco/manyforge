@@ -1521,20 +1521,14 @@ class ProgramRunOwner:
         with motion_stop_lock:
             with self._lock:
                 entry = self._entry(program_run_id)
-                if entry.state in {
-                    ProgramRunState.STOPPING,
-                    ProgramRunState.FULL_STOPPING,
-                }:
-                    # A Stop or Full Stop already contains this run: like a
-                    # Full Stop here, a motion Stop has no effect.
-                    return self._snapshot(entry)
                 if entry.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }:
-                    raise ProgramRunOwnerError(
-                        "motion Stop requires a current running Program"
-                    )
+                    # A Stop or Full Stop already contains this run, it is
+                    # halted, or it has ended: like a Full Stop here, a
+                    # motion Stop has no effect.
+                    return self._snapshot(entry)
                 run = entry.run
             stop_identity = stop_request_id or f"owner-motion-stop:{uuid4().hex}"
             try:
@@ -1545,6 +1539,8 @@ class ProgramRunOwner:
                 raise ProgramRunOwnerOutcomeUnknownError(
                     str(exc) or "Kernel motion Stop outcome is unknown"
                 ) from exc
+            # The Kernel accepted the Stop: from here the reply is the run's
+            # current state, never an error.
             with self._lock:
                 # Publish the accepted holds and their Run revision together.
                 # This short local lock never waits for tree work or owner I/O.
@@ -1552,34 +1548,27 @@ class ProgramRunOwner:
                     run.publish_operator_stop_scope(
                         accepted["state"], notify_observation=False
                     )
-                except Exception as exc:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        str(exc) or "Kernel motion Stop projection is unknown"
-                    ) from exc
+                except Exception:
+                    return self._snapshot(self._entry(program_run_id))
                 entry = self._entry(program_run_id)
                 if entry.run is not run or entry.state not in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Program state changed while motion Stop was applied"
-                    )
+                    # The run changed while the Stop was applied.
+                    return self._snapshot(entry)
                 entry.active_operation_count = None
                 entry.revision += 1
                 held = self._note_mock_held(entry)
                 held_revision, held_paused = entry.revision, self._mock_paused(entry)
-                selection_error = accepted.get("selection_error")
                 snapshot = self._snapshot(entry)
             if held is not None:
                 # The new mask under this command's revision.
                 self._notify_mock_run_paused(
                     program_run_id, held_revision, held_paused, held
                 )
-            if selection_error is not None:
-                raise ProgramRunOwnerOutcomeUnknownError(
-                    "Kernel conservatively contained an invalid selection: "
-                    + str(selection_error)
-                )
+            # A Kernel selection error means it contained more than the
+            # selection (a Full Stop); the state stream shows it.
             # The existing tick host schedules settlement. No tree/owner
             # read may extend this command or retain Stop serialization.
             return snapshot

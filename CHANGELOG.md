@@ -11,6 +11,31 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **The Program runner never refuses a Stop.** A Program Stop, motion Stop
+  or Full Stop is forwarded to the owner and the execution Kernel, which
+  applies its own rules, or answered with no effect:
+  - The runner's in-flight Stop table is removed. A repeated or concurrent
+    Stop with the same request id reaches the Kernel again, which replays an
+    exact repeat and promotes a changed one to a Full Stop
+    (`request_identity_conflict`). `execution_control_ingress_busy` is no
+    longer answered to a Stop.
+  - A Stop for a run that ended in this application start answers that run
+    unchanged. A motion Stop on a halted (`full_stopped`), stopped,
+    succeeded, failed or finalizing run has no effect instead of
+    `program_motion_stop_invalid`.
+  - A Stop for a run id the runner has never seen is forwarded to the
+    Kernel, which treats an unknown run as a Full Stop; the reply keeps its
+    code (`program_run_not_found`, `program_motion_stop_invalid` or
+    `program_full_stop_invalid`) and says the Stop was forwarded. The
+    behaviour port keeps no Stop entry for such a run.
+  - Errors after the Kernel accepted a Stop answer the run's current state:
+    a run that changed while a motion Stop was applied, a Kernel selection
+    error, a failed hold projection, a failed scheduling of the stopping run,
+    and a reply from another runner incarnation than the caller expected.
+    "Outcome unknown" remains only when the Kernel call itself failed.
+  - A Program Stop, motion Stop or Full Stop whose path and body name
+    different runs is a Full Stop through the recognized-malformed Stop call
+    instead of `program_run_path_invalid`.
 - **Composer keeps its control connection open instead of closing it on a
   fault, so Stop keeps working.** Each case is recorded so its cause can be
   found:

@@ -6139,3 +6139,60 @@ def test_headless_client_conditional_reads_return_none_on_304() -> None:
     )
     # Plain reads are unchanged.
     assert client.assistant_mode("composer-assistant") == reads["mode"]
+
+
+def test_program_stop_naming_two_runs_is_a_full_stop() -> None:
+    """A Program Stop whose path and body name different runs is invalid, so
+    it is a Full Stop through the recognized-malformed Stop call."""
+    execution = FakeExecution()
+    runner = FakeProgramRunner()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution, program_runner=runner))
+    body = {
+        **_caller(),
+        "request_id": "request.mismatch",
+        "program_run_id": "program-run.other",
+        "expected_owner_epoch": "program-runner.epoch.1",
+        "reason": "operator stop",
+    }
+    with TestClient(app) as client:
+        replies = [
+            client.post(
+                f"/api/program/runs/program-run.1/{route}",
+                json=body,
+                headers={"x-request-id": f"program.mismatch.{index}"},
+            )
+            for index, route in enumerate(("stop", "motion-stop", "full-stop"))
+        ]
+    assert [reply.status_code for reply in replies] == [200, 200, 200], [r.text for r in replies]
+    assert [request for request in execution.requests if request[0] == "recognized_malformed_stop"] == [
+        ("recognized_malformed_stop", {
+            "request_id": f"malformed-stop.program.mismatch.{index}",
+            "recognized_route": route,
+            "reason": "recognized_stop_payload_invalid",
+        })
+        for index, route in enumerate(
+            ("/api/execution/stops", "/api/execution/stops", "/api/execution/full-stop")
+        )
+    ]
+    assert [call[0] for call in runner.calls] == []
+
+
+def test_a_program_stop_reply_from_another_owner_incarnation_is_the_reply() -> None:
+    """The Stop is applied: a run snapshot from another runner incarnation
+    than the caller expected is returned as received, not refused."""
+    runner = FakeProgramRunner()
+    app = create_app(service=_service(FakeCore(), FakeManager(), program_runner=runner))
+    with TestClient(app) as client:
+        reply = client.post(
+            "/api/program/runs/program-run.1/full-stop",
+            json={
+                **_caller(),
+                "request_id": "request.full-stop.stale-epoch",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.0",
+                "reason": "operator Full Stop",
+            },
+        )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["state"] == "full_stopping"
+    assert reply.json()["owner_epoch"] == "program-runner.epoch.1"

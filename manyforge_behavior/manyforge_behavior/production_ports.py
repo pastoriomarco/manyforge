@@ -3810,6 +3810,9 @@ class NativeKernelProgramPort:
         # "already stopped" shortcut could let an older Resume erase a newer
         # Stop. Exact retry/no-effect semantics already belong to the Kernel.
         retained_count = len(tasks) + len(local_tasks)
+        # Whether this port holds anything of the run: a run it never bound
+        # leaves no Stop entry behind (see the acceptance below).
+        port_knows_run = existing_stop is not None or retained_count > 0
         # A zero local task count does not prove that the run is idle: its first
         # operation may be crossing the native Execute boundary. Always hand
         # the semantic Program Stop to the Kernel, whose current-run and
@@ -3822,6 +3825,7 @@ class NativeKernelProgramPort:
             try:
                 context = self._context(program_run_id)
                 request_owner_epoch = context.request_owner_epoch
+                port_knows_run = True
             except ProductionPortError:
                 # Starting may precede tree binding. The Kernel can fence the
                 # claimed run without any local task or operation existing.
@@ -3878,9 +3882,17 @@ class NativeKernelProgramPort:
             stop_generation = accepted.get("stop_generation")
             if type(stop_generation) is not int or stop_generation < 1:
                 raise ProductionPortError("Program-run Stop generation is invalid")
+            # A run this port never bound, which the Kernel does not know (a
+            # Full Stop) or has already contained: no settlement will ever
+            # retire a Stop entry for it, so none is kept.
+            unbound = not port_knows_run and accepted.get("resolution_reason") in {
+                "unknown_program_run",
+                "known_terminal_or_idle_no_effect",
+            }
             with self._lock:
                 if (
-                    self._scope_stops.get(program_run_id) is stop
+                    not unbound
+                    and self._scope_stops.get(program_run_id) is stop
                     and stop.owner_epoch == request_owner_epoch
                     and stop_generation > stop.generation
                 ):

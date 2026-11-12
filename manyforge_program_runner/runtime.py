@@ -340,14 +340,6 @@ class ProgramRunnerConfig:
             raise ValueError("persistent-key register must be a stable absolute path")
 
 
-@dataclass(slots=True)
-class _InflightStop:
-    intent: dict[str, Any]
-    settled: Event
-    result: dict[str, Any] | None = None
-    error: ProgramRunnerError | None = None
-
-
 class _SelectedSimulationContextPort:
     """Bind the configured simulator only for this captured Program's dependency."""
 
@@ -672,11 +664,6 @@ class ProgramRuntime:
         # Serialize ordinary Start/Reset lifecycle admission and journal writes.
         # Stop never takes this lock.
         self._transition_lock = RLock()
-        # Stop correlation is deliberately independent of the ordinary durable
-        # request ledger and lifecycle mutex. Full/unavailable ordinary state
-        # can therefore never reject recognized containment.
-        self._inflight_stops_lock = RLock()
-        self._inflight_stops: dict[tuple[str, str, str], _InflightStop] = {}
         self._started = False
         self._closed = False
 
@@ -6359,41 +6346,10 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        intent = request.model_dump(mode="json")
-        key = ("execution", request.request_owner_epoch, request.request_id)
-        retained: _InflightStop | None = None
-        owns_record = False
-        with self._inflight_stops_lock:
-            resident = self._inflight_stops.get(key)
-            if resident is not None and resident.intent == intent:
-                retained = resident
-            elif resident is None and len(self._inflight_stops) < (
-                self.config.maximum_inflight_commands
-            ):
-                retained = _InflightStop(intent, Event())
-                self._inflight_stops[key] = retained
-                owns_record = True
-
-        if retained is None:
-            raise ProgramRunnerError(
-                "execution_control_ingress_busy",
-                "Program Stop in-flight command bound is full or identity conflicts",
-            )
-
-        if retained is not None and not owns_record:
-            retained.settled.wait()
-            if retained.result is not None:
-                return deepcopy(retained.result)
-            if retained.error is not None:
-                raise ProgramRunnerError(
-                    retained.error.code, str(retained.error),
-                    producer=retained.error.producer,
-                )
-            raise ProgramRunnerError(
-                "program_cycle_reconciliation_required",
-                "resident Stop outcome is unavailable",
-            )
-
+        # A repeated or concurrent Stop with the same request goes to the
+        # owner and the Kernel again: the Kernel replays an exact repeat and
+        # promotes a changed one to a Full Stop.
+        stop_request_id = f"execution:{request.request_owner_epoch}:{request.request_id}"
         stopping_committed = False
         stop_sent = False
 
@@ -6413,7 +6369,8 @@ class ProgramRuntime:
                 cycle.owner_epoch != self.owner_epoch
                 or cycle.program_run_id != program_run_id
             ):
-                raise ProgramRunnerError(
+                return self._stop_outside_current_run(
+                    program_run_id, stop_request_id, request.reason,
                     "program_run_not_found",
                     "Program Stop does not identify the current Program cycle",
                 )
@@ -6439,9 +6396,9 @@ class ProgramRuntime:
                     "execution_control_revision": (cycle.execution_control_revision),
                 }
             elif not (state_before == "running" or recovery_stop):
-                raise ProgramRunnerError(
-                    "program_run_not_found",
-                    "Program cycle is already Idle",
+                return self._stop_outside_current_run(
+                    program_run_id, stop_request_id, request.reason,
+                    "program_run_not_found", "Program cycle is already Idle",
                 )
 
             if state_before == "starting":
@@ -6478,9 +6435,28 @@ class ProgramRuntime:
                 )
                 result = self._project_run(snapshot.to_dict())
         except ProgramRunOwnerError as error:
+            if stop_sent:
+                # The owner no longer holds this run: the Kernel applies its
+                # own rule to the Stop.
+                try:
+                    self._native.scope.request_stop(
+                        program_run_id, stop_request_id, request.reason
+                    )
+                except Exception:
+                    _LOGGER.warning("Program Stop forwarding failed", exc_info=True)
             outcome = ProgramRunnerError("program_run_not_found", str(error))
         except ProgramSchedulingError as error:
-            outcome = self._runner_error(error)
+            if not stop_sent:
+                outcome = self._runner_error(error)
+            else:
+                # The owner accepted the Stop; only scheduling failed. The
+                # reply is the run's current state.
+                try:
+                    result = self._project_run(self._host.read(program_run_id).to_dict())
+                except Exception:
+                    outcome = self._runner_error(error)
+                else:
+                    return self._stop_run_sent(result, record_stopping, journal)
         except ProgramRunnerError as error:
             outcome = error
         except Exception as error:
@@ -6490,27 +6466,7 @@ class ProgramRuntime:
             )
         else:
             if stop_sent:
-                # Journal projection is subordinate to recognized
-                # containment. It must neither gate the owner call nor turn
-                # success into failure.
-                try:
-                    record_stopping()
-                except Exception:
-                    _LOGGER.warning(
-                        "Program Stop was sent; its stopping record failed",
-                        exc_info=True,
-                    )
-                try:
-                    journal.retain_run_snapshot(result)
-                    if result.get("state") in {"stopped", "succeeded", "failed"}:
-                        self._record_terminal_snapshot(result)
-                except Exception:
-                    pass
-            if retained is not None:
-                retained.result = deepcopy(result)
-                retained.settled.set()
-                with self._inflight_stops_lock:
-                    self._inflight_stops.pop(key, None)
+                return self._stop_run_sent(result, record_stopping, journal)
             return result
 
         if stop_sent:
@@ -6533,12 +6489,32 @@ class ProgramRuntime:
                 str(outcome),
                 details={"cause_code": outcome.code},
             )
-        if retained is not None:
-            retained.error = outcome
-            retained.settled.set()
-            with self._inflight_stops_lock:
-                self._inflight_stops.pop(key, None)
         raise outcome
+
+    def _stop_run_sent(
+        self,
+        result: dict[str, Any],
+        record_stopping: Callable[[], None],
+        journal: Any,
+    ) -> dict[str, Any]:
+        """Record a Program Stop the owner accepted; the reply stays its state."""
+
+        # Journal projection is subordinate to recognized containment. It must
+        # neither gate the owner call nor turn success into failure.
+        try:
+            record_stopping()
+        except Exception:
+            _LOGGER.warning(
+                "Program Stop was sent; its stopping record failed",
+                exc_info=True,
+            )
+        try:
+            journal.retain_run_snapshot(result)
+            if result.get("state") in {"stopped", "succeeded", "failed"}:
+                self._record_terminal_snapshot(result)
+        except Exception:
+            pass
+        return result
 
     def stop_motion(
         self,
@@ -6559,40 +6535,10 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        intent = request.model_dump(mode="json")
-        key = ("motion", request.request_owner_epoch, request.request_id)
-        retained: _InflightStop | None = None
-        owns_record = False
-        with self._inflight_stops_lock:
-            resident = self._inflight_stops.get(key)
-            if resident is not None and resident.intent == intent:
-                retained = resident
-            elif len(self._inflight_stops) < self.config.maximum_inflight_commands:
-                retained = _InflightStop(intent, Event())
-                self._inflight_stops[key] = retained
-                owns_record = True
-
-        if retained is None:
-            raise ProgramRunnerError(
-                "execution_control_ingress_busy",
-                "Program motion Stop in-flight command bound is full or identity conflicts",
-            )
-
-        if retained is not None and not owns_record:
-            retained.settled.wait()
-            if retained.result is not None:
-                return deepcopy(retained.result)
-            if retained.error is not None:
-                raise ProgramRunnerError(
-                    retained.error.code,
-                    str(retained.error),
-                    producer=retained.error.producer,
-                )
-            raise ProgramRunnerError(
-                "program_motion_stop_outcome_unknown",
-                "resident motion Stop outcome is unavailable",
-            )
-
+        # A repeated or concurrent Stop with the same request goes to the
+        # owner and the Kernel again: the Kernel replays an exact repeat and
+        # promotes a changed one to a Full Stop.
+        stop_request_id = f"motion:{request.request_owner_epoch}:{request.request_id}"
         try:
             # The resident Run supplies the immutable claim. The Kernel
             # validates and holds its selection before any journal/projection
@@ -6612,12 +6558,14 @@ class ProgramRuntime:
                 str(error),
             )
         except ProgramRunOwnerError as error:
-            outcome = ProgramRunnerError(
-                "program_motion_stop_invalid",
-                str(error),
+            # The owner holds no such run.
+            return self._stop_outside_current_run(
+                program_run_id, stop_request_id, request.reason,
+                "program_motion_stop_invalid", str(error),
             )
         except ProgramSchedulingError as error:
-            outcome = self._runner_error(error)
+            # The owner accepted the Stop; only scheduling failed.
+            return self._current_run_state(program_run_id, error)
         except ProgramRunnerError as error:
             outcome = error
         except Exception as error:
@@ -6626,18 +6574,7 @@ class ProgramRuntime:
                 str(error) or type(error).__name__,
             )
         else:
-            if retained is not None:
-                retained.result = deepcopy(result)
-                retained.settled.set()
-                with self._inflight_stops_lock:
-                    self._inflight_stops.pop(key, None)
             return result
-
-        if retained is not None:
-            retained.error = outcome
-            retained.settled.set()
-            with self._inflight_stops_lock:
-                self._inflight_stops.pop(key, None)
         raise outcome
 
     def resume_motion(
@@ -6781,42 +6718,11 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        intent = request.model_dump(mode="json")
-        key = ("full", request.request_owner_epoch, request.request_id)
-        retained: _InflightStop | None = None
-        owns_record = False
-        with self._inflight_stops_lock:
-            resident = self._inflight_stops.get(key)
-            if resident is not None and resident.intent == intent:
-                retained = resident
-            elif resident is None and len(self._inflight_stops) < (
-                self.config.maximum_inflight_commands
-            ):
-                retained = _InflightStop(intent, Event())
-                self._inflight_stops[key] = retained
-                owns_record = True
-
-        if retained is None:
-            raise ProgramRunnerError(
-                "execution_control_ingress_busy",
-                "Program Full Stop in-flight command bound is full or identity conflicts",
-            )
-
-        if retained is not None and not owns_record:
-            retained.settled.wait()
-            if retained.result is not None:
-                return deepcopy(retained.result)
-            if retained.error is not None:
-                raise ProgramRunnerError(
-                    retained.error.code,
-                    str(retained.error),
-                    producer=retained.error.producer,
-                )
-            raise ProgramRunnerError(
-                "program_full_stop_outcome_unknown",
-                "resident Full Stop outcome is unavailable",
-            )
-
+        # A repeated or concurrent Stop with the same request goes to the
+        # owner and the Kernel again: the Kernel replays an exact repeat and
+        # promotes a changed one to a Full Stop.
+        stop_request_id = f"full:{request.request_owner_epoch}:{request.request_id}"
+        outcome: ProgramRunnerError | None = None
         try:
             snapshot = self._host.full_stop(
                 program_run_id,
@@ -6832,12 +6738,14 @@ class ProgramRuntime:
                 str(error),
             )
         except ProgramRunOwnerError as error:
-            outcome = ProgramRunnerError(
-                "program_full_stop_invalid",
-                str(error),
+            # The owner holds no such run.
+            return self._stop_outside_current_run(
+                program_run_id, stop_request_id, request.reason,
+                "program_full_stop_invalid", str(error),
             )
         except ProgramSchedulingError as error:
-            outcome = self._runner_error(error)
+            # The owner accepted the Full Stop; only scheduling failed.
+            result = self._current_run_state(program_run_id, error)
         except ProgramRunnerError as error:
             outcome = error
         except Exception as error:
@@ -6845,25 +6753,68 @@ class ProgramRuntime:
                 "program_full_stop_outcome_unknown",
                 str(error) or type(error).__name__,
             )
-        else:
-            try:
-                _admission, journal = self._require_cycle_owner()
-                journal.retain_run_snapshot(result)
-            except Exception:
-                pass
-            if retained is not None:
-                retained.result = deepcopy(result)
-                retained.settled.set()
-                with self._inflight_stops_lock:
-                    self._inflight_stops.pop(key, None)
-            return result
+        if outcome is not None:
+            raise outcome
+        try:
+            _admission, journal = self._require_cycle_owner()
+            journal.retain_run_snapshot(result)
+        except Exception:
+            pass
+        return result
 
-        if retained is not None:
-            retained.error = outcome
-            retained.settled.set()
-            with self._inflight_stops_lock:
-                self._inflight_stops.pop(key, None)
-        raise outcome
+    def _current_run_state(
+        self, program_run_id: str, cause: ProgramSchedulingError
+    ) -> dict[str, Any]:
+        """The current state of a run whose owner accepted a Stop."""
+
+        try:
+            return self._project_run(self._host.read(program_run_id).to_dict())
+        except Exception:
+            raise self._runner_error(cause) from cause
+
+    def _stop_outside_current_run(
+        self,
+        program_run_id: str,
+        stop_request_id: str,
+        reason: str | None,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """A Stop for a run that is not this runner's current run.
+
+        A run that ended in this application start answers its retained state:
+        the Stop has no effect. Any other id goes to the Kernel, which applies
+        its own rule (an unknown run is a Full Stop).
+        """
+
+        ended = self._ended_run_state(program_run_id)
+        if ended is not None:
+            return ended
+        self._native.scope.request_stop(program_run_id, stop_request_id, reason)
+        raise ProgramRunnerError(
+            code, f"{message}; the Stop was forwarded to the execution Kernel"
+        )
+
+    def _ended_run_state(self, program_run_id: str) -> dict[str, Any] | None:
+        """The retained state of a run that ended in this application start."""
+
+        ended = {"stopped", "succeeded", "failed"}
+        try:
+            snapshot = self._host.read(program_run_id).to_dict()
+        except Exception:
+            snapshot = None
+        if snapshot is None and self._journal is not None:
+            try:
+                snapshot = self._journal.read_run_snapshot(program_run_id)
+            except Exception:
+                snapshot = None
+        if (
+            snapshot is None
+            or snapshot.get("owner_epoch") != self.owner_epoch
+            or snapshot.get("state") not in ended
+        ):
+            return None
+        return self._project_run(snapshot)
 
     def resume_full_stop(
         self,

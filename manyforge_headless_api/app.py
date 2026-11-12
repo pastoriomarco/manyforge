@@ -857,6 +857,45 @@ def create_app(
             },
         )
 
+    async def recognized_malformed_stop(
+        request: Request,
+        recognized_route: str,
+    ) -> Response:
+        """An invalid Stop request is a Full Stop, recognized on its route."""
+
+        reason = getattr(
+            request.state,
+            "recognized_stop_malformed_reason",
+            "recognized_stop_payload_invalid",
+        )
+        adapter_request_id = "malformed-stop." + getattr(
+            request.state, "request_id", uuid.uuid4().hex[:16]
+        )
+        attribution = _trusted_attribution(
+            request,
+            trusted_principal_adapter,
+        )
+        try:
+            response = execution_response(
+                await control_call(
+                    lambda: service.execution_recognized_malformed_stop(
+                        request_id=adapter_request_id,
+                        recognized_route=recognized_route,
+                        reason=reason,
+                        attribution=attribution,
+                    ),
+                    stop=True,
+                )
+            )
+        except HeadlessApiError as execution_error:
+            response = await headless_error_handler(
+                request,
+                execution_error,
+            )
+        if getattr(request.state, "recognized_stop_close_connection", False):
+            response.headers["Connection"] = "close"
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def request_validation_handler(
         request: Request,
@@ -869,38 +908,7 @@ def create_app(
             else _PROGRAM_STOP_ROUTES.get(route)
         )
         if request.method == "POST" and recognized_route is not None:
-            reason = getattr(
-                request.state,
-                "recognized_stop_malformed_reason",
-                "recognized_stop_payload_invalid",
-            )
-            adapter_request_id = "malformed-stop." + getattr(
-                request.state, "request_id", uuid.uuid4().hex[:16]
-            )
-            attribution = _trusted_attribution(
-                request,
-                trusted_principal_adapter,
-            )
-            try:
-                response = execution_response(
-                    await control_call(
-                        lambda: service.execution_recognized_malformed_stop(
-                            request_id=adapter_request_id,
-                            recognized_route=recognized_route,
-                            reason=reason,
-                            attribution=attribution,
-                        ),
-                        stop=True,
-                    )
-                )
-            except HeadlessApiError as execution_error:
-                response = await headless_error_handler(
-                    request,
-                    execution_error,
-                )
-            if getattr(request.state, "recognized_stop_close_connection", False):
-                response.headers["Connection"] = "close"
-            return response
+            return await recognized_malformed_stop(request, recognized_route)
         return JSONResponse(
             status_code=422,
             content={
@@ -1118,9 +1126,9 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
-            raise HeadlessApiError(
-                "program_run_path_invalid",
-                "Program-run identity in the path and request body must match",
+            # Path and body name different runs: an invalid Stop, so a Full Stop.
+            return await recognized_malformed_stop(  # type: ignore[return-value]
+                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/stop"]
             )
         return await rest_execution_command(
             command_kind="program_stop",
@@ -1136,9 +1144,9 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
-            raise HeadlessApiError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
+            # Path and body name different runs: an invalid Stop, so a Full Stop.
+            return await recognized_malformed_stop(  # type: ignore[return-value]
+                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/motion-stop"]
             )
         return await rest_execution_command(
             command_kind="program_motion_stop",
@@ -1209,9 +1217,9 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
-            raise HeadlessApiError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
+            # Path and body name different runs: an invalid Stop, so a Full Stop.
+            return await recognized_malformed_stop(  # type: ignore[return-value]
+                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/full-stop"]
             )
         return await rest_execution_command(
             command_kind="program_full_stop",

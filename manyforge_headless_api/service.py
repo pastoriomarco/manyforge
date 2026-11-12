@@ -2603,7 +2603,9 @@ class HeadlessService:
         return self._validate_program_run_snapshot(
             projection,
             expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
+            # The Stop is applied: the reply is the run as received, even
+            # from another owner incarnation than the caller expected.
+            expected_owner_epoch=None,
         )
 
     def program_run_motion_stop(
@@ -2621,7 +2623,9 @@ class HeadlessService:
         return self._validate_program_run_snapshot(
             projection,
             expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
+            # The Stop is applied: the reply is the run as received, even
+            # from another owner incarnation than the caller expected.
+            expected_owner_epoch=None,
         )
 
     def program_run_motion_resume(
@@ -2692,7 +2696,9 @@ class HeadlessService:
         return self._validate_program_run_snapshot(
             projection,
             expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
+            # The Stop is applied: the reply is the run as received, even
+            # from another owner incarnation than the caller expected.
+            expected_owner_epoch=None,
         )
 
     def program_run_resume_full_stop(

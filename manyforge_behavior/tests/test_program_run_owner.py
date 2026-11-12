@@ -3107,8 +3107,10 @@ def test_late_stop_reply_preserves_a_completed_run_projection():
         return accepted
 
     scope.stop_selection = complete_before_reply
-    with pytest.raises(ProgramRunOwnerOutcomeUnknownError, match="state changed"):
-        owner.stop_motion(run_id)
+    # The Kernel accepted the Stop; the run ended meanwhile: the reply is its
+    # current state, not an error.
+    replied = owner.stop_motion(run_id)
+    assert replied == terminal[0]
     assert terminal[0].state is ProgramRunState.SUCCEEDED
     assert terminal[0].active_operation_count == 0
     assert owner.read(run_id) == terminal[0]
@@ -6025,9 +6027,66 @@ def test_motion_stop_has_no_effect_while_a_stop_or_full_stop_contains_the_run():
     assert repeated.run_revision == halting.run_revision
     assert scope.last_selection_stop is None
 
-    # A finished Full Stop is not stopping: the motion Stop keeps its refusal.
-    assert owner.reconcile_full_stop(run_id).state is ProgramRunState.FULL_STOPPED
-    with pytest.raises(ProgramRunOwnerError, match="current running Program"):
+    # A halted run (Full Stop finished) is contained: no effect either.
+    halted = owner.reconcile_full_stop(run_id)
+    assert halted.state is ProgramRunState.FULL_STOPPED
+    scope.last_selection_stop = None
+    assert owner.stop_motion(run_id) == halted
+    assert scope.last_selection_stop is None
+
+
+def test_motion_stop_on_an_ended_run_has_no_effect():
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    ended = owner.stop(run_id)
+    assert ended.state is ProgramRunState.STOPPED
+    scope.last_selection_stop = None
+    assert owner.stop_motion(run_id) == ended
+    assert scope.last_selection_stop is None
+
+
+def test_motion_stop_answers_the_current_run_after_the_kernel_accepted_it():
+    """A Kernel selection error (it contained more: a Full Stop) or a failed
+    hold projection after acceptance answers the run, not an error."""
+    for failure in ("selection_error", "projection"):
+        owner, admission, task, scope, events = _fixture(
+            initial_task_state=OwnerTaskState.ACTIVE
+        )
+        run_id = owner.start(admission).capture.program_run_id
+        owner.advance_once(run_id)
+        stop = scope.stop_selection
+
+        def accepted_with_failure(request, stop=stop, failure=failure):
+            accepted = dict(stop(request))
+            if failure == "selection_error":
+                accepted["selection_error"] = {
+                    "code": "request_id_conflict",
+                    "message": "Program Stop identity was reused with a different selection",
+                }
+            else:
+                accepted["state"] = None
+            return accepted
+
+        scope.stop_selection = accepted_with_failure
+        replied = owner.stop_motion(run_id)
+        assert replied.state is ProgramRunState.RUNNING, failure
+        assert replied == owner.read(run_id), failure
+
+    # Only a failed Kernel call itself leaves the outcome unknown.
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+
+    def unreachable(request):
+        raise TimeoutError("Kernel did not answer")
+
+    scope.stop_selection = unreachable
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
         owner.stop_motion(run_id)
 
 
