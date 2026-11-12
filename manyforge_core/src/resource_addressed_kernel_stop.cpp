@@ -523,6 +523,17 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     const auto computed = ordinary != nullptr ? ComputeNormalizedStopIntentDigest(*ordinary)
                                               : ComputeNormalizedStopIntentDigest(*full);
     if (!computed.ok()) {
+      // A parsed Stop with an invalid field is promoted to a Full Stop, the
+      // same way as a Stop body the transport could not parse. Only a request
+      // identity that cannot name the Stop is still refused.
+      const MalformedStopIngressDTO invalid{
+          context.request_id, config_.request_owner_epoch, attribution,
+          ordinary != nullptr ? "/api/execution/stops" : "/api/execution/full-stop",
+          "recognized_stop_payload_invalid"};
+      if (!malformed_stop_ingress_field_error(invalid).has_value()) {
+        return accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                  accepted_at_ns, nullptr, &invalid);
+      }
       return Result<StopAcceptedDTO>::Err(computed.error());
     }
     normalized_digest = computed.value();

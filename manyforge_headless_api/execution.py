@@ -2161,7 +2161,8 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "full_stop"
             or not isinstance(accepted, dict)
-            or accepted.get("resolution_reason") != "explicit_full_stop"
+            or accepted.get("resolution_reason")
+            not in {"explicit_full_stop", "malformed_ordinary_intent"}
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",

@@ -751,6 +751,23 @@ def test_execution_client_projects_scoped_and_full_stop_commands(
     assert control_commands[0]["request"]["request_context"] == context
     assert control_commands[2]["command"] == "malformed_stop"
 
+    # A Full Stop with an invalid field is still a Full Stop; the reply says
+    # it was promoted because the request was malformed.
+    def promoted_exchange(command: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.execution_command_response.v4",
+            "accepted": {
+                "request_id": context["request_id"],
+                "resolution_disposition": "promoted_to_full",
+                "resolution_reason": "malformed_ordinary_intent",
+            },
+            "command": "full_stop",
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange_control", promoted_exchange)
+    promoted = client.full_stop(full, trusted_principal_id=None)
+    assert promoted["accepted"]["resolution_disposition"] == "promoted_to_full"
 
 
 def _direct_motion_request() -> OperationIntentRequest:

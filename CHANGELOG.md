@@ -45,6 +45,18 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **A Stop with an invalid field stops the whole cell instead of nothing.** A
+  Stop or Full Stop request that was read correctly but had an invalid field
+  (targets unsorted or repeated, an empty, oversized or NUL-containing id or
+  label, an out-of-range expected revision or generation) was refused with
+  `normalized_stop_intent_invalid` or `normalized_full_stop_intent_invalid`,
+  and nothing was stopped. It is now accepted as a Full Stop, the same way
+  as a Stop body the API cannot parse: the reply carries
+  `resolution_disposition: promoted_to_full` and `resolution_reason:
+  malformed_ordinary_intent`, and repeating the same request while that Stop
+  runs returns its exact replay. A request id that cannot name a Stop (empty,
+  over 128 bytes, or with characters other than letters, digits and `_.:-`)
+  is still refused.
 - **The assistant can be enabled again.** The ROS overlay's installed scripts
   ran under the image's system Python instead of the application's virtual
   environment, so the assistant host started its bridge without a module the

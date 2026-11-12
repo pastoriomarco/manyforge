@@ -20138,6 +20138,180 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 }
 
+// A parsed Stop with an invalid field is promoted to a Full Stop, like a Stop
+// body the transport could not parse: it stops the moving operation and the
+// reply says it was promoted because the request was malformed. A repeat of
+// the same request while the Stop runs is its exact replay.
+TEST(ResourceAddressedExecutionKernelTest, StopWithInvalidFieldPromotesToFullStop) {
+  using Intent = std::variant<StopIntentDTO, FullStopIntentDTO>;
+  const auto context = [](std::string request_id) {
+    return PublicRequestContextDTO{RequestId(std::move(request_id)),
+                                   RequestOwnerEpoch("kernel.epoch.1"), "test", std::nullopt};
+  };
+  const auto operations = [](const OperationAcceptedDTO& accepted) {
+    return std::vector<StopOperationTargetDTO>{
+        {accepted.operation_id, OperationRevision(1U), StopGeneration(0U)}};
+  };
+  constexpr std::uint64_t kUnsafeCounter = 9'007'199'254'740'992ULL;
+  const std::vector<std::pair<std::string, std::function<Intent(const OperationAcceptedDTO&)>>>
+      cases{
+          {"duplicate_targets",
+           [&](const auto& accepted) {
+             auto targets = operations(accepted);
+             targets.push_back(targets.front());
+             return StopIntentDTO{context("request.invalid.duplicate"), targets, std::nullopt};
+           }},
+          {"empty_selector",
+           [&](const auto&) {
+             return StopIntentDTO{context("request.invalid.empty"),
+                                  std::vector<StopOperationTargetDTO>{}, std::nullopt};
+           }},
+          {"oversized_target_id",
+           [&](const auto&) {
+             return StopIntentDTO{context("request.invalid.oversized-target"),
+                                  std::vector<StopOperationTargetDTO>{
+                                      {OperationId(std::string(129U, 'o')), OperationRevision(1U),
+                                       StopGeneration(0U)}},
+                                  std::nullopt};
+           }},
+          {"nul_in_target_id",
+           [&](const auto& accepted) {
+             auto targets = operations(accepted);
+             targets.front().operation_id =
+                 OperationId(accepted.operation_id.value() + std::string(1U, '\0'));
+             return StopIntentDTO{context("request.invalid.nul-target"), targets, std::nullopt};
+           }},
+          {"unsafe_expectation",
+           [&](const auto& accepted) {
+             auto targets = operations(accepted);
+             targets.front().expected_stop_generation = StopGeneration(kUnsafeCounter);
+             return StopIntentDTO{context("request.invalid.unsafe-expectation"), targets,
+                                  std::nullopt};
+           }},
+          {"empty_component_graph_revision",
+           [&](const auto&) {
+             return StopIntentDTO{context("request.invalid.component"),
+                                  std::vector<StopComponentTargetDTO>{
+                                      {ControllableComponentId("arm"), GraphRevision(""),
+                                       ComponentLifecycleGeneration(1U)}},
+                                  std::nullopt};
+           }},
+          {"nul_in_program_run_id",
+           [&](const auto&) {
+             return StopIntentDTO{context("request.invalid.program-run"),
+                                  std::vector<StopProgramRunTargetDTO>{
+                                      {ProgramRunId(std::string("run") + '\0')}},
+                                  std::nullopt};
+           }},
+          {"empty_source_label",
+           [&](const auto& accepted) {
+             auto request = context("request.invalid.source");
+             request.source_label.clear();
+             return StopIntentDTO{request, operations(accepted), std::nullopt};
+           }},
+          {"oversized_correlation_id",
+           [&](const auto& accepted) {
+             auto request = context("request.invalid.correlation");
+             request.correlation_id = std::string(257U, 'c');
+             return StopIntentDTO{request, operations(accepted), std::nullopt};
+           }},
+          {"full_stop_empty_source_label",
+           [&](const auto&) {
+             auto request = context("request.invalid.full-source");
+             request.source_label.clear();
+             return FullStopIntentDTO{request, StopGeneration(0U), {}};
+           }},
+          {"full_stop_unsafe_generation",
+           [&](const auto&) {
+             return FullStopIntentDTO{context("request.invalid.full-generation"),
+                                      StopGeneration(kUnsafeCounter), {}};
+           }},
+      };
+  for (const auto& [name, make_intent] : cases) {
+    SCOPED_TRACE(name);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    clock.set(100);
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+        {registration(make_binding("arm", "execution.trajectory.execute",
+                                   CoordinateKind::kAngular),
+                      engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto& kernel = *owner;
+    const auto operation = kernel.execute(motion_operation("request.invalid-stop.execute"));
+    ASSERT_TRUE(operation.ok()) << operation.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    HeldSettlementCall stage;
+    engine.translate_stop_stage_hook = stage.Blocker();
+
+    const auto intent = make_intent(operation.value());
+    const auto submit = [&] {
+      return std::visit(
+          [&](const auto& value) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(value)>, StopIntentDTO>) {
+              return kernel.stop(value);
+            } else {
+              return kernel.full_stop(value);
+            }
+          },
+          intent);
+    };
+    const auto stopped = submit();
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    EXPECT_EQ(stopped.value().replay_status, RequestReplayStatusDTO::kAcceptedNew);
+    EXPECT_EQ(stopped.value().resolution_disposition,
+              StopResolutionDispositionDTO::kPromotedToFull);
+    EXPECT_EQ(stopped.value().resolution_reason,
+              StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent);
+    ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+    EXPECT_EQ(stopped.value().affected_operation_revisions.front().operation_id,
+              operation.value().operation_id);
+
+    const auto replay = submit();
+    ASSERT_TRUE(replay.ok()) << replay.error().message;
+    EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(replay.value().stop_id, stopped.value().stop_id);
+
+    stage.Release();
+    ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() >= 1; }));
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto state = kernel.get_operation_state(operation.value().operation_id);
+    ASSERT_TRUE(state.ok()) << state.error().message;
+    EXPECT_EQ(state.value().state, OperationStateKind::kStopped);
+    ASSERT_TRUE(wait_until([&] { return journal.stop_acceptance_calls.load() == 1; }));
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_acceptance.has_value());
+    EXPECT_EQ(journal.last_stop_acceptance->malformed_ingress_reason,
+              std::optional<std::string>("recognized_stop_payload_invalid"));
+  }
+}
+
+// A request identity that cannot name a Stop is still refused: the promoted
+// Full Stop has no identity to replay or journal under.
+TEST(ResourceAddressedExecutionKernelTest, StopWithUnusableRequestIdentityIsStillRefused) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  auto& kernel = *owner;
+  const auto operation = kernel.execute(motion_operation("request.unusable-identity.execute"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  auto intent = stop_request(std::string(129U, 'r'), operation.value(), 1U);
+  const auto refused = kernel.stop(intent);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "normalized_stop_intent_invalid");
+  EXPECT_EQ(engine.stop_calls.load(), 0);
+}
+
 [[nodiscard]] bool stop_terminal_recorded(const ResourceAddressedExecutionKernel& kernel,
                                           const StopId& stop_id) {
   const auto status = kernel.get_stop_status(stop_id);
