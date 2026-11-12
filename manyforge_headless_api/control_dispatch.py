@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -469,11 +470,26 @@ class HeadlessExecutionControlDispatch:
                     f"unsupported execution command kind {kind!r}",
                 )
         except ValidationError as error:
-            raise HeadlessApiError(
-                "execution_control_payload_invalid",
-                "command payload does not match its declared command kind",
-                details={"validation": str(error)},
-            ) from error
+            if not (
+                is_stop_command(envelope.command_kind)
+                and error.title in _STOP_REQUEST_MODELS
+            ):
+                raise HeadlessApiError(
+                    "execution_control_payload_invalid",
+                    "command payload does not match its declared command kind",
+                    details={"validation": str(error)},
+                ) from error
+            # A recognized Stop whose payload is invalid is a Full Stop, as on
+            # the Stop HTTP routes; the adapter names it, as they do.
+            full = envelope.command_kind in {"cell_full_stop", "program_full_stop"}
+            result = self._service.execution_recognized_malformed_stop(
+                request_id="malformed-stop." + uuid4().hex[:16],
+                recognized_route=(
+                    "/api/execution/full-stop" if full else "/api/execution/stops"
+                ),
+                reason="recognized_stop_payload_invalid",
+                attribution=attribution,
+            )
 
         def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
             return self._addressed_result(
@@ -503,6 +519,19 @@ class HeadlessExecutionControlDispatch:
             ),
             result,
         )
+
+
+# The payload models of the Stop command kinds. Only their validation
+# failure promotes; any other model's failure keeps its refusal.
+_STOP_REQUEST_MODELS = frozenset(
+    model.__name__
+    for model in (
+        StopIntentRequest,
+        FullStopIntentRequest,
+        ProgramRunStopRequest,
+        ProgramSelectionStopRequest,
+    )
+)
 
 
 __all__ = [

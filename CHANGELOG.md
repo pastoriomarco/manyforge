@@ -45,6 +45,15 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **A Stop sent over the control WebSocket or `/api/control/commands` with
+  an invalid payload stops the cell instead of nothing.** It was refused with
+  `execution_control_payload_invalid`. Like an invalid body on the Stop HTTP
+  routes, it is now accepted as a Full Stop (`promoted_to_full`,
+  `malformed_ordinary_intent`) under an id the API makes
+  (`malformed-stop.…`); a repeat joins the Full Stop while it runs. This
+  covers `operation_stop`, `cell_full_stop`, `program_stop`,
+  `program_full_stop` and `program_motion_stop`. Other commands with an
+  invalid payload are still refused.
 - **A Stop with an invalid field stops the whole cell instead of nothing.** A
   Stop or Full Stop request that was read correctly but had an invalid field
   (targets unsorted or repeated, an empty, oversized or NUL-containing id or
