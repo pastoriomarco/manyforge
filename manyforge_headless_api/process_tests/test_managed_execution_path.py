@@ -213,6 +213,23 @@ def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
         time.sleep(0.005)
 
 
+def _wait_events_settled(client: ExecutionCommandClient, owner_epoch: str) -> dict[str, Any]:
+    """The event page once the Kernel has journaled its interrupt-rule states.
+
+    Enabling the cell queues each global rule's first state; the Kernel's
+    projection worker journals it asynchronously, and the baseline is
+    `projection_pending` until then.
+    """
+
+    deadline = time.monotonic() + 10.0
+    page = client.events(owner_epoch, 0)
+    while (page.get("interrupt_rule_state_baseline") or {}).get("status") != "ready":
+        assert time.monotonic() < deadline, page
+        time.sleep(0.01)
+        page = client.events(owner_epoch, 0)
+    return page
+
+
 def _wait_cell_latch_cleared(headless: HeadlessHttpClient) -> dict[str, Any]:
     """The latch is derived; it clears by itself once every
     component is healthy and idle. Nothing recovers or acknowledges it."""
@@ -659,7 +676,9 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
             return client._exchange({"api_version": EXECUTION_COMMAND_VERSION,
                                      "command": "query_target", "query": {**query, **change}})
 
-        before = client.events(identity["owner_epoch"], 0)
+        # Read-only queries append nothing; the rule states enabling queued
+        # are journaled first.
+        before = _wait_events_settled(client, identity["owner_epoch"])
         identity_transform = exchange({})
         assert identity_transform["ok"] is True, identity_transform
         typed = client.query_target(TargetObservationQuery.model_validate(query))
