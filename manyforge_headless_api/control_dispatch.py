@@ -322,7 +322,18 @@ class HeadlessExecutionControlDispatch:
         )
         origin_epoch = context["request_owner_epoch"]
         payload = dict(request.payload)
-        if requires_execution_owner_fence(envelope.command_kind):
+        if requires_execution_owner_fence(envelope.command_kind) and is_stop_command(
+            envelope.command_kind
+        ):
+            # A Stop needs no owner fence: the Kernel resolves every Stop
+            # against its own current epoch. Without one it keeps the
+            # caller's epoch; a value given is the Stop's epoch and is
+            # validated with the rest of its payload.
+            if _EXPECTED_EXECUTION_OWNER_FIELD in payload:
+                context["request_owner_epoch"] = payload.pop(
+                    _EXPECTED_EXECUTION_OWNER_FIELD
+                )
+        elif requires_execution_owner_fence(envelope.command_kind):
             execution_owner = payload.pop(_EXPECTED_EXECUTION_OWNER_FIELD, None)
             if (
                 not isinstance(execution_owner, str)

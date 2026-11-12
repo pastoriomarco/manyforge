@@ -4029,6 +4029,66 @@ def test_recognized_malformed_stop_promotes_instead_of_returning_validation_erro
     ]
 
 
+def test_program_stop_with_invalid_body_promotes_instead_of_validation_error() -> None:
+    """A Program Stop, Program Full Stop or Program motion Stop with an invalid
+    body is a Full Stop, as on the execution Stop routes; other Program
+    routes keep their validation error."""
+    execution = FakeExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        stop = client.post(
+            "/api/program/runs/run.1/stop",
+            content=b'{"request_id":',
+            headers={"content-type": "application/json", "x-request-id": "program.stop.1"},
+        )
+        motion = client.post(
+            "/api/program/runs/run.1/motion-stop",
+            json={"request_id": "program.motion.1"},
+            headers={"x-request-id": "program.stop.2"},
+        )
+        full = client.post(
+            "/api/program/runs/run.1/full-stop",
+            json={},
+            headers={"x-request-id": "program.stop.3"},
+        )
+        resume = client.post(
+            "/api/program/runs/run.1/resume-motion",
+            json={},
+            headers={"x-request-id": "program.resume.1"},
+        )
+
+    assert stop.status_code == 200, stop.text
+    assert motion.status_code == 200, motion.text
+    assert full.status_code == 200, full.text
+    assert resume.status_code == 422, resume.text
+    assert execution.requests == [
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.program.stop.1",
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_payload_invalid",
+            },
+        ),
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.program.stop.2",
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_payload_invalid",
+            },
+        ),
+        (
+            "recognized_malformed_stop",
+            {
+                "request_id": "malformed-stop.program.stop.3",
+                "recognized_route": "/api/execution/full-stop",
+                "reason": "recognized_stop_payload_invalid",
+            },
+        ),
+    ]
+
+
 def test_query_cardinality_and_safe_integer_bounds_precede_native_conversion() -> None:
     client, _core, _manager = _client()
     with client:

@@ -133,6 +133,13 @@ from .activation_preparer import ActivationPreparer
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
+# A Program Stop whose body is invalid is a Full Stop too, recognized on the
+# execution Stop route of its kind.
+_PROGRAM_STOP_ROUTES = {
+    "/api/program/runs/{program_run_id}/stop": "/api/execution/stops",
+    "/api/program/runs/{program_run_id}/motion-stop": "/api/execution/stops",
+    "/api/program/runs/{program_run_id}/full-stop": "/api/execution/full-stop",
+}
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
@@ -855,10 +862,13 @@ def create_app(
         request: Request,
         error: RequestValidationError,
     ) -> Response:
-        if request.method == "POST" and request.url.path in {
-            "/api/execution/stops",
-            "/api/execution/full-stop",
-        }:
+        route = getattr(request.scope.get("route"), "path", None)
+        recognized_route = (
+            request.url.path
+            if request.url.path in {"/api/execution/stops", "/api/execution/full-stop"}
+            else _PROGRAM_STOP_ROUTES.get(route)
+        )
+        if request.method == "POST" and recognized_route is not None:
             reason = getattr(
                 request.state,
                 "recognized_stop_malformed_reason",
@@ -876,7 +886,7 @@ def create_app(
                     await control_call(
                         lambda: service.execution_recognized_malformed_stop(
                             request_id=adapter_request_id,
-                            recognized_route=request.url.path,
+                            recognized_route=recognized_route,
                             reason=reason,
                             attribution=attribution,
                         ),

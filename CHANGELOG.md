@@ -116,6 +116,16 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **An invalid Program Stop over HTTP, and a control Stop without an owner
+  fence, no longer stop nothing.** A Program Stop, Program Full Stop or
+  Program motion Stop sent to `/api/program/runs/{id}/stop`, `/full-stop`
+  or `/motion-stop` with an invalid body was answered 422; it is now a Full
+  Stop (`promoted_to_full`, `malformed_ordinary_intent`), as on the
+  execution Stop routes. On the control WebSocket and `/api/control/commands`
+  an `operation_stop` or `cell_full_stop` no longer needs
+  `expected_execution_owner_epoch`: without it the Stop is an ordinary Stop
+  (before: refused with `execution_control_payload_invalid`); with an
+  invalid value it is a Full Stop. Other commands still require the field.
 - **A Stop sent over the control WebSocket or `/api/control/commands` with
   an invalid payload stops the cell instead of nothing.** It was refused with
   `execution_control_payload_invalid`. Like an invalid body on the Stop HTTP
