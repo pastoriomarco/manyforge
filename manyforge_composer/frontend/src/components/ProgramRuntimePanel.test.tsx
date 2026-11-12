@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ASSISTANT_TURN_IN_PROGRESS, type ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import {
+  ASSISTANT_TURN_IN_PROGRESS, programPendingAfterProjection, type ProgramRuntimeController,
+} from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   ProgramBindingDocument,
@@ -2285,6 +2287,89 @@ describe('Halt', () => {
         expect(program.fullStop).toHaveBeenCalledTimes(1);
       } finally { await open.unmount(); }
     });
+  });
+});
+
+describe('Pending flags after fast owner transitions', () => {
+  it('offers Resume and Reset after Halt then Execute on a run whose motion is held', () => {
+    // Execute after Halt: the resumed run is held again by its first tree
+    // tick, so the projection goes from full_stopped straight back to
+    // intervention_required.
+    const program = controller('intervention_required');
+    program.state.controls = ordinaryMotionStopControls();
+    program.state.controls.recoveryOffer = null;
+    const resumed = program.state.run!;
+    const halted = { ...resumed, state: 'full_stopped' as const, runRevision: resumed.runRevision - 2 };
+    program.state.pending = programPendingAfterProjection(
+      'resume-full-stop', resumed, program.state.controls,
+      { programRunnerOwnerEpoch: resumed.ownerEpoch, cycleGeneration: 1, state: 'running',
+        programRunId: resumed.capture.programRunId, cycleClaimGeneration: 1 },
+      halted,
+      { cycleGeneration: 1, programRunId: halted.capture.programRunId,
+        ownerEpoch: halted.ownerEpoch, runRevision: halted.runRevision },
+    );
+    expect(program.state.pending).toBeNull();
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*>Executing<\/button>/);
+    expect(markup).not.toContain('Executing…');
+    expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+    expect(markup).toMatch(/class="transport-reset[^"]*"(?![^>]*disabled)[^>]*>Reset<\/button>/);
+  });
+
+  it('drops an unconfirmed Halt that waits for motion when the run is halted or ends meanwhile', async () => {
+    composerSettingsOverride.confirmHalt = false;
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'running';
+    program.state.controls = controls;
+    vi.mocked(program.stopMotion).mockResolvedValue(true);
+    const open = await mountTransport(program);
+    try {
+      await open.press((props) => String(props.className).startsWith('danger-button transport-full-stop'));
+      await open.rerender();
+      expect(open.mounted((props) => props.children === 'Halting')).toBe(true);
+      // Another client halted the run before its motion was seen held.
+      program.state.run = { ...program.state.run!, state: 'full_stopped' };
+      await open.rerender();
+      await open.rerender();
+      expect(program.fullStop).not.toHaveBeenCalled();
+      // Later the run is resumed with its motion held: the dropped Halt must
+      // not wake up and halt it again.
+      program.state.run = { ...program.state.run!, state: 'intervention_required' };
+      controls.executionSelections.groups[0].state = 'held';
+      await open.rerender();
+      await open.rerender();
+      expect(program.fullStop).not.toHaveBeenCalled();
+    } finally {
+      composerSettingsOverride.confirmHalt = null;
+      await open.unmount();
+    }
+  });
+
+  it('asks the Reset question once the run ends while Reset waits for motion to stop', async () => {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'running';
+    program.state.controls = controls;
+    vi.mocked(program.stopMotion).mockResolvedValue(true);
+    const open = await mountTransport(program);
+    try {
+      await open.press((props) => props.children === 'Reset'
+        && String(props.className).startsWith('transport-reset'));
+      await open.rerender();
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(false);
+      // The run ended before its group was seen held.
+      program.state.run = { ...program.state.run!, state: 'stopped' };
+      program.cycleState = 'terminal_awaiting_reset';
+      controls.executionSelections.groups[0].state = 'unavailable';
+      await open.rerender();
+      await open.rerender();
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+    } finally { await open.unmount(); }
   });
 });
 

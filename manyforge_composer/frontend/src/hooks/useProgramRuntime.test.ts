@@ -186,6 +186,84 @@ describe('Program runtime idle selection', () => {
 });
 
 describe('Program command settlement', () => {
+  // A pending flag clears on the first projection that shows the command's
+  // effect, or that the state it was sent from no longer holds; coalesced
+  // state messages can skip any one transient state.
+  const cycleIn = (state: string, generation = 4, programRunId: string | null = 'run-1') => ({
+    programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: generation,
+    state, programRunId, cycleClaimGeneration: 8,
+  }) as Parameters<typeof programPendingAfterProjection>[3];
+  const runIn = (state: string, runRevision: number, programRunId = 'run-1') => ({
+    ownerEpoch: 'runner.epoch.1', state, runRevision, capture: { programRunId },
+  }) as unknown as ProgramRunStatus;
+  const originOf = (run: ProgramRunStatus | null, cycleGeneration = 4) => ({
+    cycleGeneration,
+    programRunId: run?.capture.programRunId ?? null,
+    ownerEpoch: run?.ownerEpoch ?? null,
+    runRevision: run?.runRevision ?? null,
+  });
+
+  it('clears Execute after Halt when the resumed run is held again before running is seen', () => {
+    const halted = runIn('full_stopped', 9);
+    const origin = originOf(halted);
+    expect(programPendingAfterProjection(
+      'resume-full-stop', halted, null, cycleIn('running'), halted, origin,
+    )).toBe('resume-full-stop');
+    expect(programPendingAfterProjection(
+      'resume-full-stop', runIn('intervention_required', 11), null, cycleIn('running'), halted, origin,
+    )).toBeNull();
+    expect(programPendingAfterProjection(
+      'resume-full-stop', runIn('stopped', 12), null, cycleIn('terminal_awaiting_reset'), halted, origin,
+    )).toBeNull();
+  });
+
+  it('clears a Full Stop whose run ends, or is resumed, before full_stopped is seen', () => {
+    const running = runIn('intervention_required', 5);
+    const origin = originOf(running);
+    expect(programPendingAfterProjection(
+      'full-stop', running, null, cycleIn('running'), running, origin,
+    )).toBe('full-stop');
+    // Accepted: the owner took it with a new run revision (halting).
+    expect(programPendingAfterProjection(
+      'full-stop', runIn('full_stopping', 6), null, cycleIn('running'), running, origin,
+    )).toBeNull();
+    // Halted and already resumed by another client: never seen full_stopped.
+    expect(programPendingAfterProjection(
+      'full-stop', runIn('running', 8), null, cycleIn('running'), running, origin,
+    )).toBeNull();
+    // Sent while a Program Stop ends the run: no effect, the run ends.
+    const stopping = runIn('stopping', 5);
+    expect(programPendingAfterProjection(
+      'full-stop', runIn('stopped', 5), null, cycleIn('terminal_awaiting_reset'), stopping,
+      originOf(stopping),
+    )).toBeNull();
+  });
+
+  it('clears Execute once a run is captured, whatever state it is in', () => {
+    const origin = originOf(null, 4);
+    expect(programPendingAfterProjection('run', null, null, cycleIn('starting', 4, 'run-1'), null, origin))
+      .toBe('run');
+    // The first node fails or is held at once: never seen running.
+    expect(programPendingAfterProjection(
+      'run', runIn('intervention_required', 2), null, cycleIn('running', 4), null, origin,
+    )).toBeNull();
+    // The run ended and the cycle was reset meanwhile.
+    expect(programPendingAfterProjection(
+      'run', null, null, cycleIn('idle_after_reset', 5, null), null, origin,
+    )).toBeNull();
+  });
+
+  it('clears Reset once a later cycle is seen, even if its idle state was skipped', () => {
+    const ended = runIn('stopped', 7);
+    const origin = originOf(ended, 4);
+    expect(programPendingAfterProjection(
+      'reset', ended, null, cycleIn('resetting', 4), ended, origin,
+    )).toBe('reset');
+    expect(programPendingAfterProjection(
+      'reset', runIn('running', 1, 'run-2'), null, cycleIn('running', 5, 'run-2'), ended, origin,
+    )).toBeNull();
+  });
+
   it.each(['motion-stop', 'resume-motion'] as const)(
     'retires %s delivery feedback when its owner/run is replaced or ends', (pending) => {
       const run = { ownerEpoch: 'owner.1', state: 'running',

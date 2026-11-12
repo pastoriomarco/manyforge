@@ -494,3 +494,63 @@ it('repeats a motion Stop and a Full Stop while the run is Full stopping or stop
     expect(test.send).toHaveBeenCalledTimes(2);
   }
 });
+
+it('clears the Execute pending flag when the resumed run is held again at once', async () => {
+  // Execute after Halt resumes the run, whose first tree tick re-holds the
+  // node the motion Stop held: the client may never see `running`.
+  const test = await mount(true);
+  expect(test.runtime.state.run?.state).toBe('full_stopped');
+  await act(async () => { await test.runtime.resumeFullStop(); });
+  expect(test.send.mock.calls.map((call) => call[0])).toEqual(['program_resume_full_stop']);
+  expect(test.runtime.state.pending).toBe('resume-full-stop');
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle,
+      run: { ...heldRun(), state: 'intervention_required', runRevision: 6 },
+    };
+  });
+  expect(test.runtime.state.run?.state).toBe('intervention_required');
+  expect(test.runtime.state.pending).toBeNull();
+});
+
+it('clears a Run or Resume once the owner applied a newer selection, whatever the group shows', async () => {
+  const test = await mount();
+  const run = heldRun();
+  const controls = (selectionRevision: number, state: string, heldNodeCount: number) => ({
+    schemaVersion: 'manyforge.program_runtime_control_projection.v9',
+    ownerId: 'program-runner.development-workbench',
+    ownerEpoch: run.ownerEpoch,
+    programRunId: run.capture.programRunId,
+    runRevision: run.runRevision,
+    runtimeControls: { runtimeControlRevision: 1 } as never,
+    recoveryOffer: null,
+    recoveryHolds: [],
+    executionSelections: {
+      selectionRevision,
+      motionHeld: state === 'held',
+      groups: [{
+        groupId: 'all', nodeCount: 2, heldNodeCount, state,
+        stopAllowed: state !== 'held', startAllowed: true, startUnavailableReason: null,
+        resumeAllowed: state === 'held', resumeUnavailableReason: null,
+        runtimeScaleSelector: null, runtimeScaleUnavailableReason: null, resourceIds: [],
+      }],
+    },
+  }) as unknown as ProgramRuntimeControlProjection;
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle, state: 'running', programRunId: run.capture.programRunId,
+      runRevision: run.runRevision, run, runtimeControls: controls(3, 'held', 1),
+    };
+  });
+  test.send.mockImplementation(() => new Promise<never>(() => undefined));
+  await act(async () => { void test.runtime.resumeMotion('all'); });
+  expect(test.runtime.state.selectionPending).toHaveLength(1);
+  // Resumed, its node finished and the next one waits: the group never
+  // shows `running` in a projection, but the selection revision moved on.
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle, runtimeControls: controls(4, 'ready', 0),
+    };
+  });
+  expect(test.runtime.state.selectionPending).toEqual([]);
+});

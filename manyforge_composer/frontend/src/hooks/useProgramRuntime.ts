@@ -165,6 +165,21 @@ export interface ProgramSelectionPending {
   requestId: string;
   ownerEpoch: string;
   programRunId: string;
+  /** The selection revision the command was sent from, when known. */
+  selectionRevision?: number;
+}
+
+/**
+ * What a pending Program command was sent from. A pending flag clears on the
+ * first projection that shows the command's effect, or that this origin no
+ * longer holds; never only on one transient state, which coalesced state
+ * messages can skip.
+ */
+export interface ProgramPendingOrigin {
+  cycleGeneration: number | null;
+  programRunId: string | null;
+  ownerEpoch: string | null;
+  runRevision: number | null;
 }
 
 interface ProgramRuntimeState {
@@ -179,6 +194,8 @@ interface ProgramRuntimeState {
   loading: boolean;
   observationError: string | null;
   pending: ProgramPendingCommand;
+  /** What `pending` was sent from; absent when nothing is pending. */
+  pendingOrigin?: ProgramPendingOrigin | null;
   selectionPending: ProgramSelectionPending[];
   controlPending: string | null;
   error: string | null;
@@ -213,6 +230,7 @@ const INITIAL_STATE: ProgramRuntimeState = {
   loading: true,
   observationError: null,
   pending: null,
+  pendingOrigin: null,
   selectionPending: [],
   controlPending: null,
   error: null,
@@ -312,6 +330,20 @@ export function programMotionStopSettled(
   );
 }
 
+/** The run a Program command addressed is gone, changed or advanced. */
+function programRunLeftOrigin(
+  run: ProgramRunStatus | null,
+  cycle: ProgramCycleDebugProjection | null,
+  origin: ProgramPendingOrigin | null,
+): boolean {
+  if (cycle !== null && cycle.state !== 'running') return true;
+  if (origin === null || origin.programRunId === null) return false;
+  return run === null
+    || run.capture.programRunId !== origin.programRunId
+    || run.ownerEpoch !== origin.ownerEpoch
+    || (origin.runRevision !== null && run.runRevision > origin.runRevision);
+}
+
 /** Cycle controls mirror owner transitions; selected commands track delivery only. */
 export function programPendingAfterProjection(
   pending: ProgramPendingCommand,
@@ -319,6 +351,7 @@ export function programPendingAfterProjection(
   _controls: ProgramRuntimeControlProjection | null,
   cycle: ProgramCycleDebugProjection | null = null,
   previousRun: ProgramRunStatus | null = run,
+  origin: ProgramPendingOrigin | null = null,
 ): ProgramPendingCommand {
   if (pending === 'start-motion' || pending === 'motion-stop' || pending === 'resume-motion') {
     // Delivery feedback belongs to its captured run, not a successor/idle
@@ -334,13 +367,25 @@ export function programPendingAfterProjection(
       && run.state === 'running'
       && cycle?.state === 'running'
       && cycle.programRunId === run.capture.programRunId) return null;
+    // Sent from an idle cycle: a captured run in any state (it may be held
+    // or halted before a `running` projection is seen) or a later cycle
+    // shows it took effect.
+    if (cycle !== null && (
+      (cycle.state === 'running' && cycle.programRunId !== null)
+      || (origin?.cycleGeneration != null && cycle.cycleGeneration > origin.cycleGeneration)
+    )) return null;
     return cycle !== null
       && ['stopping', 'resetting', 'terminal_awaiting_reset', 'recovery_required']
         .includes(cycle.state)
       ? null : pending;
   }
   if (pending === 'reset') {
-    return cycle?.state === 'idle_after_reset' ? null : pending;
+    // Reset ends in a new idle cycle generation; a later cycle (another
+    // client may already have started a run) also shows it took effect.
+    return cycle?.state === 'idle_after_reset'
+      || (cycle != null && origin?.cycleGeneration != null
+        && cycle.cycleGeneration > origin.cycleGeneration)
+      ? null : pending;
   }
   if (pending === 'stop') {
     const settled = (
@@ -351,12 +396,20 @@ export function programPendingAfterProjection(
     return settled ? null : pending;
   }
   if (pending === 'full-stop') {
-    return run?.state === 'full_stopped' ? null : pending;
+    if (run?.state === 'full_stopped') return null;
+    // The owner takes a Full Stop with a new run revision; the run ending,
+    // being replaced or the cycle leaving `running` also ends the wait.
+    return programRunLeftOrigin(run, cycle, origin)
+      || ['stopped', 'succeeded', 'failed'].includes(run?.state ?? '')
+      ? null : pending;
   }
   if (pending === 'resume-full-stop') {
-    return run?.state === 'running' && cycle?.state === 'running'
-      ? null
-      : pending;
+    if (run?.state === 'running' && cycle?.state === 'running') return null;
+    // Sent from a halted run: the resumed run may be held again by its first
+    // tree tick (`intervention_required`) before `running` is ever seen.
+    return programRunLeftOrigin(run, cycle, origin)
+      || (run !== null && run.state !== 'full_stopped')
+      ? null : pending;
   }
   return pending;
 }
@@ -507,6 +560,11 @@ function selectionPendingAfterProjection(
       request.groupIds.includes(group.groupId)
     ));
     if (rows.length !== request.groupIds.length) return true;
+    // The owner applied a selection change after this command was sent.
+    if (request.selectionRevision !== undefined
+      && controls.executionSelections.selectionRevision > request.selectionRevision) {
+      return false;
+    }
     const complete = request.kind === 'motion-stop'
       ? rows.every((group) => group.state === 'stopping' || group.state === 'held')
       : rows.every((group) => group.state === 'running' && group.heldNodeCount === 0);
@@ -606,6 +664,9 @@ export function useProgramRuntime(
   const cellLatch: CellLatch | null = cellState.latch;
   const mounted = useRef(true);
   const pendingProgramRequest = useRef<string | null>(null);
+  // The cycle the next Program command is sent from (see ProgramPendingOrigin).
+  const latestCycleGeneration = useRef<number | null>(null);
+  latestCycleGeneration.current = snapshot?.programCycle.cycleGeneration ?? null;
   const refreshing = useRef(false);
   const refreshQueued = useRef(false);
   const observationRetryAttempt = useRef(0);
@@ -755,6 +816,7 @@ export function useProgramRuntime(
         projected.controls,
         cycleDebugProjection,
         current.run,
+        current.pendingOrigin ?? null,
       );
       const controlPending = controlPendingAfterProjection(
         current.controlPending,
@@ -936,9 +998,16 @@ export function useProgramRuntime(
     selectionGroups: string[] = [],
   ) => {
     pendingProgramRequest.current = requestId;
+    const cycleGeneration = latestCycleGeneration.current;
     setState((current) => ({
       ...current,
       pending,
+      pendingOrigin: {
+        cycleGeneration,
+        programRunId: current.run?.capture.programRunId ?? null,
+        ownerEpoch: current.run?.ownerEpoch ?? null,
+        runRevision: current.run?.runRevision ?? null,
+      },
       selectionPending: pending === 'start-motion'
         || pending === 'motion-stop' || pending === 'resume-motion'
         ? [
@@ -949,6 +1018,10 @@ export function useProgramRuntime(
             requestId,
             ownerEpoch: current.run?.ownerEpoch ?? '',
             programRunId: current.run?.capture.programRunId ?? '',
+            ...(current.controls !== null && current.run !== null
+              && controlsMatchRun(current.controls, current.run)
+              ? { selectionRevision: current.controls.executionSelections.selectionRevision }
+              : {}),
           },
         ]
         : current.selectionPending,

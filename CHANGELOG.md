@@ -175,6 +175,19 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **Execute no longer stays "Executing…" after Halt, with Resume and Reset
+  disabled.** After Halt, Execute resumes the run, whose first tree tick
+  holds the motion the Halt stopped; the run can go from halted straight back
+  to held without the browser ever seeing it running. Composer waited for
+  that running state, so Execute stayed busy and Resume, Run, Retry and Reset
+  stayed disabled until the page was reloaded. Composer's pending Program
+  commands now clear on the first state that shows the command took effect or
+  that the state it was sent from is gone, never on one passing state only:
+  Execute (a captured run in any state), Execute after Halt, Halt's Full Stop
+  (a new run revision, or the run ending), Reset (a later cycle), group Run and
+  Resume (a newer selection revision). An unconfirmed Halt still waiting for
+  motion is dropped when the run is halted or ends, and a Reset waiting for
+  motion to stop asks its question once the run has ended.
 - **An invalid Program Stop over HTTP, and a control Stop without an owner
   fence, no longer stop nothing.** A Program Stop, Program Full Stop or
   Program motion Stop sent to `/api/program/runs/{id}/stop`, `/full-stop`

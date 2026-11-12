@@ -1783,15 +1783,24 @@ export function ProgramTransportControls({
   const canProgramHalt = runToStop;
 
   useEffect(() => {
-    if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
+    if (haltIntent !== 'automatic') return;
+    // The run left the states with motion (halted, ended, replaced): there
+    // is no quiescence left to wait for.
+    if (!programMotionRunning) {
+      setHaltIntent(null);
+      return;
+    }
+    if (!allMotionQuiesced) return;
     setHaltIntent(null);
     void program.fullStop();
-  }, [allMotionQuiesced, haltIntent, program]);
+  }, [allMotionQuiesced, haltIntent, program, programMotionRunning]);
 
   // Ask only once every motion group has stopped (no groups: nothing moves).
   // A completed Halt has already contained all motion; while it settles,
   // wait for it rather than sending a motion Stop the owner would refuse.
-  const motionSettled = allGroup === undefined || allMotionQuiesced || programFullStopped;
+  // A run with nothing left to stop (ended, or none) is settled too.
+  const motionSettled = allGroup === undefined || allMotionQuiesced || programFullStopped
+    || !runToStop;
   useEffect(() => {
     if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');
     if (resetIntent === 'automatic' && motionSettled) {
