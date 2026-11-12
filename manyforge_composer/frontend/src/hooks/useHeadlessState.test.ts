@@ -1236,9 +1236,16 @@ describe('HeadlessStateSource delivery scheduling', () => {
         expect((failure as Error).message).toContain('Reset required');
       }
       if (malformed) expect((failure as Error).message).not.toContain('Reset required');
-      expect(FakeWebSocket.shell.readyState).toBe(confirmed ? FakeWebSocket.OPEN : 3);
-      expect(FakeWebSocket.shell.sent.some((frame) =>
-        JSON.parse(frame).incident_kind === 'command_delivery_unconfirmed')).toBe(!confirmed);
+      // An unknown outcome keeps the connection open; it is recorded with the
+      // command kind and the HTTP status, and blocks commands other than Stop.
+      expect(FakeWebSocket.shell.readyState).toBe(FakeWebSocket.OPEN);
+      expect(FakeWebSocket.shell.sent.some((frame) => {
+        const value = JSON.parse(frame) as Record<string, unknown>;
+        return value.incident_kind === 'command_delivery_unconfirmed'
+          && value.reason_code === `http_response_unconfirmed:program_run:http_${status}`;
+      })).toBe(!confirmed);
+      expect(source.getShellSnapshot().transportError).toBe(confirmed ? null
+        : 'Command delivery is unconfirmed; commands other than Stop are disabled.');
       expect(fetch).toHaveBeenCalledTimes(1);
     } finally {
       source.dispose();
@@ -1314,7 +1321,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
     await expect(source.sendExecutionCommand(
       'program_run', { scenario_id: 'lite6' }, 'run.http.unknown',
     )).rejects.toThrow('Command delivery is unconfirmed; commands other than Stop are disabled.');
-    expect(FakeWebSocket.shell.readyState).toBe(3);
+    expect(FakeWebSocket.shell.readyState).toBe(FakeWebSocket.OPEN);
+    expect(FakeWebSocket.shell.sent.some((frame) => (
+      JSON.parse(frame).reason_code === 'http_response_unconfirmed:program_run:network'
+    ))).toBe(true);
     source.dispose();
   });
 
@@ -2853,10 +2863,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(FakeWebSocket.shell, 'control-session.test-2');
     receiveControlSnapshot(FakeWebSocket.shell, withRules, 'control-session.test-2');
     expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'clear', keys: [] }]);
-    // The re-sent disconnect incident took a client sequence: rows stay not
-    // current until the heartbeat confirms the latest echo.
+    // The re-sent disconnect and invalid-projection incidents, and the
+    // latter's resolution, took client sequences: rows stay not current until
+    // the heartbeat confirms the latest echo.
     expect(source.getGlobalRulesCurrent()).toBe(false);
-    receiveHeartbeat(FakeWebSocket.shell, 3, '3', 'control-session.test-2');
+    const latestClientSequence = (source as unknown as { controlClientSequence: number })
+      .controlClientSequence;
+    receiveHeartbeat(FakeWebSocket.shell, 3, String(latestClientSequence), 'control-session.test-2');
     expect(source.getShellSnapshot().transportStatus).toBe('connected');
     expect(source.getGlobalRulesCurrent()).toBe(true);
     source.dispose();
@@ -3349,7 +3362,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('fails closed once for unconfirmed delivery until a fresh session snapshot', async () => {
+  it('keeps the connection after an unconfirmed command and clears its latch on the watermark', async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -3385,40 +3398,43 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(first, wireState(1));
     (source as unknown as { clearControlHeartbeatWatch: () => void })
       .clearControlHeartbeatWatch();
+    const frames = () => first.sent.map((value) => JSON.parse(value) as Record<string, unknown>);
+    const commands = () => frames().filter((value) => value.message_kind === 'command') as Array<{
+      client_sequence: string; command: { command_envelope: { command_kind: string } };
+    }>;
     const pending = source.sendExecutionCommand(
       'program_reset', {}, 'correlation.unconfirmed-1',
     );
     const rejection = expect(pending).rejects.toThrow(
       'Command delivery is unconfirmed',
     );
+    const resetSequence = commands()[0]!.client_sequence;
 
     vi.advanceTimersByTime(1_000);
     await rejection;
-    expect(first.readyState).toBe(3);
-    const activated = first.sent
-      .map((value) => JSON.parse(value) as Record<string, unknown>)
-      .find((value) => value.message_kind === 'client_incident');
-    expect(activated).toMatchObject({
+    // The socket stays open; the event is recorded with kind and sequence.
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(frames().find((value) => value.message_kind === 'client_incident')).toMatchObject({
       incident_kind: 'command_delivery_unconfirmed',
       phase: 'activated',
+      reason_code: `command_watermark_missing:program_reset:${resetSequence}`,
     });
+    expect(source.getShellSnapshot().transportError)
+      .toBe('Command delivery is unconfirmed; commands other than Stop are disabled.');
+    expect(source.getShellSnapshot().commandLatch).toBe(true);
+    // Commands other than Stop stay disabled; a Stop goes out.
+    await expect(source.sendExecutionCommand('program_reset', {}, 'correlation.blocked'))
+      .rejects.toThrow('Control connection is not synchronized.');
+    const stop = source.sendExecutionCommand('program_motion_stop', {}, 'correlation.stop');
+    void stop.catch(() => undefined);
+    expect(commands().map((value) => value.command.command_envelope.command_kind))
+      .toEqual(['program_reset', 'program_motion_stop']);
 
-    vi.advanceTimersByTime(1_000);
-    const replacement = FakeWebSocket.instances[1]!;
-    replacement.onopen?.();
-    synchronizeControl(replacement, 'control-session.test-2');
-    expect(source.getShellSnapshot().error).not.toBeNull();
-    receiveControlSnapshot(replacement, wireState(1), 'control-session.test-2');
-    expect(replacement.sent.some((value) => (
-      JSON.parse(value).incident_kind === 'command_delivery_unconfirmed'
-      && JSON.parse(value).phase === 'resolved'
-    ))).toBe(false);
-    receiveHeartbeat(replacement, 3, '4', 'control-session.test-2');
-    expect(source.getShellSnapshot().error).toBeNull();
-    const transitions = replacement.sent
-      .map((value) => JSON.parse(value) as Record<string, unknown>)
-      .filter((value) => value.message_kind === 'client_incident');
-    expect(transitions).toEqual(expect.arrayContaining([
+    // The owner's watermark reaches the late command: the latch clears.
+    receiveHeartbeat(first, 3, resetSequence);
+    expect(source.getShellSnapshot().transportError).toBeNull();
+    expect(frames()).toEqual(expect.arrayContaining([
       expect.objectContaining({
         incident_kind: 'command_delivery_unconfirmed',
         phase: 'resolved',
@@ -3726,6 +3742,191 @@ describe('Stop is never refused on an open control socket', () => {
     await expect(session.send('program_motion_stop', 'motion-stop.closed')).rejects
       .toThrow('Control connection is not synchronized.');
     expect(session.sentKinds()).toEqual([]);
+    await session.dispose();
+  });
+});
+
+describe('The control connection stays open for Stop', () => {
+  function mountSession(cycleState: string) {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly sent: string[] = [];
+      readonly url: string;
+      readyState = FakeWebSocket.OPEN;
+      closed: number | null = null;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+      close(code?: number): void { this.closed = code ?? 1000; this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    const controls = () => FakeWebSocket.instances
+      .filter((socket) => new URL(socket.url).pathname === '/ws/control');
+    const socket = controls()[0]!;
+    synchronizeControl(socket);
+    const shell = wireState(1);
+    (shell.program_cycle as Record<string, unknown>).state = cycleState;
+    receiveControlSnapshot(socket, shell);
+    const commandKinds = () => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'command')
+      .map((value) => (value.command as { command_envelope: { command_kind: string } })
+        .command_envelope.command_kind);
+    const pending: Array<Promise<unknown>> = [];
+    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0], id: string) => {
+      const promise = source.sendExecutionCommand(kind, {}, id);
+      pending.push(promise.catch(() => undefined));
+      return promise;
+    };
+    const dispose = async () => {
+      source.dispose();
+      await Promise.all(pending);
+    };
+    return { source, socket, controls, commandKinds, send, dispose };
+  }
+  const invalidDelta = (socket: ControlTestSocket) => receiveControl(socket, {
+    schema_version: 'manyforge.execution_control.v2',
+    message_kind: 'delta',
+    control_session_id: CONTROL_SESSION_ID,
+    server_sequence: nextControlServerSequence(socket),
+    event_class: 'cold',
+    control: null,
+    shell: null,
+  });
+
+  it('latches an invalid control message during a run, keeps the socket and still sends Stop', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('starting');
+    expect(session.source.getShellSnapshot().snapshot?.programCycle.state).toBe('starting');
+    invalidDelta(session.socket);
+    expect(session.socket.closed).toBeNull();
+    // Recorded with what was invalid, the message kind and its sequence.
+    expect(session.socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>)
+      .find((value) => value.message_kind === 'client_incident')).toMatchObject({
+      incident_kind: 'control_projection_invalid',
+      phase: 'activated',
+      reason_code: 'invalid_projection:delta:4',
+    });
+    expect(session.source.getShellSnapshot().commandLatch).toBe(true);
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.');
+    await expect(session.send('program_reset', 'reset.invalid')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('program_full_stop', 'full-stop.invalid');
+    expect(session.commandKinds()).toEqual(['program_full_stop']);
+    // Owner state is no longer applied; heartbeats are still answered.
+    const shell = wireState(2);
+    (shell.program_cycle as Record<string, unknown>).state = 'idle_after_reset';
+    receiveControlSnapshot(session.socket, shell);
+    expect(session.source.getShellSnapshot().snapshot?.programCycle.state).toBe('starting');
+    const echoes = session.socket.sent.filter((value) => JSON.parse(value).message_kind === 'heartbeat_echo').length;
+    receiveHeartbeat(session.socket, 3, '2');
+    expect(session.socket.sent.filter((value) => JSON.parse(value).message_kind === 'heartbeat_echo'))
+      .toHaveLength(echoes + 1);
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.');
+    expect(session.socket.closed).toBeNull();
+    await session.dispose();
+  });
+
+  it('closes on an invalid control message, as before, when nothing is active, and resolves its record after the reconnect', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('idle_after_reset');
+    invalidDelta(session.socket);
+    expect(session.socket.closed).toBe(4002);
+    expect(session.source.getShellSnapshot().commandLatch).toBe(false);
+    expect(session.socket.sent.some((value) => (
+      JSON.parse(value).incident_kind === 'control_projection_invalid'
+      && JSON.parse(value).phase === 'activated'
+    ))).toBe(true);
+    // The fake close does not report the close; the replacement is opened
+    // as the reconnect path does.
+    session.source.reconnect();
+    const replacement = session.controls().at(-1)!;
+    synchronizeControl(replacement, 'control-session.test-2');
+    receiveControlSnapshot(replacement, wireState(1), 'control-session.test-2');
+    expect(replacement.sent.map((value) => JSON.parse(value) as Record<string, unknown>))
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        incident_kind: 'control_projection_invalid',
+        phase: 'resolved',
+      })]));
+    await session.dispose();
+  });
+
+  it.each([
+    ['intervention_required', 'running'],
+    ['full_stopping', 'running'],
+    ['full_stopped', 'running'],
+  ] as const)('treats a run that is %s as active', async (runState, cycleState) => {
+    vi.useFakeTimers();
+    const session = mountSession(cycleState);
+    const internal = session.source as unknown as {
+      latest: { programCycle: { state: string; run: { state: string } | null } };
+      executionActive: () => boolean;
+    };
+    internal.latest.programCycle.state = 'terminal_awaiting_reset';
+    internal.latest.programCycle.run = { state: runState };
+    expect(internal.executionActive()).toBe(true);
+    internal.latest.programCycle.run = { state: 'succeeded' };
+    expect(internal.executionActive()).toBe(false);
+    await session.dispose();
+  });
+
+  it('replaces a connection stale for 30 s only while no run or operation is active', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('starting');
+    vi.advanceTimersByTime(1_000);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('stale');
+    vi.advanceTimersByTime(30_000);
+    // A run is active: the stale connection is kept for Stop.
+    expect(session.socket.closed).toBeNull();
+    expect(session.controls()).toHaveLength(1);
+    session.send('program_motion_stop', 'stop.stale');
+    expect(session.commandKinds()).toEqual(['program_motion_stop']);
+    const internal = session.source as unknown as {
+      latest: { programCycle: { state: string } };
+    };
+    internal.latest.programCycle.state = 'idle_after_reset';
+    vi.advanceTimersByTime(1_000);
+    expect(session.socket.closed).toBe(1000);
+    expect(session.socket.sent.some((value) => (
+      JSON.parse(value).incident_kind === 'control_disconnected'
+      && JSON.parse(value).reason_code === 'control_stale_reconnect'
+    ))).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(session.controls()).toHaveLength(2);
+    await session.dispose();
+  });
+
+  it('clears an unconfirmed HTTP command once the owner state moves past it', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 503, json: async () => ({}),
+    }));
+    const session = mountSession('idle_after_reset');
+    await expect(session.send('program_run', 'run.unknown')).rejects
+      .toThrow('Command delivery is unconfirmed');
+    expect(session.socket.closed).toBeNull();
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Command delivery is unconfirmed; commands other than Stop are disabled.');
+    receiveControlSnapshot(session.socket, wireState(2));
+    expect(session.source.getShellSnapshot().transportError).toBeNull();
     await session.dispose();
   });
 });

@@ -241,6 +241,7 @@ def test_client_incident_is_a_closed_non_authoritative_enum() -> None:
     with pytest.raises(ValidationError):
         ControlClientIncidentDTO.model_validate({**incident, "payload": {}})
     for kind in (
+        "control_projection_invalid",
         "viewer_model_unavailable",
         "viewer_scene_unverified",
         "viewer_observation_stale",

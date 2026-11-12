@@ -11,6 +11,40 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **Composer keeps its control connection open instead of closing it on a
+  fault, so Stop keeps working.** Each case is recorded so its cause can be
+  found:
+  - A WebSocket command whose delivery the owner did not confirm within 1 s
+    no longer closes the connection. Commands other than Stop stay disabled
+    until the owner's watermark reaches it; the `command_delivery_unconfirmed`
+    incident now names the command kind and sequence
+    (`command_watermark_missing:<kind>:<sequence>`) and is resolved when the
+    watermark arrives.
+  - A Run, start or recovery command whose HTTP outcome is unknown (server
+    error, network error or timeout) no longer closes the connection.
+    Commands other than Stop stay disabled until the owner state shows a
+    newer control revision or cycle generation; the incident names the kind
+    and outcome (`http_response_unconfirmed:<kind>:http_<status>|network|timeout`).
+  - An invalid control message while a Stop could still matter (a Program
+    cycle starting, running, stopping, resetting or needing recovery; a run
+    held, halted or halting; an unfinished manual operation) no longer closes
+    the connection: Composer shows "Control state is invalid; commands other
+    than Stop are disabled. Reconnect when motion has stopped.", stops
+    applying owner state and still sends Stop. With nothing active it
+    reconnects as before. Either way it is recorded as the new client
+    incident `control_projection_invalid`
+    (`parse_error|non_monotonic|invalid_projection:<message kind>:<sequence>`),
+    resolved once a later session applies valid state.
+  - These latches on an open connection are titled "Control commands
+    unavailable" (with Reconnect); "Control connection unavailable" stays
+    for a connection that is down.
+  - A control connection that stays stale is replaced after 30 s, and only
+    while no run or operation is active (recorded as `control_disconnected`,
+    `control_stale_reconnect`).
+  - The Composer backend relay waits up to 30 s (was 0.25 s) for the browser
+    to take a frame. A send slower than 0.25 s, or one that times out, is
+    logged at a bounded rate with the control session id, message kind and
+    wait time.
 - **A motion Stop while the Program run is already stopping or Full
   stopping has no effect instead of being refused.** The Program-run owner
   answered it with `program_motion_stop_invalid` ("motion Stop requires a

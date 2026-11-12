@@ -4,6 +4,7 @@ import { VIEWER_POSE_RATE_HZ } from '../state/composerSettings';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { CommandRefusalError, receiptRefusal } from '../state/commandRefusal';
+import { operationStateIsTerminal } from '../state/robotControl';
 import { structuredErrorText } from '../state/structuredError';
 import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
@@ -46,6 +47,14 @@ import {
 } from '../utils/viewerPerformance';
 
 const RECONNECT_DELAY_MS = 1000;
+// A stale control connection is replaced only after this long, and only while
+// no run or operation is active; it is the owner's dead-peer bound.
+const CONTROL_STALE_RECONNECT_MS = 30_000;
+const CONTROL_STALE_RECONNECT_RECHECK_MS = 1_000;
+const COMMAND_DELIVERY_UNCONFIRMED =
+  'Command delivery is unconfirmed; commands other than Stop are disabled.';
+const CONTROL_STATE_INVALID =
+  'Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.';
 // The server already coalesces the shared shell projection. Retain a small
 // browser-side batch for React, but do not add a visible tenth of a second to
 // execution-control settlement.
@@ -223,6 +232,11 @@ export interface HeadlessStateResult {
   error: string | null;
   transportStatus: ControlTransportStatus;
   transportError: string | null;
+  /**
+   * The transportError is a latch on an open connection (an unconfirmed
+   * command or invalid control state), not a connection fault.
+   */
+  commandLatch: boolean;
   semanticStatus: ControlSemanticStatus;
   semanticReason: string | null;
   reconnect: () => void;
@@ -294,6 +308,15 @@ const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'runtime_scale',
 ]);
 
+/** Message kind and server sequence named by a control_projection_invalid record. */
+function controlIncidentMessage(record: Record<string, unknown>): { kind: string; sequence: string } {
+  const kind = typeof record.message_kind === 'string'
+    ? record.message_kind.replace(/[^a-z_]/g, '').slice(0, 64) : '';
+  const sequence = typeof record.server_sequence === 'string'
+    ? record.server_sequence.replace(/[^0-9]/g, '').slice(0, 20) : '';
+  return { kind: kind || 'unknown', sequence: sequence || 'none' };
+}
+
 export function executionCommandPayload(
   commandKind: ExecutionControlCommandKind,
   payload: Record<string, unknown>,
@@ -339,6 +362,7 @@ export type ControlClientIncidentKind =
   | 'browser_render_delayed'
   | 'command_delivery_unconfirmed'
   | 'control_disconnected'
+  | 'control_projection_invalid'
   | 'history_detail_request_failed'
   | 'history_request_failed'
   | 'viewer_model_unavailable'
@@ -784,6 +808,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private controlHeartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private controlStaleReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private controlSessionId: string | null = null;
   private controlReceiverIncarnation: string | null = null;
   private controlSnapshotBarrierPending = true;
@@ -796,6 +821,19 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private commandDeliveryFaultSessionId: string | null = null;
   private controlTransportStatus: ControlTransportStatus = 'disconnected';
   private controlTransportError: string | null = null;
+  // Latches that keep the connection open. Each disables commands other than
+  // Stop until its own condition clears, or until a new control session.
+  // Unconfirmed WS command: the owner's watermark must reach this sequence.
+  private deliveryWatermarkLatch: bigint | null = null;
+  // Unconfirmed HTTP command: the owner state must move past this point.
+  private deliveryRevisionLatch: {
+    executionControlRevision: number;
+    cycleGeneration: number | null;
+  } | null = null;
+  // An invalid control message: owner state is no longer applied.
+  private controlStateInvalidCause: string | null = null;
+  // The session on which control_projection_invalid was raised.
+  private controlProjectionInvalidSessionId: string | null | undefined = undefined;
   private controlSemanticStatus: ControlSemanticStatus = 'synchronizing';
   private controlSemanticReason: string | null = 'control_projection_synchronizing';
   private executionControl: CurrentExecutionControl | null = null;
@@ -964,7 +1002,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       || control === null
       || (!stop && (
         !this.controlHeartbeatConfirmed
-        || this.controlTransportError !== null
+        || this.commandBlockingError() !== null
         || !this.controlProjectionIsCurrent()
       ))
     ) {
@@ -999,6 +1037,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         const abort = new AbortController();
         const deadline = setTimeout(() => abort.abort(), 5_000);
         let acknowledged = false;
+        let httpStatus: number | null = null;
         try {
           const response = await fetch(resolveStructuralAssetUrl('/api/control/commands'), {
             method: 'POST',
@@ -1019,6 +1058,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               payload: fencedPayload,
             }),
           });
+          httpStatus = response.status;
           const body: unknown = await response.json();
           if (!response.ok) {
             // A non-5xx owner response is a known outcome, including an
@@ -1086,14 +1126,21 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           };
         } catch (error: unknown) {
           if (!acknowledged) {
-            this.controlTransportError = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
-            this.commandDeliveryFaultSessionId = sessionId;
-            this.reportClientIncident(
-              'command_delivery_unconfirmed', true, 'http_response_unconfirmed', 5_000_000_000,
+            // Keep the connection: the owner state shows the outcome. Until it
+            // moves past this point, commands other than Stop stay disabled.
+            const outcome = abort.signal.aborted ? 'timeout'
+              : httpStatus === null ? 'network' : `http_${httpStatus}`;
+            this.latchCommandDelivery(
+              sessionId,
+              `http_response_unconfirmed:${commandKind}:${outcome}`,
+              5_000_000_000,
+              null,
+              {
+                executionControlRevision: control.execution_control_revision,
+                cycleGeneration: this.latest?.programCycle.cycleGeneration ?? null,
+              },
             );
-            this.refreshControlCondition();
-            socket.close(4002, 'command delivery unconfirmed');
-            throw new CommandDeliveryUnconfirmedError(this.controlTransportError, { cause: error });
+            throw new CommandDeliveryUnconfirmedError(COMMAND_DELIVERY_UNCONFIRMED, { cause: error });
           }
           throw error;
         } finally {
@@ -1155,22 +1202,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           if (this.runtimeScaleControlPending === correlationId) {
             this.runtimeScaleControlPending = null;
           }
-          const error = new CommandDeliveryUnconfirmedError(
-            'Command delivery is unconfirmed; commands other than Stop are disabled.',
-          );
-          pending.reject(error);
-          this.controlTransportError = error.message;
-          this.commandDeliveryFaultSessionId = sessionId;
-          this.reportClientIncident(
-            'command_delivery_unconfirmed',
-            true,
-            'command_watermark_missing',
+          pending.reject(new CommandDeliveryUnconfirmedError(COMMAND_DELIVERY_UNCONFIRMED));
+          // Keep the connection: an open socket delivers in order, so this
+          // command is late, not lost. Commands other than Stop stay disabled
+          // until the owner's watermark reaches it.
+          this.latchCommandDelivery(
+            sessionId,
+            `command_watermark_missing:${commandKind}:${clientSequence}`,
             CONTROL_COMMAND_DELIVERY_NS,
+            pending.clientSequence,
+            null,
           );
-          this.refreshControlCondition();
-          // Recover only through a new current snapshot. The backend may have
-          // received the command even though this session could not prove it.
-          socket.close(4002, 'command delivery unconfirmed');
         }, CONTROL_COMMAND_DELIVERY_NS / 1_000_000);
       } catch (reason) {
         this.commandReceipts.delete(correlationId);
@@ -1394,6 +1436,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.lastReceivedClientSequence = 0n;
     this.controlHeartbeatFreshness = null;
     this.controlTransportError = null;
+    this.clearConnectionLatches();
     this.controlSemanticStatus = 'synchronizing';
     this.controlSemanticReason = 'control_projection_synchronizing';
     this.ordinaryControlPending = null;
@@ -1430,6 +1473,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     if (!this.enabled || this.disposed) return;
     this.controlTransportStatus = 'connecting';
     this.controlTransportError = null;
+    this.clearConnectionLatches();
     this.refreshControlCondition();
     const serial = ++this.serial;
     const socket = new WebSocket(websocketUrl('/ws/control'));
@@ -1455,12 +1499,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     };
     socket.onmessage = (message) => {
       if (serial !== this.serial) return;
+      // What the incident names if this message proves invalid.
+      let incidentMessage = { kind: 'unparsed', sequence: 'none' };
       try {
         const raw: unknown = JSON.parse(String(message.data));
         if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
           throw new Error('Control message must be an object.');
         }
         const record = raw as Record<string, unknown>;
+        incidentMessage = controlIncidentMessage(record);
         if (record.schema_version !== CONTROL_PROTOCOL_VERSION) {
           throw new Error('Control protocol version is unsupported.');
         }
@@ -1661,11 +1708,16 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           return;
         }
         if (kind === 'resync_required') {
-          throw new Error('Control session requires a current resynchronization.');
+          this.publishError('Control session requires a current resynchronization.');
+          socket.close(4002, 'invalid headless projection');
+          return;
         }
         if (kind !== 'snapshot' && kind !== 'delta') {
           throw new Error('Control server message kind is unsupported.');
         }
+        // After an invalid message, owner state is no longer applied; the
+        // session stays open for heartbeats, receipts and Stop.
+        if (this.controlStateInvalidCause !== null) return;
         if (this.controlSnapshotBarrierPending && kind !== 'snapshot') {
           throw new Error('Control delta preceded its snapshot barrier.');
         }
@@ -1677,14 +1729,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           throw new Error('Control state delivery sequence is invalid.');
         }
         if (ownerState) this.admitControlWatermark(record.received_client_sequence);
-        this.applyControlState(record, kind, socket);
+        this.applyControlState(record, kind, serial, socket);
       } catch (reason) {
-        this.publishError(
-          reason instanceof Error
-            ? reason.message
-            : 'Invalid headless WebSocket projection.',
-        );
-        socket.close(4002, 'invalid headless projection');
+        this.latchControlStateInvalid(serial, socket, reason, 'parse_error', incidentMessage);
       }
     };
     socket.onerror = () => {
@@ -1723,11 +1770,131 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       throw new Error('Control client watermark regressed.');
     }
     this.lastReceivedClientSequence = watermark;
+    if (this.deliveryWatermarkLatch !== null && watermark >= this.deliveryWatermarkLatch) {
+      this.deliveryWatermarkLatch = null;
+      this.resolveCommandDeliveryLatch();
+    }
+  }
+
+  /** Commands other than Stop are disabled while this is not null. */
+  private commandBlockingError(): string | null {
+    return this.controlTransportError ?? this.commandLatchMessage();
+  }
+
+  /** A latch on the open connection; a connection fault takes precedence. */
+  private commandLatchMessage(): string | null {
+    if (this.controlStateInvalidCause !== null) return CONTROL_STATE_INVALID;
+    return this.deliveryWatermarkLatch !== null || this.deliveryRevisionLatch !== null
+      ? COMMAND_DELIVERY_UNCONFIRMED
+      : null;
+  }
+
+  private clearConnectionLatches(): void {
+    this.deliveryWatermarkLatch = null;
+    this.deliveryRevisionLatch = null;
+    this.controlStateInvalidCause = null;
+    if (this.controlStaleReconnectTimer !== null) {
+      clearTimeout(this.controlStaleReconnectTimer);
+      this.controlStaleReconnectTimer = null;
+    }
+  }
+
+  private latchCommandDelivery(
+    sessionId: string,
+    reasonCode: string,
+    observedDelayNs: number,
+    watermark: bigint | null,
+    revision: NonNullable<HeadlessStateSource['deliveryRevisionLatch']> | null,
+  ): void {
+    if (this.controlSessionId !== sessionId) return;
+    if (watermark !== null && (this.deliveryWatermarkLatch === null
+      || watermark > this.deliveryWatermarkLatch)) {
+      this.deliveryWatermarkLatch = watermark;
+    }
+    if (revision !== null && this.deliveryRevisionLatch === null) {
+      this.deliveryRevisionLatch = revision;
+    }
+    this.commandDeliveryFaultSessionId = sessionId;
+    this.reportClientIncident(
+      'command_delivery_unconfirmed', true, reasonCode, observedDelayNs,
+    );
+    this.refreshControlCondition();
+  }
+
+  private resolveCommandDeliveryLatch(): void {
+    if (this.deliveryWatermarkLatch !== null || this.deliveryRevisionLatch !== null) return;
+    this.commandDeliveryFaultSessionId = null;
+    this.reportClientIncident(
+      'command_delivery_unconfirmed',
+      false,
+      'command_delivery_confirmed',
+    );
+    this.refreshControlCondition();
+  }
+
+  /**
+   * Whether a Stop could still matter, as the last applied owner state shows
+   * it: a Program cycle that is not idle or ended, a run that is still alive
+   * (also held or halted, before its Resume or Reset), or a manual operation
+   * that has not ended.
+   */
+  private executionActive(): boolean {
+    const snapshot = this.latest;
+    if (snapshot === null) return false;
+    const cycle = snapshot.programCycle;
+    if (['starting', 'running', 'stopping', 'resetting', 'recovery_required'].includes(cycle.state)) {
+      return true;
+    }
+    if (['running', 'intervention_required', 'full_stopping', 'full_stopped', 'stopping',
+      'finalizing'].includes(cycle.run?.state ?? '')) {
+      return true;
+    }
+    return (snapshot.executionControlStatus?.manualOperations ?? [])
+      .some((operation) => !operationStateIsTerminal(operation.state));
+  }
+
+  /**
+   * An invalid control message is a defect to find, not a reason to drop the
+   * connection a Stop travels on. Commands other than Stop are disabled and
+   * owner state is no longer applied; the connection is replaced only while
+   * no run or operation is active.
+   */
+  private latchControlStateInvalid(
+    serial: number,
+    socket: WebSocket,
+    reason: unknown,
+    category: 'parse_error' | 'non_monotonic' | 'invalid_projection',
+    message: { kind: string; sequence: string },
+    closeReason = 'invalid headless projection',
+  ): void {
+    if (serial !== this.serial || this.socket !== socket) return;
+    const cause = reason instanceof Error ? reason.message : 'Invalid headless WebSocket projection.';
+    // Resolved once a later control session applies valid state.
+    this.controlProjectionInvalidSessionId = this.controlSessionId;
+    this.reportClientIncident(
+      'control_projection_invalid',
+      true,
+      `${category}:${message.kind}:${message.sequence}`,
+    );
+    if (this.controlStateInvalidCause === null && !this.executionActive()) {
+      this.publishError(cause);
+      socket.close(4002, closeReason);
+      return;
+    }
+    if (this.controlStateInvalidCause !== null) return;
+    this.controlStateInvalidCause = cause;
+    this.refreshControlCondition();
+  }
+
+  private replaceControlConnection(reason: string): void {
+    this.stopConnection(reason);
+    this.reconnectTimer = setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
   }
 
   private applyControlState(
     record: Record<string, unknown>,
     kind: 'snapshot' | 'delta',
+    serial: number,
     socket: WebSocket,
   ): void {
     try {
@@ -1908,8 +2075,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         candidate,
       );
       if (!admission.accepted) {
-        this.publishError(admission.reason);
-        socket.close(4002, 'non-monotonic headless projection');
+        this.latchControlStateInvalid(
+          serial, socket, new Error(admission.reason ?? 'Headless projection is not monotonic.'),
+          'non_monotonic', controlIncidentMessage(record), 'non-monotonic headless projection',
+        );
         return;
       }
       this.controlSnapshotBarrierPending = false;
@@ -1921,6 +2090,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || record.event_class === 'critical'
         || !sameShellPublication(this.latest, candidate));
       this.latest = candidate;
+      const revisionLatch = this.deliveryRevisionLatch;
+      if (revisionLatch !== null && (
+        (this.executionControl?.execution_control_revision ?? 0)
+          > revisionLatch.executionControlRevision
+        || (revisionLatch.cycleGeneration !== null
+          && candidate.programCycle.cycleGeneration > revisionLatch.cycleGeneration))) {
+        this.deliveryRevisionLatch = null;
+        this.resolveCommandDeliveryLatch();
+      }
       if (progressPresent || globalRulesPresent || cellFactsPresent || kind === 'snapshot') {
         if (progressPresent || kind === 'snapshot') {
           this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
@@ -1944,6 +2122,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.refreshControlCondition();
       this.advancePresentedFrame(candidate);
       this.resolveCommandDeliveryFaultAfterResynchronization();
+      if (this.controlProjectionInvalidSessionId !== undefined
+        && this.controlProjectionInvalidSessionId !== this.controlSessionId) {
+        this.controlProjectionInvalidSessionId = undefined;
+        this.reportClientIncident(
+          'control_projection_invalid', false, 'control_state_valid_after_reconnect',
+        );
+      }
       if (!this.controlHeartbeatConfirmed) {
         // A frozen, unverified viewer frame never outlives an identity
         // change: publish it so the model is hidden behind the barrier.
@@ -1959,12 +2144,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         if (shellChanged) this.scheduleShell(record.event_class === 'critical');
       }
     } catch (reason) {
-      this.publishError(
-        reason instanceof Error
-          ? reason.message
-          : 'Invalid headless WebSocket projection.',
+      this.latchControlStateInvalid(
+        serial, socket, reason, 'invalid_projection', controlIncidentMessage(record),
       );
-      socket.close(4002, 'invalid headless projection');
     }
   }
 
@@ -1973,6 +2155,24 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       clearTimeout(this.controlHeartbeatTimer);
       this.controlHeartbeatTimer = null;
     }
+    if (this.controlStaleReconnectTimer !== null) {
+      clearTimeout(this.controlStaleReconnectTimer);
+      this.controlStaleReconnectTimer = null;
+    }
+  }
+
+  private scheduleStaleReconnect(serial: number, socket: WebSocket, delayMs: number): void {
+    this.controlStaleReconnectTimer = setTimeout(() => {
+      this.controlStaleReconnectTimer = null;
+      if (serial !== this.serial || this.socket !== socket
+        || this.controlTransportStatus !== 'stale') return;
+      if (this.executionActive()) {
+        this.scheduleStaleReconnect(serial, socket, CONTROL_STALE_RECONNECT_RECHECK_MS);
+        return;
+      }
+      this.reportClientIncident('control_disconnected', true, 'control_stale_reconnect');
+      this.replaceControlConnection('control connection stale');
+    }, delayMs);
   }
 
   private resolveCommandDeliveryFaultAfterResynchronization(): void {
@@ -2053,6 +2253,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         // Keep the live transport. The server keeps one challenge
         // outstanding and can recover the session without reconnect churn;
         // it separately reclaims a genuinely dead peer after a bounded wait.
+        // A connection still stale after that bound is replaced, but only
+        // while no run or operation is active.
+        this.scheduleStaleReconnect(serial, socket, CONTROL_STALE_RECONNECT_MS);
       }, (CONTROL_HEARTBEAT_STALE_NS - CONTROL_HEARTBEAT_DELAYED_NS) / 1_000_000);
     }, CONTROL_HEARTBEAT_DELAYED_NS / 1_000_000);
   }
@@ -2249,7 +2452,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       snapshot: this.latest,
       error: this.latestError,
       transportStatus: this.controlTransportStatus,
-      transportError: this.controlTransportError,
+      transportError: this.commandBlockingError(),
+      commandLatch: this.controlTransportError === null && this.commandLatchMessage() !== null,
       semanticStatus: semantic.status,
       semanticReason: semantic.reason,
       reconnect: this.reconnect,
@@ -2318,12 +2522,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const rulesCurrent = this.controlTransportStatus === 'connected'
       && this.controlSemanticStatus === 'current'
       && this.controlHeartbeatConfirmed
-      && this.controlTransportError === null;
+      && this.commandBlockingError() === null;
     if (rulesCurrent !== this.globalRulesCurrent) {
       this.globalRulesCurrent = rulesCurrent;
       for (const listener of this.operationProgressListeners) listener();
     }
-    let error = this.enabled ? this.controlTransportError : null;
+    const blockingError = this.commandBlockingError();
+    let error = this.enabled ? blockingError : null;
     const semantic = this.semanticCondition();
     if (this.enabled && error === null && semantic.status === 'synchronizing') {
       error = 'Control state is synchronizing; commands other than Stop are disabled.';
@@ -2334,7 +2539,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     if (
       error === this.latestError
       && this.shellResult.transportStatus === this.controlTransportStatus
-      && this.shellResult.transportError === this.controlTransportError
+      && this.shellResult.transportError === blockingError
+      && this.shellResult.commandLatch === (
+        this.controlTransportError === null && this.commandLatchMessage() !== null)
       && this.shellResult.semanticStatus === semantic.status
       && this.shellResult.semanticReason === semantic.reason
     ) return;
@@ -2610,6 +2817,7 @@ export function useViewerHeadlessState(
     error: null,
     transportStatus: 'disconnected',
     transportError: null,
+    commandLatch: false,
     semanticStatus: 'synchronizing',
     semanticReason: 'control_projection_synchronizing',
     reconnect: source.reconnect,

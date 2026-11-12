@@ -2219,7 +2219,8 @@ CanonicalValue HeadlessApiCore::RecordClientIncident(
   const std::set<std::string> allowed_kinds{
       "browser_render_delayed", "command_delivery_unconfirmed",
       "control_delayed",        "control_disconnected",
-      "control_stale",          "history_detail_request_failed",
+      "control_stale",          "control_projection_invalid",
+      "history_detail_request_failed",
       "history_request_failed", "control_source_unavailable",
       // Browser-only viewer conditions presented as errors:
       // an unavailable/unverified view of the applied robot or Scene.

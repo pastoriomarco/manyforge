@@ -145,7 +145,8 @@ published enum of browser-only transport/render/history/viewer failures;
 Headless supplies time and attribution and cannot be used as a general event
 writer. The v2 client enum is `browser_render_delayed`,
 `command_delivery_unconfirmed`, `control_disconnected`,
-`history_request_failed`, `history_detail_request_failed`,
+`control_projection_invalid`, `history_request_failed`,
+`history_detail_request_failed`,
 `viewer_model_unavailable`, `viewer_scene_unverified`,
 `viewer_observation_stale`, and `viewer_geometry_unavailable`. The viewer kinds
 record an unavailable or unverifiable view of the applied robot model, Scene,

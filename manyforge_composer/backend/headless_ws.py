@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -24,9 +25,20 @@ from websockets.exceptions import ConnectionClosed
 
 from .authoring_admission import AuthoringAdmissionCoordinator
 from .authoring_workspace import AuthoringWorkspace
+from .log_throttle import ThrottledLog
 
 
-_SEND_TIMEOUT_SECONDS = 0.25
+# A browser that cannot take one frame within the owner's dead-peer bound
+# (30 s) is gone; a slower but live browser keeps its control connection.
+# Memory stays bounded: one frame is in this send, and the owner sends at most
+# one state frame per browser credit plus one heartbeat slot and its bounded
+# receipts, which wait in the upstream connection's bounded receive queue.
+_SEND_TIMEOUT_SECONDS = 30.0
+# A send slower than this used to end the connection; it is now recorded.
+_SLOW_SEND_SECONDS = 0.25
+_SEND_LOG = ThrottledLog(min_interval_s=5.0)
+_MESSAGE_KIND = re.compile(r'"message_kind"\s*:\s*"([a-z_]{1,64})"')
+_SESSION_ID = re.compile(r'"control_session_id"\s*:\s*"([^"\\]{1,256})"')
 _STATE_MESSAGE = re.compile(r'"message_kind"\s*:\s*"(?:snapshot|delta)"')
 _SNAPSHOT_MESSAGE = re.compile(r'"message_kind"\s*:\s*"snapshot"')
 _SERVER_SEQUENCE = re.compile(r'("server_sequence"\s*:\s*")([1-9][0-9]*)(")')
@@ -188,6 +200,22 @@ class HeadlessStateSource:
             raise ValueError("Composer local control projection is oversized")
         return encoded
 
+def _log_send(outcome: str, session_id: str, payload: str, waited_s: float) -> None:
+    """Record a slow or timed-out browser send, rate-limited per outcome."""
+
+    kind = _MESSAGE_KIND.search(payload)
+    _SEND_LOG.warning(
+        _LOGGER,
+        f"control_proxy.browser_send_{outcome}",
+        "control proxy browser send %s: control_session_id=%s message_kind=%s wait_ms=%.1f",
+        outcome,
+        session_id,
+        "unknown" if kind is None else kind.group(1),
+        waited_s * 1000.0,
+        extra={"event": f"manyforge.composer.control_proxy_send_{outcome}"},
+    )
+
+
 async def serve_headless_state(
     websocket: WebSocket,
     source: HeadlessStateSource,
@@ -214,6 +242,21 @@ async def serve_headless_state(
         ) as upstream:
             downstream_sequence = 0
             latest_state_payload: str | None = None
+            session_id = "unknown"
+
+            async def send_browser(payload: str) -> None:
+                started = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        websocket.send_text(payload),
+                        timeout=_SEND_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    _log_send("timeout", session_id, payload, time.monotonic() - started)
+                    raise
+                waited = time.monotonic() - started
+                if waited > _SLOW_SEND_SECONDS:
+                    _log_send("slow", session_id, payload, waited)
 
             def downstream(payload: str) -> str:
                 nonlocal downstream_sequence
@@ -259,7 +302,7 @@ async def serve_headless_state(
                     await upstream.send(message)
 
             async def owner_to_browser() -> None:
-                nonlocal latest_state_payload
+                nonlocal latest_state_payload, session_id
                 iterator = upstream.__aiter__()
                 owner_next = asyncio.create_task(iterator.__anext__())
                 local_next = asyncio.create_task(local_subscription.wake.wait())
@@ -276,6 +319,10 @@ async def serve_headless_state(
                                 return
                             if not isinstance(message, str):
                                 raise ValueError("Headless control frame is not text")
+                            if session_id == "unknown":
+                                found = _SESSION_ID.search(message)
+                                if found is not None:
+                                    session_id = found.group(1)
                             is_state = _STATE_MESSAGE.search(message) is not None
                             # Only the initial snapshot needs Composer-local
                             # enrichment. Owner deltas and control messages stay
@@ -287,19 +334,13 @@ async def serve_headless_state(
                             )
                             if is_state:
                                 latest_state_payload = payload
-                            await asyncio.wait_for(
-                                websocket.send_text(downstream(payload)),
-                                timeout=_SEND_TIMEOUT_SECONDS,
-                            )
+                            await send_browser(downstream(payload))
                             owner_next = asyncio.create_task(iterator.__anext__())
                         if local_next in done:
                             local_subscription.wake.clear()
                             if latest_state_payload is not None:
                                 payload = source.local_delta(latest_state_payload)
-                                await asyncio.wait_for(
-                                    websocket.send_text(downstream(payload)),
-                                    timeout=_SEND_TIMEOUT_SECONDS,
-                                )
+                                await send_browser(downstream(payload))
                                 latest_state_payload = payload
                             local_next = asyncio.create_task(
                                 local_subscription.wake.wait()

@@ -93,6 +93,7 @@ ControlClientIncidentKind = Literal[
     "browser_render_delayed",
     "command_delivery_unconfirmed",
     "control_disconnected",
+    "control_projection_invalid",
     "history_detail_request_failed",
     "history_request_failed",
     "viewer_model_unavailable",

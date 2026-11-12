@@ -356,6 +356,7 @@ describe('headless Composer presentation adapters', () => {
         error: 'Headless projection disconnected.',
         transportStatus: 'disconnected',
         transportError: 'Headless projection disconnected.',
+        commandLatch: false,
         semanticStatus: 'current',
         semanticReason: null,
         reconnect,
@@ -380,6 +381,7 @@ describe('headless Composer presentation adapters', () => {
         error: null,
         transportStatus: 'connected',
         transportError: null,
+        commandLatch: false,
         semanticStatus: 'current',
         semanticReason: null,
         reconnect,
@@ -409,6 +411,7 @@ describe('headless Composer presentation adapters', () => {
         error: null,
         transportStatus: 'connected',
         transportError: null,
+        commandLatch: false,
         semanticStatus: 'current',
         semanticReason: null,
         reconnect,
@@ -441,7 +444,7 @@ describe('headless Composer presentation adapters', () => {
         unacknowledgedCount: 1, liveCount: 1, motionAttentionCount: 0,
         motionAttentionMembership: [], unacknowledgedMembership: [],
       } },
-      error: null, transportStatus: 'connected' as const, transportError: null,
+      error: null, transportStatus: 'connected' as const, transportError: null, commandLatch: false,
       semanticStatus: 'current' as const, semanticReason: null, reconnect,
     };
     // A warning (yellow) is never in the red row.

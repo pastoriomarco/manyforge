@@ -2331,6 +2331,36 @@ TEST(HeadlessApiCore, ViewerClientIncidentsAreErrorsWithTheirClosedKinds) {
   }
 }
 
+TEST(HeadlessApiCore, InvalidControlProjectionIsAnErrorIncident) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto receipt = core.RecordClientIncident(
+      "client-incident.projection", "control_projection_invalid", "activated",
+      "control-session.one", "client.one", "operator_ui",
+      "invalid_projection:delta:42", 1U, std::nullopt, 100U, 100U);
+  EXPECT_TRUE(std::get<bool>(Member(receipt, "recorded").storage()));
+
+  HistorianQuery query;
+  query.components.insert("manyforge.composer");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (!Array(page, "events").empty()) {
+      break;
+    }
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &event = Member(Array(page, "events").front(), "event");
+  EXPECT_EQ(Text(event, "event_type"), "client_incident_activated");
+  EXPECT_EQ(Text(event, "severity"), "ERROR");
+  EXPECT_EQ(Text(Member(event, "payload"), "incident_kind"),
+            "control_projection_invalid");
+  EXPECT_EQ(Text(Member(event, "payload"), "reason_code"),
+            "invalid_projection:delta:42");
+}
+
 TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());

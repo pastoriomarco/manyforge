@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 import threading
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from manyforge_composer.backend import headless_ws
+from manyforge_composer.backend.log_throttle import ThrottledLog
 from manyforge_composer.backend.headless_ws import (
     HeadlessStateSource,
     serve_headless_state,
@@ -240,6 +242,54 @@ def test_slow_browser_output_cannot_block_command_ingress(monkeypatch) -> None:
         await asyncio.wait_for(task, 0.5)
 
     asyncio.run(exercise())
+
+
+def test_a_slow_browser_send_keeps_the_connection_and_is_recorded(
+    monkeypatch, caplog,
+) -> None:
+    """A send slower than the old 0.25 s bound no longer ends the session."""
+
+    class _SlowBrowser(_Browser):
+        async def send_text(self, message: str) -> None:
+            self.send_started.set()
+            await self.release_send.wait()
+            self.sent.append(json.loads(message))
+
+    async def exercise() -> None:
+        upstream = _Upstream(wait_for_browser=False)
+        monkeypatch.setattr(
+            headless_ws,
+            "connect_websocket",
+            lambda *_args, **_kwargs: upstream,
+        )
+        monkeypatch.setattr(headless_ws, "_SEND_LOG", ThrottledLog(min_interval_s=5.0))
+        browser = _SlowBrowser("stop-command")
+        task = asyncio.create_task(
+            serve_headless_state(browser, _source())  # type: ignore[arg-type]
+        )
+        await asyncio.wait_for(browser.send_started.wait(), 0.2)
+        await asyncio.sleep(0.4)
+        assert not task.done()
+        assert not browser.closed
+        browser.release_send.set()
+        while not browser.sent:
+            await asyncio.sleep(0.01)
+        assert browser.sent[0]["message_kind"] == "snapshot"
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert headless_ws._SEND_TIMEOUT_SECONDS == 30.0  # noqa: SLF001
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(exercise())
+    records = [
+        record.getMessage() for record in caplog.records
+        if "control proxy browser send slow" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert "control_session_id=control-session.1" in records[0]
+    assert "message_kind=snapshot" in records[0]
 
 
 def test_local_draft_wake_emits_one_resequenced_latest_shell(

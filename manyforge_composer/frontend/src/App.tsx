@@ -654,7 +654,9 @@ export default function App() {
         id: 'control.connection',
         severity: 'error',
         domain: 'transport',
-        title: 'Control connection unavailable',
+        // A latch on an open connection is not a connection fault.
+        title: headlessState.commandLatch
+          ? 'Control commands unavailable' : 'Control connection unavailable',
         message: headlessState.transportError,
         actions: [{
           id: 'reconnect',
@@ -687,6 +689,7 @@ export default function App() {
   }, [
     headlessEnabled,
     headlessSnapshot,
+    headlessState.commandLatch,
     headlessState.reconnect,
     headlessState.semanticReason,
     headlessState.semanticStatus,

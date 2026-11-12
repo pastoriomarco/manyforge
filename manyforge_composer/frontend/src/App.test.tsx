@@ -184,6 +184,13 @@ describe('Composer shell continuity', () => {
     }
   });
 
+  it('titles a latch on an open control connection apart from a connection fault', () => {
+    const source = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    const notice = source.slice(source.indexOf('const controlNotices'), source.indexOf("id: 'control.state'"));
+    // Both keep the latch or fault sentence as the body and offer Reconnect.
+    expect(notice).toMatch(/title: headlessState\.commandLatch\s*\? 'Control commands unavailable' : 'Control connection unavailable',\s*message: headlessState\.transportError,\s*actions: \[\{\s*id: 'reconnect',/);
+  });
+
   it('keeps the canvas fixed and gives scrolling to bounded side surfaces', () => {
     const markup = renderToStaticMarkup(<App />);
     const css = readStyleSource();
