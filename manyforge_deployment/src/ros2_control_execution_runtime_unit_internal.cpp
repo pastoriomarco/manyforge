@@ -254,8 +254,6 @@ CanonicalValue ros2_control_execution_runtime_infrastructure_projection(
             CanonicalValue(liveness.runtime_policy_revision.value())},
            {"heartbeat_period_ns",
             CanonicalValue(static_cast<double>(liveness.heartbeat_period_ns))},
-           {"expiry_timeout_ns",
-            CanonicalValue(static_cast<double>(liveness.expiry_timeout_ns))},
            {"local_safe_state_contract_id",
             CanonicalValue(liveness.local_safe_state_contract_id.value())},
            {"local_safe_state_contract_revision",

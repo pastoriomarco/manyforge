@@ -164,7 +164,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
@@ -218,7 +218,7 @@ TEST(OwnerSettlementReaders,
     return ReadActiveProgramRunProductForReconciliation(fixture.path());
   };
 
-  const auto current = journal(9);
+  const auto current = journal(10);
   ASSERT_TRUE(current.ok());
   ASSERT_TRUE(current.value().has_value());
   EXPECT_EQ(current.value()->program_run_id, core::ProgramRunId("run.7"));
@@ -226,6 +226,8 @@ TEST(OwnerSettlementReaders,
   EXPECT_FALSE(journal(3).ok());
   EXPECT_FALSE(journal(7).ok());
   EXPECT_FALSE(journal(8).ok());
+  EXPECT_FALSE(journal(9).ok());
+  EXPECT_FALSE(journal(11).ok());
 }
 
 TEST(OwnerSettlementReaders, AbsentProgramJournalHasNoRecoveryProduct) {
@@ -245,7 +247,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase current;
   current.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "INSERT INTO program_cycle VALUES(1,'running','run.7',0)");
@@ -258,7 +260,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "INSERT INTO program_cycle "
@@ -274,7 +276,7 @@ TEST(OwnerSettlementReaders, ActiveProgramRunRecoveryRejectsACrossRunCapture) {
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "program_run_id TEXT,reconciliation_required INTEGER);"
       "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY KEY,"
@@ -318,7 +320,7 @@ TEST(OwnerSettlementReaders,
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY "
         "KEY,schema_version INTEGER);"
-        "INSERT INTO program_cycle_metadata VALUES(1,9);"
+        "INSERT INTO program_cycle_metadata VALUES(1,10);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state "
         "TEXT,program_run_id TEXT,reconciliation_required INTEGER);"
         "CREATE TABLE program_run_history(program_run_id TEXT PRIMARY "
@@ -373,7 +375,7 @@ TEST(OwnerSettlementReaders,
     TemporaryDatabase fixture;
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-        "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+        "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
         "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
         "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -419,7 +421,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -446,7 +448,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase retired;
   retired.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,schema_version INTEGER);"
-      "INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,owner_epoch TEXT,"
       "program_run_id TEXT,claim_json TEXT,terminal_reference TEXT,start_settlement_json TEXT,"
       "release_intent_json TEXT,reconciliation_required INTEGER,acquisition_pending_json TEXT,reset_phase TEXT);");
@@ -459,7 +461,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase missing_intent;
   missing_intent.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -490,7 +492,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -526,7 +528,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -547,7 +549,7 @@ TEST(OwnerSettlementReaders,
   EXPECT_FALSE(
       ValidateProgramCycleSettlementReadOnly(fixture.path(), claim, release)
           .ok());
-  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=9");
+  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=10");
 
   fixture.Exec("UPDATE program_cycle SET reset_phase='stopping'");
   fixture.Close();
@@ -572,7 +574,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -604,7 +606,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -650,7 +652,7 @@ TEST(OwnerSettlementReaders,
   TemporaryDatabase terminal;
   terminal.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
-      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "schema_version INTEGER); INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
       "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
       "release_intent_json TEXT,terminal_reference TEXT,"
@@ -741,7 +743,7 @@ TEST(OwnerSettlementReaders,
       fixture.Exec(
           "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
           "schema_version INTEGER); INSERT INTO program_cycle_metadata "
-          "VALUES(1,9);"
+          "VALUES(1,10);"
           "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
           "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
           "release_intent_json TEXT,terminal_reference TEXT,"
@@ -811,7 +813,7 @@ TEST(OwnerSettlementReaders,
     fixture.Exec(
         "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,"
         "schema_version INTEGER); INSERT INTO program_cycle_metadata "
-        "VALUES(1,9);"
+        "VALUES(1,10);"
         "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,"
         "owner_epoch TEXT,program_run_id TEXT,claim_json TEXT,"
         "terminal_reference TEXT,start_settlement_json TEXT,"
@@ -873,7 +875,7 @@ TEST(OwnerSettlementReaders, IdleResetReleaseRequiresItsExactAcceptedJournalOccu
   TemporaryDatabase fixture;
   fixture.Exec(
       "CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY,schema_version INTEGER);"
-      "INSERT INTO program_cycle_metadata VALUES(1,9);"
+      "INSERT INTO program_cycle_metadata VALUES(1,10);"
       "CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY,state TEXT,owner_epoch TEXT,"
       "cycle_generation INTEGER,program_run_id TEXT,claim_json TEXT,terminal_reference TEXT,"
       "reconciliation_required INTEGER,acquisition_pending_json TEXT,reset_phase TEXT,reset_effect_claim_json TEXT,"
@@ -899,7 +901,7 @@ TEST(OwnerSettlementReaders, IdleResetReleaseRequiresItsExactAcceptedJournalOccu
   }
   fixture.Exec("UPDATE program_cycle SET reset_phase='releasing'; UPDATE program_cycle_metadata SET schema_version=7");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());
-  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=9; UPDATE program_cycle SET reconciliation_required=1");
+  fixture.Exec("UPDATE program_cycle_metadata SET schema_version=10; UPDATE program_cycle SET reconciliation_required=1");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());
   fixture.Exec("UPDATE program_cycle SET reconciliation_required=0; UPDATE program_cycle_inflight_commands SET request_id='foreign'");
   EXPECT_FALSE(ValidateProgramResetSettlementReadOnly(fixture.path(), claim, release).ok());

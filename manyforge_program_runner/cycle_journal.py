@@ -28,7 +28,7 @@ from .liveness import RetainedLiveness
 # Development-only cutover: this runner creates and opens exactly this
 # journal version. Older and newer journals are refused unchanged, before any
 # write; their run history is not migrated or reinterpreted.
-SCHEMA_VERSION: Final = 9
+SCHEMA_VERSION: Final = 10
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 MAXIMUM_FINISHED_HISTORY_BYTES: Final = 256 * 1024 * 1024
@@ -74,8 +74,6 @@ _REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] 
         ("singleton", "INTEGER", 0, 1),
         ("manager_runtime_epoch", "TEXT", 0, 0),
         ("manager_owner_epoch", "TEXT", 0, 0),
-        ("predecessor_expired", "INTEGER", 1, 0),
-        ("fault_reference", "TEXT", 0, 0),
     ),
     "program_run_history": (
         ("program_run_id", "TEXT", 0, 1),
@@ -141,10 +139,7 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
         CREATE TABLE program_runner_liveness (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
           manager_runtime_epoch TEXT,
-          manager_owner_epoch TEXT,
-          predecessor_expired INTEGER NOT NULL
-            CHECK(predecessor_expired IN (0,1)),
-          fault_reference TEXT
+          manager_owner_epoch TEXT
         )
     """,
     "program_run_history": """
@@ -874,8 +869,7 @@ class ProgramCycleJournal:
                     )
 
             liveness_rows = database.execute(
-                "SELECT singleton,manager_runtime_epoch,manager_owner_epoch,"
-                "predecessor_expired,fault_reference "
+                "SELECT singleton,manager_runtime_epoch,manager_owner_epoch "
                 "FROM program_runner_liveness"
             ).fetchall()
             if (
@@ -884,12 +878,6 @@ class ProgramCycleJournal:
                 or any(
                     value is not None and not _bounded_identity(value)
                     for value in liveness_rows[0][1:3]
-                )
-                or type(liveness_rows[0][3]) is not int
-                or liveness_rows[0][3] not in {0, 1}
-                or (
-                    liveness_rows[0][4] is not None
-                    and not isinstance(liveness_rows[0][4], str)
                 )
             ):
                 raise RuntimeError("Program-cycle liveness row is corrupt")
@@ -1148,7 +1136,7 @@ class ProgramCycleJournal:
                     )
                     self._database.execute(
                         "INSERT INTO program_runner_liveness "
-                        "VALUES(1,NULL,NULL,0,NULL)"
+                        "VALUES(1,NULL,NULL)"
                     )
                     self._database.execute(
                         """
@@ -2148,7 +2136,6 @@ class ProgramCycleJournal:
             live = self.liveness()
             if (
                 self.read() != expected
-                or live.expired
                 or live.manager_runtime_epoch != manager_runtime_epoch
                 or live.manager_owner_epoch != manager_owner_epoch
             ):
@@ -2429,54 +2416,18 @@ class ProgramCycleJournal:
                 raise RuntimeError("Program-cycle reconciliation latch is stale")
 
     def liveness(self) -> RetainedLiveness:
-        """Read only durable identities/evidence, never a deadline or age."""
+        """Read only the retained Manager identity, never a deadline or age."""
         with self._lock:
             self._validate_storage()
             row = self._database.execute(
                 """
-                SELECT manager_runtime_epoch,manager_owner_epoch,
-                       predecessor_expired,fault_reference
+                SELECT manager_runtime_epoch,manager_owner_epoch
                 FROM program_runner_liveness WHERE singleton=1
                 """
             ).fetchone()
         if row is None:
             raise RuntimeError("Program Runner liveness journal is corrupt")
-        return RetainedLiveness(row[0], row[1], bool(row[2]), row[3])
-
-    def retain_liveness_loss(
-        self,
-        *,
-        manager_runtime_epoch: str,
-        manager_owner_epoch: str | None,
-        fault_reference: str,
-        expected_generation: int,
-    ) -> None:
-        """Atomically latch Manager loss and cycle reconciliation evidence."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_runner_liveness
-                SET manager_runtime_epoch=?,manager_owner_epoch=?,
-                    predecessor_expired=1,fault_reference=?
-                WHERE singleton=1
-                """,
-                (
-                    manager_runtime_epoch,
-                    manager_owner_epoch,
-                    fault_reference,
-                ),
-            ).rowcount
-            cycle_changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET reconciliation_required=1,
-                    reconciliation_evidence_digest=?
-                WHERE singleton=1 AND cycle_generation=?
-                """,
-                (fault_reference, expected_generation),
-            ).rowcount
-            if changed != 1 or cycle_changed != 1:
-                raise RuntimeError("Program Runner liveness loss is stale")
+        return RetainedLiveness(row[0], row[1])
 
     def retain_liveness_manager(
         self, *, manager_runtime_epoch: str, manager_owner_epoch: str
@@ -2486,8 +2437,7 @@ class ProgramCycleJournal:
             changed = self._database.execute(
                 """
                 UPDATE program_runner_liveness
-                SET manager_runtime_epoch=?,manager_owner_epoch=?,
-                    predecessor_expired=0
+                SET manager_runtime_epoch=?,manager_owner_epoch=?
                 WHERE singleton=1
                 """,
                 (manager_runtime_epoch, manager_owner_epoch),

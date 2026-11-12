@@ -107,6 +107,40 @@ formats; such changes are listed explicitly.
   until all motion has stopped before its Full Stop once the motion Stop is
   accepted; a refused or failed motion Stop no longer cancels the Halt but
   sends the Full Stop at once.
+- **The Manager no longer holds leases on the Program Runner and the
+  Kernel.** The Manager still reports its identity, the Runner's cycle status
+  and cell readiness every 250 ms, but a report never expires. A Manager or
+  Program Runner that is late or stalled (1 s, 10 s or longer) no longer
+  Full-Stops the cell, inhibits motion, stops the running Program or makes the
+  execution host exit with code 70. Motion already admitted stays under Kernel
+  supervision. A failed report closes cell readiness (no Stop) and the next
+  successful one reopens it. A Program Runner that stops answering during an
+  active Program cycle still latches `program_runner_loss`, and the Kernel now
+  stops that Program run's motion once when it latches it (a program-run Stop
+  with source `kernel.program_runner_loss` and reason `program_runner_loss`;
+  not a Full Stop, nothing else in the cell is stopped), because the Program's
+  own Stop and Halt go through the silent Runner. Before, the expiring lease
+  Full-Stopped the whole cell. Removed with it:
+  - the Runner's 1 s expiry, its Manager-loss Stop (`manager_presence_expired`),
+    its durable Manager-loss record and the `/api/program/liveness/status`
+    route; a new Manager epoch is accepted and reconciled directly instead of
+    waiting for the old one to expire;
+  - the Kernel receiver's expiry timer and its scheduler thread, the
+    `manager_epoch_expired` rejection, the Manager's retry gate, the host's
+    wait for that expiry on a closed Manager channel, and the refusal of
+    heartbeats after a stuck drain (`drain_stuck` still prints and waits);
+  - the development workbench's wait for the Runner to see the Manager
+    expire on shutdown.
+
+  A Manager epoch replacement still closes admission and Full-Stops the cell
+  as before. Formats: the retained `manager_liveness_policy` drops
+  `expiry_timeout_ns` (runtime manifest
+  `manyforge.ros2_control_execution_runtime_manifest.v2`), the private
+  Manager-to-host liveness packets move to `v2`, and the Program-cycle journal
+  moves to schema 10. Bundles and journals of earlier versions are refused.
+  Error codes no longer produced and removed from the catalog:
+  `manager_epoch_expired`, `manager_presence_expired`, `receiver_destroyed`,
+  `watchdog_schedule_failed`.
 - **Bounded work on the time-critical paths.** The request replay ledgers,
   Program-run fences and operation history are indexed by id in slots
   allocated once, so a Stop finds, adds and evicts entries without scanning or

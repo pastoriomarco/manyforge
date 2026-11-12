@@ -3,7 +3,6 @@
 #include "manager_liveness_rpc_internal.hpp"
 #include <array>
 #include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
 
 namespace manyforge::component_manager::detail {
 namespace {
@@ -20,7 +19,6 @@ ManagerLivenessTransportRequestDTO Request() {
       RuntimePolicyId("policy.native"),
       RuntimePolicyRevision(std::string(kDigest)),
       250,
-      1000,
       ProductContractId("safe.native"),
       ProductContractRevision(std::string(kDigest2))};
   std::vector<RequiredManagerLivenessReceiverDTO> receivers{
@@ -66,8 +64,7 @@ ManagerLivenessLossIntentDTO LossIntent(std::uint64_t sequence = 3U) {
           request.required_set.manager_runtime_unit_id,
           request.required_set.manager_runtime_epoch,
           request.required_set.manager_owner_epoch,
-          sequence,
-          ManagerLivenessLossKindDTO::kExpiry};
+          sequence};
 }
 
 class LivenessObservations final : public IManagerLivenessObservationPort {
@@ -143,18 +140,15 @@ TEST(ManagerLivenessCommandAdmission,
 }
 
 TEST(ManagerLivenessCommandAdmission,
-     ExactLeaseOpensThenExpiryClosesBeforeExactlyOneContainment) {
+     ExactReportOpensAndAQuietManagerNeverClosesOrContains) {
   auto clock = std::make_shared<FakeClock>();
-  auto scheduler = std::make_unique<ManualScheduler>();
-  auto *const scheduler_observer = scheduler.get();
   LivenessObservations observations;
   CountingContainment containment;
   ManagerLivenessCommandAdmission admission;
-  ChildOwnedManagerLivenessReceiver child_lifetime(clock, std::move(scheduler));
+  ChildOwnedManagerLivenessReceiver child_lifetime(clock);
   child_lifetime.Install(
       ReceiverConfig(),
       [&](const ManagerLivenessLossIntentDTO &intent) {
-        EXPECT_TRUE(admission.open());
         return admission.CloseAndAttest(intent);
       },
       containment, observations);
@@ -168,27 +162,27 @@ TEST(ManagerLivenessCommandAdmission,
   admission.OpenIfUnchanged(admission_generation);
   ASSERT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
 
-  clock->set(request.policy.expiry_timeout_ns);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns);
-  EXPECT_FALSE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
-  ASSERT_EQ(containment.intents.size(), 1U);
-  EXPECT_EQ(containment.intents.front().kind,
-            ManagerLivenessLossKindDTO::kExpiry);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns * 2);
-  EXPECT_EQ(containment.intents.size(), 1U);
-  admission.OpenIfUnchanged(admission_generation);
-  EXPECT_FALSE(admission.open());
+  // A Manager stall of 1 s and of 10 s: no report arrives, nothing closes.
+  for (const std::int64_t quiet : {1'000'000'000LL, 10'000'000'000LL}) {
+    clock->set(quiet);
+    EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
+    EXPECT_EQ(receiver->status().state, ManagerLivenessStateDTO::kCurrent);
+    EXPECT_FALSE(receiver->status().command_fenced);
+  }
+  EXPECT_TRUE(containment.intents.empty());
+  auto next = request.heartbeat;
+  ++next.heartbeat_sequence;
+  ASSERT_TRUE(receiver->Renew(next).ok());
+  EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
 }
 
 TEST(ManagerLivenessCommandAdmission,
-     ChildOwnedWatchdogSurvivesCompositionReplacementAndRejectsStaleManager) {
+     ChildOwnedReceiverSurvivesCompositionReplacementAndRejectsStaleManager) {
   auto clock = std::make_shared<FakeClock>();
-  auto scheduler = std::make_unique<ManualScheduler>();
-  auto *const scheduler_observer = scheduler.get();
   LivenessObservations observations;
   CountingContainment containment;
   ManagerLivenessCommandAdmission admission;
-  ChildOwnedManagerLivenessReceiver child_lifetime(clock, std::move(scheduler));
+  ChildOwnedManagerLivenessReceiver child_lifetime(clock);
   child_lifetime.Install(
       ReceiverConfig(),
       [&](const ManagerLivenessLossIntentDTO &intent) {
@@ -217,14 +211,11 @@ TEST(ManagerLivenessCommandAdmission,
   EXPECT_FALSE(receiver->CompleteReconciliation(*request.reconciliation).ok());
   admission.OpenIfUnchanged(generation);
   EXPECT_FALSE(admission.open());
-
-  clock->set(request.policy.expiry_timeout_ns * 2);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns * 2);
   EXPECT_EQ(containment.intents.size(), 1U);
 }
 
 TEST(ManagerLivenessBatchPolicy,
-     NativeSubsetCarriesFullCrossTransportSetAndFailureWithholdsFullExpiry) {
+     NativeSubsetCarriesFullCrossTransportSetAndOneBatchDeadline) {
   std::array requests{Request(), Request()};
   const auto &native_policy = requests[0].policy;
   for (auto &request : requests) {
@@ -261,46 +252,6 @@ TEST(ManagerLivenessBatchPolicy,
   EXPECT_EQ(receiver_deadlines[0], started + std::chrono::nanoseconds(750));
   EXPECT_EQ(receiver_deadlines[1], receiver_deadlines[0]);
 
-  ManagerLivenessRetryGate retry_gate;
-  ASSERT_TRUE(retry_gate.attempt_allowed(100U));
-  retry_gate.RecordFailure(100U, 1000U);
-  for (std::size_t receiver = 0U; receiver < 2U; ++receiver) {
-    SCOPED_TRACE(receiver);
-    EXPECT_FALSE(retry_gate.attempt_allowed(100U));
-    EXPECT_FALSE(retry_gate.attempt_allowed(1099U));
-  }
-  EXPECT_TRUE(retry_gate.attempt_allowed(1100U));
-  retry_gate.RecordSuccess();
-  EXPECT_FALSE(retry_gate.failed());
-  EXPECT_TRUE(retry_gate.attempt_allowed(1100U));
-}
-
-TEST(ManagerLivenessRpcInternal,
-     RetryPolicyUsesNativeBatchCertaintyNotUnrelatedReceiverFailure) {
-  constexpr std::uint64_t origin = 31ULL * 365ULL * 86400ULL * 1'000'000'000ULL;
-  for (const auto progress : {ManagerLivenessBatchProgress::kNotStarted,
-                              ManagerLivenessBatchProgress::kInFlight,
-                              ManagerLivenessBatchProgress::kValidated}) {
-    ManagerLivenessRetryGate gate;
-    gate.RecordFailure(origin, 1000);
-    EXPECT_FALSE(gate.attempt_allowed(origin + 999));
-    EXPECT_TRUE(gate.attempt_allowed(origin + 1000));
-    gate.RecordAttemptFailure(progress, origin + 1000, 1000);
-    EXPECT_EQ(gate.failed(),
-              progress == ManagerLivenessBatchProgress::kInFlight);
-    EXPECT_EQ(gate.attempt_allowed(origin + 1001),
-              progress != ManagerLivenessBatchProgress::kInFlight);
-    EXPECT_TRUE(gate.attempt_allowed(origin + 2000));
-    gate.RecordSuccess(); // the same reset used for a successor publication
-    EXPECT_FALSE(gate.failed());
-    EXPECT_TRUE(gate.attempt_allowed(origin + 1001));
-  }
-  ManagerLivenessRetryGate gate;
-  const auto maximum = std::numeric_limits<std::uint64_t>::max();
-  gate.RecordAttemptFailure(ManagerLivenessBatchProgress::kInFlight,
-                            maximum - 2, 1000);
-  EXPECT_FALSE(gate.attempt_allowed(maximum - 1));
-  EXPECT_TRUE(gate.attempt_allowed(maximum));
 }
 
 TEST(ManagerLivenessRpcInternal,
@@ -415,6 +366,12 @@ TEST(ManagerLivenessRpcInternal,
 
   EXPECT_FALSE(IsManagerLivenessRpcPacket(
       "manyforge.manager-liveness.response.v1 foreign"));
+  // A request of the earlier format (with the removed expiry field) is refused.
+  auto earlier = EncodeManagerLivenessRpcRequest(Request());
+  earlier.replace(0U, kManagerLivenessRequestTag.size(),
+                  "manyforge.manager-liveness.request.v1");
+  EXPECT_FALSE(IsManagerLivenessRpcPacket(earlier));
+  EXPECT_THROW(DecodeManagerLivenessRpcRequest(earlier), std::invalid_argument);
   EXPECT_THROW(DecodeManagerLivenessRpcResponse(
                    "manyforge.manager-liveness.response.v1 foreign"),
                std::invalid_argument);

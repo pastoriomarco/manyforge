@@ -887,11 +887,6 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
         ),
     )
     monkeypatch.setattr(workbench, "_stop_manager", lambda: observed.append("Manager"))
-    monkeypatch.setattr(
-        workbench,
-        "_wait_for_program_runner_manager_expiry",
-        lambda: observed.append("Program runner fenced"),
-    )
 
     workbench.close()
 
@@ -900,7 +895,6 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
         "Composer backend",
         "Headless API",
         "Manager",
-        "Program runner fenced",
         "Program runner",
     ]
 
@@ -1188,7 +1182,6 @@ def test_direct_serve_selects_one_session_before_starting_any_owner(tmp_path, mo
 
     monkeypatch.setattr(workbench, "start", start)
     monkeypatch.setattr(workbench, "_stop_manager", lambda: True)
-    monkeypatch.setattr(workbench, "_wait_for_program_runner_manager_expiry", lambda: True)
     workbench.serve()
     assert len(started) == 1
     assert workbench.session is None

@@ -1468,7 +1468,6 @@ manager_command_response_invalid	Manager answer invalid	An internal check failed
 manager_command_response_oversized	Manager answer too large	An internal check failed: a Manager answer exceeds the transport size limit. Collect the logs and report it.
 manager_command_transport_failure	Manager command truncated	The command to the Manager was not sent completely. Collect the logs and report it.
 manager_command_unavailable	Manager not reachable	The Manager could not be reached. Check that the workbench runtime is running.
-manager_epoch_expired	Manager epoch expired	The Manager's liveness epoch has expired, so its heartbeats are refused.
 manager_liveness_identity_mismatch	Manager liveness identity mismatch	An internal check failed: a manager liveness report does not match the expected bundle, runtime set or manager identity. Collect the logs and report it.
 manager_liveness_not_current	Manager not ready for commands	The command was refused because the Manager is not currently confirmed or a configuration change is in progress. Wait until the cell is idle and try again.
 manager_liveness_observation_invalid	Manager liveness report invalid	An internal check failed: a manager liveness report is malformed. Collect the logs and report it.
@@ -1477,7 +1476,6 @@ manager_liveness_reconciliation_superseded	Liveness reconciliation superseded	Th
 manager_liveness_required_set_invalid	Manager liveness set invalid	An internal check failed: the set of required manager liveness receivers is malformed. Collect the logs and report it.
 manager_liveness_set_not_configured	Manager liveness set not configured	An internal check failed: a manager liveness report arrived before any required set was configured. Collect the logs and report it.
 manager_liveness_status_not_strict	Manager liveness report out of order	An internal check failed: a manager liveness report did not advance the receiver's status sequence. Collect the logs and report it.
-manager_presence_expired	Manager presence expired	The component manager stopped reporting its presence in time, so the Program run was stopped. Check that the manager is running, then start the run again.
 manager_projection_unavailable	Manager state unavailable	Apply needs a current state from the Manager, which is not available. Check that the workbench runtime is running.
 manager_publication_time_in_future	Manager time is in the future	The Manager data is stamped later than this computer's clock. Check the clock synchronisation of the workbench.
 manager_receiver_age_saturated	Manager data too old to measure	The Manager data is older than the supported age. Check that the Manager is running.
@@ -2759,7 +2757,6 @@ rebind_ingress_failed	Contact input rebind refused	The contact input could not b
 rebind_invalid	Contact input rebind invalid	The contact input could not be rebound: its binding is incomplete or its collision check cannot be prepared for the robot's joints. Check the Scene and the collision components.
 rebind_stale_or_changed	Contact input binding changed	The contact input rebind is out of date, or its source, signals or target changed, so it was refused. Refresh the binding and try again.
 receiver_clock_out_of_range	Receive time out of range	An internal check failed: the Manager heartbeat receive time is outside the supported range. Collect the logs and report it.
-receiver_destroyed	Manager receiver stopped	The Manager liveness receiver has been shut down, so this report was not accepted.
 receiver_time_invalid	Receiver time negative	An internal check failed: the receiver time used for an observed-state read is negative. Collect the logs and report it.
 recognized_stop_body_oversized	Stop request body too large	The Stop request body is larger than allowed. It is still recognized as a Stop request, delivered as a malformed Stop, and its connection is closed.
 recognized_stop_payload_invalid	Stop request payload invalid	The Stop request body is not a valid JSON object. It is still recognized as a Stop request and delivered as a malformed Stop.
@@ -3741,7 +3738,6 @@ value_invalid	Stored value dropped	A stored persistent value was dropped because
 viewer_model_asset_invalid	Viewer model data invalid	An internal check failed: the robot model data for the 3D view is inconsistent or out of bounds. Collect the logs and report it.
 viewer_model_asset_unavailable	Viewer model not available	The viewer has no model to show, because the Manager has no active configuration or the active configuration has no viewer model. Apply a configuration, then reload the view.
 volatile_motion_trace_unavailable	Motion trace unavailable	This execution host has no motion trace collector, or the trace could not be captured within its size limit.
-watchdog_schedule_failed	Manager watchdog unavailable	The Manager heartbeat watchdog could not be scheduled. Collect the logs and report it.
 waypoint_position_count_mismatch	Waypoint shape inconsistent	A waypoint has a different number of positions than the trajectory has joints, so collision projection was refused. Correct the trajectory.
 worker_envelope_invalid	Viewer worker request invalid	An internal check failed: a request to the 3D viewer worker was built with invalid fields. Collect the logs and report it.
 worker_envelope_payload_too_large	Viewer worker data too large	The data for the 3D viewer worker exceeded its size limit and was not sent. Collect the logs and report it.

@@ -1203,6 +1203,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const GlobalInterruptStopSelection* global_selection = nullptr);
   void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
   void refresh_manager_liveness_inhibition();
+  // Program-run Stop for a newly latched Runner loss; called with no Core lock held.
+  void stop_program_run_after_runner_loss(const ProgramRunId& program_run_id) noexcept;
   /// The operator's Program Stop (`stop_program_selection`) under the lock;
   /// a global `stop`/`hold` rule trip issues the same.
   [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection_locked(

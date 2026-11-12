@@ -1374,46 +1374,9 @@ class Workbench:
         )
         if manager is not None:
             # The bounded command is preferred, but a failed command must not
-            # leave Manager renewing the lease until the container disappears.
+            # leave Manager running until the container disappears.
             self._terminate(manager)
         return contained
-
-    def _wait_for_program_runner_manager_expiry(self) -> bool:
-        """Let the runner durably observe Manager loss before it exits."""
-
-        runner = next(
-            (process for name, process in self.processes if name == "Program runner"),
-            None,
-        )
-        if runner is None or runner.poll() is not None:
-            return False
-
-        def manager_expired() -> bool:
-            with HeadlessHttpClient(
-                f"http://127.0.0.1:{self.runner_port}", timeout_seconds=0.2
-            ) as client:
-                status = client.request("GET", "/api/program/liveness/status")
-                cycle = client.program_cycle_status()
-            return bool(
-                status.get("state") == "expired"
-                and status.get("command_fenced") is True
-                and cycle.get("state")
-                in {"idle_after_reset", "terminal_awaiting_reset"}
-            )
-
-        try:
-            _wait_until(
-                "Program Runner Manager-loss retention",
-                manager_expired,
-                (("Program runner", runner),),
-                timeout_seconds=2.0,
-            )
-            return True
-        except WorkbenchError:
-            # Cleanup remains bounded even if the runner is already unhealthy.
-            # Its next start will retain/fence the predecessor through the same
-            # watchdog before accepting a replacement Manager.
-            return False
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> bool:
@@ -1442,7 +1405,6 @@ class Workbench:
             if process_name == "Headless API":
                 verified = self._terminate(process) and verified
         verified = self._stop_manager() and verified
-        verified = self._wait_for_program_runner_manager_expiry() and verified
         for process_name, process in reversed(self.processes):
             if process_name == "Program runner":
                 verified = self._terminate(process) and verified

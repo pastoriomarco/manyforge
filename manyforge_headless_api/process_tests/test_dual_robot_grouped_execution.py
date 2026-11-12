@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import signal
+import os
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -1467,7 +1469,7 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
             _reset_cycle(client, program_run_id)
 
 
-def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_closed() -> None:
+def test_runner_loss_during_admitted_motion_alarms_stops_the_program_run_and_keeps_admission_closed() -> None:
     # This fixture has no production Workbench supervisor: it keeps the API
     # alive to inspect the process chain, not browser visibility during teardown.
     with _dual_robot_stack() as stack:
@@ -1489,7 +1491,7 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             original_ids = {event["operation_id"] for event in accepted}
             assert len(original_ids) == 2
             # Reuse the genuine fixture's runtime scale control to keep the
-            # authored motions active across the existing lease/Stop interval.
+            # authored motions active well past the former 1 s lease.
             _set_scale(composer, selector, 0.05, "r5.runner-loss.slow-active-motion")
             _wait_scale_applied(composer, selector, 0.05)
             native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
@@ -1541,20 +1543,21 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
                 "program_runner_liveness_probe", "program_runner_liveness_renewal",
                 "program_runner_reconciliation_renewal",
             }
-            # Do not issue Stop here. The already-configured Manager-presence
-            # lease owns containment; the alarm itself is not proof of rest.
+            # The Runner owns Program Stop and Halt; with it silent, the
+            # Kernel stops this Program run's motion once (a program-run Stop,
+            # never a Full Stop) when it latches the Runner loss.
             containment_deadline = time.monotonic() + 20.0
             while True:
                 events = _native_events(stack)
-                lease_stops = [event for event in events
-                               if event["record_kind"] == "stop_acceptance_projected"
-                               and event["payload"]["intent"]["intent_kind"] == "full_stop"
-                               and event["payload"]["intent"]["value"]["request_context"][
-                                   "source_label"] == "kernel.manager_liveness"]
+                run_stops = [event for event in events
+                             if event["record_kind"] == "stop_acceptance_projected"
+                             and event["payload"]["intent"]["intent_kind"] == "ordinary_stop"
+                             and event["payload"]["intent"]["value"]["request_context"][
+                                 "source_label"] == "kernel.program_runner_loss"]
                 terminals = []
-                if lease_stops:
-                    assert len(lease_stops) == 1, lease_stops
-                    stop_id = lease_stops[0]["payload"]["acceptance"]["stop_id"]
+                if run_stops:
+                    assert len(run_stops) == 1, run_stops
+                    stop_id = run_stops[0]["payload"]["acceptance"]["stop_id"]
                     terminals = [event for event in events
                                  if event["record_kind"] == "stop_terminal_projected"
                                  and event["payload"]["stop_id"] == stop_id]
@@ -1562,31 +1565,25 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
                     break
                 assert time.monotonic() < containment_deadline, events
                 time.sleep(0.01)
-            stop = lease_stops[0]["payload"]
+            assert not [event for event in events
+                        if event["record_kind"] == "stop_acceptance_projected"
+                        and event["payload"]["intent"]["intent_kind"] == "full_stop"], events
+            stop = run_stops[0]["payload"]
+            assert stop["intent"]["value"]["reason"] == "program_runner_loss", stop
             assert executing_ids <= {operation["operation_id"]
                                      for operation in stop["affected_state"]["operations"]}
-            assert len(terminals) == 1, terminals
             terminal = terminals[0]["payload"]
             assert terminal["state"] == "succeeded", terminal
-            assert terminal["result"] in {"succeeded_nominal", "succeeded_escalated"}, terminal
-            assert terminal["stop_generation"] == stop["acceptance"]["stop_generation"]
-            assert terminal["stop_certificate_id"]
-            assert terminal["failed_count"] == terminal["unsettled_count"] == 0
-            assert terminal["dispatched_stopped_count"] >= len(executing_ids)
-            if not terminal["details_truncated"]:
-                stopped_ids = {entry["subject"]["operation_id"]
-                               for entry in terminal["dispatched_stopped"]
-                               if entry["subject"]["kind"] == "participant"}
-                assert executing_ids <= stopped_ids, terminal
             for operation_id in executing_ids:
                 contained = native.read(operation_id)["operation"]
                 assert contained["state"] == "stopped", contained
                 assert contained["active_stop_id"] == terminal["stop_id"]
-                assert contained["active_stop_generation"] == terminal["stop_generation"]
+            # No host exit: the same execution owner still answers.
+            assert native.identity()["identity"]["owner_epoch"] == native_epoch
 
             assert headless.authoring_admission()["authoring_allowed"] is False
-            # A distinct valid Execute must reach the authoritative host lease
-            # gate, not merely fail against the retained operation's engine.
+            # A distinct valid Execute is refused by readiness (Runner loss),
+            # not by a Manager lease.
             refused_intent = deepcopy(accepted[0]["payload"]["intent"])
             refused_intent.pop("request_attribution")  # Journal-only provenance.
             refused_intent["program_run_id"] = "r5.runner-loss.manual-refusal-run"
@@ -1599,7 +1596,7 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             refused = native.submit(OperationIntentRequest.model_validate(refused_intent),
                                     trusted_principal_id=None)
             assert refused["ok"] is False, refused
-            assert refused["error"]["code"] == "manager_liveness_not_current", refused
+            assert refused["error"]["code"] != "manager_liveness_not_current", refused
             after_events = _native_events(stack)
             assert not any(
                 event["record_kind"] == "operation_accepted"
@@ -1617,11 +1614,140 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             for key in ("condition_id", "activation_id", "activation_count", "lifecycle_state"):
                 assert retained[0][key] == first_alarm[key]
             print(json.dumps({"runner_loss_alarm_observed_after_s": alarm_observed_after_s,
-                              "contained_operation_ids": sorted(executing_ids),
+                              "stopped_operation_ids": sorted(executing_ids),
                               "stop_id": terminal["stop_id"],
-                              "stop_certificate_id": terminal["stop_certificate_id"]}, sort_keys=True))
+                              "refused_code": refused["error"]["code"]}, sort_keys=True))
             # No ACK, Reset, replacement Runner or recovery: this sticky fault
             # requires Workbench restart. Fixture teardown owns process cleanup.
+
+
+def _executing_operation_ids(native: ExecutionCommandClient, operation_ids: set[str]) -> set[str]:
+    deadline = time.monotonic() + 20.0
+    while True:
+        executing = {operation_id for operation_id in operation_ids
+                     if native.read(operation_id)["operation"]["state"] == "executing"}
+        if executing:
+            return executing
+        assert time.monotonic() < deadline, {
+            operation_id: native.read(operation_id)["operation"]["state"]
+            for operation_id in operation_ids}
+        time.sleep(0.01)
+
+
+def _wait_operations_stopped(native: ExecutionCommandClient, operation_ids: set[str]) -> None:
+    deadline = time.monotonic() + 20.0
+    while True:
+        states = {operation_id: native.read(operation_id)["operation"]["state"]
+                  for operation_id in operation_ids}
+        if all(state == "stopped" for state in states.values()):
+            return
+        assert time.monotonic() < deadline, states
+        time.sleep(0.01)
+
+
+def test_a_frozen_manager_never_gates_a_users_stop() -> None:
+    # The Manager is not in the motion or Stop path: with it frozen (SIGSTOP)
+    # for longer than any former lease or status freshness, a Program motion
+    # Stop, an operation Stop and a Program Full Stop sent by a client still
+    # reach the Kernel and stop the motion. The client uses the run identity
+    # it already holds, as the operator's screen does: status reads that ask
+    # the Manager for the Scene revision (identity, status, targets, control
+    # state) wait for it and are not used while it is frozen.
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        applied = _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
+        selector = _group_selector(applied["program_binding_id"])
+        assert stack.manager is not None
+        manager_pid = stack.manager.pid
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
+            started = _start_run(
+                stack, scenario_id=applied["scenario_id"],
+                source_document_digest=applied["source_document_digest"], applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(composer, started, request_id="frozen-manager.motion-start")
+            first_ids = {event["operation_id"]
+                         for event in _operation_acceptances(stack, program_run_id)}
+            _set_scale(composer, selector, 0.05, "frozen-manager.slow-motion")
+            _wait_scale_applied(composer, selector, 0.05)
+            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native_epoch = native.identity()["identity"]["owner_epoch"]
+            executing = _executing_operation_ids(native, first_ids)
+            runner_owner_epoch = composer.program_cycle_status()["program_runner_owner_epoch"]
+
+            def control(request_id: str) -> dict[str, Any]:
+                return {
+                    "request_id": request_id,
+                    "request_owner_epoch": "dual-robot.grouped.process-test",
+                    "source_label": "dual_robot_grouped_process_test",
+                    "correlation_id": request_id,
+                    "program_run_id": program_run_id,
+                }
+
+            # 1. Program motion Stop with the Manager frozen.
+            os.kill(manager_pid, signal.SIGSTOP)
+            try:
+                time.sleep(3.0)
+                composer.program_run_motion_stop(program_run_id, {
+                    **control("frozen-manager.motion-stop"),
+                    "expected_owner_epoch": runner_owner_epoch,
+                    "reason": "Stop with the Manager frozen",
+                    "group_ids": ["robot_group"],
+                })
+                _wait_operations_stopped(native, executing)
+            finally:
+                os.kill(manager_pid, signal.SIGCONT)
+
+            cycle, selections = _wait_group_held(composer, program_run_id, "robot_group")
+            composer.program_run_motion_resume(program_run_id, {
+                **control("frozen-manager.resume"),
+                "expected_owner_epoch": cycle["program_runner_owner_epoch"],
+                "expected_selection_revision": selections["selection_revision"],
+                "reason": "resume before the next frozen-Manager Stops",
+                "group_ids": ["robot_group"],
+            })
+            resumed_ids = {event["operation_id"]
+                           for event in _operation_acceptances(
+                               stack, program_run_id, minimum=len(first_ids) + 2)} - first_ids
+            resumed = _executing_operation_ids(native, resumed_ids)
+
+            # 2. Operation Stop and 3. Program Full Stop with the Manager frozen.
+            os.kill(manager_pid, signal.SIGSTOP)
+            try:
+                time.sleep(3.0)
+                target = sorted(resumed)[0]
+                operation = native.read(target)["operation"]
+                composer.stop_operations({
+                    "request_context": {
+                        "request_id": "frozen-manager.operation-stop",
+                        "request_owner_epoch": native_epoch,
+                        "source_label": "dual_robot_grouped_process_test",
+                        "correlation_id": "frozen-manager.operation-stop",
+                    },
+                    "operations": [{
+                        "operation_id": target,
+                        "expected_operation_revision": operation["operation_revision"],
+                        "expected_stop_generation": 0,
+                    }],
+                    "reason": "operation Stop with the Manager frozen",
+                })
+                _wait_operations_stopped(native, {target})
+                composer.program_run_full_stop(program_run_id, {
+                    **control("frozen-manager.full-stop"),
+                    "expected_owner_epoch": runner_owner_epoch,
+                    "reason": "Full Stop with the Manager frozen",
+                })
+                _wait_operations_stopped(native, resumed_ids)
+            finally:
+                os.kill(manager_pid, signal.SIGCONT)
+            # Three Stops were accepted by the Kernel while the Manager was frozen.
+            stops = [event for event in _native_events(stack)
+                     if event["record_kind"] == "stop_acceptance_projected"]
+            assert len(stops) >= 3, stops
+            # Nothing exited and the same execution owner still answers.
+            assert stack.manager.poll() is None
+            assert native.identity()["identity"]["owner_epoch"] == native_epoch
 
 
 def test_separate_group_stop_does_not_stop_the_other_robot() -> None:

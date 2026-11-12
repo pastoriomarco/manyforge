@@ -284,7 +284,7 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     # makes the Kernel's source unavailable (exact-sender gap) before the
     # write returns, so its rules can't watch and hold their scope; then the
     # Run's Program Stop, then the fault fences liveness. No resend.
-    receiver, _rclock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _rclock, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     events: list[Any] = []
     store = _store()
@@ -327,7 +327,6 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     assert acknowledgement["receiver_status_digest"] == _expected_status_digest(
         acknowledgement
     )
-    assert receiver.manager_fault_reference is None
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
 
@@ -373,7 +372,7 @@ def test_writes_before_the_source_exists_are_carried_by_its_baseline() -> None:
 def test_reconciliation_and_later_heartbeats_never_clear_the_latch(
     tmp_path: Path,
 ) -> None:
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     probe = receiver._handle(  # noqa: SLF001
         {"api_version": _heartbeat()["api_version"], "cell_id": "cell", "kind": "probe"}
@@ -700,7 +699,7 @@ def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     tmp_path: Path,
 ) -> None:
     # A between-Runs start failure changes no source and never fences.
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     runtime = object.__new__(ProgramRuntime)
     runtime._liveness = receiver  # noqa: SLF001
@@ -943,27 +942,6 @@ def test_runtime_reset_retires_the_run_sender_without_a_frame() -> None:
     assert [frame["kind"] for frame in host.frames] == ["baseline"]
 
 
-def test_manager_loss_and_publisher_fault_keep_each_cause(tmp_path: Path) -> None:
-    # With both faults the emitted fault_reference is the digest of
-    # the emitted publisher ErrorDTO; the Manager loss keeps its own field.
-    from manyforge_program_runner.liveness import EXPIRY_TIMEOUT_NS
-
-    receiver, clock, losses, _reconciliations = _receiver(tmp_path)
-    receiver._handle({**_heartbeat(), "reconciliation_digest": None})  # noqa: SLF001
-    clock.now += EXPIRY_TIMEOUT_NS + 1
-    assert receiver.check_expiry()
-    fault = {"code": FAULT_CODE, "message": "lost", "details": {}}
-    receiver.latch_publisher_fault(fault, ProgramRuntime._digest(fault))  # noqa: SLF001
-    status = receiver.status()
-    assert status["publisher_fault"] == fault
-    assert status["fault_reference"] == ProgramRuntime._digest(  # noqa: SLF001
-        status["publisher_fault"]
-    )
-    assert status["command_fenced"] is True
-    assert receiver.manager_fault_reference == losses[0]
-    assert losses[0] != status["fault_reference"]
-
-
 # A refused between-Runs publication never fences the Runner -----------
 
 
@@ -979,7 +957,7 @@ def _fencing_runtime(
 ) -> tuple[ProgramRuntime, _Applied, _Journal, Any, list[str]]:
     """The real publisher wiring (`_new_bbkey_publisher`) on a live receiver."""
 
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     applied, journal = _Applied(), _Journal()
     runtime, _hosts = _runtime(applied, journal)

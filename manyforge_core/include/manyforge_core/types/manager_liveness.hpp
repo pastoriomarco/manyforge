@@ -15,8 +15,7 @@ inline constexpr std::size_t kMaximumManagerLivenessReceivers = 4096U;
 inline constexpr std::uint64_t kMaximumManagerLivenessCounter =
     9'007'199'254'740'991ULL;
 
-enum class ManagerLivenessStateDTO { kCurrent, kExpired, kUnreconciled };
-enum class ManagerLivenessLossKindDTO { kExpiry, kManagerEpochReplacement };
+enum class ManagerLivenessStateDTO { kCurrent, kUnreconciled };
 
 [[nodiscard]] std::string_view to_string(ManagerLivenessStateDTO value) noexcept;
 
@@ -24,7 +23,6 @@ struct ManagerLivenessPolicyDTO final {
   RuntimePolicyId runtime_policy_id;
   RuntimePolicyRevision runtime_policy_revision;
   std::int64_t heartbeat_period_ns{};
-  std::int64_t expiry_timeout_ns{};
   ProductContractId local_safe_state_contract_id;
   ProductContractRevision local_safe_state_contract_revision;
 
@@ -96,7 +94,6 @@ struct ManagerLivenessLossIntentDTO final {
   RuntimeEpoch lost_manager_runtime_epoch;
   RequestOwnerEpoch lost_manager_owner_epoch;
   std::uint64_t receiver_status_sequence{};
-  ManagerLivenessLossKindDTO kind{ManagerLivenessLossKindDTO::kExpiry};
 
   friend bool operator==(const ManagerLivenessLossIntentDTO&,
                          const ManagerLivenessLossIntentDTO&) = default;

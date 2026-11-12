@@ -216,9 +216,9 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
                         raise ValueError("unformatted Program journal schema")
                     if database.execute("SELECT singleton FROM program_cycle").fetchall() != [(1,)]:
                         raise ValueError("Program owner row absent or invalid")
-                    # Ordinary Manager shutdown retains liveness reconciliation
-                    # even on an idle cycle with no run/effect. That bit is
-                    # unknown evidence, not a positive unfinished operation.
+                    # A retained reconciliation bit on an idle cycle with no
+                    # run/effect is unknown evidence, not a positive
+                    # unfinished operation.
                     if database.execute("SELECT 1 FROM program_cycle WHERE state='idle_after_reset' AND program_run_id IS NULL AND claim_json IS NULL AND acquisition_pending_json IS NULL AND reconciliation_required != 0 AND NOT EXISTS(SELECT 1 FROM program_cycle_inflight_commands) LIMIT 1").fetchone():
                         unknown.append(family)
                 for query in queries:

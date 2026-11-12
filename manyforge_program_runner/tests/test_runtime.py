@@ -1156,11 +1156,15 @@ def test_manager_recovery_same_program_runner_epoch_is_transport_noop(
             ],
         },
     )
-    journal.retain_liveness_loss(
+    journal.retain_liveness_manager(
         manager_runtime_epoch="manager.old",
         manager_owner_epoch="manager-owner.old",
-        fault_reference=_DIGEST_B,
+    )
+    journal.transition(
         expected_generation=1,
+        expected_states=("idle_after_reset",),
+        state="idle_after_reset",
+        reconciliation_required=True,
     )
 
     runtime._reconcile_manager_liveness(
@@ -4965,224 +4969,6 @@ def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     runtime.shutdown()
 
 
-def test_restart_retries_containment_after_durable_loss_crash_window(
-    tmp_path,
-) -> None:
-    path = tmp_path / "cycle.sqlite3"
-    old = ProgramCycleJournal(path, owner_epoch="runner.old")
-    intent = {
-        "owner_role": "program_runner",
-        "owner_epoch": "runner.old",
-        "owner_transaction_id": "program-run.1",
-        "request_id": "start.1",
-        "request_payload_digest": _DIGEST_A,
-    }
-    claim = {
-        "intent": intent,
-        "claim_generation": 7,
-        "acquired_admission_generation": 6,
-        "accepted_at_ns": 1,
-    }
-    old.begin_acquire(
-        expected_generation=1,
-        provisional_run_id="program-run.1",
-        evidence=intent,
-    )
-    old.remember_acquired_claim(
-        expected_generation=1,
-        provisional_run_id="program-run.1",
-        claim=claim,
-    )
-    old.transition(
-        expected_generation=1,
-        expected_states=("starting",),
-        state="running",
-        program_run_id="program-run.1",
-    )
-    old.retain_liveness_manager(
-        manager_runtime_epoch="manager.old",
-        manager_owner_epoch="manager-owner.old",
-    )
-    old.retain_liveness_loss(
-        manager_runtime_epoch="manager.old",
-        manager_owner_epoch="manager-owner.old",
-        fault_reference=_DIGEST_B,
-        expected_generation=1,
-    )
-    old.close()
-
-    replacement = ProgramCycleJournal(path, owner_epoch="runner.new")
-    with pytest.raises(RuntimeError, match="not contained"):
-        replacement.reconcile_liveness(
-            owner_epoch="runner.new",
-            evidence_digest=_DIGEST_A,
-        )
-    execution_run_root = tmp_path / "execution-run"
-    execution_run_root.mkdir()
-    runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test",
-            owner_epoch="runner.new",
-            execution_run_root=execution_run_root,
-            cycle_journal_path=path,
-            manager_liveness_socket=tmp_path / "runner.sock",
-            cell_id="cell",
-        ),
-        headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
-        admission_client=_Admission(),  # type: ignore[arg-type]
-        cycle_journal=replacement,
-    )
-    runtime._host.shutdown()
-    owner = _Owner()
-    owner.rows["program-run.1"] = _Snapshot(
-        "program-run.1",
-        owner_id=runtime.owner_id,
-        owner_epoch=runtime.owner_epoch,
-        state="running",
-        revision=1,
-    )
-    host = _Host(
-        owner,
-        owner_id=runtime.owner_id,
-        owner_epoch=runtime.owner_epoch,
-    )
-    runtime._owner = owner  # type: ignore[assignment]
-    runtime._host = host  # type: ignore[assignment]
-
-    runtime.start()
-
-    assert host.start_admissions == []
-    assert host.stop_calls == [("program-run.1", "manager_presence_expired")]
-    assert replacement.read().state == "terminal_awaiting_reset"
-    assert replacement.read().reconciliation_required is True
-    assert runtime.liveness_status()["command_fenced"] is True
-    runtime.shutdown()
-
-
-def test_restart_contains_a_nonresident_run_from_exact_kernel_scope(
-    tmp_path,
-) -> None:
-    path = tmp_path / "cycle.sqlite3"
-    old = ProgramCycleJournal(path, owner_epoch="runner.old")
-    claim = _program_cycle_claim("runner.old")
-    old.begin_acquire(
-        expected_generation=1,
-        provisional_run_id="program-run.1",
-        evidence=claim["intent"],
-    )
-    old.remember_acquired_claim(
-        expected_generation=1,
-        provisional_run_id="program-run.1",
-        claim=claim,
-    )
-    running = _Snapshot(
-        "program-run.1",
-        owner_id="program-runner",
-        owner_epoch="runner.old",
-        state="running",
-        revision=4,
-    ).to_dict()
-    old.transition(
-        expected_generation=1,
-        expected_states=("starting",),
-        state="running",
-        program_run_id="program-run.1",
-        run_snapshot=running,
-    )
-    old.retain_liveness_manager(
-        manager_runtime_epoch="manager.old",
-        manager_owner_epoch="manager-owner.old",
-    )
-    old.retain_liveness_loss(
-        manager_runtime_epoch="manager.old",
-        manager_owner_epoch="manager-owner.old",
-        fault_reference=_DIGEST_B,
-        expected_generation=1,
-    )
-    old.close()
-
-    class _SettledScope:
-        def __init__(self) -> None:
-            self.requests: list[tuple[str, str, str | None]] = []
-            self.observations = 0
-
-        def request_stop(
-            self,
-            program_run_id: str,
-            stop_request_id: str,
-            reason: str | None,
-        ) -> ProgramRunScopeSnapshot:
-            self.requests.append((program_run_id, stop_request_id, reason))
-            return ProgramRunScopeSnapshot(
-                program_run_id,
-                (
-                    ProgramRunScopeState.ACTIVE
-                    if len(self.requests) == 1
-                    else ProgramRunScopeState.SETTLED
-                ),
-                1 if len(self.requests) == 1 else 0,
-            )
-
-        def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
-            self.observations += 1
-            return ProgramRunScopeSnapshot(
-                program_run_id,
-                ProgramRunScopeState.SETTLED,
-                0,
-            )
-
-    replacement = ProgramCycleJournal(path, owner_epoch="runner.new")
-    execution_run_root = tmp_path / "execution-run"
-    execution_run_root.mkdir()
-    runtime = ProgramRuntime(
-        ProgramRunnerConfig(
-            headless_url="http://headless.test",
-            owner_epoch="runner.new",
-            execution_run_root=execution_run_root,
-            cycle_journal_path=path,
-            manager_liveness_socket=tmp_path / "runner.sock",
-            cell_id="cell",
-        ),
-        headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
-        admission_client=_Admission(),  # type: ignore[arg-type]
-        cycle_journal=replacement,
-    )
-    scope = _SettledScope()
-    runtime._native = SimpleNamespace(scope=scope)  # type: ignore[assignment]  # noqa: SLF001
-
-    runtime.start()
-
-    # Startup submits containment once without polling or delaying liveness.
-    # The next ordinary Manager renewal rejoins the same exact Kernel Stop and
-    # observes its settlement.
-    assert replacement.read().state == "running"
-    assert runtime._contain_retained_run(  # noqa: SLF001
-        "program-run.1",
-        fault_reference=_DIGEST_B,
-    )
-
-    cycle = replacement.read()
-    terminal = replacement.read_run_snapshot("program-run.1")
-    assert cycle.state == "terminal_awaiting_reset"
-    assert cycle.reconciliation_required is True
-    assert terminal is not None
-    assert terminal["run_revision"] == 5
-    assert terminal["state"] == "stopped"
-    assert terminal["tree_status"] == "invalid"
-    assert terminal["node_statuses"] == {"root": "idle"}
-    assert terminal["node_status_revision"] == 5
-    assert terminal["active_operation_count"] == 0
-    assert len(scope.requests) == 2
-    assert scope.requests[0][0] == "program-run.1"
-    assert scope.requests[0][2] == "manager_presence_expired"
-    assert scope.requests[0][1] == scope.requests[1][1]
-    assert scope.observations == 0
-    assert runtime.liveness_status()["command_fenced"] is True
-    runtime.shutdown()
-
-
 def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> None:
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3",
@@ -6020,11 +5806,10 @@ def test_unknown_reset_never_restores_without_exact_containment(
         elif crossing == "active_run":
             owner.rows[run_id]._value["active_operation_count"] = 1
         elif crossing == "liveness":
-            journal.retain_liveness_loss(
-                expected_generation=1,
+            # A different Manager was reconciled meanwhile.
+            journal.retain_liveness_manager(
                 manager_runtime_epoch="manager.1",
                 manager_owner_epoch="manager.1",
-                fault_reference="manager-lost.1",
             )
         else:
             journal.update_reset_phase(

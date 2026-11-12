@@ -21753,7 +21753,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     ReceiverExpiryPreemptsBlockedUnfenceAndContainsActiveOperation) {
+     ManagerEpochReplacementPreemptsBlockedUnfenceAndContainsActiveOperation) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
@@ -21799,9 +21799,9 @@ TEST(ResourceAddressedExecutionKernelTest,
           liveness.manager_runtime_epoch, liveness.manager_owner_epoch,
           ManagerLivenessPolicyDTO{liveness.required_receivers.front().runtime_policy_id,
                                    liveness.required_receivers.front().runtime_policy_revision, 10,
-                                   30, ProductContractId("safe.1"), ProductContractRevision("1")},
+                                   ProductContractId("safe.1"), ProductContractRevision("1")},
           liveness.active_bundle_id, liveness.required_runtime_set_digest},
-      clock, scheduler,
+      clock,
       []() -> ContentDigest { throw std::runtime_error("injected local-safe failure"); }, kernel,
       kernel);
   ASSERT_TRUE(
@@ -21834,16 +21834,20 @@ TEST(ResourceAddressedExecutionKernelTest,
     FAIL() << "Manager-liveness publication did not reach its blocking seam";
   }
 
-  clock.set(30);
-  auto expiring = std::async(std::launch::async, [&] { scheduler.advance_to(30); });
+  auto replacing = std::async(std::launch::async, [&] {
+    return receiver.BeginManagerEpochReplacement(liveness.manager_runtime_unit_id,
+                                                 RuntimeEpoch("manager.epoch.2"),
+                                                 RequestOwnerEpoch("manager.owner.2"));
+  });
   ASSERT_TRUE(wait_until([&] {
     const auto state = kernel.get_operation_state(operation.value().operation_id);
     return state.ok() && state.value().state != OperationStateKind::kPrepared;
   }));
-  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kExpired);
+  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kUnreconciled);
+  EXPECT_TRUE(receiver.status().command_fenced);
   EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
   release_publication_promise.set_value();
-  expiring.get();
+  ASSERT_TRUE(replacing.get().ok());
   const auto reconciliation = publishing.get();
   ASSERT_FALSE(reconciliation.ok());
   EXPECT_EQ(reconciliation.error().details.at("reason"),
@@ -27256,6 +27260,68 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.translate_stop_stage_hook = {};
 }
 
+// The Runner owns Program Stop and Halt. A newly latched Runner loss
+// therefore stops that Program run's motion through the ordinary Stop path,
+// once: a program-run Stop, not a Full Stop, and no motion inhibit.
+TEST(ResourceAddressedExecutionKernelTest, RunnerLossStopsTheProgramRunMotionOnce) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
+      {registration(make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+                    engine)},
+      clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
+  const auto acquired = claim_program_execution(kernel);
+  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
+  ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+  start_program_motion(kernel);
+  const auto moving = kernel.execute(scoped_motion_operation("runner-loss.motion"));
+  ASSERT_TRUE(moving.ok()) << moving.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto stop_generation_before = kernel.cell_stop_action_projection().expected_stop_generation;
+
+  ProgramRunnerContactLossDTO loss{
+      RequestOwnerEpoch("manager.owner.1"),
+      RuntimeEpoch("manager.epoch.1"),
+      {RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+       ProgramRunId("run.1"), acquired.value().claim_generation, std::nullopt},
+      "program_runner_liveness_probe",
+      "connection refused"};
+  CellAdmissionReadinessSnapshotDTO closed{
+      false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
+  closed.program_runner_loss = loss;
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  ASSERT_TRUE(wait_until([&] { return engine.stop_calls.load() == 1; }));
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_intent.has_value());
+    const auto* intent = std::get_if<StopIntentDTO>(&*journal.last_stop_intent);
+    ASSERT_NE(intent, nullptr) << "a program-run Stop, never a Full Stop";
+    EXPECT_EQ(intent->request_context.source_label, "kernel.program_runner_loss");
+    EXPECT_EQ(intent->reason, std::optional<std::string>("program_runner_loss"));
+    const auto* runs = std::get_if<std::vector<StopProgramRunTargetDTO>>(&intent->selector);
+    ASSERT_NE(runs, nullptr);
+    ASSERT_EQ(runs->size(), 1U);
+    EXPECT_EQ(runs->front().program_run_id, ProgramRunId("run.1"));
+  }
+  EXPECT_GT(kernel.cell_stop_action_projection().expected_stop_generation.value(),
+            stop_generation_before.value());
+  EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_FALSE(kernel.get_cell_latch().latched);
+  for (const auto& block : kernel.ReadExecutionBlocks())
+    EXPECT_NE(block.code, "manager_unavailable");
+
+  // The same loss again (every later report repeats it) stops nothing more.
+  ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(closed).ok());
+  scheduler.advance_to(clock.now());
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+}
+
 TEST(ResourceAddressedExecutionKernelTest,
      SpringFallbackCannotInventPermissionOrDispatchAfterFailedContainment) {
   for (const unsigned permission : {0U, 1U, 2U, 3U, 4U}) {
@@ -31720,7 +31786,7 @@ struct BbKernelIntegrationFixture final {
         1U,
         sequence,
         0,
-        current ? ManagerLivenessStateDTO::kCurrent : ManagerLivenessStateDTO::kExpired,
+        current ? ManagerLivenessStateDTO::kCurrent : ManagerLivenessStateDTO::kUnreconciled,
         !current,
         std::nullopt};
     return {status, liveness.active_bundle_id, liveness.required_runtime_set_digest,
@@ -32121,7 +32187,7 @@ TEST(ResourceAddressedExecutionKernelTest, ManagerLossIsAReadinessReasonThatLift
       set.cell_id, set.active_bundle_id, set.required_runtime_set_digest,
       receiver.runtime_unit_id, receiver.runtime_epoch, receiver.runtime_policy_id,
       receiver.runtime_policy_revision, set.manager_runtime_unit_id, set.manager_runtime_epoch,
-      set.manager_owner_epoch, 2U, ManagerLivenessLossKindDTO::kExpiry});
+      set.manager_owner_epoch, 2U});
   const auto blocks = fixture.kernel->ReadExecutionBlocks();
   ASSERT_EQ(blocks.size(), 1U);
   EXPECT_EQ(blocks.front().code, "manager_unavailable");
@@ -32150,8 +32216,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                                           set.manager_runtime_unit_id,
                                           set.manager_runtime_epoch,
                                           set.manager_owner_epoch,
-                                          2U,
-                                          ManagerLivenessLossKindDTO::kExpiry};
+                                          2U};
   const auto before = fixture.kernel->cell_stop_action_projection().expected_stop_generation;
   fixture.kernel->LatchAndContain(loss);
   EXPECT_GT(fixture.kernel->cell_stop_action_projection().expected_stop_generation, before);
@@ -33668,7 +33733,7 @@ ManagerLivenessLossIntentDTO AtomicBlackboardHealthLoss(const BbKernelIntegratio
   return {set.cell_id, set.active_bundle_id, set.required_runtime_set_digest,
           receiver.runtime_unit_id, receiver.runtime_epoch, receiver.runtime_policy_id,
           receiver.runtime_policy_revision, set.manager_runtime_unit_id, set.manager_runtime_epoch,
-          set.manager_owner_epoch, 2U, ManagerLivenessLossKindDTO::kExpiry};
+          set.manager_owner_epoch, 2U};
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -33855,27 +33920,27 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     BbKernelRunnerContactFailureWhileIdleRetiresSourceAtReceiverExpiry) {
+     BbKernelRunnerContactFailureWhileIdleKeepsSourceAndNothingExpires) {
   // A Runner contact or publisher failure while Idle (also
   // TerminalAwaitingReset/Resetting) carries no Runner loss; the Manager sends
   // the same cycle with current=false, which alone keeps the source (GL). The
-  // failed renewal sends no native heartbeat, so the native receiver expires
-  // one expiry timeout after its last accepted heartbeat. That loss retires the
-  // source and the global rule can't watch its keys: it holds its scope.
+  // failed renewal sends no native heartbeat. Reports never expire, so after
+  // 1 s and 10 s without one the receiver stays current, the source is kept,
+  // no rule holds, nothing latches; admission follows readiness and reopens
+  // on the next current report.
   BbKernelIntegrationFixture fixture(true, false, false, false);
   const auto& row = fixture.liveness.required_receivers.front();
   constexpr Duration kHeartbeatPeriod = 250'000'000;
-  constexpr Duration kExpiryTimeout = 1'000'000'000;  // Retained native policy.
   ManagerLivenessReceiver receiver(
       ManagerLivenessReceiverConfig{
           fixture.liveness.cell_id, row.runtime_unit_id, row.runtime_epoch,
           fixture.liveness.manager_runtime_unit_id, fixture.liveness.manager_runtime_epoch,
           fixture.liveness.manager_owner_epoch,
           ManagerLivenessPolicyDTO{row.runtime_policy_id, row.runtime_policy_revision,
-                                   kHeartbeatPeriod, kExpiryTimeout,
-                                   ProductContractId("safe.1"), ProductContractRevision("1")},
+                                   kHeartbeatPeriod, ProductContractId("safe.1"),
+                                   ProductContractRevision("1")},
           fixture.liveness.active_bundle_id, fixture.liveness.required_runtime_set_digest},
-      fixture.clock, fixture.scheduler,
+      fixture.clock,
       [](const ManagerLivenessLossIntentDTO&) { return ContentDigest(test_digest('9')); },
       *fixture.kernel, *fixture.kernel);
   // The last successful renewal: heartbeat, then reconciled (current, unfenced).
@@ -33899,32 +33964,33 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.baseline()).ok());
   ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
   ASSERT_TRUE(fixture.kernel->ReadRuleHolds().empty());
+  const auto stops_before =
+      fixture.kernel->cell_stop_action_projection().expected_stop_generation;
   // The failed renewal: same Idle cycle, not current, no Runner loss.
   auto closed = fixture.readiness;
   closed.program_cycle_status_current = false;
   std::shared_ptr<IIoSignalService> affected;
   ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(closed, &affected).ok());
   EXPECT_FALSE(affected);
-  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
-  EXPECT_TRUE(fixture.kernel->ReadRuleHolds().empty());
-  // No further heartbeat. Just before expiry the source is still retained.
-  fixture.clock.set(last_heartbeat + kExpiryTimeout - 1);
-  fixture.scheduler.advance_to(last_heartbeat + kExpiryTimeout - 1);
-  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kCurrent);
-  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
-  EXPECT_TRUE(fixture.kernel->ReadRuleHolds().empty());
-  // At expiry: Manager-liveness loss retires the source; the rule holds.
-  fixture.clock.set(last_heartbeat + kExpiryTimeout);
-  fixture.scheduler.advance_to(last_heartbeat + kExpiryTimeout);
-  EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kExpired);
-  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
-  const auto holds = fixture.kernel->ReadRuleHolds();
-  ASSERT_EQ(holds.size(), 1U);
-  EXPECT_EQ(holds.front().code, "rule_holds");
-  EXPECT_FALSE(fixture.kernel->get_cell_latch().latched);
+  // A 1 s and a 10 s Manager stall: no expiry, no retirement, no Stop.
+  for (const Duration quiet : {Duration{1'000'000'000}, Duration{10'000'000'000}}) {
+    fixture.clock.set(last_heartbeat + quiet);
+    fixture.scheduler.advance_to(last_heartbeat + quiet);
+    EXPECT_EQ(receiver.status().state, ManagerLivenessStateDTO::kCurrent);
+    EXPECT_FALSE(receiver.status().command_fenced);
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    EXPECT_TRUE(fixture.kernel->ReadRuleHolds().empty());
+    EXPECT_FALSE(fixture.kernel->get_cell_latch().latched);
+  }
+  EXPECT_EQ(fixture.kernel->cell_stop_action_projection().expected_stop_generation,
+            stops_before);
+  // Readiness alone keeps the Program blackboard closed (retryable).
   const auto refused = fixture.kernel->PublishProgramBlackboard(fixture.update(2U, false));
   ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_owner_not_current");
+  EXPECT_EQ(refused.error().details.at("reason"), "program_bb_cycle_status_closed");
+  // The next successful report reopens it.
+  ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(fixture.readiness).ok());
+  EXPECT_TRUE(fixture.kernel->PublishProgramBlackboard(fixture.update(2U, false)).ok());
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

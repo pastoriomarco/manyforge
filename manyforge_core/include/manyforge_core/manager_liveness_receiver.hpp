@@ -5,9 +5,7 @@
 #include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/i_manager_liveness_observation_port.hpp>
 #include <manyforge_core/time/iclock.hpp>
-#include <manyforge_core/time/ischeduler.hpp>
 #include <memory>
-#include <chrono>
 
 namespace manyforge::core {
 
@@ -37,24 +35,19 @@ struct ManagerLivenessReconciliationAck final {
   ContentDigest reconciliation_evidence_digest;
 };
 
-/// Reusable receiver-local watchdog. Dependencies must outlive the receiver
-/// and any scheduler callback already dequeued when destruction begins.
+/// Receiver of the Manager's status and identity reports. It holds no timer:
+/// a report never expires. Dependencies must outlive the receiver.
 class ManagerLivenessReceiver final : public IManagerHeartbeatSink {
  public:
   ManagerLivenessReceiver(ManagerLivenessReceiverConfig config, IClock& clock,
-                          IScheduler& scheduler,
                           ManagerLossLocalSafeCallback local_safe_callback,
                           IManagerLivenessFailSafePort& fail_safe_port,
                           IManagerLivenessObservationPort& observation_port);
   ManagerLivenessReceiver(ManagerLivenessReceiverConfig config, IClock& clock,
-                          IScheduler& scheduler,
                           LegacyManagerLossLocalSafeCallback local_safe_callback,
                           IManagerLivenessFailSafePort& fail_safe_port,
                           IManagerLivenessObservationPort& observation_port);
   ~ManagerLivenessReceiver();
-  /// Retire the watchdog before its borrowed scheduler and clock are destroyed.
-  void DetachScheduler() noexcept;
-  [[nodiscard]] bool DetachSchedulerUntil(std::chrono::steady_clock::time_point deadline) noexcept;
 
   ManagerLivenessReceiver(const ManagerLivenessReceiver&) = delete;
   ManagerLivenessReceiver& operator=(const ManagerLivenessReceiver&) = delete;

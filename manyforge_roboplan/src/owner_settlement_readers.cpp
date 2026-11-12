@@ -24,7 +24,7 @@ constexpr int kBusyTimeoutMilliseconds = 5000;
 // The only Program-cycle journal schema these readers accept. It equals
 // `SCHEMA_VERSION` in manyforge_program_runner/cycle_journal.py (a runner test
 // checks this); older and newer development journals are refused unchanged.
-constexpr int kProgramCycleJournalSchema = 9;
+constexpr int kProgramCycleJournalSchema = 10;
 
 class Statement final {
 public:

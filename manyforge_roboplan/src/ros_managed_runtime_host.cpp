@@ -70,7 +70,6 @@
 #include <manyforge_roboplan/mock_boolean_input_provider.hpp>
 #include <manyforge_roboplan/ros_boolean_input_provider.hpp>
 #include <manyforge_core/time/host_boot_identity.hpp>
-#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
@@ -7432,18 +7431,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       stable_kernel_owner->resource_admission_table());
   component_manager::detail::ManagerLivenessCommandAdmission
       manager_liveness_admission;
-  auto manager_liveness_scheduler = std::make_unique<SimpleScheduler>(
-      SimpleSchedulerConfig::from_environment());
-  // Its RuntimeSafety Expire callback is a safety path: a throw contains the
-  // cell through the same sink as the shared scheduler. The stable Kernel is
-  // declared first, so it outlives this receiver and its workers.
-  manager_liveness_scheduler->set_safety_path_fault_sink(
-      [kernel = stable_kernel_owner](const std::string_view reason_code) {
-        kernel->ContainInternalFault(reason_code);
-      });
   component_manager::detail::ChildOwnedManagerLivenessReceiver
-      manager_liveness_receiver(std::make_shared<WallClock>(),
-                                std::move(manager_liveness_scheduler));
+      manager_liveness_receiver(std::make_shared<WallClock>());
   NativeShutdownOwnerPhase receiver_destructor_phase{
       shutdown_projection, ShutdownPhase::kLivenessReceiverDestruction,
       manager_liveness_receiver};
@@ -8402,21 +8391,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 
   const auto stable_addressed_kernel = [&]() -> core::ResourceAddressedExecutionKernel* {
     return stable_kernel_owner;
-  };
-
-  const auto await_manager_loss_containment = [&] {
-    if (!manager_liveness_installed.load(std::memory_order_acquire)) {
-      return;
-    }
-    while (g_stop_requested == 0 &&
-           manager_liveness_receiver.get()->status().state !=
-               core::ManagerLivenessStateDTO::kExpired) {
-      int waited = -1;
-      do {
-        waited = ::poll(nullptr, 0U, 25);
-      } while (waited < 0 && errno == EINTR && g_stop_requested == 0);
-      Require(waited >= 0, "Manager-loss containment wait failed");
-    }
   };
 
   const auto snapshot_registration_engines = [](const Composition &composition) {
@@ -9415,7 +9389,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   manager_liveness_lane = std::jthread([&](const std::stop_token stop_token) {
     try {
       bool ordinary_status_available = true;
-      const char *operational_stuck_drain = nullptr;
       while (!stop_token.stop_requested()) {
         std::array<pollfd, 2> descriptors{
             {{config.manager_liveness_channel_fd, POLLIN | POLLHUP, 0},
@@ -9499,18 +9472,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               continue;
             }
             if (component_manager::detail::IsManagerLivenessRpcPacket(*packet)) {
-              SendManagedRuntimePacket(
-                  config.manager_liveness_channel_fd,
-                  host_detail::DispatchHeartbeatForDrain(
-                      core::FirstStuckDrainName(),
-                      shutdown_status_servicing.load(std::memory_order_acquire),
-                      operational_stuck_drain,
-                      [&] { return handle_manager_liveness(*packet); },
-                      [](const char *drain) {
-                        return component_manager::detail::
-                            EncodeManagerLivenessRpcRejection(
-                                std::string("drain_stuck.") + drain);
-                      }));
+              SendManagedRuntimePacket(config.manager_liveness_channel_fd,
+                                       handle_manager_liveness(*packet));
               continue;
             }
             Require(
@@ -9630,9 +9593,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     shutdown_failure_phase = "motion_engine_detach";
     for (const auto &engine : shutdown_motion_engines)
       if (!engine->detach(deadline).ok()) return false;
-    shutdown_failure_phase = "manager_liveness_detach";
-    if (auto *receiver = manager_liveness_receiver.get();
-        receiver && !receiver->DetachSchedulerUntil(deadline)) return false;
     shutdown_failure_phase = "component_stream_health_detach";
     if (!host_component_stream_health()->DetachSchedulerUntil(deadline)) return false;
     if (detached_owner_scheduler) {
@@ -10002,7 +9962,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     if ((descriptor.revents & POLLHUP) != 0 &&
         (descriptor.revents & POLLIN) == 0) {
-      await_manager_loss_containment();
       rethrow_manager_liveness_failure();
       return 0;
     }
@@ -10015,7 +9974,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     const auto rpc_received = DiagnosticClock::now();
     if (!packet.has_value()) {
       rethrow_manager_liveness_failure();
-      await_manager_loss_containment();
       return 0;
     }
     const std::string_view request(*packet);

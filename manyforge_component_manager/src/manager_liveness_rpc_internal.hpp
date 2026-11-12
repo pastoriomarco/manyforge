@@ -23,9 +23,9 @@ class ManagerLivenessRpcRejection final : public std::invalid_argument {
 };
 
 inline constexpr std::string_view kManagerLivenessRequestTag =
-    "manyforge.manager-liveness.request.v1";
+    "manyforge.manager-liveness.request.v2";
 inline constexpr std::string_view kManagerLivenessResponseTag =
-    "manyforge.manager-liveness.response.v1";
+    "manyforge.manager-liveness.response.v2";
 inline constexpr std::string_view kManagerLivenessRejectionTag =
     "manyforge.manager-liveness.rejected.v1";
 inline constexpr std::size_t kMaximumManagerLivenessRpcPacketBytes = 16U * 1024U;
@@ -181,7 +181,7 @@ class ManagerLivenessCommandAdmission final {
     open_ = false;
     ++generation_;
     std::string material(
-        "manyforge.native-execution.manager-loss-local-admission-close.v1");
+        "manyforge.native-execution.manager-loss-local-admission-close.v2");
     for (const auto& value :
          {intent.cell_id.value(), intent.active_bundle_id.value(),
           intent.required_runtime_set_digest.value(),
@@ -196,8 +196,6 @@ class ManagerLivenessCommandAdmission final {
     }
     material.push_back('\0');
     material.append(std::to_string(intent.receiver_status_sequence));
-    material.push_back('\0');
-    material.append(std::to_string(static_cast<unsigned>(intent.kind)));
     return manyforge::core::ContentDigest(
         manyforge::content_identity::sha256_digest(material));
   }
@@ -208,18 +206,15 @@ class ManagerLivenessCommandAdmission final {
   std::uint64_t generation_{};
 };
 
-/// Owns watchdog timing dependencies for the full managed-child lifetime.
-/// Member order intentionally destroys the receiver before its scheduler and
-/// clock, independently of composition replacement.
+/// Owns the receiver's clock for the full managed-child lifetime. Member
+/// order destroys the receiver before its clock.
 class ChildOwnedManagerLivenessReceiver final {
  public:
-  ChildOwnedManagerLivenessReceiver(
-      std::shared_ptr<manyforge::core::IClock> clock,
-      std::unique_ptr<manyforge::core::IScheduler> scheduler)
-      : clock_(std::move(clock)), scheduler_(std::move(scheduler)) {
-    if (clock_ == nullptr || scheduler_ == nullptr) {
-      throw std::invalid_argument(
-          "child-owned Manager liveness timing is incomplete");
+  explicit ChildOwnedManagerLivenessReceiver(
+      std::shared_ptr<manyforge::core::IClock> clock)
+      : clock_(std::move(clock)) {
+    if (clock_ == nullptr) {
+      throw std::invalid_argument("child-owned Manager liveness clock is absent");
     }
   }
 
@@ -232,8 +227,8 @@ class ChildOwnedManagerLivenessReceiver final {
       throw std::logic_error("Manager liveness receiver is already installed");
     }
     receiver_ = std::make_unique<manyforge::core::ManagerLivenessReceiver>(
-        std::move(config), *clock_, *scheduler_,
-        std::move(local_safe_callback), fail_safe_port, observation_port);
+        std::move(config), *clock_, std::move(local_safe_callback),
+        fail_safe_port, observation_port);
   }
 
   [[nodiscard]] manyforge::core::ManagerLivenessReceiver* get() noexcept {
@@ -242,7 +237,6 @@ class ChildOwnedManagerLivenessReceiver final {
 
  private:
   std::shared_ptr<manyforge::core::IClock> clock_;
-  std::unique_ptr<manyforge::core::IScheduler> scheduler_;
   std::unique_ptr<manyforge::core::ManagerLivenessReceiver> receiver_;
 };
 

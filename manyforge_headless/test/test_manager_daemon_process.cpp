@@ -870,6 +870,8 @@ public:
                              LogDetail());
   }
 
+  [[nodiscard]] pid_t pid() const noexcept { return pid_; }
+
   ~ProgramRunnerProcess() {
     if (pid_ > 0) {
       static_cast<void>(::kill(pid_, SIGTERM));
@@ -3004,7 +3006,7 @@ TEST(ManagerDaemonProcess,
 
   ProgramRunnerProcess runner(directory, fixture.cell_id);
   // Owner-issued admission proves the complete validated renewal/readiness
-  // path succeeded; a probe or a retry-gate reset alone is not recovery.
+  // path succeeded; a probe alone is not recovery.
   EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
   const auto recovered_warnings = warning_count();
   expect_unchanged_over_heartbeats(recovered_warnings);
@@ -3012,8 +3014,8 @@ TEST(ManagerDaemonProcess,
   std::filesystem::rename(socket, saved_socket);
   wait_for_warning(recovered_warnings + 1U);
   EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
-  // Restore promptly, before spending the existing lease-expiry budget. No
-  // changed intermediate cause may disguise a missing success-edge reset.
+  // Restore promptly. No changed intermediate cause may disguise a missing
+  // success-edge reset.
   std::filesystem::rename(saved_socket, socket);
   EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
   expect_unchanged_over_heartbeats(recovered_warnings + 1U);
@@ -3021,6 +3023,54 @@ TEST(ManagerDaemonProcess,
   wait_for_warning(recovered_warnings + 2U);
   EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
   std::filesystem::rename(saved_socket, socket);
+  const auto stopped = manager.Stop(SIGTERM);
+  EXPECT_TRUE(WIFEXITED(stopped));
+}
+
+TEST(ManagerDaemonProcess,
+     StalledManagerOrRunnerStopsNothingAndAdmissionFollowsReadiness) {
+  // Reports never expire. A Manager stalled for 1 s or 10 s, or a stalled
+  // Program Runner, leaves the execution host running (no Full Stop, no
+  // inhibit, no exit); admission follows readiness and is open again after
+  // the next successful report.
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  const auto socket = directory.program_runner_liveness_socket_path();
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         fixture.admission_filename,
+                         installed_manager.string(), socket.string());
+  manager.WaitReady(directory);
+  ProgramRunnerProcess runner(directory, fixture.cell_id);
+  ASSERT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  const auto host =
+      WaitForSoleManagedChild(manager.pid(), "before the stalls");
+  const auto expect_host_kept = [&](const char *after) {
+    SCOPED_TRACE(after);
+    EXPECT_EQ(::kill(host, 0), 0);
+    EXPECT_EQ(ReadDirectChildren(manager.pid()), std::vector<pid_t>{host});
+    EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+    EXPECT_EQ(ReadStartupStderr(directory).find(
+                  "Manager heartbeat renewal was rejected"),
+              std::string::npos)
+        << ReadStartupStderr(directory);
+  };
+  for (const auto stall : {std::chrono::milliseconds(1500),
+                           std::chrono::milliseconds(10000)}) {
+    ASSERT_EQ(::kill(manager.pid(), SIGSTOP), 0);
+    std::this_thread::sleep_for(stall);
+    ASSERT_EQ(::kill(manager.pid(), SIGCONT), 0);
+    expect_host_kept("Manager stall");
+  }
+  ASSERT_EQ(::kill(runner.pid(), SIGSTOP), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
+  EXPECT_EQ(::kill(host, 0), 0);
+  ASSERT_EQ(::kill(runner.pid(), SIGCONT), 0);
+  expect_host_kept("Program Runner stall");
   const auto stopped = manager.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
 }

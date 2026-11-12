@@ -1831,9 +1831,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(std::get<double>(
                 member(retained_liveness, "heartbeat_period_ns").storage()),
             static_cast<double>(liveness.heartbeat_period_ns));
-  EXPECT_EQ(std::get<double>(
-                member(retained_liveness, "expiry_timeout_ns").storage()),
-            static_cast<double>(liveness.expiry_timeout_ns));
+  EXPECT_EQ(retained_liveness.find_object_member("expiry_timeout_ns"), nullptr);
   EXPECT_EQ(string_member(retained_liveness, "local_safe_state_contract_id"),
             liveness.local_safe_state_contract_id.value());
   EXPECT_EQ(string_member(retained_liveness, "local_safe_state_contract_revision"),
@@ -2266,8 +2264,8 @@ TEST(RetainedBundleMaterializer,
     std::string to;
   };
   const std::array<Mutation, 10U> mutations{{
-      {"API version", "manyforge.ros2_control_execution_runtime_manifest.v1",
-       "manyforge.ros2_control_execution_runtime_manifest.v0"},
+      {"API version", "manyforge.ros2_control_execution_runtime_manifest.v2",
+       "manyforge.ros2_control_execution_runtime_manifest.v1"},
       {"lifecycle", "manager_managed", "externally_managed"},
       {"process adapter", "manyforge.installed_execution_target",
        "manyforge.arbitrary_command"},

@@ -38,7 +38,6 @@ from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAdapterPorts,
     OwnerTaskPort,
-    ProgramRunScopeState,
     ProgramRunPortContext,
 )
 from manyforge_behavior.orchestration_values import (
@@ -65,7 +64,6 @@ from manyforge_behavior.production_ports import (
 )
 from manyforge_behavior.program_run_owner import (
     PROGRAM_RESET_STOP_REASON,
-    PROGRAM_RUN_STATUS_API,
     ProgramRunOwner,
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
@@ -486,7 +484,6 @@ class ProgramRuntime:
                 receiver_runtime_unit_id=self.owner_id,
                 receiver_runtime_epoch=self.owner_epoch,
                 retained=self._journal.liveness(),
-                on_expiry=self._contain_manager_loss,
                 on_reconciliation=self._reconcile_manager_liveness,
                 cycle_status=self._current_cycle_status_projection,
                 publication_check=self._retry_pending_bbkey_sources,
@@ -742,40 +739,6 @@ class ProgramRuntime:
             # reconciliation digest. Kernel owner rotation has its own
             # domain-separated evidence.
             del evidence_digest
-            retained = journal.liveness()
-            cycle = journal.read()
-            # Manager-loss evidence only: a BB publication fault is retained
-            # separately and is never a Manager loss.
-            fault_reference = (
-                None
-                if self._liveness is None
-                else self._liveness.manager_fault_reference
-            )
-            if (
-                cycle.reconciliation_required
-                and cycle.program_run_id is not None
-                and cycle.state not in {"idle_after_reset", "terminal_awaiting_reset"}
-                and isinstance(fault_reference, str)
-            ):
-                self._contain_retained_run(
-                    cycle.program_run_id,
-                    fault_reference=fault_reference,
-                )
-                cycle = journal.read()
-            if (
-                not retained.expired
-                and isinstance(fault_reference, str)
-                and fault_reference
-            ):
-                cycle = journal.read()
-                journal.retain_liveness_loss(
-                    manager_runtime_epoch=(
-                        retained.manager_runtime_epoch or "unknown-manager"
-                    ),
-                    manager_owner_epoch=retained.manager_owner_epoch,
-                    fault_reference=fault_reference,
-                    expected_generation=cycle.cycle_generation,
-                )
             cycle = journal.read()
             reset_recovery_phase = self._reset_recovery_phase(
                 cycle,
@@ -1040,167 +1003,6 @@ class ProgramRuntime:
                 manager_runtime_epoch=manager_runtime_epoch,
                 manager_owner_epoch=manager_owner_epoch,
             )
-
-    def _contain_manager_loss(self, fault_reference: str) -> str:
-        """Fence first, durably latch loss, then settle the current run."""
-        journal = self._journal
-        if journal is None:
-            return fault_reference
-        with self._transition_lock:
-            try:
-                cycle = journal.read()
-            except Exception:
-                cycle = None
-            try:
-                retained = journal.liveness()
-                if cycle is not None:
-                    journal.retain_liveness_loss(
-                        manager_runtime_epoch=(
-                            retained.manager_runtime_epoch or "unknown-manager"
-                        ),
-                        manager_owner_epoch=retained.manager_owner_epoch,
-                        fault_reference=fault_reference,
-                        expected_generation=cycle.cycle_generation,
-                    )
-            except Exception:
-                # Durable-state failure must not block the independent Stop
-                # path.  The receiver remains fenced and reconciliation cannot
-                # be proven until the journal is available again.
-                pass
-            run_ids: list[str] = []
-            if (
-                cycle is not None
-                and cycle.program_run_id is not None
-                and cycle.state not in {"idle_after_reset", "terminal_awaiting_reset"}
-            ):
-                run_ids.append(cycle.program_run_id)
-            if not run_ids:
-                try:
-                    snapshots, _truncated = self._owner.list_snapshots(
-                        active_only=True,
-                        limit=self.config.maximum_retained_runs,
-                    )
-                    run_ids.extend(
-                        snapshot.capture.program_run_id for snapshot in snapshots
-                    )
-                except Exception:
-                    pass
-            for program_run_id in dict.fromkeys(run_ids):
-                try:
-                    self._owner.read(program_run_id)
-                except ProgramRunOwnerError:
-                    try:
-                        self._contain_retained_run(
-                            program_run_id,
-                            fault_reference=fault_reference,
-                        )
-                    except Exception:
-                        # The exact Kernel scope did not prove settlement. The
-                        # retained cycle stays fenced for later reconciliation.
-                        pass
-                    continue
-                try:
-                    snapshot = self._host.stop_run(
-                        program_run_id,
-                        reason="manager_presence_expired",
-                    )
-                    self._record_terminal_snapshot(snapshot.to_dict())
-                except Exception:
-                    # Reconciliation stays latched and Reset remains
-                    # unavailable whenever containment cannot be proven.
-                    pass
-        return fault_reference
-
-    def _contain_retained_run(
-        self,
-        program_run_id: str,
-        *,
-        fault_reference: str,
-    ) -> bool:
-        """Contain one non-resident retained run from exact Kernel evidence.
-
-        A replacement Program Runner deliberately cannot recreate an in-flight
-        behavior tree. It can still fence the immutable Program-run identity at
-        the Kernel and, after certified settlement, retain the same terminal
-        presentation that an ordinary owner Stop would have produced.
-        """
-
-        journal = self._journal
-        if journal is None:
-            return False
-        retained = journal.read_run_snapshot(program_run_id)
-        if not isinstance(retained, Mapping):
-            return False
-        capture = retained.get("capture")
-        if (
-            not isinstance(capture, Mapping)
-            or capture.get("program_run_id") != program_run_id
-        ):
-            return False
-        state = retained.get("state")
-        if state in {"stopped", "succeeded", "failed"}:
-            self._record_terminal_snapshot(retained)
-            return journal.read().state == "terminal_awaiting_reset"
-        revision = retained.get("run_revision")
-        node_revision = retained.get("node_status_revision")
-        statuses = retained.get("node_statuses")
-        if (
-            type(revision) is not int
-            or revision < 1
-            or type(node_revision) is not int
-            or node_revision < 1
-            or not isinstance(statuses, Mapping)
-        ):
-            return False
-
-        scope = self._native.scope
-        settlement = scope.request_stop(
-            program_run_id,
-            self._digest(
-                {
-                    "fault_reference": fault_reference,
-                    "kind": "manager_loss_retained_run_stop",
-                    "program_run_id": program_run_id,
-                }
-            ),
-            "manager_presence_expired",
-        )
-        # Reconciliation is retried by the existing Manager-renewal cadence.
-        # Never hold that liveness request open while physical settlement is
-        # pending: the exact Kernel Stop identity is idempotent, so the next
-        # renewal observes or rejoins the same containment operation.
-        if settlement.state is not ProgramRunScopeState.SETTLED:
-            return False
-
-        stopped_statuses = {instance_id: "idle" for instance_id in statuses}
-        terminal = deepcopy(dict(retained))
-        terminal.update(
-            {
-                # The same Stop presentation an ordinary owner Stop produces:
-                # a Stop is not a failure, so it has no details or origin.
-                "schema_version": PROGRAM_RUN_STATUS_API,
-                "run_revision": revision + 1,
-                "state": "stopped",
-                "tree_status": "invalid",
-                "node_status_revision": (
-                    node_revision + 1
-                    if dict(statuses) != stopped_statuses
-                    else node_revision
-                ),
-                "node_statuses": stopped_statuses,
-                "active_operation_count": 0,
-                "reason_code": None,
-                "message": "",
-                "details": None,
-                "origin": None,
-            }
-        )
-        self._record_terminal_snapshot(terminal)
-        cycle = journal.read()
-        return bool(
-            cycle.state == "terminal_awaiting_reset"
-            and cycle.program_run_id == program_run_id
-        )
 
     def _build_owner_availability(self) -> dict[str, AvailabilityFact]:
         resolver = build_executable_node_resolver(self._environment)
@@ -1685,8 +1487,6 @@ class ProgramRuntime:
         ):
             return False
         journal = self._require_cycle_owner()[1]
-        if journal.liveness().expired:
-            return False
         rows = journal.pending_commands() if pending is None else pending
         resets = [row for row in rows if row["kind"] == "reset"]
         if not rows or len(resets) > 1:
@@ -2958,14 +2758,6 @@ class ProgramRuntime:
             },
             "availability": availability,
         }
-
-    def liveness_status(self) -> dict[str, Any]:
-        if self._liveness is None:
-            raise ProgramRunnerError(
-                "program_runner_manager_liveness_unavailable",
-                "Manager-presence liveness is not configured for this fixture",
-            )
-        return self._liveness.status()
 
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         if self._closed:

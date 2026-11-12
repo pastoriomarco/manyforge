@@ -31,7 +31,6 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
-#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
@@ -97,55 +96,6 @@ TEST(HostShutdownWatchdogTest, FinishedWorkReturnsWithoutIncompleteDiagnostic) {
     }
     std::_Exit(0);
   }, ::testing::ExitedWithCode(0), "^$");
-}
-
-TEST(ManagedRuntimeDrainTest, MissedDrainRefusesRenewalButShutdownOnlyDoesNot) {
-  namespace rpc = component_manager::detail;
-  const char *observed_drain = nullptr;
-  unsigned renewed = 0;
-  const auto renew = [&] {
-    ++renewed;
-    return std::string("renewed");
-  };
-  const auto refuse = [](const char *drain) {
-    return rpc::EncodeManagerLivenessRpcRejection(std::string("drain_stuck.") +
-                                                  drain);
-  };
-
-  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(
-                nullptr, false, observed_drain, renew, refuse),
-            "renewed");
-
-  int attempts = 0;
-  testing::internal::CaptureStderr();
-  core::WaitForDrain("kernel_runtime.test_drain", std::chrono::nanoseconds(1),
-                     [&](std::chrono::nanoseconds) { return ++attempts == 2; });
-  static_cast<void>(testing::internal::GetCapturedStderr());
-  ASSERT_EQ(attempts, 2);
-  const auto *first = core::FirstStuckDrainName();
-  ASSERT_NE(first, nullptr);
-  EXPECT_STREQ(first, "kernel_runtime.test_drain");
-
-  const auto rejected = host_detail::DispatchHeartbeatForDrain(
-      first, false, observed_drain, renew, refuse);
-  try {
-    static_cast<void>(rpc::DecodeManagerLivenessRpcResponse(rejected));
-    FAIL() << "expected the liveness protocol to reject renewal";
-  } catch (const rpc::ManagerLivenessRpcRejection &error) {
-    EXPECT_EQ(error.reason(), "drain_stuck.kernel_runtime.test_drain");
-  }
-  EXPECT_EQ(renewed, 1U);
-  // A fault seen during service stays sticky if teardown begins later.
-  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(first, true, observed_drain,
-                                                   renew, refuse),
-            rejected);
-  EXPECT_EQ(renewed, 1U);
-
-  const char *shutdown_only = nullptr;
-  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(first, true, shutdown_only,
-                                                   renew, refuse),
-            "renewed");
-  EXPECT_EQ(renewed, 2U);
 }
 
 TEST(RetainedExecutionHostExit,
@@ -1103,16 +1053,9 @@ private:
   std::optional<std::string> previous_hold_;
 };
 
-// The Manager's periodic liveness lane for one exact required set.
-//
-// A native receiver lease stays current for `expiry_timeout_ns` after its last
-// accepted heartbeat, and the Manager owns renewing it every
-// `heartbeat_period_ns` for as long as anything relies on it. A test standing
-// in for the Manager must keep that cadence: one heartbeat followed by a wait
-// on asynchronous child work (composition, Kernel attachment, route recovery)
-// lets the lease expire by contract once that work outlasts the expiry under
-// load. Expiry fences admission for the whole Manager epoch, and the receiver
-// then rejects every later renewal of that epoch.
+// The Manager's periodic report lane for one exact required set, at the
+// policy's `heartbeat_period_ns`. Reports never expire; the lane lets a test
+// check that the child keeps serving them while other work runs.
 class ManagerHeartbeatLane final {
 public:
   // `accepted` is the request whose heartbeat the receiver already accepted;
@@ -2733,9 +2676,8 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(liveness.required_runtime_set_digest, required_set_digest);
   ASSERT_EQ(liveness.status.state, core::ManagerLivenessStateDTO::kCurrent);
   ASSERT_FALSE(liveness.status.command_fenced);
-  // From here on the test is the Manager of this required set. The child keeps
-  // attaching its composition asynchronously, so the lease is renewed at the
-  // policy cadence rather than assumed to outlast that work.
+  // From here on the test is the Manager of this required set and keeps
+  // reporting at the policy cadence while the child attaches its composition.
   ManagerHeartbeatLane heartbeat_lane(adapter, liveness_request);
 
   EXPECT_FALSE(adapter.GetAuthoringAdmission().authoring_allowed);

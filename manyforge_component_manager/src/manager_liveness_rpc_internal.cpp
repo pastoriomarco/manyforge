@@ -153,7 +153,7 @@ std::string EncodeManagerLivenessRpcRequest(
       << request.receiver_runtime_unit_id.value() << ' '
       << policy.runtime_policy_id.value() << ' '
       << policy.runtime_policy_revision.value() << ' '
-      << policy.heartbeat_period_ns << ' ' << policy.expiry_timeout_ns << ' '
+      << policy.heartbeat_period_ns << ' '
       << policy.local_safe_state_contract_id.value() << ' '
       << policy.local_safe_state_contract_revision.value() << ' '
       << beat.heartbeat_sequence << ' ';
@@ -179,22 +179,22 @@ std::string EncodeManagerLivenessRpcRequest(
 ManagerLivenessTransportRequestDTO DecodeManagerLivenessRpcRequest(
     std::string_view bytes) {
   const auto f = Fields(bytes);
-  if (f.size() < 24U || f[0] != kManagerLivenessRequestTag) {
+  if (f.size() < 23U || f[0] != kManagerLivenessRequestTag) {
     Fail("wrong closed request shape");
   }
   for (std::size_t i = 1; i < f.size(); ++i) {
     CheckToken(f[i]);
   }
-  const auto receiver_count = Unsigned<std::size_t>(f[19]);
+  const auto receiver_count = Unsigned<std::size_t>(f[18]);
   if (receiver_count == 0U ||
       receiver_count > kMaximumManagerLivenessReceivers ||
-      f.size() != 20U + receiver_count * 4U) {
+      f.size() != 19U + receiver_count * 4U) {
     Fail("wrong required receiver count");
   }
   std::vector<RequiredManagerLivenessReceiverDTO> receivers;
   receivers.reserve(receiver_count);
   for (std::size_t index = 0; index < receiver_count; ++index) {
-    const auto offset = 20U + index * 4U;
+    const auto offset = 19U + index * 4U;
     receivers.push_back(
         {RuntimeUnitId(f[offset]), RuntimeEpoch(f[offset + 1U]),
          RuntimePolicyId(f[offset + 2U]),
@@ -206,10 +206,10 @@ ManagerLivenessTransportRequestDTO DecodeManagerLivenessRpcRequest(
       std::move(receivers)};
   ManagerLivenessPolicyDTO policy{
       RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12]), Signed(f[13]),
-      Signed(f[14]), ProductContractId(f[15]), ProductContractRevision(f[16])};
+      ProductContractId(f[14]), ProductContractRevision(f[15])};
   ManagerHeartbeatDTO heartbeat{
       CellId(f[4]), RuntimeUnitId(f[7]), RuntimeEpoch(f[8]),
-      RequestOwnerEpoch(f[9]), Unsigned<std::uint64_t>(f[17]),
+      RequestOwnerEpoch(f[9]), Unsigned<std::uint64_t>(f[16]),
       RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12])};
   ManagerLivenessTransportRequestDTO result{
       RuntimeUnitId(f[10]),
@@ -218,11 +218,11 @@ ManagerLivenessTransportRequestDTO DecodeManagerLivenessRpcRequest(
       GraphRevision(f[2]),
       ContentDigest(f[3]),
       set, policy, heartbeat, std::nullopt};
-  if (f[18] != "-") {
+  if (f[17] != "-") {
     result.reconciliation = ManagerLivenessReconciliationAck{
         set.cell_id, set.manager_runtime_unit_id, set.manager_runtime_epoch,
         set.manager_owner_epoch, set.active_bundle_id,
-        set.required_runtime_set_digest, ContentDigest(f[18])};
+        set.required_runtime_set_digest, ContentDigest(f[17])};
   }
   if (!ValidateManagerLivenessRequiredSet(set).ok() ||
       !ValidateManagerLivenessPolicy(policy).ok() ||

@@ -3,13 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import socket
-from threading import Thread
 
 import pytest
 
 from manyforge_program_runner.liveness import (
     API_VERSION,
-    EXPIRY_TIMEOUT_NS,
     POLICY_ID,
     POLICY_REVISION,
     ProgramRunnerLivenessError,
@@ -51,22 +49,20 @@ def _cycle_status(**changes):
 
 def _receiver(tmp_path: Path):
     clock = _Clock()
-    losses: list[str] = []
     reconciliations: list[tuple[str, str, str]] = []
     receiver = ProgramRunnerLivenessReceiver(
         tmp_path / "runner.sock",
         cell_id="cell",
         receiver_runtime_unit_id="program-runner.instance",
         receiver_runtime_epoch="runner-epoch",
-        retained=RetainedLiveness(None, None, False, None),
-        on_expiry=lambda reference: losses.append(reference) or reference,
+        retained=RetainedLiveness(None, None),
         on_reconciliation=lambda digest, runtime, owner: reconciliations.append(
             (digest, runtime, owner)
         ),
         cycle_status=_cycle_status,
         monotonic_ns=clock,
     )
-    return receiver, clock, losses, reconciliations
+    return receiver, clock, reconciliations
 
 
 def _heartbeat(*, sequence: int = 1, manager: str = "manager-1"):
@@ -112,7 +108,7 @@ def _expected_status_digest(status) -> str:
 
 
 def test_starts_unreconciled_and_accepts_only_fresh_exact_heartbeat(tmp_path: Path):
-    receiver, _clock, _losses, reconciliations = _receiver(tmp_path)
+    receiver, _clock, reconciliations = _receiver(tmp_path)
 
     assert receiver.status()["state"] == "unreconciled"
     with pytest.raises(ProgramRunnerLivenessError):
@@ -147,7 +143,7 @@ def test_starts_unreconciled_and_accepts_only_fresh_exact_heartbeat(tmp_path: Pa
     ],
 )
 def test_rejects_foreign_heartbeat(tmp_path: Path, change):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     packet = {**_heartbeat(), **change}
 
     with pytest.raises(ProgramRunnerLivenessError):
@@ -158,94 +154,67 @@ def test_rejects_foreign_heartbeat(tmp_path: Path, change):
 def test_heartbeat_without_readiness_renews_only_liveness(
     tmp_path: Path, initially_current: bool
 ):
-    receiver, clock, losses, reconciliations = _receiver(tmp_path)
+    receiver, clock, reconciliations = _receiver(tmp_path)
     if initially_current:
         receiver._handle(_heartbeat())
     for sequence in range(2, 6):
-        clock.now += EXPIRY_TIMEOUT_NS // 2
+        clock.now += 10_000_000_000  # Reports never expire, however far apart.
         result = receiver._handle(
             {**_heartbeat(sequence=sequence), "reconciliation_digest": None}
         )
         assert result["state"] == ("current" if initially_current else "unreconciled")
         assert result["command_fenced"] is not initially_current
-        assert not receiver.check_expiry()
-    assert not losses
     assert len(reconciliations) == int(initially_current)
     receiver._handle(_heartbeat(sequence=6))
     receiver.require_current()
     assert len(reconciliations) == 1
 
 
-def test_liveness_only_cannot_clear_actual_manager_loss(tmp_path: Path):
-    receiver, clock, losses, reconciliations = _receiver(tmp_path)
-    receiver._handle({**_heartbeat(), "reconciliation_digest": None})
-    clock.now += EXPIRY_TIMEOUT_NS + 1
-    assert receiver.check_expiry()
-    result = receiver._handle({**_heartbeat(sequence=2), "reconciliation_digest": None})
-    assert result["state"] == "unreconciled"
-    assert result["command_fenced"]
-    assert result["fault_reference"] == losses[0]
-    assert not reconciliations
-    with pytest.raises(ProgramRunnerLivenessError, match="has not expired"):
-        receiver._handle(
-            {**_heartbeat(manager="manager-2"), "reconciliation_digest": None}
-        )
-    with pytest.raises(ProgramRunnerLivenessError):
+@pytest.mark.parametrize("quiet_ns", [1_000_000_000, 10_000_000_000])
+def test_a_quiet_manager_fences_and_stops_nothing(tmp_path: Path, quiet_ns: int):
+    receiver, clock, reconciliations = _receiver(tmp_path)
+    receiver._handle(_heartbeat())  # noqa: SLF001
+    clock.now += quiet_ns
+    status = receiver.status()
+    assert status["state"] == "current" and status["command_fenced"] is False
+    assert status["local_heartbeat_age_ns"] == quiet_ns
+    receiver.require_current()
+    result = receiver._handle(  # noqa: SLF001
+        {**_heartbeat(sequence=2), "reconciliation_digest": None}
+    )
+    assert result["state"] == "current" and not result["command_fenced"]
+    assert result["fault_reference"] is None
+    assert len(reconciliations) == 1
+
+
+def test_a_new_manager_epoch_is_accepted_and_reconciled_directly(tmp_path: Path):
+    receiver, _clock, reconciliations = _receiver(tmp_path)
+    receiver._handle(_heartbeat(sequence=9))  # noqa: SLF001
+    receiver.require_current()
+
+    first = receiver._handle(  # noqa: SLF001
+        {**_heartbeat(manager="manager-2"), "reconciliation_digest": None}
+    )
+    assert first["manager_runtime_epoch"] == "manager-2"
+    assert first["state"] == "unreconciled" and first["command_fenced"]
+    with pytest.raises(ProgramRunnerLivenessError, match="reconciliation"):
         receiver.require_current()
 
+    reconciled = receiver._handle(_heartbeat(sequence=2, manager="manager-2"))  # noqa: SLF001
+    assert reconciled["state"] == "current" and not reconciled["command_fenced"]
+    assert reconciliations[-1] == ("sha256:" + "b" * 64, "manager-2", "owner-manager-2")
+    receiver.require_current()
 
-def test_fake_clock_expiry_fences_and_allows_new_manager_only_after_loss(
-    tmp_path: Path,
-):
-    receiver, clock, losses, _reconciliations = _receiver(tmp_path)
-    receiver._handle(_heartbeat())  # noqa: SLF001
-    with pytest.raises(ProgramRunnerLivenessError):
-        receiver._handle(_heartbeat(manager="manager-2"))  # noqa: SLF001
-
-    clock.now += EXPIRY_TIMEOUT_NS + 1
-    assert receiver.check_expiry()
-    assert receiver.status()["state"] == "expired"
-    assert receiver.status()["command_fenced"] is True
-    assert len(losses) == 1
-
-    receiver._handle(_heartbeat(manager="manager-2"))  # noqa: SLF001
-    assert receiver.status()["manager_runtime_epoch"] == "manager-2"
-    assert receiver.status()["state"] == "current"
-
-
-def test_reconciliation_runs_without_the_liveness_lock_and_refuses_a_raced_expiry(
-    tmp_path: Path,
-):
-    receiver, clock, losses, reconciliations = _receiver(tmp_path)
-    receiver._handle({**_heartbeat(), "reconciliation_digest": None})
-    clock.now += EXPIRY_TIMEOUT_NS + 1
-    expired: list[bool] = []
-
-    def reconcile_while_the_watchdog_expires(digest, runtime, owner):
-        reconciliations.append((digest, runtime, owner))
-        if len(reconciliations) == 1:
-            # The watchdog thread must not wait for this heartbeat.
-            watchdog = Thread(target=lambda: expired.append(receiver.check_expiry()))
-            watchdog.start()
-            watchdog.join(timeout=5)
-            assert not watchdog.is_alive()
-
-    receiver._on_reconciliation = reconcile_while_the_watchdog_expires
-    with pytest.raises(ProgramRunnerLivenessError, match="changed during"):
-        receiver._handle(_heartbeat(sequence=2))
-    assert expired == [True] and len(losses) == 1
-    status = receiver.status()
-    assert status["state"] == "expired" and status["command_fenced"]
-    assert status["last_accepted_heartbeat_sequence"] == 1
-
-    # The Manager's next renewal reconciles once more and is accepted.
-    result = receiver._handle(_heartbeat(sequence=3))
-    assert result["state"] == "current" and not result["command_fenced"]
-    assert len(reconciliations) == 2
+    # The same runtime epoch with a different owner epoch stays foreign.
+    with pytest.raises(ProgramRunnerLivenessError, match="owner epoch"):
+        receiver._handle(  # noqa: SLF001
+            {**_heartbeat(sequence=3, manager="manager-2"),
+             "manager_owner_epoch": "owner-foreign"}
+        )
 
 
 def test_listener_is_mode_0600_and_removes_only_owned_socket(tmp_path: Path):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver.start()
     path = tmp_path / "runner.sock"
     try:
@@ -261,7 +230,7 @@ def test_start_refuses_to_replace_active_same_user_listener(tmp_path: Path):
     active.bind(str(path))
     path.chmod(0o600)
     active.listen(1)
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     try:
         with pytest.raises(ProgramRunnerLivenessError, match="active listener"):
             receiver.start()
@@ -277,7 +246,7 @@ def test_start_recovers_same_user_stale_socket_inode(tmp_path: Path):
     path.chmod(0o600)
     crashed.close()
 
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver.start()
     try:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -304,7 +273,7 @@ def test_listener_pins_run_root_and_cleans_its_original_socket(
 ):
     run_root = tmp_path / "run"
     run_root.mkdir(mode=0o700)
-    receiver, _clock, _losses, _reconciliations = _receiver(run_root)
+    receiver, _clock, _reconciliations = _receiver(run_root)
     receiver.start()
     retained_root = tmp_path / "retained-run"
     run_root.rename(retained_root)
@@ -320,7 +289,7 @@ def test_start_rejects_unsafe_or_noncanonical_run_root(tmp_path: Path):
     unsafe = tmp_path / "unsafe"
     unsafe.mkdir(mode=0o700)
     unsafe.chmod(0o720)
-    receiver, _clock, _losses, _reconciliations = _receiver(unsafe)
+    receiver, _clock, _reconciliations = _receiver(unsafe)
     with pytest.raises(ProgramRunnerLivenessError, match="unsafe"):
         receiver.start()
 
@@ -328,13 +297,13 @@ def test_start_rejects_unsafe_or_noncanonical_run_root(tmp_path: Path):
     real.mkdir(mode=0o700)
     alias = tmp_path / "alias"
     alias.symlink_to(real, target_is_directory=True)
-    receiver, _clock, _losses, _reconciliations = _receiver(alias)
+    receiver, _clock, _reconciliations = _receiver(alias)
     with pytest.raises(ProgramRunnerLivenessError, match="unsafe"):
         receiver.start()
 
 
 def test_noncanonical_and_open_packets_are_rejected(tmp_path: Path):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     with pytest.raises(ProgramRunnerLivenessError):
         receiver._decode(b'{ "api_version":"x"}')  # noqa: SLF001
     with pytest.raises(ProgramRunnerLivenessError):
@@ -344,7 +313,7 @@ def test_noncanonical_and_open_packets_are_rejected(tmp_path: Path):
 def test_probe_fails_closed_when_owner_cannot_issue_current_cycle_status(
     tmp_path: Path,
 ):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._cycle_status = lambda: (_ for _ in ()).throw(  # noqa: SLF001
         ProgramRunnerLivenessError("stale owner")
     )
@@ -356,7 +325,7 @@ def test_probe_fails_closed_when_owner_cannot_issue_current_cycle_status(
 
 
 def test_probe_rejects_open_or_malformed_cycle_projection(tmp_path: Path):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._cycle_status = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
         **_cycle_status(),
         "foreign": True,
@@ -380,7 +349,7 @@ def test_probe_reports_pending_cycle_without_a_claim(
     tmp_path: Path,
     state: str,
 ):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver._cycle_status = lambda: _cycle_status(  # type: ignore[method-assign]  # noqa: SLF001
         state=state,
         program_run_id="program-cycle.7",
@@ -407,7 +376,7 @@ def test_probe_reports_pending_cycle_without_a_claim(
 
 @pytest.mark.parametrize("packet", [b"{}", b"x" * 16_385])
 def test_listener_drops_malformed_and_oversized_packets(tmp_path: Path, packet):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     receiver.start()
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     connection.settimeout(0.2)
@@ -423,32 +392,24 @@ def test_listener_drops_malformed_and_oversized_packets(tmp_path: Path, packet):
         receiver.close()
 
 
-def test_journal_retains_only_manager_loss_identity_and_evidence(tmp_path: Path):
+def test_journal_retains_only_the_manager_identity(tmp_path: Path):
     path = tmp_path / "cycle.sqlite3"
     journal = ProgramCycleJournal(path, owner_epoch="runner")
-    fault = "sha256:" + "d" * 64
     journal.retain_liveness_manager(
         manager_runtime_epoch="manager-runtime",
         manager_owner_epoch="manager-owner",
     )
-    journal.retain_liveness_loss(
-        manager_runtime_epoch="manager-runtime",
-        manager_owner_epoch="manager-owner",
-        fault_reference=fault,
-        expected_generation=1,
-    )
     journal.close()
 
     reopened = ProgramCycleJournal(path, owner_epoch="runner")
-    retained = reopened.liveness()
-    assert retained == RetainedLiveness("manager-runtime", "manager-owner", True, fault)
-    assert reopened.read().reconciliation_required is True
+    assert reopened.liveness() == RetainedLiveness("manager-runtime", "manager-owner")
+    assert reopened.read().reconciliation_required is False
     reopened.close()
 
 
 @pytest.mark.parametrize("claim_generation", [None, 11])
 def test_private_heartbeat_reports_selected_idle_reset_without_fictitious_run(tmp_path, claim_generation):
-    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver, _clock, _reconciliations = _receiver(tmp_path)
     context = {"request_owner_epoch": "caller.1", "request_id": "reset.1",
                "request_payload_digest": "sha256:" + "a" * 64,
                "reload_initial_scene": True, "reset_robot_position": False,

@@ -2,8 +2,9 @@
 
 The reconciliation heartbeat once held the liveness lock while it waited for
 the transition lock, and every ordinary command takes them the other way
-round. A Manager back after a pause while one command ran and a second
-waited deadlocked the Runner for good. This test forces that interleaving.
+round. A reconciliation heartbeat (a new Manager epoch) while one command ran
+and a second waited deadlocked the Runner for good. This test forces that
+interleaving.
 """
 
 from __future__ import annotations
@@ -60,14 +61,6 @@ class _Journal:
             raise R.ProgramRunnerError("test_x1_done", "X1 transition ends")
         raise RuntimeError("journal unavailable in this test")
 
-    def liveness(self) -> Any:
-        raise RuntimeError("journal unavailable in this test")
-
-
-class _Owner:
-    def list_snapshots(self, **_kwargs: Any) -> Any:
-        raise RuntimeError("owner unavailable in this test")
-
 
 class _Clock:
     now = 10_000_000_000
@@ -103,17 +96,14 @@ def test_reconciliation_heartbeat_and_waiting_command_cannot_deadlock() -> None:
     runtime._started = True
     runtime._journal = _Journal()
     runtime._admission = object()
-    runtime._owner = _Owner()
-    runtime.config = type("Config", (), {"maximum_retained_runs": 8})()
-    lock = _GatedLock({"H", "W"}, gate)
+    lock = _GatedLock({"H"}, gate)
     runtime._transition_lock = lock
     receiver = L.ProgramRunnerLivenessReceiver(
         Path("/nonexistent/program-runner-liveness.sock"),
         cell_id="cell",
         receiver_runtime_unit_id="runner-unit",
         receiver_runtime_epoch="runner-epoch",
-        retained=L.RetainedLiveness("manager-epoch", "manager-owner", False, None),
-        on_expiry=runtime._contain_manager_loss,
+        retained=L.RetainedLiveness("manager-epoch", "manager-owner"),
         on_reconciliation=runtime._reconcile_manager_liveness,
         cycle_status=lambda: {},
         monotonic_ns=clock,
@@ -137,16 +127,15 @@ def test_reconciliation_heartbeat_and_waiting_command_cannot_deadlock() -> None:
     request = object.__new__(ProgramRunStartRequest)
     x1 = thread("X1", lambda: runtime.start_run(request))
     x2 = thread("X2", lambda: runtime.start_run(request))
-    watchdog = thread("W", receiver.check_expiry)
-    heartbeat = thread("H", lambda: receiver._handle(_heartbeat(6)))
+    # A new Manager epoch: the heartbeat fences, then reconciles.
+    heartbeat = thread(
+        "H", lambda: receiver._handle({**_heartbeat(1), "manager_runtime_epoch": "manager-epoch.2",
+                                       "manager_owner_epoch": "manager-owner.2"}))
 
     x1.start()
     assert runtime._journal.x1_in_io.wait(_JOIN_TIMEOUT_S)
     x2.start()
     assert lock.event(lock.waiting, "X2").wait(_JOIN_TIMEOUT_S)
-    clock.now += L.EXPIRY_TIMEOUT_NS + 1  # the Manager was silent > 1 s
-    watchdog.start()
-    assert lock.event(lock.waiting, "W").wait(_JOIN_TIMEOUT_S)
     heartbeat.start()
     assert lock.event(lock.waiting, "H").wait(_JOIN_TIMEOUT_S)
     runtime._journal.x1_release.set()
@@ -154,16 +143,15 @@ def test_reconciliation_heartbeat_and_waiting_command_cannot_deadlock() -> None:
     assert lock.event(lock.holding, "X2").wait(_JOIN_TIMEOUT_S)
     gate.set()
 
-    for worker in (x1, x2, watchdog, heartbeat):
+    for worker in (x1, x2, heartbeat):
         worker.join(_JOIN_TIMEOUT_S)
-    stuck = [w.name for w in (x1, x2, watchdog, heartbeat) if w.is_alive()]
+    stuck = [w.name for w in (x1, x2, heartbeat) if w.is_alive()]
     assert stuck == [], f"deadlocked threads: {stuck}"
     assert getattr(results["X1"], "code", None) == "test_x1_done"
     assert getattr(results["X2"], "code", None) == (
         "program_runner_manager_liveness_unavailable"
     )
-    assert results["W"] is True
     # The test journal cannot reconcile, so the heartbeat is refused and
     # the Runner stays fenced until the Manager's next renewal.
     assert isinstance(results["H"], RuntimeError)
-    assert receiver.status()["state"] == "expired"
+    assert receiver.status()["state"] == "unreconciled"

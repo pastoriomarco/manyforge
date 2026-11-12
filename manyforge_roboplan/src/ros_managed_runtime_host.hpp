@@ -16,20 +16,6 @@ namespace manyforge::roboplan_backend::host_detail {
 
 int RunExecutionHostMain(int argc, char **argv);
 
-// The liveness lane owns `observed`. A drain first observed while the host is
-// exiting does not turn its normal shutdown into a Manager-loss incident.
-// A fault observed during service remains latched throughout teardown.
-// A miss recorded just before shutdown but first observed afterward is treated
-// as shutdown-only as well.
-template <typename Renew, typename Refuse>
-auto DispatchHeartbeatForDrain(const char *first_stuck, bool shutting_down,
-                               const char *&observed, Renew &&renew,
-                               Refuse &&refuse) {
-  if (observed == nullptr && !shutting_down)
-    observed = first_stuck;
-  return observed != nullptr ? refuse(observed) : renew();
-}
-
 /// `text` cut to at most `bytes` bytes on a UTF-8 character boundary.
 [[nodiscard]] inline std::string BoundedUtf8(const std::string_view text,
                                              const std::size_t bytes) {

@@ -1860,7 +1860,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   KernelLivenessLaneCall(const detail::KernelCellAdmissionRpcPacket &request) {
     // Readiness and liveness form one ordered fail-closed control stream.
     // Keep it independent from projection and authoring calls: those may
-    // legitimately take longer than the Manager lease renewal interval.
+    // legitimately take longer than the Manager report interval.
     std::lock_guard lock(liveness_mutex);
     if (liveness_endpoints.size() != 1U) {
       return manyforge::core::Result<Response>::Err(

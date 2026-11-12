@@ -43,6 +43,9 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
     const CellAdmissionReadinessSnapshotDTO& snapshot,
     std::shared_ptr<IIoSignalService>* actual_retired_service) {
   if (actual_retired_service) actual_retired_service->reset();  // Destroy outside Core locks.
+  // A newly latched Runner loss names the run whose motion is stopped below,
+  // after every Core lock is released.
+  std::optional<ProgramRunId> lost_runner_run;
   auto updated = [&] {
     std::lock_guard admission_lock(*admission_mutex_);
     if (snapshot.program_runner_loss) {
@@ -68,7 +71,10 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
       }
       // The first owner-issued fault remains observable even if advancing
       // ordinary readiness fails its journal write. This grants no recovery.
-      if (!program_runner_loss_) program_runner_loss_ = snapshot.program_runner_loss;
+      if (!program_runner_loss_) {
+        program_runner_loss_ = snapshot.program_runner_loss;
+        lost_runner_run = cycle.program_run_id;
+      }
       const auto bb_retired = retire_program_blackboard_source_locked(actual_retired_service);
       if (!bb_retired.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_retired.error());
       if (cycle.program_run_id) retire_program_io_watches_locked(*cycle.program_run_id);
@@ -97,7 +103,34 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
     }
     return result;
   }();
+  if (lost_runner_run) stop_program_run_after_runner_loss(*lost_runner_run);
   return updated;
+}
+
+// The Runner owns Program Stop and Halt, so with a silent Runner nobody else
+// could stop the Program's motion. Stop that run's operations once per loss
+// through the ordinary Stop path; nothing else in the cell is stopped. A
+// refused Stop leaves the latch and the closed readiness unchanged.
+void ResourceAddressedExecutionKernel::stop_program_run_after_runner_loss(
+    const ProgramRunId& program_run_id) noexcept {
+  try {
+    const auto material = config_.request_owner_epoch.value() + "\nprogram-runner-loss\n" +
+                          program_run_id.value();
+    const StopIntentDTO intent{
+        PublicRequestContextDTO{RequestId(content_identity::sha256_digest(material)),
+                                config_.request_owner_epoch, "kernel.program_runner_loss",
+                                program_run_id.value()},
+        std::vector<StopProgramRunTargetDTO>{StopProgramRunTargetDTO{program_run_id}},
+        std::string("program_runner_loss"),
+        RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
+                              std::nullopt}};
+    const auto stopped = stop(intent);
+    if (!stopped.ok())
+      (void)std::fprintf(stderr, "manyforge_fault code=program_runner_loss_stop_refused "
+                                 "program_run_id=%s error=%s\n",
+                         program_run_id.value().c_str(), stopped.error().code.c_str());
+  } catch (...) {
+  }
 }
 
 std::optional<ProgramRunnerContactLossDTO>

@@ -1038,11 +1038,10 @@ def test_reset_discharge_is_exact_and_keeps_original_commands(tmp_path, crossing
             phase="settling",
         )
     elif crossing == "liveness":
-        journal.retain_liveness_loss(
-            expected_generation=1,
+        # A different Manager was reconciled meanwhile.
+        journal.retain_liveness_manager(
             manager_runtime_epoch="manager.1",
             manager_owner_epoch="manager.1",
-            fault_reference="manager-lost.1",
         )
     elif crossing == "reconciliation_digest":
         # Liveness/reconciliation changes need not advance the control

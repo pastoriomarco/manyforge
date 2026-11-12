@@ -32,7 +32,6 @@ void Append(std::string& out, std::uint64_t value) {
 std::string_view to_string(ManagerLivenessStateDTO value) noexcept {
   switch (value) {
     case ManagerLivenessStateDTO::kCurrent: return "current";
-    case ManagerLivenessStateDTO::kExpired: return "expired";
     case ManagerLivenessStateDTO::kUnreconciled: return "unreconciled";
   }
   return "unreconciled";
@@ -41,9 +40,6 @@ std::string_view to_string(ManagerLivenessStateDTO value) noexcept {
 Result<void> ValidateManagerLivenessPolicy(const ManagerLivenessPolicyDTO& policy) {
   if (!Identity(policy.runtime_policy_id) || !Identity(policy.runtime_policy_revision) ||
       policy.heartbeat_period_ns <= 0 ||
-      policy.expiry_timeout_ns <= policy.heartbeat_period_ns ||
-      static_cast<std::uint64_t>(policy.expiry_timeout_ns) >
-          kMaximumManagerLivenessCounter ||
       !Identity(policy.local_safe_state_contract_id) ||
       !Identity(policy.local_safe_state_contract_revision)) {
     return Invalid<void>("policy_fields");
@@ -157,10 +153,7 @@ Result<void> ValidateManagerLivenessLossIntent(
       !Identity(intent.lost_manager_runtime_epoch) ||
       !Identity(intent.lost_manager_owner_epoch) ||
       intent.receiver_status_sequence == 0U ||
-      intent.receiver_status_sequence > kMaximumManagerLivenessCounter ||
-      (intent.kind != ManagerLivenessLossKindDTO::kExpiry &&
-       intent.kind !=
-           ManagerLivenessLossKindDTO::kManagerEpochReplacement)) {
+      intent.receiver_status_sequence > kMaximumManagerLivenessCounter) {
     return Invalid<void>("loss_intent_fields");
   }
   return Result<void>::Ok();
