@@ -86,7 +86,7 @@ struct ExecutionPortParticipantConfig final {
   /// lanes; 0 (non-expiring) is admitted only on commanded lanes.
   Duration progress_freshness_budget_ns{0};
   // Observation only: failures must never change dispatch or authorization.
-  std::function<void(const ExecutionGoalKey&, const PreparedOperationParticipantDTO&,
+  std::function<void(const ControllerGoalId&, const PreparedOperationParticipantDTO&,
                      ExecutionBindingEpoch)> observe_goal_context{};
   /// The separate apply-tool-context action (`ApplyToolContext`):
   /// run before a new goal is sent and before it counts as running, with no
@@ -164,9 +164,12 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   [[nodiscard]] Result<void> RetireOwnerRebindTimer(const std::shared_ptr<OwnerRebindStage>& stage);
   [[nodiscard]] Result<void> LockOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage);
   /// Read the validated retained-motion fact only while the stage is locked.
-  [[nodiscard]] bool LockedOwnerRebindNeedsMotionProof(
+  /// Empty, and nothing changes, when the stage is not this participant's locked stage.
+  [[nodiscard]] std::optional<bool> LockedOwnerRebindNeedsMotionProof(
       const std::shared_ptr<OwnerRebindStage>& stage) const noexcept;
-  void CommitLockedOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage) noexcept;
+  /// False, and nothing changes, when the stage is not this participant's
+  /// locked, uncommitted stage.
+  [[nodiscard]] bool CommitLockedOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage) noexcept;
   void UnlockOwnerRebind(const std::shared_ptr<OwnerRebindStage>& stage) noexcept;
   std::optional<std::pair<std::uint64_t, std::uint64_t>>
   owner_rebuild_observation() const override;
@@ -197,7 +200,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
                                       std::uint64_t execution_id) override;
   Result<void> RetirePreparedExecution(std::uint64_t execution_id) override;
   Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
-      std::uint64_t execution_id, std::uint64_t execution_generation, const ExecutionGoalKey& goal,
+      std::uint64_t execution_id, std::uint64_t execution_generation, const ControllerGoalId& goal,
       const ContentDigest& digest) const override;
   Result<void> BeginReplacementPreparationScaleHold(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id,
@@ -208,7 +211,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
       const PreparedMotionReplacementSourceDTO& source) override;
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id,
-      const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor_goal,
+      const PreparedOperationParticipantDTO& participant, const ControllerGoalId& successor_goal,
       std::int64_t preparation_deadline_ns,
       const ReplacementSendRecheck& recheck_before_send = {}) override;
   Result<PreparedMotionReplacementObservationDTO> ObserveReplacement(
@@ -218,8 +221,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
                                 PreparedMotionReplacementCommitDTO commit) override;
   Result<void> ApplyToolContext(const PreparedOperationParticipantDTO& participant) override;
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
-                           const ControllerGoalId& controller_goal_id,
-                           ControllerGoalGeneration controller_goal_generation) override;
+                           const ControllerGoalId& controller_goal_id) override;
   /// Prepared dispatch only; the trajectory-only path is refused.
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override;
   Result<void> sync_observed_state_before_planning() override;
@@ -274,14 +276,12 @@ class ExecutionPortParticipant final : public IExecutionBackend {
                                                       const TrajectoryDTO& candidate) const;
   struct PreparedGoalRecord {
     ControllerGoalId goal_id;
-    ControllerGoalGeneration generation;
     ContentDigest prepared_contract_digest;
     ExecutionHandle handle;
   };
 
   [[nodiscard]] ExecutionHandle RejectedHandle(const PreparedOperationParticipantDTO& participant,
                                                const ControllerGoalId& goal_id,
-                                               ControllerGoalGeneration generation,
                                                ErrorDTO error) const;
   [[nodiscard]] std::optional<std::string_view> BindingFieldError(
       const PreparedOperationParticipantDTO& participant) const;
@@ -355,7 +355,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   /// next Dispatch refuses its goal when a Stop started since.
   std::optional<std::uint64_t> tool_context_stops_before_;
   /// The goal a Stop stage found unsent and contained; Dispatch refuses it.
-  std::optional<ExecutionGoalKey> stopped_before_dispatch_;
+  std::optional<ControllerGoalId> stopped_before_dispatch_;
   ExecutionPortTimingMetrics timing_{};
   ExecutionLaneFactsDTO lane_;
 
@@ -368,11 +368,24 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   bool scale_frozen_{false};
   struct PreparationScaleHold {
     std::uint64_t candidate_id;
-    ExecutionGoalKey source_goal;
+    ControllerGoalId source_goal;
     double factor;
     bool confirmed{false};
   };
   std::optional<PreparationScaleHold> preparation_scale_hold_;
+  /// One `manyforge_moving_scale_hold` line, captured under the locks and
+  /// printed after they are released (OD-221).
+  struct ScaleHoldTrace {
+    const char* stage{};
+    std::uint64_t owner{};
+    ControllerGoalId goal{};
+    double factor{};
+    double cursor_s{};
+    double rate_per_s{};
+  };
+  /// The worker's "released" line from ObserveSample, printed by
+  /// WaitForCompletion after `mutex_` (guarded by `mutex_`).
+  std::optional<ScaleHoldTrace> released_scale_hold_trace_;
 
   /// The factor moves linearly toward its target.
   struct ScaleRamp {

@@ -2,55 +2,31 @@ import type { ManagerApplyStatus } from '../types/api';
 import { errorCatalogRow, errorPresentation } from './commandRefusal';
 import type { WorkbenchNotice } from './workbenchNotices';
 
-const WORKBENCH_REPOSITORY_ROOT = '/workspace';
-const STOP_WORKBENCH_COMMAND = './scripts/compose-dev.sh stop --keep-evidence';
-const SINGLE_FILE_SCENARIO_SUFFIXES = ['.scenario.yaml', '.scenario.yml'] as const;
 const SCENARIO_COMPOSITION_REFUSED = 'scenario_composition_refused';
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-function repositoryRelativeScenarioPath(path: string): string | null {
-  if (path === WORKBENCH_REPOSITORY_ROOT) return '.';
-  const prefix = `${WORKBENCH_REPOSITORY_ROOT}/`;
-  if (!path.startsWith(prefix)) return null;
-  const relative = path.slice(prefix.length);
-  return relative.split('/').some((part) => part === '' || part === '.' || part === '..')
-    ? null
-    : relative;
-}
-
-function isSingleFileScenarioPath(path: string): boolean {
-  const lowerPath = path.toLowerCase();
-  return SINGLE_FILE_SCENARIO_SUFFIXES.some((suffix) => lowerPath.endsWith(suffix));
-}
-
-function reloadUnavailableReason(
-  savedScenarioPath: string | null,
-  repositoryRelativePath: string | null,
-): string | null {
-  if (savedScenarioPath === null) {
-    return 'No Saved Scenario path is available, so this workbench can only be closed.';
-  }
-  if (isSingleFileScenarioPath(savedScenarioPath)) {
-    return 'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only stopping the workbench is available.';
-  }
-  if (repositoryRelativePath === null) {
-    return 'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only stopping the workbench is available.';
-  }
-  return null;
-}
 
 function preEffectAdmissionDetail(authoringAdmissionOpen: boolean | null): string {
   if (authoringAdmissionOpen === true) {
-    return 'The current owner confirms authoring admission is open, so a cold restart is not required. The failed Apply remains recorded; this observation does not confirm acknowledgement.';
+    return 'Authoring is available again; nothing is held.';
   }
   if (authoringAdmissionOpen === false) {
-    return 'The current owner still reports authoring admission closed. An admission claim and Kernel fence may remain, and readiness may remain closed. Do not retry while it remains closed; inspect Runtime/history for the current admission holder. This Apply record alone does not justify a cold restart.';
+    return 'The failed Apply still holds the cell, so authoring is unavailable. Acknowledge it; if authoring stays unavailable, use New: it clears the failed Apply and empties the cell.';
   }
-  return 'Current authoring admission is unavailable, so settlement cannot be confirmed from this Apply record alone. An admission claim and Kernel fence may remain, and readiness may remain closed. Inspect Runtime/history before retrying; the record alone does not justify a cold restart.';
+  return 'Whether the failed Apply still holds the cell is not known yet. Acknowledge re-reads it; if authoring stays unavailable, use New: it clears the failed Apply and empties the cell.';
 }
+
+/**
+ * What still holds the cell after an ended Apply: `nothing_held` while the
+ * authoring admission is open, `new_clears` otherwise (New clears whatever the
+ * Apply still holds).
+ */
+export type FailedApplyHold = 'new_clears' | 'nothing_held';
+
+export function failedApplyHold(authoringAdmissionOpen: boolean | null): FailedApplyHold {
+  return authoringAdmissionOpen === true ? 'nothing_held' : 'new_clears';
+}
+
+const NEW_CLEARS_APPLY = 'What the Apply changed in the cell is not confirmed. '
+  + 'Use New to clear the failed Apply and empty the cell, then Load again.';
 
 /**
  * A terminal activation failure as the Manager reported it: its message,
@@ -66,18 +42,20 @@ function preEffectAdmissionDetail(authoringAdmissionOpen: boolean | null): strin
  * notice here (`dismiss`). Otherwise Acknowledge only re-reads the status; the
  * notice goes only on positive evidence (acknowledged, or no failed Apply).
  * `unavailable` proves nothing is released. After an attempt whose outcome is
- * unknown nothing is resent: the Manager permits one attempt and keeps it
- * incomplete, and only a cold workbench restart settles it.
+ * unknown nothing is resent; New clears the failed Apply.
+ *
+ * The way out it names follows `hold` (:func:`failedApplyHold`): New where
+ * something is held, nothing where nothing is held.
  */
 export function activationFailureNotice(
   id: string,
-  applyId: string,
+  /** The Apply's display form (`3f9a/apply4`). */
+  apply: string,
   status: {
     state: Extract<ManagerApplyStatus['state'], 'failed' | 'unknown_effect'>;
     failure: ManagerApplyStatus['failure'];
     failureAcknowledgement: ManagerApplyStatus['failureAcknowledgement'];
   },
-  savedScenarioPath: string | null,
   authoringAdmissionOpen: boolean | null,
   acknowledgement: {
     busy: boolean;
@@ -88,25 +66,26 @@ export function activationFailureNotice(
     /** Hide this notice in this browser (a refusal before the fence only). */
     dismiss: () => void;
   } = { busy: false, error: null, outcomeUnknown: false, run: () => {}, dismiss: () => {} },
+  hold: FailedApplyHold = 'new_clears',
 ): WorkbenchNotice | null {
   if (status.state === 'failed'
     && status.failureAcknowledgement === 'acknowledged') return null;
   const failure = status.failure;
   if (status.state === 'failed' && failure?.causeCode === SCENARIO_COMPOSITION_REFUSED) {
     // The runtime refused composing the Scenario: nothing was applied and the
-    // runtime keeps running. The refused Apply keeps authoring closed, so the
-    // next Load needs a workbench restart. The producer's message names the
-    // cause to fix.
+    // runtime keeps running. The producer's message names the cause to fix.
     const component = failure.causeDetails.component_id;
     const guidance = errorCatalogRow(SCENARIO_COMPOSITION_REFUSED)?.[1] ?? '';
+    const wayOut = hold === 'new_clears'
+      ? 'Use New to clear the failed Apply, then correct the Scenario and Load again.'
+      : 'Nothing was changed; correct the Scenario and Load again.';
     return {
       id,
       severity: 'error',
       domain: 'activation',
       title: 'Scenario refused',
       message: `${failure.message}${component === undefined ? '' : ` (component ${component})`}. `
-        + `${guidance} Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND}, then start the `
-        + `workbench again. (${applyId})`,
+        + `${guidance} ${wayOut} (${apply})`,
     };
   }
   const cause = failure === null ? '' : (() => {
@@ -122,7 +101,7 @@ export function activationFailureNotice(
     : `${failure.message} Failed during ${failure.phase.replaceAll('_', ' ')} (${failure.code}); `
       + (failure.effectDisposition === 'known'
         ? 'its effects are known.'
-        : 'its effects are unknown, so admission stays closed until explicit diagnosis.') + cause;
+        : 'its effects are unknown.') + cause;
   const isBeforeEffectFailure = status.state === 'failed'
     && failure !== null
     && failure.effectBoundary === 'before_effect';
@@ -143,9 +122,7 @@ export function activationFailureNotice(
     // Refused before the fence: the Manager never held a claim or fence.
     const nothingHeld = !durable && isKnownPreEffectRefusal && !acknowledgement.outcomeUnknown;
     const offerState = acknowledgement.outcomeUnknown
-      ? ' The acknowledgement outcome is unknown. The Manager permits no second attempt, so nothing is resent and Acknowledge only re-reads the status. '
-        + 'Nothing in the Manager settles this attempt short of a cold restart: if admission stays closed, stop the workbench and keep evidence '
-        + `(${STOP_WORKBENCH_COMMAND}) and start the workbench again.`
+      ? ' The acknowledgement outcome is unknown; Acknowledge re-reads the status.'
       : !durable && isBeforeEffectFailure && !isKnownPreEffectRefusal
         ? ' Manager reports acknowledgement unavailable, which does not prove the Apply hold is released; Acknowledge re-reads the status.'
         : '';
@@ -154,7 +131,7 @@ export function activationFailureNotice(
       severity: 'error',
       domain: 'activation',
       title: 'Activation failed',
-      message: `${detail} Applied state was not confirmed (${applyId}). `
+      message: `${detail} Applied state was not confirmed (${apply}). `
         + (isKnownPreEffectRefusal
           ? 'Manager recorded a known pre-effect refusal. '
           : 'Manager reports that this Apply made no configuration, runtime, component, or Scene change. ')
@@ -175,30 +152,13 @@ export function activationFailureNotice(
       busy: acknowledgement.busy,
     };
   }
-  const relativePath = savedScenarioPath === null
-    ? null
-    : repositoryRelativeScenarioPath(savedScenarioPath);
-  const reloadPath = relativePath !== null && savedScenarioPath !== null
-    && !isSingleFileScenarioPath(savedScenarioPath)
-    ? relativePath
-    : null;
-  const reloadAvailability = reloadUnavailableReason(savedScenarioPath, relativePath);
-  const commands = reloadPath === null
-    ? `Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND}`
-    : `Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND} `
-      + `Reload: ${STOP_WORKBENCH_COMMAND} && ./scripts/compose-dev.sh start --project ${shellQuote(reloadPath)}`;
   return {
     id,
     severity: 'error',
     domain: 'activation',
     title: status.state === 'failed' ? 'Activation failed' : 'Activation outcome unknown',
-    message: `${detail} Applied state was not confirmed (${applyId}). The runtime remains locked. `
-      + `Development workbench recovery must be run from the repository root; unsaved changes will be lost. `
-      + 'Evidence is written under .manyforge-dev/evidence/ and its exact path is printed in the terminal. '
-      + 'The page disconnects when the workbench stops and may need a refresh after Reload. '
-      + 'An invalid Saved Scenario leaves the runtime closed. Execution never resumes automatically. '
-      + (reloadAvailability === null ? '' : `${reloadAvailability} `)
-      + commands
+    message: `${detail} Applied state was not confirmed (${apply}). `
+      + (hold === 'new_clears' ? NEW_CLEARS_APPLY : 'Nothing is held; Load again.')
       + acknowledgementError,
   };
 }

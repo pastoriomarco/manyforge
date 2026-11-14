@@ -56,6 +56,33 @@ private:
   std::optional<std::chrono::nanoseconds> goal_result_bound_;
 };
 
+/// The component adapter of a ros2_control lane family without vendor steps
+/// (Mock, Isaac): the lane adapter, plus what an xArm machine does with its
+/// driver. Prepare and Recover with an exited launch (`launch_exited`) start
+/// it again through the host's driver-restart entry (`restart_driver`), then
+/// run Prepare's step on the new launch (its controllers spawned and loaded,
+/// within the lifecycle command time) and, for Recover, Recover's own step.
+/// The component ends prepared: nothing is enabled and nothing moves. A
+/// failed restart is the action's failure with its typed error; the exit
+/// fault stays and the action can be tried again. Without a restart entry it
+/// is the lane adapter.
+class Ros2ControlDriverRestartAdapter final : public core::IComponentAdapter {
+public:
+  Ros2ControlDriverRestartAdapter(std::shared_ptr<core::IComponentAdapter> lane,
+                                  std::function<bool()> launch_exited,
+                                  std::function<core::Result<void>(std::stop_token)> restart_driver);
+
+  [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
+  [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
+                                       std::stop_token stop) override;
+  [[nodiscard]] std::vector<core::Capability> capabilities() const override;
+
+private:
+  std::shared_ptr<core::IComponentAdapter> lane_;
+  std::function<bool()> launch_exited_;
+  std::function<core::Result<void>(std::stop_token)> restart_driver_;
+};
+
 /// One primitive's outcome as an action result: succeeded; `unknown` when
 /// its effect is unknown (never resent); otherwise failed with its typed
 /// error. The coordinator stamps the times.

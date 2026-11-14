@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v3
 content_version: 3.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:7794f5c2c483e713113143b08316b5dd5b70dfcdc10e5a6eaeea6fdc2c318797
+catalog_digest: sha256:cc7d43f05623ebbb3b1012ca7c0557eceb47bbab38bd6eec3345e1261c032318
 schema_types:
   tcp_selector:
     type: object
@@ -4033,7 +4033,7 @@ entries:
   name: Stop operation
   category: recovery
   description: Requests a Stop for the current operation of the target and succeeds
-    when that Stop is certified. It fails when the Stop is not certified.
+    when that Stop is complete. It fails when a stopped participant was not contained.
   stability: stable
   tags:
   - kernel
@@ -4070,11 +4070,12 @@ entries:
       implementation_id: kernel_stop_operation_v1
   observability:
     event_family: manyforge.program.node
-- id: kernel.full_stop
-  name: Full Stop
+- id: kernel.cell_stop
+  name: Cell Stop
   category: recovery
-  description: Requests a Full Stop of the whole cell and succeeds when that Stop
-    is certified. It fails when the Stop is not certified.
+  description: Stops every operation in the cell, manual ones included, without holding
+    the Program, and succeeds when that Stop is complete. It fails when a stopped
+    participant was not contained.
   stability: stable
   tags:
   - kernel
@@ -4090,13 +4091,13 @@ entries:
   execution:
     blocking: true
     cancellable: false
-    owner_api: kernel.full_stop
+    owner_api: kernel.cell_stop
   outcomes:
     success: stop_certified
     failure: stop_failed
   runners:
     py_trees:
-      implementation_id: kernel_full_stop_v1
+      implementation_id: kernel_cell_stop_v1
   observability:
     event_family: manyforge.program.node
 - id: kernel.reset_operation

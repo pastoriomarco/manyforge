@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
+import {
+  displayId,
+  type ApplicationStartId,
+} from '../api/applicationIdentity';
 import { errorMessage } from '../state/structuralResource';
 import { failureContextText } from '../state/structuredError';
 import { commandRefusalCause } from '../state/commandRefusal';
+import {
+  awaitCommandSuccess,
+  CommandEndedError,
+  commandProgressText,
+} from '../state/commandRows';
+import { useCommandRowWaiter } from './useCommandRowWaiter';
 import type {
   AppliedProgramSelection,
   AppliedProgramStatus,
+  CommandRow,
   CurrentScenarioResponse,
   JsonValue,
   CycleRecoveryActionId,
@@ -17,14 +28,16 @@ import type {
   ProgramCycleStatus,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
+  RunnerCommandRowKind,
   StructuredError,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { CellLatch, CellState, RunReadiness } from '../types/components';
 import { useActivateExecute } from './useActivateExecute';
 import {
-  browserStableIdentity,
   CommandDeliveryUnconfirmedError,
+  type ExecutionCommandReceipt,
+  type ExecutionCommandSessionIdentity,
   type ExecutionControlCommandKind,
   type HeadlessStateSource,
 } from './useHeadlessState';
@@ -43,16 +56,25 @@ import {
 
 /** The Composer refuses these starts with `execution_assistant_turn_in_progress` meanwhile. */
 export const ASSISTANT_TURN_IN_PROGRESS = 'An assistant request is running: wait or cancel it';
+/**
+ * Why a Program runner command waits while another runs: the runner refuses
+ * it at once (OD-144). Stop, Stop all and Halt never pass through the runner.
+ */
+export const PROGRAM_COMMAND_REASON = 'Not available while another Program command is running.';
+
+/** The busy reason naming the runner's command in progress and its step (OD-214). */
+export function programCommandReason(row: CommandRow): string {
+  return `${PROGRAM_COMMAND_REASON.slice(0, -1)}: ${commandProgressText(row)}.`;
+}
 
 const CURRENT_STATES = new Set([
   'running',
   'intervention_required',
-  'full_stopping',
-  'full_stopped',
+  'halting',
+  'halted',
   'stopping',
 ]);
 type ProgramCycleDebugProjection = Pick<ProgramCycleStatus,
-  | 'programRunnerOwnerEpoch'
   | 'cycleGeneration'
   | 'state'
   | 'programRunId'
@@ -60,7 +82,19 @@ type ProgramCycleDebugProjection = Pick<ProgramCycleStatus,
 > & {
   admissionGeneration?: number;
   authoringAllowed?: boolean;
+  /** The current application start, for the display form of ids. */
+  applicationStartId?: ApplicationStartId;
 };
+
+/** A run number as the operator reads it (`3f9a/run3`, D4); bare without a start. */
+export function displayRunId(
+  applicationStartId: ApplicationStartId | null | undefined,
+  programRunId: number,
+): string {
+  return applicationStartId == null
+    ? `run${programRunId}`
+    : displayId(applicationStartId, 'run', programRunId);
+}
 
 export function programCurrentStatusSummary(
   run: ProgramRunStatus | null,
@@ -74,13 +108,14 @@ export function programCurrentStatusSummary(
       .slice(0, 6)
       .map(([node, status]) => `${node}=${status}`);
   const recovery = controls?.recoveryOffer ?? null;
+  const start = cycle?.applicationStartId;
   const runContext = run?.reason ? failureContextText(run.reason) : null;
   const recoveryContext = recovery === null ? null : failureContextText(recovery.reason);
   return [
     run === null
       ? 'Observed run: none.'
       : [
-        `Observed run ${run.capture.programRunId}: ${run.state}, revision ${run.runRevision}, tree ${run.treeStatus}, active operations ${run.activeOperationCount ?? 'unknown'}.`,
+        `Observed run ${displayRunId(start, run.capture.programRunId)}: ${run.state}, revision ${run.runRevision}, tree ${run.treeStatus}, active operations ${run.activeOperationCount ?? 'unknown'}.`,
         run.reason === null ? null : `Run reason: ${run.reason.code}.`,
         run.message ? `Run message: ${run.message}.` : null,
         runContext === null ? null : `Run failure details: ${runContext}.`,
@@ -88,11 +123,12 @@ export function programCurrentStatusSummary(
       ].filter((value): value is string => value !== null).join(' '),
     cycle === null
       ? 'Observed cycle: unavailable.'
-      : `Observed cycle: ${cycle.state}, generation ${cycle.cycleGeneration}, run ${cycle.programRunId ?? 'none'}, claim ${cycle.cycleClaimGeneration ?? 'none'}, owner ${cycle.programRunnerOwnerEpoch}.`,
+      : `Observed cycle: ${cycle.state}, generation ${cycle.cycleGeneration}, run ${cycle.programRunId === null ? 'none' : displayRunId(start, cycle.programRunId)}, claim ${cycle.cycleClaimGeneration ?? 'none'}.`,
     recovery === null
       ? 'Observed recovery: none.'
       : [
-        `Observed recovery ${recovery.recoveryClass}: ${recovery.status}, offer revision ${recovery.offerRevision}, node ${recovery.nodeInstanceId}, operation ${recovery.operationId}.`,
+        `Observed recovery ${recovery.recoveryClass}: ${recovery.status}, offer revision ${recovery.offerRevision}, node ${recovery.nodeInstanceId}, operation ${recovery.operationId === null || start === undefined
+          ? recovery.operationId : displayId(start, 'op', recovery.operationId)}.`,
         `Recovery reason: ${recovery.reason.code}.`,
         recovery.reason.message ? `Recovery message: ${recovery.reason.message}.` : null,
         recoveryContext === null ? null : `Recovery failure details: ${recoveryContext}.`,
@@ -131,21 +167,14 @@ export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): s
     ? managerActive as Record<string, unknown>
     : null;
   return [
-    snapshot.receiverEpoch,
-    manager.sourceOwnerEpoch ?? 'no-manager-owner',
+    snapshot.applicationStartId,
+    manager.sourceOwnerId ?? 'no-manager-owner',
     typeof active?.retained_bundle_id === 'string'
       ? active.retained_bundle_id : 'no-retained-bundle',
     typeof active?.graph_revision === 'string'
       ? active.graph_revision : 'no-graph-revision',
-    basis?.appliedProgramOwnerEpoch ?? 'no-applied-owner',
     basis?.appliedProgramGeneration ?? 'no-applied-generation',
   ].join(':');
-}
-
-function identity(prefix: string): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `${prefix}.${random}`;
 }
 
 export type ProgramPendingCommand =
@@ -153,20 +182,18 @@ export type ProgramPendingCommand =
   | 'start-motion'
   | 'motion-stop'
   | 'resume-motion'
-  | 'full-stop'
-  | 'resume-full-stop'
-  | 'stop'
+  | 'stop-all'
+  | 'halt'
+  | 'resume-halt'
   | 'reset'
   | null;
 
 export interface ProgramSelectionPending {
   kind: 'start-motion' | 'motion-stop' | 'resume-motion';
   groupIds: string[];
-  requestId: string;
-  ownerEpoch: string;
-  programRunId: string;
-  /** The selection revision the command was sent from, when known. */
-  selectionRevision?: number;
+  programRunId: number;
+  /** The hold revision the command was sent from, when known. */
+  holdRevision?: number;
 }
 
 /**
@@ -177,13 +204,15 @@ export interface ProgramSelectionPending {
  */
 export interface ProgramPendingOrigin {
   cycleGeneration: number | null;
-  programRunId: string | null;
-  ownerEpoch: string | null;
+  programRunId: number | null;
   runRevision: number | null;
 }
 
 interface ProgramRuntimeState {
   applied: AppliedProgramSelection | null;
+  /** The start of the snapshot under which `applied` was read; source
+   * generations restart with each start. */
+  appliedApplicationStartId?: string | null;
   /** The Applied Program is preserved but not executable in the active
    * Deployment; derived on every refresh, never stored as a flag. */
   nonExecutable: AppliedProgramStatus | null;
@@ -215,13 +244,13 @@ interface ProgramRuntimeState {
 export type RunnerCommandKind =
   | 'program_run'
   | 'program_reset'
-  | 'program_full_stop'
   | 'program_motion_stop'
   | 'runtime_scale'
   | 'program_runtime_blackboard_write';
 
 const INITIAL_STATE: ProgramRuntimeState = {
   applied: null,
+  appliedApplicationStartId: null,
   nonExecutable: null,
   currentScenario: null,
   run: null,
@@ -255,23 +284,26 @@ function currentScenarioKey(value: CurrentScenarioResponse | null): string {
 }
 
 /** The exact Applied Program selection a view shows ('none' when absent). */
-export function appliedKey(value: AppliedProgramSelection | null): string {
+export function appliedKey(
+  value: AppliedProgramSelection | null,
+  applicationStartId: string | null | undefined,
+): string {
   return value === null
     ? 'none'
-    : `${value.sourceOwnerEpoch}:${value.sourceGeneration}:${value.recordDigest}`;
+    : `${applicationStartId ?? 'no-start'}:${value.sourceGeneration}:${value.recordDigest}`;
 }
 
 export function programRunProjectionKey(value: ProgramRunStatus | null): string {
   return value === null
     ? 'none'
-    : `${value.ownerEpoch}:${value.capture.programRunId}:`
+    : `${value.capture.programRunId}:`
       + `${value.runRevision}:${value.nodeStatusRevision}`;
 }
 
 function controlsKey(value: ProgramRuntimeControlProjection | null): string {
   return value === null
     ? 'none'
-    : `${value.ownerEpoch}:${value.programRunId}:${value.runRevision}:`
+    : `${value.programRunId}:${value.runRevision}:`
       + `${value.runtimeControls.runtimeControlRevision}:`
       + `${value.recoveryOffer?.offerId ?? 'no-offer'}:`
       + `${value.recoveryOffer?.offerRevision ?? 0}:`
@@ -322,7 +354,6 @@ export function programMotionStopSettled(
     run === null
     || controls === null
     || !['running', 'intervention_required'].includes(run.state)
-    || controls.ownerEpoch !== run.ownerEpoch
     || controls.programRunId !== run.capture.programRunId
   ) return false;
   return controls.executionSelections.groups.some(
@@ -340,7 +371,6 @@ function programRunLeftOrigin(
   if (origin === null || origin.programRunId === null) return false;
   return run === null
     || run.capture.programRunId !== origin.programRunId
-    || run.ownerEpoch !== origin.ownerEpoch
     || (origin.runRevision !== null && run.runRevision > origin.runRevision);
 }
 
@@ -357,7 +387,6 @@ export function programPendingAfterProjection(
     // Delivery feedback belongs to its captured run, not a successor/idle
     // projection. Its late reply cannot clear a newer request's exact token.
     return run === null
-      || run.ownerEpoch !== previousRun?.ownerEpoch
       || run.capture.programRunId !== previousRun?.capture.programRunId
       || !['running', 'intervention_required'].includes(run.state)
       ? null : pending;
@@ -375,7 +404,7 @@ export function programPendingAfterProjection(
       || (origin?.cycleGeneration != null && cycle.cycleGeneration > origin.cycleGeneration)
     )) return null;
     return cycle !== null
-      && ['stopping', 'resetting', 'terminal_awaiting_reset', 'recovery_required']
+      && ['resetting', 'terminal_awaiting_reset', 'recovery_required']
         .includes(cycle.state)
       ? null : pending;
   }
@@ -387,28 +416,21 @@ export function programPendingAfterProjection(
         && cycle.cycleGeneration > origin.cycleGeneration)
       ? null : pending;
   }
-  if (pending === 'stop') {
-    const settled = (
-      run !== null
-      && ['stopped', 'succeeded', 'failed'].includes(run.state)
-    ) || cycle?.state === 'terminal_awaiting_reset'
-      || cycle?.state === 'idle_after_reset';
-    return settled ? null : pending;
-  }
-  if (pending === 'full-stop') {
-    if (run?.state === 'full_stopped') return null;
-    // The owner takes a Full Stop with a new run revision; the run ending,
-    // being replaced or the cycle leaving `running` also ends the wait.
+  if (pending === 'halt') {
+    if (run?.state === 'halted') return null;
+    // The run shows a Halt with a new run revision; the run ending, being
+    // replaced or the cycle leaving `running` also ends the wait. Without a
+    // run nothing shows it: the receipt ends the wait (`halt`).
     return programRunLeftOrigin(run, cycle, origin)
       || ['stopped', 'succeeded', 'failed'].includes(run?.state ?? '')
       ? null : pending;
   }
-  if (pending === 'resume-full-stop') {
+  if (pending === 'resume-halt') {
     if (run?.state === 'running' && cycle?.state === 'running') return null;
     // Sent from a halted run: the resumed run may be held again by its first
     // tree tick (`intervention_required`) before `running` is ever seen.
     return programRunLeftOrigin(run, cycle, origin)
-      || (run !== null && run.state !== 'full_stopped')
+      || (run !== null && run.state !== 'halted')
       ? null : pending;
   }
   return pending;
@@ -421,15 +443,10 @@ export function programPendingAfterProjection(
 export function buildProgramStartRequest(
   applied: AppliedProgramSelection | null,
   workspace: ProgramWorkspaceResponse | null,
-  requestOwnerEpoch: string,
-  requestId: string,
 ): Record<string, JsonValue> | null {
   if (applied === null || workspace === null || workspace.draft.programRevision == null) return null;
   return {
-    request_id: requestId,
-    request_owner_epoch: requestOwnerEpoch,
     source_label: 'operator_ui',
-    correlation_id: requestId,
     scenario_id: applied.scenarioId,
     source_document_digest: applied.sourceDocumentDigest,
     expected_applied_record_digest: applied.recordDigest,
@@ -437,12 +454,11 @@ export function buildProgramStartRequest(
   };
 }
 
-/** The exact Reset this browser sent: the cycle it ends and its correlation. */
+/** The exact Reset this browser sent: the cycle it ends and its command. */
 export interface ProgramResetIdentity {
-  requestId: string;
-  correlationId: string;
-  programRunId: string | null;
-  programRunnerOwnerEpoch: string;
+  /** The WebSocket command (session number and client sequence) that sent it. */
+  command: ExecutionCommandSessionIdentity;
+  programRunId: number | null;
   cycleGeneration: number;
 }
 
@@ -458,7 +474,6 @@ export interface ProgramResetOptions {
 }
 
 export interface ProgramResetCallOptions extends ProgramResetOptions {
-  correlationId?: string;
   expected?: ProgramResetExpectation;
 }
 
@@ -473,9 +488,6 @@ export type ProgramResetOutcome =
 
 export function buildProgramResetRequest(
   snapshot: ComposerHeadlessState | null,
-  requestOwnerEpoch: string,
-  requestId: string,
-  correlationId: string = requestId,
   options: ProgramResetOptions = {},
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
@@ -490,17 +502,16 @@ export function buildProgramResetRequest(
   if (
     cycle === undefined
     || !allowed
-    || (cycle.programRunId === null && retainedReset === null && (cycle.state !== 'idle_after_reset'
+    // A recovery_required cycle whose acquire outcome is unknown announces no
+    // run; its Reset names the cycle generation alone.
+    || (cycle.programRunId === null && retainedReset === null
+      && cycle.state !== 'recovery_required' && (cycle.state !== 'idle_after_reset'
       || cycle.cycleClaimGeneration !== null || cycle.terminalOrSettlementReference !== null))
   ) return null;
   const selected = retainedReset ?? options;
   return {
-    request_id: requestId,
-    request_owner_epoch: requestOwnerEpoch,
     source_label: 'operator_ui',
-    correlation_id: correlationId,
     program_run_id: cycle.programRunId,
-    expected_owner_epoch: cycle.programRunnerOwnerEpoch,
     expected_cycle_generation: cycle.cycleGeneration,
     expected_claim_generation: cycle.cycleClaimGeneration,
     terminal_reference: cycle.terminalOrSettlementReference,
@@ -515,7 +526,6 @@ function controlsMatchRun(
   run: ProgramRunStatus,
 ): controls is ProgramRuntimeControlProjection {
   return controls !== null
-    && controls.ownerEpoch === run.ownerEpoch
     && controls.programRunId === run.capture.programRunId
     && controls.runRevision === run.runRevision;
 }
@@ -548,8 +558,7 @@ function selectionPendingAfterProjection(
     return [];
   }
   const currentRunPending = pending.filter((request) => (
-    request.ownerEpoch === run.ownerEpoch
-    && request.programRunId === run.capture.programRunId
+    request.programRunId === run.capture.programRunId
   ));
   // Keep delivery feedback while a matching run's control projection is
   // temporarily unavailable. Clearing it here would make a lost observation
@@ -561,8 +570,8 @@ function selectionPendingAfterProjection(
     ));
     if (rows.length !== request.groupIds.length) return true;
     // The owner applied a selection change after this command was sent.
-    if (request.selectionRevision !== undefined
-      && controls.executionSelections.selectionRevision > request.selectionRevision) {
+    if (request.holdRevision !== undefined
+      && controls.executionSelections.holdRevision > request.holdRevision) {
       return false;
     }
     const complete = request.kind === 'motion-stop'
@@ -579,8 +588,6 @@ function sameSelectionPending(
   return left.length === right.length && left.every((request, index) => {
     const other = right[index];
     return request.kind === other.kind
-      && request.requestId === other.requestId
-      && request.ownerEpoch === other.ownerEpoch
       && request.programRunId === other.programRunId
       && request.groupIds.length === other.groupIds.length
       && request.groupIds.every((id, groupIndex) => id === other.groupIds[groupIndex]);
@@ -598,7 +605,6 @@ export function programRuntimeAfterSnapshot(
   if (cycle.programRunId === null) return { run: null, controls: null };
   const observedRun = cycle.run;
   const currentMatchesCycle = currentRun !== null
-    && currentRun.ownerEpoch === cycle.programRunnerOwnerEpoch
     && currentRun.capture.programRunId === cycle.programRunId;
   const run = currentMatchesCycle && (
     observedRun === null
@@ -634,7 +640,7 @@ export function programRuntimeAfterSnapshot(
  */
 export function persistentValuesFence(
   current: PersistentKeyValues,
-  run: { capture: { programRunId: string }; runRevision: number } | null,
+  run: { capture: { programRunId: number }; runRevision: number } | null,
 ): PersistentKeyValuesFence | null {
   if (current.programRunId === null) return {};
   if (run === null || run.capture.programRunId !== current.programRunId) return null;
@@ -663,7 +669,18 @@ export function useProgramRuntime(
   const readiness: RunReadiness | null = cellState.readiness;
   const cellLatch: CellLatch | null = cellState.latch;
   const mounted = useRef(true);
-  const pendingProgramRequest = useRef<string | null>(null);
+  // This page's runner commands wait here for their published end (OD-214).
+  const runnerRows = useCommandRowWaiter(
+    snapshot?.programCycle.runnerCommands ?? null,
+    snapshot?.applicationStartId ?? null,
+  );
+  /** Resolves when a runner command's row ends succeeded; throws CommandEndedError otherwise. */
+  const commandEnd = useCallback(async (receipt: ExecutionCommandReceipt): Promise<void> => {
+    if (receipt.command !== null) await awaitCommandSuccess(receipt.command, runnerRows);
+  }, [runnerRows]);
+  // The Program command `pending` belongs to: a fresh object per command, so a
+  // late reply never clears a newer command's pending flag.
+  const pendingProgramRequest = useRef<object | null>(null);
   // The cycle the next Program command is sent from (see ProgramPendingOrigin).
   const latestCycleGeneration = useRef<number | null>(null);
   latestCycleGeneration.current = snapshot?.programCycle.cycleGeneration ?? null;
@@ -690,21 +707,20 @@ export function useProgramRuntime(
   const groupScaleStopActiveRef = useRef<Set<string>>(new Set());
   const groupScaleIdentityRef = useRef('');
   const requestedWakeKey = useRef<string | null>(null);
-  const callerEpoch = useRef(browserStableIdentity(
-    'manyforge.composer.program_request_owner_epoch',
-    'composer-program-owner',
-  ));
+  const applicationStartId = snapshot?.applicationStartId ?? null;
+  const applicationStartIdRef = useRef(applicationStartId);
+  applicationStartIdRef.current = applicationStartId;
   const wakeKey = programRuntimeWakeKey(snapshot);
   const snapshotAvailable = snapshot !== null;
   const cycleDebugProjection = useMemo<ProgramCycleDebugProjection | null>(
     () => snapshot === null ? null : {
-      programRunnerOwnerEpoch: snapshot.programCycle.programRunnerOwnerEpoch,
       cycleGeneration: snapshot.programCycle.cycleGeneration,
       state: snapshot.programCycle.state,
       programRunId: snapshot.programCycle.programRunId,
       cycleClaimGeneration: snapshot.programCycle.cycleClaimGeneration,
       admissionGeneration: snapshot.authoringAdmission.admissionGeneration,
       authoringAllowed: snapshot.authoringAdmission.authoringAllowed,
+      applicationStartId: snapshot.applicationStartId,
     },
     [snapshot],
   );
@@ -715,6 +731,9 @@ export function useProgramRuntime(
       return;
     }
     refreshing.current = true;
+    // The start this read is made under; a read sent after the tab admitted
+    // a new start reaches only that start's Headless.
+    const requestApplicationStartId = applicationStartIdRef.current;
     try {
       const [currentScenarioResult, appliedResult] = await Promise.allSettled([
         api.programs.currentScenario(),
@@ -768,6 +787,7 @@ export function useProgramRuntime(
           ...current,
           currentScenario,
           applied,
+          appliedApplicationStartId: applied === null ? null : requestApplicationStartId,
           nonExecutable,
           runnerAvailable: true,
           loading: false,
@@ -778,7 +798,8 @@ export function useProgramRuntime(
         };
         return currentScenarioKey(current.currentScenario)
             === currentScenarioKey(next.currentScenario)
-          && appliedKey(current.applied) === appliedKey(next.applied)
+          && appliedKey(current.applied, current.appliedApplicationStartId)
+            === appliedKey(next.applied, next.appliedApplicationStartId)
           && JSON.stringify(current.nonExecutable) === JSON.stringify(next.nonExecutable)
           && programRunProjectionKey(current.run) === programRunProjectionKey(next.run)
           && controlsKey(current.controls) === controlsKey(next.controls)
@@ -908,7 +929,7 @@ export function useProgramRuntime(
     return () => {
       mounted.current = false;
       // Observation loss is deliberately effect-free. In particular, client
-      // unmount never submits Program Stop.
+      // unmount never submits a Stop.
     };
   }, []);
 
@@ -944,11 +965,9 @@ export function useProgramRuntime(
     [state.controls],
   );
   groupScaleRowsRef.current = groupScaleRows;
-  const groupScaleOwnerEpoch = snapshot?.executionControlStatus?.ownerEpoch
-    ?? state.run?.ownerEpoch
-    ?? '';
+  const groupScaleApplicationStartId = snapshot?.executionControlStatus?.applicationStartId ?? '';
   const groupScaleIdentityKey = JSON.stringify([
-    groupScaleOwnerEpoch,
+    groupScaleApplicationStartId,
     ...groupScaleRows.map((group) => [
       group.groupId,
       group.runtimeScaleSelector,
@@ -961,7 +980,9 @@ export function useProgramRuntime(
     group.heldNodeCount,
   ]));
   const groupScaleStopActive = useMemo(() => {
-    const allProgramStop = ['stopping', 'full_stopping'].includes(state.run?.state ?? '');
+    // A Stop all (the All row, Halt's first step) stops every group.
+    const allProgramStop = ['stopping', 'halting'].includes(state.run?.state ?? '')
+      || state.pending === 'stop-all';
     return new Set(groupScaleRows
       .filter((group) => (
         allProgramStop
@@ -976,7 +997,7 @@ export function useProgramRuntime(
         )
       ))
       .map((group) => group.groupId));
-  }, [groupScaleRows, state.run?.state, state.selectionPending]);
+  }, [groupScaleRows, state.pending, state.run?.state, state.selectionPending]);
   groupScaleStopActiveRef.current = groupScaleStopActive;
 
   const dismissError = useCallback(() => {
@@ -994,10 +1015,10 @@ export function useProgramRuntime(
 
   const beginProgramCommand = useCallback((
     pending: Exclude<ProgramPendingCommand, null>,
-    requestId: string,
+    request: object,
     selectionGroups: string[] = [],
   ) => {
-    pendingProgramRequest.current = requestId;
+    pendingProgramRequest.current = request;
     const cycleGeneration = latestCycleGeneration.current;
     setState((current) => ({
       ...current,
@@ -1005,7 +1026,6 @@ export function useProgramRuntime(
       pendingOrigin: {
         cycleGeneration,
         programRunId: current.run?.capture.programRunId ?? null,
-        ownerEpoch: current.run?.ownerEpoch ?? null,
         runRevision: current.run?.runRevision ?? null,
       },
       selectionPending: pending === 'start-motion'
@@ -1015,12 +1035,10 @@ export function useProgramRuntime(
           {
             kind: pending,
             groupIds: [...selectionGroups],
-            requestId,
-            ownerEpoch: current.run?.ownerEpoch ?? '',
-            programRunId: current.run?.capture.programRunId ?? '',
+            programRunId: current.run?.capture.programRunId ?? 0,
             ...(current.controls !== null && current.run !== null
               && controlsMatchRun(current.controls, current.run)
-              ? { selectionRevision: current.controls.executionSelections.selectionRevision }
+              ? { holdRevision: current.controls.executionSelections.holdRevision }
               : {}),
           },
         ]
@@ -1043,42 +1061,53 @@ export function useProgramRuntime(
   const recordCommandFailure = useCallback(async (
     reason: unknown,
     fallback: string,
-    requestId: string,
+    request: object | null,
     pendingKind: 'program' | 'control',
     expectedPending: string,
     expectedRun?: ProgramRunStatus,
+    selectionGroups: string[] = [],
   ) => {
     if (!mounted.current) return;
+    // A command's published end is its true outcome: it is shown even when
+    // this page's pending feedback has already moved on.
+    const ended = reason instanceof CommandEndedError;
     setState((current) => {
       const selectionRequest = expectedPending === 'start-motion'
         || expectedPending === 'motion-stop'
         || expectedPending === 'resume-motion';
-      if (
-        (pendingKind === 'program' && (
-          selectionRequest
-            ? !current.selectionPending.some((entry) => entry.requestId === requestId)
-            : current.pending !== expectedPending
-              || pendingProgramRequest.current !== requestId
+      // A selection command's entry: the first one of its kind for its run
+      // and groups.
+      const selectionIndex = selectionRequest && expectedRun !== undefined
+        ? current.selectionPending.findIndex((entry) => (
+          entry.kind === expectedPending
+          && entry.programRunId === expectedRun.capture.programRunId
+          && entry.groupIds.length === selectionGroups.length
+          && entry.groupIds.every((id, index) => id === selectionGroups[index])
         ))
+        : -1;
+      const stale = (pendingKind === 'program' && (
+        selectionRequest
+          ? selectionIndex < 0
+          : current.pending !== expectedPending
+            || pendingProgramRequest.current !== request
+      ))
         || (pendingKind === 'control'
           && current.controlPending !== expectedPending)
-        || (expectedRun !== undefined && (
-          current.run?.ownerEpoch !== expectedRun.ownerEpoch
-          || current.run?.capture.programRunId !== expectedRun.capture.programRunId
-        ))
-      ) return current;
+        || (expectedRun !== undefined
+          && current.run?.capture.programRunId !== expectedRun.capture.programRunId);
+      if (stale && !ended) return current;
       return {
         ...current,
-        pending: pendingKind === 'program'
-          && (!selectionRequest || pendingProgramRequest.current === requestId)
+        pending: !stale && pendingKind === 'program'
+          && (!selectionRequest || pendingProgramRequest.current === request)
           ? null : current.pending,
-        selectionPending: pendingKind === 'program'
-          ? current.selectionPending.filter((entry) => entry.requestId !== requestId)
+        selectionPending: !stale && pendingKind === 'program'
+          ? current.selectionPending.filter((_, index) => index !== selectionIndex)
           : current.selectionPending,
-        controlPending: pendingKind === 'control' ? null : current.controlPending,
+        controlPending: !stale && pendingKind === 'control' ? null : current.controlPending,
         error: [
           errorMessage(reason, fallback),
-          `Request ${requestId}. Backend state remains authoritative.`,
+          'Backend state remains authoritative.',
         ].join(' '),
         failureNoticeKey: null,
         errorRefusal: commandRefusalCause(reason),
@@ -1102,24 +1131,20 @@ export function useProgramRuntime(
     : assistantTurnRunning ? ASSISTANT_TURN_IN_PROGRESS : null;
 
   const ordinaryRun = useCallback(async () => {
-    const requestId = identity('program-run-start');
-    const request = buildProgramStartRequest(
-      state.applied, workspace, callerEpoch.current, requestId,
-    );
+    const request = buildProgramStartRequest(state.applied, workspace);
     if (request === null || state.pending !== null) return;
     if (controlSource === null) return;
-    beginProgramCommand('run', requestId);
+    const sent = {};
+    beginProgramCommand('run', sent);
     try {
-      await controlSource.sendExecutionCommand(
-        'program_run', request, requestId,
-      );
+      await commandEnd(await controlSource.sendExecutionCommand('program_run', request));
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Program Run was rejected.', requestId, 'program', 'run',
+        reason, 'Program Run was rejected.', sent, 'program', 'run',
       );
     }
   }, [
-    beginProgramCommand, controlSource, recordCommandFailure,
+    beginProgramCommand, commandEnd, controlSource, recordCommandFailure,
     state.applied, state.pending, workspace,
   ]);
 
@@ -1130,15 +1155,13 @@ export function useProgramRuntime(
    * confirmed: when the current observation differs, nothing is sent. A
    * definite refusal (not sent, or refused by the owner) is distinct from a
    * submitted Reset whose reply was lost: that one may have been received, so
-   * it keeps its request identity for reconciliation and must never be
-   * resent. Neither outcome is settlement: callers that continue after Reset
-   * observe its correlated cycle Idle.
+   * it keeps the cycle it was sent for and must never be resent. Neither
+   * outcome is settlement: callers that continue after Reset observe its
+   * cycle Idle.
    */
   const reset = useCallback(async (
     options: ProgramResetCallOptions = {},
   ): Promise<ProgramResetOutcome> => {
-    const requestId = identity('program-cycle-reset');
-    const correlationId = options.correlationId ?? requestId;
     const cycle = snapshot?.programCycle ?? null;
     const { expected } = options;
     if (expected !== undefined && (
@@ -1148,12 +1171,11 @@ export function useProgramRuntime(
     )) {
       return {
         status: 'refused',
-        message: `Program Reset was not sent: the observed cycle is no longer run ${expected.programRunId} at cycle generation ${expected.cycleGeneration}.`,
+        message: `Program Reset was not sent: the observed cycle is no longer run ${expected.programRunId === null ? null
+          : displayRunId(snapshot?.applicationStartId, expected.programRunId)} at cycle generation ${expected.cycleGeneration}.`,
       };
     }
-    const request = buildProgramResetRequest(
-      snapshot, callerEpoch.current, requestId, correlationId, options,
-    );
+    const request = buildProgramResetRequest(snapshot, options);
     if (request === null || controlSource === null || cycle === null) {
       const message = request === null
         ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
@@ -1164,29 +1186,34 @@ export function useProgramRuntime(
       await refresh();
       return { status: 'refused', message };
     }
-    const sent: ProgramResetIdentity = {
-      requestId,
-      correlationId,
+    const sent: Omit<ProgramResetIdentity, 'command'> = {
       programRunId: cycle.programRunId,
-      programRunnerOwnerEpoch: cycle.programRunnerOwnerEpoch,
       cycleGeneration: cycle.cycleGeneration,
     };
-    beginProgramCommand('reset', requestId);
+    beginProgramCommand('reset', sent);
     try {
-      await controlSource.sendExecutionCommand(
-        'program_reset', request, correlationId,
-      );
-      return { status: 'sent', reset: sent };
+      // Reset is a WebSocket command: its receipt names its session and
+      // client sequence.
+      const receipt = await controlSource.sendExecutionCommand('program_reset', request);
+      // Callers follow the cycle; a Reset that ends other than succeeded
+      // shows its reason where a refused Reset does.
+      void commandEnd(receipt).catch((reason: unknown) => recordCommandFailure(
+        reason, 'Program Reset was rejected.', sent, 'program', 'reset',
+      ));
+      return { status: 'sent', reset: { ...sent, command: {
+        controlSessionNumber: receipt.controlSessionNumber!,
+        clientSequence: receipt.clientSequence!,
+      } } };
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Program Reset was rejected.', requestId, 'program', 'reset',
+        reason, 'Program Reset was rejected.', sent, 'program', 'reset',
       );
       return reason instanceof CommandDeliveryUnconfirmedError
-        ? { status: 'unconfirmed', reset: sent, message: reason.message }
+        ? { status: 'unconfirmed', reset: { ...sent, command: reason.command! }, message: reason.message }
         : { status: 'refused', message: errorMessage(reason, 'Program Reset was rejected.') };
     }
   }, [
-    beginProgramCommand, controlSource,
+    beginProgramCommand, commandEnd, controlSource,
     recordCommandFailure, refresh, snapshot,
   ]);
 
@@ -1201,14 +1228,14 @@ export function useProgramRuntime(
       || groupIds.length === 0
       || !state.run
       // A motion Stop needs only a run to stop: nothing in progress holds it
-      // back. While a Stop or Full Stop ends the run, the owner answers a
+      // back. While a Stop or Halt ends the run, the owner answers a
       // repeat with no effect.
       || !(start || resume
         ? ['running', 'intervention_required']
-        : ['running', 'intervention_required', 'stopping', 'full_stopping'])
+        : ['running', 'intervention_required', 'stopping', 'halting'])
         .includes(state.run.state)
       || ((start || resume) && (!state.runnerAvailable
-        || ['stop', 'full-stop', 'reset'].includes(state.pending ?? '')))
+        || ['halt', 'reset'].includes(state.pending ?? '')))
       || ((start || resume) && (state.selectionPending.length > 0 || state.controlPending !== null
         || !controlsMatchRun(controls, state.run)
         || !groupIds.every((id) => controls.executionSelections.groups.some(
@@ -1216,35 +1243,31 @@ export function useProgramRuntime(
             && (start ? group.startAllowed : group.resumeAllowed),
         ))))
     ) return false;
-    const requestId = identity(`program-${pending}`);
     if (controlSource === null) return false;
-    beginProgramCommand(pending, requestId, groupIds);
+    const sent = {};
+    beginProgramCommand(pending, sent, groupIds);
     try {
-      await controlSource.sendExecutionCommand(
+      const receipt = await controlSource.sendExecutionCommand(
         start
           ? 'program_motion_start'
           : resume ? 'program_motion_resume' : 'program_motion_stop',
         {
-          request_id: requestId,
-          request_owner_epoch: callerEpoch.current,
           source_label: 'operator_ui',
-          correlation_id: requestId,
           program_run_id: state.run.capture.programRunId,
-          expected_owner_epoch: state.run.ownerEpoch,
           group_ids: groupIds,
-          // Run/Resume is fenced on run id, owner epoch and selection
-          // revision; tree ticks move the run revision without changing it.
+          // Run/Resume is fenced on run number and hold revision; tree
+          // ticks move the run revision without changing it.
           ...((start || resume) && controls !== null ? {
-            expected_selection_revision: controls.executionSelections.selectionRevision,
+            expected_hold_revision: controls.executionSelections.holdRevision,
           } : {}),
           reason: `operator ${pending}`,
         },
-        requestId,
       );
+      await commandEnd(receipt);
       return true;
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Selection command was rejected.', requestId, 'program', pending, state.run,
+        reason, 'Selection command was rejected.', sent, 'program', pending, state.run, groupIds,
       );
       return false;
     } finally {
@@ -1253,7 +1276,7 @@ export function useProgramRuntime(
       if (mounted.current) setState((current) => ({
         ...current,
         pending: current.pending === pending
-          && pendingProgramRequest.current === requestId
+          && pendingProgramRequest.current === sent
           ? null : current.pending,
         // Keep accepted scope feedback until the owner projection proves the
         // requested state. A receipt only proves admission; removing it here
@@ -1262,7 +1285,7 @@ export function useProgramRuntime(
       }));
     }
   }, [
-    beginProgramCommand, controlSource, composerRefusalReason,
+    beginProgramCommand, commandEnd, controlSource, composerRefusalReason,
     recordCommandFailure,
     state.pending, state.selectionPending, state.controlPending, state.controls,
     state.run, state.runnerAvailable,
@@ -1348,7 +1371,7 @@ export function useProgramRuntime(
       return;
     }
     groupScaleQueue.current.delete(row.groupId);
-    const scopeFence = runtimeScaleControlScopeFence(groupScaleOwnerEpoch, status);
+    const scopeFence = runtimeScaleControlScopeFence(groupScaleApplicationStartId, status);
     const inFlight = { groupId: row.groupId, scopeFence };
     groupScaleInFlight.current = inFlight;
     groupScaleLastSentAt.current = performance.now();
@@ -1365,7 +1388,6 @@ export function useProgramRuntime(
         : { ...current[row.groupId], pending: true, error: null },
     }));
     try {
-      const commandRequestId = identity(`program-group-scale.${row.groupId}`);
       const receipt = await controlSource.sendExecutionCommand(
         'runtime_scale',
         {
@@ -1373,7 +1395,6 @@ export function useProgramRuntime(
           expected_control_generation: status.controlGeneration,
           scale,
         },
-        commandRequestId,
       );
       if (
         groupScaleInFlight.current !== inFlight
@@ -1385,7 +1406,7 @@ export function useProgramRuntime(
       // flight; keep whichever owner generation is newer.
       const nextStatus = mergeRuntimeScaleStatus(
         groupScaleStatusRef.current.get(row.groupId) ?? null,
-        acceptedRuntimeScaleStatus(status, accepted, commandRequestId, scale),
+        acceptedRuntimeScaleStatus(status, accepted, scale),
       );
       groupScaleStatusRef.current.set(row.groupId, nextStatus);
       groupScaleScopeFenceRef.current.set(row.groupId, scopeFence);
@@ -1441,7 +1462,7 @@ export function useProgramRuntime(
         scheduleGroupScaleFlush();
       }
     }
-  }, [controlSource, groupScaleOwnerEpoch, scheduleGroupScaleFlush]);
+  }, [controlSource, groupScaleApplicationStartId, scheduleGroupScaleFlush]);
   groupScaleFlush.current = () => { void flushGroupScale(); };
 
   useEffect(() => {
@@ -1481,7 +1502,7 @@ export function useProgramRuntime(
         ) {
           throw new Error('Runtime velocity status does not match its group scope.');
         }
-        const scopeFence = runtimeScaleControlScopeFence(groupScaleOwnerEpoch, status);
+        const scopeFence = runtimeScaleControlScopeFence(groupScaleApplicationStartId, status);
         const priorFence = groupScaleScopeFenceRef.current.get(row.groupId);
         const merged = priorFence === scopeFence
           ? mergeRuntimeScaleStatus(
@@ -1529,7 +1550,7 @@ export function useProgramRuntime(
     enabled,
     groupScaleIdentityKey,
     groupScaleObservationKey,
-    groupScaleOwnerEpoch,
+    groupScaleApplicationStartId,
     groupScaleRefreshSequence,
     snapshotAvailable,
   ]);
@@ -1594,81 +1615,81 @@ export function useProgramRuntime(
     groupScaleFlush.current();
   }, []);
 
-  const fullStop = useCallback(async () => {
-    // A Full Stop needs only a run to stop: nothing in progress holds it back.
-    // A repeat while the run is Full stopping joins the running Full Stop;
-    // while a Program Stop ends the run the owner answers with no effect.
-    if (
-      !state.run
-      || !['running', 'intervention_required', 'full_stopping', 'stopping']
-        .includes(state.run.state)
-    ) return;
-    const requestId = identity('program-full-stop');
-    if (controlSource === null) return;
-    beginProgramCommand('full-stop', requestId);
+  /**
+   * One cell-wide Stop command (`stop_all` or `halt`). Neither names a run or
+   * needs one: nothing in progress holds it back and a repeat is accepted as
+   * another Stop. Resolves to whether it was received.
+   */
+  const cellStop = useCallback(async (
+    commandKind: 'stop_all' | 'halt',
+    pending: 'stop-all' | 'halt',
+    fallback: string,
+  ): Promise<boolean> => {
+    if (controlSource === null) return false;
+    const sent = {};
+    // Only a live run shows a Halt; otherwise its receipt ends the wait.
+    const runShowsHalt = pending === 'halt' && state.run !== null
+      && ['running', 'intervention_required', 'stopping', 'halting'].includes(state.run.state);
+    beginProgramCommand(pending, sent);
     try {
-      await controlSource.sendExecutionCommand(
-        'program_full_stop',
-        {
-          request_id: requestId,
-          request_owner_epoch: callerEpoch.current,
-          source_label: 'operator_ui',
-          correlation_id: requestId,
-          program_run_id: state.run.capture.programRunId,
-          expected_owner_epoch: state.run.ownerEpoch,
-          reason: 'ordinary operator Full Stop',
-        },
-        requestId,
-      );
+      await controlSource.sendExecutionCommand(commandKind, {});
+      if (!runShowsHalt && mounted.current) {
+        setState((current) => current.pending === pending && pendingProgramRequest.current === sent
+          ? { ...current, pending: null } : current);
+      }
+      return true;
     } catch (reason) {
-      await recordCommandFailure(
-        reason, 'Full Stop was rejected.', requestId, 'program', 'full-stop',
-      );
+      await recordCommandFailure(reason, fallback, sent, 'program', pending);
+      return false;
     }
-  }, [
-    beginProgramCommand, controlSource,
-    recordCommandFailure, state.run,
-  ]);
+  }, [beginProgramCommand, controlSource, recordCommandFailure, state.run]);
 
-  const resumeFullStop = useCallback(async () => {
+  /** Stop all: every motion in the cell, manual moves included; the Program's groups stay held. */
+  const stopAll = useCallback(
+    () => cellStop('stop_all', 'stop-all', 'Stop all was rejected.'),
+    [cellStop],
+  );
+  /** Halt: Stop all and freeze the Program until Execute or Reset. */
+  const halt = useCallback(
+    () => cellStop('halt', 'halt', 'Halt was rejected.'),
+    [cellStop],
+  );
+
+  /** Execute after Halt: unfreezes the halted Program; motion holds stay until Resume. */
+  const resumeHalt = useCallback(async () => {
     if (
       composerRefusalReason !== null
       || !state.run
-      || state.run.state !== 'full_stopped'
+      || state.run.state !== 'halted'
       || !state.runnerAvailable
       || state.pending !== null
     ) return;
-    const requestId = identity('program-full-stop-run');
     if (controlSource === null) return;
-    beginProgramCommand('resume-full-stop', requestId);
+    const sent = {};
+    beginProgramCommand('resume-halt', sent);
     try {
-      await controlSource.sendExecutionCommand(
-        'program_resume_full_stop',
+      await commandEnd(await controlSource.sendExecutionCommand(
+        'program_resume_halt',
         {
-          request_id: requestId,
-          request_owner_epoch: callerEpoch.current,
           source_label: 'operator_ui',
-          correlation_id: requestId,
           program_run_id: state.run.capture.programRunId,
-          expected_owner_epoch: state.run.ownerEpoch,
           expected_run_revision: state.run.runRevision,
-          reason: 'operator Run after Full Stop',
+          reason: 'operator Execute after Halt',
         },
-        requestId,
-      );
+      ));
     } catch (reason) {
       await recordCommandFailure(
-        reason, 'Run after Full Stop was rejected.', requestId, 'program',
-        'resume-full-stop',
+        reason, 'Execute after Halt was rejected.', sent, 'program',
+        'resume-halt',
       );
     }
   }, [
-    beginProgramCommand, controlSource, composerRefusalReason,
+    beginProgramCommand, commandEnd, controlSource, composerRefusalReason,
     recordCommandFailure,
     state.pending, state.run, state.runnerAvailable,
   ]);
 
-  const runtimeControlRequest = useCallback((requestId: string) => {
+  const runtimeControlRequest = useCallback(() => {
     const controls = state.controls;
     const currentRun = state.run;
     if (
@@ -1676,16 +1697,11 @@ export function useProgramRuntime(
       || currentRun === null
       || state.controlPending !== null
       || controls.programRunId !== currentRun.capture.programRunId
-      || controls.ownerEpoch !== currentRun.ownerEpoch
       || controls.runRevision !== currentRun.runRevision
     ) return null;
     return {
-      request_id: requestId,
-      request_owner_epoch: callerEpoch.current,
       source_label: 'operator_ui',
-      correlation_id: requestId,
       program_run_id: controls.programRunId,
-      expected_owner_epoch: controls.ownerEpoch,
       expected_run_revision: controls.runRevision,
     } satisfies Record<string, JsonValue>;
   }, [state.controlPending, state.controls, state.run]);
@@ -1693,7 +1709,6 @@ export function useProgramRuntime(
   /** Resolves to null when accepted, otherwise to the backend's reason. */
   const performRuntimeControl = useCallback(async (
     pending: string,
-    requestId: string,
     commandKind: ExecutionControlCommandKind,
     payload: Record<string, JsonValue>,
     fallback: string,
@@ -1701,9 +1716,7 @@ export function useProgramRuntime(
     if (controlSource === null) return 'The execution control connection is unavailable.';
     beginControlCommand(pending);
     try {
-      await controlSource.sendExecutionCommand(
-        commandKind, payload, requestId,
-      );
+      await commandEnd(await controlSource.sendExecutionCommand(commandKind, payload));
       // A recovery stays pending until the owner retires its offer.
       if (mounted.current && !pending.startsWith('recovery:')) {
         setState((current) => current.controlPending === pending
@@ -1713,11 +1726,11 @@ export function useProgramRuntime(
       return null;
     } catch (reason) {
       await recordCommandFailure(
-        reason, fallback, requestId, 'control', pending,
+        reason, fallback, null, 'control', pending,
       );
       return errorMessage(reason, fallback);
     }
-  }, [beginControlCommand, controlSource, recordCommandFailure]);
+  }, [beginControlCommand, commandEnd, controlSource, recordCommandFailure]);
 
   /** Applies one action of one offer (a failure hold's, or the focused operator Stop's), only while that exact revision is current. */
   const applyRecoveryAction = useCallback((
@@ -1735,13 +1748,8 @@ export function useProgramRuntime(
       // Retry and continue resume the run; only a Reset ends it.
       || (!action.performsBackendReset && composerRefusalReason !== null)
     ) return;
-    const requestId = identity('program-recovery');
     const body = {
-      request_id: requestId,
-      request_owner_epoch: callerEpoch.current,
       source_label: 'operator_ui',
-      correlation_id: requestId,
-      expected_owner_epoch: state.controls?.ownerEpoch ?? '',
       offer_id: offer.offerId,
       offer_revision: offer.offerRevision,
       action_id: actionId,
@@ -1749,7 +1757,6 @@ export function useProgramRuntime(
     } satisfies Record<string, JsonValue>;
     void performRuntimeControl(
       `recovery:${offer.offerId}:${actionId}`,
-      requestId,
       'execution_recovery',
       body,
       'The recovery action was rejected.',
@@ -1761,8 +1768,7 @@ export function useProgramRuntime(
     key: string,
     value: JsonValue,
   ): Promise<string | null> => {
-    const requestId = identity('program-runtime-blackboard');
-    const base = runtimeControlRequest(requestId);
+    const base = runtimeControlRequest();
     if (base === null) {
       return Promise.resolve(
         'Not written: the run changed or another control is pending. Review the current state and try again.',
@@ -1770,7 +1776,6 @@ export function useProgramRuntime(
     }
     return performRuntimeControl(
       `blackboard:${key}`,
-      requestId,
       'program_runtime_blackboard_write',
       { ...base, key, value },
       'The runtime blackboard value was rejected.',
@@ -1783,12 +1788,22 @@ export function useProgramRuntime(
   // current revision; without a run the last admitted edit wins.
   const currentRun = useRef(state.run);
   currentRun.current = state.run;
+  const currentStart = useRef(applicationStartId);
+  currentStart.current = applicationStartId;
   const persistentValues = useMemo(() => {
-    const requestIdentity = () => ({
-      request_id: identity('program-persistent-value'),
-      request_owner_epoch: callerEpoch.current,
+    const requestIdentity = (start: ApplicationStartId) => ({
+      application_start_id: start,
       source_label: 'operator_ui',
     });
+    // Answered at acceptance: the values are read again once the edit's row
+    // ended succeeded (null); any other end throws its reason.
+    const settled = async (row: CommandRow<RunnerCommandRowKind>): Promise<null> => {
+      await awaitCommandSuccess(row, runnerRows);
+      return null;
+    };
+    const startUnavailable = () => Promise.reject(
+      new Error('Execution owner identity is unavailable.'),
+    );
     return {
       read: (signal?: AbortSignal) => api.programs.persistentValues(signal),
       /** Set a stored value, or Reset it to `initial:` when value is omitted. */
@@ -1799,32 +1814,36 @@ export function useProgramRuntime(
             'The run holding these values is not the run shown here. Refresh and try again.',
           ));
         }
+        const start = currentStart.current;
+        if (start === null) return startUnavailable();
         return api.programs.editPersistentValue({
-          ...requestIdentity(),
+          ...requestIdentity(start),
           ...fence,
           project_path: current.projectPath,
           key,
           expected_program_revision: current.programRevision,
           ...(value === undefined ? {} : { value }),
-        });
+        }).then(settled);
       },
-      clear: (current: PersistentKeyValues) => api.programs.clearPersistentValues(
-        { ...requestIdentity(), project_path: current.projectPath },
-      ),
+      clear: (current: PersistentKeyValues) => {
+        const start = currentStart.current;
+        if (start === null) return startUnavailable();
+        return api.programs.clearPersistentValues(
+          { ...requestIdentity(start), project_path: current.projectPath },
+        ).then(settled);
+      },
     };
-  }, []);
+  }, [runnerRows]);
 
   const stageManualResult = useCallback((
     outcome: 'succeeded' | 'failed',
     output: JsonValue,
   ) => {
     const offer = state.controls?.recoveryOffer;
-    const requestId = identity('program-manual-result');
-    const base = runtimeControlRequest(requestId);
+    const base = runtimeControlRequest();
     if (base === null || offer === null || offer === undefined) return;
     void performRuntimeControl(
       `manual-result:${outcome}`,
-      requestId,
       'program_manual_result_stage',
       {
         ...base,
@@ -1856,20 +1875,29 @@ export function useProgramRuntime(
     )?.disabledReason
     ?? null
   ), [snapshot]);
+  /** Set while the Runner publishes a command in progress (from any panel). */
+  const runnerCommandInProgress = snapshot?.programCycle.runnerCommands.inProgress ?? null;
+  const runnerBusyReason: string | null = runnerCommandInProgress === null
+    ? null : programCommandReason(runnerCommandInProgress);
 
   // Execute is the ordinary run request; the backend's readiness gates it.
   const run = ordinaryRun;
   // Blocked only by components not enabled: Execute offers to activate them first.
   const activation = useActivateExecute(cellState.components, readiness, ordinaryRun,
-    snapshot?.executionControlStatus?.cellStopAction.expectedStopGeneration ?? null);
+    // 0 before the first Stop; null while the control state is unknown.
+    snapshot?.executionControlStatus == null
+      ? null : snapshot.executionControlStatus.cellStopAction.lastEventId ?? 0,
+    snapshot?.applicationStartId ?? null);
 
   return useMemo(() => ({
     state,
+    applicationStartId,
     cycleState,
     cycleFailure,
     resetRobotPositionAvailability,
     runnerAllows,
     runnerRefusal,
+    runnerBusyReason,
     readiness,
     cellLatch,
     composerRefusalReason,
@@ -1884,8 +1912,9 @@ export function useProgramRuntime(
     groupRuntimeScales,
     setGroupRuntimeScale,
     commitGroupRuntimeScale,
-    fullStop,
-    resumeFullStop,
+    stopAll,
+    halt,
+    resumeHalt,
     reset,
     applyRecoveryAction,
     writeRuntimeBlackboard,
@@ -1893,6 +1922,7 @@ export function useProgramRuntime(
     stageManualResult,
   }), [
     active,
+    applicationStartId,
     applyRecoveryAction,
     dismissError,
     cycleFailure,
@@ -1900,6 +1930,7 @@ export function useProgramRuntime(
     resetRobotPositionAvailability,
     runnerAllows,
     runnerRefusal,
+    runnerBusyReason,
     readiness,
     cellLatch,
     composerRefusalReason,
@@ -1914,8 +1945,9 @@ export function useProgramRuntime(
     groupRuntimeScales,
     setGroupRuntimeScale,
     commitGroupRuntimeScale,
-    fullStop,
-    resumeFullStop,
+    stopAll,
+    halt,
+    resumeHalt,
     stageManualResult,
     state,
     writeRuntimeBlackboard,

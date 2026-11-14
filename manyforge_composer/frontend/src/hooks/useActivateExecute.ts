@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import { requestErrorText } from '../components/ComponentStatePanel';
 import {
   activationClears,
@@ -48,8 +49,10 @@ export function useActivateExecute(
   states: readonly ComponentState[] | null,
   readiness: RunReadiness | null,
   execute: () => Promise<void>,
-  /** The cell's Stop generation (it changes with every Stop): a Stop ends the group action. */
-  stopGeneration: number | null = null,
+  /** The cell's last Stop event id, 0 before the first (it changes with every Stop): a Stop ends the group action. */
+  lastStopEventId: number | null = null,
+  /** The current application start; Recover and Enable names it. */
+  applicationStartId: ApplicationStartId | null = null,
 ) {
   const [flow, setFlow] = useState<ActivationFlow | null>(null);
   const step = useRef<ActivationStep | null>(null);
@@ -57,9 +60,9 @@ export function useActivateExecute(
   // once); the rest wait here, with the causes the operator confirmed.
   const recoveryQueue = useRef<string[]>([]);
   const confirmed = useRef<RecoveryPreflight[]>([]);
-  const latest = useRef({ states, execute, stopGeneration });
+  const latest = useRef({ states, execute, lastStopEventId, applicationStartId });
   // eslint-disable-next-line react-hooks/refs -- event handlers read the latest values written during render.
-  latest.current = { states, execute, stopGeneration };
+  latest.current = { states, execute, lastStopEventId, applicationStartId };
   // A new token for each popup: answers to an earlier one are dropped.
   const token = useRef(0);
 
@@ -78,7 +81,7 @@ export function useActivateExecute(
       return;
     }
     const cell = latest.current.states ?? [];
-    step.current = activationStep(action, targets, cell, latest.current.stopGeneration);
+    step.current = activationStep(action, targets, cell, latest.current.lastStopEventId);
     setFlow((value) => value === null ? null : { ...value, phase: action });
     api.components.groupAction(action, targets).catch((reason: unknown) => {
       fail(current, [{ componentId: null, text: requestErrorText(reason) }]);
@@ -115,9 +118,12 @@ export function useActivateExecute(
         return;
       }
       const states = latest.current.states ?? [];
-      step.current = activationStep('enable', [target], states, latest.current.stopGeneration);
+      step.current = activationStep('enable', [target], states, latest.current.lastStopEventId);
       setFlow((value) => value === null ? null : { ...value, phase: 'recover' });
-      api.components.recoverEnable(target, recoveryConfirmation(fresh)).catch((reason: unknown) => {
+      const start = latest.current.applicationStartId;
+      (start === null
+        ? Promise.reject(new Error('Execution owner identity is unavailable.'))
+        : api.components.recoverEnable(target, recoveryConfirmation(fresh), start)).catch((reason: unknown) => {
         fail(current, [{ componentId: target, text: requestErrorText(reason) }]);
       });
     }).catch((reason: unknown) => fail(current, [{ componentId: target, text: requestErrorText(reason) }]));
@@ -178,7 +184,7 @@ export function useActivateExecute(
   useEffect(() => {
     const current = token.current;
     if ((phase === 'prepare' || phase === 'recover' || phase === 'enable') && step.current !== null && states !== null) {
-      const progress = stepProgress(step.current, states, stopGeneration);
+      const progress = stepProgress(step.current, states, lastStopEventId);
       if (progress.failures.length > 0) fail(current, progress.failures);
       else if (progress.done && (phase === 'prepare' || phase === 'recover')) {
         step.current = null;
@@ -189,7 +195,7 @@ export function useActivateExecute(
         setFlow((value) => value === null ? null : { ...value, phase: 'waiting' });
       }
     }
-  }, [fail, phase, recoverNext, states, stopGeneration]);
+  }, [fail, phase, recoverNext, states, lastStopEventId]);
 
   useEffect(() => {
     if (phase !== 'waiting' || readiness === null) return;

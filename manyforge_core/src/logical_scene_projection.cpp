@@ -64,7 +64,7 @@ Result<LogicalSceneSnapshotDTO> ApplyResolvedSceneTransaction(
       !std::holds_alternative<ResolvedCollisionPolicyDTO>(
           transaction.resolved_operation);
   if (!current.locally_valid() || !exact_content_identity(current) ||
-      transaction.request_id.empty() || !transaction.attribution.locally_valid() ||
+      !transaction.attribution.locally_valid() ||
       transaction.transaction_sequence == 0U ||
       transaction.transaction_sequence <= current.transaction_sequence ||
       !transaction.prior_projection_revision.valid() ||

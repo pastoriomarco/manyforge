@@ -28,7 +28,7 @@ SNAPSHOT_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
 _MAXIMUM_SNAPSHOT_BYTES: Final = 4 * 1024 * 1024
 _MAXIMUM_SNAPSHOT_OBSERVERS: Final = 16
 _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
-_OWNER_EPOCH: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_APPLICATION_START_ID: Final = re.compile(r"^[0-9a-f]{16}$")
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +42,17 @@ class SnapshotRequest:
     height: int
     media_type: str
     deadline_ns: int
-    required_owner_epoch: str
+    required_application_start_id: str
     required_generation: int
 
 
 @dataclass(frozen=True)
 class SnapshotCapture:
-    """One image and the exact browser-observed owner frame it depicts."""
+    """One image and the exact browser-observed frame it depicts."""
 
     image_bytes: bytes
     media_type: str
-    observed_owner_epoch: str
+    observed_application_start_id: str
     observed_generation: int
 
 
@@ -225,7 +225,7 @@ class SnapshotBroker:
             height=height,
             media_type=media_type,
             deadline_ns=deadline_ns,
-            required_owner_epoch=required_frame[0],
+            required_application_start_id=required_frame[0],
             required_generation=required_frame[1],
         )
         try:
@@ -306,7 +306,7 @@ class SnapshotBroker:
         request_id: str,
         image_bytes: Optional[bytes],
         *,
-        observed_owner_epoch: str | None = None,
+        observed_application_start_id: str | None = None,
         observed_generation: int | None = None,
     ) -> bool:
         with self._lock:
@@ -319,16 +319,18 @@ class SnapshotBroker:
                 self._results[request_id] = None
                 event.set()
                 return True
-            required_epoch, required_generation, media_type = requirement
+            required_start_id, required_generation, media_type = requirement
+            # The browser can still present a frame of the previous start:
+            # this is the only start check on the snapshot path.
             if (
                 type(image_bytes) is not bytes
                 or not image_bytes
                 or len(image_bytes) > _MAXIMUM_SNAPSHOT_BYTES
-                or type(observed_owner_epoch) is not str
-                or _OWNER_EPOCH.fullmatch(observed_owner_epoch) is None
+                or type(observed_application_start_id) is not str
+                or _APPLICATION_START_ID.fullmatch(observed_application_start_id) is None
                 or type(observed_generation) is not int
                 or isinstance(observed_generation, bool)
-                or observed_owner_epoch != required_epoch
+                or observed_application_start_id != required_start_id
                 or observed_generation < required_generation
                 or (
                     media_type == "image/png"
@@ -344,7 +346,7 @@ class SnapshotBroker:
             self._results[request_id] = SnapshotCapture(
                 image_bytes=image_bytes,
                 media_type=media_type,
-                observed_owner_epoch=observed_owner_epoch,
+                observed_application_start_id=observed_application_start_id,
                 observed_generation=observed_generation,
             )
             event.set()
@@ -393,17 +395,17 @@ def create_snapshot_router(
         if (
             type(runtime) is not dict
             or runtime.get("schema_version")
-            != "manyforge.headless_runtime_snapshot.v1"
+            != "manyforge.headless_runtime_snapshot.v3"
             or runtime.get("complete") is not True
-            or type(runtime.get("projection_owner_epoch")) is not str
-            or not runtime["projection_owner_epoch"]
+            or type(runtime.get("application_start_id")) is not str
+            or not runtime["application_start_id"]
             or type(runtime.get("projection_generation")) is not int
             or isinstance(runtime.get("projection_generation"), bool)
             or runtime["projection_generation"] < 0
         ):
             return None
         return (
-            runtime["projection_owner_epoch"],
+            runtime["application_start_id"],
             runtime["projection_generation"],
         )
 
@@ -434,7 +436,7 @@ def create_snapshot_router(
                         "height": request.height,
                         "mime": request.media_type,
                         "requiredFrame": {
-                            "ownerEpoch": request.required_owner_epoch,
+                            "applicationStartId": request.required_application_start_id,
                             "generation": request.required_generation,
                         },
                         "timeoutMs": remaining_ms,
@@ -484,7 +486,9 @@ def create_snapshot_router(
                 )
             body.extend(chunk)
         image = bytes(body) if body else None
-        observed_epoch = request.headers.get("x-manyforge-viewer-owner-epoch")
+        observed_start_id = request.headers.get(
+            "x-manyforge-viewer-application-start-id"
+        )
         raw_generation = request.headers.get("x-manyforge-viewer-generation")
         try:
             observed_generation = (
@@ -495,7 +499,7 @@ def create_snapshot_router(
         if not broker.deliver(
             request_id,
             image,
-            observed_owner_epoch=observed_epoch,
+            observed_application_start_id=observed_start_id,
             observed_generation=observed_generation,
         ):
             return JSONResponse(
@@ -533,7 +537,6 @@ def create_snapshot_router(
             media_type=capture.media_type,
             headers={
                 "Cache-Control": "no-store",
-                "X-ManyForge-Viewer-Owner-Epoch": capture.observed_owner_epoch,
                 "X-ManyForge-Viewer-Generation": str(capture.observed_generation),
             },
         )

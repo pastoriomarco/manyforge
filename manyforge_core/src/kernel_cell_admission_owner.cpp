@@ -1,7 +1,6 @@
 #include "admission_timing_internal.hpp"
 
 #include <algorithm>
-#include <cstdio>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <stdexcept>
@@ -44,16 +43,16 @@ template <typename Value>
 
 [[nodiscard]] bool SameRequest(const CellAdmissionClaimIntentDTO& left,
                                const CellAdmissionClaimIntentDTO& right) {
-  return left.owner_epoch == right.owner_epoch && left.request_id == right.request_id;
+  return left.owner_role == right.owner_role && left.request_key == right.request_key;
 }
 
+// A release names its claim by the claim's own identity. Its request_key is
+// the key of the request that causes the release (contract 1.15.2), so it is
+// recorded but never compared with the claim's key.
 [[nodiscard]] bool SameReleaseIdentity(const CellAdmissionClaimDTO& claim,
                                        const CellAdmissionClaimReleaseDTO& release) {
   return claim.intent.owner_role == release.owner_role &&
-         claim.intent.owner_epoch == release.owner_epoch &&
          claim.intent.owner_transaction_id == release.owner_transaction_id &&
-         claim.intent.request_id == release.request_id &&
-         claim.intent.request_payload_digest == release.request_payload_digest &&
          claim.acquired_admission_generation == release.acquired_admission_generation &&
          claim.claim_generation == release.claim_generation;
 }
@@ -67,14 +66,12 @@ template <typename Value>
     case CellAdmissionClaimKindDTO::kAuthoringMutation:
     case CellAdmissionClaimKindDTO::kAuthoredScene:
       return settlement == CellAdmissionSettlementKindDTO::kOwnerCommit ||
-             settlement == CellAdmissionSettlementKindDTO::kProvenNoEffect ||
-             settlement == CellAdmissionSettlementKindDTO::kReconciled;
+             settlement == CellAdmissionSettlementKindDTO::kProvenNoEffect;
     case CellAdmissionClaimKindDTO::kManagerApply:
     case CellAdmissionClaimKindDTO::kInterventionOrRecovery:
     case CellAdmissionClaimKindDTO::kManualOperation:
       return settlement == CellAdmissionSettlementKindDTO::kTerminalEffectsSettled ||
-             settlement == CellAdmissionSettlementKindDTO::kProvenNoEffect ||
-             settlement == CellAdmissionSettlementKindDTO::kReconciled;
+             settlement == CellAdmissionSettlementKindDTO::kProvenNoEffect;
   }
   return false;
 }
@@ -82,51 +79,22 @@ template <typename Value>
 }  // namespace
 
 KernelCellAdmissionOwner::KernelCellAdmissionOwner(
-    RequestOwnerEpoch kernel_owner_epoch, std::size_t capacity, IClock& clock,
-    IOperationJournal& journal,
-    std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionClaimDTO> recovery,
-    AdmissionGeneration recovered_generation_high_water,
+    std::size_t capacity, IClock& clock, CellAdmissionJournalPoster post_records,
     CellAdmissionInterventionValidator intervention_validator,
     CellAdmissionSettlementValidator settlement_validator,
-    CellAdmissionReconcileValidator reconcile_validator,
-    std::vector<OperationJournalRecoveryDTO::RecoveredCellAdmissionMembershipDTO>
-        recovered_membership,
-    std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners,
     std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set,
-    CellAdmissionClaimGeneration recovered_claim_generation_high_water,
     CellAdmissionProgramNodeValidator program_node_validator,
-    CellAdmissionProgramResetStatusSource program_reset_status_source,
     std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer)
-    : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
-      capacity_(capacity),
+    : capacity_(capacity),
       clock_(clock),
-      journal_(journal),
+      post_records_(std::move(post_records)),
       intervention_validator_(std::move(intervention_validator)),
       settlement_validator_(std::move(settlement_validator)),
-      program_reset_status_source_(std::move(program_reset_status_source)),
-      reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
       required_health_loss_observer_(std::move(required_health_loss_observer)),
-      manager_liveness_required_set_(std::move(manager_liveness_required_set)),
-      membership_(std::move(recovered_membership)),
-      current_owners_(std::move(recovered_current_owners)) {
-  if (kernel_owner_epoch_.empty() || capacity_ == 0U || capacity_ > kMaximumCellAdmissionClaims ||
-      recovery.size() > capacity_ || membership_.size() > capacity_ ||
-      current_owners_.size() > kMaximumCellAdmissionClaims) {
+      manager_liveness_required_set_(std::move(manager_liveness_required_set)) {
+  if (capacity_ == 0U || capacity_ > kMaximumCellAdmissionClaims) {
     throw std::invalid_argument("Kernel cell-admission owner configuration is invalid");
-  }
-  const auto owners_canonical =
-      std::is_sorted(
-          current_owners_.begin(), current_owners_.end(),
-          [](const auto& left, const auto& right) { return left.owner_role < right.owner_role; }) &&
-      std::adjacent_find(current_owners_.begin(), current_owners_.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.owner_role == right.owner_role;
-                         }) == current_owners_.end() &&
-      std::none_of(current_owners_.begin(), current_owners_.end(),
-                   [](const auto& owner) { return owner.owner_epoch.empty(); });
-  if (!owners_canonical) {
-    throw std::runtime_error("durable cell-admission current-owner truth is invalid");
   }
   if (manager_liveness_required_set_.has_value()) {
     if (!ValidateManagerLivenessRequiredSet(*manager_liveness_required_set_).ok()) {
@@ -134,111 +102,17 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     }
     manager_liveness_rows_.reserve(manager_liveness_required_set_->required_receivers.size());
     for (const auto& receiver : manager_liveness_required_set_->required_receivers) {
-      manager_liveness_rows_.push_back({receiver, 0U, false, false, false, 0U, false});
+      manager_liveness_rows_.push_back({receiver, 0U, false, false, 0U, false});
     }
   }
-  for (std::size_t index = 0; index < membership_.size(); ++index) {
-    const auto& member = membership_[index];
-    if (member.owner_epoch.empty() || member.request_id.empty() ||
-        !content_identity::is_sha256_digest(member.semantic_intent_digest.value()) ||
-        std::any_of(membership_.begin(), membership_.begin() + index, [&](const auto& prior) {
-          return prior.owner_epoch == member.owner_epoch && prior.request_id == member.request_id;
-        })) {
-      throw std::runtime_error("durable cell-admission membership is invalid");
-    }
-  }
-  generation_ =
-      AdmissionGeneration(std::max<std::uint64_t>(1U, recovered_generation_high_water.value()));
-  if (recovered_claim_generation_high_water.value() >= 9'007'199'254'740'991ULL) {
-    throw std::runtime_error("durable cell-admission claim generation high-water is invalid");
-  }
-  next_claim_generation_ = CellAdmissionClaimGeneration(
-      std::max<std::uint64_t>(1U, recovered_claim_generation_high_water.value() + 1U));
   entries_.reserve(capacity_);
   membership_.reserve(capacity_);
-  current_owners_.reserve(7U);
-  reconciliations_.reserve(capacity_);
-  bool held_program_cycle = false;
-  for (auto& recovered : recovery) {
-    if (!ValidateCellAdmissionClaimIntent(recovered.claim.intent).ok() ||
-        !recovered.claim.claim_generation.nonzero() ||
-        !recovered.claim.acquired_admission_generation.nonzero() ||
-        recovered.claim.claim_generation.value() > 9'007'199'254'740'991ULL ||
-        recovered.claim.acquired_admission_generation.value() > 9'007'199'254'740'989ULL ||
-        recovered.claim.accepted_at_ns < 0 ||
-        (recovered.release.has_value() &&
-         (!ValidateCellAdmissionClaimRelease(*recovered.release).ok() ||
-          !SameReleaseIdentity(recovered.claim, *recovered.release)))) {
-      throw std::runtime_error("durable cell-admission recovery is invalid");
-    }
-    generation_ = AdmissionGeneration(
-        std::max(generation_.value(), recovered.claim.acquired_admission_generation.value() +
-                                          (recovered.release.has_value() ? 2U : 1U)));
-    next_claim_generation_ = CellAdmissionClaimGeneration(
-        std::max(next_claim_generation_.value(), recovered.claim.claim_generation.value() + 1U));
-    if (recovered.release.has_value() && recovered.reconcile_settlement.has_value()) {
-      throw std::runtime_error("durable cell-admission recovery is invalid");
-    }
-    if (recovered.reconcile_settlement.has_value() &&
-        (recovered.reconcile_settlement->predecessor_claim != recovered.claim ||
-         recovered.reconcile_settlement->successor_owner_role !=
-             recovered.claim.intent.owner_role ||
-         recovered.reconcile_settlement->successor_owner_epoch.empty() ||
-         recovered.reconcile_settlement->successor_owner_epoch ==
-             recovered.claim.intent.owner_epoch ||
-         recovered.reconcile_settlement->settlement_predicate !=
-             CellAdmissionSettlementKindDTO::kReconciled ||
-         !content_identity::is_sha256_digest(
-             recovered.reconcile_settlement->reconciliation_evidence_digest.value()))) {
-      throw std::runtime_error("durable cell-admission recovery is invalid");
-    }
-    entries_.push_back(Entry{std::move(recovered.claim), std::move(recovered.release),
-                             std::move(recovered.reconcile_settlement)});
-    if (!entries_.back().release.has_value() && !entries_.back().reconcile_settlement.has_value()) {
-      if (entries_.back().claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
-        if (held_program_cycle) throw std::runtime_error("multiple held Program-cycle claims");
-        held_program_cycle = true;
-      }
-      ++held_claim_count_;
-    }
-  }
-  for (const auto& entry : entries_) {
-    const auto digest = CellAdmissionClaimIntentDigest(entry.claim.intent);
-    if (!digest.ok()) {
-      throw std::runtime_error("durable cell-admission membership is invalid");
-    }
-    const auto found =
-        std::find_if(membership_.begin(), membership_.end(), [&](const auto& member) {
-          return member.owner_epoch == entry.claim.intent.owner_epoch &&
-                 member.request_id == entry.claim.intent.request_id;
-        });
-    if (found == membership_.end()) {
-      membership_.push_back({entry.claim.intent.owner_role, entry.claim.intent.owner_epoch,
-                             entry.claim.intent.request_id, digest.value()});
-    } else if (found->owner_role != entry.claim.intent.owner_role ||
-               found->semantic_intent_digest != digest.value()) {
-      throw std::runtime_error("durable cell-admission membership conflicts with claim truth");
-    }
-  }
-  if (membership_.size() > capacity_) {
-    throw std::runtime_error("durable cell-admission membership exceeds its bound");
-  }
-  std::vector<CellAdmissionRecoveryLedgerEntryDTO> footprint_entries;
-  footprint_entries.reserve(entries_.size());
-  for (const auto& entry : entries_) {
-    footprint_entries.push_back({entry.claim, entry.release, entry.reconcile_settlement});
-  }
-  const auto footprint = ComputeCellAdmissionRecoveryFootprint(kernel_owner_epoch_, generation_,
-                                                               footprint_entries, current_owners_);
-  if (!footprint.ok() || !footprint.value().admitted()) {
-    throw std::runtime_error("durable cell-admission recovery footprint exceeds its bound");
-  }
 }
 
 Result<KernelCellAdmissionOwner::ProgramBlackboardAdmissionGuard>
 KernelCellAdmissionOwner::AcquireProgramBlackboardAdmission() const {
   std::unique_lock lock(mutex_);
-  if (persistence_outcome_unknown_ || !manager_liveness_required_set_ ||
+  if (!manager_liveness_required_set_ ||
       manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
       !readiness_.program_cycle_status || readiness_.program_runner_loss)
     return Result<ProgramBlackboardAdmissionGuard>::Err(
@@ -261,7 +135,7 @@ KernelCellAdmissionOwner::AcquireProgramBlackboardAdmission() const {
 Result<KernelCellAdmissionOwner::ManagedProductAdmissionGuard>
 KernelCellAdmissionOwner::AcquireManagedProductAdmission() const {
   std::unique_lock lock(mutex_);
-  if (persistence_outcome_unknown_ || !manager_liveness_required_set_ ||
+  if (!manager_liveness_required_set_ ||
       manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size())
     return Result<ManagedProductAdmissionGuard>::Err(
         {"stale_generation", "Global interrupt rules require the current managed product owner",
@@ -291,17 +165,15 @@ bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
 bool KernelCellAdmissionOwner::ManualParentReadyLocked(const Entry* parent) const noexcept {
   const auto& cycle = readiness_.program_cycle_status;
   return parent && NonCycleReadinessLocked() && readiness_.program_cycle_status_current && cycle &&
-         cycle->state == ProgramCycleStateDTO::kRunning &&
-         cycle->program_runner_owner_epoch == parent->claim.intent.owner_epoch &&
-         cycle->program_run_id &&
-         cycle->program_run_id->value() == parent->claim.intent.owner_transaction_id &&
+         cycle->state == ProgramCycleStateDTO::kRunning && cycle->program_run_id &&
+         parent->claim.intent.owner_transaction_id ==
+             CellAdmissionOwnerTransactionId(*cycle->program_run_id) &&
          cycle->cycle_claim_generation == parent->claim.claim_generation;
 }
 
 Result<void> KernelCellAdmissionOwner::CheckManualCellAdmissionReadiness(
     const std::optional<CellAdmissionClaimGeneration> parent) const {
   std::lock_guard lock(mutex_);
-  if (persistence_outcome_unknown_) return Result<void>::Err(*persistence_outcome_unknown_);
   if (!parent) {
     return AdmissionLocked().authoring_allowed
                ? Result<void>::Ok()
@@ -309,7 +181,6 @@ Result<void> KernelCellAdmissionOwner::CheckManualCellAdmissionReadiness(
   }
   const auto held = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
     return entry.claim.claim_generation == *parent && !entry.release &&
-           !entry.reconcile_settlement &&
            entry.claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle;
   });
   if (held == entries_.end() || !ManualParentReadyLocked(&*held))
@@ -322,99 +193,37 @@ Result<void> KernelCellAdmissionOwner::CheckManualCellAdmissionReadiness(
 bool KernelCellAdmissionOwner::MatchingStartingProgramCycleLocked(
     const CellAdmissionClaimIntentDTO& intent) const noexcept {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kProgramCycle ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner || held_claim_count_ != 0U ||
+      intent.owner_role != ApplicationRole::kProgramRunner || held_claim_count_ != 0U ||
       !NonCycleReadinessLocked() || !readiness_.program_cycle_status_current ||
       !readiness_.program_cycle_status.has_value()) {
     return false;
   }
   const auto& cycle = *readiness_.program_cycle_status;
-  return cycle.state == ProgramCycleStateDTO::kStarting &&
-         cycle.program_runner_owner_epoch == intent.owner_epoch &&
-         cycle.program_run_id.has_value() &&
-         cycle.program_run_id->value() == intent.owner_transaction_id &&
+  return cycle.state == ProgramCycleStateDTO::kStarting && cycle.program_run_id.has_value() &&
+         intent.owner_transaction_id == CellAdmissionOwnerTransactionId(*cycle.program_run_id) &&
          !cycle.cycle_claim_generation.has_value() &&
          !cycle.terminal_or_settlement_reference.has_value();
 }
 
-Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
-KernelCellAdmissionOwner::PrepareProgramResetStatus(
-    const ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
-    const std::optional<CellAdmissionClaimDTO>& claim) const {
+Result<std::optional<ProgramRunNumber>> KernelCellAdmissionOwner::ProgramResetRunForCleanup(
+    const CellAdmissionClaimIntentDTO& intent,
+    const ProgramCycleStatusDTO& program_cycle_status) const {
+  using RunResult = Result<std::optional<ProgramRunNumber>>;
   const auto valid = ValidateCellAdmissionClaimIntent(intent);
-  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
-  PreparedProgramResetStatus proof(intent);
-  proof.owner = this;
-  {
-    std::lock_guard lock(mutex_);
-    proof.generation = generation_;
-    proof.readiness = readiness_;
-    proof.manager = manager_liveness_required_set_;
-    proof.manager_current_count = manager_liveness_current_unfenced_count_;
-    proof.purpose = purpose;
-    proof.claim = claim;
-    // Existing exact replay is independent of current journal/readiness.
-    if (purpose == ProgramResetJournalReadPurpose::kAcquire && FindReplayLocked(intent))
-      return Result<PreparedProgramResetStatus>::Ok(std::move(proof));
-    if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status)
-      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_status_not_current");
-  }
-  // No admission, liveness-transition or owner lock spans SQLite. In particular
-  // Manager-loss containment must be able to close admission while this reads.
-  if (!program_reset_status_source_)
-    return Result<PreparedProgramResetStatus>::Err(
-        {"authoring_not_ready", "Program Reset phase proof is unavailable",
-         {{"reason", "program_reset_phase_proof_unavailable"}}});
-  auto current = program_reset_status_source_(purpose, intent, claim);
-  if (!current.ok()) return Result<PreparedProgramResetStatus>::Err(current.error());
-  proof.status = std::move(current).value();
-  return Result<PreparedProgramResetStatus>::Ok(std::move(proof));
+  if (!valid.ok()) return RunResult::Err(valid.error());
+  std::lock_guard lock(mutex_);
+  // Existing exact replay is independent of the current status.
+  if (FindReplayLocked(intent)) return RunResult::Ok(std::optional<ProgramRunNumber>{});
+  if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status)
+    return AuthoringNotReady<std::optional<ProgramRunNumber>>(generation_,
+                                                              "program_reset_status_not_current");
+  return RunResult::Ok(MatchingProgramResetLocked(intent, program_cycle_status)
+                           ? program_cycle_status.program_run_id
+                           : std::optional<ProgramRunNumber>{});
 }
 
-Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
-KernelCellAdmissionOwner::PrepareProgramResetSceneAuthorization(
-    const ProgramResetSceneAuthorizationDTO& authorization) const {
-  const auto valid = manyforge::core::ValidateProgramResetSceneAuthorization(authorization);
-  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
-  std::optional<CellAdmissionClaimDTO> claim;
-  {
-    std::lock_guard lock(mutex_);
-    const auto generation = authorization.reset_claim
-        ? authorization.reset_claim->reset_claim_generation : authorization.cycle_claim_generation;
-    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
-      return row.claim.claim_generation == generation && !row.release;
-    });
-    if (entry == entries_.end())
-      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_claim_not_exact");
-    claim = entry->claim;
-  }
-  return PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kReloadInitialScene,
-                                   claim->intent, claim);
-}
-
-Result<KernelCellAdmissionOwner::PreparedProgramResetStatus>
-KernelCellAdmissionOwner::PrepareProgramResetPositionAuthorization(
+Result<void> KernelCellAdmissionOwner::ValidateProgramResetPositionAuthorization(
     const ProgramResetPositionAuthorizationDTO& authorization) const {
-  const auto valid = manyforge::core::ValidateProgramResetPositionAuthorization(authorization);
-  if (!valid.ok()) return Result<PreparedProgramResetStatus>::Err(valid.error());
-  std::optional<CellAdmissionClaimDTO> claim;
-  {
-    std::lock_guard lock(mutex_);
-    const auto generation = authorization.reset_claim_generation
-        ? *authorization.reset_claim_generation : *authorization.cycle_claim_generation;
-    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
-      return row.claim.claim_generation == generation && !row.release;
-    });
-    if (entry == entries_.end())
-      return AuthoringNotReady<PreparedProgramResetStatus>(generation_, "program_reset_claim_not_exact");
-    claim = entry->claim;
-  }
-  return PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kResetRobotPosition,
-                                   claim->intent, claim);
-}
-
-Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetPositionAuthorization(
-    const ProgramResetPositionAuthorizationDTO& authorization,
-    const PreparedProgramResetStatus& proof) const {
   const auto valid = manyforge::core::ValidateProgramResetPositionAuthorization(authorization);
   if (!valid.ok()) return valid;
   std::lock_guard lock(mutex_);
@@ -423,76 +232,59 @@ Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetPositionAutho
   const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
     return row.claim.claim_generation == generation && !row.release;
   });
+  if (entry == entries_.end())
+    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status)
+    return AuthoringNotReady<void>(generation_, "program_reset_status_not_current");
   const auto kind = authorization.reset_claim_generation ? CellAdmissionClaimKindDTO::kProgramReset
                                                        : CellAdmissionClaimKindDTO::kProgramCycle;
-  if (entry == entries_.end() || entry->claim.intent.claim_kind != kind ||
-      entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner ||
-      (authorization.reset_claim_generation && (entry->reconcile_settlement || held_claim_count_ != 1U)) ||
+  if (entry->claim.intent.claim_kind != kind ||
+      entry->claim.intent.owner_role != ApplicationRole::kProgramRunner ||
+      (authorization.reset_claim_generation && held_claim_count_ != 1U) ||
       HasUnsettledChildrenLocked(generation))
     return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
-  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kResetRobotPosition,
-                                         entry->claim.intent, entry->claim, proof);
+  const auto current = CurrentResetLocked(entry->claim.intent, authorization.program_cycle_status);
   if (!current.ok()) return Result<void>::Err(current.error());
   const auto& status = current.value();
   const auto& accepted = *status.accepted_reset;
   if (!accepted.reset_robot_position ||
-      status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
       status.cycle_generation != authorization.cycle_generation ||
       status.program_run_id != authorization.program_run_id ||
       status.cycle_claim_generation != authorization.cycle_claim_generation ||
       status.terminal_or_settlement_reference != authorization.terminal_or_settlement_reference ||
-      accepted.request_owner_epoch != authorization.request_owner_epoch ||
-      accepted.request_id != authorization.request_id ||
+      accepted.request_key != authorization.request_key ||
       accepted.request_payload_digest != authorization.request_payload_digest ||
       accepted.reset_claim_generation != authorization.reset_claim_generation)
     return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
-  const bool held_by_current_owner = !entry->reconcile_settlement &&
-      entry->claim.intent.owner_epoch == authorization.program_runner_owner_epoch;
-  const bool reconciled_to_current_owner = entry->reconcile_settlement &&
-      entry->reconcile_settlement->predecessor_claim == entry->claim &&
-      entry->reconcile_settlement->successor_owner_role == CellAdmissionOwnerRoleDTO::kProgramRunner &&
-      entry->reconcile_settlement->successor_owner_epoch == authorization.program_runner_owner_epoch &&
-      entry->reconcile_settlement->settlement_predicate == CellAdmissionSettlementKindDTO::kReconciled;
-  if (!held_by_current_owner && !reconciled_to_current_owner)
-    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_current");
   if (!authorization.reset_claim_generation) {
-    if (entry->claim.intent.owner_transaction_id != authorization.program_run_id->value())
+    if (entry->claim.intent.owner_transaction_id !=
+        CellAdmissionOwnerTransactionId(*authorization.program_run_id))
       return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
   } else {
-    const auto identity = ProgramResetClaimRequestId(status);
-    if (!identity.ok() || entry->claim.intent.request_id != identity.value() ||
-        entry->claim.intent.owner_transaction_id != identity.value().value() ||
-        entry->claim.intent.request_payload_digest != accepted.request_payload_digest)
+    const auto identity = ProgramResetClaimRequestKey(status);
+    if (!identity.ok() || entry->claim.intent.request_key != identity.value())
       return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
   }
   return Result<void>::Ok();
 }
 
+// The carried status is the Program runner's own current cycle status
+// (OD-139). It is validated here, in memory, against the held claim and the
+// Manager-relayed readiness; the runner alone sequences the Reset phases.
 Result<ProgramCycleStatusDTO> KernelCellAdmissionOwner::CurrentResetLocked(
-    const ProgramResetJournalReadPurpose purpose, const CellAdmissionClaimIntentDTO& intent,
-    const std::optional<CellAdmissionClaimDTO>& claim,
-    const PreparedProgramResetStatus& proof) const {
+    const CellAdmissionClaimIntentDTO& intent, const ProgramCycleStatusDTO& carried) const {
   const bool reset_claim = intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset;
   if ((reset_claim && !NonCycleReadinessLocked()) || !readiness_.program_cycle_status_current ||
-      !readiness_.program_cycle_status) {
+      !readiness_.program_cycle_status || !manager_liveness_required_set_ ||
+      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
+      route_recovery_pending_) {
     return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_status_not_current");
   }
-  if (proof.owner != this || proof.generation != generation_ || proof.readiness != readiness_ ||
-      proof.manager != manager_liveness_required_set_ ||
-      proof.manager_current_count != manager_liveness_current_unfenced_count_ ||
-      !manager_liveness_required_set_ ||
-      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
-      proof.purpose != purpose ||
-      proof.intent != intent || proof.claim != claim || !proof.status ||
-      persistence_outcome_unknown_ || route_recovery_pending_) {
-    return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_dependencies_changed");
-  }
-  const auto current = Result<ProgramCycleStatusDTO>::Ok(*proof.status);
+  const auto current = Result<ProgramCycleStatusDTO>::Ok(carried);
   const auto& cycle = current.value();
   const auto& observed = *readiness_.program_cycle_status;
   if (!ValidateProgramCycleStatus(cycle).ok() || cycle.state != ProgramCycleStateDTO::kResetting ||
       !cycle.accepted_reset || cycle.program_run_id != observed.program_run_id ||
-      cycle.program_runner_owner_epoch != observed.program_runner_owner_epoch ||
       cycle.cycle_generation != observed.cycle_generation ||
       (reset_claim && observed.state != ProgramCycleStateDTO::kIdleAfterReset &&
        observed.state != ProgramCycleStateDTO::kResetting &&
@@ -514,28 +306,18 @@ Result<ProgramCycleStatusDTO> KernelCellAdmissionOwner::CurrentResetLocked(
 }
 
 bool KernelCellAdmissionOwner::MatchingProgramResetLocked(
-    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) const {
+    const CellAdmissionClaimIntentDTO& intent, const ProgramCycleStatusDTO& carried) const {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kProgramReset || held_claim_count_ != 0U) {
     return false;
   }
-  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kAcquire, intent, std::nullopt, proof);
+  const auto current = CurrentResetLocked(intent, carried);
   if (!current.ok()) return false;
   const auto& cycle = current.value();
-  if (cycle.cycle_claim_generation || cycle.accepted_reset->reset_claim_generation ||
-      cycle.program_runner_owner_epoch != intent.owner_epoch) {
+  if (cycle.cycle_claim_generation || cycle.accepted_reset->reset_claim_generation) {
     return false;
   }
-  const auto identity = ProgramResetClaimRequestId(cycle);
-  return identity.ok() && intent.request_id == identity.value() &&
-         intent.owner_transaction_id == identity.value().value() &&
-         intent.request_payload_digest == cycle.accepted_reset->request_payload_digest;
-}
-
-std::optional<ProgramRunId> KernelCellAdmissionOwner::ProgramResetRunForCleanup(
-    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) const {
-  std::lock_guard lock(mutex_);
-  if (!MatchingProgramResetLocked(intent, proof) || !proof.status) return std::nullopt;
-  return proof.status->program_run_id;
+  const auto identity = ProgramResetClaimRequestKey(cycle);
+  return identity.ok() && intent.request_key == identity.value();
 }
 
 Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
@@ -544,39 +326,14 @@ Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
                                       "cell-authoring admission is not ready",
                                       {{"reason", "admission_generation_exhausted"}}});
   }
-  const AdmissionGeneration next(generation_.value() + 1U);
-  auto recorded =
-      journal_.RecordCellAdmissionGenerationAdvanced(kernel_owner_epoch_, generation_, next);
-  if (!recorded.ok()) {
-    return Result<void>::Err(recorded.error());
-  }
-  generation_ = next;
+  generation_ = AdmissionGeneration(generation_.value() + 1U);
   return Result<void>::Ok();
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::AdmissionLocked() const noexcept {
-  return AuthoringAdmissionDTO{!persistence_outcome_unknown_ && !route_recovery_pending_ &&
-                                   BaseReadinessLocked() && held_claim_count_ == 0U,
+  return AuthoringAdmissionDTO{!route_recovery_pending_ && BaseReadinessLocked() &&
+                                   held_claim_count_ == 0U,
                                generation_};
-}
-
-std::optional<ErrorDTO> KernelCellAdmissionOwner::persistence_outcome_unknown() const {
-  std::lock_guard lock(mutex_);
-  return persistence_outcome_unknown_;
-}
-
-void KernelCellAdmissionOwner::CloseForPersistenceUnknownLocked(
-    ErrorDTO&& error, const CellAdmissionClaimDTO& claim) {
-  if (persistence_outcome_unknown_) return;
-  persistence_outcome_unknown_ = std::move(error);
-  // One bounded first-cause log; physical Stop never takes this ordinary path.
-  std::fprintf(
-      stderr,
-      "ManyForge Kernel admission persistence outcome unknown: owner=%.256s request=%.256s "
-      "transaction=%.256s claim=%llu\n",
-      claim.intent.owner_epoch.value().c_str(), claim.intent.request_id.value().c_str(),
-      claim.intent.owner_transaction_id.c_str(),
-      static_cast<unsigned long long>(claim.claim_generation.value()));
 }
 
 Result<void> KernelCellAdmissionOwner::SetRouteRecoveryPending(bool pending) {
@@ -596,12 +353,6 @@ bool KernelCellAdmissionOwner::route_recovery_pending() const {
   return route_recovery_pending_;
 }
 
-bool KernelCellAdmissionOwner::manager_liveness_lost() const {
-  std::lock_guard lock(mutex_);
-  return std::any_of(manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
-                     [](const ManagerLivenessRow& row) { return row.direct_loss_inhibited; });
-}
-
 AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
   std::lock_guard lock(mutex_);
   return AdmissionLocked();
@@ -612,9 +363,7 @@ Result<void> KernelCellAdmissionOwner::ValidateProgramRunnerContactLossSource(
   const auto valid = ValidateProgramRunnerContactLoss(loss);
   if (!valid.ok()) return valid;
   std::lock_guard lock(mutex_);
-  if (!manager_liveness_required_set_ ||
-      loss.manager_owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
-      loss.manager_runtime_epoch != manager_liveness_required_set_->manager_runtime_epoch) {
+  if (!manager_liveness_required_set_) {
     return Reject<void>("invalid_request", "program_runner_contact_loss_invalid");
   }
   return Result<void>::Ok();
@@ -638,11 +387,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
   std::lock_guard lock(mutex_);
   if (snapshot.program_runner_loss &&
       (!ValidateProgramRunnerContactLoss(*snapshot.program_runner_loss).ok() ||
-       snapshot.program_cycle_status_current || !manager_liveness_required_set_ ||
-       snapshot.program_runner_loss->manager_owner_epoch !=
-           manager_liveness_required_set_->manager_owner_epoch ||
-       snapshot.program_runner_loss->manager_runtime_epoch !=
-           manager_liveness_required_set_->manager_runtime_epoch)) {
+       snapshot.program_cycle_status_current || !manager_liveness_required_set_)) {
     return Reject<AuthoringAdmissionDTO>("invalid_request", "program_runner_contact_loss_invalid");
   }
   if (readiness_ != snapshot) {
@@ -650,14 +395,8 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::UpdateCellAdmissionReadi
       return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                       "admission_generation_exhausted");
     }
-    const AdmissionGeneration next(generation_.value() + 1U);
-    auto recorded =
-        journal_.RecordCellAdmissionGenerationAdvanced(kernel_owner_epoch_, generation_, next);
-    if (!recorded.ok()) {
-      return Result<AuthoringAdmissionDTO>::Err(recorded.error());
-    }
     readiness_ = snapshot;
-    generation_ = next;
+    generation_ = AdmissionGeneration(generation_.value() + 1U);
   }
   return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
 }
@@ -677,26 +416,14 @@ Result<void> KernelCellAdmissionOwner::Publish(
   if (!manager_liveness_required_set_.has_value()) {
     return Reject<void>("invalid_request", "manager_liveness_set_not_configured");
   }
-  const auto& expected = *manager_liveness_required_set_;
   const auto& status = observation.status;
-  if (status.cell_id != expected.cell_id ||
-      observation.active_bundle_id != expected.active_bundle_id ||
-      observation.required_runtime_set_digest != expected.required_runtime_set_digest ||
-      status.manager_runtime_unit_id != expected.manager_runtime_unit_id ||
-      status.manager_runtime_epoch != expected.manager_runtime_epoch ||
-      status.manager_owner_epoch != expected.manager_owner_epoch) {
-    return Reject<void>("invalid_request", "manager_liveness_identity_mismatch");
-  }
   const auto found = std::lower_bound(manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
                                       status.receiver_runtime_unit_id,
                                       [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
                                         return row.receiver.runtime_unit_id < id;
                                       });
   if (found == manager_liveness_rows_.end() ||
-      found->receiver.runtime_unit_id != status.receiver_runtime_unit_id ||
-      found->receiver.runtime_epoch != status.receiver_runtime_epoch ||
-      found->receiver.runtime_policy_id != status.runtime_policy_id ||
-      found->receiver.runtime_policy_revision != status.runtime_policy_revision) {
+      found->receiver.runtime_unit_id != status.receiver_runtime_unit_id) {
     return Reject<void>("invalid_request", "manager_liveness_receiver_foreign");
   }
   const bool retry_pending_fence = status.receiver_status_sequence == found->status_sequence &&
@@ -707,8 +434,6 @@ Result<void> KernelCellAdmissionOwner::Publish(
   }
   const bool next_current =
       status.state == ManagerLivenessStateDTO::kCurrent && !status.command_fenced;
-  // A newer current status after a loss: the Manager is alive again.
-  if (next_current) found->direct_loss_inhibited = false;
   const auto token = status.receiver_status_sequence;
   bool transition_required = retry_pending_fence;
   if (!retry_pending_fence) {
@@ -732,8 +457,7 @@ Result<void> KernelCellAdmissionOwner::Publish(
     }
   }
   // Invalidate already acquired observations at the same health boundary as
-  // new admissions, before journal I/O releases this mutex. A registered rule
-  // must not keep consuming the old BB snapshot while persistence is blocked.
+  // new admissions: a registered rule must not keep consuming the old BB snapshot.
   auto invalidated = !next_current && required_health_loss_observer_
                          ? required_health_loss_observer_(actual_retired_service)
                          : Result<void>::Ok();
@@ -742,19 +466,7 @@ Result<void> KernelCellAdmissionOwner::Publish(
     if (!invalidated.ok()) return invalidated;
     return Reject<void>("authoring_not_ready", "admission_generation_exhausted");
   }
-  const auto previous_generation = generation_;
-  const AdmissionGeneration next_generation(generation_.value() + 1U);
-  lock.unlock();
-  auto recorded = journal_.RecordCellAdmissionGenerationAdvanced(
-      kernel_owner_epoch_, previous_generation, next_generation);
-  lock.lock();
-  if (!recorded.ok()) {
-    auto error = recorded.error();
-    if (!invalidated.ok())
-      error.details.emplace("program_bb_invalidation_error", invalidated.error().code);
-    return Result<void>::Err(std::move(error));
-  }
-  generation_ = next_generation;
+  generation_ = AdmissionGeneration(generation_.value() + 1U);
   const auto current = std::lower_bound(
       manager_liveness_rows_.begin(), manager_liveness_rows_.end(), status.receiver_runtime_unit_id,
       [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
@@ -764,78 +476,12 @@ Result<void> KernelCellAdmissionOwner::Publish(
       current->receiver.runtime_unit_id == status.receiver_runtime_unit_id &&
       current->generation_advance_pending && current->generation_pending_sequence == token) {
     current->generation_advance_pending = false;
-    if (next_current && current->status_sequence == token && !current->direct_loss_inhibited &&
-        !current->current_unfenced) {
+    if (next_current && current->status_sequence == token && !current->current_unfenced) {
       current->current_unfenced = true;
       ++manager_liveness_current_unfenced_count_;
     }
   }
   return invalidated;
-}
-
-bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
-    const ManagerLivenessLossIntentDTO& intent,
-    std::optional<ErrorDTO>* source_invalidation_error) noexcept {
-  return LatchManagerLivenessLoss(intent, source_invalidation_error, nullptr);
-}
-
-bool KernelCellAdmissionOwner::LatchManagerLivenessLoss(
-    const ManagerLivenessLossIntentDTO& intent,
-    std::optional<ErrorDTO>* source_invalidation_error,
-    std::shared_ptr<IIoSignalService>* actual_retired_service) noexcept {
-  bool committed = false;
-  try {
-    if (!ValidateManagerLivenessLossIntent(intent).ok()) {
-      return false;
-    }
-    std::lock_guard lock(mutex_);
-    if (!manager_liveness_required_set_.has_value()) {
-      return false;
-    }
-    const auto& expected = *manager_liveness_required_set_;
-    if (intent.cell_id != expected.cell_id ||
-        intent.active_bundle_id != expected.active_bundle_id ||
-        intent.required_runtime_set_digest != expected.required_runtime_set_digest ||
-        intent.lost_manager_runtime_unit_id != expected.manager_runtime_unit_id ||
-        intent.lost_manager_runtime_epoch != expected.manager_runtime_epoch ||
-        intent.lost_manager_owner_epoch != expected.manager_owner_epoch) {
-      return false;
-    }
-    const auto found =
-        std::lower_bound(manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
-                         intent.receiver_runtime_unit_id,
-                         [](const ManagerLivenessRow& row, const RuntimeUnitId& id) {
-                           return row.receiver.runtime_unit_id < id;
-                         });
-    if (found == manager_liveness_rows_.end() ||
-        found->receiver.runtime_unit_id != intent.receiver_runtime_unit_id ||
-        found->receiver.runtime_epoch != intent.receiver_runtime_epoch ||
-        found->receiver.runtime_policy_id != intent.runtime_policy_id ||
-        found->receiver.runtime_policy_revision != intent.runtime_policy_revision ||
-        intent.receiver_status_sequence <= found->status_sequence) {
-      return false;
-    }
-    found->status_sequence = intent.receiver_status_sequence;
-    found->direct_loss_inhibited = true;
-    if (found->current_unfenced) {
-      found->current_unfenced = false;
-      --manager_liveness_current_unfenced_count_;
-      found->generation_advance_pending = true;
-      found->generation_pending_sequence = intent.receiver_status_sequence;
-      found->generation_pending_current = false;
-    }
-    committed = true;
-    if (required_health_loss_observer_) {
-      auto invalidated = required_health_loss_observer_(actual_retired_service);
-      if (!invalidated.ok() && source_invalidation_error)
-        *source_invalidation_error = invalidated.error();
-    }
-    return true;
-  } catch (...) {
-    // A bounded invalidation/diagnostic failure cannot turn a committed real
-    // health loss into a stale request and suppress mandatory containment.
-    return committed;
-  }
 }
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReplaceManagerLivenessRequiredSet(
@@ -854,7 +500,7 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReplaceManagerLivenessRe
   std::vector<ManagerLivenessRow> next_rows;
   next_rows.reserve(required_set.required_receivers.size());
   for (const auto& receiver : required_set.required_receivers) {
-    next_rows.push_back({receiver, 0U, false, false, false, 0U, false});
+    next_rows.push_back({receiver, 0U, false, false, 0U, false});
   }
   std::lock_guard transition_lock(liveness_transition_mutex_);
   std::lock_guard lock(mutex_);
@@ -887,8 +533,7 @@ const KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::FindReplayLocke
 KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::FindHeldLocked(
     CellAdmissionClaimGeneration generation) {
   const auto found = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    return entry.claim.claim_generation == generation && !entry.release.has_value() &&
-           !entry.reconcile_settlement.has_value();
+    return entry.claim.claim_generation == generation && !entry.release.has_value();
   });
   return found == entries_.end() ? nullptr : &*found;
 }
@@ -898,51 +543,29 @@ const KernelCellAdmissionOwner::Entry* KernelCellAdmissionOwner::ParentCycleLock
   const auto generation = parent_program_cycle_claim(intent);
   if (!generation.has_value()) return nullptr;
   const auto found = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    return !entry.release.has_value() && !entry.reconcile_settlement.has_value() &&
+    return !entry.release.has_value() &&
            entry.claim.claim_generation == *generation &&
            entry.claim.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle;
   });
   return found == entries_.end() ? nullptr : &*found;
 }
 
-bool KernelCellAdmissionOwner::IsStaleOwnerLocked(const CellAdmissionClaimIntentDTO& intent) const {
-  const auto current =
-      std::find_if(current_owners_.begin(), current_owners_.end(),
-                   [&](const auto& owner) { return owner.owner_role == intent.owner_role; });
-  return current != current_owners_.end() && current->owner_epoch != intent.owner_epoch;
-}
-
 bool KernelCellAdmissionOwner::HasUnsettledChildrenLocked(
-    const CellAdmissionClaimGeneration parent,
-    const std::vector<CellAdmissionReconcileSettlementDTO>& prospective) const {
+    const CellAdmissionClaimGeneration parent) const {
   return std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    if (entry.release.has_value() || entry.reconcile_settlement.has_value() ||
-        parent_program_cycle_claim(entry.claim.intent) != parent)
-      return false;
-    // Reconcile authorizations are exact and generation-sorted before this
-    // check. Assess the whole prospective batch before changing any claim.
-    const auto settlement =
-        std::lower_bound(prospective.begin(), prospective.end(), entry.claim.claim_generation,
-                         [](const auto& candidate, const auto generation) {
-                           return candidate.predecessor_claim.claim_generation < generation;
-                         });
-    return settlement == prospective.end() || settlement->predecessor_claim != entry.claim;
+    return !entry.release.has_value() && parent_program_cycle_claim(entry.claim.intent) == parent;
   });
 }
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
-  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
-    auto proof = PrepareProgramResetStatus(ProgramResetJournalReadPurpose::kAcquire, intent);
-    if (!proof.ok()) return Result<CellAdmissionClaimDTO>::Err(proof.error());
-    return AcquirePreparedProgramResetClaim(intent, proof.value());
-  }
+  // A Program Reset claim needs the carried status (AcquireProgramResetClaim).
   return AcquireClaim(intent, intervention_validator_);
 }
 
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquirePreparedProgramResetClaim(
-    const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) {
-  return AcquireClaim(intent, intervention_validator_, {}, &proof);
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireProgramResetClaim(
+    const CellAdmissionClaimIntentDTO& intent, const ProgramCycleStatusDTO& program_cycle_status) {
+  return AcquireClaim(intent, intervention_validator_, {}, &program_cycle_status);
 }
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireManualCellAdmissionClaim(
@@ -958,7 +581,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationAppl
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionConfigurationApplyValidator& validate) {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kManager || !intent.scope.resources.empty() ||
+      intent.owner_role != ApplicationRole::kManager || !intent.scope.resources.empty() ||
       !intent.scope.configurations.empty() || intent.program_cycle_evidence ||
       intent.intervention_evidence || intent.program_node_evidence || !validate) {
     return Reject<CellAdmissionClaimDTO>("invalid_request",
@@ -971,40 +594,35 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer,
     const CellAdmissionConfigurationApplyValidator& configuration_apply_validator,
-    const PreparedProgramResetStatus* reset_proof) {
-  detail::AdmissionTiming timing(false, intent.request_id.value());
+    const ProgramCycleStatusDTO* program_reset_status) {
+  detail::AdmissionTiming timing(false, {});
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
   auto wait_start = detail::AdmissionTiming::Clock::now();
-  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::unique_lock transition_lock(liveness_transition_mutex_);
   timing.record->transition_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto valid = ValidateCellAdmissionClaimIntent(intent);
   if (!valid.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(valid.error());
   }
   wait_start = detail::AdmissionTiming::Clock::now();
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   timing.record->owner_wait += detail::AdmissionTiming::Clock::now() - wait_start;
-  if (!configuration_apply && IsStaleOwnerLocked(intent)) {
-    return Reject<CellAdmissionClaimDTO>("stale_request_owner_epoch", "request_owner_epoch_stale");
-  }
   if (const auto* replay = FindReplayLocked(intent); replay != nullptr) {
     if (replay->claim.intent != intent) {
       return Reject<CellAdmissionClaimDTO>("request_id_conflict", "request_reuse_conflict");
     }
-    if (replay->release.has_value() || replay->reconcile_settlement.has_value()) {
+    if (replay->release.has_value()) {
       return Reject<CellAdmissionClaimDTO>("request_result_expired", "request_result_compacted");
     }
     return Result<CellAdmissionClaimDTO>::Ok(replay->claim);
   }
-  if (persistence_outcome_unknown_)
-    return Result<CellAdmissionClaimDTO>::Err(*persistence_outcome_unknown_);
   const auto intent_digest = CellAdmissionClaimIntentDigest(intent);
   if (!intent_digest.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(intent_digest.error());
   }
   const auto compacted =
       std::find_if(membership_.begin(), membership_.end(), [&](const auto& member) {
-        return member.owner_epoch == intent.owner_epoch && member.request_id == intent.request_id;
+        return member.owner_role == intent.owner_role && member.request_key == intent.request_key;
       });
   if (compacted != membership_.end()) {
     if (compacted->owner_role != intent.owner_role ||
@@ -1024,8 +642,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "route_recovery_pending");
   }
   const auto retire_released = [&](const auto& entry) {
-    return entry.release.has_value() && entry.claim.intent.owner_role == intent.owner_role &&
-           entry.claim.intent.owner_epoch == intent.owner_epoch;
+    return entry.release.has_value() && entry.claim.intent.owner_role == intent.owner_role;
   };
   const auto retired_count =
       static_cast<std::size_t>(std::count_if(entries_.begin(), entries_.end(), retire_released));
@@ -1036,9 +653,9 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   std::vector<CellAdmissionClaimDTO> configuration_held;
   if (configuration_apply) {
     for (const auto& entry : entries_) {
-      if (!entry.release && !entry.reconcile_settlement) {
+      if (!entry.release) {
         if (entry.claim.intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
-            entry.claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kManager) {
+            entry.claim.intent.owner_role != ApplicationRole::kManager) {
           return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
                                                           "configuration_apply_foreign_claim");
         }
@@ -1064,8 +681,8 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const auto& evidence = *intent.program_node_evidence;
     const auto& cycle = readiness_.program_cycle_status;
     if (parent == nullptr || !program_node_validator_ ||
-        parent->claim.intent.owner_epoch != evidence.program_runner_owner_epoch ||
-        parent->claim.intent.owner_transaction_id != evidence.program_run_id.value()) {
+        parent->claim.intent.owner_transaction_id !=
+            CellAdmissionOwnerTransactionId(evidence.program_run_id)) {
       return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
                                                       "program_node_parent_not_current");
     }
@@ -1083,7 +700,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
         (cycle->cycle_claim_generation == evidence.parent_program_cycle_claim_generation ||
          (cycle->state == ProgramCycleStateDTO::kStarting && !cycle->cycle_claim_generation));
     if (!readiness_.program_cycle_status_current || !cycle ||
-        cycle->program_runner_owner_epoch != evidence.program_runner_owner_epoch ||
         (!idle_predecessor && !matching_cycle)) {
       auto rejected =
           AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_node_cycle_not_current");
@@ -1132,7 +748,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     // Concurrent children of this parent retain their owners' existing narrow
     // reservations. No authoring/manual/recovery claim inherits this exception.
     if (std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
-          return !entry.release.has_value() && !entry.reconcile_settlement.has_value() &&
+          return !entry.release.has_value() &&
                  &entry != parent &&
                  (!entry.claim.intent.program_node_evidence.has_value() ||
                   parent_program_cycle_claim(entry.claim.intent) != parent->claim.claim_generation);
@@ -1140,13 +756,12 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
       return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_node_claim_conflict");
     }
     // Ordinary admission is held by the composing Kernel across this bounded
-    // fence check and journal write. Stop can overtake the write, but Resume
-    // cannot release the fence until this exact child becomes visible/settled.
+    // fence check and the commit below. Resume cannot release the fence until
+    // this exact child becomes visible/settled.
     const auto admitted = program_node_validator_(evidence);
     if (!admitted.ok()) return Result<CellAdmissionClaimDTO>::Err(admitted.error());
   } else if (configuration_apply) {
     if (!manager_liveness_required_set_ ||
-        intent.owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
         manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
         !readiness_.required_component_status_current || !readiness_.deployment_status_current ||
         !readiness_.program_cycle_status_current || !readiness_.program_cycle_status ||
@@ -1157,8 +772,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     // Installed inventory and each immutable old terminal must be independently
     // proved. This is not a generic readiness/fault bypass or live-owner takeover.
     const auto validated =
-        configuration_apply_validator(intent, configuration_held, readiness_,
-                                      manager_liveness_required_set_->manager_runtime_epoch);
+        configuration_apply_validator(intent, configuration_held, readiness_);
     if (!validated.ok()) return Result<CellAdmissionClaimDTO>::Err(validated.error());
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
              (intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation &&
@@ -1188,7 +802,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
-    if (!reset_proof || !MatchingProgramResetLocked(intent, *reset_proof)) {
+    if (!program_reset_status || !MatchingProgramResetLocked(intent, *program_reset_status)) {
       return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_reset_not_current");
     }
   } else if (!AdmissionLocked().authoring_allowed && !MatchingStartingProgramCycleLocked(intent)) {
@@ -1204,86 +818,44 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   footprint_entries.reserve(entries_.size() + 1U);
   for (const auto& entry : entries_) {
     if (!retire_released(entry)) {
-      footprint_entries.push_back({entry.claim, entry.release, entry.reconcile_settlement});
+      footprint_entries.push_back({entry.claim, entry.release});
     }
   }
-  footprint_entries.push_back({claim, std::nullopt, std::nullopt});
-  auto footprint_owners = current_owners_;
-  if (std::none_of(footprint_owners.begin(), footprint_owners.end(),
-                   [&](const auto& owner) { return owner.owner_role == intent.owner_role; })) {
-    footprint_owners.push_back({intent.owner_role, intent.owner_epoch});
-  }
-  if (configuration_apply) {
-    for (auto& owner : footprint_owners) {
-      if (owner.owner_role == CellAdmissionOwnerRoleDTO::kManager)
-        owner.owner_epoch = intent.owner_epoch;
-    }
-  }
+  footprint_entries.push_back({claim, std::nullopt});
   const auto footprint = ComputeCellAdmissionRecoveryFootprint(
-      kernel_owner_epoch_, AdmissionGeneration(generation_.value() + 1U), footprint_entries,
-      footprint_owners);
+      AdmissionGeneration(generation_.value() + 1U), footprint_entries);
   if (!footprint.ok() || !footprint.value().admitted()) {
     return Reject<CellAdmissionClaimDTO>("invalid_request", "recovery_footprint_exceeded");
   }
-  std::vector<RequestId> retired_request_ids;
-  retired_request_ids.reserve(retired_count);
+  std::vector<RequestKey> retired_request_keys;
+  retired_request_keys.reserve(retired_count);
   for (const auto& entry : entries_) {
     if (retire_released(entry)) {
-      retired_request_ids.push_back(entry.claim.intent.request_id);
+      retired_request_keys.push_back(entry.claim.intent.request_key);
     }
   }
-  // Prepare all allocation-bearing in-memory state before durable commit.
-  Entry prepared_entry{claim, std::nullopt, std::nullopt};
-  OperationJournalRecoveryDTO::RecoveredCellAdmissionMembershipDTO prepared_member{
-      intent.owner_role, intent.owner_epoch, intent.request_id, intent_digest.value()};
-  auto prepared_owners = footprint_owners;
-  std::sort(prepared_owners.begin(), prepared_owners.end(),
-            [](const auto& a, const auto& b) { return a.owner_role < b.owner_role; });
-  if (configuration_apply) {
-    const auto journal_start = detail::AdmissionTiming::Clock::now();
-    auto recorded = journal_.RecordConfigurationApplyClaimAcquired(
-        kernel_owner_epoch_, claim, {CellAdmissionOwnerRoleDTO::kManager, intent.owner_epoch},
-        configuration_held, current_owners_);
-    timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
-    if (!recorded.ok()) {
-      if (recorded.error().code == "persistence_outcome_unknown") {
-        CloseForPersistenceUnknownLocked(std::move(recorded.error()), claim);
-        return Result<CellAdmissionClaimDTO>::Err(*persistence_outcome_unknown_);
-      }
-      return Result<CellAdmissionClaimDTO>::Err(recorded.error());
-    }
-    if (recorded.value().intent != claim.intent ||
-        recorded.value().claim_generation != claim.claim_generation ||
-        recorded.value().acquired_admission_generation != claim.acquired_admission_generation ||
-        recorded.value().accepted_at_ns < 0) {
-      return Reject<CellAdmissionClaimDTO>("operation_journal_request_conflict",
-                                           "configuration_apply_durable_claim_not_exact");
-    }
-    prepared_entry.claim.accepted_at_ns = recorded.value().accepted_at_ns;
-    claim.accepted_at_ns = recorded.value().accepted_at_ns;
-  } else {
-    const auto journal_start = detail::AdmissionTiming::Clock::now();
-    auto recorded = journal_.RecordCellAdmissionClaimAcquired(kernel_owner_epoch_, claim);
-    timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
-    if (!recorded.ok()) return Result<CellAdmissionClaimDTO>::Err(recorded.error());
-  }
-  // Both prepared copies carry the exact persisted timestamp on replay.
+  Entry prepared_entry{claim, std::nullopt};
+  Membership prepared_member{intent.owner_role, intent.request_key, intent_digest.value()};
   entries_.erase(std::remove_if(entries_.begin(), entries_.end(), retire_released), entries_.end());
   membership_.erase(
       std::remove_if(membership_.begin(), membership_.end(),
                      [&](const auto& member) {
                        return member.owner_role == intent.owner_role &&
-                              member.owner_epoch == intent.owner_epoch &&
-                              std::find(retired_request_ids.begin(), retired_request_ids.end(),
-                                        member.request_id) != retired_request_ids.end();
+                              std::find(retired_request_keys.begin(), retired_request_keys.end(),
+                                        member.request_key) != retired_request_keys.end();
                      }),
       membership_.end());
   entries_.push_back(std::move(prepared_entry));
   membership_.push_back(std::move(prepared_member));
-  current_owners_ = std::move(prepared_owners);
   ++held_claim_count_;
   next_claim_generation_ = CellAdmissionClaimGeneration(next_claim_generation_.value() + 1U);
   generation_ = AdmissionGeneration(generation_.value() + 1U);
+  // The claim holds from here; its record follows, posted outside both locks.
+  JournalRecord record{JournalCellClaimAcquired{claim}, "cell_claim_acquired", std::nullopt, false,
+                       false};
+  lock.unlock();
+  transition_lock.unlock();
+  post_records_(std::span<JournalRecord>(&record, 1U));
   return Result<CellAdmissionClaimDTO>::Ok(std::move(claim));
 }
 
@@ -1292,7 +864,7 @@ std::vector<std::string> KernelCellAdmissionOwner::unsettled_program_child_nodes
   std::lock_guard lock(mutex_);
   std::vector<std::string> nodes;
   for (const auto& entry : entries_) {
-    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value() &&
+    if (!entry.release.has_value() &&
         parent_program_cycle_claim(entry.claim.intent) == parent) {
       nodes.push_back(entry.claim.intent.program_node_evidence.has_value()
                           ? entry.claim.intent.program_node_evidence->node_instance_id
@@ -1304,23 +876,17 @@ std::vector<std::string> KernelCellAdmissionOwner::unsettled_program_child_nodes
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
-  detail::AdmissionTiming timing(true, release.request_id.value());
+  detail::AdmissionTiming timing(true, {});
   auto wait_start = detail::AdmissionTiming::Clock::now();
-  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::unique_lock transition_lock(liveness_transition_mutex_);
   timing.record->transition_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto valid = ValidateCellAdmissionClaimRelease(release);
   if (!valid.ok()) {
     return Result<AuthoringAdmissionDTO>::Err(valid.error());
   }
   wait_start = detail::AdmissionTiming::Clock::now();
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   timing.record->owner_wait += detail::AdmissionTiming::Clock::now() - wait_start;
-  const auto current_owner =
-      std::find_if(current_owners_.begin(), current_owners_.end(),
-                   [&](const auto& owner) { return owner.owner_role == release.owner_role; });
-  if (current_owner != current_owners_.end() && current_owner->owner_epoch != release.owner_epoch) {
-    return Reject<AuthoringAdmissionDTO>("stale_generation", "claim_owner_epoch_stale");
-  }
   auto* entry = FindHeldLocked(release.claim_generation);
   if (entry == nullptr || !SameReleaseIdentity(entry->claim, release) ||
       !SettlementKindCompatible(entry->claim.intent.claim_kind,
@@ -1332,107 +898,98 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClai
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                     "parent_cycle_intervention_unsettled");
   }
-  if (!settlement_validator_) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                    "settlement_validator_unavailable");
-  }
-  const auto settlement_start = detail::AdmissionTiming::Clock::now();
-  auto settlement = settlement_validator_(entry->claim, release);
-  timing.record->settlement += detail::AdmissionTiming::Clock::now() - settlement_start;
-  if (!settlement.ok()) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "settlement_not_proven");
+  // Program-cycle and Program-Reset releases: the exact held identity, the
+  // settlement kind and the settled children above are the whole proof; the
+  // Program runner alone sequences its Reset (OD-139). No owner file is read.
+  if (entry->claim.intent.claim_kind != CellAdmissionClaimKindDTO::kProgramCycle &&
+      entry->claim.intent.claim_kind != CellAdmissionClaimKindDTO::kProgramReset) {
+    if (!settlement_validator_) {
+      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
+                                                      "settlement_validator_unavailable");
+    }
+    const auto settlement_start = detail::AdmissionTiming::Clock::now();
+    auto settlement = settlement_validator_(entry->claim, release);
+    timing.record->settlement += detail::AdmissionTiming::Clock::now() - settlement_start;
+    if (!settlement.ok()) {
+      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "settlement_not_proven");
+    }
   }
   if (generation_.value() >= 9'007'199'254'740'991ULL) {
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "admission_generation_exhausted");
   }
-  const AdmissionGeneration next(generation_.value() + 1U);
-  const auto journal_start = detail::AdmissionTiming::Clock::now();
-  auto recorded =
-      journal_.RecordCellAdmissionClaimReleased(kernel_owner_epoch_, entry->claim, release, next);
-  timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
-  if (!recorded.ok()) {
-    return Result<AuthoringAdmissionDTO>::Err(recorded.error());
-  }
   entry->release = release;
   --held_claim_count_;
-  generation_ = next;
-  return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
+  generation_ = AdmissionGeneration(generation_.value() + 1U);
+  auto admission = AdmissionLocked();
+  JournalRecord record{JournalCellClaimReleased{entry->claim, release, clock_.now()},
+                       "cell_claim_released", std::nullopt, false, false};
+  lock.unlock();
+  transition_lock.unlock();
+  post_records_(std::span<JournalRecord>(&record, 1U));
+  return Result<AuthoringAdmissionDTO>::Ok(admission);
 }
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseTerminalApplyClaimsAfterSuccess(
     const CellAdmissionClaimDTO& fresh_claim,
     const CellAdmissionClaimReleaseDTO& fresh_success_release,
     const CellAdmissionConfigurationApplySuccessValidator& validate) {
-  std::lock_guard transition_lock(liveness_transition_mutex_);
-  std::lock_guard lock(mutex_);
-  if (persistence_outcome_unknown_)
-    return Result<AuthoringAdmissionDTO>::Err(*persistence_outcome_unknown_);
+  std::unique_lock transition_lock(liveness_transition_mutex_);
+  std::unique_lock lock(mutex_);
   auto* fresh = FindHeldLocked(fresh_claim.claim_generation);
   if (!validate || !fresh || fresh->claim != fresh_claim ||
       fresh_claim.intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
-      fresh_claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kManager ||
-      IsStaleOwnerLocked(fresh_claim.intent) ||
+      fresh_claim.intent.owner_role != ApplicationRole::kManager ||
       !ValidateCellAdmissionClaimRelease(fresh_success_release).ok() ||
       !SameReleaseIdentity(fresh_claim, fresh_success_release) ||
       fresh_success_release.settlement.settlement_kind !=
           CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
     return Reject<AuthoringAdmissionDTO>("invalid_request", "fresh_apply_success_not_exact");
   }
-  std::vector<CellAdmissionClaimDTO> held;
   std::vector<CellAdmissionClaimDTO> old;
-  std::vector<CellAdmissionClaimReleaseDTO> releases;
   for (const auto& entry : entries_) {
-    if (entry.release || entry.reconcile_settlement) continue;
+    if (entry.release) continue;
     if (entry.claim.intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
-        entry.claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kManager) {
+        entry.claim.intent.owner_role != ApplicationRole::kManager) {
       return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                       "fresh_apply_success_foreign_claim");
     }
-    held.push_back(entry.claim);
     if (entry.claim == fresh_claim) continue;
     old.push_back(entry.claim);
   }
-  const auto order = [](const auto& a, const auto& b) {
-    return a.claim_generation < b.claim_generation;
-  };
-  std::sort(held.begin(), held.end(), order);
-  std::sort(old.begin(), old.end(), order);
+  std::sort(old.begin(), old.end(),
+            [](const auto& a, const auto& b) { return a.claim_generation < b.claim_generation; });
   const auto validated = validate(fresh_claim, fresh_success_release, old);
   if (!validated.ok()) return Result<AuthoringAdmissionDTO>::Err(validated.error());
   if (old.empty()) return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
-  for (const auto& claim : old) {
-    releases.push_back({claim.intent.owner_role, claim.intent.owner_epoch,
-                        claim.intent.owner_transaction_id, claim.intent.request_id,
-                        claim.intent.request_payload_digest, claim.acquired_admission_generation,
-                        claim.claim_generation, fresh_success_release.settlement});
-  }
-  auto recorded = journal_.RecordTerminalApplyClaimsReleasedBySuccess(
-      kernel_owner_epoch_, fresh_claim, fresh_success_release, held, current_owners_, generation_);
-  if (!recorded.ok()) {
-    if (recorded.error().code == "persistence_outcome_unknown") {
-      CloseForPersistenceUnknownLocked(std::move(recorded.error()), fresh_claim);
-      return Result<AuthoringAdmissionDTO>::Err(*persistence_outcome_unknown_);
-    }
-    return Result<AuthoringAdmissionDTO>::Err(recorded.error());
-  }
-  if (recorded.value().value() != generation_.value() + 1U) {
-    return Reject<AuthoringAdmissionDTO>("operation_journal_request_conflict",
-                                         "fresh_apply_success_generation_not_exact");
-  }
-  for (auto& release : releases) {
-    FindHeldLocked(release.claim_generation)->release = std::move(release);
+  std::vector<JournalRecord> records;
+  records.reserve(old.size());
+  const auto released_at_ns = clock_.now();
+  for (auto& claim : old) {
+    CellAdmissionClaimReleaseDTO release{claim.intent.owner_role,
+                                         claim.intent.owner_transaction_id,
+                                         claim.intent.request_key,
+                                         claim.acquired_admission_generation,
+                                         claim.claim_generation,
+                                         fresh_success_release.settlement};
+    FindHeldLocked(claim.claim_generation)->release = release;
     --held_claim_count_;
+    records.emplace_back(
+        JournalCellClaimReleased{std::move(claim), std::move(release), released_at_ns},
+        "cell_claim_released", std::nullopt, false, false);
   }
-  generation_ = recorded.value();
-  return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
+  generation_ = AdmissionGeneration(generation_.value() + 1U);
+  auto admission = AdmissionLocked();
+  lock.unlock();
+  transition_lock.unlock();
+  post_records_(records);
+  return Result<AuthoringAdmissionDTO>::Ok(admission);
 }
 
 std::optional<CellAdmissionClaimDTO> KernelCellAdmissionOwner::held_claim(
     const CellAdmissionClaimKindDTO kind) const {
   std::lock_guard lock(mutex_);
   for (const auto& entry : entries_) {
-    if (entry.claim.intent.claim_kind == kind && !entry.release.has_value() &&
-        !entry.reconcile_settlement.has_value()) {
+    if (entry.claim.intent.claim_kind == kind && !entry.release.has_value()) {
       return entry.claim;
     }
   }
@@ -1440,12 +997,13 @@ std::optional<CellAdmissionClaimDTO> KernelCellAdmissionOwner::held_claim(
 }
 
 std::optional<CellAdmissionClaimDTO> KernelCellAdmissionOwner::held_claim(
-    const CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const {
+    const CellAdmissionClaimKindDTO kind,
+    const CellAdmissionOwnerTransactionId& owner_transaction_id) const {
   std::lock_guard lock(mutex_);
   for (const auto& entry : entries_) {
     if (entry.claim.intent.claim_kind == kind &&
         entry.claim.intent.owner_transaction_id == owner_transaction_id &&
-        !entry.release.has_value() && !entry.reconcile_settlement.has_value()) {
+        !entry.release.has_value()) {
       return entry.claim;
     }
   }
@@ -1458,282 +1016,12 @@ std::vector<CellAdmissionClaimDTO> KernelCellAdmissionOwner::held_claims(
   std::vector<CellAdmissionClaimDTO> claims;
   claims.reserve(held_claim_count_);
   for (const auto& entry : entries_) {
-    if (entry.claim.intent.claim_kind == kind && !entry.release && !entry.reconcile_settlement)
+    if (entry.claim.intent.claim_kind == kind && !entry.release)
       claims.push_back(entry.claim);
   }
   std::sort(claims.begin(), claims.end(),
             [](const auto& a, const auto& b) { return a.claim_generation < b.claim_generation; });
   return claims;
-}
-
-Result<std::optional<CellAdmissionReconcileDTO>>
-KernelCellAdmissionOwner::manual_owner_reconciliation_request() const {
-  using Request = std::optional<CellAdmissionReconcileDTO>;
-  std::lock_guard lock(mutex_);
-  constexpr auto role = CellAdmissionOwnerRoleDTO::kManualOperationOwner;
-  const auto owner = std::find_if(current_owners_.begin(), current_owners_.end(),
-                                  [](const auto& row) { return row.owner_role == role; });
-  if (owner == current_owners_.end() || owner->owner_epoch == kernel_owner_epoch_)
-    return Result<Request>::Ok(std::nullopt);
-  const auto digest =
-      CellAdmissionOwnerEpochReconciliationEvidenceDigest(role, kernel_owner_epoch_);
-  if (!digest.ok()) return Result<Request>::Err(digest.error());
-  CellAdmissionReconcileDTO request{kernel_owner_epoch_, {}, current_owners_, digest.value()};
-  for (auto& row : request.current_owner_epochs)
-    if (row.owner_role == role) row.owner_epoch = kernel_owner_epoch_;
-  for (const auto& entry : entries_)
-    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value())
-      request.retained_claims.push_back(entry.claim);
-  std::sort(request.retained_claims.begin(), request.retained_claims.end(),
-            [](const auto& left, const auto& right) {
-              return left.claim_generation < right.claim_generation;
-            });
-  return Result<Request>::Ok(std::move(request));
-}
-
-Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReconcileCellAdmissionClaims(
-    const CellAdmissionReconcileDTO& reconcile) {
-  std::lock_guard transition_lock(liveness_transition_mutex_);
-  std::lock_guard lock(mutex_);
-  const auto claims_canonical =
-      std::is_sorted(reconcile.retained_claims.begin(), reconcile.retained_claims.end(),
-                     [](const auto& left, const auto& right) {
-                       return left.claim_generation < right.claim_generation;
-                     }) &&
-      std::adjacent_find(reconcile.retained_claims.begin(), reconcile.retained_claims.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.claim_generation == right.claim_generation;
-                         }) == reconcile.retained_claims.end();
-  const auto epochs_canonical =
-      std::is_sorted(reconcile.current_owner_epochs.begin(), reconcile.current_owner_epochs.end(),
-                     [](const auto& left, const auto& right) {
-                       return std::tie(left.owner_role, left.owner_epoch) <
-                              std::tie(right.owner_role, right.owner_epoch);
-                     }) &&
-      std::adjacent_find(reconcile.current_owner_epochs.begin(),
-                         reconcile.current_owner_epochs.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.owner_role == right.owner_role;
-                         }) == reconcile.current_owner_epochs.end();
-  if (reconcile.kernel_owner_epoch != kernel_owner_epoch_ ||
-      reconcile.retained_claims.size() > capacity_ ||
-      reconcile.current_owner_epochs.size() > kMaximumCellAdmissionClaims || !claims_canonical ||
-      !epochs_canonical ||
-      !content_identity::is_sha256_digest(reconcile.reconciliation_evidence_digest.value()) ||
-      !reconcile_validator_) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "reconcile_shape_invalid");
-  }
-  const auto replay =
-      std::find_if(reconciliations_.begin(), reconciliations_.end(), [&](const auto& recorded) {
-        return recorded.first.reconciliation_evidence_digest ==
-               reconcile.reconciliation_evidence_digest;
-      });
-  if (replay != reconciliations_.end()) {
-    if (replay->first != reconcile) {
-      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "reconcile_replay_conflict");
-    }
-    // This exact receipt was installed only after its durable commit. Reading
-    // it neither settles today's work nor republishes predecessor ownership.
-    // Do not revalidate changed resource facts or rewrite the same journal row.
-    return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
-  }
-  std::vector<CellAdmissionClaimDTO> held;
-  for (const auto& entry : entries_) {
-    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value()) {
-      held.push_back(entry.claim);
-    }
-  }
-  std::sort(held.begin(), held.end(), [](const auto& left, const auto& right) {
-    return left.claim_generation < right.claim_generation;
-  });
-  if (held != reconcile.retained_claims) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "reconcile_inventory_not_exact");
-  }
-  auto validation = reconcile_validator_(held, current_owners_, reconcile);
-  if (!validation.ok()) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "reconcile_evidence_not_exact");
-  }
-  if (validation.value().current_owner_epochs != reconcile.current_owner_epochs) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                    "reconcile_current_owner_not_authorized");
-  }
-  const auto& authorizations = validation.value().settlements;
-  const auto authorizations_canonical =
-      authorizations.size() <= held.size() &&
-      std::is_sorted(authorizations.begin(), authorizations.end(),
-                     [](const auto& left, const auto& right) {
-                       return left.predecessor_claim.claim_generation <
-                              right.predecessor_claim.claim_generation;
-                     }) &&
-      std::adjacent_find(authorizations.begin(), authorizations.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.predecessor_claim.claim_generation ==
-                                  right.predecessor_claim.claim_generation;
-                         }) == authorizations.end();
-  if (!authorizations_canonical) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                    "reconcile_authorization_not_exact");
-  }
-  for (const auto& authorization : authorizations) {
-    const auto predecessor = std::find(held.begin(), held.end(), authorization.predecessor_claim);
-    const auto successor =
-        std::find(validation.value().current_owner_epochs.begin(),
-                  validation.value().current_owner_epochs.end(),
-                  CellAdmissionCurrentOwnerEpochDTO{authorization.successor_owner_role,
-                                                    authorization.successor_owner_epoch});
-    if (predecessor == held.end() ||
-        authorization.successor_owner_role != authorization.predecessor_claim.intent.owner_role ||
-        authorization.successor_owner_epoch == authorization.predecessor_claim.intent.owner_epoch ||
-        successor == validation.value().current_owner_epochs.end() ||
-        authorization.settlement_predicate != CellAdmissionSettlementKindDTO::kReconciled ||
-        authorization.reconciliation_evidence_digest != reconcile.reconciliation_evidence_digest) {
-      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                      "reconcile_authorization_not_exact");
-    }
-  }
-  for (const auto& authorization : authorizations) {
-    const auto& parent = authorization.predecessor_claim;
-    if (parent.intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle &&
-        HasUnsettledChildrenLocked(parent.claim_generation, authorizations)) {
-      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                      "reconcile_parent_child_unsettled");
-    }
-  }
-  for (const auto& predecessor : held) {
-    const auto successor = std::find_if(
-        validation.value().current_owner_epochs.begin(),
-        validation.value().current_owner_epochs.end(),
-        [&](const auto& owner) { return owner.owner_role == predecessor.intent.owner_role; });
-    if (successor == validation.value().current_owner_epochs.end()) {
-      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                      "reconcile_current_owner_not_authorized");
-    }
-    if (successor->owner_epoch == predecessor.intent.owner_epoch) {
-      continue;
-    }
-    const bool settled =
-        std::any_of(authorizations.begin(), authorizations.end(), [&](const auto& authorization) {
-          return authorization.predecessor_claim == predecessor &&
-                 authorization.successor_owner_role == successor->owner_role &&
-                 authorization.successor_owner_epoch == successor->owner_epoch;
-        });
-    if (!settled) {
-      return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
-                                                      "reconcile_predecessor_unsettled");
-    }
-  }
-  const bool changed =
-      !authorizations.empty() || current_owners_ != validation.value().current_owner_epochs;
-  if (changed && generation_.value() >= 9'007'199'254'740'991ULL) {
-    return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "admission_generation_exhausted");
-  }
-  const AdmissionGeneration next(generation_.value() + (changed ? 1U : 0U));
-  std::vector<CellAdmissionRecoveryLedgerEntryDTO> footprint_entries;
-  footprint_entries.reserve(entries_.size());
-  for (const auto& entry : entries_) {
-    CellAdmissionRecoveryLedgerEntryDTO prospective{entry.claim, entry.release,
-                                                    entry.reconcile_settlement};
-    const auto authorization = std::find_if(
-        authorizations.begin(), authorizations.end(),
-        [&](const auto& candidate) { return candidate.predecessor_claim == entry.claim; });
-    if (authorization != authorizations.end()) {
-      prospective.reconcile_settlement = *authorization;
-    }
-    const auto current = std::find_if(
-        validation.value().current_owner_epochs.begin(),
-        validation.value().current_owner_epochs.end(),
-        [&](const auto& owner) { return owner.owner_role == entry.claim.intent.owner_role; });
-    const bool released_obsolete = prospective.release.has_value() &&
-                                   current != validation.value().current_owner_epochs.end() &&
-                                   current->owner_epoch != prospective.claim.intent.owner_epoch;
-    const bool reconciled_obsolete =
-        prospective.reconcile_settlement.has_value() &&
-        current != validation.value().current_owner_epochs.end() &&
-        prospective.reconcile_settlement->successor_owner_epoch != current->owner_epoch;
-    if (!released_obsolete && !reconciled_obsolete) {
-      footprint_entries.push_back(std::move(prospective));
-    }
-  }
-  const auto footprint = ComputeCellAdmissionRecoveryFootprint(
-      kernel_owner_epoch_, next, footprint_entries, validation.value().current_owner_epochs);
-  if (!footprint.ok() || !footprint.value().admitted()) {
-    return Reject<AuthoringAdmissionDTO>("invalid_request", "recovery_footprint_exceeded");
-  }
-  auto recorded = journal_.RecordCellAdmissionClaimsReconciled(kernel_owner_epoch_, reconcile,
-                                                               validation.value(), next);
-  if (!recorded.ok()) {
-    return Result<AuthoringAdmissionDTO>::Err(recorded.error());
-  }
-  for (auto& entry : entries_) {
-    const auto authorization = std::find_if(
-        authorizations.begin(), authorizations.end(),
-        [&](const auto& candidate) { return candidate.predecessor_claim == entry.claim; });
-    if (authorization != authorizations.end()) {
-      entry.reconcile_settlement = *authorization;
-    }
-  }
-  held_claim_count_ -= authorizations.size();
-  current_owners_ = validation.value().current_owner_epochs;
-  entries_.erase(
-      std::remove_if(
-          entries_.begin(), entries_.end(),
-          [&](const auto& entry) {
-            const auto current = std::find_if(
-                current_owners_.begin(), current_owners_.end(), [&](const auto& owner) {
-                  return owner.owner_role == entry.claim.intent.owner_role;
-                });
-            const bool released_obsolete = entry.release.has_value() &&
-                                           current != current_owners_.end() &&
-                                           current->owner_epoch != entry.claim.intent.owner_epoch;
-            const bool reconciled_obsolete =
-                entry.reconcile_settlement.has_value() && current != current_owners_.end() &&
-                entry.reconcile_settlement->successor_owner_role == current->owner_role &&
-                entry.reconcile_settlement->successor_owner_epoch != current->owner_epoch;
-            return released_obsolete || reconciled_obsolete;
-          }),
-      entries_.end());
-  membership_.erase(
-      std::remove_if(membership_.begin(), membership_.end(),
-                     [&](const auto& member) {
-                       const auto current = std::find_if(
-                           current_owners_.begin(), current_owners_.end(), [&](const auto& owner) {
-                             return owner.owner_role == member.owner_role;
-                           });
-                       const bool unresolved =
-                           std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
-                             return !entry.release.has_value() &&
-                                    !entry.reconcile_settlement.has_value() &&
-                                    entry.claim.intent.owner_role == member.owner_role &&
-                                    entry.claim.intent.owner_epoch == member.owner_epoch;
-                           });
-                       const bool reconciled =
-                           std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
-                             return entry.reconcile_settlement.has_value() &&
-                                    entry.claim.intent.owner_role == member.owner_role &&
-                                    entry.claim.intent.owner_epoch == member.owner_epoch;
-                           });
-                       return current != current_owners_.end() &&
-                              current->owner_epoch != member.owner_epoch && !unresolved &&
-                              !reconciled;
-                     }),
-      membership_.end());
-  reconciliations_.erase(
-      std::remove_if(reconciliations_.begin(), reconciliations_.end(),
-                     [&](const auto& recorded) {
-                       return std::none_of(
-                           recorded.second.settlements.begin(), recorded.second.settlements.end(),
-                           [&](const auto& settlement) {
-                             return std::any_of(entries_.begin(), entries_.end(),
-                                                [&](const auto& entry) {
-                                                  return entry.reconcile_settlement.has_value() &&
-                                                         *entry.reconcile_settlement == settlement;
-                                                });
-                           });
-                     }),
-      reconciliations_.end());
-  generation_ = next;
-  reconciliations_.emplace_back(reconcile, validation.value());
-  return Result<AuthoringAdmissionDTO>::Ok(AdmissionLocked());
 }
 
 Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissionRecoveryReceipt(
@@ -1745,17 +1033,13 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
   std::lock_guard lock(mutex_);
   CellAdmissionRecoveryReceiptDTO receipt{
       .status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
-      .kernel_owner_epoch = kernel_owner_epoch_,
       .admission_generation = generation_,
       .matched_claim = std::nullopt,
       .matched_release = std::nullopt,
-      .matched_reconcile_settlement = std::nullopt,
       .held_claims = {},
-      .current_owner_epochs = {},
   };
-  receipt.current_owner_epochs = current_owners_;
   for (const auto& entry : entries_) {
-    if (!entry.release.has_value() && !entry.reconcile_settlement.has_value()) {
+    if (!entry.release.has_value()) {
       receipt.held_claims.push_back(entry.claim);
     }
   }
@@ -1766,7 +1050,7 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
 
   const auto digest = CellAdmissionClaimIntentDigest(query.intent);
   const auto member = std::find_if(membership_.begin(), membership_.end(), [&](const auto& row) {
-    return row.owner_epoch == query.intent.owner_epoch && row.request_id == query.intent.request_id;
+    return row.owner_role == query.intent.owner_role && row.request_key == query.intent.request_key;
   });
   if (member == membership_.end()) {
     receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown;
@@ -1778,8 +1062,8 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
     return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
   }
   const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
-    return row.claim.intent.owner_epoch == query.intent.owner_epoch &&
-           row.claim.intent.request_id == query.intent.request_id;
+    return row.claim.intent.owner_role == query.intent.owner_role &&
+           row.claim.intent.request_key == query.intent.request_key;
   });
   if (entry == entries_.end()) {
     receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kUnknown;
@@ -1793,15 +1077,7 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
     return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
   }
   receipt.matched_claim = entry->claim;
-  if (entry->reconcile_settlement.has_value()) {
-    if (query.expected_release.has_value()) {
-      receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kConflicting;
-      receipt.matched_claim.reset();
-      return Result<CellAdmissionRecoveryReceiptDTO>::Ok(std::move(receipt));
-    }
-    receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact;
-    receipt.matched_reconcile_settlement = entry->reconcile_settlement;
-  } else if (entry->release.has_value()) {
+  if (entry->release.has_value()) {
     receipt.status = CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
     receipt.matched_release = entry->release;
   } else {
@@ -1812,17 +1088,16 @@ Result<CellAdmissionRecoveryReceiptDTO> KernelCellAdmissionOwner::GetCellAdmissi
 
 Result<void> KernelCellAdmissionOwner::ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) const {
-  auto proof = PrepareProgramResetSceneAuthorization(authorization);
-  if (!proof.ok()) return Result<void>::Err(proof.error());
-  return ValidatePreparedProgramResetSceneAuthorization(authorization, proof.value());
-}
-
-Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetSceneAuthorization(
-    const ProgramResetSceneAuthorizationDTO& authorization,
-    const PreparedProgramResetStatus& proof) const {
   const auto valid = manyforge::core::ValidateProgramResetSceneAuthorization(authorization);
   if (!valid.ok()) return Result<void>::Err(valid.error());
   std::lock_guard lock(mutex_);
+  const auto held_generation = authorization.reset_claim
+      ? authorization.reset_claim->reset_claim_generation : authorization.cycle_claim_generation;
+  if (std::none_of(entries_.begin(), entries_.end(), [&](const auto& row) {
+        return row.claim.claim_generation == held_generation && !row.release;
+      })) {
+    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
+  }
   if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status.has_value()) {
     return AuthoringNotReady<void>(generation_, "program_reset_status_not_current");
   }
@@ -1831,28 +1106,23 @@ Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetSceneAuthoriz
     const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto& row) {
       return row.claim.claim_generation == expected.reset_claim_generation;
     });
-    if (entry == entries_.end() || entry->release || entry->reconcile_settlement || held_claim_count_ != 1U ||
+    if (entry == entries_.end() || entry->release || held_claim_count_ != 1U ||
         entry->claim.intent.claim_kind != CellAdmissionClaimKindDTO::kProgramReset ||
-        entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner) {
+        entry->claim.intent.owner_role != ApplicationRole::kProgramRunner) {
       return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
     }
-    const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kReloadInitialScene,
-                                                entry->claim.intent, entry->claim, proof);
+    const auto current = CurrentResetLocked(entry->claim.intent, authorization.program_cycle_status);
     if (!current.ok()) return Result<void>::Err(current.error());
     const auto& status = current.value();
     const auto& accepted = *status.accepted_reset;
-    const auto identity = ProgramResetClaimRequestId(status);
+    const auto identity = ProgramResetClaimRequestKey(status);
     if (!accepted.reload_initial_scene ||
-        status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
         status.cycle_generation != expected.cycle_generation ||
-        accepted.request_owner_epoch != expected.request_owner_epoch ||
-        accepted.request_id != expected.request_id ||
+        accepted.request_key != expected.request_key ||
         accepted.request_payload_digest != expected.request_payload_digest ||
         accepted.reset_claim_generation != expected.reset_claim_generation ||
-        !identity.ok() || entry->claim.intent.owner_epoch != status.program_runner_owner_epoch ||
-        entry->claim.intent.request_id != identity.value() ||
-        entry->claim.intent.owner_transaction_id != identity.value().value() ||
-        entry->claim.intent.request_payload_digest != accepted.request_payload_digest) {
+        !identity.ok() ||
+        entry->claim.intent.request_key != identity.value()) {
       return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
     }
     return Result<void>::Ok();
@@ -1862,39 +1132,23 @@ Result<void> KernelCellAdmissionOwner::ValidatePreparedProgramResetSceneAuthoriz
   });
   if (entry == entries_.end() || entry->release.has_value() ||
       entry->claim.intent.claim_kind != CellAdmissionClaimKindDTO::kProgramCycle ||
-      entry->claim.intent.owner_role != CellAdmissionOwnerRoleDTO::kProgramRunner ||
-      entry->claim.intent.owner_transaction_id != authorization.program_run_id.value()) {
+      entry->claim.intent.owner_role != ApplicationRole::kProgramRunner ||
+      entry->claim.intent.owner_transaction_id !=
+          CellAdmissionOwnerTransactionId(authorization.program_run_id)) {
     return AuthoringNotReady<void>(generation_, "program_reset_claim_not_exact");
   }
-  const auto current = CurrentResetLocked(ProgramResetJournalReadPurpose::kReloadInitialScene,
-                                         entry->claim.intent, entry->claim, proof);
+  const auto current = CurrentResetLocked(entry->claim.intent, authorization.program_cycle_status);
   if (!current.ok()) return Result<void>::Err(current.error());
   const auto& status = current.value();
   if (!status.accepted_reset->reload_initial_scene) {
     return AuthoringNotReady<void>(generation_, "program_reset_scene_not_selected");
   }
-  if (status.program_runner_owner_epoch != authorization.program_runner_owner_epoch ||
-      status.program_run_id != std::optional<ProgramRunId>{authorization.program_run_id} ||
+  if (status.program_run_id != std::optional<ProgramRunNumber>{authorization.program_run_id} ||
       status.cycle_claim_generation !=
           std::optional<CellAdmissionClaimGeneration>{authorization.cycle_claim_generation} ||
       status.terminal_or_settlement_reference !=
           std::optional<ContentDigest>{authorization.terminal_or_settlement_reference}) {
     return AuthoringNotReady<void>(generation_, "program_reset_status_mismatch");
-  }
-  const bool held_by_current_owner =
-      !entry->reconcile_settlement.has_value() &&
-      entry->claim.intent.owner_epoch == authorization.program_runner_owner_epoch;
-  const bool reconciled_to_current_owner =
-      entry->reconcile_settlement.has_value() &&
-      entry->reconcile_settlement->predecessor_claim == entry->claim &&
-      entry->reconcile_settlement->successor_owner_role ==
-          CellAdmissionOwnerRoleDTO::kProgramRunner &&
-      entry->reconcile_settlement->successor_owner_epoch ==
-          authorization.program_runner_owner_epoch &&
-      entry->reconcile_settlement->settlement_predicate ==
-          CellAdmissionSettlementKindDTO::kReconciled;
-  if (!held_by_current_owner && !reconciled_to_current_owner) {
-    return AuthoringNotReady<void>(generation_, "program_reset_claim_not_current");
   }
   if (HasUnsettledChildrenLocked(entry->claim.claim_generation)) {
     return AuthoringNotReady<void>(generation_, "program_reset_child_unsettled");
@@ -1908,10 +1162,10 @@ bool KernelCellAdmissionOwner::has_unresolved_claims() const {
 }
 
 bool KernelCellAdmissionOwner::has_unresolved_claims_except(
-    CellAdmissionOwnerRoleDTO owner_role) const {
+    ApplicationRole owner_role) const {
   std::lock_guard lock(mutex_);
   return std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    return !entry.release && !entry.reconcile_settlement &&
+    return !entry.release &&
            entry.claim.intent.owner_role != owner_role;
   });
 }

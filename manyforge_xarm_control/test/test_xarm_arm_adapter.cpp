@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <future>
@@ -68,18 +69,22 @@ struct World final {
   [[nodiscard]] core::ActionResult Run(const ComponentAction action) {
     return adapter->Run(action, std::stop_token{});
   }
-  /// The hardware switch: records "on"/"off", answers `hardware_outcome`;
-  /// switched on, the plugin arms the robot (a ready report, motors on)
-  /// when `arms_robot`.
-  [[nodiscard]] std::function<core::ActionResult(bool, std::stop_token)> Hardware() {
-    return [this](const bool active, std::stop_token) {
+  /// The hardware switch: records "on"/"off" and its step deadline,
+  /// answers `hardware_outcome` (with `hardware_error`); switched on, the
+  /// plugin arms the robot (a ready report, motors on) when `arms_robot`.
+  [[nodiscard]] std::function<core::ActionResult(
+      bool, std::optional<std::chrono::steady_clock::time_point>, std::stop_token)>
+  Hardware() {
+    return [this](const bool active,
+                  const std::optional<std::chrono::steady_clock::time_point> step_deadline,
+                  std::stop_token) {
       hardware.push_back(active ? "on" : "off");
+      hardware_deadlines.push_back(step_deadline);
       core::ActionResult made;
       made.action = active ? ComponentAction::kEnable : ComponentAction::kDisable;
       made.outcome = hardware_outcome;
       if (hardware_outcome != ActionOutcome::kSucceeded) {
-        made.error = core::ActionError{"ros2_control_hardware_deactivation_refused",
-                                       "refused", {}, {}};
+        made.error = core::ActionError{hardware_error, "refused", {}, {}};
         return made;
       }
       hardware_on = active;
@@ -95,7 +100,10 @@ struct World final {
   std::shared_ptr<FakeLane> lane = std::make_shared<FakeLane>();
   std::optional<std::vector<double>> measured{std::vector<double>{0.1, -0.2, 0.3, 0.0, 0.5, 0.6}};
   std::vector<std::string> hardware;
+  /// The step deadline each hardware switch carried.
+  std::vector<std::optional<std::chrono::steady_clock::time_point>> hardware_deadlines;
   ActionOutcome hardware_outcome{ActionOutcome::kSucceeded};
+  std::string hardware_error{"ros2_control_hardware_deactivation_refused"};
   /// A fresh process: the launch starts the hardware inactive.
   bool hardware_on{false};
   bool arms_robot{true};
@@ -378,6 +386,46 @@ TEST(XArmArmAdapter, EnableFromPreparedSwitchesTheHardwareOnThenTheController) {
   EXPECT_TRUE(world.hardware_on);
   EXPECT_TRUE(world.driver->Calls().empty());
   EXPECT_EQ(world.adapter->State(world.clock.now()).lifecycle, ComponentLifecycle::kEnabled);
+}
+
+// OD-214: Enable's hardware switch carries the adapter's lifecycle command
+// time (the configured `action_timeout`), so a controller manager that never
+// answers ends the Enable with the switch's own unknown result; Prepare and
+// Disable keep each call's own cap.
+TEST(XArmArmAdapter, EnablesHardwareSwitchCarriesTheLifecycleDeadlineAndEndsOnItsTimeout) {
+  World world;
+  world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
+  ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(world.hardware_deadlines.size(), 1U);
+  EXPECT_FALSE(world.hardware_deadlines[0].has_value());
+  world.hardware.clear();
+  world.hardware_deadlines.clear();
+  const auto before = std::chrono::steady_clock::now();
+  ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  const auto after = std::chrono::steady_clock::now();
+  ASSERT_EQ(world.hardware, (Ids{"off", "on"}));
+  ASSERT_EQ(world.hardware_deadlines.size(), 2U);
+  for (const auto &deadline : world.hardware_deadlines) {
+    ASSERT_TRUE(deadline.has_value());
+    EXPECT_GE(*deadline, before + std::chrono::seconds(10));
+    EXPECT_LE(*deadline, after + std::chrono::seconds(10));
+  }
+  EXPECT_TRUE(world.hardware_deadlines[0] == world.hardware_deadlines[1]);  // one step deadline
+  // Disable: the hardware off with no step deadline, as before.
+  world.hardware_deadlines.clear();
+  ASSERT_EQ(world.Run(ComponentAction::kDisable).outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(world.hardware_deadlines.size(), 1U);
+  EXPECT_FALSE(world.hardware_deadlines[0].has_value());
+  // The switch unanswered within that deadline: the Enable ends with it.
+  world.hardware.clear();
+  world.hardware_outcome = ActionOutcome::kUnknown;
+  world.hardware_error = "component_action_refused";  // the lane's mapping of the switch timeout
+  const auto unanswered = world.Run(ComponentAction::kEnable);
+  EXPECT_EQ(unanswered.outcome, ActionOutcome::kUnknown);
+  EXPECT_EQ(unanswered.action, ComponentAction::kEnable);
+  ASSERT_TRUE(unanswered.error.has_value());
+  EXPECT_EQ(unanswered.error->code, "component_action_refused");
+  EXPECT_EQ(world.hardware, Ids{"off"});  // nothing is resent
 }
 
 TEST(XArmArmAdapter, EnableOnARobotNotReadyRunsTheFullArmingSequenceAsM7) {

@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -97,6 +98,14 @@ static_assert(std::is_same_v<
               decltype(&IManagerSceneProjectionMaintenancePort::
                            ActiveProjectionHealth),
               ActiveProjectionHealthSignature>);
+using EndConfigurationAdoptionSignature = void (
+    IManagerSceneProjectionMaintenancePort::*)(
+    const ApplyId&, ApplyGeneration,
+    const std::optional<ActiveBundlePublicationReceiptDTO>&);
+static_assert(std::is_same_v<
+              decltype(&IManagerSceneProjectionMaintenancePort::
+                           EndOriginalManagerConfigurationAdoption),
+              EndConfigurationAdoptionSignature>);
 
 using BeginBootstrapSignature = ProjectionBootstrapAcceptedDTO (
     IManagerSceneProjectionBootstrapPort::*)(const ProjectionBootstrapIntentDTO&);
@@ -130,7 +139,6 @@ using ObserveFenceAdmissionSignature = ConfigurationFenceAdmissionSnapshotDTO (
 using AcquireFenceSignature = ConfigurationFenceAcceptedDTO (IManagerKernelApplyFencePort::*)(const ApplyConfigurationFenceIntentDTO&);
 using ReconcileFenceAttemptSignature = ApplyFenceAcquireAttemptReconcileResultDTO (
     IManagerKernelApplyFencePort::*)(const ApplyFenceAcquireAttemptQueryDTO&) const;
-using RehydrateFenceSignature = ApplyFenceReconcileResultDTO (IManagerKernelApplyFencePort::*)(const ApplyFenceRehydrateDTO&);
 using QueryFenceStatusSignature = ConfigurationFenceStatusDTO (IManagerKernelApplyFencePort::*)(
     const ConfigurationFenceStatusQueryDTO&) const;
 using ReleaseFenceSignature = ConfigurationFenceReleasedDTO (IManagerKernelApplyFencePort::*)(
@@ -142,8 +150,6 @@ static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::Acquire),
 static_assert(
     std::is_same_v<decltype(&IManagerKernelApplyFencePort::ReconcileAcquireAttempt),
                    ReconcileFenceAttemptSignature>);
-static_assert(std::is_same_v<decltype(&IManagerKernelApplyFencePort::Rehydrate),
-                             RehydrateFenceSignature>);
 static_assert(std::is_same_v <decltype(&IManagerKernelApplyFencePort::QueryStatus),
                              QueryFenceStatusSignature>);
 static_assert(
@@ -189,7 +195,7 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   return ProjectionAggregateHealthDTO{
       MaintenanceProjectionSetSourceDTO{
-          ApplyId{"apply-1"},
+          ApplyId{1U},
           ApplyGeneration{1U},
           candidate,
       },
@@ -220,7 +226,7 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
   const auto projection = Projection(kOtherDigest, kOtherDigest, 2U);
   return ActiveBundlePublicationRequestDTO{
       NamedApplyPublicationTransactionDTO{
-          ApplyId{"apply-1"},
+          ApplyId{1U},
           ApplyGeneration{1U},
       },
       projection,
@@ -313,12 +319,10 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
 [[nodiscard]] ApplyConfigurationFenceIntentDTO FenceIntent() {
   return ApplyConfigurationFenceIntentDTO{
       PublicRequestContextDTO{
-          RequestId{"request-1"},
-          RequestOwnerEpoch{"kernel-epoch-1"},
+          TestRequestKey("request-1"),
           "component-manager",
-          std::nullopt,
       },
-      ApplyFenceOwnerDTO{ApplyId{"apply-1"}, ApplyGeneration{1U}},
+      ApplyFenceOwnerDTO{ApplyId{1U}, ApplyGeneration{1U}},
       FenceScope(),
       ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       RetainedBundleId{kDigest},
@@ -331,44 +335,23 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
   };
 }
 
-[[nodiscard]] ApplyFenceRehydrateDTO FenceRehydrateRequest() {
-  return ApplyFenceRehydrateDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      RequestId{"request-1"},
-      RequestOwnerEpoch{"kernel-epoch-1"},
-      ContentDigest{kDigest},
-      RetainedBundleId{kDigest},
-      GraphRevision{kDigest},
-      RetainedBundleId{kOtherDigest},
-      GraphRevision{kOtherDigest},
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      FenceScope(),
-      "fence_acquired",
-      RuntimeEpoch{"manager-epoch-2"},
-  };
-}
-
 [[nodiscard]] ApplyFenceAcquireAttemptQueryDTO FenceAttemptQuery() {
   return ApplyFenceAcquireAttemptQueryDTO{
       FenceIntent(),
       ContentDigest{kDigest},
-      RuntimeEpoch{"manager-epoch-2"},
   };
 }
 
 [[nodiscard]] ExecutionHostEpochDTO ExecutionHostEpoch() {
   return ExecutionHostEpochDTO{
       RuntimeUnitId{"runtime.kernel"},       RuntimeEpoch{"kernel-runtime-2"},
-      RequestOwnerEpoch{"kernel-epoch-1"},   ContentDigest{kDigest},
+      ContentDigest{kDigest},
       ActiveBundlePublicationGeneration{4U},
   };
 }
 
 [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO FenceAdmissionSnapshot() {
-  const ConfigurationFenceAdmissionQueryDTO query{
-      FenceScope(), RuntimeEpoch{"manager-epoch-2"}};
+  const ConfigurationFenceAdmissionQueryDTO query{FenceScope()};
   return {
       query,
       ExecutionHostEpoch(),
@@ -388,7 +371,7 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
 [[nodiscard]] ConfigurationFenceReconciliationEvidenceDTO FenceReleaseEvidence() {
   return ConfigurationFenceReconciliationEvidenceDTO{
       ExecutionHostEpoch(),
-      ApplyFenceOwnerDTO{ApplyId{"apply-1"}, ApplyGeneration{1U}},
+      ApplyFenceOwnerDTO{ApplyId{1U}, ApplyGeneration{1U}},
       ConfigurationFenceId{"fence-1"},
       ConfigurationFenceGeneration{1U},
       FenceScope(),
@@ -408,7 +391,6 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
 [[nodiscard]] ConfigurationFenceReleaseDTO FenceReleaseRequest() {
   return {
       FenceReleaseEvidence(),
-      RuntimeEpoch{"manager-epoch-2"},
   };
 }
 
@@ -419,7 +401,6 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
       evidence.configuration_fence_id,
       evidence.configuration_fence_generation,
       evidence.reconciled_scope,
-      RuntimeEpoch{"manager-epoch-2"},
   };
 }
 
@@ -487,7 +468,7 @@ TEST(ComponentManagerPortContracts, PublicationRejectsEmptyAndZeroTransactionIde
   ASSERT_TRUE(named.valid());
 
   named.transaction_ref = NamedApplyPublicationTransactionDTO{
-      ApplyId{""},
+      ApplyId{0U},
       ApplyGeneration{0U},
   };
   EXPECT_FALSE(named.valid());
@@ -519,7 +500,7 @@ TEST(ComponentManagerPortContracts, PublicationPresenceAndCompareAndSwapAreTrans
 
   auto stale = request;
   stale.transaction_ref = NamedApplyPublicationTransactionDTO{
-      ApplyId{"apply-2"},
+      ApplyId{2U},
       ApplyGeneration{1U},
   };
   stale.expected_previous_publication_generation = ActiveBundlePublicationGeneration{2U};
@@ -871,7 +852,7 @@ TEST(ComponentManagerPortContracts, FenceScopeOwnerAndBundleGraphKeyRemainExplic
   auto intent = FenceIntent();
 
   EXPECT_TRUE(intent.valid());
-  EXPECT_EQ(intent.owner_transaction.apply_id, ApplyId{"apply-1"});
+  EXPECT_EQ(intent.owner_transaction.apply_id, ApplyId{1U});
   EXPECT_EQ(intent.expected_retained_bundle_id, RetainedBundleId{kDigest});
   EXPECT_EQ(intent.expected_graph_revision, GraphRevision{kOtherDigest});
 
@@ -992,16 +973,13 @@ TEST(ComponentManagerPortContracts, FenceAcceptedAllowsOnlyAcceptedOrExactReplay
   EXPECT_FALSE(accepted.valid());
   accepted.replay_status = RequestReplayStatusDTO::kRequestLedgerFull;
   EXPECT_FALSE(accepted.valid());
-  accepted.replay_status = RequestReplayStatusDTO::kStaleRequestOwnerEpoch;
-  EXPECT_FALSE(accepted.valid());
   accepted.replay_status = static_cast<RequestReplayStatusDTO>(999);
   EXPECT_FALSE(accepted.valid());
 }
 
 TEST(ComponentManagerPortContracts,
      FenceAdmissionSnapshotIsReadOnlyCanonicalPredecessorEvidence) {
-  const auto query = ConfigurationFenceAdmissionQueryDTO{
-      FenceScope(), RuntimeEpoch{"manager-epoch-2"}};
+  const auto query = ConfigurationFenceAdmissionQueryDTO{FenceScope()};
   auto snapshot = FenceAdmissionSnapshot();
   EXPECT_TRUE(snapshot.presence_valid());
   EXPECT_TRUE(snapshot.matches(query));
@@ -1015,10 +993,6 @@ TEST(ComponentManagerPortContracts,
       ControlDomainId{"domain.other"};
   EXPECT_FALSE(snapshot.presence_valid());
 
-  snapshot = FenceAdmissionSnapshot();
-  snapshot.echoed_query.manager_runtime_epoch = RuntimeEpoch{"manager-epoch-3"};
-  EXPECT_TRUE(snapshot.presence_valid());
-  EXPECT_FALSE(snapshot.matches(query));
 }
 
 TEST(ComponentManagerPortContracts, FenceAcceptanceMatchesExactScopeAndSuccessorGeneration) {
@@ -1073,7 +1047,7 @@ TEST(ComponentManagerPortContracts, FenceReleaseRequiresExactReconciledIdleState
   EXPECT_FALSE(release.valid());
 }
 
-TEST(ComponentManagerPortContracts, FenceStatusSeparatesHeldPendingAndExactReleasedEvidence) {
+TEST(ComponentManagerPortContracts, FenceStatusSeparatesHeldAndExactReleasedEvidence) {
   const auto query = FenceStatusQuery();
   ConfigurationFenceStatusDTO status{
       query,
@@ -1087,13 +1061,6 @@ TEST(ComponentManagerPortContracts, FenceStatusSeparatesHeldPendingAndExactRelea
   };
   EXPECT_TRUE(status.matches(query));
 
-  status.state = ConfigurationFenceState::kReleasePending;
-  EXPECT_FALSE(status.presence_valid());
-  status.required_compensation_or_operator_direction =
-      "keep admission fenced and reconcile the release ledger";
-  status.error = ErrorDTO{"fence_release_pending", "release uncertain", {}};
-  EXPECT_TRUE(status.presence_valid());
-
   status.state = ConfigurationFenceState::kReleased;
   status.admission_fenced = false;
   status.required_compensation_or_operator_direction.clear();
@@ -1103,10 +1070,8 @@ TEST(ComponentManagerPortContracts, FenceStatusSeparatesHeldPendingAndExactRelea
       ContentDigest{kOtherDigest},
   };
   EXPECT_TRUE(status.presence_valid());
-  status.release_receipt->request.manager_runtime_epoch = RuntimeEpoch{"foreign-manager"};
-  EXPECT_TRUE(status.presence_valid());
   status.release_receipt->request.reconciliation_evidence.owner_transaction =
-      ApplyFenceOwnerDTO{ApplyId{"foreign"}, ApplyGeneration{1U}};
+      ApplyFenceOwnerDTO{ApplyId{99U}, ApplyGeneration{1U}};
   EXPECT_FALSE(status.presence_valid());
   status.release_receipt = ConfigurationFenceReleasedDTO{
       FenceReleaseRequest(),       ExecutionHostEpoch(), 42, RequestReplayStatusDTO::kAcceptedNew,
@@ -1160,104 +1125,6 @@ TEST(ComponentManagerPortContracts, FenceAttemptReconciliationHasOneRetryableNoR
 
   result.state = static_cast<ApplyFenceAcquireAttemptReconcileState>(999);
   result.admission_fenced = true;
-  EXPECT_FALSE(result.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, FenceRehydrateNewIdentityIsPresentOnlyWhenRecreated) {
-  ApplyFenceReconcileEntryDTO entry{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      ApplyFenceReconcileState::kMatched,
-      std::nullopt,
-      std::nullopt,
-  };
-  EXPECT_TRUE(entry.presence_valid());
-
-  entry.state = ApplyFenceReconcileState::kRecreated;
-  EXPECT_FALSE(entry.presence_valid());
-  entry.reconciled_configuration_fence_id = ConfigurationFenceId{"fence-2"};
-  entry.reconciled_configuration_fence_generation = ConfigurationFenceGeneration{2U};
-  EXPECT_TRUE(entry.presence_valid());
-
-  entry.state = ApplyFenceReconcileState::kConflicting;
-  EXPECT_FALSE(entry.presence_valid());
-  entry.reconciled_configuration_fence_id.reset();
-  entry.reconciled_configuration_fence_generation.reset();
-  EXPECT_TRUE(entry.presence_valid());
-
-  entry.state = static_cast<ApplyFenceReconcileState>(999);
-  EXPECT_FALSE(entry.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, FenceReconciliationCannotOpenOnMissingConflictOrError) {
-  const auto request = FenceRehydrateRequest();
-  const ApplyFenceReconcileEntryDTO matched{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      ApplyFenceReconcileState::kMatched,
-      std::nullopt,
-      std::nullopt,
-  };
-  ApplyFenceReconcileResultDTO result{
-      ExecutionHostEpoch(), {matched}, false, "", ContentDigest{kDigest}, std::nullopt,
-  };
-  EXPECT_TRUE(result.presence_valid());
-  EXPECT_TRUE(result.matches(request));
-
-  result.execution_host_epoch.request_owner_epoch =
-      RequestOwnerEpoch{"different-kernel-owner-epoch"};
-  EXPECT_TRUE(result.matches(request));
-
-  result.fence_results.clear();
-  EXPECT_FALSE(result.presence_valid());
-
-  result.fence_results = {matched};
-  result.error = ErrorDTO{"fence_reconcile_failed", "test error", {}};
-  EXPECT_FALSE(result.presence_valid());
-
-  result.fence_results.front().state = ApplyFenceReconcileState::kMissing;
-  result.admission_fenced = false;
-  result.required_compensation_or_operator_direction = "recreate or inspect the missing fence";
-  EXPECT_FALSE(result.presence_valid());
-
-  result.admission_fenced = true;
-  EXPECT_TRUE(result.presence_valid());
-  EXPECT_TRUE(result.matches(request));
-
-  result.fence_results.front().state = ApplyFenceReconcileState::kConflicting;
-  EXPECT_TRUE(result.presence_valid());
-  result.error->code.clear();
-  EXPECT_FALSE(result.presence_valid());
-  result.error.reset();
-  EXPECT_FALSE(result.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, FenceReconcileOrderingAndSingletonRequestMatchAreExplicit) {
-  const auto request = FenceRehydrateRequest();
-  const ApplyFenceReconcileEntryDTO first{
-      ConfigurationFenceId{"fence-1"},
-      ConfigurationFenceGeneration{1U},
-      ApplyFenceReconcileState::kMatched,
-      std::nullopt,
-      std::nullopt,
-  };
-  const ApplyFenceReconcileEntryDTO second{
-      ConfigurationFenceId{"fence-2"},
-      ConfigurationFenceGeneration{1U},
-      ApplyFenceReconcileState::kMatched,
-      std::nullopt,
-      std::nullopt,
-  };
-  ApplyFenceReconcileResultDTO result{
-      ExecutionHostEpoch(), {second, first}, false, "", ContentDigest{kDigest}, std::nullopt,
-  };
-  EXPECT_FALSE(result.presence_valid());
-
-  result.fence_results = {first, second};
-  EXPECT_TRUE(result.presence_valid());
-  EXPECT_FALSE(result.matches(request));
-
-  result.fence_results = {first, first};
   EXPECT_FALSE(result.presence_valid());
 }
 

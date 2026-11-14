@@ -55,7 +55,7 @@ closed request contains:
 - operator intent: `assistantMode`, `message`, sorted unique
   `requestedTools`, and narrowing-only `fieldPolicy`;
 - forwarded proof input: the complete `modeProjection`
-  (`manyforge.assistant_mode_projection.v2`, which names the
+  (`manyforge.assistant_mode_projection.v3`, which names the
   `assistant_component_id` and the cell states the mode `runs_in`) and exact
   `resolvedCatalog` (`catalogHash`, `grantPolicy`, `nodes`, `skills`, `tools`);
 - Composer context: `composerDraft` with Draft identity/revision, the

@@ -77,12 +77,12 @@ struct Stored {
 } // namespace
 
 core::Result<V> VolatileMotionTrace::SnapshotFile(
-    const core::RequestOwnerEpoch &owner, std::size_t allowance,
+    core::ApplicationStartId application_start_id, std::size_t allowance,
     const std::filesystem::path &directory) const {
   const auto error = [](const char *code, const char *message) {
     return core::Result<V>::Err({code, message, {}});
   };
-  auto snapshot = Snapshot(owner, allowance);
+  auto snapshot = Snapshot(application_start_id, allowance);
   if (!snapshot.ok()) return snapshot;
   try {
     const auto bytes = content_identity::canonical_json(snapshot.value());
@@ -192,9 +192,9 @@ core::Result<V> VolatileMotionTrace::SnapshotFile(
       partial = partial || (encoded != "false" && encoded != "0");
     }
     return core::Result<V>::Ok(V(V::Object{
-        {"schema_version", V("manyforge.motion_trace_file.v1")},
+        {"schema_version", V("manyforge.motion_trace_file.v2")},
         {"file", V(filename)}, {"bytes", V(static_cast<double>(bytes.size()))},
-        {"sha256", V(digest)}, {"request_owner_epoch", V(owner.value())},
+        {"sha256", V(digest)},
         {"status", V(partial ? "partial" : "complete")}}));
   } catch (const std::exception &failure) {
     return core::Result<V>::Err({"motion_trace_store_unavailable", failure.what(), {}});

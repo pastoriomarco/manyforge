@@ -10,7 +10,7 @@ import { runtimeStatusPresentation } from './runtimeStatus';
 const robot: ComponentState = {
   component_id: 'lite6_robot',
   lifecycle: 'fault',
-  fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'enable', since_ns: 1 },
+  fault: { code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'enable', since_ns: 1 },
   activity: 'idle',
   streams: [],
   capabilities: [],
@@ -32,7 +32,7 @@ describe('component overview', () => {
     const html = render({ components: [robot], latch: null, io: null, readiness: null });
     expect(html).toContain('lite6_robot');
     expect(html).toContain('status-error');
-    expect(html).toContain('<small>Emergency stop active</small>');
+    expect(html).toContain('<small>Robot stopped itself</small>');
     expect(html).toContain('<span class="status-pill status-pill-error">Fault</span>');
   });
 
@@ -59,7 +59,7 @@ describe('component overview', () => {
       io: null,
       readiness: null,
     });
-    expect(html).toContain('2 errors require attention · lite6_robot: Emergency stop active');
+    expect(html).toContain('2 errors require attention · lite6_robot: Robot stopped itself');
     expect(html).toContain('gripper: offline');
   });
 

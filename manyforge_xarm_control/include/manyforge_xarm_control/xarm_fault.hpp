@@ -35,7 +35,7 @@ namespace manyforge::xarm_control {
 
 /// The plan's fault catalogue for a controller error code, as
 /// the machine owner's fault (its operator action is the owner's Recover):
-/// C1-C3 `fault_estop`, C31 `fault_protective_stop`, C23/C24/C35/C60
+/// C31 `fault_protective_stop`, C23/C24/C35/C60
 /// `fault_limit_violation`, C22 `fault_self_collision`, C21/C25
 /// `fault_motion_invalid`, C10-C17 `fault_drive` (not clearable, power cycle),
 /// C19/C33 `fault_communication`, anything else `fault_vendor`; each with the

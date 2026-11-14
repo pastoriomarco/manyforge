@@ -454,9 +454,8 @@ function MockInputControls({ signal, sample, mock, onSetMock }: {
   );
 }
 
-function selectorOf(ownerEpoch: string, signal: ToolIoSignal): IoSignalSelector {
+function selectorOf(signal: ToolIoSignal): IoSignalSelector {
   return {
-    ownerEpoch,
     programBindingId: signal.programBindingId,
     componentId: signal.signalComponentId,
     signalName: signal.signalName,
@@ -506,8 +505,8 @@ function useDeploymentIoFacts(enabled: boolean, retainedBundleId: string | null)
 
 export interface ToolIoPanelProps {
   enabled: boolean;
-  /** The execution owner epoch the host fences Mock input writes by. */
-  ownerEpoch: string | null;
+  /** The execution status's start identity; only its presence is used. */
+  applicationStartId: string | null;
   /** The running cell's retained bundle. */
   retainedBundleId: string | null;
   /**
@@ -537,7 +536,7 @@ const NO_MOTION_COMPONENTS: ReadonlySet<string> = new Set();
  */
 export function ToolIoPanel({
   enabled,
-  ownerEpoch,
+  applicationStartId,
   retainedBundleId,
   ioSignalBindings,
   systemSignals: ownerSystemSignals,
@@ -561,14 +560,15 @@ export function ToolIoPanel({
   );
   const samples = useMemo(() => (cell.io === null ? null
     : new Map(cell.io.map((sample) => [sample.signal_id, sample]))), [cell.io]);
-  const facts = useDeploymentIoFacts(enabled && ownerEpoch !== null, retainedBundleId);
+  const ownerPresent = applicationStartId !== null;
+  const facts = useDeploymentIoFacts(enabled && ownerPresent, retainedBundleId);
   const bindings = ioSignalBindings ?? facts.bindings;
-  const systemSignals = enabled && ownerEpoch !== null && retainedBundleId !== null
+  const systemSignals = enabled && ownerPresent && retainedBundleId !== null
     ? ownerSystemSignals ?? []
     : [];
   const unavailableReason = !enabled
     ? 'Tool and I/O signals require the configured headless runtime.'
-    : ownerEpoch === null || retainedBundleId === null
+    : !ownerPresent || retainedBundleId === null
       ? 'Waiting for the execution owner.'
       : bindings === null && systemSignals.length === 0
         ? 'No applied Program binding of the running cell names I/O signals yet.'
@@ -589,9 +589,9 @@ export function ToolIoPanel({
   }, []);
 
   const setMock = useCallback((signal: ToolIoSignal, value: boolean) => {
-    if (ownerEpoch === null) return;
+    if (!ownerPresent) return;
     const key = toolIoSignalKey(signal);
-    const selector = selectorOf(ownerEpoch, signal);
+    const selector = selectorOf(signal);
     setMocks((current) => ({ ...current, [key]: { sending: true, receipt: current[key]?.receipt ?? null, error: null } }));
     // The Mock source fences its toggle by its current source epoch, read
     // just before; one explicit toggle, never replayed.
@@ -604,7 +604,7 @@ export function ToolIoPanel({
       .catch((error: unknown) => setMocks((current) => ({
         ...current, [key]: { sending: false, receipt: current[key]?.receipt ?? null, error: message(error) },
       })));
-  }, [ownerEpoch]);
+  }, [ownerPresent]);
 
   return (
     <ToolIoPanelView

@@ -11,6 +11,7 @@
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <manyforge_core/types/prepared_participant_stop_plan.hpp>
+#include <manyforge_core/types/stop_event.hpp>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -23,7 +24,6 @@ struct MotionResumeIntent;
 
 struct ResolvedParticipantStopStageDTO;
 struct SpringBackReturnPointDTO;
-struct StopCertificateDTO;
 
 struct ResolvedPreparedMotionSpringReturnContextDTO final {
   std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
@@ -165,7 +165,6 @@ struct ResolvedPreparedCapabilityCommandSnapshotDTO final {
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   std::optional<PrepareParticipantResultDTO> backend_prepare_result;
   std::optional<ControllerGoalId> controller_goal_id;
-  std::optional<ControllerGoalGeneration> controller_goal_generation;
   std::optional<GripperCommandResultDTO> dispatch_result;
   std::optional<ErrorDTO> error;
 };
@@ -225,10 +224,13 @@ class IResolvedPreparedParticipantExecutionEngine {
   }
 
   /// Reuse one cold sealed spring-return candidate only after exact source
-  /// Stop/local settlement. Called outside addressed state; may retire the
-  /// completed source worker/membership, but never dispatches or resets.
+  /// Stop/local settlement. `incumbent` is the source participant's stop
+  /// outcome of the attempt started by the fallback's Stop event (K11);
+  /// its `stop_event_id` replaces the former certificate identity.
+  /// Called outside addressed state; may retire the completed source
+  /// worker/membership, but never dispatches or resets.
   virtual Result<bool> PrepareColdMotionAfterStop(
-      std::uint64_t /*candidate_id*/, const StopCertificateDTO& /*certificate*/) {
+      std::uint64_t /*candidate_id*/, const ParticipantStopOutcomeDTO& /*incumbent*/) {
     return Result<bool>::Err(ErrorCode::kUnsupportedCapability);
   }
 
@@ -245,8 +247,7 @@ class IResolvedPreparedParticipantExecutionEngine {
   /// repetition returns the retained dispatch result without a second effect.
   virtual Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
       std::uint64_t preparation_id, const ContentDigest& prepared_contract_digest,
-      const ControllerGoalId& controller_goal_id,
-      ControllerGoalGeneration controller_goal_generation) = 0;
+      const ControllerGoalId& controller_goal_id) = 0;
 
   /// Cancel one command preparation before dispatch. This is idempotent and
   /// cannot call a physical Stop primitive.

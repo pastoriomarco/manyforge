@@ -25,6 +25,7 @@ vi.mock('../api/client', async (importOriginal) => ({
 
 import { useAuthoringWorkspace } from './useAuthoringWorkspace';
 import { managerApplyRecord } from '../test/managerApplyRecord';
+import { replacementAdmissionAllowed } from '../components/authoringAdmission';
 import { ApiError, authoringRefusalMessage, KnownOutcomeError } from '../api/client';
 import type { ControlTransportStatus } from './useHeadlessState';
 
@@ -128,16 +129,17 @@ function headlessSnapshot(
   deploymentDraftRevision = 4,
 ): ComposerHeadlessState {
   return {
-    schemaVersion: 'manyforge.composer_headless_state.v2',
+    schemaVersion: 'manyforge.composer_headless_state.v4',
+    applyCommands: { inProgress: null, ended: [] },
     complete: true,
     executionControlStatus: null,
     runtime: { sections: { manager: {
       available: true, freshness: 'fresh', knownGaps: [], sourceOwnerId: 'manager',
-      sourceOwnerEpoch: 'manager.1', sourceGeneration: 1, receiverAgeNs: 0,
+      sourceGeneration: 1, receiverAgeNs: 0,
       payload: { apply: { mutation_available: true, records: [], unavailable_reason_code: null } },
     } } } as unknown as ComposerHeadlessState['runtime'],
     componentOverview: {
-      schemaVersion: 'manyforge.component_overview.v2',
+      schemaVersion: 'manyforge.component_overview.v3',
       overviewRevision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summaryLabel: 'Ready',
@@ -148,22 +150,14 @@ function headlessSnapshot(
       components: [],
       maintenanceOperation: null,
       basis: {
-        runtimeProjectionOwnerEpoch: null,
         runtimeProjectionGeneration: null,
-        managerSourceOwnerEpoch: null,
-        logicalSceneSourceOwnerEpoch: null,
         logicalSceneSourceGeneration: null,
-        sceneRuntimeSourceOwnerEpoch: null,
         sceneRuntimeSourceGeneration: null,
-        alarmOwnerEpoch: null,
         alarmGeneration: null,
         alarmStateRevision: null,
         admissionGeneration: null,
-        programRunnerOwnerEpoch: null,
         programCycleGeneration: null,
-        appliedProgramOwnerEpoch: null,
         appliedProgramGeneration: null,
-        executionOwnerEpoch: null,
         executionPublicationGeneration: null,
       },
     },
@@ -180,7 +174,7 @@ function headlessSnapshot(
       deploymentDraftRevision,
     },
     authoringWorkspaceContainment: null,
-    receiverEpoch: 'receiver.epoch.1',
+    applicationStartId: '3f9a0000000000a1',
     snapshotSequence: workspaceRevision,
   };
 }
@@ -307,7 +301,7 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => {
       expect(latest!.beginMutation('document', 'save')).toBe(true);
       expect(latest!.beginMutation('document', 'save')).toBe(false);
-      latest!.finishMutation({ applyId: 'apply-3', applyGeneration: 3 });
+      latest!.finishMutation({ applyId: 3, applyGeneration: 3 });
     });
     expect(latest!.unavailableReason).toBe('Save is in progress.');
     await rerender(headlessSnapshot(1));
@@ -367,15 +361,15 @@ describe('useAuthoringWorkspace', () => {
       records: [managerApplyRecord('terminal', 'succeeded')], mutation_available: true, unavailable_reason_code: null,
     } };
     await rerender(terminal);
-    await act(async () => latest!.finishMutation({ applyId: 'apply-3', applyGeneration: 3 }));
+    await act(async () => latest!.finishMutation({ applyId: 3, applyGeneration: 3 }));
     expect(latest!.unavailableReason).toBe(null);
     await rerender(headlessSnapshot(1));
     await act(async () => {
       expect(latest!.beginMutation('document', 'save')).toBe(true);
-      latest!.finishMutation({ applyId: 'apply-4', applyGeneration: 4 });
+      latest!.finishMutation({ applyId: 4, applyGeneration: 4 });
     });
-    const result = { applyId: 'apply-4', applyGeneration: 4, state: 'succeeded' } as import('../types/api').ManagerApplyStatus;
-    await act(async () => latest!.observeApply({ ...result, applyId: 'other' }));
+    const result = { applyId: 4, applyGeneration: 4, state: 'succeeded' } as import('../types/api').ManagerApplyStatus;
+    await act(async () => latest!.observeApply({ ...result, applyId: 96 }));
     expect(latest!.unavailableReason).not.toBe(null);
     await act(async () => latest!.observeApply(result));
     expect(latest!.unavailableReason).toBe(null);
@@ -488,7 +482,7 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => { expect(latest!.beginMutation('edit', 'edit')).toBe(true); });
     const fence = {
       draftId: 'draft.1', expectedDraftRevision: 3,
-      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'copy.1',
+      expectedAdmissionGeneration: 4, applicationStartId: '3f9a0000000000a1', requestKey: 'c'.repeat(32),
       expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
     } as Parameters<typeof realApi.programWorkspace.mutate>[0];
     const failure = await realApi.programWorkspace.mutate(
@@ -535,7 +529,7 @@ describe('useAuthoringWorkspace', () => {
     const fence = {
       draftId: 'draft.1', expectedDraftRevision: 3,
       deploymentDraftId: 'deployment-draft.1', expectedDeploymentDraftRevision: 4,
-      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'load.1',
+      expectedAdmissionGeneration: 4, applicationStartId: '3f9a0000000000a1', requestKey: 'd'.repeat(32),
       expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
     } as Parameters<typeof realApi.scenarioDocuments.save>[0];
     for (const request of [
@@ -733,6 +727,28 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.recheckMessage).toBe('Current Scenario: mock_lite6_motion_preemption, applied. Nothing was retried.');
   });
 
+  it.each([
+    ['fence acquire_pending', 'acquire_pending', false],
+    ['committed', 'held', true],
+    ['a release of unknown outcome', 'release_pending', false],
+  ] as const)('admits New and Load after a newest failed Apply (%s)', async (_name, fenceState, committed) => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    const failed = managerApplyRecord('runtime_convergence_pending', 'failed');
+    failed.fence = { ...failed.fence, state: fenceState };
+    failed.committed = committed;
+    const closed = headlessSnapshot(1);
+    closed.authoringAdmission = { ...closed.authoringAdmission, authoringAllowed: false };
+    closed.runtime.sections.manager.payload = { apply: {
+      records: [failed], mutation_available: false, unavailable_reason_code: 'failed',
+    } };
+    await rerender(closed);
+    expect(latest!.failedApplyHoldsCell).toBe(true);
+    expect(latest!.replaceUnavailableReason).toBe(null);
+    expect(replacementAdmissionAllowed(false, 'not_admitted', latest!.failedApplyHoldsCell)).toBe(true);
+  });
+
   it('a later successful action settles a lost reply; a refusal does not', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
@@ -756,7 +772,7 @@ describe('useAuthoringWorkspace', () => {
   });
 
   it('rechecks exact local settlement, not an unrelated revision or idle status', async () => {
-    const identity = { requestOwnerEpoch: 'browser.1', requestId: 'edit.1', expectedAdmissionGeneration: 7 };
+    const identity = { applicationStartId: '3f9a0000000000a1', requestKey: 'e'.repeat(32), expectedAdmissionGeneration: 7 };
     apiMock.failedIdentity.mockReturnValue(identity);
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
@@ -779,7 +795,7 @@ describe('useAuthoringWorkspace', () => {
   });
 
   it('looks up a recovered Manager identity and preserves terminal unknown-effect admission', async () => {
-    apiMock.failedIdentity.mockReturnValue({ requestOwnerEpoch: 'browser.1', requestId: 'apply.1', expectedAdmissionGeneration: 7 });
+    apiMock.failedIdentity.mockReturnValue({ applicationStartId: '3f9a0000000000a1', requestKey: 'a'.repeat(32), expectedAdmissionGeneration: 7 });
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
@@ -789,26 +805,28 @@ describe('useAuthoringWorkspace', () => {
       records: [managerApplyRecord('terminal', 'unknown_effect')], mutation_available: false, unavailable_reason_code: 'unknown_effect',
     } };
     await rerender(terminal);
-    apiMock.authoringWorkspace.submissionOutcome.mockResolvedValue({ kind: 'manager_accepted', apply: { applyId: 'apply-3', applyGeneration: 3 } });
+    apiMock.authoringWorkspace.submissionOutcome.mockResolvedValue({ kind: 'manager_accepted', apply: { applyId: 3, applyGeneration: 3 } });
     apiMock.manager.applyStatus.mockRejectedValueOnce(new Error('status unavailable'));
     await act(async () => { await latest!.recheckSubmission(); });
     expect(latest!.submissionUnconfirmed).toBe(true);
-    apiMock.manager.applyStatus.mockResolvedValue({ applyId: 'apply-3', applyGeneration: 3, state: 'unknown_effect' });
+    apiMock.manager.applyStatus.mockResolvedValue({ applyId: 3, applyGeneration: 3, state: 'unknown_effect' });
     await act(async () => { await latest!.recheckSubmission(); });
-    expect(apiMock.manager.applyStatus).toHaveBeenCalledWith('apply-3', 3);
+    expect(apiMock.manager.applyStatus).toHaveBeenCalledWith(3, 3, '3f9a0000000000a1');
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.beginMutation('document', 'save')).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');
   });
 
-  it('correlates a lost reply to its Apply by exact request id, never by the latest record', async () => {
-    apiMock.failedIdentity.mockReturnValue({ requestOwnerEpoch: 'browser.1', requestId: 'composer-document.1', expectedAdmissionGeneration: 7 });
+  it('matches a lost reply to its Apply by exact request key, never by the latest record', async () => {
+    // The browser's key; Headless records it with its own first byte (class and part).
+    const requestKey = `0f${'1'.repeat(30)}`;
+    apiMock.failedIdentity.mockReturnValue({ applicationStartId: '3f9a0000000000a1', requestKey, expectedAdmissionGeneration: 7 });
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => { latest!.beginMutation('document', 'save'); latest!.finishMutation(null, new Error('lost')); });
     const unrelated = managerApplyRecord('terminal', 'unknown_effect');
-    unrelated.request = { ...unrelated.request, correlation_id: 'composer-document.other' as never };
+    unrelated.request = { ...unrelated.request, request_key: `c0${'2'.repeat(30)}` };
     const other = headlessSnapshot(1);
     other.runtime.sections.manager.payload = { apply: {
       records: [unrelated], mutation_available: false, unavailable_reason_code: 'unknown_effect',
@@ -817,14 +835,14 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.submissionUnconfirmed).toBe(true);
     expect(latest!.correlatedApply).toBe(null);
     const own = managerApplyRecord('terminal', 'unknown_effect');
-    own.apply_id = 'apply-7';
-    own.request = { ...own.request, correlation_id: 'composer-document.1' as never };
+    own.apply_id = 7;
+    own.request = { ...own.request, request_key: `c0${requestKey.slice(2)}` };
     const matched = headlessSnapshot(1);
     matched.runtime.sections.manager.payload = { apply: {
       records: [unrelated, own], mutation_available: false, unavailable_reason_code: 'unknown_effect',
     } };
     await rerender(matched);
-    expect(latest!.correlatedApply).toEqual({ applyId: 'apply-7', applyGeneration: 3 });
+    expect(latest!.correlatedApply).toEqual({ applyId: 7, applyGeneration: 3 });
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.beginMutation('document', 'save')).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');

@@ -6,9 +6,6 @@ Reports never expire: a quiet Manager closes, fences and stops nothing here.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-import errno
-import hashlib
 import json
 import logging
 import os
@@ -18,20 +15,15 @@ import socket
 import stat
 import struct
 from threading import Event, RLock, Thread
-import time
 from typing import Any, Final
 import unicodedata
 
 from manyforge_headless_api.program_cycle import AcceptedProgramResetDTO
 
 
-API_VERSION: Final = "manyforge.program_runner_liveness.v1"
+API_VERSION: Final = "manyforge.program_runner_liveness.v2"
 POLICY_ID: Final = "manyforge.program-runner.manager-presence.v1"
 POLICY_REVISION: Final = "1"
-LOCAL_SAFE_STATE_CONTRACT_ID: Final = (
-    "manyforge.program-runner.manager-loss-containment.v1"
-)
-LOCAL_SAFE_STATE_CONTRACT_REVISION: Final = "1"
 # Cadence at which pending BB key sources are started.
 PUBLICATION_CHECK_INTERVAL_S: Final = 0.0625
 MAXIMUM_PACKET_BYTES: Final = 16_384
@@ -47,12 +39,6 @@ class ProgramRunnerLivenessError(RuntimeError):
     """A malformed, foreign, or stale private liveness packet."""
 
 
-@dataclass(frozen=True, slots=True)
-class RetainedLiveness:
-    manager_runtime_epoch: str | None
-    manager_owner_epoch: str | None
-
-
 class ProgramRunnerLivenessReceiver:
     """Mode-0600 seqpacket listener plus the pending BB key-source check."""
 
@@ -63,10 +49,7 @@ class ProgramRunnerLivenessReceiver:
         cell_id: str,
         receiver_runtime_unit_id: str,
         receiver_runtime_epoch: str,
-        retained: RetainedLiveness,
-        on_reconciliation: Callable[[str, str, str], None],
         cycle_status: Callable[[], Mapping[str, Any]],
-        monotonic_ns: Callable[[], int] = time.monotonic_ns,
         publication_check: Callable[[], None] | None = None,
     ) -> None:
         if not path.is_absolute() or path.name in {"", ".", ".."}:
@@ -75,9 +58,7 @@ class ProgramRunnerLivenessReceiver:
         self._cell_id = cell_id
         self._runtime_unit_id = receiver_runtime_unit_id
         self._runtime_epoch = receiver_runtime_epoch
-        self._on_reconciliation = on_reconciliation
         self._cycle_status = cycle_status
-        self._clock = monotonic_ns
         # Starts pending BB key sources, run on the publication thread.
         self._publication_check = publication_check
         self._lock = RLock()
@@ -88,11 +69,8 @@ class ProgramRunnerLivenessReceiver:
         self._run_root_identity: tuple[int, int] | None = None
         self._server_thread: Thread | None = None
         self._publication_thread: Thread | None = None
-        self._manager_runtime_epoch = retained.manager_runtime_epoch
-        self._manager_owner_epoch = retained.manager_owner_epoch
         self._manager_runtime_unit_id: str | None = None
         self._last_sequence: int | None = None
-        self._last_accepted_ns: int | None = None
         self._receiver_status_sequence = 1
         self._state = "unreconciled"
         self._fenced = True
@@ -212,57 +190,6 @@ class ProgramRunnerLivenessReceiver:
         listener: socket.socket | None = None
         bound_identity: tuple[int, int] | None = None
         try:
-            try:
-                existing = self._endpoint_status(descriptor)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
-                if (
-                    not stat.S_ISSOCK(existing.st_mode)
-                    or existing.st_uid != os.geteuid()
-                    or existing.st_nlink != 1
-                    or stat.S_IMODE(existing.st_mode) != 0o600
-                ):
-                    raise ProgramRunnerLivenessError(
-                        "liveness path exists and is not the exact owned socket"
-                    )
-                identity = (existing.st_dev, existing.st_ino)
-                probe = socket.socket(
-                    socket.AF_UNIX,
-                    socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
-                )
-                probe.settimeout(0.2)
-                try:
-                    probe.connect(socket_address)
-                except OSError as error:
-                    if error.errno != errno.ECONNREFUSED:
-                        raise ProgramRunnerLivenessError(
-                            "liveness socket state is ambiguous"
-                        ) from error
-                else:
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket already has an active listener"
-                    )
-                finally:
-                    probe.close()
-                try:
-                    current = self._endpoint_status(descriptor)
-                except FileNotFoundError as error:
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket changed during stale-path recovery"
-                    ) from error
-                if (
-                    (current.st_dev, current.st_ino) != identity
-                    or not stat.S_ISSOCK(current.st_mode)
-                    or current.st_uid != os.geteuid()
-                    or current.st_nlink != 1
-                    or stat.S_IMODE(current.st_mode) != 0o600
-                ):
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket changed during stale-path recovery"
-                    )
-                os.unlink(self._path.name, dir_fd=descriptor)
-
             listener = socket.socket(
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
@@ -345,9 +272,8 @@ class ProgramRunnerLivenessReceiver:
     def latch_publisher_fault(
         self, fault: Mapping[str, Any], reference: str
     ) -> bool:
-        """Latch the first BB publication fault for this receiver's lifetime,
-        unless its owner clears it (`clear_publisher_fault`). True when
-        this call latched it."""
+        """Latch the first BB publication fault until its owner clears it
+        (`clear_publisher_fault`). True when this call latched it."""
 
         message = fault.get("message")
         if (
@@ -377,9 +303,9 @@ class ProgramRunnerLivenessReceiver:
         return True
 
     def clear_publisher_fault(self, reference: str) -> bool:
-        """Clear exactly the latched fault with this reference (a
-        between-Runs source whose loss the Kernel confirmed, or that a newer
-        source superseded). True when it was cleared."""
+        """Clear exactly the latched fault with this reference (a source
+        whose loss the Kernel confirmed, or that a newer source superseded).
+        True when it was cleared."""
 
         with self._lock:
             if (
@@ -406,27 +332,18 @@ class ProgramRunnerLivenessReceiver:
             _LOGGER.exception("pending BB key source start failed")
 
     def status(self) -> dict[str, Any]:
-        now = self._clock()
         with self._lock:
-            age = (
-                None
-                if self._last_accepted_ns is None
-                else max(0, now - self._last_accepted_ns)
-            )
             publisher_fault = (
                 None if self._publisher_fault is None else dict(self._publisher_fault)
             )
             return {
-                "schema_version": "manyforge.program_runner_liveness_status.v1",
+                "schema_version": "manyforge.program_runner_liveness_status.v2",
                 "cell_id": self._cell_id,
                 "receiver_runtime_unit_id": self._runtime_unit_id,
                 "receiver_runtime_epoch": self._runtime_epoch,
                 "manager_runtime_unit_id": self._manager_runtime_unit_id,
-                "manager_runtime_epoch": self._manager_runtime_epoch,
-                "manager_owner_epoch": self._manager_owner_epoch,
                 "last_accepted_heartbeat_sequence": self._last_sequence,
                 "receiver_status_sequence": self._receiver_status_sequence,
-                "local_heartbeat_age_ns": age,
                 "state": self._state,
                 # A publisher fault reuses the digested fence; its reference
                 # is the digest of the emitted publisher ErrorDTO.
@@ -437,10 +354,6 @@ class ProgramRunnerLivenessReceiver:
                 "publisher_fault": publisher_fault,
                 "runtime_policy_id": POLICY_ID,
                 "runtime_policy_revision": POLICY_REVISION,
-                "local_safe_state_contract_id": LOCAL_SAFE_STATE_CONTRACT_ID,
-                "local_safe_state_contract_revision": (
-                    LOCAL_SAFE_STATE_CONTRACT_REVISION
-                ),
             }
 
     def _serve(self) -> None:
@@ -528,12 +441,10 @@ class ProgramRunnerLivenessReceiver:
             {
                 "allowed_commands",
                 "accepted_reset",
-                "causal_client_sequence",
-                "causal_correlation_id",
-                "causal_session_id",
-                "program_runner_owner_epoch",
+                "causal_request_key",
                 "cycle_generation",
                 "current_command_kind",
+                "runner_commands",
                 "execution_control_revision",
                 "failure",
                 "state",
@@ -548,7 +459,6 @@ class ProgramRunnerLivenessReceiver:
         projected = {
             key: status[key]
             for key in (
-                "program_runner_owner_epoch",
                 "cycle_generation",
                 "state",
                 "program_run_id",
@@ -557,7 +467,6 @@ class ProgramRunnerLivenessReceiver:
                 "accepted_reset",
             )
         }
-        owner = projected["program_runner_owner_epoch"]
         generation = projected["cycle_generation"]
         state = projected["state"]
         run_id = projected["program_run_id"]
@@ -578,17 +487,13 @@ class ProgramRunnerLivenessReceiver:
             and (accepted_reset["reload_initial_scene"] or accepted_reset["reset_robot_position"])
         )
         if (
-            not isinstance(owner, str)
-            or not owner
-            or len(owner.encode("utf-8")) > 256
-            or type(generation) is not int
+            type(generation) is not int
             or not 1 <= generation <= MAXIMUM_SEQUENCE
             or state
             not in {
                 "idle_after_reset",
                 "starting",
                 "running",
-                "stopping",
                 "resetting",
                 "terminal_awaiting_reset",
                 "recovery_required",
@@ -605,20 +510,21 @@ class ProgramRunnerLivenessReceiver:
             not idle
             and not recovery
             and not idle_reset
+            # A start announces its run only after the Kernel claim (1.15.5).
+            and not (state == "starting" and run_id is None and claim_generation is None)
             and (
-                not isinstance(run_id, str)
-                or not run_id
-                or len(run_id.encode("utf-8")) > 256
+                type(run_id) is not int
+                or not 1 <= run_id <= MAXIMUM_SEQUENCE
             )
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
-        if claim_generation is not None and not isinstance(run_id, str):
+        if claim_generation is not None and type(run_id) is not int:
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
         claimless_terminal = state == "terminal_awaiting_reset" and terminal is not None
         if (
             not idle
             and claim_generation is None
-            and state not in {"starting", "stopping", "resetting", "recovery_required"}
+            and state not in {"starting", "resetting", "recovery_required"}
             and not claimless_terminal
         ):
             raise ProgramRunnerLivenessError("malformed unacquired Program cycle")
@@ -638,44 +544,12 @@ class ProgramRunnerLivenessReceiver:
             raise ProgramRunnerLivenessError("terminal Program cycle lacks evidence")
         return projected
 
-    @staticmethod
-    def _status_digest(status: Mapping[str, Any]) -> str:
-        material = bytearray(b"manyforge.manager-liveness.status.v1|")
-
-        def append(value: str | int) -> None:
-            encoded = str(value).encode("utf-8")
-            material.extend(str(len(encoded)).encode("ascii"))
-            material.extend(b":")
-            material.extend(encoded)
-            material.extend(b"|")
-
-        for value in (
-            status["cell_id"],
-            status["receiver_runtime_unit_id"],
-            status["receiver_runtime_epoch"],
-            status["manager_runtime_unit_id"],
-            status["manager_runtime_epoch"],
-            status["manager_owner_epoch"],
-            status["runtime_policy_id"],
-            status["runtime_policy_revision"],
-            status["last_accepted_heartbeat_sequence"],
-            status["receiver_status_sequence"],
-            status["local_heartbeat_age_ns"],
-            status["state"],
-            "true" if status["command_fenced"] else "false",
-            status["fault_reference"] or "",
-        ):
-            append(value)
-        return "sha256:" + hashlib.sha256(material).hexdigest()
-
     def _handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if request.get("api_version") != API_VERSION:
             raise ProgramRunnerLivenessError("unsupported liveness API")
         kind = request.get("kind")
         if kind == "probe":
             self._exact(request, {"api_version", "cell_id", "kind"})
-            if request["cell_id"] != self._cell_id:
-                raise ProgramRunnerLivenessError("foreign cell")
             return {
                 "api_version": API_VERSION,
                 "cell_id": self._cell_id,
@@ -685,10 +559,6 @@ class ProgramRunnerLivenessReceiver:
                 "receiver_runtime_unit_id": self._runtime_unit_id,
                 "runtime_policy_id": POLICY_ID,
                 "runtime_policy_revision": POLICY_REVISION,
-                "local_safe_state_contract_id": LOCAL_SAFE_STATE_CONTRACT_ID,
-                "local_safe_state_contract_revision": (
-                    LOCAL_SAFE_STATE_CONTRACT_REVISION
-                ),
             }
         if kind != "heartbeat":
             raise ProgramRunnerLivenessError("unsupported liveness packet kind")
@@ -700,8 +570,6 @@ class ProgramRunnerLivenessReceiver:
                 "cell_id",
                 "heartbeat_sequence",
                 "kind",
-                "manager_owner_epoch",
-                "manager_runtime_epoch",
                 "manager_runtime_unit_id",
                 "receiver_runtime_epoch",
                 "receiver_runtime_unit_id",
@@ -713,23 +581,13 @@ class ProgramRunnerLivenessReceiver:
         )
         for key in (
             "active_bundle_id",
-            "manager_owner_epoch",
-            "manager_runtime_epoch",
             "manager_runtime_unit_id",
             "required_runtime_set_digest",
         ):
             if not isinstance(request[key], str) or not request[key]:
                 raise ProgramRunnerLivenessError(f"invalid {key}")
         sequence = request["heartbeat_sequence"]
-        if (
-            type(sequence) is not int
-            or not 1 <= sequence <= MAXIMUM_SEQUENCE
-            or request["cell_id"] != self._cell_id
-            or request["receiver_runtime_unit_id"] != self._runtime_unit_id
-            or request["receiver_runtime_epoch"] != self._runtime_epoch
-            or request["runtime_policy_id"] != POLICY_ID
-            or request["runtime_policy_revision"] != POLICY_REVISION
-        ):
+        if type(sequence) is not int or not 1 <= sequence <= MAXIMUM_SEQUENCE:
             raise ProgramRunnerLivenessError("foreign heartbeat identity")
         reconciliation = request["reconciliation_digest"]
         if reconciliation is not None and (
@@ -739,57 +597,16 @@ class ProgramRunnerLivenessReceiver:
         ):
             raise ProgramRunnerLivenessError("invalid reconciliation digest")
 
-        # Lock order: the Runner's transition lock before this lock, never
-        # the reverse. The reconciliation takes the transition lock, so it
-        # runs with this lock released. Heartbeats are served one at a time
-        # on this receiver's single serving thread.
-        self._lock.acquire()
-        try:
-            incoming_manager = request["manager_runtime_epoch"]
+        # Heartbeats are served one at a time on this receiver's single
+        # serving thread; this lock is held for memory-only work.
+        with self._lock:
             needs_reconciliation = self._state != "current"
-            if self._manager_runtime_epoch is not None:
-                if incoming_manager != self._manager_runtime_epoch:
-                    # A new Manager epoch is accepted directly: commands are
-                    # fenced at once and reopen when it has reconciled.
-                    self._last_sequence = None
-                    needs_reconciliation = True
-                    if self._state == "current" or not self._fenced:
-                        self._state = "unreconciled"
-                        self._fenced = True
-                        if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
-                            self._receiver_status_sequence += 1
-                else:
-                    if (
-                        self._manager_owner_epoch is not None
-                        and request["manager_owner_epoch"] != self._manager_owner_epoch
-                    ):
-                        raise ProgramRunnerLivenessError(
-                            "Manager owner epoch changed without a new runtime epoch"
-                        )
-                    if (
-                        self._last_sequence is not None
-                        and sequence <= self._last_sequence
-                    ):
-                        raise ProgramRunnerLivenessError("stale heartbeat sequence")
             if self._receiver_status_sequence >= MAXIMUM_SEQUENCE:
                 raise ProgramRunnerLivenessError(
                     "receiver status sequence is exhausted"
                 )
-            if needs_reconciliation and reconciliation is not None:
-                self._lock.release()
-                try:
-                    self._on_reconciliation(
-                        reconciliation,
-                        incoming_manager,
-                        request["manager_owner_epoch"],
-                    )
-                finally:
-                    self._lock.acquire()
-            self._manager_runtime_epoch = incoming_manager
-            self._manager_owner_epoch = request["manager_owner_epoch"]
             self._manager_runtime_unit_id = request["manager_runtime_unit_id"]
             self._last_sequence = sequence
-            self._last_accepted_ns = self._clock()
             self._receiver_status_sequence += 1
             # Receipt proves peer liveness, not runtime readiness. During Apply
             # a healthy Manager may have no reconciled native projection yet.
@@ -799,8 +616,6 @@ class ProgramRunnerLivenessReceiver:
             elif needs_reconciliation:
                 self._state = "unreconciled"
                 self._fenced = True
-        finally:
-            self._lock.release()
         status = self.status()
         return {
             **status,
@@ -809,7 +624,6 @@ class ProgramRunnerLivenessReceiver:
             "kind": "heartbeat_ack",
             "program_cycle_status": self._project_cycle_status(),
             "required_runtime_set_digest": request["required_runtime_set_digest"],
-            "receiver_status_digest": self._status_digest(status),
         }
 
     def _publication_loop(self) -> None:
@@ -819,13 +633,10 @@ class ProgramRunnerLivenessReceiver:
 
 __all__ = [
     "API_VERSION",
-    "LOCAL_SAFE_STATE_CONTRACT_ID",
-    "LOCAL_SAFE_STATE_CONTRACT_REVISION",
     "POLICY_ID",
     "POLICY_REVISION",
     "PUBLICATION_CHECK_INTERVAL_S",
     "PUBLISHER_FAULT_CODE",
     "ProgramRunnerLivenessError",
     "ProgramRunnerLivenessReceiver",
-    "RetainedLiveness",
 ]

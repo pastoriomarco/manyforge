@@ -52,7 +52,6 @@ using content_identity::CanonicalValue;
                     {"availability", std::move(availability)},
                     {"interlock_alarms", "[]"}}};
   if (snapshot != nullptr) {
-    refusal.details.emplace("owner_epoch", snapshot->owner_epoch);
     refusal.details.emplace("generation", std::to_string(snapshot->generation));
   }
   return refusal;
@@ -62,8 +61,7 @@ using content_identity::CanonicalValue;
 
 Result<void> validate_operator_alarm_attention_snapshot(
     const OperatorAlarmAttentionSnapshotDTO& snapshot) {
-  if (!bounded_text(snapshot.cell_id.value()) || !bounded_text(snapshot.owner_epoch) ||
-      !bounded_text(snapshot.owner_host_boot_id) || snapshot.owner_incarnation_us == 0U ||
+  if (!bounded_text(snapshot.cell_id.value()) || !bounded_text(snapshot.owner_host_boot_id) ||
       (snapshot.active_configuration.has_value() &&
        (!bounded_text(snapshot.active_configuration->retained_bundle_id.value()) ||
         !bounded_text(snapshot.active_configuration->graph_revision.value())))) {
@@ -153,11 +151,25 @@ std::optional<ErrorDTO> evaluate_operator_alarm_motion_attention(
       reason,
       "an active operator-alarm condition interlock gates this motion; resolve its cause",
       {{"reason", reason},
-       {"owner_epoch", snapshot.owner_epoch},
        {"generation", std::to_string(snapshot.generation)},
        {"interlock_alarms", std::move(interlock_alarms)}}};
   if (truncated) refusal.details.emplace("alarm_membership_truncated", "true");
   return refusal;
+}
+
+std::optional<ErrorDTO> evaluate_disk_cannot_keep_records_refusal(
+    const std::optional<RetainedOperatorAlarmAttentionDTO>& retained,
+    const OperatorAlarmAttentionPolicyDTO& policy, const CellId& cell_id,
+    const TimePoint now_ns, const std::string_view reason, std::string message) {
+  if (!retained.has_value() || !retained->snapshot.disk_cannot_keep_records ||
+      retained->snapshot.cell_id != cell_id || now_ns < retained->received_at_ns ||
+      now_ns - retained->received_at_ns > policy.maximum_snapshot_age_ns) {
+    return std::nullopt;
+  }
+  return ErrorDTO{std::string(reason),
+                  std::move(message),
+                  {{"reason", std::string(reason)},
+                   {"generation", std::to_string(retained->snapshot.generation)}}};
 }
 
 }  // namespace manyforge::core

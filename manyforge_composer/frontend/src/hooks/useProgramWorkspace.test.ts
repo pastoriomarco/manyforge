@@ -2,6 +2,7 @@ import { act, createElement, memo, useEffect, useMemo, type ReactNode } from 're
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
+  ApplyCommandRow,
   DraftMutationResponse,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -48,6 +49,8 @@ import {
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { ProgramDraftChangedError, useProgramWorkspace } from './useProgramWorkspace';
 import { ApiError } from '../api/client';
+import { endedApplyRow, endedProgramApplyRow } from '../test/applyCommandRow';
+import { codedErrorText } from '../state/componentPresentation';
 
 /**
  * A real shared-publication controller for this hook's tests.
@@ -70,6 +73,7 @@ function testAuthoringController(
     unavailableReason: authoringUnavailableReason(published, snapshot),
     editUnavailableReason: draftEditUnavailableReason(published, snapshot),
     replaceUnavailableReason: scenarioReplacementUnavailableReason(published, snapshot),
+    failedApplyHoldsCell: false,
     project: projectFacts(published),
     reading: false,
     error: null,
@@ -343,11 +347,12 @@ function authoringSnapshot(
   current: ProgramWorkspaceResponse,
 ): ComposerHeadlessState {
   return {
-    schemaVersion: 'manyforge.composer_headless_state.v2',
+    schemaVersion: 'manyforge.composer_headless_state.v4',
+    applyCommands: { inProgress: null, ended: [] },
     complete: true,
     executionControlStatus: null,
     componentOverview: {
-      schemaVersion: 'manyforge.component_overview.v2',
+      schemaVersion: 'manyforge.component_overview.v3',
       overviewRevision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summaryLabel: 'Ready',
@@ -358,29 +363,20 @@ function authoringSnapshot(
       components: [],
       maintenanceOperation: null,
       basis: {
-        runtimeProjectionOwnerEpoch: null,
         runtimeProjectionGeneration: null,
-        managerSourceOwnerEpoch: null,
-        logicalSceneSourceOwnerEpoch: null,
         logicalSceneSourceGeneration: null,
-        sceneRuntimeSourceOwnerEpoch: null,
         sceneRuntimeSourceGeneration: null,
-        alarmOwnerEpoch: null,
         alarmGeneration: null,
         alarmStateRevision: null,
         admissionGeneration: null,
-        programRunnerOwnerEpoch: null,
         programCycleGeneration: null,
-        appliedProgramOwnerEpoch: null,
         appliedProgramGeneration: null,
-        executionOwnerEpoch: null,
         executionPublicationGeneration: null,
       },
     },
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
     heldRunDraftEditAllowed: false,
     programCycle: {
-      programRunnerOwnerEpoch: 'program-runner.epoch.1',
       cycleGeneration: 3,
       state: 'idle_after_reset',
       programRunId: null,
@@ -390,10 +386,9 @@ function authoringSnapshot(
       nodeStatusRevision: null,
       runtimeControlRevision: null,
       executionControlRevision: 1,
-      causalCorrelationId: null,
-      causalSessionId: null,
-      causalClientSequence: null,
-      currentCommandKind: null,
+      causalRequestKey: null,
+      causalDisplay: null,
+      currentCommandKind: null, runnerCommands: { inProgress: null, ended: [] },
       failure: null,
       resetPhase: null, resetOptions: null,
       resetRobotPosition: { available: false, reason: 'unsupported' },
@@ -410,39 +405,37 @@ function authoringSnapshot(
       deploymentDraftRevision: 4,
     },
     authoringWorkspaceContainment: null,
-    receiverEpoch: 'headless-receiver.epoch.1',
+    applicationStartId: '3f9a0000000000a1',
     snapshotSequence: 11,
     runtime: {
-      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      schemaVersion: 'manyforge.headless_runtime_snapshot.v3',
       activeConfiguration: null,
       complete: true,
       projectionGeneration: 1,
-      projectionOwnerEpoch: 'runtime.epoch.1',
       projectionOwnerId: 'runtime.owner',
       reasons: [],
       unavailableSections: [],
       sections: {
         manager: {
           available: true, freshness: 'fresh', knownGaps: [], payload: {},
-          sourceGeneration: 1, sourceOwnerEpoch: 'manager.epoch.1',
+          sourceGeneration: 1,
           sourceOwnerId: 'manager.owner', receiverAgeNs: 1,
         },
         logicalScene: {
           available: true, freshness: 'fresh', knownGaps: [], payload: {},
-          sourceGeneration: 1, sourceOwnerEpoch: 'scene.epoch.1',
+          sourceGeneration: 1,
           sourceOwnerId: 'scene.owner', receiverAgeNs: 1,
         },
         sceneRuntime: {
           available: true, freshness: 'fresh', knownGaps: [], payload: {},
-          sourceGeneration: 1, sourceOwnerEpoch: 'runtime.epoch.1',
+          sourceGeneration: 1,
           sourceOwnerId: 'runtime.owner', receiverAgeNs: 1,
         },
       },
     },
     alarms: {
-      schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
+      schemaVersion: 'manyforge.operator_alarm_snapshot.v3',
       ownerId: 'alarm.owner',
-      ownerEpoch: 'alarm.epoch.1',
       generation: 1,
       stateRevision: 1,
       reconciled: true,
@@ -659,8 +652,9 @@ describe('useProgramWorkspace Draft policy interaction', () => {
           draftId: 'draft-1',
           expectedDraftRevision: 1,
           expectedAdmissionGeneration: 7,
-          requestOwnerEpoch: expect.stringMatching(/^composer-authoring-owner\./),
-          requestId: expect.stringMatching(/^composer-authoring\./),
+          // The snapshot's `A` and a fresh 32-hex key; no browser-stored epoch.
+          applicationStartId: '3f9a0000000000a1',
+          requestKey: expect.stringMatching(/^[0-9a-f]{32}$/),
         }),
         'program_draft_update_node_policies',
         {
@@ -696,24 +690,22 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     const afterReset = authoringSnapshot(workspace(2));
     afterReset.authoringAdmission = { ...afterReset.authoringAdmission, admissionGeneration: 12 };
     await rerender(afterReset);
-    apiMock.programWorkspace.apply.mockResolvedValueOnce({
-      status: 'accepted',
-      workspace: workspace(2),
-      headless: { apply_id: 'apply-1', apply_generation: 2 },
-    });
+    apiMock.programWorkspace.apply.mockResolvedValueOnce(
+      endedProgramApplyRow('program_apply', { applyId: 1, applyGeneration: 2 }),
+    );
+    // The workspace is read once the Apply's row ended (OD-214).
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(2));
     await act(async () => {
-      await latest?.apply({ correlationId: 'reset-apply.1', expectedDraft });
+      await latest?.apply({ expectedDraft });
     });
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 2, expectedAdmissionGeneration: 12 }),
-      undefined,
-      'reset-apply.1',
     );
     // Another browser's edit is now installed: the confirmed content is gone,
     // so no Apply is sent, with a named refusal.
     apiMock.programWorkspace.get.mockResolvedValue(workspace(3));
     await rerender(authoringSnapshot(workspace(3)));
-    await expect(latest!.apply({ correlationId: 'reset-apply.1', expectedDraft }))
+    await expect(latest!.apply({ expectedDraft }))
       .rejects.toBeInstanceOf(ProgramDraftChangedError);
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
   });
@@ -722,8 +714,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
-    apiMock.cellApply.newScenario.mockResolvedValue({ outcome: 'succeeded',
-      components: [{ component_id: 'arm', disposition: 'remove', lifecycle_after: 'offline' }] });
+    apiMock.cellApply.newScenario.mockResolvedValue(endedApplyRow({ outcome: 'succeeded',
+      components: [{ component_id: 'arm', disposition: 'remove', lifecycle_after: 'offline' }] }, 'scenario_new'));
     apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(2));
     await act(async () => { await latest?.newScenarioDocument(); });
     expect(apiMock.cellApply.newScenario).toHaveBeenCalledOnce();
@@ -860,8 +852,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       expect.objectContaining({ directory: '/workspace', name: 'cell' }),
     );
 
-    apiMock.cellApply.load.mockResolvedValueOnce({ outcome: 'succeeded',
-      components: [{ component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' }] });
+    apiMock.cellApply.load.mockResolvedValueOnce(endedApplyRow({ outcome: 'succeeded',
+      components: [{ component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' }] }, 'scenario_load'));
     apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(1));
     await act(async () => { await latest?.loadScenarioDocument('/workspace/cell'); });
     expect(apiMock.cellApply.load).toHaveBeenCalledExactlyOnceWith('/workspace/cell');
@@ -871,18 +863,34 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
 
     // A failed Load (ApplyResult outcome failed) is shown and does not count as opened.
-    apiMock.cellApply.load.mockResolvedValueOnce({ outcome: 'failed', components: [],
-      error: { code: 'scenario_source_invalid', message: 'bad file' } });
+    apiMock.cellApply.load.mockResolvedValueOnce(endedApplyRow({ outcome: 'failed', components: [],
+      error: { code: 'scenario_source_invalid', message: 'bad file' } }, 'scenario_load'));
     await act(async () => { await latest?.loadScenarioDocument('/workspace/cell'); });
     expect(apiMock.cellApply.load).toHaveBeenCalledTimes(2);
     expect(latest?.state.error).toContain('Apply failed');
     expect(scenarioOpened).toHaveBeenCalledTimes(1);
     expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
+    // A Load whose preparation refused it ends its row refused (OD-214): it
+    // is shown as a refusal, as its HTTP refusal was.
+    const refusals: string[] = [];
+    apiMock.cellApply.load.mockResolvedValueOnce({
+      kind: 'scenario_load', requestKey: 'e'.repeat(32), step: 'previewing', stepSource: null,
+      acceptedAtNs: '1', end: { outcome: 'refused', code: 'activation_preparation_failed',
+        details: null, finishedAtNs: '2' },
+    } satisfies ApplyCommandRow);
+    await act(async () => {
+      await latest?.loadScenarioDocument('/workspace/cell', (message) => { refusals.push(message); });
+    });
+    expect(refusals).toEqual([
+      `Scenario Load refused: ${codedErrorText({ code: 'activation_preparation_failed', message: '' })}`,
+    ]);
+    expect(scenarioOpened).toHaveBeenCalledTimes(1);
   });
 
   it('rebases text only after successful Program, Scenario, and open-Draft resets', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(2)), testPublication(workspace(2)));
+    const snapshot = authoringSnapshot(workspace(2));
+    const rerender = await mountHarness(initial, snapshot, testPublication(workspace(2)));
     await act(async () => initial.resolve(workspace(2)));
     expect(latest?.programDraftInputResetEpoch).toBe(0);
     expect(latest?.scenarioDraftInputResetEpoch).toBe(0);
@@ -920,9 +928,10 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       await Promise.resolve();
     });
     expect(latest?.scenarioDraftInputResetEpoch).toBe(1);
-    apiMock.programWorkspace.revert.mockResolvedValueOnce({
-      status: 'accepted', headless: { apply_id: 'revert-apply', apply_generation: 2 }, workspace: workspace(1),
-    });
+    apiMock.programWorkspace.revert.mockResolvedValueOnce(
+      endedProgramApplyRow('program_revert', { applyId: 5, applyGeneration: 2 }),
+    );
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(1));
     await act(async () => {
       latest?.revert();
       await Promise.resolve();
@@ -930,6 +939,30 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     });
     expect(latest?.scenarioDraftInputResetEpoch).toBe(2);
     expect(latest?.state.transitionStatus).toBe('accepted');
+
+    // OD-214: a Revert answered at acceptance is followed to its row's end;
+    // one that ended refused shows its catalogue text as its refusal.
+    const accepted: ApplyCommandRow = {
+      kind: 'program_revert', requestKey: 'd'.repeat(32), step: 'previewing',
+      stepSource: null, acceptedAtNs: '1', end: null,
+    };
+    apiMock.programWorkspace.revert.mockResolvedValueOnce(accepted);
+    await act(async () => {
+      latest?.revert();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiMock.programWorkspace.revert).toHaveBeenCalledTimes(3);
+    expect(latest?.state.error).toBeNull();
+    await rerender({ ...snapshot, applyCommands: { inProgress: null, ended: [{ ...accepted,
+      end: { outcome: 'refused', code: 'scenario_revert_requires_deployment', details: null, finishedAtNs: '2' },
+    }] } });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(latest?.state.error).toBe(
+      'Program Revert: Revert the whole Scenario. The Saved Deployment differs from the Applied one. '
+      + 'Use the Deployment Revert to revert the whole Scenario.',
+    );
+    expect(latest?.scenarioDraftInputResetEpoch).toBe(2);
 
     apiMock.programWorkspace.openDraft.mockRejectedValueOnce(new Error('open failed'));
     await act(async () => {

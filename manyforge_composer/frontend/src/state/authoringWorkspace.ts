@@ -13,7 +13,8 @@ import type {
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
-import { manualOperationSettled } from './heldRunAuthoring';
+import type { ApplicationStartId } from '../api/applicationIdentity';
+import { heldRunEditReason, manualOperationSettled } from './heldRunAuthoring';
 import type { WorkbenchNotice } from './workbenchNotices';
 
 /** Component reason the alarm owner issues for active alarms it can report. */
@@ -164,7 +165,7 @@ export function draftEditUnavailableReason(
   }
   return snapshot!.heldRunDraftEditAllowed
     ? null
-    : `Program execution is ${snapshot!.programCycle.state.replaceAll('_', ' ')}; editing requires Idle or all Program motion stopped (Stop, Halt, a failure pause, or Executed but not yet Run).`;
+    : heldRunEditReason(snapshot!.programCycle.state);
 }
 
 /**
@@ -268,28 +269,34 @@ export function authoringContainmentNotices(
   }];
 }
 
+/**
+ * The local fence of one authoring request: the application start the
+ * snapshot belongs to (`A`) and the request's own key name the request.
+ */
 export function programLocalFence(
   published: PublishedAuthoringWorkspace,
   snapshot: ComposerHeadlessState,
-  requestOwnerEpoch: string,
-  requestId: string,
+  requestKey: string,
 ): LocalWorkspaceFenceRequest {
   return programLocalFenceFromAdmission(
-    published, snapshot.authoringAdmission.admissionGeneration, requestOwnerEpoch, requestId,
+    published,
+    snapshot.authoringAdmission.admissionGeneration,
+    snapshot.applicationStartId,
+    requestKey,
   );
 }
 
 export function programLocalFenceFromAdmission(
   published: PublishedAuthoringWorkspace,
   admissionGeneration: number,
-  requestOwnerEpoch: string,
-  requestId: string,
+  applicationStartId: ApplicationStartId,
+  requestKey: string,
 ): LocalWorkspaceFenceRequest {
   return {
     ...localDraftFence(published),
     expectedAdmissionGeneration: admissionGeneration,
-    requestOwnerEpoch,
-    requestId,
+    applicationStartId,
+    requestKey,
   };
 }
 
@@ -297,11 +304,10 @@ export function programLocalFenceFromAdmission(
 export function deploymentLocalFence(
   published: PublishedAuthoringWorkspace,
   snapshot: ComposerHeadlessState,
-  requestOwnerEpoch: string,
-  requestId: string,
+  requestKey: string,
 ): LocalWorkspaceFenceRequest {
   return {
-    ...programLocalFence(published, snapshot, requestOwnerEpoch, requestId),
+    ...programLocalFence(published, snapshot, requestKey),
     draftId: published.identity.deploymentDraftId,
     expectedDraftRevision: published.identity.deploymentDraftRevision,
   };
@@ -310,11 +316,10 @@ export function deploymentLocalFence(
 export function scenarioLocalFence(
   published: PublishedAuthoringWorkspace,
   snapshot: ComposerHeadlessState,
-  requestOwnerEpoch: string,
-  requestId: string,
+  requestKey: string,
 ): ScenarioDocumentFenceRequest {
   return {
-    ...programLocalFence(published, snapshot, requestOwnerEpoch, requestId),
+    ...programLocalFence(published, snapshot, requestKey),
     deploymentDraftId: published.identity.deploymentDraftId,
     expectedDeploymentDraftRevision: published.identity.deploymentDraftRevision,
   };

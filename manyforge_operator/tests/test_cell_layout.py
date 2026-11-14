@@ -10,7 +10,7 @@ from manyforge_operator.cell_layout import (
     CELL_LAYOUT_INITIALIZER,
     CELL_LAYOUT_MARKER,
     CELL_LAYOUT_MARKER_MAX_BYTES,
-    SEMANTIC_OWNERS,
+    CELL_LAYOUT_SCHEMA,
     CellInstanceLayout,
     CellLayoutError,
 )
@@ -28,10 +28,56 @@ def test_clean_bootstrap_reopens_exact_layout(tmp_path: Path) -> None:
     )
     assert second == first
     first.validate()
-    assert first.artifact_root.is_dir()
-    assert first.projection_root.is_dir()
-    assert first.run_root.is_dir()
-    assert all(first.owner_state_root(owner).is_dir() for owner in SEMANTIC_OWNERS)
+    assert CELL_LAYOUT_SCHEMA == "manyforge.cell_instance_layout.v2"
+    # Saved data, History and the launcher's own record are kept; running
+    # state lives in current/, which the run selection creates fresh.
+    assert sorted(entry.name for entry in cell.iterdir()) == [
+        CELL_LAYOUT_MARKER, "data", "history", "operator"]
+    assert first.data_root.is_dir() and first.history_root.is_dir()
+    assert first.operator_root.is_dir() and not first.current_root.exists()
+
+
+def test_session_entries_are_valid_beside_the_kept_roots(tmp_path: Path) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    cell = tmp_path / "cell"
+    layout = CellInstanceLayout.open_or_create(
+        cell_id="cell.a", cell_root=cell, install_root=install
+    )
+    for name in ("current", "previous-runs", "session-reports"):
+        (cell / name).mkdir()
+    layout.validate()
+
+
+def test_version_1_root_is_refused_with_guidance_and_left_unchanged(
+    tmp_path: Path,
+) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    cell = tmp_path / "cell"
+    cell.mkdir(mode=0o700)
+    (cell / "state" / "program-runner").mkdir(parents=True)
+    (cell / "state/program-runner/persistent-keys.json").write_text("{}\n", encoding="utf-8")
+    marker = cell / CELL_LAYOUT_MARKER
+    marker.write_text(
+        json.dumps({"schema_version": "manyforge.cell_instance_layout.v1"},
+                   sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    marker.chmod(0o600)
+    before = sorted(str(path) for path in cell.rglob("*"))
+
+    with pytest.raises(CellLayoutError) as refused:
+        CellInstanceLayout.open_or_create(
+            cell_id="cell.a", cell_root=cell, install_root=install
+        )
+
+    message = str(refused.value)
+    assert "manyforge.cell_instance_layout.v1" in message
+    assert "new instance" in message
+    assert str(cell / "state/program-runner/persistent-keys.json") in message
+    assert "data/program-runner/ as persistent-keys.v<N>.json" in message
+    assert sorted(str(path) for path in cell.rglob("*")) == before
 
 
 def test_clean_bootstrap_creates_missing_private_namespace_chain(
@@ -135,9 +181,9 @@ def test_symlink_and_inode_replacement_fail_closed(tmp_path: Path) -> None:
     layout = CellInstanceLayout.open_or_create(
         cell_id="cell.a", cell_root=tmp_path / "cell", install_root=install
     )
-    artifact = layout.artifact_root
-    artifact.rename(tmp_path / "old-artifacts")
-    artifact.mkdir()
+    data = layout.data_root
+    data.rename(tmp_path / "old-data")
+    data.mkdir()
     with pytest.raises(CellLayoutError):
         layout.validate()
 
@@ -191,7 +237,7 @@ def test_marked_layout_missing_child_is_rejected_without_repair(tmp_path: Path) 
     CellInstanceLayout.open_or_create(
         cell_id="cell.a", cell_root=cell, install_root=install
     )
-    missing = cell / "run" / "headless"
+    missing = cell / "history"
     missing.rmdir()
 
     with pytest.raises(CellLayoutError, match="missing roots|capability root"):
@@ -202,9 +248,9 @@ def test_marked_layout_missing_child_is_rejected_without_repair(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    "relative_root", ["state/execution-host", "run/execution-host"]
+    "relative_root", ["data", "history", "operator"]
 )
-def test_state_and_run_capability_replacement_are_both_rejected_without_repair(
+def test_kept_capability_replacement_is_rejected_without_repair(
     tmp_path: Path, relative_root: str
 ) -> None:
     install = tmp_path / "install"

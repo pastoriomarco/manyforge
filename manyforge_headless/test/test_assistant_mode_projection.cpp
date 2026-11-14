@@ -52,7 +52,7 @@ TEST(AssistantModeProjection, IndexWithoutAnAssistantComponentHasNoMode) {
   const auto index = ProjectAssistantModeIndex(*bundle);
   const auto bytes = content_identity::canonical_json(index);
 
-  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.assistant_mode_index.v2\""),
+  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.assistant_mode_index.v3\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"modes\":[]"), std::string::npos);
   EXPECT_NE(bytes.find("\"assistant_component_id\":null"), std::string::npos);

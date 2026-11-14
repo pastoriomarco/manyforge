@@ -30,8 +30,6 @@ inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     "manyforge_roboplan_candidate_worker";
 inline constexpr std::string_view kManagerLivenessPolicyId =
     "manyforge.retained_manager_liveness";
-inline constexpr std::string_view kManagerLivenessLocalSafeContractId =
-    "manyforge.execution_host.manager_loss_safe";
 
 /// One joint's typed jerk value; a joint without one takes the preset.
 struct JointJerkSetting final {

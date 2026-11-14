@@ -41,6 +41,8 @@ from .authoring_admission import (
     AuthoringMutationEnvelope,
     headless_client_http_exception,
 )
+from .application_identity import new_request_key
+from .apply_orchestration import ApplyCommands, apply_step_source
 from .authoring_forest import from_program
 from .authoring_identity import canonical_digest
 from .deployment_intent import (
@@ -155,6 +157,22 @@ def _manager_refusal_message(lead: str, response: object) -> str:
     return f"{lead}: {cause}" if cause else lead
 
 
+def _preparation_row(rows: Any, request_key: str) -> dict[str, Any] | None:
+    """The activation-preparation row with this key, from its status."""
+
+    if not isinstance(rows, dict):
+        return None
+    candidates = [rows.get("in_progress"), *(rows.get("ended") or ())]
+    return next(
+        (
+            row
+            for row in candidates
+            if isinstance(row, dict) and row.get("request_key") == request_key
+        ),
+        None,
+    )
+
+
 _PREPARED_ACTIVATION_FIELDS = (
     "schema_version",
     "prepared_activation_id",
@@ -237,6 +255,7 @@ class ComposerState:
     def __init__(
         self,
         *,
+        application_start_id: int,
         node_environment: NodeEnvironment | None = None,
         program: Program | None = None,
         program_source_path: str | None = None,
@@ -283,6 +302,9 @@ class ComposerState:
             if allowed_deployment_write_roots is None
             else list(allowed_deployment_write_roots)
         )
+        # This application start's `A` (``--application-start-id``): Composer's
+        # own requests carry it; a browser's requests carry the browser's.
+        self.application_start_id = application_start_id
         self.headless_client = headless_client
         self.execution_observation_source = (
             ExecutionObservationSource(headless_client)
@@ -299,7 +321,7 @@ class ComposerState:
             deployment_session=self.deployment_draft_session,
         )
         self.authoring_admission = (
-            AuthoringAdmissionCoordinator(headless_client)
+            AuthoringAdmissionCoordinator(headless_client, application_start_id)
             if headless_client is not None
             else None
         )
@@ -325,6 +347,8 @@ class ComposerState:
         # Headless runs one activation preparation at a time; previews and
         # Apply preparations wait here for their turn instead of being refused.
         self._activation_preparation_lock = Lock()
+        # The Apply-level rows of Apply, Revert, Load and New (OD-214).
+        self.apply_commands = ApplyCommands()
         self.applied_deployment_document: dict[str, Any] | None = None
         self._applied_activation_context: dict[str, Any] | None = None
         self._applied_deployment_identity: _DeploymentPublicationIdentity | None = None
@@ -567,6 +591,7 @@ class ComposerState:
     def from_paths(
         cls,
         *,
+        application_start_id: int,
         program_path: str | None,
         allowed_fs_roots: list[str] | None = None,
         allowed_program_write_roots: list[str] | None = None,
@@ -587,6 +612,7 @@ class ComposerState:
             else None
         )
         return cls(
+            application_start_id=application_start_id,
             node_environment=node_environment,
             program=program,
             program_source_path=resolved_program,
@@ -789,7 +815,7 @@ class ComposerState:
         status: dict[str, Any],
         *,
         phase: str = "unspecified",
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str]:
         source = status.get("source")
         payload = status.get("status")
         active = payload.get("active") if isinstance(payload, dict) else None
@@ -801,11 +827,6 @@ class ComposerState:
                 ("source_available", row.get("available") is True),
                 ("source_fresh", row.get("freshness") == "fresh"),
                 ("no_known_gaps", row.get("known_gaps") == []),
-                (
-                    "source_owner_epoch",
-                    isinstance(row.get("source_owner_epoch"), str)
-                    and bool(row["source_owner_epoch"]),
-                ),
                 (
                     "manager_ready",
                     isinstance(payload, dict) and payload.get("manager_ready") is True,
@@ -835,7 +856,6 @@ class ComposerState:
         return (
             active["retained_bundle_id"],
             active["graph_revision"],
-            source["source_owner_epoch"],
         )
 
     def _optional_applied(
@@ -992,6 +1012,9 @@ class ComposerState:
             # admission form, never both a direct generation and a parent.
             request_body.pop("expected_admission_generation", None)
             request_body["parent_authoring_claim"] = claim
+            if self.authoring_admission is not None:
+                # From the send on, the Manager owns the parent claim.
+                self.authoring_admission.manager_submission_sent(claim)
         try:
             response = self.headless_client.manager_apply(request_body)
         except HeadlessClientError as error:
@@ -1016,9 +1039,13 @@ class ComposerState:
                 ),
             )
         acceptance = deepcopy(response)
+        # Any state is the Manager's answer for one journaled Apply: one that
+        # already ended (for example its parent check failed at acceptance)
+        # is observed and reported like any other.
         if (
-            response.get("state") != "pending"
-            or not isinstance(response.get("apply_id"), str)
+            response.get("state")
+            not in {"pending", "succeeded", "failed", "unknown_effect"}
+            or type(response.get("apply_id")) is not int
             or type(response.get("apply_generation")) is not int
         ):
             raise AuthoringOperationError(
@@ -1076,6 +1103,73 @@ class ComposerState:
             }
         )
 
+    # The pace at which the preparation's published status is read.
+    _ACTIVATION_PREPARATION_POLL_S = 0.2
+
+    def _prepare_activation(self, body: dict[str, Any]) -> dict[str, Any]:
+        """One activation preparation, to its end (OD-214).
+
+        Headless answers at acceptance with the preparation's row and
+        publishes it in its cycle status (``activation_preparation``); the
+        prepared activation is read once the row ended ``succeeded``. Any
+        other end is raised as a ``HeadlessClientError`` carrying the row's
+        code and details: a ``refused`` end as a definite refusal (409), the
+        others without an HTTP status. No limit on the wait: the preparer
+        bounds its own subprocess.
+        """
+
+        assert self.headless_client is not None
+        reply = self.headless_client.prepare_activation(body)
+        row = reply.get("command")
+        if (
+            reply.get("schema_version")
+            != "manyforge.activation_preparation_reply.v1"
+            or not isinstance(row, dict)
+            or row.get("kind") != "activation_preparation"
+            or row.get("captured_input_digest") != body["captured_input_digest"]
+            or not isinstance(row.get("request_key"), str)
+        ):
+            raise AuthoringOperationError(
+                "activation_preparer_response_invalid",
+                "Activation preparation returned an invalid reply",
+            )
+        key = row["request_key"]
+        apply_step_source(
+            "previewing",
+            {
+                "status": "activation_preparation",
+                "captured_input_digest": body["captured_input_digest"],
+            },
+        )
+        while row.get("end") is None:
+            time.sleep(self._ACTIVATION_PREPARATION_POLL_S)
+            try:
+                status = self.headless_client.program_cycle_status()
+                rows = status.get("activation_preparation")
+            except HeadlessClientError as error:
+                # The Program runner's absence does not hide this status.
+                rows = error.details.get("activation_preparation")
+                if not isinstance(rows, dict):
+                    raise
+            current = _preparation_row(rows, key)
+            if current is None:
+                raise AuthoringOperationError(
+                    "activation_preparer_response_invalid",
+                    "Activation preparation status omitted its row",
+                )
+            row = current
+        end = row["end"]
+        if end.get("outcome") != "succeeded":
+            code = end.get("code")
+            details = end.get("details")
+            raise HeadlessClientError(
+                code if isinstance(code, str) and code else "activation_preparation_failed",
+                code if isinstance(code, str) and code else "activation_preparation_failed",
+                409 if end.get("outcome") == "refused" else None,
+                details=details if isinstance(details, dict) else None,
+            )
+        return self.headless_client.prepared_activation(body["captured_input_digest"])
+
     def _prepare_authored_deployment_candidate(
         self,
         intent: dict[str, Any],
@@ -1093,12 +1187,17 @@ class ComposerState:
         """
 
         assert self.headless_client is not None
+        if claim is None and self.authoring_admission is not None:
+            # The preparation waits for open admission: settle first a claim
+            # a lost answer left with this process.
+            self.authoring_admission.settle_before_preparation()
         phases: dict[str, float] = {}
         started = time.monotonic()
         try:
             with self._activation_preparation_lock:
-                response = self.headless_client.prepare_activation(
+                response = self._prepare_activation(
                     {
+                        "request_key": new_request_key().hex(),
                         "source_document_digest": intent["source_document_digest"],
                         "scenario_id": intent["scenario_id"],
                         "project_path": intent["project_path"],
@@ -1111,6 +1210,7 @@ class ComposerState:
                         "expected_admission_generation": intent[
                             "expected_admission_generation"
                         ],
+                        "application_start_id": intent["application_start_id"],
                     }
                 )
         except HeadlessClientError as error:
@@ -1119,6 +1219,7 @@ class ComposerState:
                 and error.status_code is not None
                 and 400 <= error.status_code < 500
             ):
+                # A refusal at once, or a preparation that ended ``refused``.
                 # Unclaimed preparation is effect-free and precedes every
                 # claim, workspace commit and Manager submission of its
                 # request, and the preparer answered with a definite refusal:
@@ -1140,7 +1241,7 @@ class ComposerState:
         phases["preparation_ms"] = (time.monotonic() - started) * 1000.0
         started = time.monotonic()
         status = self.headless_client.manager_status()
-        current_bundle, current_graph, manager_epoch = self._manager_current(
+        current_bundle, current_graph = self._manager_current(
             status, phase="activation.after_preparation"
         )
         if intent["expected_manager_current"] != {
@@ -1171,7 +1272,7 @@ class ComposerState:
                 "expected_admission_generation": intent[
                     "expected_admission_generation"
                 ],
-                "request_owner_epoch": manager_epoch,
+                "application_start_id": intent["application_start_id"],
             }
         )
         receipt = preview.get("candidate_receipt")
@@ -1231,10 +1332,9 @@ class ComposerState:
         manager_apply = None
         if apply and not confirmation_required and receipt is not None:
             manager_apply = {
-                "request_id": intent["manager_request_id"],
-                "request_owner_epoch": manager_epoch,
+                "request_key": intent["request_key"],
+                "application_start_id": intent["application_start_id"],
                 "source_label": "manyforge_composer_deployment_apply",
-                "correlation_id": intent["correlation_id"],
                 "deployment_artifact_id": prepared_activation[
                     "deployment_artifact_id"
                 ],
@@ -1267,10 +1367,10 @@ class ComposerState:
             "confirmation_token": confirmation_token,
             "preparation": (
                 {
-                    "request_owner_epoch": intent.get(
-                        "preparation_request_owner_epoch"
+                    "application_start_id": intent.get(
+                        "preparation_application_start_id"
                     ),
-                    "request_id": intent.get("preparation_request_id"),
+                    "request_key": intent.get("preparation_request_key"),
                 }
                 if confirmation_required
                 else None

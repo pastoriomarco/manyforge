@@ -11,33 +11,81 @@
 // nothing with it but the same short reads the `events` command already makes.
 //
 // Client -> host, one packet:
-//   {"after_cursor": <int>, "api_version": "manyforge.execution_command.v3",
-//    "command": "subscribe_events", "owner_epoch": <str|null>}
+//   {"after_cursor": <int>, "api_version": "manyforge.execution_command.v4",
+//    "command": "subscribe_events"}
 // Host -> client, one packet per message, each
-//   {"api_version": "manyforge.execution_event_stream.v1", "type": ...}:
-//   snapshot  {owner_epoch, cursor, reason, state}  first message, and again
-//             after a gap; events continue strictly after `cursor`.
-//   event     {owner_epoch, event}   one journal row as in an `events` page.
-//   state     {owner_epoch, state}   the non-journal facts, when they changed.
-//   progress  {owner_epoch, operation_progress}  the `events` reply's progress
-//             rows, when they changed (also to []).
-//   heartbeat {owner_epoch, cursor}  every second.
-//   gap       {owner_epoch, reason}  the subscriber's cursor cannot be served
-//             (`owner_epoch_changed`); a snapshot follows.
+//   {"api_version": "manyforge.execution_event_stream.v4", "type": ...}:
+//   snapshot  {cursor, reason, state}  first message; events continue
+//             strictly after `cursor`.
+//   event     {event}                one journal row as in an `events` page.
+//   state     {state}                the non-journal facts, when they changed.
+//   progress  {operation_progress}   the `events` reply's progress rows, when
+//             they changed (also to []).
+//   heartbeat {cursor}               every second.
 //   error     {error}                the subscription ends.
+// One Kernel and one journal per application start: no message names an
+// owner (contract 1.16.4 rule 1).
 // `state` is the `events` reply without its page and progress:
 // admission_generation, carried_object_lost_signals, execution_owner_ready,
-// interrupt_rule_catalog, interrupt_rule_state_baseline, runtime_faults.
-// Each round sends the new rows first, then a changed state, so a ready
-// baseline's `through_sequence` covers every rule-state row sent before it,
-// then changed progress. A writer wakes on the change signal (journal commit,
-// rule-state cut, catalog install, carried-object-lost store) and for the
+// interrupt_rule_catalog, interrupt_rule_state_baseline, runtime_faults;
+// and the Kernel's memory Stop facts (stop state model K18):
+// `program_run_hold` (null without a claimed run, else {program_run_id,
+// hold_revision, frozen, frozen_by|null, all_groups_held, held_by_rule|null}),
+// `last_stop_event_id` (null before the first Stop of this start) and
+// `stop_progress_sequence`. The Kernel raises the change signal after every
+// change of these facts (hold change, release, new event, a participant
+// ending a stop attempt), so a Stop reaches the runner without waiting for
+// the journal.
+// v3 (OD-215): `runtime_faults.operation_journal_write_fault` (when not
+// null) also carries `queue_full` (bool), the journal queue's "full" level;
+// it changes without a new row, and the change signal or the next heartbeat
+// round carries it.
+// v3 (OD-205 (b)): `operations` {change, faulted[], faulted_total}, from
+// Kernel memory: `change` rises at every change of an operation's state,
+// residence or pending control; `faulted` lists, lowest operation ids first
+// and at most 32, the resident operations in state failed, interrupted or
+// intervention_required or stopped by the runtime monitor, each with the
+// facts its alarm reads ({operation_id, operation_revision, state,
+// stop_event_id, pending_control, runtime_monitor_stop, complete} and, when
+// `complete`, {program_binding_id, program_run_id, resources (<= 16),
+// resource_total, terminal_error {code, reason, message (<= 256 bytes),
+// message_truncated}, participants [{state, execution_scope, terminal_error
+// {reason}, terminal_fact {kind, effect, error}}]}); `faulted_total` counts
+// them all. The Kernel raises the change signal after the unlock of every
+// such change.
+// v4 (OD-213): `operations` also carries `resident` and `resident_total`:
+// every resident operation (the active set and the takeover slots), lowest
+// operation ids first and at most 64, each {operation_id, operation,
+// control_pending, last_control} with the `read` reply's members (its
+// `operation` without the participants' `progress` and the `updated_at_ns`;
+// null when it encodes to more than 16 KiB); `resident_total` counts them
+// all. `change` and both lists are read in one Kernel section, so a reader
+// whose table has a `change` at least an acceptance reply's
+// `operations_change` sees that operation as it was after the acceptance, or
+// sees it retired. The runner's nodes read their operations from it.
+// v4 (OD-213 (1)): `planning_jobs`, the execution host's pick/place planning
+// jobs in acceptance order, at most 8, each {job_id, kind ("pick"|"place"),
+// program_run_id|null, state ("accepted"|"planning"|"done"|"failed"|
+// "cancelled")}; never the result, which `read_planning_job` returns. The
+// host raises the change signal after every change of the job table.
+// Each round sends a changed state first, then the new rows, then changed
+// progress. The rule-state baseline in `state` is read from Kernel memory:
+// a rule trip that starts and ends between two state reads sends nothing.
+// A writer wakes on the change signal (journal commit, rule-state change,
+// catalog install, carried-object-lost store, Stop facts, operation changes)
+// and for the
 // heartbeat; while an operation executes it also re-reads progress every
 // `kProgressPeriod` (progress is sampled at control rate in lock-free
 // publications, which never take the signal's lock).
 
+// The descriptor holder, the send with deadline, the error frame, the peer
+// check, the subscriber pool and the acceptor are the shared private stream
+// server (`manyforge_private_stream`); this stream passes its own bounds and
+// codes.
+
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/execution_event_change_signal.hpp>
+#include <manyforge_private_stream/private_stream_server.hpp>
 
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -45,15 +93,12 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <exception>
 #include <functional>
-#include <list>
-#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -65,18 +110,17 @@
 namespace manyforge::roboplan_backend::host_detail {
 
 inline constexpr std::string_view kEventStreamApiVersion =
-    "manyforge.execution_event_stream.v1";
+    "manyforge.execution_event_stream.v4";
 
 /// The two reads a stream makes. Both may throw; the subscription then ends
 /// with an `error` message and the client reconnects.
 struct ExecutionEventStreamSource final {
   using Value = content_identity::CanonicalValue;
-  /// Current owner epoch and state object.
-  std::function<std::pair<std::string, Value>()> read_state;
+  /// The current state object.
+  std::function<Value()> read_state;
   /// One `events` page object (`events`, `next_after_sequence`, `has_more`)
-  /// of `owner_epoch` strictly after `after`.
-  std::function<Value(const std::string &owner_epoch, std::uint64_t after)>
-      read_page;
+  /// strictly after `after`.
+  std::function<Value(std::uint64_t after)> read_page;
   /// The executing operations' progress rows (an array; empty when none).
   std::function<Value()> read_progress;
 };
@@ -112,56 +156,18 @@ public:
   /// every subscription (each writer sees the stop within one poll slice)
   /// and returns once they are closed.
   void Run(const int socket, const std::stop_token stop) noexcept {
-    Fd wake(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
-    if (wake.get() < 0)
-      return;
-    const std::stop_callback wake_on_stop(stop, [&wake] {
-      const std::uint64_t one = 1U;
-      // An eventfd write only fails when the counter is already non-zero
-      // (EAGAIN): the poll loop is woken either way.
-      [[maybe_unused]] const auto written =
-          ::write(wake.get(), &one, sizeof(one));
-    });
-    std::list<Writer> writers;
-    while (!stop.stop_requested()) {
-      pollfd ready[2]{{socket, POLLIN, 0}, {wake.get(), POLLIN, 0}};
-      const int count = ::poll(ready, 2, -1);
-      if (count < 0 && errno == EINTR)
-        continue;
-      if (count < 0 || stop.stop_requested() ||
-          (ready[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-        break;
-      if ((ready[0].revents & POLLIN) == 0)
-        continue;
-      Fd client(::accept4(socket, nullptr, nullptr,
-                          SOCK_CLOEXEC | SOCK_NONBLOCK));
-      if (client.get() < 0)
-        continue;
-      writers.remove_if([](const Writer &writer) { return writer.done->load(); });
-      ucred peer{};
-      socklen_t peer_size = sizeof(peer);
-      if (::getsockopt(client.get(), SOL_SOCKET, SO_PEERCRED, &peer,
-                       &peer_size) != 0 ||
-          peer_size != sizeof(peer) || peer.uid != ::geteuid())
-        continue;
-      if (writers.size() >= kMaximumSubscribers) {
-        static_cast<void>(Send(client.get(),
-                               Error("execution_event_subscribers_full",
-                                     "the execution host serves its bounded "
-                                     "number of event subscriptions"),
-                               stop));
-        continue;
-      }
-      auto done = std::make_shared<std::atomic<bool>>(false);
-      writers.push_back(Writer{
-          done, std::jthread([this, done, fd = std::make_shared<Fd>(std::move(client))](
-                                 const std::stop_token writer_stop) {
-            Serve(fd->get(), writer_stop);
-            done->store(true);
-          })});
-    }
-    // Each jthread is stopped and joined; its socket closes with it.
-    writers.clear();
+    private_stream::AcceptSubscribers(
+        socket,
+        private_stream::SubscriberPoolOptions{
+            kMaximumSubscribers, std::string(kEventStreamApiVersion),
+            "execution_event_subscribers_full",
+            "the execution host serves its bounded number of event "
+            "subscriptions",
+            kMaximumMessageBytes, kSendDeadline},
+        [this](const int subscriber, const std::stop_token writer_stop) {
+          Serve(subscriber, writer_stop);
+        },
+        stop);
   }
 
   /// Serves one connected subscriber until it fails, disconnects or `stop`.
@@ -175,25 +181,29 @@ public:
                                stop));
         return;
       }
-      auto [epoch, state] = source_.read_state();
+      auto state = source_.read_state();
       std::uint64_t cursor = request->after_cursor;
-      std::string reason = "subscribed";
-      if (request->owner_epoch && *request->owner_epoch != epoch) {
-        if (!Send(client, Gap(epoch, "owner_epoch_changed"), stop))
-          return;
-        cursor = 0U;
-        reason = "owner_epoch_changed";
-      }
-      if (!Send(client, Snapshot(epoch, cursor, reason, state), stop))
+      if (!Send(client, Snapshot(cursor, "subscribed", state), stop))
         return;
       auto sent_state = content_identity::canonical_json(state);
       std::string sent_progress = "[]";
       auto next_heartbeat = Clock::now() + kHeartbeatPeriod;
       while (!stop.stop_requested()) {
         const auto generation = signal_.Generation();
+        // State first (OD-205 (b)): a slow journal-file read never delays
+        // the Kernel's memory facts; no consumer orders rows before it.
+        auto current_state = source_.read_state();
+        auto current = content_identity::canonical_json(current_state);
+        if (current != sent_state) {
+          if (!Send(client,
+                    Message("state", {{"state", std::move(current_state)}}),
+                    stop))
+            return;
+          sent_state = std::move(current);
+        }
         bool more = false;
         for (std::size_t index = 0; index < kMaximumPagesPerRound; ++index) {
-          const auto page = source_.read_page(epoch, cursor);
+          const auto page = source_.read_page(cursor);
           const auto *events = page.find_object_member("events");
           const auto *has_more = page.find_object_member("has_more");
           if (events == nullptr || !events->is_array() || has_more == nullptr ||
@@ -203,34 +213,13 @@ public:
             const auto sequence = Counter(event, "sequence");
             if (!sequence || *sequence <= cursor)
               throw std::runtime_error("event page is not ordered");
-            if (!Send(client, Message("event", epoch, {{"event", event}}), stop))
+            if (!Send(client, Message("event", {{"event", event}}), stop))
               return;
             cursor = *sequence;
           }
           more = has_more->as_bool();
           if (!more)
             break;
-        }
-        auto [current_epoch, current_state] = source_.read_state();
-        if (current_epoch != epoch) {
-          // A new Kernel owner in this process: its journal starts anew.
-          epoch = std::move(current_epoch);
-          cursor = 0U;
-          if (!Send(client, Gap(epoch, "owner_epoch_changed"), stop) ||
-              !Send(client, Snapshot(epoch, cursor, "owner_epoch_changed",
-                                     current_state),
-                    stop))
-            return;
-          sent_state = content_identity::canonical_json(current_state);
-          continue;
-        }
-        auto current = content_identity::canonical_json(current_state);
-        if (current != sent_state) {
-          if (!Send(client,
-                    Message("state", epoch, {{"state", std::move(current_state)}}),
-                    stop))
-            return;
-          sent_state = std::move(current);
         }
         const auto progress =
             source_.read_progress ? source_.read_progress() : Value(Value::Array{});
@@ -239,14 +228,14 @@ public:
         auto progress_json = content_identity::canonical_json(progress);
         if (progress_json != sent_progress) {
           if (!Send(client,
-                    Message("progress", epoch, {{"operation_progress", progress}}),
+                    Message("progress", {{"operation_progress", progress}}),
                     stop))
             return;
           sent_progress = std::move(progress_json);
         }
         if (Clock::now() >= next_heartbeat) {
           if (!Send(client,
-                    Message("heartbeat", epoch,
+                    Message("heartbeat",
                             {{"cursor", Value(static_cast<double>(cursor))}}),
                     stop))
             return;
@@ -271,31 +260,10 @@ public:
   }
 
 private:
-  class Fd final {
-  public:
-    explicit Fd(const int value = -1) noexcept : value_(value) {}
-    ~Fd() {
-      if (value_ >= 0)
-        ::close(value_);
-    }
-    Fd(Fd &&other) noexcept : value_(std::exchange(other.value_, -1)) {}
-    Fd(const Fd &) = delete;
-    Fd &operator=(const Fd &) = delete;
-    Fd &operator=(Fd &&) = delete;
-    [[nodiscard]] int get() const noexcept { return value_; }
-
-  private:
-    int value_;
-  };
-
-  struct Writer final {
-    std::shared_ptr<std::atomic<bool>> done;
-    std::jthread thread;
-  };
+  using Fd = private_stream::Fd;
 
   struct Subscribe final {
     std::uint64_t after_cursor{};
-    std::optional<std::string> owner_epoch;
   };
 
   [[nodiscard]] static std::optional<std::uint64_t>
@@ -330,86 +298,45 @@ private:
       const auto root = content_identity::parse_canonical_json(buffer);
       const auto *api = root.find_object_member("api_version");
       const auto *command = root.find_object_member("command");
-      const auto *epoch = root.find_object_member("owner_epoch");
       const auto after = Counter(root, "after_cursor");
-      if (!root.is_object() || root.as_object().size() != 4U || api == nullptr ||
+      if (!root.is_object() || root.as_object().size() != 3U || api == nullptr ||
           !api->is_string() ||
-          api->as_string() != "manyforge.execution_command.v3" ||
+          api->as_string() != "manyforge.execution_command.v4" ||
           command == nullptr || !command->is_string() ||
-          command->as_string() != "subscribe_events" || epoch == nullptr ||
-          !(epoch->is_null() ||
-            (epoch->is_string() && !epoch->as_string().empty() &&
-             epoch->as_string().size() <= 2048U)) ||
-          !after)
+          command->as_string() != "subscribe_events" || !after)
         return std::nullopt;
-      return Subscribe{*after, epoch->is_null()
-                                   ? std::nullopt
-                                   : std::optional<std::string>(epoch->as_string())};
+      return Subscribe{*after};
     } catch (...) {
       return std::nullopt;
     }
   }
 
   [[nodiscard]] static Value Message(const std::string_view type,
-                                     const std::string &epoch,
                                      Value::Object fields) {
     fields.emplace_back("api_version", Value(std::string(kEventStreamApiVersion)));
-    fields.emplace_back("owner_epoch", Value(epoch));
     fields.emplace_back("type", Value(std::string(type)));
     return Value(std::move(fields));
   }
 
-  [[nodiscard]] static Value Snapshot(const std::string &epoch,
-                                      const std::uint64_t cursor,
+  [[nodiscard]] static Value Snapshot(const std::uint64_t cursor,
                                       const std::string &reason,
                                       const Value &state) {
-    return Message("snapshot", epoch,
+    return Message("snapshot",
                    {{"cursor", Value(static_cast<double>(cursor))},
                     {"reason", Value(reason)},
                     {"state", state}});
   }
 
-  [[nodiscard]] static Value Gap(const std::string &epoch,
-                                 const std::string &reason) {
-    return Message("gap", epoch, {{"reason", Value(reason)}});
-  }
-
   [[nodiscard]] static Value Error(const std::string_view code,
                                    const std::string_view message) {
-    return Value(Value::Object{
-        {"api_version", Value(std::string(kEventStreamApiVersion))},
-        {"error", Value(Value::Object{
-                      {"code", Value(std::string(code))},
-                      {"details", Value(Value::Object{})},
-                      {"message", Value(std::string(message.substr(0U, 1024U)))}})},
-        {"type", Value("error")}});
+    return private_stream::ErrorFrame(kEventStreamApiVersion, code, message);
   }
 
   /// One packet, or false: the subscriber is gone, too slow or stopping.
   [[nodiscard]] static bool Send(const int client, const Value &message,
                                  const std::stop_token stop) noexcept {
-    try {
-      const auto bytes = content_identity::canonical_json(message);
-      if (bytes.empty() || bytes.size() > kMaximumMessageBytes)
-        return false;
-      const auto deadline = Clock::now() + kSendDeadline;
-      for (;;) {
-        const auto sent = ::send(client, bytes.data(), bytes.size(),
-                                 MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (sent == static_cast<ssize_t>(bytes.size()))
-          return true;
-        if (sent >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
-          return false;
-        if (stop.stop_requested() || Clock::now() >= deadline)
-          return false;
-        // A full socket buffer: wait for room in short slices so a stop is
-        // seen promptly; nothing else waits on this writer.
-        pollfd outbound{client, POLLOUT, 0};
-        static_cast<void>(::poll(&outbound, 1, 100));
-      }
-    } catch (...) {
-      return false;
-    }
+    return private_stream::SendFrame(client, message, kMaximumMessageBytes,
+                                     kSendDeadline, stop);
   }
 
   ExecutionEventStreamSource source_;

@@ -30,7 +30,7 @@ TEST(SourceModelProjection, CanonicalEmptyBundleHasAClosedEmptyProjection) {
 
   const auto value = projection.Project(admission.retained_bundle());
   const auto bytes = content_identity::canonical_json(value);
-  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.source_model_projection.v3\""),
+  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.source_model_projection.v4\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"model_map_contract\":null"), std::string::npos);
   EXPECT_NE(bytes.find("\"model_map_product_id\":null"), std::string::npos);

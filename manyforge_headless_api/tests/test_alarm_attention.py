@@ -26,7 +26,7 @@ class _Core:
 
     def operator_alarm_motion_attention(self) -> dict[str, Any]:
         self.reads += 1
-        return {"generation": self.generation, "owner_epoch": "alarm.owner.1"}
+        return {"generation": self.generation}
 
 
 class _Kernel:
@@ -48,7 +48,7 @@ class _Kernel:
         self.received_at.append(time.monotonic())
         if self.wanted and len(self.published) >= self.wanted:
             self.enough.set()
-        return {"generation": projection["generation"], "owner_epoch": "alarm.owner.1"}
+        return {"generation": projection["generation"]}
 
 
 def test_every_publication_carries_the_current_projection() -> None:
@@ -183,8 +183,8 @@ class _BlockedSourceRefresh:
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
-        return paged_subscription(self, after_cursor, owner_epoch)
+    def subscribe_events(self, after_cursor: int):
+        return paged_subscription(self, after_cursor)
 
     def identity(self) -> dict[str, Any]:
         self.entered.set()
@@ -203,7 +203,9 @@ def test_publications_keep_their_period_while_the_event_pump_is_blocked(
     samples = 12
     core, kernel = _Core(), _Kernel(wanted=samples)
     source = _BlockedSourceRefresh()
-    pump = ExecutionEventPump(_PumpCore(), source, poll_seconds=0.1)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        _PumpCore(), source, application_start_id="3f9a0000000000a1", poll_seconds=0.1
+    )
     publisher = OperatorAlarmAttentionPublisher(core, kernel)
     loaded = threading.Event()
 
@@ -277,7 +279,6 @@ def test_the_kernel_held_copy_is_the_last_acknowledged_projection(
     assert publisher.kernel_held_attention() == {
         "active_configuration": {"graph_revision": "graph.1", "retained_bundle_id": "bundle.1"},
         "generation": 1,
-        "owner_epoch": "alarm.owner.1",
         "reconciled": False,
     }
     assert len(changes) == 1

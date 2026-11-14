@@ -60,12 +60,12 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kMotionTripCompleted: return "motion_trip_completed";
     case kMotionExecutionOutcomeRecorded:
       return "motion_execution_outcome_recorded";
-    case kStopCertificatePublished: return "stop_certificate_published";
     case kRecoveryAssessmentChanged: return "recovery_assessment_changed";
     case kRecoveryActionAccepted: return "recovery_action_accepted";
     case kRecoveryActionRejected: return "recovery_action_rejected";
     case kRuntimeCollisionCoverage: return "runtime_collision_coverage";
     case kContactPolicyViolation: return "contact_policy_violation";
+    case kParticipantDispatchOutcome: return "participant_dispatch_outcome";
   }
   return "unknown";
 }
@@ -109,24 +109,18 @@ void KernelFlightRecorder::note_published_snapshot(
   snapshot_note_.present = true;
 }
 
-void KernelFlightRecorder::set_dump_directory(std::string directory) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  dump_directory_ = std::move(directory);
-}
-
 std::uint64_t KernelFlightRecorder::recorded_total() const noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   return next_sequence_ - 1;
 }
 
-std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
+void KernelFlightRecorder::dump_now(const char* reason) noexcept {
   // Crash-context lock acquisition: spin briefly, then emit only a minimal
   // marker if the lock remains busy. A dying kernel must not deadlock behind a
   // telemetry mutex, but unsynchronized ring reads would be undefined behavior.
   std::array<FlightRecord, kCapacity> copy;
   std::uint64_t next_sequence = 0;
   SnapshotNote snapshot_note;
-  std::string directory;
   bool torn = false;
   {
     bool locked = false;
@@ -137,7 +131,6 @@ std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
       copy = ring_;
       next_sequence = next_sequence_;
       snapshot_note = snapshot_note_;
-      directory = dump_directory_;
       mutex_.unlock();
     } else {
       // Reading the ring without synchronization is a C++ data race, not a
@@ -146,29 +139,11 @@ std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
       // touching concurrently-written storage.
       torn = true;
       next_sequence = 1;
-      directory.clear();
     }
   }
 
-  std::FILE* out = nullptr;
-  std::string path;
-  if (!directory.empty()) {
-    const auto wall_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    char name[64];
-    (void)std::snprintf(name, sizeof(name), "/flight-%lld.jsonl",
-                        static_cast<long long>(wall_ms));
-    path = directory + name;
-    out = std::fopen(path.c_str(), "w");
-  }
-  const bool to_stderr = out == nullptr;
-  if (to_stderr) {
-    path.clear();
-    out = stderr;
-    (void)std::fputs("MANYFORGE_KERNEL_FLIGHT_DUMP_BEGIN\n", stderr);
-  }
+  std::FILE* const out = stderr;
+  (void)std::fputs("MANYFORGE_KERNEL_FLIGHT_DUMP_BEGIN\n", stderr);
 
   char line[512];
   const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -218,14 +193,8 @@ std::string KernelFlightRecorder::dump_now(const char* reason) noexcept {
     write_line(out, line, n);
   }
 
-  if (to_stderr) {
-    (void)std::fputs("MANYFORGE_KERNEL_FLIGHT_DUMP_END\n", stderr);
-    (void)std::fflush(stderr);
-  } else {
-    (void)std::fflush(out);
-    (void)std::fclose(out);
-  }
-  return path;
+  (void)std::fputs("MANYFORGE_KERNEL_FLIGHT_DUMP_END\n", stderr);
+  (void)std::fflush(stderr);
 }
 
 }  // namespace manyforge::core

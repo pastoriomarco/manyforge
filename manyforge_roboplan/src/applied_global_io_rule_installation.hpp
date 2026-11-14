@@ -35,22 +35,16 @@ CompileGlobalIoRuleCatalog(
     const deployment::ProgramBinding *binding,
     const std::shared_ptr<core::IIoSignalService> &service);
 
-// Slow actual terminal reads run outside the composition/Kernel locks. Final
-// activation retains the exact current composition pin through the Core gate.
-// This handles a real Composition; empty selected products use the same
-// source proof at their existing selected-request owner boundary.
+// Activates the installed product's rules once the caller holds the Manager's
+// success of its Apply; the composition pin is held through the Core gate.
 [[nodiscard]] core::Result<void> EnsureAppliedGlobalIoRuleCatalog(
     ExecutionCompositionAccess &access,
-    core::ResourceAddressedExecutionKernel &kernel,
-    const std::filesystem::path &manager_state_root,
-    const core::CellId &cell_id);
+    core::ResourceAddressedExecutionKernel &kernel);
 
-// Same successful proof/final pin, for the actual existing startup recovery
-// exclusion. Core independently requires route_recovery_pending at commit.
+// The same, for the startup recovery exclusion. Core independently requires
+// route_recovery_pending at commit.
 [[nodiscard]] core::Result<void> RestoreAppliedGlobalIoRuleCatalog(
     ExecutionCompositionAccess &access,
-    core::ResourceAddressedExecutionKernel &kernel,
-    const std::filesystem::path &manager_state_root,
-    const core::CellId &cell_id);
+    core::ResourceAddressedExecutionKernel &kernel);
 
 } // namespace manyforge::roboplan_backend::host_detail

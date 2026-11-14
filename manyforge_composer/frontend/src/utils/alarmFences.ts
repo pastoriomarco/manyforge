@@ -5,18 +5,19 @@ export interface AlarmAcknowledgementMember {
 }
 
 export interface AlarmAcknowledgementFence {
-  ownerEpoch: string;
+  /** The start of the admitted snapshot the alarm set came from. */
+  applicationStartId: string;
   generation: number;
   members: AlarmAcknowledgementMember[];
 }
 
 export function acknowledgementFence(
-  ownerEpoch: string,
+  applicationStartId: string,
   generation: number,
   members: AlarmAcknowledgementMember[],
 ): AlarmAcknowledgementFence {
   return {
-    ownerEpoch,
+    applicationStartId,
     generation,
     members: members.map((member) => ({ ...member })),
   };
@@ -29,12 +30,12 @@ function memberKey(member: AlarmAcknowledgementMember): string {
 /** Confirmation remains bound to exact observed membership and generation. */
 export function acknowledgementFenceMatches(
   fence: AlarmAcknowledgementFence,
-  ownerEpoch: string,
+  applicationStartId: string,
   generation: number,
   members: AlarmAcknowledgementMember[],
 ): boolean {
   if (
-    fence.ownerEpoch !== ownerEpoch
+    fence.applicationStartId !== applicationStartId
     || fence.generation !== generation
     || fence.members.length !== members.length
   ) {

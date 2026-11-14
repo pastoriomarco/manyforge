@@ -37,7 +37,7 @@ class ExecutionCorrelationTracker {
   std::string move_id_;
 
   mutable std::mutex program_run_id_mutex_;
-  std::string program_run_id_;
+  std::optional<ProgramRunNumber> program_run_id_;
 
   mutable std::mutex action_span_mutex_;
   std::optional<ActionSpanDTO> action_span_;

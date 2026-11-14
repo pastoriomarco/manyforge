@@ -27,8 +27,8 @@ from manyforge_behavior.reference_validation import validate_reference_refusal
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
 # Stays v1: the command protocol version is unchanged.
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v2"
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
 MAX_MANAGER_REQUEST_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 MAX_OBSERVATION_PAYLOAD_BYTES = 64 * 1024
@@ -175,7 +175,6 @@ class SceneProjectionRevision:
 @dataclass(frozen=True)
 class SceneRuntimeOwnerSnapshot:
     cell_id: str
-    owner_epoch: str
     runtime_identity: SceneRuntimeIdentity
     initialization_generation: int
     initialization_state: str
@@ -303,16 +302,11 @@ class ManagerSceneRuntimeClient:
                 "initialization_state",
                 "ok",
                 "runtime_identity",
-                "scene_runtime_owner_epoch",
             },
             label="scene-runtime owner response",
         )
         try:
             cell_id = _bounded_text(record["cell_id"], label="cell_id")
-            owner_epoch = _bounded_text(
-                record["scene_runtime_owner_epoch"],
-                label="scene_runtime_owner_epoch",
-            )
             generation = _safe_integer(
                 record["initialization_generation"],
                 label="initialization_generation",
@@ -326,7 +320,6 @@ class ManagerSceneRuntimeClient:
             raise _response_invalid("scene-runtime owner response is invalid") from exc
         return SceneRuntimeOwnerSnapshot(
             cell_id=cell_id,
-            owner_epoch=owner_epoch,
             runtime_identity=identity,
             initialization_generation=generation,
             initialization_state=state,

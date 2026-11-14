@@ -74,7 +74,7 @@ def _context(signal_rows=None, *, coordinate_roles=(), tree=None) -> ProgramRunP
     if tree is not None:
         program = {"program_id": "io_program", "program_revision": _A, "tree": tree}
     return ProgramRunPortContext(
-        program_run_id="run.1",
+        program_run_id=1,
         applied_record_digest=_D,
         scenario_id="io_scenario",
         source_document_digest=_A,
@@ -136,7 +136,6 @@ class _Transport:
         return {
             "ok": True,
             "identity": {
-                "owner_epoch": "kernel.epoch.7",
                 "graph_revision": _C,
                 "retained_bundle_id": _B,
                 "scene_revision": {"scene_id": _D, "revision_id": 1, "content_hash": _E},
@@ -148,16 +147,14 @@ class _Transport:
 
     read = reset = acknowledge_completed = stop = submit
 
-    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
+    def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]:
         return {
             "ok": True,
             "scope": {
-                "schema_version": "manyforge.program_execution_scope.v2",
+                "schema_version": "manyforge.program_execution_scope.v3",
                 "program_run_id": program_run_id,
-                "request_owner_epoch": "kernel.epoch.7",
-                "program_runner_owner_epoch": "runner.epoch.3",
                 "claim_generation": 5,
-                "selection_revision": 0,
+                "hold_revision": 0,
             },
         }
 
@@ -169,7 +166,7 @@ class _Transport:
             "ok": True,
             "target_observation": {
                 **query,
-                "schema_version": "manyforge.target_observation.v2",
+                "schema_version": "manyforge.target_observation.v3",
                 "value": deepcopy(self.value),
             },
         }
@@ -199,11 +196,9 @@ class _Transport:
             raise self.register_error
         return {
             "registration": {
-                "owner_epoch": body["owner_epoch"],
                 "catalog_generation": "1",
                 "registration_id": str(len(self.registrations)),
                 "scope": {
-                    "program_runner_owner_epoch": body["program_runner_owner_epoch"],
                     "program_run_id": body["program_run_id"],
                     "node": {
                         "node_instance_id": body["node_instance_id"],
@@ -238,8 +233,8 @@ def _bound(context: ProgramRunPortContext | None = None):
     return transport, port
 
 
-def _identity(instance: str = "io_node", attempt: str = "attempt.1") -> NodeAttemptIdentity:
-    return NodeAttemptIdentity("run.1", instance, attempt)
+def _identity(instance: str = "io_node", attempt: int = 1) -> NodeAttemptIdentity:
+    return NodeAttemptIdentity(1, instance, attempt)
 
 
 def _read(port, node_id: str, **parameters):
@@ -276,8 +271,7 @@ def test_fresh_get_input_returns_the_exact_boolean(value: bool) -> None:
     assert result.output is value
     assert result.metadata["quality"] == "fresh"
     assert transport.queries == [{
-        "schema_version": "manyforge.target_observation_query.v2",
-        "owner_epoch": "kernel.epoch.7",
+        "schema_version": "manyforge.target_observation_query.v3",
         "program_binding_id": _A,
         "kind": "io_signal",
         "signal": signal("io.1", "di_0"),
@@ -459,14 +453,12 @@ def test_watch_registers_exact_attempt_reads_and_releases_the_exact_token() -> N
     task = port.io_watches.start("io.wait_for_input", identity, _wait_inputs())
     assert task.state is OwnerTaskState.ACTIVE
     assert transport.registrations == [{
-        "schema_version": "manyforge.io_watch_request.v2",
-        "owner_epoch": "kernel.epoch.7",
+        "schema_version": "manyforge.io_watch_request.v3",
         "program_binding_id": _A,
-        "program_runner_owner_epoch": "runner.epoch.3",
         "claim_generation": 5,
-        "program_run_id": "run.1",
+        "program_run_id": 1,
         "node_instance_id": "io_node",
-        "node_attempt_id": "attempt.1",
+        "node_attempt_id": 1,
         "signal": signal("io.1", "di_0"),
         "condition": {"kind": "level", "expected_value": True},
     }]
@@ -512,9 +504,9 @@ def test_watch_port_refuses_an_edge_condition() -> None:
 
 def test_run_teardown_releases_remaining_watches_even_after_a_failed_release() -> None:
     transport, port = _bound()
-    first = _identity("wait_a", "attempt.a")
+    first = _identity("wait_a", 1)
     port.io_watches.start("io.wait_for_input", first, _wait_inputs())
-    port.io_watches.start("io.wait_for_input", _identity("wait_b", "attempt.b"), _wait_inputs())
+    port.io_watches.start("io.wait_for_input", _identity("wait_b", 2), _wait_inputs())
     transport.release_error = _OwnerError("execution_owner_unavailable")
     with pytest.raises(_OwnerError):
         port.io_watches.cancel(
@@ -522,20 +514,18 @@ def test_run_teardown_releases_remaining_watches_even_after_a_failed_release() -
         )
     assert len(port._io_watches) == 2  # An unconfirmed release keeps the token.
     transport.release_error = None
-    port.unbind("run.1")
+    port.unbind(1)
     assert sorted(row["registration_id"] for row in transport.releases) == ["1", "2"]
     assert port._io_watches == {}
 
 
 _SCOPE_RELEASE = {
-    "schema_version": "manyforge.io_watch_scope_release.v1",
-    "owner_epoch": "kernel.epoch.7",
+    "schema_version": "manyforge.io_watch_scope_release.v2",
     "program_binding_id": _A,
-    "program_runner_owner_epoch": "runner.epoch.3",
     "claim_generation": 5,
-    "program_run_id": "run.1",
+    "program_run_id": 1,
     "node_instance_id": "io_node",
-    "node_attempt_id": "attempt.1",
+    "node_attempt_id": 1,
 }
 
 
@@ -560,7 +550,7 @@ def test_unknown_scope_release_is_left_to_run_teardown() -> None:
         port.io_watches.start("io.wait_for_input", _identity(), _wait_inputs())
     assert failed.value is transport.register_error  # The original failure.
     assert len(transport.scope_releases) == 1  # Sent once, never retried.
-    port.unbind("run.1")
+    port.unbind(1)
     assert len(transport.scope_releases) == 1 and transport.releases == []
 
 
@@ -633,7 +623,7 @@ def _waiter(timeout_s: float | None = None, *, port: Any = None):
     }
     if timeout_s is not None:
         parameters["timeout_s"] = timeout_s
-    attempts = iter(f"attempt.{index}" for index in range(1, 100))
+    attempts = iter(range(1, 100))
     events: list[dict[str, Any]] = []
     port = _WatchPort() if port is None else port
     node = IoInputWaitAdapter(
@@ -641,7 +631,7 @@ def _waiter(timeout_s: float | None = None, *, port: Any = None):
         node_id="io.wait_for_input",
         node_instance_id="wait",
         attempt_source=SimpleNamespace(
-            begin=lambda _: NodeAttemptIdentity("run.1", "wait", next(attempts))
+            begin=lambda _: NodeAttemptIdentity(1, "wait", next(attempts))
         ),
         parameters=parameters,
         value_sources={},
@@ -703,7 +693,7 @@ def test_retry_after_an_unavailable_attempt_records_the_source_available() -> No
         "program_node_io_source_available",
     ]
     assert events[1]["node_instance_id"] == "wait"
-    assert events[1]["node_attempt_id"] == "attempt.2"
+    assert events[1]["node_attempt_id"] == 2
     assert events[1]["quality"] is None
     assert port.releases() == [("cancel", "watch.1")]
 
@@ -757,7 +747,7 @@ def test_stop_reset_or_preemption_releases_and_reports_interrupted() -> None:
     assert node.presented_interrupted is True
     # The next attempt registers a new watch.
     node.tick_once()
-    assert ("start", "attempt.2") in port.calls
+    assert ("start", 2) in port.calls
 
 
 def test_transient_read_failure_is_not_teardown() -> None:
@@ -783,7 +773,7 @@ def test_a_watch_is_never_owner_work_to_settle_and_a_hold_keeps_it() -> None:
     assert len(port.calls) == observed  # A match is reported when ticking resumes.
     assert node.has_active_task is False
     assert node.observe_control_state() == "inactive"
-    assert node.reconcile_full_stop_task(selected_resume=True) == "unaffected"
+    assert node.reconcile_halt_task(selected_resume=True) == "unaffected"
     assert port.releases() == []
 
 
@@ -846,27 +836,25 @@ def _wire_port(monkeypatch, tmp_path, replies: dict[str, dict[str, Any]]):
     return port, sent
 
 
-def _wire_registration(attempt: str) -> dict[str, Any]:
+def _wire_registration(attempt: int) -> dict[str, Any]:
     return {
-        "owner_epoch": "kernel.epoch.7",
         "catalog_generation": "1",
         "registration_id": "1",
         "scope": {
-            "program_runner_owner_epoch": "runner.epoch.3",
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "node": {"node_instance_id": "wait", "node_attempt_id": attempt},
         },
     }
 
 
 def _wire_replies(read: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    api = {"api_version": "manyforge.execution_command_response.v1"}
+    api = {"api_version": "manyforge.execution_command_response.v6"}
     observation = _value("fresh", False)
     observation["receipt_age_ns"] = "1000"
     return {
         "register_io_watch": {
             **api, "ok": True, "command": "register_io_watch",
-            "registration": _wire_registration("attempt.1"),
+            "registration": _wire_registration(1),
             "result": {"state": "pending", "observation": observation, "matched_sample": None},
         },
         "read_io_watch": {**api, **read},
@@ -891,7 +879,7 @@ def test_actual_released_reply_fails_the_wait_with_io_watch_released(
     assert [command["command"] for command in sent] == [
         "register_io_watch", "read_io_watch", "release_io_watch"
     ]
-    assert sent[2]["registration"] == _wire_registration("attempt.1")
+    assert sent[2]["registration"] == _wire_registration(1)
 
 
 def test_actual_stale_generation_refusal_fails_the_wait_with_its_reason(
@@ -943,14 +931,14 @@ def test_actual_unknown_registration_fails_and_releases_the_attempt_scope(
     assert set(release) == {"api_version", "command", "attribution", "scope_request"}
     assert release["attribution"]["transport"] == "internal"
     assert release["scope_request"] == {
-        **_SCOPE_RELEASE, "node_instance_id": "wait", "node_attempt_id": "attempt.1"
+        **_SCOPE_RELEASE, "node_instance_id": "wait", "node_attempt_id": 1
     }
-    # The next attempt registers again; nothing else is released for attempt.1.
+    # The next attempt registers again; nothing else is released for attempt 1.
     node.tick_once()
     assert [command["command"] for command in sent][2:] == [
         "register_io_watch", "release_io_watch"
     ]
-    assert sent[3]["scope_request"]["node_attempt_id"] == "attempt.2"
+    assert sent[3]["scope_request"]["node_attempt_id"] == 2
 
 
 def test_changed_outside_requires_a_bound_output_base() -> None:

@@ -64,14 +64,8 @@ inline constexpr char kRecoveryFailedNotRetryable[] =
 inline constexpr char kRecoveryStaleAssessment[] = "assessment_stale";
 inline constexpr char kRecoveryStaleEpoch[] = "control_epoch_changed";
 inline constexpr char kRecoveryExecutionChanged[] = "execution_changed";
-inline constexpr char kRecoveryStopCertificateChanged[] =
-    "stop_certificate_changed";
-inline constexpr char kRecoveryStopOwnerGenerationChanged[] =
-    "stop_owner_generation_changed";
 inline constexpr char kRecoveryActionNotAllowed[] = "action_not_allowed";
 inline constexpr char kRecoveryPrincipalMissing[] =
     "principal_id_missing";
-inline constexpr char kRecoveryRequestIdMissing[] =
-    "request_id_missing";
 
 }  // namespace manyforge::core::reason_codes

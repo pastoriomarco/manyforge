@@ -9,11 +9,9 @@ namespace manyforge::core {
 /// Existing applied Program/Runner occurrence and Reset journal counter.
 /// Run/claim provenance is absent between Runs; it is not source lifetime.
 struct IoProgramBlackboardScopeDTO final {
-  RequestOwnerEpoch request_owner_epoch;
-  RequestOwnerEpoch program_runner_owner_epoch;
   std::uint64_t cycle_generation;
   std::optional<CellAdmissionClaimGeneration> claim_generation;
-  std::optional<ProgramRunId> program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
   ProgramBindingId program_binding_id;
   /// Existing actual Applied publication occurrence; zero is unqualified.
   ActiveBundlePublicationGeneration active_publication_generation{0U};
@@ -134,10 +132,9 @@ enum class IoProgramBlackboardAcknowledgementStatus { kAccepted, kSuperseded };
 /// Returned from exact Kernel/source admission, never synthesized from the
 /// caller's packet. Unknown replies create no authority to retry or advance.
 struct IoProgramBlackboardAcknowledgementDTO final {
-  RequestOwnerEpoch owner_epoch;
   ProgramBindingId program_binding_id;
   std::uint64_t cycle_generation;
-  std::optional<ProgramRunId> program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
   IoSourceIncarnation source_epoch;
   /// Present only for actual accepted admission; superseded has no fake ACK.
   std::optional<std::uint64_t> accepted_sequence;

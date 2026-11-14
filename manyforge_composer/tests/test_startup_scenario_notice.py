@@ -28,10 +28,13 @@ class _Headless:
 
 
 class _Admission:
-    owner_epoch = "composer-owner-1"
+    application_start_id = 0x3F9A0000000000A1
 
-    def recover(self) -> None:
-        return None
+    def settle_before_preparation(self) -> None:
+        """No local claim is pending in these route-unit tests."""
+
+    def manager_submission_sent(self, _claim) -> None:
+        """The parent claim's hand-over is the real coordinator's concern."""
 
 
 @pytest.mark.parametrize(
@@ -52,7 +55,7 @@ class _Admission:
 def test_refused_startup_project_starts_empty_with_a_visible_notice(
     monkeypatch: pytest.MonkeyPatch, refusal: Exception, code: str, reason: str,
 ) -> None:
-    state = ComposerState(headless_client=_Headless())  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_Headless())  # type: ignore[arg-type]
     state.authoring_admission = _Admission()  # type: ignore[assignment]
     calls: list[str] = []
 
@@ -81,10 +84,10 @@ def test_refused_startup_project_starts_empty_with_a_visible_notice(
 def test_failed_startup_load_reports_its_failed_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The orchestrated Load ended `failed` after the workspace commit: the
-    project stays open, nothing is rolled back or retried."""
+    """The orchestrated Load's row ended `failed` after the workspace
+    commit: the project stays open, nothing is rolled back or retried."""
 
-    state = ComposerState(headless_client=_Headless())  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_Headless())  # type: ignore[arg-type]
     state.authoring_admission = _Admission()  # type: ignore[assignment]
 
     def commit_then_fail(_state: ComposerState, path: str) -> dict[str, Any]:
@@ -97,9 +100,11 @@ def test_failed_startup_load_reports_its_failed_step(
             document, document_path=path,
             source_document_digest="sha256:" + "0" * 64,
         ))
-        return {"outcome": "failed", "components": [], "error": {
-            "code": "manager_apply_rejected", "message": "Manager rejected the candidate",
-        }}
+        # The Load's ended row (OD-214): a typed code, no text.
+        return {"kind": "scenario_load", "request_key": "a" * 32,
+                "step": "applying", "accepted_at_ns": "1", "step_source": None,
+                "end": {"outcome": "failed", "code": "manager_apply_rejected",
+                        "details": {"components": []}, "finished_at_ns": "2"}}
 
     monkeypatch.setattr(routes_scenario_documents, "load_exact_scenario_document", commit_then_fail)
 
@@ -110,7 +115,7 @@ def test_failed_startup_load_reports_its_failed_step(
     assert state.startup_scenario_notice == {
         "path": "/p/cell.scenario", "code": "manager_apply_rejected",
         "message": "Startup project /p/cell.scenario was not activated: "
-        "Manager rejected the candidate",
+        "manager_apply_rejected",
     }
 
 
@@ -137,7 +142,7 @@ def test_restart_with_a_startup_project_keeps_an_applied_scenario(
                 active["cell_graph"] = graph
             return {"status": {"manager_ready": True, "active": active}}
 
-    state = ComposerState(headless_client=_AppliedHeadless())  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_AppliedHeadless())  # type: ignore[arg-type]
     state.authoring_admission = _Admission()  # type: ignore[assignment]
     before = state.authoring_workspace.snapshot().as_dict()
 
@@ -155,5 +160,5 @@ def test_startup_load_proceeds_over_an_empty_cell() -> None:
                 "model_instances": [], "controllable_components": [],
             }}}}
 
-    state = ComposerState(headless_client=_EmptyHeadless())  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_EmptyHeadless())  # type: ignore[arg-type]
     routes_scenario_documents.require_empty_cell(state)  # no refusal

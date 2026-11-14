@@ -11,6 +11,7 @@ on:
     paths:
       - "manyforge_core/**"
       - "manyforge_content_identity/**"
+      - "manyforge_private_stream/**"
       - "manyforge_persistence/**"
       - "manyforge_scene/**"
       - "manyforge_component_manager/**"
@@ -26,6 +27,7 @@ on:
     paths:
       - "manyforge_core/**"
       - "manyforge_content_identity/**"
+      - "manyforge_private_stream/**"
       - "manyforge_persistence/**"
       - "manyforge_scene/**"
       - "manyforge_component_manager/**"
@@ -156,6 +158,8 @@ jobs:
         include:
           - package: manyforge_content_identity
             testing: -DMANYFORGE_CONTENT_IDENTITY_BUILD_TESTING=ON
+          - package: manyforge_private_stream
+            testing: -DMANYFORGE_PRIVATE_STREAM_BUILD_TESTING=ON
           - package: manyforge_persistence
             testing: -DMANYFORGE_PERSISTENCE_BUILD_TESTING=ON
           - package: manyforge_scene

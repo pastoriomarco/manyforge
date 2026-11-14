@@ -11,6 +11,11 @@ namespace manyforge::core {
 // component offline by the operator's own power action, or a member offline
 // through a not-prepared owner, is outside the latch (`latch_exempt`).
 // Nothing is stored or journaled; every change recomputes it.
+//
+// A component whose last Stop ended uncontained (stop state model §3.6 F2)
+// counts as `activity: unknown` with reason `stop_unconfirmed` until a state
+// of it arriving after the failure reports idle; the existing latch then
+// holds by itself (R1) and clears by itself (R2). No new latch exists.
 
 void ResourceAddressedExecutionKernel::observe_component_states(
     std::vector<ComponentState> states) {
@@ -66,29 +71,97 @@ void ResourceAddressedExecutionKernel::observe_component_states_locked(
     }
   }
   component_states_ = std::move(states);
-  refresh_cell_latch_locked(arm);
-  // A restart's unclosed predecessor ends here: every component reports
-  // healthy and idle, so its orphan resources are free again.
-  if (motion_admission_unreconciled_ && cell_settled_locked()) {
-    const auto snapshot = resource_slots_->coherent_snapshot();
-    std::vector<ResourceId> orphans;
-    for (const auto& slot : snapshot.slots)
-      if (slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal && !slot.owner &&
-          std::binary_search(recovered_orphan_resources_.begin(),
-                             recovered_orphan_resources_.end(), slot.resource_id))
-        orphans.push_back(slot.resource_id);
-    std::sort(orphans.begin(), orphans.end());
-    if (!orphans.empty())
-      (void)resource_slots_->reconcile_unreconciled_external_or_orphan_goal(
-          snapshot.operation_resource_generation, orphans);
-    recovered_orphan_resources_.clear();
-    motion_admission_unreconciled_ = false;
+  // F2 clear: only the controller's own idle report clears "stop
+  // unconfirmed" (Reset and Recover do not). Ordered by arrival under this
+  // lock: the first idle state in a component-state update that arrives after
+  // the failure was recorded clears it. Component states are stamped by the
+  // host's component runtime clock (`WallClock`, roboplan
+  // `ros_managed_runtime_host.cpp:7280`), not necessarily the Kernel's clock
+  // (`clock_`, a FakeClock in tests), so no times are compared across clocks.
+  if (stop_unconfirmed_.table) {
+    for (const auto& state : component_states_) {
+      if (state.activity != ComponentActivity::kIdle) continue;
+      const auto index = stop_component_index_locked(ControllableComponentId(state.component_id));
+      if (index && stop_unconfirmed_.marked[*index]) stop_unconfirmed_.marked[*index] = 0U;
+    }
   }
+  refresh_cell_latch_locked(arm);
 }
 
-void ResourceAddressedExecutionKernel::set_stop_listener(std::function<void()> on_stop_accepted) {
+void ResourceAddressedExecutionKernel::set_stop_listener(IStopListener* listener) noexcept {
+  stop_listener_.store(listener, std::memory_order_release);
+}
+
+void ResourceAddressedExecutionKernel::rebuild_stop_component_table_locked() {
+  auto table = std::make_shared<StopComponentTable>();
+  table->reserve(stop_component_scope_.size());
+  for (const auto& component : stop_component_scope_)
+    table->push_back(component.controllable_component_id);
+  std::sort(table->begin(), table->end());
+  table->erase(std::unique(table->begin(), table->end()), table->end());
+  // Keep the marks of components that stay in the cell.
+  std::vector<std::uint8_t> marked(table->size(), 0U);
+  std::vector<std::int64_t> since(table->size(), 0);
+  if (stop_unconfirmed_.table) {
+    for (std::size_t old_index = 0U; old_index < stop_unconfirmed_.table->size(); ++old_index) {
+      if (!stop_unconfirmed_.marked[old_index]) continue;
+      const auto& id = (*stop_unconfirmed_.table)[old_index];
+      const auto found = std::lower_bound(table->begin(), table->end(), id);
+      if (found == table->end() || *found != id) continue;
+      const auto new_index = static_cast<std::size_t>(found - table->begin());
+      marked[new_index] = 1U;
+      since[new_index] = stop_unconfirmed_.since_ns[old_index];
+    }
+  }
+  std::shared_ptr<const StopComponentTable> shared = std::move(table);
+  stop_unconfirmed_.table = shared;
+  stop_unconfirmed_.marked = std::move(marked);
+  stop_unconfirmed_.since_ns = std::move(since);
+  stop_component_count_.store(shared->size(), std::memory_order_release);
+  stop_component_table_ = std::move(shared);
+}
+
+std::optional<std::size_t> ResourceAddressedExecutionKernel::stop_component_index_locked(
+    const ControllableComponentId& component) const noexcept {
+  if (!stop_component_table_) return std::nullopt;
+  const auto& table = *stop_component_table_;
+  const auto found = std::lower_bound(table.begin(), table.end(), component);
+  if (found == table.end() || *found != component) return std::nullopt;
+  return static_cast<std::size_t>(found - table.begin());
+}
+
+bool ResourceAddressedExecutionKernel::stop_unconfirmed_locked(
+    const std::string_view component_id) const noexcept {
+  if (!stop_unconfirmed_.table) return false;
+  const auto& table = *stop_unconfirmed_.table;
+  const auto found = std::lower_bound(
+      table.begin(), table.end(), component_id,
+      [](const ControllableComponentId& row, std::string_view id) { return row.value() < id; });
+  return found != table.end() && found->value() == component_id &&
+         stop_unconfirmed_.marked[static_cast<std::size_t>(found - table.begin())] != 0U;
+}
+
+std::vector<ComponentState> ResourceAddressedExecutionKernel::latch_component_states_locked() const {
+  auto states = component_states_;
+  for (auto& state : states) {
+    if (!stop_unconfirmed_locked(state.component_id)) continue;
+    state.activity = ComponentActivity::kUnknown;
+    state.reason = ComponentStateReason{
+        std::string(kStopUnconfirmedReason),
+        "Its last Stop did not confirm the robot at rest; activity is unknown until its "
+        "controller reports idle"};
+  }
+  return states;
+}
+
+std::vector<ControllableComponentId> ResourceAddressedExecutionKernel::stop_unconfirmed_components()
+    const {
   std::lock_guard state_lock(state_mutex_);
-  stop_listener_ = std::move(on_stop_accepted);
+  std::vector<ControllableComponentId> components;
+  if (!stop_unconfirmed_.table) return components;
+  for (std::size_t index = 0U; index < stop_unconfirmed_.table->size(); ++index)
+    if (stop_unconfirmed_.marked[index]) components.push_back((*stop_unconfirmed_.table)[index]);
+  return components;
 }
 
 std::vector<ErrorDTO> ResourceAddressedExecutionKernel::ReadExecutionBlocks() const {
@@ -96,34 +169,15 @@ std::vector<ErrorDTO> ResourceAddressedExecutionKernel::ReadExecutionBlocks() co
   std::vector<ErrorDTO> blocks;
   if (internal_fault_)
     blocks.push_back({"execution_host_internal_fault",
-                      "The execution host had an internal fault; restart it to run motion again",
+                      "The execution host had an internal fault; restart ManyForge to run motion again",
                       {{"reason", internal_fault_->reason_code}}});
-  if (manager_liveness_motion_inhibited_)
-    blocks.push_back({"manager_unavailable",
-                      "The cell Manager isn't answering; motion waits until it is back",
-                      {}});
-  // A restart's unclosed predecessor with no latch cause: before the first
-  // component report one row for the restart, then one row per component
-  // still busy, never blocking invisibly.
-  if (motion_admission_unreconciled_ && component_states_.empty())
-    blocks.push_back({"execution_host_restart_awaiting_components",
-                      "After the execution host restart, motion waits for the first "
-                      "component report",
-                      {}});
-  if (motion_admission_unreconciled_ && !cell_latched_locked())
-    for (const auto& state : component_states_)
-      if (!latch_exempt(state, component_states_) && state.activity != ComponentActivity::kIdle)
-        blocks.push_back({"execution_host_restart_settling",
-                          "After the execution host restart, motion waits until " +
-                              state.component_id + " is idle",
-                          {{"component_id", state.component_id}}});
   return blocks;
 }
 
 CellLatch ResourceAddressedExecutionKernel::get_cell_latch() const {
   std::lock_guard state_lock(state_mutex_);
-  if (!cell_latch_armed_ && !motion_admission_unreconciled_) return {};
-  auto causes = cell_latch_causes(component_states_);
+  if (!cell_latch_armed_) return {};
+  auto causes = cell_latch_causes(latch_component_states_locked());
   const bool latched = !causes.empty();
   return CellLatch{latched, std::move(causes)};
 }
@@ -131,7 +185,8 @@ CellLatch ResourceAddressedExecutionKernel::get_cell_latch() const {
 bool ResourceAddressedExecutionKernel::cell_settled_locked() const {
   return std::all_of(component_states_.begin(), component_states_.end(), [&](const auto& state) {
     return latch_exempt(state, component_states_) ||
-           (component_healthy(state) && state.activity == ComponentActivity::kIdle);
+           (component_healthy(state) && state.activity == ComponentActivity::kIdle &&
+            !stop_unconfirmed_locked(state.component_id));
   });
 }
 
@@ -143,9 +198,7 @@ void ResourceAddressedExecutionKernel::refresh_cell_latch_locked(const bool arm)
 bool ResourceAddressedExecutionKernel::cell_latched_locked() const {
   // The same causes `get_cell_latch` lists: a member offline through its
   // owner counts as its owner.
-  // A restart's unclosed predecessor counts as a Stop until it ends.
-  return (cell_latch_armed_ || motion_admission_unreconciled_) &&
-         !cell_latch_causes(component_states_).empty();
+  return cell_latch_armed_ && !cell_latch_causes(latch_component_states_locked()).empty();
 }
 
 std::optional<ErrorDTO> ResourceAddressedExecutionKernel::cell_latch_refusal_locked() const {

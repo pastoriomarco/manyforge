@@ -19,9 +19,9 @@ from manyforge_behavior.interrupt_condition import (
     condition_keys,
 )
 from manyforge_behavior.interrupt_outcome import (
-    contained_stage_from_stop_terminal,
-    contained_stages_from_stop_terminal,
+    interrupt_stop_pending,
     map_interrupt_result,
+    participant_stops,
 )
 from manyforge_behavior.orchestration_values import ProgramValueStore
 from manyforge_behavior.program import (
@@ -393,7 +393,7 @@ def _row(
     stop_result: str | None = None,
     trip: bool = False,
     losses: tuple[dict[str, Any], ...] = (),
-    operation_id: str = "op",
+    operation_id: int = 1,
     error: dict[str, Any] | None = None,
     blackboard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -404,7 +404,6 @@ def _row(
             trip_row["blackboard"] = blackboard
     return {
         "registration": {
-            "owner_epoch": "kernel-1",
             "policy_id": "door_rule",
             "scope": {"kind": "operation", "operation_id": operation_id},
         },
@@ -414,28 +413,79 @@ def _row(
             "source_losses": list(losses),
             "evaluation_error": None,
         },
-        "stop_id": "stop" if stop_result else None,
-        "stop_generation": 1 if stop_result else None,
-        "stop_certificate_id": "cert" if stop_result else None,
-        "stop_certificate_revision": 1 if stop_result else None,
+        "stop_event_id": 1 if stop_result else None,
         "stop_result": stop_result,
         "terminal_cause": cause,
         "error": error,
     }
 
 
-def _operation(*rows: dict[str, Any]) -> dict[str, Any]:
-    return {"operation_id": "op", "participants": [{"io_rule_outcomes": list(rows)}]}
+def _stop(
+    stage: str | None = None,
+    *,
+    phase: str = "stopped",
+    attribution: str = "rule",
+    mode: str = "interrupt",
+    stop_event_id: int = 1,
+    escalated: bool = False,
+) -> dict[str, Any]:
+    """One covered participant's ``stop`` object of the operation read."""
+
+    return {
+        "phase": phase,
+        "attempt": 1,
+        "stop_event_id": stop_event_id,
+        "mode": mode,
+        "attribution_class": attribution,
+        "plan_digest": None,
+        "containing_stage_id": stage,
+        "containing_stage_index": None if stage is None else _CHAIN.index(stage)
+        if stage in _CHAIN else 0,
+        "escalated": escalated,
+    }
+
+
+def _operation(
+    *rows: dict[str, Any], stops: dict[str, dict[str, Any] | None] | None = None
+) -> dict[str, Any]:
+    """The operation read: the rule rows on the first participant ("arm");
+    ``stops`` gives each named participant's ``stop`` object (None: never
+    covered)."""
+
+    stops = {"arm": None} if stops is None else stops
+    participants = []
+    for index, (name, stop) in enumerate(stops.items()):
+        participants.append({
+            "participant_id": _pid(name),
+            "io_rule_outcomes": list(rows) if index == 0 else [],
+            "stop": stop,
+        })
+    return {"operation_id": 1, "participants": participants}
+
+
+def _covered(row: dict[str, Any], contained: str | None) -> dict[str, dict[str, Any] | None]:
+    """The participant Stop that matches the row: none without a Stop result,
+    failed for ``some_failed``, else stopped by this rule's own plan."""
+
+    result = row["stop_result"]
+    if result is None:
+        return {"arm": None}
+    return {"arm": _stop(
+        contained,
+        phase="failed" if result == "some_failed" else "stopped",
+        escalated=result == "stopped_escalated",
+    )}
 
 
 def _map(node_id: str, row: dict[str, Any], *, contained: str | None = None, **parameters: Any):
     return map_interrupt_result(
-        node_id, parameters, _operation(row), stop_chain=_CHAIN, contained_stage_id=contained
+        node_id, parameters, _operation(row, stops=_covered(row, contained)),
+        stop_chain=_CHAIN,
     )
 
 
-_NOMINAL = dict(stop_result="succeeded_nominal", trip=True)
-_ESCALATED = dict(stop_result="succeeded_escalated", trip=True)
+_NOMINAL = dict(stop_result="stopped", trip=True)
+_ESCALATED = dict(stop_result="stopped_escalated", trip=True)
 _LOSS = ({"source_id": "gripper.io", "source_epoch": "e1", "kind": "stale"},)
 _THROUGH_CANCEL = {"success_through_stage_id": "controller_goal_cancel"}
 
@@ -467,18 +517,16 @@ _THROUGH_CANCEL = {"success_through_stage_id": "controller_goal_cancel"}
         # Never Success from a match or Stop acceptance alone, nor from
         # unknown or failed containment, even with a threshold.
         ("motion.move_until_signal", _row(None, trip=True), _THROUGH_CANCEL, (False, "failed")),
-        ("motion.move_until_signal", _row("failed", stop_result="partial", trip=True),
-         _THROUGH_CANCEL, (False, "failed")),
-        ("motion.move_until_signal", _row("failed", stop_result="failed_uncontained", trip=True),
+        ("motion.move_until_signal", _row("failed", stop_result="some_failed", trip=True),
          _THROUGH_CANCEL, (False, "failed")),
         # Source loss: Failure through normal failure handling (46c).
-        ("motion.move_until_signal", _row("failed", stop_result="succeeded_nominal", losses=_LOSS),
+        ("motion.move_until_signal", _row("failed", stop_result="stopped", losses=_LOSS),
          {}, (False, "failed")),
         ("motion.move_until_signal", _row("no_signal_trip", losses=_LOSS), {}, (False, "failed")),
         ("motion.move_until_signal", _row("failed", **_ESCALATED, losses=_LOSS),
          _THROUGH_CANCEL, (False, "failed")),
         # Results of another operation do not count.
-        ("motion.move_until_signal", _row("signal_trip", **_NOMINAL, operation_id="x"), {},
+        ("motion.move_until_signal", _row("signal_trip", **_NOMINAL, operation_id=2), {},
          (False, "failed")),
     ],
 )
@@ -518,105 +566,160 @@ def test_success_through_stage_threshold(parameters, contained, expected) -> Non
     assert not result.effect_uncertain
 
 
-def _scope_key(participant: str, operation: str = "op") -> dict[str, Any]:
-    return {
-        "origin_stop_generation": 1,
-        "origin_stop_id": "stop",
-        "subject": {"kind": "participant", "operation_id": operation, "participant_id": participant},
-    }
+def test_participant_stops_reads_each_covered_participants_stop_object() -> None:
+    operation = _operation(_row("failed", **_ESCALATED), stops={
+        "arm": _stop("controlled_stop"), "arm2": None, "other": _stop(phase="stopping")})
+    stops = participant_stops(operation)
+    assert set(stops) == {_PARTICIPANTS["arm"], _PARTICIPANTS["other"]}
+    assert stops[_PARTICIPANTS["arm"]]["containing_stage_id"] == "controlled_stop"
+    malformed = _operation(stops={"arm": {**_stop(), "phase": "halted"}})
+    with pytest.raises(ValueError):
+        participant_stops(malformed)
+    with pytest.raises(ValueError):
+        participant_stops(_operation(stops={"arm": {**_stop(), "extra": 1}}))
 
 
-def _attempt(participant: str, stage_id: str, index: int, **patch: Any) -> dict[str, Any]:
-    return {
-        "authority": "authoritative",
-        "error": None,
-        "operation_id": patch.pop("operation", "op"),
-        "outcome": "succeeded",
-        "participant_id": participant,
-        "participant_stop_invocation_plan_digest": f"plan-{participant}",
-        "scope_key": _scope_key(participant, patch.pop("scope_operation", "op")),
-        "stage": {"stage_id": stage_id, "stage_index": index, "stage_kind": "x", "action_class": "controlled"},
-        **patch,
-    }
+def test_interrupt_stop_pending_while_any_covered_participant_is_stopping() -> None:
+    assert interrupt_stop_pending(_operation(stops={
+        "arm": _stop("controlled_stop"), "arm2": _stop(phase="stopping")}))
+    assert not interrupt_stop_pending(_operation(stops={
+        "arm": _stop("controlled_stop"), "arm2": _stop(phase="failed")}))
+    assert not interrupt_stop_pending(_operation(stops={"arm": None}))
+    # A malformed object is not a wait; the mapping refuses it.
+    assert not interrupt_stop_pending(_operation(stops={"arm": {"phase": "stopping"}}))
+    result = map_interrupt_result(
+        "motion.move_until_signal", {}, _operation(
+            _row("signal_trip", **_NOMINAL), stops={"arm": {"phase": "stopping"}}),
+        stop_chain=_CHAIN)
+    assert (result.reason_code, result.effect_uncertain) == (
+        "motion_interrupt_result_invalid", True)
 
 
-def _terminal(*attempts: dict[str, Any], **patch: Any) -> dict[str, Any]:
-    return {
-        "api_version": "manyforge.stop_terminal_projection.v1",
-        "details_truncated": False,
-        "stop_id": "stop",
-        "stop_generation": 1,
-        "stop_certificate_id": "cert",
-        "stop_certificate_revision": 1,
-        "attempted_stages": list(attempts),
-        "participant_settlement": [
-            {"scope_key": _scope_key(name), "participant_stop_invocation_plan_digest": f"plan-{name}"}
-            for name in ("arm", "arm2")
-        ],
-        **patch,
-    }
+@pytest.mark.parametrize("row", [
+    _row("signal_trip", **_NOMINAL), _row("failed", **_ESCALATED), _row("no_signal_trip"),
+])
+def test_operator_attribution_is_an_operator_hold_not_a_rule_outcome(row) -> None:
+    operation = _operation(row, stops={"arm": _stop("controlled_stop", attribution="operator")})
+    assert map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL, operation,
+        stop_chain=_CHAIN) is None
 
 
-def test_contained_stage_reads_authoritative_attempts_of_the_rows_own_certificate() -> None:
+@pytest.mark.parametrize("attribution", ["rule", "program_own"])
+def test_rule_own_plan_maps_nominal_and_escalated_trips(attribution) -> None:
+    nominal = map_interrupt_result(
+        "motion.move_until_signal", {},
+        _operation(_row("signal_trip", **_NOMINAL),
+                   stops={"arm": _stop("controlled_stop", attribution=attribution)}),
+        stop_chain=_CHAIN)
+    assert (nominal.success, nominal.node_outcome) == (True, "signal_trip")
+    escalated = map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL,
+        _operation(_row("failed", **_ESCALATED), stops={"arm": _stop(
+            "controller_goal_cancel", attribution=attribution, escalated=True)}),
+        stop_chain=_CHAIN)
+    assert (escalated.success, escalated.node_outcome) == (True, "signal_trip")
+    assert "controller_goal_cancel" in escalated.message
+    beyond = map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL,
+        _operation(_row("failed", **_ESCALATED), stops={"arm": _stop(
+            "software_hard_stop", attribution=attribution, escalated=True)}),
+        stop_chain=_CHAIN)
+    assert (beyond.success, beyond.reason_code) == (False, "motion_interrupt_stop_failed")
+
+
+@pytest.mark.parametrize(
+    "row", [_row("signal_trip", **_NOMINAL), _row("failed", **_ESCALATED)]
+)
+@pytest.mark.parametrize("mode", ["ordinary", "fault", "hard", "spring_return"])
+def test_a_non_interrupt_stop_is_an_interrupt_fault(row, mode) -> None:
+    # The participant stopped under a non-interrupt plan: the rule's
+    # criterion cannot be judged against it.
+    result = map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL,
+        _operation(row, stops={"arm": _stop("controlled_stop", mode=mode)}),
+        stop_chain=_CHAIN)
+    assert (result.success, result.node_outcome, result.reason_code) == (
+        False, "failed", "interrupt_fault")
+    assert not result.effect_uncertain
+
+
+def test_a_trip_joining_an_earlier_interrupt_stop_is_judged_by_the_threshold() -> None:
+    # Join case: the participant was already stopping under an earlier
+    # interrupt event (a lower-priority rule); this rule's row names its own
+    # later event. The trip is judged by this rule's threshold with the
+    # participant's own containing stage, as in the base.
     row = _row("failed", **_ESCALATED)
-    terminal = _terminal(
-        _attempt("arm", "controlled_stop", 0, outcome="failed"),
-        _attempt("arm", "software_hard_stop", 2, authority="superseded_late"),
-        _attempt("arm", "software_hard_stop", 2, error={"code": "e"}),
-        _attempt("other", "software_hard_stop", 2, operation="other", scope_operation="other"),
-        _attempt("arm", "controller_goal_cancel", 1),
-    )
-    assert contained_stages_from_stop_terminal(row, terminal, operation_id="op") == {
-        "arm": "controller_goal_cancel"
-    }
-    assert contained_stage_from_stop_terminal(row, terminal, operation_id="op") == (
-        "controller_goal_cancel"
-    )
-    # Another certificate, or a bounded summary without details: not proven.
-    assert contained_stages_from_stop_terminal(
-        row, {**terminal, "stop_certificate_revision": 2}, operation_id="op") is None
-    assert contained_stages_from_stop_terminal(
-        row, {**terminal, "details_truncated": True}, operation_id="op") is None
-    # Another Stop identity or generation: not proven.
-    for patch in ({"stop_id": "stop-2"}, {"stop_generation": 2}, {"stop_generation": None}):
-        assert contained_stages_from_stop_terminal(
-            row, {**terminal, **patch}, operation_id="op") is None
-    assert contained_stages_from_stop_terminal(
-        {**row, "stop_generation": None}, terminal, operation_id="op") is None
-    # A plan digest that is not the participant's own: not proven.
-    wrong = _terminal(_attempt("arm", "controller_goal_cancel", 1,
-                               participant_stop_invocation_plan_digest="plan-other"))
-    assert contained_stages_from_stop_terminal(row, wrong, operation_id="op") is None
-    # Natural finish / pre-dispatch no-effect: no attempt, no containing stage.
-    assert contained_stages_from_stop_terminal(row, _terminal(), operation_id="op") == {}
-    assert contained_stage_from_stop_terminal(row, _terminal(), operation_id="op") is None
+    row["stop_event_id"] = 9
+    operation = _operation(row, stops={
+        "arm": _stop("controller_goal_cancel", stop_event_id=4, escalated=True)})
+    within = map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL, operation, stop_chain=_CHAIN)
+    assert within.success and within.node_outcome == "signal_trip"
+    beyond = map_interrupt_result(
+        "motion.move_until_signal", {"success_through_stage_id": "controlled_stop"},
+        operation, stop_chain=_CHAIN)
+    assert (beyond.success, beyond.reason_code) == (False, "motion_interrupt_stop_failed")
+
+
+def test_a_participant_stopped_by_a_non_interrupt_plan_fails_a_coordinated_trip() -> None:
+    result = map_interrupt_result(
+        "motion.move_until_signal", {},
+        _operation(_row("signal_trip", **_NOMINAL), stops={
+            "arm": _stop("controlled_stop"),
+            "arm2": _stop("controlled_stop", mode="ordinary")}),
+        stop_chain=_CHAIN)
+    assert result.reason_code == "interrupt_fault"
+
+
+def test_a_failed_participant_fails_with_the_rows_error_code() -> None:
+    row = _row("failed", stop_result="some_failed", trip=True,
+               error={"code": "participant_stop_cascade_exhausted", "message": "", "details": {}})
+    result = map_interrupt_result(
+        "motion.move_until_signal", _THROUGH_CANCEL,
+        _operation(row, stops={"arm": _stop(phase="failed")}),
+        stop_chain=_CHAIN)
+    assert (result.success, result.reason_code, result.effect_uncertain) == (
+        False, "participant_stop_cascade_exhausted", True)
+
+
+# Participant ids are objects {operation_id, ordinal} (contract 1.5); the
+# tests name them and key results by the (operation_id, ordinal) tuple.
+_PARTICIPANTS = {"arm": (1, 1), "arm2": (1, 2), "other": (2, 1)}
+
+
+def _pid(participant: str) -> dict[str, int]:
+    operation_id, ordinal = _PARTICIPANTS[participant]
+    return {"operation_id": operation_id, "ordinal": ordinal}
 
 
 def test_coordinated_stop_is_judged_per_participant() -> None:
     row = _row("failed", **_ESCALATED)
-    terminal = _terminal(
-        _attempt("arm", "controlled_stop", 0),
-        _attempt("arm2", "software_hard_stop", 2),
-    )
-    stages = contained_stages_from_stop_terminal(row, terminal, operation_id="op")
-    assert stages == {"arm": "controlled_stop", "arm2": "software_hard_stop"}
-    # No single guessed stage for several participants.
-    assert contained_stage_from_stop_terminal(row, terminal, operation_id="op") is None
-    assert contained_stage_from_stop_terminal(
-        row, terminal, operation_id="op", participant_id="arm2") == "software_hard_stop"
-    chains = {"arm": _CHAIN, "arm2": _CHAIN}
+    operation = _operation(row, stops={
+        "arm": _stop("controlled_stop"),
+        "arm2": _stop("software_hard_stop", escalated=True),
+    })
+    chains = {_PARTICIPANTS["arm"]: _CHAIN, _PARTICIPANTS["arm2"]: _CHAIN}
     within = map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
-        _operation(row), stop_chain=chains, contained_stage_id=stages)
+        operation, stop_chain=chains)
     assert within.success and within.node_outcome == "signal_trip"
     beyond = map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "controller_goal_cancel"},
-        _operation(row), stop_chain=chains, contained_stage_id=stages)
+        operation, stop_chain=chains)
     assert (beyond.success, beyond.reason_code) == (False, "motion_interrupt_stop_failed")
     unproven = map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
-        _operation(row), stop_chain={"arm": _CHAIN}, contained_stage_id=stages)
+        operation, stop_chain={_PARTICIPANTS["arm"]: _CHAIN})
     assert unproven.reason_code == "motion_interrupt_containing_stage_unproven"
+    # One participant stopped under a non-interrupt plan.
+    other = map_interrupt_result(
+        "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
+        _operation(row, stops={
+            "arm": _stop("controlled_stop"),
+            "arm2": _stop("software_hard_stop", mode="ordinary", escalated=True)}),
+        stop_chain=chains)
+    assert other.reason_code == "interrupt_fault"
 
 
 _MOTION = "execution.trajectory.execute"
@@ -630,10 +733,10 @@ def _targets_reply(
         motion_command["stop_response_error"] = {"code": "unavailable", "message": "x", "details": {}}
     return {
         "ok": True,
-        "identity": {"owner_epoch": "kernel-1", "retained_bundle_id": "bundle-1",
+        "identity": {"retained_bundle_id": "bundle-1",
                      "graph_revision": graph},
         "targets": {
-            "schema_version": "manyforge.execution_targets.v4",
+            "schema_version": "manyforge.execution_targets.v5",
             "components": [{"controllable_component_id": "arm.component", "targets": [
                 {"command_target_id": "arm.target", "operation_capability_id": _MOTION,
                  "presentation": "motion", "command": motion_command},
@@ -657,26 +760,25 @@ def _chains_from_targets(reply: dict[str, Any], **participant: Any):
     port._kernel = SimpleNamespace(targets=lambda: reply)  # noqa: SLF001
     capture = SimpleNamespace(retained_bundle_id="bundle-1", graph_revision="graph-1")
     port._context = lambda run_id: SimpleNamespace(capture=capture)  # noqa: SLF001
-    task = SimpleNamespace(identity=SimpleNamespace(program_run_id="run"))
+    task = SimpleNamespace(identity=SimpleNamespace(program_run_id=1))
     row = _row("failed", **_ESCALATED)
-    operation = {"operation_id": "op", "participants": [{
-        "participant_id": "arm", "controllable_component_id": "arm.component",
+    operation = {"operation_id": 1, "participants": [{
+        "participant_id": _pid("arm"), "controllable_component_id": "arm.component",
         "command_target_id": "arm.target", "capability_id": _MOTION,
         "control_binding_id": "arm.binding", "control_binding_revision": "rev-1",
-        "io_rule_outcomes": [row], **participant,
+        "io_rule_outcomes": [row],
+        "stop": _stop("software_hard_stop", escalated=True), **participant,
     }]}
     chains = port._interrupt_stop_chains(task, operation)  # noqa: SLF001
-    stages = contained_stages_from_stop_terminal(
-        row, _terminal(_attempt("arm", "software_hard_stop", 2)), operation_id="op")
     return chains, map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
-        operation, stop_chain=chains, contained_stage_id=stages)
+        operation, stop_chain=chains)
 
 
 def test_stop_chain_comes_from_the_used_targets_motion_command() -> None:
     # The qualified stage order of the exact binding the operation used.
     chains, result = _chains_from_targets(_targets_reply(_STOP_RESPONSE))
-    assert chains == {"arm": _CHAIN}
+    assert chains == {_PARTICIPANTS["arm"]: _CHAIN}
     assert (result.success, result.node_outcome) == (True, "signal_trip")
     _chains, beyond = _chains_from_targets(_targets_reply({
         **_STOP_RESPONSE, "stages": _STOP_RESPONSE["stages"][:2]}))
@@ -711,13 +813,13 @@ def test_unavailable_or_foreign_stop_chain_is_unproven(reply, participant) -> No
 
 
 def test_failure_reasons_and_effect_uncertainty() -> None:
-    loss = _map("motion.move_until_signal", _row("failed", stop_result="succeeded_nominal",
+    loss = _map("motion.move_until_signal", _row("failed", stop_result="stopped",
                                                   losses=_LOSS))
     assert (loss.reason_code, loss.effect_uncertain) == ("interrupt_source_unavailable", False)
     assert "gripper.io" in loss.message
     uncontained = _map(
         "motion.move_until_signal",
-        _row("failed", stop_result="failed_uncontained", trip=True,
+        _row("failed", stop_result="some_failed", trip=True,
              error={"code": "motion_interrupt_backend_stop_failed", "message": "", "details": {}}),
     )
     assert uncontained.reason_code == "motion_interrupt_backend_stop_failed"
@@ -736,7 +838,69 @@ def test_failure_reasons_and_effect_uncertainty() -> None:
 
 
 def test_an_ordinary_stop_keeps_the_existing_stop_handling() -> None:
-    assert _map("motion.move_until_signal", _row("stopped", stop_result="succeeded_nominal")) is None
+    assert _map("motion.move_until_signal", _row("stopped", stop_result="stopped")) is None
+
+
+def _ended(state: str, *rows: dict[str, Any]) -> dict[str, Any]:
+    """An operation read whose one participant reports the terminal ``state``."""
+
+    operation = _operation(*rows)
+    operation["participants"][0]["state"] = state
+    return operation
+
+
+# OD-241: a motion that did not run to its end and left no rule result.
+@pytest.mark.parametrize("state", ["stopped", "cancelled_pre_dispatch", "interrupted"])
+def test_a_stop_before_the_rule_was_armed_keeps_the_ordinary_stop_handling(state) -> None:
+    # Case 1: an operator Stop or Halt before the dispatch barrier armed the rule.
+    for node_id in ("motion.move_until_signal", "motion.probe_search"):
+        assert map_interrupt_result(node_id, {}, _ended(state), stop_chain=_CHAIN) is None
+
+
+def test_a_refused_arm_keeps_the_motions_own_failure() -> None:
+    # Case 2: the signal was already on at the start; the Kernel ended the
+    # operation intervention required with its own typed error, no rule row.
+    for node_id in ("motion.move_until_signal", "motion.probe_search"):
+        assert map_interrupt_result(
+            node_id, {}, _ended("intervention_required"), stop_chain=_CHAIN) is None
+        assert map_interrupt_result(node_id, {}, _ended("failed"), stop_chain=_CHAIN) is None
+
+
+@pytest.mark.parametrize("state", ["stopped", "failed", "intervention_required"])
+@pytest.mark.parametrize("trip", [False, True])
+def test_a_cancelled_takeovers_removed_rule_keeps_the_ordinary_handling(state, trip) -> None:
+    # Case 3: the rule of a take-over cancelled before its hand-over was
+    # removed with it: one row, retired, with neither end cause nor Stop result.
+    row = _row(None, trip=trip)
+    assert map_interrupt_result(
+        "motion.move_until_signal", {}, _ended(state, row), stop_chain=_CHAIN) is None
+
+
+def test_a_completed_motion_without_a_rule_result_is_still_missing() -> None:
+    # It would have run unwatched: no rule row, or one with no end cause.
+    for operation in (_ended("completed"), _ended("completed", _row(None, trip=True))):
+        missing = map_interrupt_result(
+            "motion.move_until_signal", {}, operation, stop_chain=_CHAIN)
+        assert missing is not None and not missing.success and missing.effect_uncertain
+        assert missing.reason_code == "motion_interrupt_result_missing"
+
+
+def test_more_than_one_row_or_a_finalized_row_is_mapped_as_before() -> None:
+    # Two rows are inconsistent, also for a motion that did not complete.
+    two = map_interrupt_result(
+        "motion.move_until_signal", {}, _ended("stopped", _row(None), _row(None)),
+        stop_chain=_CHAIN)
+    assert two is not None and two.reason_code == "motion_interrupt_result_missing"
+    assert two.effect_uncertain
+    # A row with an end cause or a Stop result keeps its own mapping.
+    finalized = map_interrupt_result(
+        "motion.move_until_signal", {}, _ended("stopped", _row(None, stop_result="stopped",
+                                                               trip=True)),
+        stop_chain=_CHAIN)
+    assert finalized is not None and not finalized.success
+    assert map_interrupt_result(
+        "motion.move_until_signal", {}, _ended("stopped", _row("stopped", stop_result="stopped")),
+        stop_chain=_CHAIN) is None
 
 
 # Compact BB evidence ----------------------------------------------------------
@@ -744,13 +908,11 @@ def test_an_ordinary_stop_keeps_the_existing_stop_handling() -> None:
 
 def _bb_scope(**overrides: Any) -> dict[str, Any]:
     return {
-        "owner_epoch": "kernel-1",
-        "program_runner_owner_epoch": "runner-1",
         "program_binding_id": "sha256:" + "a" * 64,
         "active_publication_generation": 3,
         "cycle_generation": 7,
         "claim_generation": 2,
-        "program_run_id": "run-1",
+        "program_run_id": 1,
         **overrides,
     }
 
@@ -802,7 +964,6 @@ def test_trip_bb_evidence_must_match_its_causal_acquisition() -> None:
         {**_trip_bb(), "extra": 1},
         {k: v for k, v in _trip_bb().items() if k != "received_at_ns"},
         _trip_bb(scope={**_bb_scope(), "extra": 1}),
-        _trip_bb(scope=_bb_scope(owner_epoch="kernel-2")),
         _trip_bb(scope=_bb_scope(claim_generation=None)),
         _trip_bb(scope=_bb_scope(active_publication_generation=0)),
         _trip_bb(scope=_bb_scope(cycle_generation="7")),
@@ -850,7 +1011,7 @@ def _loss_bb(**overrides: Any) -> dict[str, Any]:
 def test_loss_bb_evidence_names_the_unavailable_key() -> None:
     loss = {"source_id": "program_bbkeys", "source_epoch": "bb-epoch-1", "kind": "unavailable",
             "blackboard": _loss_bb()}
-    result = _map("motion.move_until_signal", _row("failed", stop_result="succeeded_nominal",
+    result = _map("motion.move_until_signal", _row("failed", stop_result="stopped",
                                                     losses=(loss,)))
     assert result.reason_code == "interrupt_source_unavailable"
     assert result.message.endswith("key cell.door_open unavailable (last frame 0)")
@@ -878,33 +1039,26 @@ def test_malformed_loss_bb_evidence_is_refused(blackboard) -> None:
     assert result.reason_code == "motion_interrupt_result_invalid"
 
 
-@pytest.mark.parametrize("stop_result", ["succeeded_nominal", "succeeded_escalated", "failed_uncontained", None])
+@pytest.mark.parametrize("stop_result", ["stopped", "stopped_escalated", "some_failed", None])
 def test_interrupted_fault_is_a_failure_never_a_trip_success(stop_result) -> None:
     row = _row("interrupted_fault", stop_result=stop_result, trip=True,
                error={"code": "motion_interrupted_fault", "message": "", "details": {}})
     result = map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
-        _operation(row), stop_chain=_CHAIN, contained_stage_id="controlled_stop")
+        _operation(row, stops=_covered(row, "controlled_stop")), stop_chain=_CHAIN)
     assert result is not None and not result.success
     assert result.node_outcome == "failed"
     assert result.reason_code == "motion_interrupted_fault"
-    assert result.effect_uncertain == (stop_result in {None, "failed_uncontained"})
+    assert result.effect_uncertain == (stop_result in {None, "some_failed"})
 
 
-def test_a_bounded_summary_without_attempts_is_unknown_and_fails() -> None:
-    # No attempted_stages (bounded summary) is unknown, never
-    # inferred from the configured chain.
+def test_an_escalated_trip_without_a_containing_stage_is_unproven() -> None:
+    # No stage contained the participant: unknown, never inferred from the
+    # configured chain.
     row = _row("failed", **_ESCALATED)
-    summary = {
-        key: value for key, value in _terminal(_attempt("arm", "controlled_stop", 0)).items()
-        if key != "attempted_stages"
-    }
-    summary["details_truncated"] = True
-    assert contained_stages_from_stop_terminal(row, summary, operation_id="op") is None
     result = map_interrupt_result(
         "motion.move_until_signal", {"success_through_stage_id": "software_hard_stop"},
-        _operation(row), stop_chain=_CHAIN,
-        contained_stage_id=contained_stages_from_stop_terminal(row, summary, operation_id="op"))
+        _operation(row, stops={"arm": _stop(None, escalated=True)}), stop_chain=_CHAIN)
     assert (result.success, result.reason_code) == (
         False, "motion_interrupt_containing_stage_unproven")
 

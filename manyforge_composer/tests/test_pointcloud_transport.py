@@ -34,18 +34,16 @@ CELL_ID: Final = "isaac.cell.1"
 class _HeadlessClient:
     def __init__(self) -> None:
         self.cell_id = CELL_ID
-        self.owner_epoch = "scene.epoch.1"
         self.generation = 7
         self.fresh = True
 
     def scene(self) -> dict[str, object]:
         return {
-            "schema_version": "manyforge.scene_projection.v1",
+            "schema_version": "manyforge.scene_projection.v2",
             "logical_scene": {
                 "available": self.fresh,
                 "freshness": "fresh" if self.fresh else "stale",
                 "known_gaps": [],
-                "source_owner_epoch": self.owner_epoch,
                 "source_generation": self.generation,
                 "payload": {
                     "api_version": "manyforge.logical_scene_source.v1",

@@ -47,12 +47,10 @@ Value Intent() {
       {"claim_kind", Value("authoring_mutation")},
       {"expected_admission_generation", Value(1.0)},
       {"intervention_evidence", Value(nullptr)},
-      {"owner_epoch", Value("owner-1")},
       {"owner_role", Value("authoring_owner")},
-      {"owner_transaction_id", Value("transaction-1")},
+      {"owner_transaction_id", Value(nullptr)},
       {"program_cycle_evidence", Value(nullptr)},
-      {"request_id", Value("request-1")},
-      {"request_payload_digest", Value(std::string(kDigest))},
+      {"request_key", Value("c0000000000000000000000000000a01")},
       {"scope", Value(Value::Object{{"configurations", Value(Value::Array{})},
                                      {"resources", Value(Value::Array{})}})}});
 }
@@ -62,7 +60,6 @@ Value ResetReadiness(Value accepted) {
   for (auto& [name, value] : fields) {
     if (name != "program_cycle_status") continue;
     value = Value(Value::Object{
-        {"program_runner_owner_epoch", Value("runner.1")},
         {"cycle_generation", Value(3.0)}, {"state", Value("resetting")},
         {"program_run_id", Value(nullptr)}, {"cycle_claim_generation", Value(nullptr)},
         {"terminal_or_settlement_reference", Value(nullptr)},
@@ -74,21 +71,12 @@ Value Release() {
   return Value(Value::Object{
       {"acquired_admission_generation", Value(1.0)},
       {"claim_generation", Value(1.0)},
-      {"owner_epoch", Value("owner-1")},
       {"owner_role", Value("authoring_owner")},
-      {"owner_transaction_id", Value("transaction-1")},
-      {"request_id", Value("release-1")},
-      {"request_payload_digest", Value(std::string(kDigest))},
+      {"owner_transaction_id", Value(nullptr)},
+      {"request_key", Value("c0000000000000000000000000000a02")},
       {"settlement",
        Value(Value::Object{{"evidence_digest", Value(std::string(kDigest))},
                            {"settlement_kind", Value("owner_commit")}})}});
-}
-Value Reconcile() {
-  return Value(Value::Object{
-      {"current_owner_epochs", Value(Value::Array{})},
-      {"kernel_owner_epoch", Value("kernel-1")},
-      {"reconciliation_evidence_digest", Value(std::string(kDigest))},
-      {"retained_claims", Value(Value::Array{})}});
 }
 Value RecoveryQuery() {
   return Value(Value::Object{
@@ -129,12 +117,6 @@ public:
     return core::Result<core::AuthoringAdmissionDTO>::Ok(
         {true, core::AdmissionGeneration(9U)});
   }
-  core::Result<core::AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
-      const core::CellAdmissionReconcileDTO &) override {
-    ++calls;
-    return core::Result<core::AuthoringAdmissionDTO>::Ok(
-        {true, core::AdmissionGeneration(10U)});
-  }
   core::Result<core::CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
       const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
@@ -144,9 +126,7 @@ public:
         query.intent.expected_admission_generation, 42};
     return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
         {core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact,
-         core::RequestOwnerEpoch("kernel-1"), core::AdmissionGeneration(8U),
-         claim, std::nullopt, std::nullopt, {claim},
-         {{query.intent.owner_role, query.intent.owner_epoch}}});
+         core::AdmissionGeneration(8U), claim, std::nullopt, {claim}});
   }
   core::Result<core::OperatorAlarmAttentionAcceptedDTO>
   PublishOperatorAlarmAttention(
@@ -154,7 +134,7 @@ public:
     ++calls;
     attention = snapshot;
     return core::Result<core::OperatorAlarmAttentionAcceptedDTO>::Ok(
-        {snapshot.owner_epoch, snapshot.generation});
+        {snapshot.generation});
   }
   mutable std::size_t calls{};
   std::size_t acquire_calls{};
@@ -180,19 +160,18 @@ Value Attention(Value member,
   return Value(Value::Object{
       {"active_configuration", std::move(configuration)},
       {"cell_id", Value("cell.test")},
+      {"disk_cannot_keep_records", Value(true)},
       {"generation", Value(5.0)},
       {"members", Value(Value::Array{std::move(member)})},
-      {"owner_epoch", Value("alarm.owner.1")},
       {"owner_host_boot_id", Value("boot.test")},
-      {"owner_incarnation_us", Value(42.0)},
       {"reconciled", Value(true)},
       {"schema_version",
        Value(std::string(core::kOperatorAlarmAttentionSchemaVersion))}});
 }
 
-TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
+TEST(CellAdmissionCommandCodec, DecodesAllFiveStrictCommands) {
   RecordingKernel kernel;
-  const std::array<Value, 6> commands{
+  const std::array<Value, 5> commands{
       Value(Value::Object{
           {"api_version",
            Value(std::string(kCellAdmissionCommandApiVersion))},
@@ -200,7 +179,6 @@ TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
       Envelope("cell_admission_update_readiness", Readiness()),
       Envelope("cell_admission_acquire", Intent()),
       Envelope("cell_admission_release", Release()),
-      Envelope("cell_admission_reconcile", Reconcile()),
       Envelope("cell_admission_recovery_receipt", RecoveryQuery())};
   for (const auto &command : commands) {
     const auto decoded =
@@ -210,7 +188,7 @@ TEST(CellAdmissionCommandCodec, DecodesAllSixStrictCommands) {
         cm::DispatchKernelCellAdmissionRpc(kernel, *decoded);
     EXPECT_FALSE(std::holds_alternative<core::ErrorDTO>(response));
   }
-  EXPECT_EQ(kernel.calls, 6U);
+  EXPECT_EQ(kernel.calls, 5U);
 }
 
 TEST(CellAdmissionCommandCodec,
@@ -223,10 +201,9 @@ TEST(CellAdmissionCommandCodec,
   ASSERT_TRUE(decoded.has_value());
   const auto response = cm::DispatchKernelCellAdmissionRpc(kernel, *decoded);
   ASSERT_TRUE(kernel.attention.has_value());
-  EXPECT_EQ(kernel.attention->owner_epoch, "alarm.owner.1");
   EXPECT_EQ(kernel.attention->owner_host_boot_id, "boot.test");
-  EXPECT_EQ(kernel.attention->owner_incarnation_us, 42U);
   EXPECT_EQ(kernel.attention->generation, 5U);
+  EXPECT_TRUE(kernel.attention->disk_cannot_keep_records);  // OD-215
   ASSERT_EQ(kernel.attention->members.size(), 1U);
   EXPECT_EQ(kernel.attention->members.front().resource_ids,
             std::vector<core::ResourceId>{core::ResourceId("robot.joint_1")});
@@ -247,10 +224,9 @@ TEST(CellAdmissionCommandCodec,
                    .active_configuration.has_value());
   EXPECT_EQ(ci::canonical_json(CellAdmissionResponseValue(decoded->command,
                                                           response)),
-            "{\"api_version\":\"manyforge.execution_command_response.v4\","
+            "{\"api_version\":\"manyforge.execution_command_response.v5\","
             "\"command\":\"cell_admission_publish_operator_alarm_attention\","
-            "\"ok\":true,\"operator_alarm_attention\":{\"generation\":5,"
-            "\"owner_epoch\":\"alarm.owner.1\"}}");
+            "\"ok\":true,\"operator_alarm_attention\":{\"generation\":5}}");
   // The Manager-child binary channel never forwards this publication.
   EXPECT_THROW(static_cast<void>(cm::EncodeKernelCellAdmissionRpcRequest(*decoded)),
                std::exception);
@@ -273,11 +249,10 @@ TEST(CellAdmissionCommandCodec, ProgramNodeEvidenceIsExactAcrossBothTransports) 
     if (key == "owner_role") value = Value("authored_scene_owner");
   }
   fields.emplace_back("program_node_evidence", Value(Value::Object{
-      {"program_runner_owner_epoch", Value("runner.owner")},
-      {"program_run_id", Value("run.1")},
+      {"program_run_id", Value(1.0)},
       {"parent_program_cycle_claim_generation", Value(7.0)},
       {"node_instance_id", Value("attach")},
-      {"node_attempt_id", Value(std::string(512U, 'a'))},
+      {"node_attempt_id", Value(9007199254740991.0)},
       {"owner_api", Value("scene.carried_attachment")}}));
   const auto packet = TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope("cell_admission_acquire", Value(fields))));
@@ -302,7 +277,7 @@ TEST(CellAdmissionCommandCodec, RejectsUnknownExtraTypeRangeEnumAndOversize) {
                    R"({"api_version":"manyforge.execution_command.v2","command":"cell_admission_get"})"),
                std::invalid_argument);
   EXPECT_FALSE(TryDecodeCellAdmissionCommand(
-                   R"({"api_version":"manyforge.execution_command.v3","command":"status"})")
+                   R"({"api_version":"manyforge.execution_command.v4","command":"status"})")
                    .has_value());
   auto extra = Readiness().as_object();
   extra.emplace_back("unknown", Value(false));
@@ -400,7 +375,6 @@ TEST(CellAdmissionCommandCodec, PrivateDtoAndResponseRoundTripsAreLossless) {
         Envelope("cell_admission_update_readiness", Readiness()),
         Envelope("cell_admission_acquire", Intent()),
         Envelope("cell_admission_release", Release()),
-        Envelope("cell_admission_reconcile", Reconcile()),
         Envelope("cell_admission_recovery_receipt", RecoveryQuery())}) {
     const auto packet =
         *TryDecodeCellAdmissionCommand(ci::canonical_json(command));
@@ -434,6 +408,48 @@ TEST(CellAdmissionCommandCodec, PrivateDtoAndResponseRoundTripsAreLossless) {
                std::invalid_argument);
 }
 
+// Acquire and release end with a presence byte for the Manager-Apply facts;
+// a packet without it (the previous shape) is refused.
+TEST(CellAdmissionCommandCodec, ClaimFactsFollowAPresenceByteOnThePrivateChannel) {
+  const auto acquire = *TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", Intent())));
+  auto acquire_bytes = cm::EncodeKernelCellAdmissionRpcRequest(acquire);
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(acquire_bytes).request,
+            acquire.request);
+  acquire_bytes.pop_back();
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(acquire_bytes),
+               std::invalid_argument);
+
+  // Only a Manager-Apply claim carries a candidate bundle.
+  const cm::KernelCellAdmissionRpcPacket foreign_candidate{
+      acquire.command,
+      cm::ManagerApplyClaimAcquireRequest{
+          std::get<core::CellAdmissionClaimIntentDTO>(acquire.request),
+          core::RetainedBundleId("bundle.candidate")}};
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(
+                   cm::EncodeKernelCellAdmissionRpcRequest(foreign_candidate)),
+               std::invalid_argument);
+
+  const auto release = *TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_release", Release())));
+  auto release_bytes = cm::EncodeKernelCellAdmissionRpcRequest(release);
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(release_bytes).request,
+            release.request);
+  release_bytes.pop_back();
+  EXPECT_THROW(cm::DecodeKernelCellAdmissionRpcRequest(release_bytes),
+               std::invalid_argument);
+
+  const cm::KernelCellAdmissionRpcPacket settled{
+      release.command,
+      cm::ManagerApplyClaimReleaseRequest{
+          std::get<core::CellAdmissionClaimReleaseDTO>(release.request),
+          {core::ApplyId(4U), core::ApplyGeneration(2U), true}}};
+  EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(
+                cm::EncodeKernelCellAdmissionRpcRequest(settled))
+                .request,
+            settled.request);
+}
+
 TEST(CellAdmissionCommandCodec, LongServiceClaimSurvivesJsonAndPrivateOwnerTransport) {
   const auto packet = *TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope("cell_admission_acquire", Intent())));
@@ -456,7 +472,7 @@ TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
       core::AuthoringAdmissionDTO{true, core::AdmissionGeneration(9U)}));
   EXPECT_EQ(
       admission,
-      R"({"api_version":"manyforge.execution_command_response.v4","authoring_admission":{"admission_generation":9,"authoring_allowed":true},"command":"cell_admission_release","ok":true})");
+      R"({"api_version":"manyforge.execution_command_response.v5","authoring_admission":{"admission_generation":9,"authoring_allowed":true},"command":"cell_admission_release","ok":true})");
 
   const auto packet = *TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope("cell_admission_acquire", Intent())));
@@ -474,7 +490,7 @@ TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
   EXPECT_EQ(
       ci::canonical_json(CellAdmissionResponseValue(
           "cell_admission_acquire", error)),
-      R"({"api_version":"manyforge.execution_command_response.v4","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale","producer":"kernel"},"ok":false})");
+      R"({"api_version":"manyforge.execution_command_response.v5","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale","producer":"kernel"},"ok":false})");
 
   auto payload = Envelope("cell_admission_release", Release()).as_object();
   for (auto &[key, value] : payload) {
@@ -664,15 +680,17 @@ TEST(CellAdmissionCommandCodec,
 
 TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
   const core::ProgramRunnerContactLossDTO loss{
-      core::RequestOwnerEpoch("manager.1"), core::RuntimeEpoch("runtime.1"),
-      {core::RequestOwnerEpoch("runner.1"), 3U, core::ProgramCycleStateDTO::kRunning,
-       core::ProgramRunId("run.1"), core::CellAdmissionClaimGeneration(7U), std::nullopt},
+      {3U, core::ProgramCycleStateDTO::kRunning,
+       core::ProgramRunNumber(1U), core::CellAdmissionClaimGeneration(7U), std::nullopt,
+       std::nullopt},
       "program_runner_liveness_probe", "Runner contact failed"};
-  const auto projection = ProgramRunnerLossValue(loss, core::RequestOwnerEpoch("kernel.1"));
-  EXPECT_EQ(projection.find_object_member("request_owner_epoch")->as_string(), "kernel.1");
+  const auto projection =
+      ProgramRunnerLossValue(loss, core::ApplicationStartId{0x3f9aU});
+  EXPECT_EQ(projection.find_object_member("application_start_id")->as_string(),
+            "0000000000003f9a");
   auto loss_fields = projection.as_object();
   std::erase_if(loss_fields, [](const auto& member) {
-    return member.first == "request_owner_epoch";
+    return member.first == "application_start_id";
   });
   const auto decode = [&](Value fault) {
     auto readiness = Readiness().as_object();
@@ -706,7 +724,7 @@ TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
 
 TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {
   const Value accepted(Value::Object{
-      {"request_owner_epoch", Value("operator.1")}, {"request_id", Value("reset.1")},
+      {"request_key", Value("c0000000000000000000000000000a03")},
       {"request_payload_digest", Value(std::string(kDigest))},
       {"reload_initial_scene", Value(true)}, {"reset_robot_position", Value(false)},
       {"reset_claim_generation", Value(5.0)}});
@@ -716,7 +734,8 @@ TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {
   const auto& readiness = std::get<core::CellAdmissionReadinessSnapshotDTO>(decoded->request);
   ASSERT_TRUE(readiness.program_cycle_status->accepted_reset);
   EXPECT_FALSE(readiness.program_cycle_status->program_run_id);
-  EXPECT_EQ(readiness.program_cycle_status->accepted_reset->request_id, core::RequestId("reset.1"));
+  EXPECT_EQ(readiness.program_cycle_status->accepted_reset->request_key,
+            *core::ParseRequestKey("c0000000000000000000000000000a03"));
   for (const auto name : {"reload_initial_scene", "reset_claim_generation"}) {
     auto fields = accepted.as_object();
     for (auto& [key, value] : fields) {
@@ -729,6 +748,200 @@ TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {
   EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope("cell_admission_update_readiness", ResetReadiness(Value(nullptr))))),
       std::invalid_argument);
+}
+
+// OD-139: a Program Reset claim carries the runner's current cycle status as
+// a sibling of its intent; no other claim kind may carry one.
+TEST(CellAdmissionCommandCodec, ProgramResetAcquireCarriesTheRunnerStatusBesideItsIntent) {
+  const Value accepted(Value::Object{
+      {"request_key", Value("c0000000000000000000000000000a03")},
+      {"request_payload_digest", Value(std::string(kDigest))},
+      {"reload_initial_scene", Value(true)}, {"reset_robot_position", Value(false)},
+      {"reset_claim_generation", Value(nullptr)}});
+  Value status(nullptr);
+  const auto readiness = ResetReadiness(accepted);
+  for (const auto& [name, value] : readiness.as_object()) {
+    if (name == "program_cycle_status") status = value;
+  }
+  auto intent_fields = Intent().as_object();
+  for (auto& [name, value] : intent_fields) {
+    if (name == "claim_kind") value = Value("program_reset");
+    if (name == "owner_role") value = Value("program_runner");
+  }
+  const Value reset_intent(std::move(intent_fields));
+  auto with_status = Envelope("cell_admission_acquire", reset_intent).as_object();
+  with_status.emplace_back("program_cycle_status", status);
+  const auto decoded = TryDecodeCellAdmissionCommand(ci::canonical_json(Value(with_status)));
+  ASSERT_TRUE(decoded.has_value());
+  const auto& request =
+      std::get<component_manager::detail::ProgramResetClaimAcquireRequest>(decoded->request);
+  EXPECT_EQ(request.intent.claim_kind, core::CellAdmissionClaimKindDTO::kProgramReset);
+  EXPECT_EQ(request.program_cycle_status.state, core::ProgramCycleStateDTO::kResetting);
+  EXPECT_EQ(request.program_cycle_status.cycle_generation, 3U);
+  ASSERT_TRUE(request.program_cycle_status.accepted_reset);
+  EXPECT_TRUE(request.program_cycle_status.accepted_reset->reload_initial_scene);
+  // The status is required for a Reset claim and refused for any other.
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", reset_intent))), std::invalid_argument);
+  auto foreign = Envelope("cell_admission_acquire", Intent()).as_object();
+  foreign.emplace_back("program_cycle_status", status);
+  EXPECT_THROW(TryDecodeCellAdmissionCommand(ci::canonical_json(Value(std::move(foreign)))),
+               std::invalid_argument);
+}
+
+Value WithMember(Value object, std::string_view name, Value replacement) {
+  auto fields = object.as_object();
+  for (auto& [key, value] : fields)
+    if (key == name) value = replacement;
+  return Value(std::move(fields));
+}
+
+Value TypedIntent(core::CellAdmissionClaimKindDTO kind, core::ApplicationRole role, Value id) {
+  auto intent = WithMember(Intent(), "claim_kind", Value(std::string(core::to_string(kind))));
+  intent = WithMember(std::move(intent), "owner_role",
+                      Value(std::string(core::ApplicationRoleText(role))));
+  intent = WithMember(std::move(intent), "owner_transaction_id", std::move(id));
+  if (kind == core::CellAdmissionClaimKindDTO::kProgramCycle)
+    intent = WithMember(std::move(intent), "program_cycle_evidence",
+                        Value(Value::Object{{"applied_program_revision", Value("program.1")},
+                                            {"draft_program_revision", Value("program.1")}}));
+  return intent;
+}
+
+Value TypedRelease(core::ApplicationRole role, Value id) {
+  auto release = WithMember(Release(), "owner_role",
+                            Value(std::string(core::ApplicationRoleText(role))));
+  return WithMember(std::move(release), "owner_transaction_id", std::move(id));
+}
+
+Value WithExtraDigest(Value object) {
+  auto fields = object.as_object();
+  fields.emplace_back("request_payload_digest", Value(std::string(kDigest)));
+  return Value(std::move(fields));
+}
+
+// Each role's transaction number travels as a JSON integer (or null for a role
+// without one) and survives JSON, the binary channel and the claim response.
+TEST(CellAdmissionCommandCodec, TypedTransactionIdRoundTripsPerRole) {
+  struct Case {
+    core::CellAdmissionClaimKindDTO kind;
+    core::ApplicationRole role;
+    std::optional<core::CellAdmissionOwnerTransactionId> id;
+  };
+  const std::array<Case, 5> cases{{
+      {core::CellAdmissionClaimKindDTO::kProgramCycle, core::ApplicationRole::kProgramRunner,
+       core::CellAdmissionOwnerTransactionId(core::ProgramRunNumber(7U))},
+      {core::CellAdmissionClaimKindDTO::kManagerApply, core::ApplicationRole::kManager,
+       core::CellAdmissionOwnerTransactionId(core::ApplyId(7U))},
+      {core::CellAdmissionClaimKindDTO::kManualOperation,
+       core::ApplicationRole::kManualOperationOwner,
+       core::CellAdmissionOwnerTransactionId(core::OperationNumber(7U))},
+      {core::CellAdmissionClaimKindDTO::kAuthoringMutation,
+       core::ApplicationRole::kAuthoringOwner, std::nullopt},
+      {core::CellAdmissionClaimKindDTO::kAuthoredScene,
+       core::ApplicationRole::kAuthoredSceneOwner, std::nullopt}}};
+  for (const auto& test : cases) {
+    const auto label = std::string(core::to_string(test.kind));
+    const Value wire_id = test.id ? Value(7.0) : Value(nullptr);
+    const auto packet = TryDecodeCellAdmissionCommand(ci::canonical_json(
+        Envelope("cell_admission_acquire", TypedIntent(test.kind, test.role, wire_id))));
+    ASSERT_TRUE(packet.has_value()) << label;
+    const auto& intent = std::get<core::CellAdmissionClaimIntentDTO>(packet->request);
+    EXPECT_EQ(intent.owner_transaction_id, test.id) << label;
+    EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(
+                  cm::EncodeKernelCellAdmissionRpcRequest(*packet))
+                  .request,
+              packet->request)
+        << label;
+    RecordingKernel kernel;
+    const auto response = cm::DispatchKernelCellAdmissionRpc(kernel, *packet);
+    ASSERT_TRUE(std::holds_alternative<core::CellAdmissionClaimDTO>(response)) << label;
+    const auto json = CellAdmissionResponseValue(packet->command, response);
+    const auto& wire_claim = *json.find_object_member("claim");
+    EXPECT_EQ(*wire_claim.find_object_member("intent")->find_object_member(
+                  "owner_transaction_id"),
+              wire_id)
+        << label;
+    EXPECT_EQ(wire_claim.find_object_member("intent")->find_object_member(
+                  "request_payload_digest"),
+              nullptr)
+        << label;
+    EXPECT_EQ(DecodeCellAdmissionClaim(ci::canonical_json(wire_claim)),
+              std::get<core::CellAdmissionClaimDTO>(response))
+        << label;
+
+    const auto release = TryDecodeCellAdmissionCommand(ci::canonical_json(
+        Envelope("cell_admission_release", TypedRelease(test.role, wire_id))));
+    ASSERT_TRUE(release.has_value()) << label;
+    EXPECT_EQ(std::get<core::CellAdmissionClaimReleaseDTO>(release->request).owner_transaction_id,
+              test.id)
+        << label;
+    EXPECT_EQ(cm::DecodeKernelCellAdmissionRpcRequest(
+                  cm::EncodeKernelCellAdmissionRpcRequest(*release))
+                  .request,
+              release->request)
+        << label;
+  }
+}
+
+// The decoders refuse a request digest, a text transaction id, an id for a
+// role without one, and a missing id for a kind that needs one.
+TEST(CellAdmissionCommandCodec, RefusesTheRetiredClaimIdentityShapes) {
+  const auto refused = [](std::string command, Value request) {
+    EXPECT_THROW(static_cast<void>(TryDecodeCellAdmissionCommand(
+                     ci::canonical_json(Envelope(std::move(command), std::move(request))))),
+                 std::invalid_argument);
+  };
+  const auto apply = core::CellAdmissionClaimKindDTO::kManagerApply;
+  const auto manager = core::ApplicationRole::kManager;
+  // The baselines decode.
+  ASSERT_TRUE(TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_acquire", TypedIntent(apply, manager, Value(3.0))))));
+  ASSERT_TRUE(TryDecodeCellAdmissionCommand(ci::canonical_json(
+      Envelope("cell_admission_release", TypedRelease(manager, Value(3.0))))));
+
+  refused("cell_admission_acquire", WithExtraDigest(Intent()));
+  refused("cell_admission_acquire",
+          WithExtraDigest(TypedIntent(apply, manager, Value(3.0))));
+  refused("cell_admission_release", WithExtraDigest(Release()));
+  refused("cell_admission_release", WithExtraDigest(TypedRelease(manager, Value(3.0))));
+
+  refused("cell_admission_acquire", TypedIntent(apply, manager, Value("3")));
+  refused("cell_admission_acquire", TypedIntent(apply, manager, Value("apply.3")));
+  refused("cell_admission_release", TypedRelease(manager, Value("3")));
+
+  refused("cell_admission_acquire", WithMember(Intent(), "owner_transaction_id", Value(1.0)));
+  refused("cell_admission_release", WithMember(Release(), "owner_transaction_id", Value(1.0)));
+  refused("cell_admission_acquire",
+          TypedIntent(core::CellAdmissionClaimKindDTO::kAuthoredScene,
+                      core::ApplicationRole::kAuthoredSceneOwner, Value(1.0)));
+
+  refused("cell_admission_acquire", TypedIntent(apply, manager, Value(nullptr)));
+  refused("cell_admission_acquire", TypedIntent(apply, manager, Value(0.0)));
+  auto missing = Intent().as_object();
+  std::erase_if(missing, [](const auto& member) { return member.first == "owner_transaction_id"; });
+  refused("cell_admission_acquire", Value(std::move(missing)));
+
+  // The offer id is typed by the offering role in the same way.
+  const auto intervention = [](Value offer_id) {
+    auto intent = TypedIntent(core::CellAdmissionClaimKindDTO::kInterventionOrRecovery,
+                              core::ApplicationRole::kInterventionOrRecoveryOwner, Value(nullptr));
+    return WithMember(
+        std::move(intent), "intervention_evidence",
+        Value(Value::Object{{"offer_digest", Value(std::string(kDigest))},
+                            {"offer_transaction_id", std::move(offer_id)},
+                            {"offering_owner_role",
+                             Value(std::string(core::ApplicationRoleText(
+                                 core::ApplicationRole::kProgramRunner)))},
+                            {"parent_program_cycle_claim_generation", Value(nullptr)}}));
+  };
+  const auto offered = TryDecodeCellAdmissionCommand(
+      ci::canonical_json(Envelope("cell_admission_acquire", intervention(Value(4.0)))));
+  ASSERT_TRUE(offered.has_value());
+  EXPECT_EQ(std::get<core::CellAdmissionClaimIntentDTO>(offered->request)
+                .intervention_evidence->offer_transaction_id,
+            core::CellAdmissionOwnerTransactionId(core::ProgramRunNumber(4U)));
+  refused("cell_admission_acquire", intervention(Value("4")));
 }
 
 } // namespace

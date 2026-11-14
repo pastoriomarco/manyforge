@@ -17,6 +17,7 @@ from manyforge_behavior.assistant_program_port import (
     ProgramModelTransportError,
     validate_program_snapshot_attachment,
 )
+from manyforge_headless_api.internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 from manyforge_headless_api.native import HeadlessCorePort
 
 
@@ -100,7 +101,7 @@ class OpenAICompatibleProgramModelTransport:
     """
 
     def __init__(self, *, client: httpx.Client | None = None) -> None:
-        self._client = client or httpx.Client()
+        self._client = client or httpx.Client(limits=INTERNAL_HTTP_CLIENT_LIMITS)
         self._owns_client = client is None
         self._closed = False
         self._lock = RLock()

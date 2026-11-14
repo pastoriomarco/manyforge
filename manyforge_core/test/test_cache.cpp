@@ -47,7 +47,7 @@ class TrajectoryCacheTest : public ::testing::Test {
 protected:
   static TrajectoryCacheKey key(const std::string &move_id) {
     auto request = testing::make_test_execute_request({"joint1", "joint2"},
-                                                      "run:cache-test");
+                                                      ProgramRunNumber(146U));
     request.move_id = move_id;
     return trajectory_cache_key(request);
   }
@@ -125,7 +125,7 @@ TEST_F(TrajectoryCacheTest, MultipleMovesIndependent) {
 
 TEST_F(TrajectoryCacheTest, EveryCompositeSlotDimensionPreventsAliasing) {
   auto baseline =
-      testing::make_test_execute_request({"joint1", "joint2"}, "run:slot-a");
+      testing::make_test_execute_request({"joint1", "joint2"}, ProgramRunNumber(147U));
   baseline.move_id = "move";
   std::vector<ExecuteRequestDTO> requests{baseline};
 
@@ -137,7 +137,7 @@ TEST_F(TrajectoryCacheTest, EveryCompositeSlotDimensionPreventsAliasing) {
       ProgramBindingId("program-binding:other");
   requests.push_back(changed);
   changed = baseline;
-  changed.binding.program_run_id = ProgramRunId("run:slot-b");
+  changed.binding.program_run_id = ProgramRunNumber(115U);
   requests.push_back(changed);
   changed = baseline;
   changed.move_id = "move-other";

@@ -26,7 +26,7 @@ def test_explicit_static_dir_resolves_when_built(tmp_path):
 
 
 def test_create_app_rejects_invalid_explicit_static_dir(tmp_path):
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
 
     with pytest.raises(RuntimeError, match="Explicit frontend static dir"):
         create_app(state, static_dir=str(tmp_path / "missing"))

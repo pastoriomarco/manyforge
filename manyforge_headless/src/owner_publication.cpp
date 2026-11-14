@@ -44,10 +44,6 @@ CanonicalValue Text(const std::string_view value,
   return CanonicalValue(std::string(value));
 }
 
-CanonicalValue OptionalText(const std::optional<std::string> &value) {
-  return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
-}
-
 CanonicalValue Unsigned(const std::uint64_t value, const std::string_view label,
                         const bool nonzero = false) {
   Require(value <= kMaximumSafeInteger && (!nonzero || value != 0U),
@@ -110,7 +106,8 @@ CanonicalValue PublicationTransaction(
               {"apply_generation",
                Unsigned(transaction.apply_generation.value(),
                         "apply_generation", true)},
-              {"apply_id", CanonicalValue(transaction.apply_id.value())},
+              {"apply_id", Unsigned(transaction.apply_id.value(), "apply_id",
+                                    true)},
               {"kind", CanonicalValue("named_apply")},
           });
         } else {
@@ -411,7 +408,7 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"apply_generation",
        Unsigned(intent.apply_generation.value(), "apply_generation", true)},
-      {"apply_id", CanonicalValue(intent.apply_id.value())},
+      {"apply_id", CanonicalValue(static_cast<double>(intent.apply_id.value()))},
       {"candidate_graph_revision",
        CanonicalValue(intent.candidate_graph_revision.value())},
       {"candidate_retained_bundle_id",
@@ -429,12 +426,8 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
            component_manager::ToString(intent.scene_initialization)))},
       {"request",
        CanonicalValue(CanonicalValue::Object{
-           {"correlation_id",
-            OptionalText(intent.request_context.correlation_id)},
-           {"request_id",
-            CanonicalValue(intent.request_context.request_id.value())},
-           {"request_owner_epoch",
-            CanonicalValue(intent.request_context.request_owner_epoch.value())},
+           {"request_key",
+            CanonicalValue(core::RequestKeyText(intent.request_context.request_key))},
            {"source_label",
             CanonicalValue(intent.request_context.source_label)},
        })},

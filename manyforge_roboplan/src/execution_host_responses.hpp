@@ -2,11 +2,12 @@
 
 #include <manyforge_core/types/io_activation_rule.hpp>
 #include <manyforge_core/types/motion_preview.hpp>
+#include <manyforge_core/runtime_collision_monitor.hpp>
 
 #include <exception>
 
 #include "execution_host_commands.hpp"
-#include <manyforge_core/stop_journal_projection_codec.hpp>
+#include <manyforge_core/stop_state.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_roboplan/retained_gripper_position_limits.hpp>
 
@@ -22,8 +23,7 @@ ErrorResponse(std::string code, std::string message,
 ExecutionCommandExceptionError(const std::exception &error);
 
 [[nodiscard]] CanonicalValue ExecutionOwnerNotReadyIdentityResponse(
-    const core::ResourceAddressedExecutionKernel &owner,
-    const core::RequestOwnerEpoch &owner_epoch);
+    const core::ResourceAddressedExecutionKernel &owner);
 
 [[nodiscard]] CanonicalValue PoseValue(const core::Pose3DTO &value);
 
@@ -40,15 +40,13 @@ SceneRevisionValue(const core::SceneRevision &value);
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
     const core::RuntimeParticipantBindingDTO &direct_control_binding,
-    const core::RequestOwnerEpoch &owner_epoch,
     const CanonicalValue &path_preview);
 
 [[nodiscard]] CanonicalValue CapabilityCommandPreviewReceiptValue(
     const core::CapabilityCommandPreviewResultDTO &preview,
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
-    const std::optional<RetainedGripperPositionLimits> &limits,
-    const core::RequestOwnerEpoch &owner_epoch);
+    const std::optional<RetainedGripperPositionLimits> &limits);
 
 [[nodiscard]] CanonicalValue
 MotionSpecValue(const core::MotionSpecDTO &motion);
@@ -77,100 +75,49 @@ ControlAcceptedValue(const core::OperationControlAcceptedDTO &value);
 [[nodiscard]] CanonicalValue
 StopAcceptedValue(const core::StopAcceptedDTO &value);
 
-[[nodiscard]] std::string_view StopProjectionStateName(
-    const core::StopDurableProjectionStateDTO state) noexcept;
-
-[[nodiscard]] std::string_view
-StopStatusStateName(const core::StopStatusStateDTO state) noexcept;
-
+/// `null` for an absent event id, else the number.
 [[nodiscard]] CanonicalValue
-StopCertificateRefValue(const core::StopCertificateRefDTO &value);
+StopEventIdValue(const std::optional<core::StopEventId> &value);
 
+/// Program execution scope `manyforge.program_execution_scope.v3`.
 [[nodiscard]] CanonicalValue
 ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value);
 
+/// The event stream `state` member `program_run_hold` (K18): null without a
+/// claimed run.
+[[nodiscard]] CanonicalValue
+ProgramRunHoldValue(const std::optional<core::ProgramRunHoldFactsDTO> &value);
+
+/// Appends `program_run_hold`, `last_stop_event_id` and
+/// `stop_progress_sequence` (K18) to a stream or `events` reply state.
+void AppendStopStreamFacts(CanonicalValue::Object &state,
+                           const core::StopStreamFactsDTO &facts);
+
+/// The event stream `state` member `operations` (OD-205 (b), OD-213): the
+/// Kernel's change counter, its compact faulted operations and every resident
+/// operation as `read` projects it, from memory. No progress, no times and no
+/// host log line (the `read` encoder keeps those). A resident operation whose
+/// encoded state exceeds `kOperationTableMaximumResidentOperationBytes` is
+/// listed with `operation: null`.
+[[nodiscard]] CanonicalValue
+OperationTableValue(const core::OperationTableDTO &table);
+
+/// Program execution selection `manyforge.program_execution_selection.v3`.
 [[nodiscard]] CanonicalValue ProgramSelectionAcceptedValue(
     const core::ProgramExecutionSelectionAcceptedDTO &value,
     const std::vector<std::string> &group_ids);
 
+/// `read_stop` reply `manyforge.execution_stop_status.v2` (K16).
 [[nodiscard]] CanonicalValue
-StopStatusSummaryValue(const core::StopStatusDTO &value);
+StopEventStatusValue(const core::StopEventStatusDTO &value);
 
-[[nodiscard]] CanonicalValue
-StopProjectionStatusValue(const core::StopDurableProjectionStatusDTO &value);
-
-[[nodiscard]] std::string_view
-StopCertificateResultName(core::StopCertificateResultDTO result) noexcept;
-
-[[nodiscard]] std::string_view
-StopStageOutcomeName(core::ParticipantStopStageOutcomeDTO outcome) noexcept;
-
-[[nodiscard]] std::string_view StopAttemptDispositionName(
-    const core::StopStageAttemptDispositionDTO disposition) noexcept;
-
-[[nodiscard]] std::string_view
-StopEvidenceStateName(const core::StopEvidenceItemStateDTO state) noexcept;
-
-[[nodiscard]] std::string_view StopStageAuthorityName(
-    const core::StopStageResultAuthorityDTO authority) noexcept;
-
-[[nodiscard]] std::string_view StopParticipantSettlementName(
-    const core::StopParticipantScopeFactsDTO::TerminalSettlementState
-        settlement) noexcept;
-
-[[nodiscard]] std::string_view
-StopSelectorKindName(const core::StopRequestedSelectorKindDTO kind) noexcept;
-
-[[nodiscard]] std::string_view
-MotionInterruptStopModeName(const core::MotionInterruptStopMode mode) noexcept;
-
-[[nodiscard]] CanonicalValue
-StopHistoryJsonValue(const core::JsonValueDTO &value);
-
-[[nodiscard]] CanonicalValue
-StopHistoryStructuredValue(const core::InterruptStructuredValue &value);
-
-[[nodiscard]] CanonicalValue
-StopHistoryAccelerationValue(const core::CoordinateAccelerationDTO &value);
-
-[[nodiscard]] CanonicalValue
-StopHistoryVelocityValue(const core::CoordinateVelocityDTO &value);
-
-[[nodiscard]] CanonicalValue
-StopHistoryScopeKeyValue(const core::StopScopeEntryKeyDTO &key);
-
-[[nodiscard]] CanonicalValue
-StopHistoryScopeKeyArray(const std::vector<core::StopScopeEntryKeyDTO> &keys);
-
-[[nodiscard]] CanonicalValue
-StopHistoryProfileValue(const core::MotionInterruptStopProfileDTO &profile);
-
-[[nodiscard]] CanonicalValue StopHistoryEvidenceSourceValue(
-    const core::ResolvedStopEvidenceSourceDTO &source);
-
-[[nodiscard]] CanonicalValue
-StopHistoryEvidenceItemValue(const core::StopEvidenceItemDTO &item);
-
-[[nodiscard]] CanonicalValue
-StopHistoryAttemptValue(const core::StopAttemptedStageResultDTO &attempt,
-                        const std::int64_t accepted_at_ns);
-
-[[nodiscard]] CanonicalValue
-StopHistorySettlementValue(const core::StopScopeEntryDTO &entry);
-
-[[nodiscard]] CanonicalValue StopTerminalHistoryProjectionValue(
-    const core::StopJournalTerminalProjectionDTO &projection,
-    const std::string_view source_owner_epoch,
-    const std::string_view durable_projection_digest,
-    const bool include_details);
-
-[[nodiscard]] CanonicalValue BoundedStopTerminalHistoryProjectionValue(
-    const core::StopJournalTerminalProjectionDTO &projection,
-    const std::string_view source_owner_epoch,
-    const std::string_view durable_projection_digest);
-
+/// `cell_stop_action` of `manyforge.execution_control_state.v8` (K19).
 [[nodiscard]] CanonicalValue
 CellStopActionValue(const core::CellStopActionProjectionDTO &value);
+
+/// The participant `stop` object of the operation state (§6.3.1).
+[[nodiscard]] CanonicalValue
+ParticipantStopObservationValue(const core::ParticipantStopObservationDTO &value);
 
 [[nodiscard]] CanonicalValue
 RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value);
@@ -192,11 +139,22 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value);
 
 [[nodiscard]] CanonicalValue
 OperationStateValue(const core::OperationStateDTO &value);
+/// `OperationStateValue` for the operations table: without the
+/// participants' `progress`, the operation's `updated_at_ns` and the
+/// collision log line.
+[[nodiscard]] CanonicalValue
+OperationTableStateValue(const core::OperationStateDTO &value);
+
+/// A Program run number, or null for manual work.
+[[nodiscard]] inline CanonicalValue
+RunValue(const std::optional<core::ProgramRunNumber> &run) {
+  return run ? CanonicalValue(static_cast<double>(run->value()))
+             : CanonicalValue(nullptr);
+}
 
 /// Both existing events siblings derive from this one actual owner snapshot.
 [[nodiscard]] CanonicalValue::Object InterruptRuleEventMetadataFields(
-    const std::optional<core::IoRuleStateProjectionDTO> &actual,
-    const core::RequestOwnerEpoch &owner_epoch);
+    const std::optional<core::IoRuleStateProjectionDTO> &actual);
 
 
 [[nodiscard]] CanonicalValue
@@ -204,6 +162,13 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page);
 
 [[nodiscard]] CanonicalValue RuntimeFaultsValue(
     const core::ResourceAddressedExecutionKernel &owner);
+
+/// OD-217: one robot's row of `status.runtime_collision_checks`: its check
+/// monitor's counters since its engine was built, and the check period.
+[[nodiscard]] CanonicalValue RuntimeCollisionChecksRowValue(
+    std::string_view controllable_component_id,
+    const core::RuntimeCollisionMonitorTimingMetrics &timing,
+    core::Duration check_period_ns);
 
 [[nodiscard]] CanonicalValue
 CoordinatePositionValue(const core::CoordinatePositionDTO &position);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { displayApplyId } from '../api/applicationIdentity';
 import { api } from '../api/client';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
@@ -129,6 +130,7 @@ export function DeploymentCompositionPanel({
     maintenance === null ? inventoryApply : null,
     snapshot?.runtime.sections.manager ?? null,
     transportStatus,
+    snapshot?.applicationStartId ?? null,
   );
   const maintenanceStatus = maintenance === null ? inventoryStatus : advertisedStatus;
   const [reloadToken, setReloadToken] = useState(0);
@@ -265,15 +267,15 @@ export function DeploymentCompositionPanel({
                 {[...readModel.status.status.apply.records]
                   .sort((left, right) => (
                     right.applyGeneration - left.applyGeneration
-                    || right.applyId.localeCompare(left.applyId)
+                    || right.applyId - left.applyId
                   ))
                   .map((record) => (
                     <li key={record.applyId + ':' + record.applyGeneration}>
-                      <strong>{shortIdentity(record.applyId)}</strong>
+                      <strong>{displayApplyId(snapshot?.applicationStartId, record.applyId)}</strong>
                       {' · generation ' + record.applyGeneration}
                       {' · ' + (record.terminalState ?? record.phase)}
                       <small>
-                        {' request ' + shortIdentity(record.request.requestId)}
+                        {' request ' + shortIdentity(record.request.requestKey)}
                         {' · target ' + shortIdentity(record.candidateRetainedBundleId)}
                       </small>
                     </li>

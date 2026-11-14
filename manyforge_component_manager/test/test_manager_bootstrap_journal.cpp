@@ -16,11 +16,13 @@
 #include <future>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 
 namespace manyforge::component_manager {
 namespace {
@@ -541,13 +543,13 @@ TEST(
 
 TEST(
     ManagerBootstrapJournal,
-    IndependentWritersSerializeOneIntentAndAcceptedTarget) {
+    ConcurrentWritersSerializeOneIntentAndAcceptedTarget) {
   TemporaryDirectory directory;
   const auto database = directory.path() / "journal.sqlite3";
-  SqliteManagerBootstrapJournal first(
+  SqliteManagerBootstrapJournal journal(
       database, core::CellId("cell-a"));
-  SqliteManagerBootstrapJournal second(
-      database, core::CellId("cell-a"));
+  auto& first = journal;
+  auto& second = journal;
 
   auto first_intent = std::async(
       std::launch::async,
@@ -641,6 +643,7 @@ TEST(ManagerBootstrapJournalCrash, CommittedChildWriteSurvivesProcessExit) {
       SqliteManagerBootstrapJournal journal(
           database, core::CellId("cell-a"));
       static_cast<void>(journal.EnsureIntent(Intent()));
+      journal.Close();
       _exit(0);
     } catch (...) {
       _exit(1);
@@ -1485,6 +1488,171 @@ TEST(
   EXPECT_NO_THROW(
       ExternallyProvisionedManagerStores(
           empty_apply_peer, admission));
+}
+
+// Holds the record writer's thread inside a statement until released.
+struct WriterGate final {
+  std::promise<void> entered;
+  std::promise<void> release;
+  std::shared_future<void> released{release.get_future().share()};
+  sqlite3* connection{};
+
+  WriterGate() {
+    if (sqlite3_open(":memory:", &connection) != SQLITE_OK ||
+        sqlite3_create_function(
+            connection, "gate", 0, SQLITE_UTF8, this, &Wait, nullptr,
+            nullptr) != SQLITE_OK) {
+      throw std::runtime_error("cannot install writer gate");
+    }
+  }
+  ~WriterGate() { sqlite3_close(connection); }
+  WriterGate(const WriterGate&) = delete;
+  WriterGate& operator=(const WriterGate&) = delete;
+
+  void Hold(persistence::SqliteRecordWriter& writer) {
+    const auto slot = writer.RegisterConnection(connection, "gate", "SELECT 1");
+    persistence::SqliteRecord record;
+    record.Statement("SELECT gate()");
+    ASSERT_TRUE(writer.Post(slot, std::move(record)));
+    entered.get_future().wait();
+  }
+
+  static void Wait(sqlite3_context* context, int, sqlite3_value**) {
+    auto* gate = static_cast<WriterGate*>(sqlite3_user_data(context));
+    gate->entered.set_value();
+    gate->released.wait();
+    sqlite3_result_int(context, 1);
+  }
+};
+
+std::int64_t RawCount(
+    const std::filesystem::path& database_path,
+    const std::string& table) {
+  sqlite3* raw = nullptr;
+  EXPECT_EQ(
+      sqlite3_open_v2(
+          database_path.string().c_str(), &raw, SQLITE_OPEN_READONLY,
+          nullptr),
+      SQLITE_OK);
+  sqlite3_stmt* statement = nullptr;
+  EXPECT_EQ(
+      sqlite3_prepare_v2(
+          raw, ("SELECT COUNT(*) FROM " + table).c_str(), -1, &statement,
+          nullptr),
+      SQLITE_OK);
+  EXPECT_EQ(sqlite3_step(statement), SQLITE_ROW);
+  const auto count = sqlite3_column_int64(statement, 0);
+  sqlite3_finalize(statement);
+  sqlite3_close(raw);
+  return count;
+}
+
+TEST(ManagerBootstrapJournalWrittenAfterwards, AnswersWhileTheWriterIsBlocked) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "journal.sqlite3";
+  persistence::SqliteRecordWriter writer;
+  WriterGate gate;
+  gate.Hold(writer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        database, core::CellId("cell-a"), &writer);
+    EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
+    EXPECT_FALSE(journal.EnsureIntent(Intent()).inserted);
+    EXPECT_TRUE(journal.RecordAcceptedTarget(AcceptedTarget()).inserted);
+    EXPECT_EQ(
+        journal.ReadSnapshot().phase,
+        ManagerBootstrapJournalPhase::kAcceptedTargetPersisted);
+    const auto report = journal.VerifyIntegrity();
+    EXPECT_EQ(report.bootstrap_attempt_count, 1);
+    EXPECT_EQ(report.execution_host_binding_row_count, 2);
+    EXPECT_EQ(report.accepted_target_count, 1);
+    EXPECT_EQ(
+        journal.ReadBootstrapGenerationHighWater(core::BootstrapId("bootstrap-1")),
+        core::BootstrapGeneration(1U));
+    EXPECT_EQ(RawCount(database, "manager_bootstrap_intents"), 0);
+    gate.release.set_value();
+    writer.DrainAndStop();
+    journal.Close();
+  }
+  // Checked before the read-only counts below: a read-only connection
+  // cannot remove the sidecars it opens.
+  ExpectNoSqliteSidecars(database);
+  EXPECT_EQ(writer.records_dropped(), 0U);
+  EXPECT_EQ(writer.records_not_written(), 0U);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_intents"), 1);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_execution_host_bindings"), 2);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_accepted_targets"), 1);
+  SqliteManagerBootstrapJournal reopened(database, core::CellId("cell-a"));
+  EXPECT_EQ(
+      reopened.ReadSnapshot().phase,
+      ManagerBootstrapJournalPhase::kAcceptedTargetPersisted);
+}
+
+TEST(ManagerBootstrapJournalWrittenAfterwards, DroppedRecordIsCountedOnly) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "journal.sqlite3";
+  persistence::SqliteRecordWriter writer({1U, 1024U * 1024U});
+  WriterGate gate;
+  gate.Hold(writer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        database, core::CellId("cell-a"), &writer);
+    EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
+    EXPECT_TRUE(journal.RecordAcceptedTarget(AcceptedTarget()).inserted);
+    EXPECT_EQ(writer.records_dropped(), 1U);
+    EXPECT_EQ(
+        journal.ReadSnapshot().phase,
+        ManagerBootstrapJournalPhase::kAcceptedTargetPersisted);
+    gate.release.set_value();
+    writer.DrainAndStop();
+    journal.Close();
+  }
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_intents"), 1);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_accepted_targets"), 0);
+  // The writer marked the file: records of this start were not written.
+  EXPECT_EQ(
+      RawCount(database, "bootstrap_journal_metadata WHERE records_lost = 1"),
+      1);
+}
+
+TEST(ManagerBootstrapJournalWrittenAfterwards, FailedFileWriteIsCountedOnly) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "journal.sqlite3";
+  persistence::SqliteRecordWriter writer;
+  WriterGate gate;
+  gate.Hold(writer);
+  {
+    SqliteManagerBootstrapJournal journal(
+        database, core::CellId("cell-a"), &writer);
+    // A foreign row makes the journal's own insert fail in the file.
+    RawExec(
+        database,
+        "INSERT INTO manager_bootstrap_intents VALUES ('bootstrap-1',1,"
+        "'x','x','x','x')");
+    EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
+    gate.release.set_value();
+    writer.DrainAndStop();
+    EXPECT_EQ(writer.records_not_written(), 1U);
+    EXPECT_EQ(
+        journal.ReadSnapshot().phase,
+        ManagerBootstrapJournalPhase::kIntentPersisted);
+    journal.Close();
+  }
+}
+
+TEST(ManagerBootstrapJournalWrittenAfterwards, OwnedWriterDrainsAtClose) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "journal.sqlite3";
+  {
+    SqliteManagerBootstrapJournal journal(database, core::CellId("cell-a"));
+    static_cast<void>(journal.EnsureIntent(Intent()));
+    static_cast<void>(journal.RecordAcceptedTarget(AcceptedTarget()));
+  }
+  // Checked before the read-only counts below: a read-only connection
+  // cannot remove the sidecars it opens.
+  ExpectNoSqliteSidecars(database);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_intents"), 1);
+  EXPECT_EQ(RawCount(database, "manager_bootstrap_accepted_targets"), 1);
 }
 
 }  // namespace

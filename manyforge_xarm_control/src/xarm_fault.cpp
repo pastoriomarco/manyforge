@@ -72,12 +72,6 @@ std::optional<core::Fault> xarm_fault(const int code, const std::int64_t since_n
   auto action = FaultOperatorAction::kRecover;
   bool clearable = true;
   switch (code) {
-  case 1:
-  case 2:
-  case 3:
-    // Latched after release until cleared: the owner's Recover clears it.
-    fault = FaultCode::kEstop;
-    break;
   case 31: fault = FaultCode::kProtectiveStop; break;
   case 23:
   case 24:

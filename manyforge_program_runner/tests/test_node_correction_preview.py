@@ -7,6 +7,8 @@ motion builder, so the preview can be compared with what execution sent.
 
 from __future__ import annotations
 
+import hashlib
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -51,13 +53,25 @@ from manyforge_headless_api.models import (
 from manyforge_program_runner.runtime import ProgramRunnerError, ProgramRuntime
 
 
+def _kb(*parts) -> bytes:
+    """A deterministic 16-byte request key named by text, for readable tests."""
+
+    return hashlib.md5("/".join(map(str, parts)).encode()).digest()
+
+
+def _key(*parts) -> str:
+    """The wire form (32 lowercase hex) of ``_kb``."""
+
+    return _kb(*parts).hex()
+
+
 _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
 _DIGEST_D = "sha256:" + "d" * 64
 _DIGEST_E = "sha256:" + "e" * 64
-_RUN_OWNER_EPOCH = "program-runner.epoch.1"
+_APPLICATION_START_ID = "3f9a00000000002a"
 _NODE = "move_to_pick"
 
 
@@ -74,7 +88,7 @@ class _KernelTransport:
         return {
             "ok": True,
             "identity": {
-                "owner_epoch": "kernel.epoch.1",
+                "application_start_id": "3f9a00000000002a",
                 "graph_revision": _DIGEST_C,
                 "retained_bundle_id": _DIGEST_B,
                 "scene_revision": {
@@ -89,7 +103,7 @@ class _KernelTransport:
         self.submissions.append(deepcopy(dict(body)))
         return {
             "ok": True,
-            "accepted": {"operation_id": "operation-1", "operation_revision": 1},
+            "accepted": {"operation_id": 1, "operation_revision": 1},
         }
 
     def _effect(self, name: str):
@@ -168,7 +182,7 @@ class _ScopePort:
     def __init__(self) -> None:
         self.stop_requests = 0
         self.release_requests = 0
-        self.selection_revision = 0
+        self.hold_revision = 0
         self.held = False
         self.node_count = 0
 
@@ -179,54 +193,55 @@ class _ScopePort:
             self.node_count += 1
             pending.extend(node.get("children", ()))
 
-    def unbind(self, _program_run_id: str) -> None:
+    def unbind(self, _program_run_id: int) -> None:
         pass
 
-    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+    def execution_scope(self, program_run_id: int) -> Mapping[str, Any]:
         return {
-            "schema_version": "manyforge.program_execution_scope.v2",
-            "request_owner_epoch": "kernel.epoch.1",
-            "program_runner_owner_epoch": _RUN_OWNER_EPOCH,
+            "schema_version": "manyforge.program_execution_scope.v3",
             "claim_generation": 1,
             "program_run_id": program_run_id,
-            "selection_revision": self.selection_revision,
+            "hold_revision": self.hold_revision,
             "held_node_indices": list(range(self.node_count)) if self.held else [],
             "ready_node_indices": [],
             "stopping_node_indices": [],
             "faulted_node_indices": [],
+            "selection_release_block_reason": None,
+            "stopped_by": None,
+            "rule_id": None,
+            "frozen": "none",
+            "frozen_by": None,
+            "all_groups_held": False,
         }
 
     def stop_selection(self, request):
         self.request_stop(request["program_run_id"], "", None)
         return {
             "state": self.execution_scope(request["program_run_id"]),
-            "selection_error": None,
+            "stop": {},
         }
 
-    def release_selection(self, request, _expected_selection_revision):
+    def release_selection(self, request, _expected_hold_revision):
         self.release_requests += 1
         raise AssertionError("preview must not release a hold")
 
-    def start_selection(self, request, _expected_selection_revision):
+    def start_selection(self, request, _expected_hold_revision):
         raise AssertionError("preview must not start motion")
 
     def request_stop(self, program_run_id, _request_id, _reason):
         self.stop_requests += 1
         self.held = True
-        self.selection_revision += 1
+        self.hold_revision += 1
         return ProgramRunScopeSnapshot(program_run_id, ProgramRunScopeState.SETTLED, 0)
 
-    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+    def observe(self, program_run_id: int) -> ProgramRunScopeSnapshot:
         return ProgramRunScopeSnapshot(program_run_id, ProgramRunScopeState.SETTLED, 0)
 
-    def capture_stop(self, _program_run_id):
-        return ("stop.1", 1) if self.stop_requests else None
-
-    def release_stop(self, program_run_id, *, expected_stop=None):
+    def release_halt(self, program_run_id, *, expected_hold_revision):
         self.release_requests += 1
-        raise AssertionError("preview must not release a Stop")
+        raise AssertionError("preview must not release a Halt")
 
-    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot:
+    def reset(self, program_run_id: int) -> ProgramRunScopeSnapshot:
         raise AssertionError("preview must not reset")
 
 
@@ -322,20 +337,17 @@ def _held_run():
         readiness=readiness,
         owner_identities=(
             ProgramRunOwnerIdentity(
-                owner_role="kernel_operations",
-                owner_id="kernel.cell-a",
-                owner_epoch="kernel.epoch.1",
+                role="kernel_operations",
+                application_start_id=_APPLICATION_START_ID,
             ),
         ),
     )
     owner = ProgramRunOwner(
         owner_id="program-runner.cell-a",
-        owner_epoch=_RUN_OWNER_EPOCH,
+        application_start_id=_APPLICATION_START_ID,
         ports=ports,
-        transport_timeout_s=30.0,
-        run_id_factory=lambda: "program-run-1",
     )
-    run_id = owner.start(admission).capture.program_run_id
+    run_id = owner.start(admission, program_run_id=1).capture.program_run_id
     # Mirror the ordered Active TCP baseline that the Runner registers at start.
     owner.value_store(run_id).write_active_tcp(
         "ur5_robot",
@@ -359,10 +371,9 @@ def _held_run():
 def _request(owner, run_id, held, **changes) -> ProgramNodeCorrectionPreviewRequest:
     capture = owner.read(run_id).capture
     body = {
-        "schema_version": "manyforge.program_node_correction_preview_request.v1",
-        "request_id": "node-preview.1",
+        "schema_version": "manyforge.program_node_correction_preview_request.v2",
+        "request_key": _key("node-preview.1"),
         "program_run_id": run_id,
-        "expected_owner_epoch": _RUN_OWNER_EPOCH,
         "program_id": capture.program_id,
         "program_revision": capture.program_revision,
         "program_binding_id": capture.program_binding_id,
@@ -385,7 +396,7 @@ def _effects(owner, transport, motion, scope, interventions, run_id):
         "cancels": motion.cancels,
         "stops": scope.stop_requests,
         "releases": scope.release_requests,
-        "selection_revision": scope.selection_revision,
+        "hold_revision": scope.hold_revision,
         "interventions": [
             (row.identity, row.policy_parameter) for row in interventions.read_all(run_id)
         ],
@@ -419,7 +430,7 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
             owner,
             run_id,
             held,
-            request_id="node-preview.2",
+            request_key=_key("node-preview.2"),
             proposed_inputs=[
                 {"path": "goal", "value": _NEW_GOAL},
                 # Shadows the node's Program-parameter value source.
@@ -433,7 +444,7 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
         assert result["unavailable_reason"] is None
         assert result["node_id"] == "motion.move_to_joint_target"
         assert result["node_attempt_id"] == held.identity.node_attempt_id
-        assert result["program_runner_owner_epoch"] == _RUN_OWNER_EPOCH
+        assert "program_runner_owner_epoch" not in result
         assert result["target"] == {
             "component_id": "ur5_robot",
             "command_target_id": "arm",
@@ -475,9 +486,8 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
 @pytest.mark.parametrize(
     ("changes", "code"),
     [
-        ({"expected_owner_epoch": "program-runner.epoch.0"}, "program_node_preview_identity_stale"),
         ({"program_id": "another_program"}, "program_node_preview_identity_stale"),
-        ({"node_attempt_id": "attempt:foreign"}, "program_node_preview_attempt_stale"),
+        ({"node_attempt_id": 999}, "program_node_preview_attempt_stale"),
         ({"node_instance_id": "remove_table"}, "program_node_preview_attempt_stale"),
         (
             {"proposed_inputs": [{"path": "target_role", "value": "other_arm"}]},
@@ -543,6 +553,6 @@ def test_path_mismatch_is_refused() -> None:
     runtime, owner, _transport, _motion, _scope, _interventions, run_id, held = _held_run()
 
     with pytest.raises(ProgramRunnerError) as refused:
-        runtime.preview_node_correction("program-run-2", _request(owner, run_id, held))
+        runtime.preview_node_correction(run_id + 1, _request(owner, run_id, held))
 
     assert refused.value.code == "program_run_path_invalid"

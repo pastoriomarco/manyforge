@@ -13,7 +13,7 @@ import unicodedata
 import rfc8785
 
 
-MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v2"
+MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v3"
 MODE_CATALOG_VERSION: Final = "manyforge.assistant_mode_catalog.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 MAXIMUM_ROWS: Final = 4_096
@@ -71,16 +71,13 @@ _SOURCE_FIELDS: Final = frozenset(
         "freshness",
         "known_gaps",
         "projection_generation",
-        "projection_owner_epoch",
         "receiver_age_ns",
         "selection_projection_generation",
         "selection_source_content_digest",
         "selection_source_generation",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
         "source_content_digest",
         "source_generation",
-        "source_owner_epoch",
         "source_owner_id",
         "source_owner_kind",
     }
@@ -362,10 +359,7 @@ def verify_active_mode_projection(payload: Any, *, expected_mode: str) -> dict[s
     if source["source_owner_kind"] != "assistant_mode_projection":
         _fail("assistant_projection_invalid", "assistant mode projection owner kind is invalid")
     for field in (
-        "projection_owner_epoch",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
-        "source_owner_epoch",
         "source_owner_id",
     ):
         _text(source[field], f"source.{field}")

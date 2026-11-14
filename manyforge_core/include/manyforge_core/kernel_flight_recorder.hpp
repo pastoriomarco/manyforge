@@ -53,16 +53,9 @@ class KernelFlightRecorder {
                                std::uint64_t execution_id,
                                ExecutionState state) noexcept;
 
-  /// Configure the dump directory. Call once at startup wiring time (not
-  /// concurrency-hardened against dump_now; setting it while the kernel is
-  /// dying is not a supported sequence). Empty (default) dumps to stderr.
-  void set_dump_directory(std::string directory);
-
-  /// Best-effort JSONL dump for fail-closed termination paths. Writes
-  /// `<dir>/flight-<wall_ms>.jsonl` and returns the path, or writes to
-  /// stderr between BEGIN/END markers and returns empty when no directory
-  /// is configured or the file cannot be opened. Never throws.
-  std::string dump_now(const char* reason) noexcept;
+  /// Best-effort JSONL dump for fail-closed termination paths. Writes to
+  /// stderr between BEGIN/END markers. Never throws.
+  void dump_now(const char* reason) noexcept;
 
   /// Total events recorded (monotonic; ring keeps the last kCapacity).
   std::uint64_t recorded_total() const noexcept;
@@ -78,7 +71,6 @@ class KernelFlightRecorder {
     ExecutionState state{};
     bool present = false;
   } snapshot_note_{};
-  std::string dump_directory_;
 };
 
 /// Stable lower-snake name for a kernel event type (dump-time only; returns

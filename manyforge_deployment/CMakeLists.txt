@@ -669,7 +669,6 @@ add_library(manyforge_deployment_verification_core
   src/command_schema_codec.cpp
   src/component_type_codec.cpp
   src/runtime_program_binding.cpp
-  src/reference_runtime_unit_verifier.cpp
   src/runtime_contract_registry.cpp
   src/verified_retained_projection.cpp
   src/runtime_profile_codec.cpp
@@ -793,7 +792,6 @@ add_library(manyforge_deployment
   src/prepared_activation_repository.cpp
   src/program_io_stop_response_validation.cpp
   src/global_io_rule_qualification.cpp
-  src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp
   src/retained_bundle_materializer.cpp
   src/retained_bundle_store.cpp

@@ -1,10 +1,15 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include "execution_host_responses.hpp"
 #include "io_rule_outcome_fixture.hpp"
 #include <gtest/gtest.h>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/types/typed_error.hpp>
+#include <algorithm>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
@@ -65,16 +70,79 @@ TEST(TypedErrorResponseTest, ProducerIsOnTopLevelRpcErrorOnly) {
             "execution_command_invalid");
 }
 
+// OD-213: the stream's operations table lists each resident operation with
+// the `read` reply's members; its state leaves out the participants'
+// `progress` and the `updated_at_ns` (they change at every progress sample),
+// and a state that encodes to more than its bound is listed as null.
+TEST(IoRuleResultResponseTest, OperationsTableListsResidentOperationsAsReadWithoutProgress) {
+  const auto names = [](const CanonicalValue &value) {
+    std::vector<std::string> result;
+    for (const auto &[name, member] : value.as_object()) {
+      static_cast<void>(member);
+      result.push_back(name);
+    }
+    return result;
+  };
+  const auto without = [](std::vector<std::string> list, const std::string &name) {
+    list.erase(std::remove(list.begin(), list.end(), name), list.end());
+    return list;
+  };
+  const auto state = core::rule_codec_test::State();
+  auto large = state;
+  large.operation_id = core::OperationNumber(state.operation_id.value() + 1U);
+  large.participants.front().io_rule_outcomes.clear();
+  large.participants.front().terminal_error = core::ErrorDTO{
+      "execution_aborted",
+      std::string(core::kOperationTableMaximumResidentOperationBytes, 'x'), {}};
+  const core::OperationControlAcceptedDTO control{
+      core::TestRequestKey("request.table.reset"), core::RequestReplayStatusDTO::kAcceptedNew,
+      large.operation_id, core::OperationRevision(1U), core::OperationControlKind::kReset,
+      core::OperationRevision(2U), 5};
+  core::OperationTableDTO table;
+  table.change = 4U;
+  table.resident.push_back(core::OperationReadProjectionDTO{state, true, std::nullopt, true});
+  table.resident.push_back(core::OperationReadProjectionDTO{large, true, control, false});
+  table.resident_total = 3U;
+
+  const auto value = OperationTableValue(table);
+  EXPECT_EQ(value.find_object_member("resident_total")->as_number(), 3.0);
+  const auto &resident = value.find_object_member("resident")->as_array();
+  ASSERT_EQ(resident.size(), 2U);
+  EXPECT_EQ(names(resident[0]),
+            (std::vector<std::string>{"control_pending", "last_control", "operation",
+                                      "operation_id"}));
+  EXPECT_EQ(resident[0].find_object_member("operation_id")->as_number(),
+            static_cast<double>(state.operation_id.value()));
+  EXPECT_TRUE(resident[0].find_object_member("control_pending")->as_bool());
+  EXPECT_TRUE(resident[0].find_object_member("last_control")->is_null());
+  const auto &listed = *resident[0].find_object_member("operation");
+  EXPECT_EQ(listed, OperationTableStateValue(state));
+  const auto read = OperationStateValue(state);
+  EXPECT_EQ(names(listed), without(names(read), "updated_at_ns"));
+  for (const auto &[name, member] : listed.as_object()) {
+    if (name == "participants") continue;
+    EXPECT_EQ(member, *read.find_object_member(name)) << name;
+  }
+  const auto &listed_participant = listed.find_object_member("participants")->as_array().front();
+  const auto &read_participant = read.find_object_member("participants")->as_array().front();
+  EXPECT_EQ(names(listed_participant), without(names(read_participant), "progress"));
+  for (const auto &[name, member] : listed_participant.as_object())
+    EXPECT_EQ(member, *read_participant.find_object_member(name)) << name;
+  // Too large to list: the reader reads it.
+  EXPECT_TRUE(resident[1].find_object_member("operation")->is_null());
+  EXPECT_EQ(*resident[1].find_object_member("last_control"), ControlAcceptedValue(control));
+  EXPECT_FALSE(resident[1].find_object_member("control_pending")->as_bool());
+}
+
 TEST(IoRuleResultResponseTest,
      PublicProjectionUsesSameClosedEvidenceAsDurableCodec) {
   const auto state = core::rule_codec_test::State();
   const auto response = OperationStateValue(state);
   const auto &participant =
       response.find_object_member("participants")->as_array().front();
-  EXPECT_EQ(participant.find_object_member("command_id")->as_string(),
-            state.participants.front().command_id.value());
-  EXPECT_EQ(participant.find_object_member("command_generation")->as_number(),
-            static_cast<double>(state.participants.front().command_generation.value()));
+  EXPECT_EQ(*participant.find_object_member("command_id"),
+            core::ControllerGoalIdValue(state.participants.front().command_id));
+  EXPECT_EQ(participant.find_object_member("command_generation"), nullptr);
   EXPECT_EQ(participant.find_object_member("controller_goal_id"), nullptr);
   EXPECT_EQ(participant.find_object_member("controller_goal_generation"), nullptr);
   const auto *evidence = participant.find_object_member("io_rule_outcomes");
@@ -85,7 +153,7 @@ TEST(IoRuleResultResponseTest,
   EXPECT_EQ(decoded.value(), state.participants.front().io_rule_outcomes);
   const auto &row = evidence->as_array().front();
   EXPECT_EQ(row.find_object_member("stop_result")->as_string(),
-            "succeeded_escalated");
+            "stopped_escalated");
   EXPECT_EQ(row.find_object_member("terminal_cause")->as_string(),
             "signal_trip");
   const auto &values = row.find_object_member("evidence")
@@ -107,7 +175,7 @@ TEST(IoRuleResultResponseTest,
             nullptr);
   state = core::rule_codec_test::State();
   state.participants.front().command_id =
-      core::ControllerGoalId("foreign.goal");
+      core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U};
   EXPECT_THROW((void)OperationStateValue(state), std::exception);
 }
 TEST(OperationStateResponseTest, AbsentTakeoverKeepsLegacyShape) {
@@ -115,29 +183,30 @@ TEST(OperationStateResponseTest, AbsentTakeoverKeepsLegacyShape) {
   EXPECT_EQ(response.find_object_member("motion_takeover"), nullptr);
 }
 
-TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
+TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndStopEvent) {
   auto state = core::rule_codec_test::State();
   state.motion_takeover = core::MotionTakeoverDecisionDTO{
-      .incumbent_operation_id = core::OperationId("operation.incumbent"),
+      .incumbent_operation_id = core::OperationNumber(1001U),
       .path = core::MotionTakeoverPathDTO::kMovingReplacement,
       .cause = std::nullopt,
       .decided_at_ns = INT64_MAX,
       .elapsed_since_acceptance_ns = 9007199254740993LL,
       .preparation_budget_ns = 1500000000,
-      .stop_certificate = std::nullopt,
+      .stop_event_id = std::nullopt,
       .planning_budget_ns = 1200000000};
   auto response = OperationStateValue(state);
   const auto *decision = response.find_object_member("motion_takeover");
   ASSERT_NE(decision, nullptr);
   EXPECT_EQ(decision->as_object().size(), 8U);
-  EXPECT_EQ(decision->find_object_member("incumbent_operation_id")->as_string(),
-            "operation.incumbent");
+  EXPECT_EQ(decision->find_object_member("incumbent_operation_id")->as_number(),
+            1001.0);
   EXPECT_EQ(decision->find_object_member("path")->as_string(),
             "moving_replacement");
   EXPECT_EQ(content_identity::canonical_json(
                 *decision->find_object_member("cause")), "null");
   EXPECT_EQ(content_identity::canonical_json(
-                *decision->find_object_member("stop_certificate")), "null");
+                *decision->find_object_member("stop_event_id")), "null");
+  EXPECT_EQ(decision->find_object_member("stop_certificate"), nullptr);
   EXPECT_EQ(decision->find_object_member("decided_at_ns")->as_string(),
             "9223372036854775807");
   EXPECT_EQ(decision->find_object_member("elapsed_since_acceptance_ns")->as_string(),
@@ -155,14 +224,11 @@ TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
   response = OperationStateValue(state);
   decision = response.find_object_member("motion_takeover");
   ASSERT_NE(decision, nullptr);
-  EXPECT_TRUE(decision->find_object_member("stop_certificate")->is_null());
+  EXPECT_TRUE(decision->find_object_member("stop_event_id")->is_null());
   EXPECT_EQ(content_identity::canonical_json(
                 *decision->find_object_member("cause")),
             content_identity::canonical_json(ErrorValue(cause)));
-  state.motion_takeover->stop_certificate = core::StopCertificateRefDTO{
-      core::StopCertificateId("certificate.actual"),
-      core::StopCertificateRevision(3U), core::StopId("stop.actual"),
-      core::StopGeneration(2U)};
+  state.motion_takeover->stop_event_id = core::StopEventId(1000U);
   for (const auto &[path, spelling] :
        {std::pair{core::MotionTakeoverPathDTO::kSpringBackHold,
                   "spring_back_hold"},
@@ -177,73 +243,37 @@ TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
     EXPECT_EQ(content_identity::canonical_json(
                   *decision->find_object_member("cause")),
               content_identity::canonical_json(ErrorValue(cause)));
-    EXPECT_EQ(content_identity::canonical_json(
-                  *decision->find_object_member("stop_certificate")),
-              "{\"stop_certificate_id\":\"certificate.actual\","
-              "\"stop_certificate_revision\":3,\"stop_generation\":2,"
-              "\"stop_id\":\"stop.actual\"}");
+    EXPECT_EQ(decision->find_object_member("stop_event_id")->as_number(), 1000.0);
   }
 }
-// Typed wire fixture only: projection status does not manufacture a
-// certificate, attempted-stage evidence, a commit sequence or a new wait budget.
-TEST(IoRuleResultResponseTest,
-     StopSummarySeparatesTerminalMotionFromPendingDurableProjection) {
-  const auto digest = "sha256:" + std::string(64U, 'a');
-  core::StopStatusDTO status{
-      .accepted = {core::RequestId("request.stop"),
-                   core::RequestReplayStatusDTO::kAcceptedNew,
-                   core::StopId("stop.actual"), core::StopGeneration(17U),
-                   core::ContentDigest(digest),
-                   core::StopResolutionDispositionDTO::kExact,
-                   core::StopScopeResolutionReasonDTO::kExplicitFullStop,
-                   {}, core::ContentDigest(digest), {}, {}, 10},
-      .state = core::StopStatusStateDTO::kSucceeded,
-      .scope_entries = {}, .current_stages = {}, .attempted_stage_results = {},
-      .evidence_items = {}, .unsettled = {}, .failed = {},
-      .acceptance_projection = {core::StopDurableProjectionStateDTO::kRecorded,
-                                std::nullopt, std::nullopt},
-      .terminal_projection = {core::StopDurableProjectionStateDTO::kPending,
-                              std::nullopt, std::nullopt},
-      .stop_certificate = std::nullopt};
-  for (const auto &[state, spelling] :
-       {std::pair{core::StopDurableProjectionStateDTO::kPending, "pending"},
-        std::pair{core::StopDurableProjectionStateDTO::kRecorded, "recorded"},
-        std::pair{core::StopDurableProjectionStateDTO::kFailed, "failed"}}) {
-    status.terminal_projection.state = state;
-    const auto response = StopStatusSummaryValue(status);
-    EXPECT_EQ(response.as_object().size(), 6U);
-    EXPECT_EQ(response.find_object_member("terminal_projection")->as_string(), spelling);
-    EXPECT_EQ(response.find_object_member("state")->as_string(), "succeeded");
-    EXPECT_EQ(response.find_object_member("stop_id")->as_string(), "stop.actual");
-    EXPECT_EQ(response.find_object_member("stop_generation")->as_number(), 17.0);
-    EXPECT_EQ(response.find_object_member("request_id")->as_string(), "request.stop");
-    EXPECT_EQ(response.find_object_member("schema_version")->as_string(),
-              "manyforge.execution_stop_status.v1");
-    EXPECT_EQ(response.find_object_member("attempted_stages"), nullptr);
-  }
-  status.state = core::StopStatusStateDTO::kStopping;
-  status.terminal_projection.state = core::StopDurableProjectionStateDTO::kPending;
-  const auto active = StopStatusSummaryValue(status);
-  EXPECT_EQ(active.find_object_member("state")->as_string(), "stopping");
-  EXPECT_EQ(active.find_object_member("terminal_projection")->as_string(), "pending");
-  for (const auto unsupported :
-       {core::StopDurableProjectionStateDTO::kNotApplicable,
-        static_cast<core::StopDurableProjectionStateDTO>(255)}) {
-    status.terminal_projection.state = unsupported;
-    EXPECT_THROW((void)StopStatusSummaryValue(status), std::exception);
-  }
-  using Value = content_identity::CanonicalValue;
-  const auto command = DecodeCommand(content_identity::canonical_json(
-      Value(Value::Object{
-          {"api_version", Value("manyforge.execution_command.v3")},
-          {"command", Value("read_stop")},
-          {"stop_id", Value("stop.actual")},
-          {"attribution", Value(Value::Object{
-              {"transport", Value("internal")},
-              {"assurance", Value("unverified")},
-              {"principal_id", Value(nullptr)}})}})));
-  EXPECT_EQ(command.kind, CommandKind::kReadStop);
-  EXPECT_EQ(command.stop_id, core::StopId("stop.actual"));
+// Stop state model: the operation carries the event that started its newest
+// attempt and each participant its stop observation (null while never
+// covered); the former active Stop id/generation members are gone.
+TEST(OperationStateResponseTest, StopEventAndParticipantStopObservation) {
+  auto state = core::rule_codec_test::State();
+  auto response = OperationStateValue(state);
+  ASSERT_NE(response.find_object_member("stop_event_id"), nullptr);
+  EXPECT_TRUE(response.find_object_member("stop_event_id")->is_null());
+  for (const auto *removed : {"active_stop_id", "active_stop_generation"})
+    EXPECT_EQ(response.find_object_member(removed), nullptr) << removed;
+  const auto *participant =
+      &response.find_object_member("participants")->as_array().front();
+  ASSERT_NE(participant->find_object_member("stop"), nullptr);
+  EXPECT_TRUE(participant->find_object_member("stop")->is_null());
+
+  state.stop_event_id = core::StopEventId(42U);
+  core::ParticipantStopObservationDTO observation;
+  observation.phase = core::StopPhase::kStopped;
+  observation.attempt = 1U;
+  observation.stop_event_id = core::StopEventId(42U);
+  observation.mode = core::StopMode::kOrdinary;
+  observation.attribution_class = core::StopAttributionClass::kOperator;
+  state.participants.front().stop = observation;
+  response = OperationStateValue(state);
+  EXPECT_EQ(response.find_object_member("stop_event_id")->as_number(), 42.0);
+  participant = &response.find_object_member("participants")->as_array().front();
+  EXPECT_EQ(*participant->find_object_member("stop"),
+            ParticipantStopObservationValue(observation));
 }
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail

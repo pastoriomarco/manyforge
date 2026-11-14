@@ -100,6 +100,10 @@ public:
                              std::chrono::nanoseconds bound) {
     resources.owner_wait_bound_ = bound;
   }
+  static std::size_t owner_stall_waiters(Ros2TransportResources &resources) {
+    std::lock_guard<std::mutex> lock(resources.dispatch_mutex_);
+    return resources.owner_stall_waiters_;
+  }
   static void fail_trigger(Ros2TransportResources &resources) {
     *resources.dispatch_trigger_ = [] { throw std::runtime_error("test notifier failure"); };
   }
@@ -1163,7 +1167,33 @@ TEST(Ros2TransportOwner, ForeignWorkAndReentryReturnActualResult) {
   EXPECT_EQ(result, 99);
 }
 
-TEST(Ros2TransportOwner, SlowOwnerWorkLatchesOneDiagnosticAndCompletes) {
+namespace {
+
+// Yields (no sleep) until the predicate holds; the guard only keeps a broken
+// build from hanging.
+template <class Predicate> bool YieldUntil(Predicate predicate) {
+  const auto guard = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= guard) return false;
+    std::this_thread::yield();
+  }
+  return true;
+}
+
+std::size_t Occurrences(const std::string &text, const std::string &marker) {
+  std::size_t count = 0;
+  for (auto at = text.find(marker); at != std::string::npos;
+       at = text.find(marker, at + marker.size()))
+    ++count;
+  return count;
+}
+
+} // namespace
+
+// OD-245: the stall is raised at the bound, lasts while the owner's task runs,
+// ends when it finishes, and a later stall is raised again with its own
+// snapshot and its own lines.
+TEST(Ros2TransportOwner, OwnerStallLastsUntilTheStalledTaskFinishesAndRaisesAgain) {
   using namespace std::chrono_literals;
   auto resources_owner = Ros2TransportResources::create("owner_stall_bound_test", "", 1);
   auto &resources = *resources_owner;
@@ -1174,34 +1204,105 @@ TEST(Ros2TransportOwner, SlowOwnerWorkLatchesOneDiagnosticAndCompletes) {
   EXPECT_FALSE(resources.owner_stall());
 
   testing::internal::CaptureStderr();
-  const auto started = std::chrono::steady_clock::now();
-  resources.invoke([&] {
-    std::this_thread::sleep_for(200ms);
-    ++calls;
-  });
-  const auto elapsed = std::chrono::steady_clock::now() - started;
-  const auto first = resources.owner_stall();
-  resources.invoke([&] {
-    std::this_thread::sleep_for(200ms);
-    ++calls;
-  });
-  const auto second = resources.owner_stall();
+  const auto stall_once = [&] {
+    std::promise<void> release;
+    auto released = release.get_future();
+    const auto began = std::chrono::steady_clock::now();
+    std::thread caller([&] {
+      resources.invoke([&] {
+        released.wait();
+        ++calls;
+      });
+    });
+    const bool raised = YieldUntil([&] { return static_cast<bool>(resources.owner_stall()); });
+    const auto raised_after = std::chrono::steady_clock::now() - began;
+    const auto during = resources.owner_stall();
+    const auto again = resources.owner_stall();
+    release.set_value();
+    caller.join();
+    EXPECT_TRUE(raised);
+    EXPECT_GE(raised_after, 50ms);
+    EXPECT_EQ(during, again);
+    // It ended inside the caller's invoke, before that returned.
+    EXPECT_FALSE(resources.owner_stall());
+    return during;
+  };
+  const auto first = stall_once();
+  const auto second = stall_once();
   resources.invoke([&] { ++calls; });
   const auto diagnostic = testing::internal::GetCapturedStderr();
 
-  EXPECT_GE(elapsed, 200ms);
   EXPECT_EQ(calls, 4);
   ASSERT_NE(first, nullptr);
-  EXPECT_EQ(first, second);
+  ASSERT_NE(second, nullptr);
+  EXPECT_NE(first, second);
   EXPECT_EQ(first->owner, "/owner_stall_bound_test");
-  EXPECT_NE(first->task.find("SlowOwnerWorkLatchesOneDiagnosticAndCompletes"),
+  EXPECT_EQ(second->owner, "/owner_stall_bound_test");
+  EXPECT_NE(first->task.find("OwnerStallLastsUntilTheStalledTaskFinishesAndRaisesAgain"),
             std::string::npos);
-  const std::string marker = "manyforge_fault code=component_owner_stalled";
-  const auto occurrence = diagnostic.find(marker);
-  ASSERT_NE(occurrence, std::string::npos);
-  EXPECT_EQ(diagnostic.find(marker, occurrence + marker.size()), std::string::npos);
-  EXPECT_NE(diagnostic.find("owner=/owner_stall_bound_test"), std::string::npos);
-  EXPECT_NE(diagnostic.find("bound_ms=50"), std::string::npos);
+  EXPECT_EQ(second->task, first->task);
+  // Per stall: the detection line, unchanged, then one end line.
+  const std::string prefix =
+      "manyforge_fault code=component_owner_stalled owner=/owner_stall_bound_test task=" +
+      first->task;
+  const std::string detection = prefix + " bound_ms=50 state=waiting_for_operator\n";
+  const std::string end = prefix + " lasted_ms=";
+  EXPECT_EQ(Occurrences(diagnostic, "manyforge_fault code=component_owner_stalled"), 4U);
+  EXPECT_EQ(Occurrences(diagnostic, detection), 2U);
+  EXPECT_EQ(Occurrences(diagnostic, end), 2U);
+  EXPECT_EQ(Occurrences(diagnostic, " state=ended\n"), 2U);
+  const auto first_detection = diagnostic.find(detection);
+  const auto first_end = diagnostic.find(end);
+  ASSERT_NE(first_detection, std::string::npos);
+  ASSERT_NE(first_end, std::string::npos);
+  EXPECT_LT(first_detection, first_end);
+  EXPECT_LT(first_end, diagnostic.find(detection, first_detection + detection.size()));
+  resources.quiesce();
+}
+
+// OD-245: with two callers past the bound on one owner, the stall ends when
+// the last of them has its task run.
+TEST(Ros2TransportOwner, OwnerStallOfTwoCallersEndsWhenTheLastFinishes) {
+  using namespace std::chrono_literals;
+  auto resources_owner = Ros2TransportResources::create("owner_stall_two_callers_test", "", 1);
+  auto &resources = *resources_owner;
+  Ros2TransportOwnerTestPeer::set_wait_bound(resources, 50ms);
+  resources.start();
+
+  testing::internal::CaptureStderr();
+  std::promise<void> entered;
+  std::promise<void> release_first;
+  std::promise<void> release_second;
+  auto first_released = release_first.get_future();
+  auto second_released = release_second.get_future();
+  std::thread first([&] {
+    resources.invoke([&] {
+      entered.set_value();
+      first_released.wait();
+    });
+  });
+  entered.get_future().wait();
+  // Queued behind the first task on the same owner.
+  std::thread second([&] { resources.invoke([&] { second_released.wait(); }); });
+  const bool both_past_bound = YieldUntil(
+      [&] { return Ros2TransportOwnerTestPeer::owner_stall_waiters(resources) == 2U; });
+  const auto stall = resources.owner_stall();
+  release_first.set_value();
+  first.join();
+  const auto after_first = resources.owner_stall();
+  const auto waiting_after_first = Ros2TransportOwnerTestPeer::owner_stall_waiters(resources);
+  release_second.set_value();
+  second.join();
+  const auto diagnostic = testing::internal::GetCapturedStderr();
+
+  EXPECT_TRUE(both_past_bound);
+  ASSERT_NE(stall, nullptr);
+  EXPECT_EQ(after_first, stall);
+  EXPECT_EQ(waiting_after_first, 1U);
+  EXPECT_FALSE(resources.owner_stall());
+  EXPECT_EQ(Ros2TransportOwnerTestPeer::owner_stall_waiters(resources), 0U);
+  EXPECT_EQ(Occurrences(diagnostic, " state=waiting_for_operator\n"), 1U);
+  EXPECT_EQ(Occurrences(diagnostic, " state=ended\n"), 1U);
   resources.quiesce();
 }
 

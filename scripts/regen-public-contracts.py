@@ -162,7 +162,7 @@ def gen_rest_api() -> str:
     # a Headless process, so the reference does not silently omit optional
     # runtime-client routes.
     spec = create_app(
-        ComposerState(headless_client=object(), assistant_client=object()),  # type: ignore[arg-type]
+        ComposerState(headless_client=object(), assistant_client=object(), application_start_id=1),  # type: ignore[arg-type]
     ).openapi()
     body: list[str] = [
         _stamp("gen_rest_api", "structural-rest"),
@@ -175,7 +175,7 @@ def gen_rest_api() -> str:
         "and the strict revision-fenced Program Draft/Saved workflow remain "
         "available. When Headless and the independent Program runner are "
         "configured, Composer also forwards scenario, Applied, Program Run, "
-        "status, explicit Program Stop, component actions and the server-run "
+        "status, Stops, component actions and the server-run "
         "Apply/Load/New requests without owning their state. Generic `/api/control/state` "
         "and `/api/control/commands` expose the same state-conditioned ingress "
         "used by the versioned `/ws/control` session; callers submit once and "
@@ -188,7 +188,7 @@ def gen_rest_api() -> str:
     )
     body.append(
         "**Real robot.** A real robot's address is a site fact "
-        "(`device_addresses` in the `manyforge.site.v1` site settings file); "
+        "(`device_addresses` in the `manyforge.site.v2` site settings file); "
         "a Scenario names only its key (`configuration.device_address_ref` of "
         "the machine owner). Component states, faults, the cell latch and "
         "readiness are readable here; the site file, robot power, network and "
@@ -201,11 +201,17 @@ def gen_rest_api() -> str:
 
 def gen_headless_rest_api() -> str:
     """Render the independent headless REST surface from its FastAPI owner."""
+    from types import SimpleNamespace
+
     from manyforge_headless_api.app import create_app
+    from manyforge_headless_api.identity import RequestAdmission
 
     # Route construction is service-neutral. The schema-only sentinel is never
-    # started and no endpoint callback is invoked during OpenAPI generation.
-    spec = create_app(service=object()).openapi()
+    # started and no endpoint callback is invoked during OpenAPI generation;
+    # it carries only the ``admission`` (``A`` check) that route construction reads.
+    spec = create_app(
+        service=SimpleNamespace(admission=RequestAdmission("0000000000000001")),  # type: ignore[arg-type]
+    ).openapi()
     body: list[str] = [
         _stamp("gen_headless_rest_api", "headless-rest"),
         "# Headless Runtime REST API\n\n",
@@ -216,7 +222,7 @@ def gen_headless_rest_api() -> str:
         "selected addressed execution owner and independent Program runner. "
         "Reads return owner-issued facts. Alarm acknowledgement, Manager and "
         "Program Apply, execution submission, no-motion preview, Program Run, "
-        "explicit Program Stop, and component actions are attributed intents. Generic `/api/control/state` and "
+        "Stops, and component actions are attributed intents. Generic `/api/control/state` and "
         "`/api/control/commands` provide the freshness-aware REST form of the "
         "same transport-neutral control ingress used by `/ws/control`; no "
         "command is automatically replayed. The API never owns or reduces execution, "
@@ -239,6 +245,12 @@ def gen_headless_rest_api() -> str:
         "one exact installed NodeEnvironment and requires ordinary Program/Binding "
         "validation before any subsequent execution.\n\n"
     )
+    body.append(
+        "The `request_key` of a Scene request (`/api/scene/transactions`) is "
+        "recognised, and the request sent again is answered with its first "
+        "result, until the Scene store folds its history into a snapshot; a "
+        "request sent again after that is treated as a new request.\n\n"
+    )
     _append_openapi_routes(body, spec)
     return "".join(body)
 
@@ -249,7 +261,7 @@ def gen_mcp_api() -> str:
     from manyforge_composer.backend.mcp_adapter import tool_contracts
     from manyforge_composer.backend.state import ComposerState
 
-    app = create_app(ComposerState(headless_client=object(), assistant_client=object()))
+    app = create_app(ComposerState(headless_client=object(), assistant_client=object(), application_start_id=1))
     contracts = tool_contracts(app)
     body = [
         _stamp("gen_mcp_api", "mcp"),
@@ -276,6 +288,15 @@ def gen_mcp_api() -> str:
         "determined by their owners. This is the current wire contract, not full "
         "historical-functional or provider qualification. Historical v0 signatures "
         "are preserved in git at `08222188293df8e12f90dc72e204c21f22f92ea1`.\n\n",
+        "The MCP library would turn NaN, Infinity or a number too large to hold "
+        "(such as `1e999`) into an empty value, so a tool call holding a repeated "
+        "member or such a number is refused as an invalid request (HTTP 400, "
+        "JSON-RPC `-32600`) and nothing is carried out. A Stop holding such a "
+        "number is not refused: a `manyforge_kernel` `stop` or `stop_all` whose "
+        "body holds one is sent on with an empty body and becomes Stop all; a "
+        "Stop command sent with `manyforge_cycle_control` whose payload holds one "
+        "is sent on with an empty payload and becomes Stop all (a Halt stays a "
+        "Halt).\n\n",
         "**Real robot.** `manyforge_components` reads component states (the "
         "machine's controller mode, state, error and motors in `details`), "
         "faults, the cell latch and readiness, and runs component actions. A "

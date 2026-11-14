@@ -214,7 +214,8 @@ class ExternallyProvisionedManagerStores::Impl final {
  public:
   Impl(
       std::filesystem::path stable_state_directory,
-      RetainedAdmissionIdentity admission_identity)
+      RetainedAdmissionIdentity admission_identity,
+      persistence::SqliteRecordWriter* const record_writer)
       : stable_state_directory_(
             ValidateStableStateDirectory(
                 std::move(stable_state_directory))),
@@ -266,16 +267,16 @@ class ExternallyProvisionedManagerStores::Impl final {
       const auto open_journal = [&] {
         bootstrap_journal_ =
             std::make_unique<SqliteManagerBootstrapJournal>(
-                journal_path, cell_id_);
+                journal_path, cell_id_, record_writer);
       };
       const auto open_publication = [&] {
         active_bundle_publication_store_ =
             std::make_unique<SqliteActiveBundlePublicationStore>(
-                publication_path, cell_id_);
+                publication_path, cell_id_, record_writer);
       };
       const auto open_apply = [&] {
         apply_journal_ = std::make_unique<SqliteManagerApplyJournal>(
-            apply_path, cell_id_);
+            apply_path, cell_id_, record_writer);
       };
 
       // Validate every initialized peer before initializing any missing or
@@ -312,7 +313,7 @@ class ExternallyProvisionedManagerStores::Impl final {
             "identity");
       }
 
-      // SQLite FULL durability covers database/WAL writes. The external
+      // The stores' writer covers database/WAL writes. The external
       // composition root additionally persists any newly created directory
       // entries before it exposes the store set. Repeating this on reopen is
       // harmless and avoids a racy pre-open existence inference.
@@ -342,10 +343,12 @@ class ExternallyProvisionedManagerStores::Impl final {
 
 ExternallyProvisionedManagerStores::ExternallyProvisionedManagerStores(
     std::filesystem::path stable_state_directory,
-    const deployment::CanonicalEmptyRetainedBundleAdmission& admission)
+    const deployment::CanonicalEmptyRetainedBundleAdmission& admission,
+    persistence::SqliteRecordWriter* const record_writer)
     : impl_(std::make_unique<Impl>(
           std::move(stable_state_directory),
-          IdentityFromAdmission(admission))) {}
+          IdentityFromAdmission(admission),
+          record_writer)) {}
 
 ExternallyProvisionedManagerStores::~ExternallyProvisionedManagerStores() =
     default;

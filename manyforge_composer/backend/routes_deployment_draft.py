@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import hashlib
 import json
 import logging
 from pathlib import Path
 from contextlib import contextmanager
 import time
-import uuid
 from typing import Any, Callable, Iterator, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
@@ -22,9 +20,19 @@ from manyforge_behavior.model_source_capture import (
     capture_deployment_model_sources,
 )
 from manyforge_headless_api.client import HeadlessClientError
-from manyforge_headless_api.held_run_authoring import held_run_draft_edit_allowed
+from manyforge_headless_api.held_run_authoring import (
+    held_run_draft_edit_allowed,
+    manual_operation_settled,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
+from .application_identity import (
+    ApplicationStartIdText,
+    RequestKeyText,
+    format_application_start_id,
+    new_request_key,
+    parse_application_start_id,
+)
 from .authoring_admission import (
     AuthoringOperationError,
     AuthoringMutationEnvelope,
@@ -50,16 +58,15 @@ from .deployment_intent import (
 )
 from .draft_session import DraftSessionError
 from .apply_orchestration import (
-    DEFAULT_LIFECYCLE_TIMEOUT_S,
-    HOST_COMPONENT_STOP_GRACE_S,
     ApplyRefused,
     ApplyStepFailed,
     Preview,
     candidate_preview,
-    lifecycle_timeouts,
+    apply_effect_unknown,
+    apply_step,
+    apply_step_source,
     one_apply_at_a_time,
     preview_view,
-    recorded_apply,
     run_apply,
 )
 from .deployment_defaults import effective_fields, with_defaults
@@ -120,10 +127,8 @@ class _Fence(BaseModel):
     expected_admission_generation: int = Field(
         alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
     )
-    request_owner_epoch: str = Field(
-        alias="requestOwnerEpoch", min_length=1, max_length=256
-    )
-    request_id: str = Field(alias="requestId", min_length=1, max_length=256)
+    application_start_id: ApplicationStartIdText = Field(alias="applicationStartId")
+    request_key: RequestKeyText = Field(alias="requestKey")
     expected_workspace_epoch: str = Field(
         alias="expectedWorkspaceEpoch", min_length=1, max_length=256
     )
@@ -134,8 +139,8 @@ class _Fence(BaseModel):
     def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
-            request_owner_epoch=self.request_owner_epoch,
-            request_id=self.request_id,
+            application_start_id=parse_application_start_id(self.application_start_id),
+            request_key=bytes.fromhex(self.request_key),
         )
 
     def require_workspace_fence(self, identity) -> None:
@@ -219,6 +224,8 @@ class ConfirmedApplyRequest(ServerApplyRequest):
     """
 
     scope: dict[str, Any] | None = None
+    # The command's identity (OD-214): the same key again returns its row.
+    request_key: RequestKeyText
 
 
 def activation_scope(state: ComposerState) -> dict[str, Any]:
@@ -273,9 +280,6 @@ def apply_slot() -> Iterator[None]:
         ) from refusal
 
 
-SERVER_REQUEST_OWNER_EPOCH = "composer-server"
-
-
 def server_admission_generation(state: ComposerState) -> int:
     if state.headless_client is None:
         raise DeploymentDraftError(
@@ -294,8 +298,9 @@ def server_deployment_fence(state: ComposerState) -> DeploymentCandidateRequest:
         draft_id=identity.deployment_draft_id,
         expected_draft_revision=identity.deployment_draft_revision,
         expected_admission_generation=server_admission_generation(state),
-        request_owner_epoch=SERVER_REQUEST_OWNER_EPOCH,
-        request_id=f"composer-server.{uuid.uuid4()}",
+        # A server-originated request: Composer's own `A` and a fresh key.
+        application_start_id=format_application_start_id(state.application_start_id),
+        request_key=new_request_key().hex(),
         expected_workspace_epoch=identity.workspace_epoch,
         expected_workspace_revision=identity.workspace_revision,
     )
@@ -394,7 +399,7 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     document = deployment["document"]
     saved_document = deployment["savedDocument"]
     workspace = {
-        "schemaVersion": "manyforge.composer_deployment_workspace.v1",
+        "schemaVersion": "manyforge.composer_deployment_workspace.v2",
         "draft": {
             "id": deployment["draftId"],
             "revision": deployment["draftRevision"],
@@ -426,6 +431,8 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         },
     }
     workspace["authoringWorkspace"] = authoring.identity.as_dict()
+    # Apply, Revert, Load and New in progress and the last ended (OD-214).
+    workspace["apply_commands"] = state.apply_commands.snapshot()
     draft = workspace["draft"]
     current: dict[str, Any] | None = None
     binding: dict[str, Any] | None = None
@@ -1059,20 +1066,14 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 }
             )
         )
-        current_bundle, current_graph, _ = state._manager_current(
+        current_bundle, current_graph = state._manager_current(
             state.headless_client.manager_status(), phase="deployment_revert.preview"
-        )
-        manager_request_id = (
-            "deployment-revert-"
-            + hashlib.sha256(
-                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
-            ).hexdigest()[:32]
         )
         compiled_saved = state.deployment_draft_session.preview_source(
             json.dumps(saved, ensure_ascii=False, allow_nan=False)
         )
         base_intent = {
-            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "schema_version": "manyforge.composer_authoring_effect.v2",
             "scene_initialization": "initialize",
             "operation_kind": "revert_deployment",
             "effect_class": "external",
@@ -1090,11 +1091,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             },
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
-            "manager_request_id": manager_request_id,
-            "correlation_id": body.request_id,
+            "application_start_id": body.application_start_id,
+            "request_key": new_request_key().hex(),
             "confirmation_token": None,
-            "preparation_request_owner_epoch": body.request_owner_epoch,
-            "preparation_request_id": body.request_id,
+            "preparation_application_start_id": body.application_start_id,
+            "preparation_request_key": body.request_key,
         }
         if program is None:
             base_intent["program_authoring"] = deepcopy(program_restore.saved_document)
@@ -1168,8 +1169,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 notify=False,
                 context=AuthoringOperationContext(
                     operation="revert_deployment",
-                    request_owner_epoch=body.request_owner_epoch,
-                    request_id=body.request_id,
+                    application_start_id=parse_application_start_id(
+                        body.application_start_id
+                    ),
+                    request_key=bytes.fromhex(body.request_key),
                 ),
             )
 
@@ -1194,7 +1197,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 )
                 self.wait_for_manager_apply(response["result"])
 
-        return _RevertPorts(state, saved)
+        return _RevertPorts(state)
 
     @router.post("/api/deployment/revert/preview")
     def preview_revert(body: ServerApplyRequest) -> dict[str, Any]:
@@ -1209,8 +1212,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/revert")
     def revert(body: ConfirmedApplyRequest) -> dict[str, Any]:
-        """Apply of the Saved Scenario; both Drafts return to Saved. Returns
-        ApplyResult. Bound to the Revert Preview's ``scope`` when given."""
+        """Apply of the Saved Scenario; both Drafts return to Saved. Answers
+        at acceptance with its row (``manyforge.apply_command_reply.v1``);
+        the row's end carries the ApplyResult's outcome. Bound to the Revert
+        Preview's ``scope`` when given."""
 
         def run() -> dict[str, Any]:
             try:
@@ -1220,7 +1225,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             except Exception as error:
                 _raise(error)
 
-        return recorded_apply(state.headless_client, "deployment_revert", run)
+        return state.apply_commands.run(
+            state.headless_client, "deployment_revert", body.request_key, run
+        )
 
     def authored_candidate(
         body: DeploymentCandidateRequest,
@@ -1251,7 +1258,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
         def manager_current() -> tuple[str, str]:
             try:
-                bundle, graph, _epoch = state._manager_current(
+                bundle, graph = state._manager_current(
                     state.headless_client.manager_status(), phase="deployment_candidate.preview"
                 )
                 return bundle, graph
@@ -1346,7 +1353,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         current_bundle, current_graph = manager_current()
         pre_state = state.authoring_retained_state()
         intent = {
-            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "schema_version": "manyforge.composer_authoring_effect.v2",
             "operation_kind": operation_kind,
             "effect_class": "external",
             "external_kind": (
@@ -1367,14 +1374,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             },
             "expected_admission_generation": body.expected_admission_generation,
             "scene_initialization": "initialize",
-            "manager_request_id": "deployment-candidate-manager-"
-            + hashlib.sha256(
-                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
-            ).hexdigest()[:32],
-            "correlation_id": body.request_id,
+            "application_start_id": body.application_start_id,
+            "request_key": new_request_key().hex(),
             "confirmation_token": None,
-            "preparation_request_owner_epoch": body.request_owner_epoch,
-            "preparation_request_id": body.request_id,
+            "preparation_application_start_id": body.application_start_id,
+            "preparation_request_key": body.request_key,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
             "post_state": pre_state,
@@ -1466,8 +1470,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 _LOGGER.exception(
                     "deployment_candidate_activation_failed",
                     extra={
-                        "request_owner_epoch": body.request_owner_epoch,
-                        "request_id": body.request_id,
+                        "application_start_id": body.application_start_id,
+                        "request_key": body.request_key,
                         "draft_id": body.draft_id,
                         "draft_revision": body.expected_draft_revision,
                         "failure_phase": failure_phase,
@@ -1517,8 +1521,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/apply")
     def apply_deployment(body: ConfirmedApplyRequest) -> dict[str, Any]:
-        """Orchestrated Apply of the current Draft; returns ApplyResult.
-        Bound to the Preview's ``scope`` when given."""
+        """Orchestrated Apply of the current Draft. Answers at acceptance
+        with its row (``manyforge.apply_command_reply.v1``); the row's end
+        carries the ApplyResult's outcome. Bound to the Preview's ``scope``
+        when given."""
 
         def run() -> dict[str, Any]:
             try:
@@ -1532,7 +1538,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             except Exception as error:
                 _raise(error)
 
-        return recorded_apply(state.headless_client, "deployment_apply", run)
+        return state.apply_commands.run(
+            state.headless_client, "deployment_apply", body.request_key, run
+        )
 
     @router.get("/api/deployment/effective")
     def effective_values() -> dict[str, Any]:
@@ -1598,30 +1606,12 @@ def orchestrated_apply(ports: Any) -> dict[str, Any]:
 
 
 class HeadlessApplyPorts:
-    """The component, Program-cycle and Manager-status reads of an Apply.
-
-    ``deployment`` is the candidate Deployment: its components' lifecycle
-    timeouts bound each step; a component that is only in the Applied one
-    (being removed) uses that one's, else the default.
-    """
+    """The component, Program-cycle and Manager-status reads of an Apply."""
 
     _POLL_SECONDS = 0.2
-    _RESET_OWNER_EPOCH = "composer-server"
 
-    def __init__(
-        self, state: ComposerState, deployment: dict[str, Any] | None = None
-    ) -> None:
+    def __init__(self, state: ComposerState) -> None:
         self._state = state
-        self._timeouts = {
-            **lifecycle_timeouts(state.applied_deployment_document),
-            **lifecycle_timeouts(deployment),
-        }
-        self._component_ids = {
-            str(row.get("component_id"))
-            for document in (state.applied_deployment_document, deployment)
-            for row in (document or {}).get("components") or ()
-            if isinstance(row, dict)
-        }
 
     @property
     def _client(self):
@@ -1642,29 +1632,47 @@ class HeadlessApplyPorts:
             self._client.execution_control_state(),
         )
 
+    def manual_operations_settled(self) -> bool:
+        try:
+            response = self._client.execution_control_state()
+        except HeadlessClientError as error:
+            # No physical product is installed yet (before the first Apply):
+            # no direct-control target exists, so no manual operation does.
+            if error.code == "execution_owner_not_ready":
+                return True
+            raise
+        control = response.get("control_state")
+        manual = control.get("manual_operations") if isinstance(control, dict) else None
+        # Unknown is not settled, as in the held-run rule.
+        return isinstance(manual, list) and all(
+            manual_operation_settled(row) for row in manual
+        )
+
     def reset_cycle(self) -> None:
         """Reset the finished or held run (as the Program tab's Reset, no
-        options) and return once the cycle is idle again.
+        options) and return once that Reset ended ``succeeded``.
 
-        The Runner's Idle reaches the Kernel admission through the Manager's
-        readiness update, a moment later; the Apply's preparation waits for
-        that admission itself (Headless ``prepare_activation``). Bounded by
-        :meth:`_apply_bound_s`, as the Manager Apply's wait; past it the Apply
-        fails ``program_cycle_reset_failed``.
+        Headless answers the Reset at acceptance with the runner's row; the
+        row is followed in the cycle status (``runner_commands``) to its end,
+        with no limit (OD-214): any other end fails the Apply step with the
+        row's code. The Runner's Idle reaches the Kernel admission through
+        the Manager's readiness update, a moment later; the Apply's
+        preparation waits for that admission itself (Headless
+        ``prepare_activation``).
         """
 
         cycle = self._client.program_cycle_status()
-        generation = cycle.get("cycle_generation")
-        request_id = f"composer-apply-reset.{uuid.uuid4()}"
-        self._client.program_cycle_reset(
+        # A server-originated Reset: Composer's own `A` and a fresh key
+        # (nothing resends it).
+        reply = self._client.program_cycle_reset(
             {
-                "request_id": request_id,
-                "request_owner_epoch": self._RESET_OWNER_EPOCH,
+                "request_key": new_request_key().hex(),
+                "application_start_id": format_application_start_id(
+                    self._state.application_start_id
+                ),
                 "source_label": "composer_apply",
-                "correlation_id": request_id,
                 "program_run_id": cycle.get("program_run_id"),
-                "expected_owner_epoch": cycle.get("program_runner_owner_epoch"),
-                "expected_cycle_generation": generation,
+                "expected_cycle_generation": cycle.get("cycle_generation"),
                 "expected_claim_generation": cycle.get("cycle_claim_generation"),
                 "terminal_reference": cycle.get("terminal_or_settlement_reference"),
                 "settlement_evidence_digest": cycle.get(
@@ -1674,35 +1682,53 @@ class HeadlessApplyPorts:
                 "reset_robot_position": False,
             }
         )
-        bound_s = self._apply_bound_s()
-        deadline = time.monotonic() + bound_s
-        while True:
-            current = self._client.program_cycle_status()
-            state = current.get("state")
-            idle = (
-                state == "idle_after_reset"
-                and isinstance(generation, int)
-                and isinstance(current.get("cycle_generation"), int)
-                and current["cycle_generation"] > generation
+        row = reply.get("command")
+        if (
+            reply.get("schema_version") != "manyforge.program_command_reply.v1"
+            or not isinstance(row, dict)
+            or row.get("kind") != "reset"
+            or not isinstance(row.get("request_key"), str)
+        ):
+            raise ApplyStepFailed(
+                "program_runner_response_invalid",
+                "The Program Reset before the Apply returned an invalid reply",
             )
-            if idle:
-                return
-            if state not in (cycle.get("state"), "resetting"):
-                failure = current.get("failure")
-                failure = failure if isinstance(failure, dict) else {}
-                raise ApplyStepFailed(
-                    str(failure.get("code") or "program_cycle_reset_failed"),
-                    str(
-                        failure.get("message")
-                        or "The Program Reset before the Apply didn't finish"
-                    ),
-                )
-            if time.monotonic() >= deadline:
-                raise ApplyStepFailed(
-                    "program_cycle_reset_failed",
-                    f"The Program Reset before the Apply didn't finish within {bound_s:g} s",
-                )
+        # Headless forms the key the runner's row carries.
+        key = row["request_key"]
+        apply_step_source(
+            "resetting_cycle",
+            {"status": "runner_command", "kind": "reset", "request_key": key},
+        )
+        while row.get("end") is None:
             time.sleep(self._POLL_SECONDS)
+            commands = self._client.program_cycle_status().get("runner_commands")
+            commands = commands if isinstance(commands, dict) else {}
+            current = next(
+                (
+                    candidate
+                    for candidate in (
+                        commands.get("in_progress"),
+                        *(commands.get("ended") or ()),
+                    )
+                    if isinstance(candidate, dict)
+                    and candidate.get("request_key") == key
+                ),
+                None,
+            )
+            if current is None:
+                raise ApplyStepFailed(
+                    "program_runner_response_invalid",
+                    "The Program cycle status omitted the Reset before the Apply",
+                )
+            row = current
+        end = row["end"]
+        if end.get("outcome") != "succeeded":
+            code = end.get("code")
+            raise ApplyStepFailed(
+                code if isinstance(code, str) and code else "program_cycle_reset_failed",
+                "The Program Reset before the Apply ended "
+                f"{end.get('outcome')}",
+            )
 
     def components(self) -> list[dict[str, Any]]:
         return list(self._client.components())
@@ -1710,28 +1736,12 @@ class HeadlessApplyPorts:
     def component_action(self, component_id: str, action: str) -> None:
         self._client.component_action(component_id, action)
 
-    def lifecycle_timeout_s(self, component_id: str) -> float:
-        return self._timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S)
-
-    def _apply_bound_s(self) -> float:
-        # The lifecycle timeouts of every component in the candidate or the
-        # installed cell (the components the host may stop or start; the
-        # default for one without an authored timeout), each with the host's
-        # stop grace for retiring its launch (a hung one waits for the group
-        # SIGKILL, F8), as the Manager's `HostApplyTimeout`; at least one
-        # default timeout. The installed components are read from the host:
-        # the remembered Applied document may not be verified yet.
-        installed = {str(row.get("component_id")) for row in self.components()}
-        return max(
-            DEFAULT_LIFECYCLE_TIMEOUT_S,
-            sum(self.lifecycle_timeout_s(component_id) + HOST_COMPONENT_STOP_GRACE_S
-                for component_id in self._component_ids | installed),
-        )
-
     def wait_for_manager_apply(self, result: dict[str, Any]) -> None:
         """Wait for an accepted Manager Apply to be terminal.
 
-        Bounded by :meth:`_apply_bound_s`; past it the outcome is unknown.
+        No limit of its own (OD-214): the Manager ends every Apply, at the
+        latest after its own bound (`apply_timed_out`); a status read that
+        fails ends the wait with its error.
         """
 
         if result.get("status") != "accepted":
@@ -1739,22 +1749,31 @@ class HeadlessApplyPorts:
             return
         apply_id = result["apply_id"]
         generation = result["apply_generation"]
-        bound_s = self._apply_bound_s()
-        deadline = time.monotonic() + bound_s
+        apply_step_source(
+            "applying",
+            {
+                "status": "manager_apply",
+                "apply_id": apply_id,
+                "apply_generation": generation,
+            },
+        )
         while True:
-            status = self._client.manager_apply_status(apply_id, generation)
+            status = self._client.manager_apply_status(
+                apply_id,
+                generation,
+                application_start_id=format_application_start_id(
+                    self._state.application_start_id
+                ),
+            )
             terminal = status.get("state") if status.get("ok") is True else None
             if terminal == "succeeded":
                 return
             if terminal in ("failed", "unknown_effect"):
+                if terminal == "unknown_effect":
+                    apply_effect_unknown()
                 # A terminal status carries the Manager's retained `failure`.
                 error = status.get("failure") if isinstance(status.get("failure"), dict) else {}
                 raise manager_apply_failure(error, terminal)
-            if time.monotonic() >= deadline:
-                raise ApplyStepFailed(
-                    "manager_apply_unknown_effect",
-                    f"The Manager Apply didn't finish within {bound_s:g} s",
-                )
             time.sleep(self._POLL_SECONDS)
 
     def wait_for_scene_clear(self, result: dict[str, Any]) -> None:
@@ -1765,8 +1784,12 @@ class HeadlessApplyPorts:
         owner transactions, which hold the cell's authoring admission; the
         Apply's result returns once that clear has ended (any outcome; it is
         reported in the cycle status), so the next Load or Preview is
-        admitted. Bounded by :meth:`_apply_bound_s`; past it, or when the
-        cycle status can't be read, the Apply returns as it is.
+        admitted. Headless publishes an end for every such Apply (OD-239), so
+        the wait has no time limit. It ends at this Apply's end; at a status
+        naming a later Apply, or naming no Apply (a direct clear), either of
+        which replaced this one's (a direct clear may also have run before
+        this Apply's clear began: the Apply then goes on without it); or,
+        logged, when the cycle status can't be read.
         """
 
         manager_apply = result.get("manager_apply")
@@ -1778,8 +1801,14 @@ class HeadlessApplyPorts:
             # Headless clears the Scene only for a newly accepted Apply.
             return
         identity = (result["apply_id"], result["apply_generation"])
-        bound_s = self._apply_bound_s()
-        deadline = time.monotonic() + bound_s
+        apply_step(
+            "clearing_scene",
+            {
+                "status": "scene_clear",
+                "apply_id": identity[0],
+                "apply_generation": identity[1],
+            },
+        )
         while True:
             try:
                 clear = self._client.program_cycle_status().get("scene_clear")
@@ -1804,12 +1833,14 @@ class HeadlessApplyPorts:
                             *identity, cause, details.get("cause_details"),
                         )
                 return
-            if time.monotonic() >= deadline:
-                logging.getLogger(__name__).warning(
-                    "Scene clear after Apply %s/%s didn't end within %g s",
-                    *identity, bound_s,
-                )
-                return
+            if isinstance(clear, dict):
+                named = clear.get("apply_id")
+                if named is None or (type(named) is int and named > identity[0]):
+                    # Another status replaced this one's (OD-239): a later
+                    # Apply's (the Manager numbers Applies in increasing
+                    # order within an application start) or a direct
+                    # clear's, which names no Apply.
+                    return
             time.sleep(self._POLL_SECONDS)
 
 
@@ -1822,8 +1853,7 @@ class _DraftApplyPorts(HeadlessApplyPorts):
         body: DeploymentCandidateRequest,
         authored_candidate: Callable[..., dict[str, Any]],
     ) -> None:
-        document = state.deployment_draft_session.retained_state().get("document")
-        super().__init__(state, document if isinstance(document, dict) else None)
+        super().__init__(state)
         self._body = body
         self._authored_candidate = authored_candidate
 

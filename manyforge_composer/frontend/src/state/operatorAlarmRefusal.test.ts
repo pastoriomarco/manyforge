@@ -30,7 +30,6 @@ describe('operator-alarm attention refusals', () => {
       details: {
         reason: 'operator_alarm_interlock_active',
         interlock_alarms: membership('alarm_scope'),
-        owner_epoch: 'alarm.owner.1',
         generation: '7',
       },
       origin: null,
@@ -38,7 +37,6 @@ describe('operator-alarm attention refusals', () => {
       { label: 'Reason', value: 'operator_alarm_interlock_active' },
       { label: 'Alarm interlocks', value: 'alarm_scope' },
       { label: 'Generation', value: '7' },
-      { label: 'Owner epoch', value: 'alarm.owner.1' },
     ]);
   });
 });

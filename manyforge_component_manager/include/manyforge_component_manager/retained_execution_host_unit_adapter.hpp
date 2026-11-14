@@ -1,16 +1,23 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
+#include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <sys/types.h>
 #include <vector>
 
 namespace manyforge::deployment {
@@ -23,6 +30,41 @@ namespace manyforge::component_manager {
 class RetainedExecutionHostUnitAdapterError final : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
+};
+
+/// Error code of the typed busy answer: a call met the execution host while it
+/// is being launched or while its projection bindings are being prepared
+/// (B13, OD-122 (16); contract 1.3). Details: `phase` (`launching` or
+/// `preparing`) and `runtime_unit_id`. The caller retries by its own action.
+inline constexpr std::string_view kRuntimeUnitLaunchInProgressCode =
+    "runtime_unit_launch_in_progress";
+
+/// Error code of the typed late answer (OD-121 (4)): the execution host did
+/// not answer a management exchange within its bound. The outcome of that
+/// request is unknown; the host is not stopped. While the reply is
+/// outstanding every management call answers this code at once and sends
+/// nothing. Details: `exchange` (the timed-out exchange kind) and `bound_ms`.
+inline constexpr std::string_view kExecutionHostLateCode =
+    "execution_host_late";
+
+/// The late execution host, as the Manager's observation tick reads it.
+struct ExecutionHostLateDTO final {
+  /// Counts timed-out exchanges since the start; a new value is a new late
+  /// episode.
+  std::uint64_t episode{};
+  /// The timed-out exchange kind (static text).
+  std::string_view exchange;
+  std::chrono::milliseconds bound{};
+  /// Since the timed-out request was sent.
+  std::chrono::milliseconds waited{};
+};
+
+/// How the execution host child ended, as the Manager observed it.
+struct ExecutionHostExitDTO final {
+  /// True when `value` is the terminating signal, false when it is the exit
+  /// status.
+  bool signaled{};
+  int value{};
 };
 
 /// Manager-owned local adapter for the retained native execution product.
@@ -40,7 +82,7 @@ public:
 /// it is never a retained package root.
 ///
 /// `site_settings_document`, when supplied, is the Manager-validated generic
-/// machine site document (`manyforge.site.v1`). It is captured once into a
+/// machine site document (`manyforge.site.v2`). It is captured once into a
 /// private run-root snapshot that is never rewritten and stays with the run's
 /// evidence; children receive only that snapshot path.
 class RetainedExecutionHostUnitAdapter final
@@ -53,9 +95,9 @@ class RetainedExecutionHostUnitAdapter final
       public IManagerLivenessTransportPort {
 public:
   RetainedExecutionHostUnitAdapter(
+      manyforge::core::ApplicationStartId application_start_id,
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
-      std::filesystem::path manager_state_root,
       std::filesystem::path manager_run_root,
       std::filesystem::path execution_state_root,
       std::filesystem::path execution_run_root,
@@ -63,15 +105,15 @@ public:
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
       std::string operating_system, std::string launch_environment_contract,
-      std::filesystem::path logical_scene_database = {},
-      std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
       std::filesystem::path scene_asset_root = {},
-      std::optional<std::string> site_settings_document = std::nullopt);
+      std::optional<std::string> site_settings_document = std::nullopt,
+      std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+          active_publication = {});
   RetainedExecutionHostUnitAdapter(
+      manyforge::core::ApplicationStartId application_start_id,
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
-      std::filesystem::path manager_state_root,
       std::filesystem::path manager_run_root,
       std::filesystem::path execution_state_root,
       std::filesystem::path execution_run_root,
@@ -80,11 +122,13 @@ public:
           &artifact_source,
       std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
-      std::filesystem::path logical_scene_database = {},
-      std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
       std::filesystem::path scene_asset_root = {},
-      std::optional<std::string> site_settings_document = std::nullopt);
+      std::optional<std::string> site_settings_document = std::nullopt,
+      // The Manager's current publication; every fence request but Release
+      // carries it to the host.
+      std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+          active_publication = {});
   ~RetainedExecutionHostUnitAdapter() override;
 
   RetainedExecutionHostUnitAdapter(const RetainedExecutionHostUnitAdapter &) =
@@ -115,8 +159,6 @@ public:
   ReconcileAcquireAttempt(
       const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &query)
       const override;
-  [[nodiscard]] manyforge::core::ApplyFenceReconcileResultDTO
-  Rehydrate(const manyforge::core::ApplyFenceRehydrateDTO &request) override;
   [[nodiscard]] manyforge::core::ConfigurationFenceStatusDTO
   QueryStatus(const manyforge::core::ConfigurationFenceStatusQueryDTO &query)
       const override;
@@ -136,12 +178,18 @@ public:
   manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
   AcquireCellAdmissionClaim(
       const manyforge::core::CellAdmissionClaimIntentDTO &intent) override;
+  [[nodiscard]]
+  manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
+  AcquireManagerApplyClaim(
+      const manyforge::core::CellAdmissionClaimIntentDTO &intent,
+      const manyforge::core::RetainedBundleId &candidate_retained_bundle_id) override;
   [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
   ReleaseCellAdmissionClaim(
       const manyforge::core::CellAdmissionClaimReleaseDTO &release) override;
   [[nodiscard]] manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
-  ReconcileCellAdmissionClaims(
-      const manyforge::core::CellAdmissionReconcileDTO &reconcile) override;
+  ReleaseManagerApplyClaim(
+      const manyforge::core::CellAdmissionClaimReleaseDTO &release,
+      const manyforge::core::ManagerApplyReleaseOutcomeDTO &outcome) override;
   [[nodiscard]] manyforge::core::Result<
       manyforge::core::CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
@@ -155,10 +203,6 @@ public:
       std::shared_ptr<manyforge::core::IPlannerSceneProjection>>
   ResolveProjection(const manyforge::core::ProjectionExecutionHostBindingDTO
                         &execution_host_binding) const override;
-  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &request) override;
-  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &request) override;
   [[nodiscard]] manyforge::core::Result<
       ManagerComponentProcessInventoryResultDTO>
   InspectInstalledComponentProcesses(
@@ -174,6 +218,34 @@ public:
   RenewManagerLivenessBatch(
       const std::vector<ManagerLivenessTransportRequestDTO>& requests)
       override;
+
+  /// The execution host's exit, once any observation or call has seen it.
+  /// Lock-free: read by the Manager's observation tick, which ends the
+  /// application on it (OD-122 (1)).
+  [[nodiscard]] std::optional<ExecutionHostExitDTO> HostExit() const noexcept;
+
+  /// The late host, present exactly while a timed-out management exchange's
+  /// reply is outstanding (OD-121 (4); maintainer 2026-11-13: no separate
+  /// latch). It ends by itself when the late reply arrives and is settled.
+  /// A failed management channel with the host alive keeps it present until
+  /// the host is stopped. Lock-free: read by the Manager's observation tick, which requests one
+  /// Halt per episode, and by its readiness reduction, which counts the host
+  /// unit faulted while it is present.
+  [[nodiscard]] std::optional<ExecutionHostLateDTO> HostLate() const noexcept;
+
+  /// OD-187 (1): `force_requested` answers whether a second stop request
+  /// came during the Manager's stop sequence. While the host's stop waits
+  /// for its exit and it answers true, the host is ended with SIGKILL. Set
+  /// once by the Manager before any stop; read lock-free; memory reads only.
+  void SetShutdownForce(bool (*force_requested)() noexcept) noexcept;
+
+  /// True while the adapter holds an execution host child whose exit it has
+  /// not observed. Memory reads under the adapter's lock only.
+  [[nodiscard]] bool HasHostChild() const;
+
+  /// The PID of the host child ended by SIGKILL for a second stop request,
+  /// once that happened; the Manager logs the kill. Lock-free.
+  [[nodiscard]] std::optional<pid_t> HostForceKilledPid() const noexcept;
 
 private:
   struct Impl;

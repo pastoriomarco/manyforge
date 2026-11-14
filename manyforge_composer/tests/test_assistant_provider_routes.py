@@ -79,22 +79,9 @@ class AdmissionHeadless:
     def authoring_admission(self) -> dict[str, Any]:
         return {"authoring_allowed": True, "admission_generation": 7}
 
-    def recover_authoring_transaction(self, _body: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "recovery_receipt": {
-                "status": "unknown",
-                "kernel_owner_epoch": "kernel.1",
-                "held_claims": [],
-                "current_owner_epochs": [],
-            }
-        }
-
-    def reconcile_authoring_owner(self, _body: dict[str, Any]) -> dict[str, Any]:
-        return {"admission": {"authoring_allowed": True, "admission_generation": 7}}
-
     def assistant_modes(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.assistant_mode_index.v2",
+            "schema_version": "manyforge.assistant_mode_index.v3",
             "assistant_component_id": self.assistant_component_id,
             "ai_model_component_id": "assistant_model",
             "modes": [],
@@ -156,7 +143,7 @@ def _submit(state: ComposerState, monkeypatch) -> TestClient:
 
 
 def _loaded_state(monkeypatch, provider: RecordingProvider) -> ComposerState:
-    state = ComposerState(headless_client=AdmissionHeadless(),  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=AdmissionHeadless(),  # type: ignore[arg-type]
                           assistant_client=provider)  # type: ignore[arg-type]
     draft = state.draft_session.snapshot()
     draft["program_loaded"] = True
@@ -204,7 +191,7 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
     from manyforge_composer.backend import routes_assistant
 
     provider = RecordingProvider()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         headless_client=AdmissionHeadless(),  # type: ignore[arg-type]
         assistant_client=provider,  # type: ignore[arg-type]
     )
@@ -273,7 +260,7 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
 
 
 def _headless_state(headless: AdmissionHeadless, provider: RecordingProvider) -> ComposerState:
-    return ComposerState(headless_client=headless,  # type: ignore[arg-type]
+    return ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=headless,  # type: ignore[arg-type]
                          assistant_client=provider)  # type: ignore[arg-type]
 
 
@@ -426,8 +413,6 @@ def test_submit_checks_runs_and_submits_under_the_workspace_fence(monkeypatch) -
 _DIGEST = "sha256:" + "1" * 64
 _FRESHNESS = {
     "context_id": "freshness-1",
-    "receiver_incarnation": "headless-1",
-    "semantic_owner_epoch": "program-1",
     "execution_control_revision": 1,
     "issued_server_sequence": "1",
     "valid_for_ns": 750_000_000,
@@ -468,11 +453,9 @@ def _execute_state(headless: ExecuteHeadless, provider: RecordingProvider):
 
 
 _RECOVERY = {
-    "request_id": "recovery-1",
-    "request_owner_epoch": "browser-1",
+    "request_key": "e1" * 16,
+    "application_start_id": "3f9a0000000000a1",
     "source_label": "test",
-    "correlation_id": None,
-    "expected_owner_epoch": "program-1",
     "offer_id": _DIGEST,
     "offer_revision": 1,
     "action_id": "retry_motion_from_current_state",
@@ -483,8 +466,8 @@ _RECOVERY = {
 def _execute(client: TestClient, start: str):
     if start == "program_runs":
         return client.post("/api/program/runs", json={
-            "request_id": "run-1", "request_owner_epoch": "browser-1", "source_label": "test",
-            "correlation_id": None, "scenario_id": "cell-a",
+            "request_key": "a1" * 16, "application_start_id": "3f9a0000000000a1",
+            "source_label": "test", "scenario_id": "cell-a",
             "source_document_digest": _DIGEST, "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
         })
@@ -492,23 +475,25 @@ def _execute(client: TestClient, start: str):
         return client.post("/api/cycle/recovery-actions", json=_RECOVERY)
     return client.post("/api/control/commands", json={
         "command_envelope": {
-            "schema_version": "manyforge.execution_command.v1",
+            "schema_version": "manyforge.execution_command.v2",
             "command_kind": start,
-            "correlation_id": "start-1",
             "source_label": "test",
-            "control_session_id": None,
+            "control_session_number": None,
             "client_sequence": None,
             "freshness": _FRESHNESS,
-            "expected_semantic_owner_epoch": "program-1",
             "expected_execution_control_revision": 1,
         },
-        "payload": _RECOVERY if start == "execution_recovery" else {},
+        # A session-less command carries its key and `A` in the payload.
+        "payload": _RECOVERY if start == "execution_recovery" else {
+            "request_key": "c1" * 16,
+            "application_start_id": "3f9a0000000000a1",
+        },
     })
 
 
 _STARTS = [
     "program_runs", "recovery_action", "program_run", "program_motion_start",
-    "program_motion_resume", "program_resume_full_stop", "execution_recovery",
+    "program_motion_resume", "program_resume_halt", "execution_recovery",
 ]
 
 

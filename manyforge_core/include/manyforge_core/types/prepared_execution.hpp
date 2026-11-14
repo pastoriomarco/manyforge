@@ -18,7 +18,7 @@ class RuntimeParticipantBinding;
 struct PreparedMotionReplacementSourceDTO final {
   std::uint64_t execution_id{};
   std::uint64_t execution_generation{};
-  ExecutionGoalKey goal;
+  ControllerGoalId goal;
   ExecutionBindingEpoch binding_epoch{0U};
   ContentDigest prepared_contract_digest{std::string{}};
   ExecutionControllerSampleDTO controller_sample;
@@ -104,7 +104,7 @@ enum class PrepareParticipantResultStateDTO : std::uint8_t {
 /// Every identity is copied from one already sealed prepared participant;
 /// adapters cannot use this value to alter Kernel preparation authority.
 struct PrepareParticipantResultDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -160,7 +160,7 @@ enum class ExecutionBackendStateDTO : std::uint8_t {
 /// Kernel operation terminality and cannot authorize a different goal,
 /// binding, route, configuration, runtime epoch, or resource scope.
 struct ExecutionBackendStatusDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -176,7 +176,6 @@ struct ExecutionBackendStatusDTO final {
   ActiveControlConfigurationId active_control_configuration_id;
   ActiveControlConfigurationGeneration active_control_configuration_generation;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   RuntimeEpoch provider_runtime_epoch;
   std::vector<ResourceId> resources;
   ExecutionBackendStateDTO state{ExecutionBackendStateDTO::kAccepted};
@@ -231,21 +230,19 @@ prepared_participant_backend_physical_binding_field_error(
 /// digest and supplies both bounded observation callbacks.
 [[nodiscard]] std::optional<std::string_view> prepared_execution_handle_field_error(
     const ExecutionHandle& handle, const PreparedOperationParticipantDTO& participant,
-    const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation) noexcept;
+    const ControllerGoalId& controller_goal_id) noexcept;
 
 /// Validate one status publication against the exact prepared participant and
 /// Kernel-minted goal identity for that dispatch.
 [[nodiscard]] std::optional<std::string_view> execution_backend_status_field_error(
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
-    const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation) noexcept;
+    const ControllerGoalId& controller_goal_id) noexcept;
 
 /// Construct one exact backend status projection from the immutable prepared
 /// participant and Kernel goal membership.
 [[nodiscard]] Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
     const PreparedOperationParticipantDTO& participant, const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation, ExecutionBackendStateDTO state,
+    ExecutionBackendStateDTO state,
     double accepted_trajectory_time_s, double progress, std::uint64_t source_sequence,
     std::int64_t receiver_local_receipt_timestamp_ns, std::optional<ErrorDTO> error = std::nullopt);
 

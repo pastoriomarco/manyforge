@@ -7,7 +7,12 @@ import { applyResultText } from '../components/ApplyImpact';
 import type { AuthoringCommand } from '../state/busyOperation';
 import { codedErrorText } from '../state/componentPresentation';
 import { errorMessage } from '../state/structuralResource';
-import type { ApplyPreview, ApplyResult } from '../types/components';
+import type { ApplyPreview } from '../types/components';
+import {
+  applyRowPreparationCause, applyRowRefusal, awaitCommandEnd, withApplyStep,
+} from '../state/commandRows';
+import { applyResultOfRow } from '../api/parsers/commandRows';
+import { useCommandRowWaiter } from './useCommandRowWaiter';
 import {
   deploymentComparisonsStale,
   deploymentLocalFence,
@@ -16,6 +21,7 @@ import {
   withSharedDeploymentAuthoring,
 } from '../state/authoringWorkspace';
 import type {
+  ApplyCommandRow,
   DeploymentWorkspaceResponse,
   DeploymentControlledStopUpdate,
   JsonValue,
@@ -23,7 +29,7 @@ import type {
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
-import { browserStableIdentity } from './useHeadlessState';
+import { newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
 
 /**
@@ -34,11 +40,6 @@ export function cellApplyErrorText(reason: unknown, fallback: string): string {
   const message = errorMessage(reason, fallback);
   const code = apiErrorCode(reason);
   return code === null ? message : codedErrorText({ code, message });
-}
-
-function requestId(): string {
-  return `composer-deployment.${globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
 
 export function useDeploymentWorkspace(
@@ -53,7 +54,7 @@ export function useDeploymentWorkspace(
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
   const [completedAdmission, setCompletedAdmission] = useState<{
-    receiverEpoch: string;
+    applicationStartId: ApplicationStartId;
     generation: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,10 +79,7 @@ export function useDeploymentWorkspace(
   const mounted = useRef(true);
   const inFlight = useRef(false);
   const refreshSequence = useRef(0);
-  const ownerEpoch = useRef(browserStableIdentity(
-    'manyforge.composer.deployment_request_owner_epoch',
-    'composer-deployment-owner',
-  ));
+  const applyRows = useCommandRowWaiter(snapshot?.applyCommands ?? null, snapshot?.applicationStartId ?? null);
 
   const refresh = useCallback(async () => {
     if (!enabled) return null;
@@ -136,7 +134,7 @@ export function useDeploymentWorkspace(
     ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
   const mutationAvailable = mutationUnavailableReason === null;
   const documentUnavailableReason = unavailableBefore
-    ?? (completedAdmission?.receiverEpoch === snapshot!.receiverEpoch
+    ?? (completedAdmission?.applicationStartId === snapshot!.applicationStartId
       && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
       ? 'Waiting for updated backend authoring permissions.'
       : authoring.unavailableReason
@@ -183,12 +181,7 @@ export function useDeploymentWorkspace(
       || published === null
       || workspace === null
     ) return null;
-    return deploymentLocalFence(
-      published,
-      snapshot,
-      ownerEpoch.current,
-      requestId(),
-    );
+    return deploymentLocalFence(published, snapshot, newRequestKey());
   }, [documentUnavailableReason, mutationUnavailableReason, published, snapshot, workspace]);
 
   const run = useCallback(async (
@@ -216,7 +209,7 @@ export function useDeploymentWorkspace(
         // admission fence (a Draft edit takes no claim and consumes none).
         if (kind === 'document') {
           setCompletedAdmission({
-            receiverEpoch: snapshot.receiverEpoch,
+            applicationStartId: snapshot.applicationStartId,
             generation: requestFence.expectedAdmissionGeneration,
           });
         }
@@ -260,7 +253,7 @@ export function useDeploymentWorkspace(
    * Program run is in progress; allowed during a cell latch.
    */
   const sendApply = useCallback(async (
-    operation: () => Promise<ApplyResult>,
+    operation: () => Promise<ApplyCommandRow>,
     failure: string,
     command: 'apply' | 'revert',
   ) => {
@@ -276,8 +269,22 @@ export function useDeploymentWorkspace(
     // The workspace is read again before the outcome is shown: the read
     // clears the error it last showed.
     try {
-      const result = await operation();
+      // Answered at acceptance; the outcome is the row's end (OD-214).
+      const ended = await awaitCommandEnd(await operation(), applyRows);
       const refreshed = await refresh();
+      // A new application start keeps no row of this Apply: the page
+      // shows the state it reads again.
+      if (ended === null) return null;
+      // Refused after acceptance (no effect): shown as a refusal before it was.
+      const refusal = applyRowRefusal(ended);
+      if (refusal !== null) {
+        if (mounted.current) {
+          setError(codedErrorText(refusal));
+          setErrorCauseCode(applyRowPreparationCause(ended));
+        }
+        return null;
+      }
+      const result = applyResultOfRow(ended);
       if (mounted.current) {
         if (result.outcome === 'failed') setError(applyResultText(result));
         else setFeedback(applyResultText(result));
@@ -303,7 +310,7 @@ export function useDeploymentWorkspace(
         setApplying(false);
       }
     }
-  }, [authoring, refresh]);
+  }, [applyRows, authoring, refresh]);
 
   /** An effect-free Preview, held as one operation like any other. */
   const preview = useCallback(async (
@@ -479,7 +486,7 @@ export function useDeploymentWorkspace(
     errorCauseCode,
     feedback,
     /** The authoring operation in progress (busy label and tooltip), or null. */
-    busyOperation: authoring.operation,
+    busyOperation: withApplyStep(authoring.operation, snapshot?.applyCommands),
     applyConfirmationOpen,
     applyPreview,
     applyPreviewKind,

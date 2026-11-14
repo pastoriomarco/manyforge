@@ -1,13 +1,12 @@
 """Component stream health: adapter-side sample sink.
 
-``ComponentStreamSink`` forwards samples and fault events of one stream from an adapter process to the execution host,
+``ComponentStreamSink`` forwards samples of one stream from an adapter process to the execution host,
 which records them into the stream the host-side adapter declared.
 
 Transport: ``diagnostic_msgs/msg/DiagnosticStatus`` on
 ``/manyforge/component_stream_samples`` (reliable, depth 64);
 ``hardware_id`` = component id, ``name`` = stream id, ``level`` OK = sample,
-ERROR = fault event, ``message`` = fault code, values ``stamp_ns`` (decimal,
-``"0"`` = arrival only) and, for faults, ``detail``.
+value ``stamp_ns`` (decimal, ``"0"`` = arrival only).
 """
 
 from __future__ import annotations
@@ -17,18 +16,14 @@ import time
 from collections.abc import Callable
 from typing import Any, Final
 
-MAX_STREAM_FAULT_DETAIL_BYTES: Final = 256
-
 COMPONENT_STREAM_SAMPLES_TOPIC: Final = "/manyforge/component_stream_samples"
 COMPONENT_STREAM_SAMPLES_DEPTH: Final = 64
 DEFAULT_HEARTBEAT_PERIOD_NS: Final = 50_000_000
 
 LEVEL_OK: Final = 0
-LEVEL_ERROR: Final = 2
 
 _MAX_INT64: Final = 2**63 - 1
 _STREAM_ID: Final = re.compile(r"[a-z0-9_./-]{1,64}")
-_FAULT_CODE: Final = re.compile(r"[a-z0-9_.]{1,64}")
 
 
 def valid_stream_id(value: object) -> bool:
@@ -37,20 +32,10 @@ def valid_stream_id(value: object) -> bool:
     return type(value) is str and _STREAM_ID.fullmatch(value) is not None
 
 
-def valid_stream_fault_code(value: object) -> bool:
-    """1..64 bytes of ``[a-z0-9_.]`` (C++ ``ValidStreamFaultCode``)."""
-
-    return type(value) is str and _FAULT_CODE.fullmatch(value) is not None
-
-
 def _require_int(value: object, label: str, *, minimum: int) -> int:
     if type(value) is not int or not minimum <= value <= _MAX_INT64:
         raise ValueError(f"{label} must be an int64 >= {minimum}")
     return value
-
-
-def _truncate_utf8(text: str, limit: int) -> str:
-    return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
 
 
 def _ros_transport() -> tuple[Any, Any, Any]:
@@ -67,7 +52,7 @@ def _ros_transport() -> tuple[Any, Any, Any]:
 
 
 class ComponentStreamSink:
-    """Forwards one stream's samples and fault events to the execution host.
+    """Forwards one stream's samples to the execution host.
 
     ``record`` is cheap: it publishes an advancing sample at most every
     ``heartbeat_period_ns`` (the first one at once; a throttled one, as the
@@ -126,28 +111,14 @@ class ComponentStreamSink:
         ):
             return
         self._last_publish_ns = now_ns
-        self._publish(LEVEL_OK, "", self._pending_stamp_ns, None)
+        self._publish(self._pending_stamp_ns)
         self._pending_stamp_ns = None
 
-    def report_fault(self, code: str, detail: str = "") -> None:
-        """Immediate bad news with a typed code and a bounded detail."""
-
-        if not valid_stream_fault_code(code):
-            raise ValueError("fault code must be 1..64 bytes of [a-z0-9_.]")
-        if type(detail) is not str:
-            raise ValueError("fault detail must be a str")
-        self._publish(
-            LEVEL_ERROR, code, 0, _truncate_utf8(detail, MAX_STREAM_FAULT_DETAIL_BYTES)
-        )
-
-    def _publish(self, level: int, code: str, stamp_ns: int, detail: str | None) -> None:
+    def _publish(self, stamp_ns: int) -> None:
         message = self._status_type()
-        message.level = bytes([level])
+        message.level = bytes([LEVEL_OK])
         message.name = self._stream_id
-        message.message = code
+        message.message = ""
         message.hardware_id = self._component
-        values = [self._key_value_type(key="stamp_ns", value=str(stamp_ns))]
-        if detail is not None:
-            values.append(self._key_value_type(key="detail", value=detail))
-        message.values = values
+        message.values = [self._key_value_type(key="stamp_ns", value=str(stamp_ns))]
         self._publisher.publish(message)

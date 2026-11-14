@@ -20,6 +20,20 @@ namespace manyforge::roboplan_backend::detail {
     const core::ProgramRunExecutionCaptureDTO &capture,
     const deployment::ProgramBinding *binding);
 
+// OD-234: the capture's resolution context. It owns the sealed pair the
+// capture was resolved from; the Kernel keeps it with the held capture and
+// hands it back for that run's work. Only ResolveSealedProgramCapture makes
+// one, so reading it back as this type is exact.
+struct SealedProgramRunSources final {
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
+  std::shared_ptr<const deployment::ProgramBinding> binding;
+};
+
+[[nodiscard]] inline const SealedProgramRunSources *
+SealedProgramRunSourcesOf(const core::ProgramRunResolutionContext &context) {
+  return static_cast<const SealedProgramRunSources *>(context.get());
+}
+
 // Resolve only from the exact already sealed pair. The aliases retain those
 // actual products; Kernel admission still owns all Run/claim/owner checks.
 [[nodiscard]] core::Result<core::ProgramRunExecutionCaptureDTO>

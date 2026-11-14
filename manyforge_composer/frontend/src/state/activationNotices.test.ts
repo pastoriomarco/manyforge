@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { activationFailureNotice } from './activationNotices';
+import { ERROR_CATALOG } from '../api/errorCatalog.generated';
+import type { ManagerApplyFailure } from '../types/api';
+import { activationFailureNotice, failedApplyHold } from './activationNotices';
 
 /** The notice, asserted present (an acknowledged failure returns null). */
 function shownNotice(...args: Parameters<typeof activationFailureNotice>) {
@@ -13,7 +15,7 @@ describe('activation failure notice', () => {
   it('keeps the owner failure phase, code and effect disposition', () => {
     const notice = shownNotice(
       'activation.a:1',
-      'apply.a',
+      '3f9a/apply1',
       {
         state: 'unknown_effect',
         failureAcknowledgement: 'unavailable',
@@ -28,7 +30,6 @@ describe('activation failure notice', () => {
           effectBoundary: 'unknown',
         },
       },
-      "/workspace/scenarios/operator's test cell.scenario",
       false,
     );
     expect(notice).toMatchObject({
@@ -37,32 +38,45 @@ describe('activation failure notice', () => {
     expect(notice.message).toContain('Failed during runtime converged');
     expect(notice.message).toContain('(runtime_composition_publication_verification_failed)');
     expect(notice.message).toContain('effects are unknown');
-    expect(notice.message).toContain('Applied state was not confirmed (apply.a)');
-    expect(notice.message).toContain('The runtime remains locked');
-    expect(notice.message).toContain(
-      'Stop the workbench and keep evidence: ./scripts/compose-dev.sh stop --keep-evidence',
-    );
-    expect(notice.message).toMatch(
-      /Reload: \.\/scripts\/compose-dev\.sh stop --keep-evidence && \.\/scripts\/compose-dev\.sh start --project 'scenarios\/operator'"'"'s test cell\.scenario'$/,
-    );
-    expect(notice.message).toContain('run from the repository root');
-    expect(notice.message).toContain('unsaved changes will be lost');
-    expect(notice.message).toContain(
-      'Evidence is written under .manyforge-dev/evidence/ and its exact path is printed in the terminal.',
-    );
-    expect(notice.message).toContain(
-      'page disconnects when the workbench stops and may need a refresh after Reload',
-    );
-    expect(notice.message).toContain('invalid Saved Scenario leaves the runtime closed');
+    expect(notice.message).toContain('Applied state was not confirmed (3f9a/apply1)');
+    expect(notice.message).toContain('Use New to clear the failed Apply and empty the cell, then Load again.');
     expect(notice.message).toContain('typed_cause_code');
     expect(notice.message).toContain('component_manager');
-    expect(notice.message).toContain('Execution never resumes automatically');
+    expect(notice.actions).toBeUndefined();
   });
+
+  it.each(['apply_progression_failed', 'apply_timed_out'] as const)(
+    'shows the catalogue text of a Manager-ended Apply (%s)',
+    (code) => {
+      const notice = shownNotice(
+        'activation.a:1',
+        '3f9a/apply1',
+        {
+          state: 'unknown_effect',
+          failureAcknowledgement: 'unavailable',
+          failure: {
+            code,
+            message: 'the Apply ended.',
+            phase: 'runtime_converged',
+            effectDisposition: 'unknown',
+            causeCode: code,
+            causeDetails: {},
+            producer: 'component_manager',
+            effectBoundary: 'unknown',
+          },
+        },
+        false,
+      );
+      expect(notice.message).toContain(`(${code})`);
+      expect(notice.message).toContain(ERROR_CATALOG[code][0]);
+      expect(notice.message).toContain(ERROR_CATALOG[code][1]);
+    },
+  );
 
   it('does not prescribe recovery for a known pre-effect refusal, and dismisses it locally', () => {
     const run = vi.fn();
     const dismiss = vi.fn();
-    const notice = shownNotice('activation.b:1', 'apply.b', {
+    const notice = shownNotice('activation.b:1', '3f9a/apply2', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -75,7 +89,7 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'unknown',
       },
-    }, null, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss });
+    }, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss });
     // A failed Apply is an error (item 21): red, never a warning.
     expect(notice).toMatchObject({ title: 'Activation failed', severity: 'error' });
     expect(notice.acknowledgeable).toBeUndefined();
@@ -85,8 +99,7 @@ describe('activation failure notice', () => {
     expect(notice.message).toContain(
       'Manager recorded a known pre-effect refusal.',
     );
-    expect(notice.message).toContain('current owner confirms authoring admission is open');
-    expect(notice.message).toContain('cold restart is not required');
+    expect(notice.message).toContain('Authoring is available again; nothing is held.');
     expect(notice.message).toContain('Correct the reported cause before trying again');
     expect(notice.message).not.toContain('stop --keep-evidence');
     expect(notice.message).not.toContain('start --project');
@@ -113,9 +126,9 @@ describe('activation failure notice', () => {
       producer: 'component_manager',
       effectBoundary: 'before_effect' as const,
     };
-    const available = shownNotice('activation.ack:1', 'apply.ack', {
+    const available = shownNotice('activation.ack:1', '3f9a/apply3', {
       state: 'failed', failure, failureAcknowledgement: 'available',
-    }, null, true, { busy: true, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
+    }, true, { busy: true, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
 
     expect(available.title).toBe('Activation failed');
     expect(available.severity).toBe('error');
@@ -127,7 +140,7 @@ describe('activation failure notice', () => {
     available.actions?.[0]?.run();
     expect(run).toHaveBeenCalledTimes(1);
 
-    const unknown = shownNotice('activation.ack:2', 'apply.unknown', {
+    const unknown = shownNotice('activation.ack:2', '3f9a/apply4', {
       state: 'unknown_effect',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -135,14 +148,14 @@ describe('activation failure notice', () => {
         effectDisposition: 'unknown' as const,
         effectBoundary: 'unknown' as const,
       },
-    }, null, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
-    // After effect the Manager never offers acknowledgement: cold recovery, no button.
+    }, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
+    // After effect the Manager never offers acknowledgement: no button.
     expect(unknown.actions).toBeUndefined();
   });
 
   it('keeps the notice and sends the durable Acknowledge again after a proven no-effect refusal while still offered', () => {
     const run = vi.fn();
-    const notice = shownNotice('activation.ack:3', 'apply.ack', {
+    const notice = shownNotice('activation.ack:3', '3f9a/apply3', {
       state: 'failed',
       // The refusal had `effect: none` and the Manager still offers acknowledgement.
       failureAcknowledgement: 'available',
@@ -156,7 +169,7 @@ describe('activation failure notice', () => {
         producer: 'kernel',
         effectBoundary: 'before_effect',
       },
-    }, null, false, {
+    }, false, {
       busy: false,
       error: 'Acknowledgement was refused (The predecessor changed.).',
       outcomeUnknown: false,
@@ -174,8 +187,8 @@ describe('activation failure notice', () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
-  it('after an unknown outcome says so, names the cold restart, and only re-reads', () => {
-    const notice = shownNotice('activation.ack:4', 'apply.ack', {
+  it('after an unknown outcome says so, names New, and only re-reads', () => {
+    const notice = shownNotice('activation.ack:4', '3f9a/apply3', {
       state: 'failed',
       // Even if a read says available, a sent attempt with an unknown outcome is never resent.
       failureAcknowledgement: 'available',
@@ -189,20 +202,25 @@ describe('activation failure notice', () => {
         producer: 'kernel',
         effectBoundary: 'before_effect',
       },
-    }, null, false, { busy: false, error: 'Acknowledgement was not confirmed.', outcomeUnknown: true, run: vi.fn(), dismiss: vi.fn() });
+    }, false, { busy: false, error: 'Acknowledgement was not confirmed.', outcomeUnknown: true, run: vi.fn(), dismiss: vi.fn() });
 
     expect(notice.severity).toBe('error');
-    expect(notice.message).toContain('The acknowledgement outcome is unknown.');
-    expect(notice.message).toContain('permits no second attempt, so nothing is resent');
-    expect(notice.message).toContain('short of a cold restart');
-    expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
+    expect(notice.message).toContain(
+      ' The acknowledgement outcome is unknown; Acknowledge re-reads the status.',
+    );
+    expect(notice.message).toContain(
+      'The failed Apply still holds the cell, so authoring is unavailable. Acknowledge it; '
+        + 'if authoring stays unavailable, use New: it clears the failed Apply and empties the cell.',
+    );
+    expect(notice.message).not.toContain('restart');
+    expect(notice.message).not.toContain('compose-dev.sh');
     expect(notice.actions).toEqual([expect.objectContaining({
       label: 'Acknowledge', title: expect.stringContaining('Re-read this Apply'),
     })]);
   });
 
   it('does not treat unavailable as released after the fence: it stays and says so', () => {
-    const notice = shownNotice('activation.ack:5', 'apply.ack', {
+    const notice = shownNotice('activation.ack:5', '3f9a/apply3', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -215,7 +233,7 @@ describe('activation failure notice', () => {
         producer: 'kernel',
         effectBoundary: 'before_effect',
       },
-    }, null, false, { busy: false, error: null, outcomeUnknown: false, run: vi.fn(), dismiss: vi.fn() });
+    }, false, { busy: false, error: null, outcomeUnknown: false, run: vi.fn(), dismiss: vi.fn() });
 
     expect(notice.severity).toBe('error');
     expect(notice.message).toContain(
@@ -239,7 +257,7 @@ describe('activation failure notice', () => {
       for (const [busy, outcomeUnknown] of [[false, false], [true, false], [false, true]] as const) {
         const run = vi.fn();
         const dismiss = vi.fn();
-        const notice = shownNotice('activation.m:1', 'apply.m', {
+        const notice = shownNotice('activation.m:1', '3f9a/apply5', {
           state: 'failed',
           failureAcknowledgement,
           failure: {
@@ -252,7 +270,7 @@ describe('activation failure notice', () => {
             producer: 'kernel',
             effectBoundary,
           },
-        }, null, null, { busy, error, outcomeUnknown, run, dismiss });
+        }, null, { busy, error, outcomeUnknown, run, dismiss });
         expect(notice.severity).toBe('error');
         expect(notice.acknowledgeable).toBeUndefined();
         expect(notice.actions?.map((action) => action.id)).toEqual(['acknowledge-apply-failure']);
@@ -268,7 +286,7 @@ describe('activation failure notice', () => {
   });
 
   it('removes an authoritatively acknowledged failure from active attention', () => {
-    const notice = activationFailureNotice('activation.acknowledged:1', 'apply.acknowledged', {
+    const notice = activationFailureNotice('activation.acknowledged:1', '3f9a/apply6', {
       state: 'failed',
       failureAcknowledgement: 'acknowledged',
       failure: {
@@ -281,13 +299,13 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'before_effect',
       },
-    }, null, false);
+    }, false);
 
     expect(notice).toBeNull();
   });
 
-  it('shows a Scenario composition refusal with its cause and the restart before the next Load', () => {
-    const notice = shownNotice('activation.r:1', 'apply.r', {
+  it('shows a Scenario composition refusal with its cause and New before the next Load', () => {
+    const notice = shownNotice('activation.r:1', '3f9a/apply10', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -303,23 +321,21 @@ describe('activation failure notice', () => {
         producer: 'execution_host',
         effectBoundary: 'unknown',
       },
-    }, '/workspace/scenarios/cell.scenario', false);
+    }, false);
 
     expect(notice).toMatchObject({ severity: 'error', domain: 'activation', title: 'Scenario refused' });
     expect(notice.message).toBe(
       'Scenario refused: RoboPlan addressed planner construction is inconsistent (component arm.1). '
         + 'The Scenario was not applied and nothing changed: composing its configuration found an '
-        + 'inconsistency in its data or setup. Fix the cause named in the details, then restart the '
-        + 'workbench before loading again. Stop the workbench and keep evidence: '
-        + './scripts/compose-dev.sh stop --keep-evidence, then start the workbench again. (apply.r)',
+        + 'inconsistency in its data or setup. Fix the cause named in the details before loading '
+        + 'again. Use New to clear the failed Apply, then correct the Scenario and Load again. (3f9a/apply10)',
     );
-    expect(notice.message).not.toContain('runtime remains locked');
     expect(notice.message).not.toContain('Load or Apply again');
     expect(notice.actions).toBeUndefined();
   });
 
-  it('keeps cold recovery for a known failure after the pre-effect phase', () => {
-    const notice = shownNotice('activation.c:1', 'apply.c', {
+  it('names New for a known failure after the pre-effect phase', () => {
+    const notice = shownNotice('activation.c:1', '3f9a/apply11', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -332,61 +348,31 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'unknown',
       },
-    }, '/tmp/external.scenario', false);
+    }, false);
 
-    expect(notice.message).toContain('The runtime remains locked');
-    expect(notice.message).toContain(
-      'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only stopping the workbench is available.',
-    );
-    expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
-    expect(notice.message).not.toContain('start --project');
+    expect(notice).toMatchObject({ severity: 'error', title: 'Activation failed' });
     expect(notice.message).toMatch(
-      /Stop the workbench and keep evidence: \.\/scripts\/compose-dev\.sh stop --keep-evidence$/,
+      /^Runtime convergence failed\. Failed during runtime converged \(runtime_convergence_failed\); its effects are known\. Cause: /,
     );
-  });
-
-  it.each([
-    '/workspace/scenarios/cell.scenario.yaml',
-    '/workspace/scenarios/cell.scenario.yml',
-  ])('offers only stopping the workbench for single-file Saved Scenario %s', (scenarioPath) => {
-    const notice = shownNotice('activation.d:1', 'apply.d', {
-      state: 'unknown_effect',
-      failureAcknowledgement: 'unavailable',
-      failure: {
-        code: 'scene_publication_unknown',
-        message: 'Scene publication could not be confirmed.',
-        phase: 'scene_activated',
-        effectDisposition: 'unknown',
-        causeCode: 'typed_cause_code',
-        causeDetails: {},
-        producer: 'component_manager',
-        effectBoundary: 'unknown',
-      },
-    }, scenarioPath, false);
-
-    expect(notice.message).toContain(
-      'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only stopping the workbench is available.',
+    expect(notice.message).toMatch(
+      / Applied state was not confirmed \(3f9a\/apply11\)\. What the Apply changed in the cell is not confirmed\. Use New to clear the failed Apply and empty the cell, then Load again\.$/,
     );
-    expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
-    expect(notice.message).not.toContain('start --project');
   });
 
   it('fails closed when a terminal failure has no detail', () => {
-    const notice = shownNotice('activation.e:1', 'apply.e', {
+    const notice = shownNotice('activation.e:1', '3f9a/apply13', {
       state: 'failed', failure: null, failureAcknowledgement: 'unavailable',
-    }, null, false);
+    }, false);
 
-    expect(notice.message).toContain(
-      'Manager reported a terminal failure without detail. Applied state was not confirmed (apply.e).',
-    );
-    expect(notice.message).toContain('The runtime remains locked');
-    expect(notice.message).toContain(
-      'No Saved Scenario path is available, so this workbench can only be closed.',
+    expect(notice.message).toBe(
+      'Manager reported a terminal failure without detail. Applied state was not confirmed (3f9a/apply13). '
+        + 'What the Apply changed in the cell is not confirmed. '
+        + 'Use New to clear the failed Apply and empty the cell, then Load again.',
     );
   });
 
   it('does not claim a known pre-effect refusal reopened admission when it remains closed', () => {
-    const notice = shownNotice('activation.f:1', 'apply.f', {
+    const notice = shownNotice('activation.f:1', '3f9a/apply14', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -399,16 +385,18 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'before_effect',
       },
-    }, '/workspace/scenarios/cell.scenario', false);
+    }, false);
 
-    expect(notice.message).toContain('current owner still reports authoring admission closed');
-    expect(notice.message).toContain('Do not retry while it remains closed');
-    expect(notice.message).toContain('Apply record alone does not justify a cold restart');
+    expect(notice.message).toContain(
+      'The failed Apply still holds the cell, so authoring is unavailable. Acknowledge it; '
+        + 'if authoring stays unavailable, use New: it clears the failed Apply and empties the cell. '
+        + 'Correct the reported cause before trying again.',
+    );
     expect(notice.message).not.toContain('stop --keep-evidence');
   });
 
-  it('does not infer settlement when authoring admission is unavailable', () => {
-    const notice = shownNotice('activation.g:1', 'apply.g', {
+  it('does not claim the hold is released when authoring admission is unavailable', () => {
+    const notice = shownNotice('activation.g:1', '3f9a/apply15', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -421,16 +409,18 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'before_effect',
       },
-    }, '/workspace/scenarios/cell.scenario', null);
+    }, null);
 
-    expect(notice.message).toContain('Current authoring admission is unavailable');
-    expect(notice.message).toContain('settlement cannot be confirmed');
+    expect(notice.message).toContain(
+      'Whether the failed Apply still holds the cell is not known yet. Acknowledge re-reads it; '
+        + 'if authoring stays unavailable, use New: it clears the failed Apply and empties the cell.',
+    );
     expect(notice.message).not.toContain('stop --keep-evidence');
   });
 
   it('uses before-effect guidance and the acknowledgement action after fence acceptance', () => {
     const run = vi.fn();
-    const notice = shownNotice('activation.h:1', 'apply.h', {
+    const notice = shownNotice('activation.h:1', '3f9a/apply16', {
       state: 'failed',
       failureAcknowledgement: 'available',
       failure: {
@@ -443,7 +433,7 @@ describe('activation failure notice', () => {
         producer: 'kernel',
         effectBoundary: 'before_effect',
       },
-    }, '/workspace/scenarios/cell.scenario', false, {
+    }, false, {
       busy: false, error: null, outcomeUnknown: false, run, dismiss: vi.fn(),
     });
 
@@ -451,9 +441,7 @@ describe('activation failure notice', () => {
     expect(notice.message).toContain(
       'no configuration, runtime, component, or Scene change.',
     );
-    expect(notice.message).toContain('authoring admission closed');
-    expect(notice.message).toContain('An admission claim and Kernel fence may remain');
-    expect(notice.message).toContain('readiness may remain closed');
+    expect(notice.message).toContain('The failed Apply still holds the cell, so authoring is unavailable.');
     expect(notice.message).not.toContain('The runtime remains locked');
     expect(notice.message).not.toContain('stop --keep-evidence');
     expect(notice.actions).toEqual([expect.objectContaining({ label: 'Acknowledge' })]);
@@ -463,7 +451,7 @@ describe('activation failure notice', () => {
 
   it('reports actual open admission when acknowledgement is unavailable without claiming success', () => {
     const run = vi.fn();
-    const notice = shownNotice('activation.i:1', 'apply.i', {
+    const notice = shownNotice('activation.i:1', '3f9a/apply17', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -476,12 +464,9 @@ describe('activation failure notice', () => {
         producer: 'kernel',
         effectBoundary: 'before_effect',
       },
-    }, null, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
+    }, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss: vi.fn() });
 
-    expect(notice.message).toContain('authoring admission is open');
-    expect(notice.message).toContain('The failed Apply remains recorded');
-    expect(notice.message).toContain('does not confirm acknowledgement');
-    expect(notice.message).not.toContain('confirmed acknowledgement');
+    expect(notice.message).toContain('Authoring is available again; nothing is held.');
     // Not offered: the one Acknowledge re-reads; only positive evidence hides it.
     expect(notice.actions).toHaveLength(1);
     notice.actions?.[0]?.run();
@@ -489,8 +474,8 @@ describe('activation failure notice', () => {
     expect(notice.message).not.toContain('The runtime remains locked');
   });
 
-  it('keeps the locked recovery warning when the typed effect boundary is unknown', () => {
-    const notice = shownNotice('activation.j:1', 'apply.j', {
+  it('says nothing is held when the typed effect boundary is unknown and admission is open', () => {
+    const notice = shownNotice('activation.j:1', '3f9a/apply18', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -503,11 +488,159 @@ describe('activation failure notice', () => {
         producer: 'component_manager',
         effectBoundary: 'unknown',
       },
-    }, '/workspace/scenarios/cell.scenario', true);
+    }, true, undefined, failedApplyHold(true));
 
-    expect(notice.message).toContain('The runtime remains locked');
-    expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
+    expect(notice.title).toBe('Activation failed');
+    expect(notice.message).toMatch(/ Applied state was not confirmed \(3f9a\/apply18\)\. Nothing is held; Load again\.$/);
     expect(notice.message).not.toContain('no configuration, runtime, component, or Scene change');
-    expect(notice.message).not.toContain('authoring admission is open');
+    expect(notice.message).not.toContain('Authoring is available again');
+  });
+});
+
+// The way out follows the facts that enable New, by the classes of an ended Apply.
+describe('the way out of an ended Apply', () => {
+  const RESTART = 'compose-dev.sh';
+  const NEW_CLEARS = 'What the Apply changed in the cell is not confirmed. '
+    + 'Use New to clear the failed Apply and empty the cell, then Load again.';
+  const failure = (
+    phase: ManagerApplyFailure['phase'],
+    effectDisposition: 'known' | 'unknown',
+    effectBoundary: 'before_effect' | 'unknown',
+    code = 'typed_failure',
+    causeCode = 'typed_cause_code',
+  ) => ({
+    code, message: 'The Apply ended.', phase, effectDisposition, causeCode,
+    causeDetails: {}, producer: 'component_manager', effectBoundary,
+  }) satisfies ManagerApplyFailure;
+  const ack = (outcomeUnknown = false) => ({
+    busy: false, error: null, outcomeUnknown, run: vi.fn(), dismiss: vi.fn(),
+  });
+
+  it('maps the authoring admission to the way out', () => {
+    expect(failedApplyHold(true)).toBe('nothing_held');
+    expect(failedApplyHold(false)).toBe('new_clears');
+    expect(failedApplyHold(null)).toBe('new_clears');
+  });
+
+  it('class 1: refused before any effect, nothing held: no change, no restart', () => {
+    const notice = shownNotice('activation.c1:1', '3f9a/apply1', {
+      state: 'failed', failureAcknowledgement: 'unavailable',
+      failure: failure('accepted', 'known', 'before_effect'),
+    }, true, ack(), failedApplyHold(true));
+    expect(notice.message).toContain('Manager recorded a known pre-effect refusal.');
+    expect(notice.message).toContain('Authoring is available again; nothing is held.');
+    expect(notice.message).not.toContain(RESTART);
+    expect(notice.message).not.toContain('use New');
+  });
+
+  it('class 2: refused before any effect with the admission still closed', () => {
+    const notice = shownNotice('activation.c2:1', '3f9a/apply2', {
+      state: 'failed', failureAcknowledgement: 'unavailable',
+      failure: failure('accepted', 'known', 'before_effect'),
+    }, false, ack(), failedApplyHold(false));
+    expect(notice.message).toContain(
+      'The failed Apply still holds the cell, so authoring is unavailable. Acknowledge it; '
+        + 'if authoring stays unavailable, use New: it clears the failed Apply and empties the cell.',
+    );
+    expect(notice.message).not.toContain(RESTART);
+  });
+
+  it('class 3: a refused Scenario names New while the Apply holds the cell, nothing once released', () => {
+    const refused = {
+      state: 'failed' as const, failureAcknowledgement: 'available' as const,
+      failure: {
+        ...failure('runtime_converged', 'known', 'unknown', 'runtime_composition_preparation_failed',
+          'scenario_composition_refused'),
+        causeDetails: { component_id: 'arm.1' },
+      },
+    };
+    const guidance = ERROR_CATALOG.scenario_composition_refused[1];
+    expect(shownNotice('activation.c3:1', '3f9a/apply3', refused, false, ack(),
+      failedApplyHold(false)).message).toBe(
+      `The Apply ended. (component arm.1). ${guidance} `
+        + 'Use New to clear the failed Apply, then correct the Scenario and Load again. (3f9a/apply3)',
+    );
+    expect(shownNotice('activation.c3:1', '3f9a/apply3', refused, true, ack(),
+      failedApplyHold(true)).message).toBe(
+      `The Apply ended. (component arm.1). ${guidance} `
+        + 'Nothing was changed; correct the Scenario and Load again. (3f9a/apply3)',
+    );
+    // Before effect after the fence: Acknowledge, no restart.
+    const beforeEffect = shownNotice('activation.c3:2', '3f9a/apply3', {
+      state: 'failed', failureAcknowledgement: 'available',
+      failure: failure('fence_accepted', 'known', 'before_effect'),
+    }, false, ack(), failedApplyHold(false));
+    expect(beforeEffect.message).toContain('made no configuration, runtime, component, or Scene change');
+    expect(beforeEffect.message).not.toContain(RESTART);
+    expect(beforeEffect.actions?.[0]?.title).toContain('Release this failed Apply');
+  });
+
+  it.each(['runtime_convergence_failed', 'apply_timed_out', 'apply_progression_failed'])(
+    'class 4: unknown effect after the fence (%s): New clears it, no lock or restart',
+    (code) => {
+      const notice = shownNotice('activation.c4:1', '3f9a/apply4', {
+        state: 'unknown_effect', failureAcknowledgement: 'unavailable',
+        failure: failure('runtime_converged', 'unknown', 'unknown', code, code),
+      }, false, ack(), failedApplyHold(false));
+      expect(notice.title).toBe('Activation outcome unknown');
+      expect(notice.message).toContain('its effects are unknown. Cause:');
+      expect(notice.message).toContain(`Applied state was not confirmed (3f9a/apply4). ${NEW_CLEARS}`);
+      expect(notice.message).not.toContain(RESTART);
+    },
+  );
+
+  it.each<[string, ManagerApplyFailure['phase']]>([
+    ['class 5: fence attempt never accepted', 'fence_acquired'],
+    ['class 7: a failure after publication', 'published'],
+  ])('%s: New clears it', (_name, phase) => {
+    const notice = shownNotice('activation.c5:1', '3f9a/apply5', {
+      state: 'unknown_effect', failureAcknowledgement: 'unavailable',
+      failure: failure(phase, 'unknown', 'unknown'),
+    }, false, ack(), failedApplyHold(false));
+    expect(notice.message).toMatch(/its effects are unknown\. Cause: /);
+    expect(notice.message).toContain(`Applied state was not confirmed (3f9a/apply5). ${NEW_CLEARS}`);
+  });
+
+  it('class 6: after a release whose outcome is unknown, New is still named', () => {
+    const notice = shownNotice('activation.c6:1', '3f9a/apply6', {
+      state: 'unknown_effect', failureAcknowledgement: 'unavailable',
+      failure: failure('runtime_converged', 'unknown', 'unknown'),
+    }, false, ack(true), failedApplyHold(false));
+    expect(notice.message).toContain(`Applied state was not confirmed (3f9a/apply6). ${NEW_CLEARS}`);
+  });
+
+  it('nothing held: a failed Apply after the fence names Load only', () => {
+    const notice = shownNotice('activation.n:1', '3f9a/apply7', {
+      state: 'failed', failureAcknowledgement: 'unavailable',
+      failure: failure('runtime_converged', 'unknown', 'unknown'),
+    }, true, ack(true), failedApplyHold(true));
+    expect(notice.title).toBe('Activation failed');
+    expect(notice.message).toMatch(/ Applied state was not confirmed \(3f9a\/apply7\)\. Nothing is held; Load again\.$/);
+  });
+
+  it('no notice of an ended Apply names a restart', () => {
+    const states = ['failed', 'unknown_effect'] as const;
+    const offers = ['available', 'unavailable'] as const;
+    const failures = [
+      null,
+      failure('accepted', 'known', 'before_effect'),
+      failure('accepted', 'known', 'unknown'),
+      failure('fence_accepted', 'known', 'before_effect'),
+      failure('fence_acquired', 'unknown', 'unknown'),
+      failure('runtime_converged', 'unknown', 'unknown'),
+      failure('published', 'known', 'unknown'),
+      failure('runtime_converged', 'known', 'unknown', 'runtime_composition_preparation_failed',
+        'scenario_composition_refused'),
+    ];
+    for (const state of states) for (const failureAcknowledgement of offers)
+      for (const shown of failures) for (const admission of [true, false, null])
+        for (const outcomeUnknown of [true, false]) {
+          const notice = shownNotice('activation.x:1', '3f9a/apply8', {
+            state, failureAcknowledgement, failure: shown,
+          }, admission, ack(outcomeUnknown), failedApplyHold(admission));
+          expect(notice.message).not.toMatch(/restart/i);
+          expect(notice.message).not.toContain('Stop ManyForge');
+          expect(notice.message).not.toContain(RESTART);
+        }
   });
 });

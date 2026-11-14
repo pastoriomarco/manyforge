@@ -87,8 +87,7 @@ class IIoSignalService {
                               "I/O scoped watch release is not installed",
                               {{"reason", "io_watch_scope_release_unsupported"}}});
   }
-  virtual Result<void> ReleaseRunWatches(const RequestOwnerEpoch& runner_owner_epoch,
-                                         const ProgramRunId& run_id) = 0;
+  virtual Result<void> ReleaseRunWatches(const ProgramRunNumber& run_id) = 0;
 
   /// Called only under the existing current captured Run admission lock,
   /// serialized with ReleaseRunWatches. The service alone owns bounded per-node

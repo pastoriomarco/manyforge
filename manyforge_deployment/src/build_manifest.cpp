@@ -747,7 +747,6 @@ compiler_contract_candidate(std::string_view own_digest) {
                              "manyforge.model_asset.v1",
                              "manyforge.product_contract.v1",
                              "manyforge.provider_manifest.v1",
-                             "manyforge.reference_runtime_manifest.v1",
                              "manyforge.retained_bundle.v1",
                              "manyforge.runtime_profile.v1",
                              "manyforge.site_overlay.v1",
@@ -840,7 +839,7 @@ compiler_contract_candidate(std::string_view own_digest) {
            {"i3_retention_subset",
             CanonicalValue(
                 "passive-or-one-bounded-controllable-component-or-exact-"
-                "reference-runtime")},
+                "ros2-control-execution-host")},
        })},
       {"retained_projection_contract",
        CanonicalValue(CanonicalValue::Object{
@@ -856,7 +855,6 @@ compiler_contract_candidate(std::string_view own_digest) {
                 "manyforge.flattened_model",
                 "manyforge.composed_model_symbol_role_map",
                 "manyforge.control_domain_control",
-                "manyforge.reference_runtime_unit",
                 "manyforge.viewer_model",
             }))},
            {"qualified_product_placements", CanonicalValue(sorted_text_values({

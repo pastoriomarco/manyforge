@@ -327,8 +327,7 @@ class _RecordingStreamSinks:
         published = self.published.setdefault(stream_id, [])
 
         class _Sink(ComponentStreamSink):
-            def _publish(self, level, code, stamp_ns, detail) -> None:
-                del level, code, detail
+            def _publish(self, stamp_ns) -> None:
                 published.append(stamp_ns)
 
         return _Sink(node, component, stream_id, heartbeat_period_ns=0)
@@ -463,8 +462,27 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         assert len(published) >= 3 and set(published) == {0}
 
 
+class _EndedNow(Exception):
+    """Raised by the test's stand-in for ``os._exit``."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+def _end_now(status: int) -> None:
+    raise _EndedNow(status)
+
+
+@pytest.mark.parametrize(
+    ("spin_failure", "status"),
+    ((KeyboardInterrupt, 1), (RuntimeError("source lost"), 78)),
+)
 def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
     monkeypatch,
+    capsys,
+    spin_failure: BaseException | type[BaseException],
+    status: int,
 ) -> None:
     events: list[str] = []
 
@@ -505,7 +523,7 @@ def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
             events.append("executor:remove")
 
         def spin(self) -> None:
-            raise KeyboardInterrupt
+            raise spin_failure
 
         def shutdown(self, *, timeout_sec: float) -> None:
             del timeout_sec
@@ -525,8 +543,82 @@ def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
         lambda **_: events.append("context:shutdown"),
     )
 
-    assert pose_source_snapshot_publisher.main([]) == 1
+    monkeypatch.setattr(pose_source_snapshot_publisher, "_exit_now", _end_now)
+
+    # OD-236: the process ends at once with the failure's status; no teardown
+    # and no interpreter finalization under the live worker.
+    with pytest.raises(_EndedNow) as ended:
+        pose_source_snapshot_publisher.main([])
+    assert ended.value.status == status
     assert events == ["publisher:start", "publisher:stop-incomplete"]
+    expected_err = "" if status == 1 else "isaac_pose_observer_failed: source lost\n"
+    assert capsys.readouterr().err == expected_err
+
+
+def test_entrypoint_that_stops_cleanly_tears_down_and_returns(monkeypatch) -> None:
+    events: list[str] = []
+
+    class _Context:
+        def ok(self) -> bool:
+            return True
+
+    class _Publisher:
+        auxiliary_nodes = ()
+
+        def __init__(self, *, context: _Context) -> None:
+            del context
+
+        def start(self) -> None:
+            events.append("publisher:start")
+
+        def stop(self) -> bool:
+            events.append("publisher:stop")
+            return True
+
+        def destroy_node(self) -> None:
+            events.append("publisher:destroy")
+
+    class _Executor:
+        def __init__(self, *, context: _Context) -> None:
+            del context
+
+        def add_node(self, _node: object) -> None:
+            pass
+
+        def remove_node(self, _node: object) -> None:
+            events.append("executor:remove")
+
+        def spin(self) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self, *, timeout_sec: float) -> None:
+            del timeout_sec
+            events.append("executor:shutdown")
+
+    monkeypatch.setattr(pose_source_snapshot_publisher, "Context", _Context)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher, "PoseSourceSnapshotPublisher", _Publisher
+    )
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher, "SingleThreadedExecutor", _Executor
+    )
+    monkeypatch.setattr(pose_source_snapshot_publisher.rclpy, "init", lambda **_: None)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher.rclpy,
+        "shutdown",
+        lambda **_: events.append("context:shutdown"),
+    )
+    monkeypatch.setattr(pose_source_snapshot_publisher, "_exit_now", _end_now)
+
+    assert pose_source_snapshot_publisher.main([]) == 0
+    assert events == [
+        "publisher:start",
+        "publisher:stop",
+        "executor:remove",
+        "publisher:destroy",
+        "executor:shutdown",
+        "context:shutdown",
+    ]
 
 
 def test_simulation_worker_future_completes_on_single_threaded_executor() -> None:

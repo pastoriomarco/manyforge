@@ -177,7 +177,6 @@ const activeProjection = {
 
 function sceneFactsWithAttachment(attachment: CarriedObjectAttachment): SceneOwnerFacts {
   return {
-    sourceOwnerEpoch: 'scene.owner.1',
     logicalScene: {
       access: {
         active_projection: activeProjection,
@@ -192,7 +191,7 @@ function sceneFactsWithAttachment(attachment: CarriedObjectAttachment): SceneOwn
 const heldRunSnapshot = {
   programCycle: {
     state: 'running',
-    programRunId: 'run.1',
+    programRunId: 1,
     runtimeControls: { executionSelections: { motionHeld: true } },
   },
 } as unknown as ComposerHeadlessState;

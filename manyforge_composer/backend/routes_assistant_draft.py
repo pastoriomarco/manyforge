@@ -32,6 +32,7 @@ from .node_environment_client import (
 )
 from .source_model_client import ActiveSourceModelProjectionError
 from .state import ComposerState
+from .application_identity import new_request_key
 from .authoring_admission import AuthoringMutationEnvelope
 from .authoring_identity import thaw_json
 from .authoring_workspace import (
@@ -180,13 +181,6 @@ class AssistantDraftCallbackRequest(BaseModel):
         max_length=256,
     )
     arguments: dict[str, Any]
-
-    def admission_envelope(self) -> AuthoringMutationEnvelope:
-        return AuthoringMutationEnvelope(
-            expected_admission_generation=self.expected_admission_generation,
-            request_owner_epoch=self.request_owner_epoch,
-            request_id=self.request_id,
-        )
 
     def require_workspace_fence(
         self, identity: AuthoringWorkspaceIdentity
@@ -581,6 +575,13 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 commit = commit_draft_edit(
                     state,
                     body,
+                    # The assistant callback carries no browser envelope: the
+                    # edit is Composer's own, named by a fresh key.
+                    envelope=AuthoringMutationEnvelope(
+                        expected_admission_generation=body.expected_admission_generation,
+                        application_start_id=state.application_start_id,
+                        request_key=new_request_key(),
+                    ),
                     operation_kind=f"assistant_{tool_id}",
                     validate=lambda: validate_mutation_context(
                         validation_as_result=False

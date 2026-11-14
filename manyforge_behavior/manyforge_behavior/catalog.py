@@ -35,7 +35,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
 EXPECTED_CONTENT_VERSION = "3.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:7794f5c2c483e713113143b08316b5dd5b70dfcdc10e5a6eaeea6fdc2c318797"
+    "sha256:cc7d43f05623ebbb3b1012ca7c0557eceb47bbab38bd6eec3345e1261c032318"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -65,8 +65,8 @@ _OWNER_APIS = {
     "assistant.scene_context",
     "assistant.scene_selection",
     "geometry.compare",
+    "kernel.cell_stop",
     "kernel.command_target",
-    "kernel.full_stop",
     "kernel.operation",
     "kernel.recovery",
     "kernel.reset",

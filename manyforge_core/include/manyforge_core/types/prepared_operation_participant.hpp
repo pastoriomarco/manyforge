@@ -23,7 +23,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kPreparedOperationParticipantApiVersion =
-    "manyforge.prepared_operation_participant.v3";
+    "manyforge.prepared_operation_participant.v4";
 inline constexpr std::string_view kPreparedOperationParticipantIdentityDomain =
     "prepared-operation-participant-contract-digest";
 
@@ -161,13 +161,13 @@ struct PreparedControllerExecutionAuthorityDTO final {
 
 struct PreparedOperationParticipantDTO final {
   ContentDigest prepared_contract_digest;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
   ControllableComponentId controllable_component_id;
@@ -187,10 +187,10 @@ struct PreparedOperationParticipantDTO final {
   std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
 
   PreparedOperationParticipantDTO(
-      ContentDigest prepared_contract_digest, OperationId operation_id,
+      ContentDigest prepared_contract_digest, OperationNumber operation_id,
       OperationRevision operation_revision, OperationParticipantId participant_id,
       ProgramId program_id, ProgramRevision program_revision, ProgramBindingId program_binding_id,
-      ProgramRunId program_run_id, RetainedBundleId retained_bundle_id,
+      std::optional<ProgramRunNumber> program_run_id, RetainedBundleId retained_bundle_id,
       GraphRevision graph_revision, ControllableComponentId controllable_component_id,
       ComponentLifecycleGeneration component_lifecycle_generation,
       ComponentTypeId component_type_id, ComponentTypeRevision component_type_revision,

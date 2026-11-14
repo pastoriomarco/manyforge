@@ -9,6 +9,7 @@
 #include <atomic>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/io_signal_subsystem.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -93,8 +94,7 @@ protected:
   c::IoRuleAppliedContextDTO Context() const {
     // This helper test supplies prospective identity only. It does not forge
     // successful Apply, a current facade, an admission claim or driver facts.
-    return {c::RequestOwnerEpoch("host.catalog"),
-            c::ActiveBundlePublicationGeneration(7U),
+    return {c::ActiveBundlePublicationGeneration(7U),
             bundle->retained_bundle_id(),
             bundle->value().cell_graph.graph_revision};
   }
@@ -134,8 +134,7 @@ protected:
                                          artifacts);
   }
   std::shared_ptr<c::IoSignalSubsystem>
-  Service(const c::RequestOwnerEpoch &owner =
-              c::RequestOwnerEpoch("host.catalog")) {
+  Service() {
     const auto configured =
         d::ResolveRetainedIoSignalCatalog(bundle->value().cell_graph);
     if (!configured.ok())
@@ -148,7 +147,7 @@ protected:
         synthetic.insert(row.descriptor.source_id);
     }
     auto created = c::IoSignalSubsystem::Create(
-        {owner, 19U, std::move(descriptors),
+        {19U, std::move(descriptors),
          std::vector<c::InterruptSourceId>(synthetic.begin(), synthetic.end())},
         {16U, 32U, 8U, 8U, 256U, 1024U}, clock);
     if (!created.ok())
@@ -246,9 +245,7 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
       {prototype.value()}, {}, fixture.program_artifact_root);
   const auto &identity = fixture.binding->value();
   const c::ProgramRunExecutionCaptureDTO request{
-      c::RequestOwnerEpoch("capture.fixture.kernel"),
-      c::RequestOwnerEpoch("capture.fixture.runner"),
-      c::CellAdmissionClaimGeneration(1U), c::ProgramRunId("capture.fixture.run"),
+      c::CellAdmissionClaimGeneration(1U), c::ProgramRunNumber(139U),
       identity.program_id, identity.program_revision, identity.program_binding_id,
       identity.retained_bundle_id, identity.graph_revision, {}};
   const auto captured = resolver.ResolveProgramCapture(request);
@@ -295,7 +292,6 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   ASSERT_NE(compiled.value().catalog, nullptr);
   EXPECT_EQ(compiled.value().waiting_for_program, nullptr);
   const auto &catalog = *compiled.value().catalog;
-  EXPECT_EQ(catalog.context.owner_epoch, before.value().owner_epoch);
   EXPECT_EQ(catalog.context.catalog_generation,
             before.value().catalog_generation);
   EXPECT_EQ(catalog.context.active_publication_generation,
@@ -334,12 +330,6 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   ASSERT_FALSE(no_service_waiting.ok());
   EXPECT_EQ(no_service_waiting.error().details.at("reason"),
             "io_global_rule_service_missing");
-  const auto foreign_service = Service(c::RequestOwnerEpoch("foreign.owner"));
-  const auto foreign = CompileGlobalIoRuleCatalog(
-      Context(), *bundle, program.get(), binding.get(), foreign_service);
-  ASSERT_FALSE(foreign.ok());
-  EXPECT_EQ(foreign.error().details.at("reason"),
-            "io_global_rule_service_context_mismatch");
   auto context = Context();
   context.graph_revision = c::GraphRevision("foreign.graph");
   const auto wrong_product = CompileGlobalIoRuleCatalog(
@@ -498,11 +488,9 @@ c::OperationIntentDTO JointMove(const c::RuntimeParticipantBinding &physical,
   for (const auto &resource : value.resources) joints.push_back(*resource.source_joint_name);
   std::vector<double> goal(joints.size(), 0.0);
   return c::OperationIntentDTO{
-      c::PublicRequestContextDTO{c::RequestId("request.tcp.fixture"),
-                                 c::RequestOwnerEpoch("tcp.fixture.kernel"), "tcp_fixture",
-                                 std::nullopt},
+      c::PublicRequestContextDTO{c::TestRequestKey("request.tcp.fixture"), "tcp_fixture"},
       value.program_id, value.program_revision, value.program_binding_id,
-      c::ProgramRunId("tcp.fixture.run"), value.graph_revision, value.retained_bundle_id,
+      c::ProgramRunNumber(113U), value.graph_revision, value.retained_bundle_id,
       std::nullopt,
       {c::OperationParticipantIntentDTO{
           {value.controllable_component_id, value.command_target_id}, value.capability_id,

@@ -201,8 +201,37 @@ def test_headless_required_process_cases_name_the_current_semantic_tests() -> No
         "run_headless_python_tests() {", 1
     )[0]
 
-    assert "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" in body
-    assert "DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop" not in body
+    # OD-120 (4), OD-121 (4): a late host is faulted, stopped once and kept;
+    # OD-122 (1), (2): any component exit ends the application and a Manager
+    # start on a run folder holding a previous run is refused, so the
+    # replacement and fresh-epoch cases are gone.
+    for current in (
+        "ManagerDaemonProcess.ALateExecutionHostIsFaultedStoppedOnceAndKeptUntilItExits",
+        "ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndAPreviousRunIsRefused",
+        "ManagerDaemonProcess.AnExecutionHostExitEndsTheApplication",
+    ):
+        assert f'"{current}"' in body
+    for removed in (
+        "CompatibleNativeReplacementUsesFreshEpochAfterCleanStop",
+        "NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement",
+        "PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement",
+        "DistinctNativePackageUsesFreshManagerGenerationAfterCleanStop",
+    ):
+        assert removed not in body
+
+
+def test_headless_python_tests_name_the_stoppable_motion_fixture() -> None:
+    # The internal run-stop process test reads this fixture through its own
+    # environment names (test_managed_execution_path.py).
+    body = _TEST_ALL.read_text(encoding="utf-8").split(
+        "run_headless_python_tests() {", 1
+    )[1].split("run_headless_tests() {", 1)[0]
+    fixture = "$build/assistant-native-stoppable-motion-test-fixture"
+    assert (
+        f'MANYFORGE_ASSISTANT_STOPPABLE_MOTION_PACKAGE_ROOT="{fixture}/retained-package"'
+        in body
+    )
+    assert f'MANYFORGE_ASSISTANT_STOPPABLE_MOTION_METADATA="{fixture}/metadata.json"' in body
 
 
 @pytest.mark.parametrize("generator", [None, "Ninja", "Unix Makefiles"])
@@ -325,9 +354,9 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         "  printf '%s\\n' 'Test #1: ManagerDaemonProcess.RejectsPreManifestRootWithTypedStartupErrorBeforeIngress'\n"
         '  if [ "${FAKE_CTEST_OMIT_NATIVE:-0}" != 1 ]; then\n'
         "    printf '%s\\n' \\\n"
-        "      'Test #2: ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop' \\\n"
-        "      'Test #3: ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
-        "      'Test #4: ManagerDaemonProcess.PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement'\n"
+        "      'Test #2: ManagerDaemonProcess.ALateExecutionHostIsFaultedStoppedOnceAndKeptUntilItExits' \\\n"
+        "      'Test #3: ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndAPreviousRunIsRefused' \\\n"
+        "      'Test #4: ManagerDaemonProcess.AnExecutionHostExitEndsTheApplication'\n"
         "  fi\n"
         "  printf '%s\\n' 'Total Tests: 99'\n"
         "fi\n",

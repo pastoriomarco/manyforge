@@ -16,13 +16,13 @@ def _origin(scenario_id="scenario_a"):
 
 
 def _publication(scenario_id="scenario_b"):
-    rows = [{"apply_id": "apply-1", "apply_generation": 1,
+    rows = [{"apply_id": 1, "apply_generation": 1,
              "scene_initialization": "initialize",
              "record_digest": "sha256:" + "a" * 64, "origin": _origin()},
-            {"apply_id": "apply-2", "apply_generation": 2,
+            {"apply_id": 2, "apply_generation": 2,
              "scene_initialization": "preserve",
              "record_digest": "sha256:" + "b" * 64, "origin": _origin(scenario_id)}]
-    return {"schema_version": "manyforge.committed_scenario_activation.v4", **deepcopy(rows[-1]),
+    return {"schema_version": "manyforge.committed_scenario_activation.v5", **deepcopy(rows[-1]),
             "publication_generation": 3, "program": None, "program_frame_facts": None,
             "program_binding_id": None, "retained_bundle_id": "sha256:" + "c" * 64,
             "graph_revision": "sha256:" + "d" * 64, "committed_applies": rows}
@@ -37,9 +37,9 @@ def test_typed_history_keeps_every_apply_and_returns_exact_source_without_mutati
     assert value["origin"]["scenario_id"] == "scenario_b"
     later = _publication("scenario_a")
     later["committed_applies"].insert(1, value["committed_applies"][1])
-    later["committed_applies"][-1].update({"apply_id": "apply-3", "apply_generation": 3,
+    later["committed_applies"][-1].update({"apply_id": 3, "apply_generation": 3,
                                          "record_digest": "sha256:" + "c" * 64})
-    later.update({"apply_id": "apply-3", "apply_generation": 3,
+    later.update({"apply_id": 3, "apply_generation": 3,
                   "record_digest": "sha256:" + "c" * 64, "publication_generation": 4})
     assert validate_committed_scenario_activation(later) is later
     assert [row["origin"]["scenario_id"] for row in later["committed_applies"]] == [
@@ -53,7 +53,7 @@ def test_typed_history_keeps_every_apply_and_returns_exact_source_without_mutati
 
 
 @pytest.mark.parametrize("mutation", ["omit_current", "more_than_published", "current_foreign_origin", "duplicate",
-    "unsorted", "v1", "old_scenario_key", "foreign_current_id", "foreign_current_generation"])
+    "unsorted", "v1", "old_scenario_key", "foreign_current_id", "text_current_id", "foreign_current_generation"])
 def test_typed_history_rejects_incomplete_or_mismatched_publication(mutation):
     value = _publication()
     if mutation == "omit_current": value["committed_applies"].pop()
@@ -63,7 +63,11 @@ def test_typed_history_rejects_incomplete_or_mismatched_publication(mutation):
     elif mutation == "unsorted": value["committed_applies"].reverse()
     elif mutation == "v1": value["schema_version"] = "manyforge.committed_scenario_activation.v1"
     elif mutation == "old_scenario_key": value["scenario_id"] = "fake"
-    elif mutation == "foreign_current_id": value["apply_id"] = "foreign"
+    elif mutation == "foreign_current_id": value["apply_id"] = 99
+    # An Apply is named by its integer Apply number (1.16.1).
+    elif mutation == "text_current_id":
+        value["apply_id"] = "2"
+        value["committed_applies"][-1]["apply_id"] = "2"
     elif mutation == "foreign_current_generation": value["apply_generation"] = 3
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)

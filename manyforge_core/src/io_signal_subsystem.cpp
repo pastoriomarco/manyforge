@@ -118,8 +118,7 @@ struct IoSignalSubsystem::State final {
   using Registration = std::variant<Watch, Rule>;
 
   State(IoSignalCatalogDTO catalog, IoSignalLimitsDTO supplied_limits, IClock& supplied_clock)
-      : owner_epoch(std::move(catalog.owner_epoch)),
-        generation(catalog.generation),
+      : generation(catalog.generation),
         limits(supplied_limits),
         clock(supplied_clock) {
     for (auto& descriptor : catalog.signals) {
@@ -227,11 +226,11 @@ struct IoSignalSubsystem::State final {
   }
 
   IoSourceCursorDTO Cursor(const InterruptSourceId& id, const Source& source) const {
-    return {owner_epoch, generation, id, source.record_sequence};
+    return {generation, id, source.record_sequence};
   }
 
   bool CursorCurrent(const IoSourceCursorDTO& cursor) const {
-    return cursor.owner_epoch == owner_epoch && cursor.catalog_generation == generation;
+    return cursor.catalog_generation == generation;
   }
 
   bool CanRecord(const Source& source, std::uint64_t count) const {
@@ -296,16 +295,13 @@ struct IoSignalSubsystem::State final {
   }
 
   bool ScopeValid(const IoWatchScopeDTO& scope) const {
-    return text_valid(scope.program_runner_owner_epoch.value(), limits.maximum_identity_bytes) &&
-           text_valid(scope.program_run_id.value(), limits.maximum_identity_bytes) &&
+    return scope.program_run_id.nonzero() &&
            valid_program_node_execution_scope(scope.node) &&
-           scope.node.node_instance_id.value().size() <= limits.maximum_identity_bytes &&
-           scope.node.node_attempt_id.size() <= limits.maximum_identity_bytes;
+           scope.node.node_instance_id.value().size() <= limits.maximum_identity_bytes;
   }
 
   bool TokenCurrent(const IoWatchRegistrationDTO& registration) const {
-    return registration.owner_epoch == owner_epoch &&
-           registration.catalog_generation == generation && registration.registration_id != 0U &&
+    return registration.catalog_generation == generation && registration.registration_id != 0U &&
            registration.registration_id <= last_watch_id;
   }
 
@@ -314,10 +310,10 @@ struct IoSignalSubsystem::State final {
       return text_valid(id.value(), limits.maximum_identity_bytes);
     };
     if (const auto* operation = std::get_if<IoOperationRuleScopeDTO>(&scope)) {
-      return text(operation->operation_id) && operation->operation_revision.nonzero() &&
-             text(operation->participant_id) && text(operation->controllable_component_id) &&
-             text(operation->command_target_id) && text(operation->controller_goal_id) &&
-             operation->controller_goal_generation.nonzero() && operation->preparation_id != 0 &&
+      return operation->operation_id.nonzero() && operation->operation_revision.nonzero() &&
+             operation->participant_id.nonzero() && text(operation->controllable_component_id) &&
+             text(operation->command_target_id) && operation->controller_goal_id.nonzero() &&
+             operation->preparation_id != 0 &&
              text(operation->prepared_contract_digest) &&
              text(operation->motion_interrupt_scope_id);
     }
@@ -326,8 +322,7 @@ struct IoSignalSubsystem::State final {
   }
 
   bool RuleTokenCurrent(const IoRuleRegistrationDTO& registration) const {
-    return registration.owner_epoch == owner_epoch &&
-           registration.catalog_generation == generation && registration.registration_id != 0 &&
+    return registration.catalog_generation == generation && registration.registration_id != 0 &&
            registration.registration_id <= last_watch_id;
   }
 
@@ -578,12 +573,11 @@ struct IoSignalSubsystem::State final {
     const auto text = [&](const auto& id) {
       return text_valid(id.value(), limits.maximum_identity_bytes);
     };
-    if (scope.request_owner_epoch != owner_epoch || !text(scope.request_owner_epoch) ||
-        !text(scope.program_runner_owner_epoch) || !text(scope.program_binding_id) ||
+    if (!text(scope.program_binding_id) ||
         !scope.active_publication_generation.nonzero() ||
         scope.claim_generation.has_value() != scope.program_run_id.has_value() ||
         (scope.claim_generation && !scope.claim_generation->nonzero()) ||
-        (scope.program_run_id && !text(*scope.program_run_id)) || !text(binding.source_id) ||
+        (scope.program_run_id && !scope.program_run_id->nonzero()) || !text(binding.source_id) ||
         !text(binding.incarnation) ||
         binding.keys.size() > limits.maximum_signals - signals.size())
       return Result<void>::Err(invalid("program_bb_binding_invalid"));
@@ -602,7 +596,6 @@ struct IoSignalSubsystem::State final {
     return Result<void>::Ok();
   }
 
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t generation;
   IoSignalLimitsDTO limits;
   IClock& clock;
@@ -648,7 +641,6 @@ Result<std::unique_ptr<IoSignalSubsystem>> IoSignalSubsystem::Create(IoSignalCat
       limits.records_per_source == 0U || limits.maximum_watches == 0U ||
       limits.maximum_identity_bytes == 0U || limits.maximum_error_bytes == 0U ||
       catalog.generation == 0U ||
-      !text_valid(catalog.owner_epoch.value(), limits.maximum_identity_bytes) ||
       catalog.signals.size() > limits.maximum_signals ||
       catalog.authoritative_synthetic_sources.size() > limits.maximum_sources)
     return Reply::Err(invalid("io_catalog_bounds_invalid"));
@@ -808,9 +800,7 @@ Result<IoProgramBlackboardAcknowledgementDTO> IoSignalSubsystem::PublishProgramB
       const auto& prior = *old.blackboard_binding;
       const auto& a = prior.scope;
       const auto& b = binding.scope;
-      continuing = a.request_owner_epoch == b.request_owner_epoch &&
-          a.program_runner_owner_epoch == b.program_runner_owner_epoch &&
-          a.program_binding_id == b.program_binding_id &&
+      continuing = a.program_binding_id == b.program_binding_id &&
           a.active_publication_generation == b.active_publication_generation &&
           prior.keys == binding.keys && prior.maximum_value_bytes == binding.maximum_value_bytes;
       // This is only the qualified same-owner Run/Reset handoff. Actual owner,
@@ -871,7 +861,7 @@ Result<IoProgramBlackboardAcknowledgementDTO> IoSignalSubsystem::PublishProgramB
   const IoRuleAcquisitionKeyDTO acquired{binding.source_id, binding.incarnation,
       publication.message_sequence, state_->Cursor(binding.source_id, source)};
   state_->EvaluateRegisteredRules(now, true, &acquired);
-  return Reply::Ok({binding.scope.request_owner_epoch, binding.scope.program_binding_id,
+  return Reply::Ok({binding.scope.program_binding_id,
       binding.scope.cycle_generation, binding.scope.program_run_id, binding.incarnation,
       publication.message_sequence, binding.scope.active_publication_generation,
       IoProgramBlackboardAcknowledgementStatus::kAccepted});
@@ -922,7 +912,7 @@ Result<IoProgramBlackboardAcknowledgementDTO> IoSignalSubsystem::PublishProgramB
                                          publication.message_sequence,
                                          state_->Cursor(found->first, source)};
   state_->EvaluateRegisteredRules(now, true, &acquired);
-  return Reply::Ok({binding.scope.request_owner_epoch, binding.scope.program_binding_id,
+  return Reply::Ok({binding.scope.program_binding_id,
                     binding.scope.cycle_generation, binding.scope.program_run_id,
                     binding.incarnation, source.last_source_sequence,
                     binding.scope.active_publication_generation,
@@ -1116,7 +1106,7 @@ Result<IoSignalRecordPageDTO> IoSignalSubsystem::ReadRecords(const IoSourceCurso
 Result<IoRuleServiceConfigurationDTO> IoSignalSubsystem::RuleServiceConfiguration() const {
   std::lock_guard lock(state_->mutex);
   return Result<IoRuleServiceConfigurationDTO>::Ok(
-      {state_->owner_epoch, state_->generation, state_->limits.maximum_watches});
+      {state_->generation, state_->limits.maximum_watches});
 }
 
 Result<IoRuleRegistrationDTO> IoSignalSubsystem::ArmRule(const IoRuleArmRequestDTO& request) {
@@ -1214,7 +1204,7 @@ Result<IoRuleRegistrationDTO> IoSignalSubsystem::ArmRule(const IoRuleArmRequestD
     return Reply::Err({kErrorMotionInterruptSourceActiveAtArm,
                        "I/O rule is active at arm",
                        {{"reason", "io_rule_active_at_arm"}}});
-  IoRuleRegistrationDTO registration{state_->owner_epoch, state_->generation,
+  IoRuleRegistrationDTO registration{state_->generation,
                                      ++state_->last_watch_id, request.policy_id, request.scope};
   State::Rule rule{registration,
                    request.condition,
@@ -1407,7 +1397,7 @@ Result<IoWatchRegistrationDTO> IoSignalSubsystem::RegisterLevelWatch(
                        "I/O watch registration bound reached",
                        {{"reason", "io_watch_bound_exceeded"}}});
   if (state_->last_watch_id == UINT64_MAX) return Reply::Err(exhausted());
-  IoWatchRegistrationDTO registration{state_->owner_epoch, state_->generation,
+  IoWatchRegistrationDTO registration{state_->generation,
                                       ++state_->last_watch_id, request.scope};
   auto observation = state_->Observation(found->second, state_->clock.now());
   State::Watch watch{registration, request.signal_id, request.expected_value, std::nullopt};
@@ -1458,16 +1448,13 @@ Result<void> IoSignalSubsystem::ReleaseNodeWatches(const IoWatchScopeDTO& scope)
   return Result<void>::Ok();
 }
 
-Result<void> IoSignalSubsystem::ReleaseRunWatches(const RequestOwnerEpoch& runner_owner_epoch,
-                                                  const ProgramRunId& run_id) {
+Result<void> IoSignalSubsystem::ReleaseRunWatches(const ProgramRunNumber& run_id) {
   std::lock_guard lock(state_->mutex);
-  if (!text_valid(runner_owner_epoch.value(), state_->limits.maximum_identity_bytes) ||
-      !text_valid(run_id.value(), state_->limits.maximum_identity_bytes))
+  if (!run_id.nonzero())
     return Result<void>::Err(invalid("io_watch_scope_invalid"));
   std::erase_if(state_->watches, [&](const auto& entry) {
     const auto* watch = std::get_if<State::Watch>(&entry.second);
-    return watch && watch->registration.scope.program_runner_owner_epoch == runner_owner_epoch &&
-           watch->registration.scope.program_run_id == run_id;
+    return watch && watch->registration.scope.program_run_id == run_id;
   });
   return Result<void>::Ok();
 }

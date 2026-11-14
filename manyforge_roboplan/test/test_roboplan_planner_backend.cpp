@@ -163,8 +163,7 @@ TEST(RoboPlanPlannerBackendTest,
   auto suffix_seed = request.start_state;
   suffix_seed.positions[0] = AngularPositionDTO{0.5};
   request.moving_replacement = MovingReplacementInputDTO{
-      ExecutionGoalKey{ControllerGoalId("source-goal"),
-                       ControllerGoalGeneration(13U)},
+      ControllerGoalId{OperationNumber(901U), 1U, 13U},
       ExecutionBindingEpoch(7U),
       1.0,
       trajectory(fixture.binding),

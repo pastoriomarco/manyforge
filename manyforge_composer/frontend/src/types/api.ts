@@ -1,3 +1,4 @@
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import type { ProgramRunEnd } from './components';
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
 import type { Nanoseconds } from './nanoseconds';
@@ -38,7 +39,7 @@ export interface StartupScenarioNotice {
 }
 
 export interface WorkbenchSessionNotice {
-  schemaVersion: 'manyforge.workbench_previous_session.v1';
+  schemaVersion: 'manyforge.workbench_previous_session.v2';
   sessionId: string;
   archiveRelativePath: string;
   shutdown: 'clean' | 'unknown';
@@ -46,6 +47,12 @@ export interface WorkbenchSessionNotice {
   historyCoverage: 'not_imported';
   journalFamilies: string[];
   message: string;
+  /** The previous run's first 64 unfinished operation numbers, each marked
+   * host_replaced; null with the count when its journal was unreadable. */
+  unfinishedOperationIds: number[] | null;
+  unfinishedOperationCount: number | null;
+  /** The start these operation numbers belong to; null with them. */
+  applicationStartId: string | null;
 }
 
 export interface CatalogJsonSchema {
@@ -542,8 +549,10 @@ export interface DeploymentScenarioCandidate {
 }
 
 export interface DeploymentWorkspaceResponse {
-  schemaVersion: 'manyforge.composer_deployment_workspace.v1';
+  schemaVersion: 'manyforge.composer_deployment_workspace.v2';
   authoringWorkspace: AuthoringWorkspaceIdentity;
+  /** The Apply-level command in progress and the last ended ones. */
+  applyCommands: ApplyCommandRows;
   draft: {
     id: string;
     revision: number;
@@ -657,7 +666,7 @@ export interface CurrentScenarioResponse {
 }
 
 export interface AppliedProgramSelection {
-  schemaVersion: 'manyforge.applied_program_selection.v4';
+  schemaVersion: 'manyforge.applied_program_selection.v5';
   scenarioId: string;
   /** The Applied Scenario project folder; it scopes persistent values. */
   projectPath: string;
@@ -670,10 +679,9 @@ export interface AppliedProgramSelection {
   nodeEnvironmentDigest: string;
   recordDigest: string;
   sourceOwnerId: string;
-  sourceOwnerEpoch: string;
   sourceGeneration: number;
   assistantProjection: Record<string, JsonValue> | null;
-  ownerIdentities: ProgramRunOwnerIdentity[];
+  ownerIdentities: ProgramRunCaptureOwnerIdentity[];
   program: ProgramDocument;
   programBinding: ProgramBindingDocument;
   programFrameFacts: {
@@ -690,8 +698,8 @@ export interface AppliedProgramSelection {
 export type ProgramRunStateName =
   | 'running'
   | 'intervention_required'
-  | 'full_stopping'
-  | 'full_stopped'
+  | 'halting'
+  | 'halted'
   | 'stopping'
   | 'finalizing'
   | 'stopped'
@@ -726,14 +734,14 @@ export interface StructuredError {
 /** The typed `{code, message, details}` carrier without run-origin context. */
 export type ErrorDTO = Pick<StructuredError, 'code' | 'message' | 'details'>;
 
-export interface ProgramRunOwnerIdentity {
-  ownerRole: string;
-  ownerId: string;
-  ownerEpoch: string;
+/** One owner a run captured: its role in one application start (1.2). */
+export interface ProgramRunCaptureOwnerIdentity {
+  role: string;
+  applicationStartId: string;
 }
 
 export interface ProgramRunCapture {
-  programRunId: string;
+  programRunId: number;
   appliedRecordDigest: string;
   scenarioId: string;
   sourceDocumentDigest: string;
@@ -745,15 +753,15 @@ export interface ProgramRunCapture {
   nodeEnvironmentDigest: string;
   nodePolicies: JsonValue[];
   nodePolicyDigest: string;
-  ownerIdentities: ProgramRunOwnerIdentity[];
+  ownerIdentities: ProgramRunCaptureOwnerIdentity[];
 }
 
 /** Exact owner-published operation failure provenance; display/history data only. */
 export interface ProgramRunOperationFailure {
   nodeInstanceId: string;
-  nodeAttemptId: string;
+  nodeAttemptId: number;
   operatorFacingRunRevision: number;
-  operation: { sourceOwnerEpoch: string; operationId: string; operationRevision: number };
+  operation: { operationId: number; operationRevision: number };
   resourceIds: string[];
   failure: { code: string; message: string };
   recoveryClass: string;
@@ -761,9 +769,8 @@ export interface ProgramRunOperationFailure {
 }
 
 export interface ProgramRunStatus {
-  schemaVersion: 'manyforge.program_run_status.v4';
+  schemaVersion: 'manyforge.program_run_status.v5';
   ownerId: string;
-  ownerEpoch: string;
   runRevision: number;
   state: ProgramRunStateName;
   capture: ProgramRunCapture;
@@ -783,6 +790,11 @@ export interface ProgramRunStatus {
   message: string;
   /** Why the run ended; null while it has not. */
   runEnd: ProgramRunEnd | null;
+  /**
+   * The Stop that froze the run (its kind and source label), while it is
+   * halting or halted; null otherwise. Kinds are kept as text.
+   */
+  halt: { kind: string; sourceLabel: string | null } | null;
 }
 
 /** The immutable selectors accepted with one Program Reset intent. */
@@ -796,22 +808,90 @@ export interface ProgramResetRobotPositionAvailability {
   reason: string | null;
 }
 
+/** How a command ended (PLCopen Done, Error, CommandAborted). */
+export type CommandOutcome = 'succeeded' | 'refused' | 'failed' | 'unknown' | 'interrupted';
+
+export interface CommandEnd {
+  outcome: CommandOutcome;
+  /** The command's typed code; null exactly when it succeeded. */
+  code: string | null;
+  /** The typed error's own details; never message text. */
+  details: Record<string, JsonValue> | null;
+  /** Wall clock, ns since the epoch, exact as sent. */
+  finishedAtNs: Nanoseconds;
+}
+
+/**
+ * One command from the moment it takes its owner's slot until its end: the
+ * same shape for the runner's commands, the Apply-level commands and the
+ * activation preparation. Text comes from the error catalogue at presentation.
+ */
+export interface CommandRow<Kind extends string = string> {
+  kind: Kind;
+  /** The key the request carried (32 hex): how a client finds its own row. */
+  requestKey: string;
+  /** The stage it is in, or the last one it reached; null before acceptance. */
+  step: string | null;
+  /** Wall clock ns, exact as sent; null while being admitted and on a refusal before acceptance. */
+  acceptedAtNs: Nanoseconds | null;
+  /** Null while the command runs. */
+  end: CommandEnd | null;
+}
+
+/** The command in progress and the last ended ones, newest first (at most 8). */
+export interface CommandRows<Kind extends string = string, Row extends CommandRow<Kind> = CommandRow<Kind>> {
+  inProgress: Row | null;
+  ended: Row[];
+}
+
+export type RunnerCommandRowKind =
+  | 'start' | 'reset' | 'scene_preparation' | 'runtime_blackboard_write'
+  | 'manual_result_stage' | 'recovery_action' | 'resume_halt' | 'start_motion'
+  | 'resume_motion' | 'prepare_manual_handover' | 'persistent_value_set'
+  | 'persistent_value_reset' | 'persistent_values_clear';
+
+export type ApplyCommandRowKind =
+  | 'deployment_apply' | 'deployment_revert' | 'scenario_load' | 'scenario_new'
+  | 'program_apply' | 'program_revert';
+
+/** The status that carries an Apply step's own detail; the row does not copy it. */
+export type ApplyStepSource =
+  | { status: 'runner_command'; kind: 'reset'; requestKey: string }
+  | { status: 'activation_preparation'; capturedInputDigest: string }
+  | { status: 'component_action'; componentId: string }
+  | { status: 'manager_apply' | 'scene_clear'; applyId: number; applyGeneration: number };
+
+export interface ApplyCommandRow extends CommandRow<ApplyCommandRowKind> {
+  stepSource: ApplyStepSource | null;
+}
+
+export type ApplyCommandRows = CommandRows<ApplyCommandRowKind, ApplyCommandRow>;
+
+export interface ActivationPreparationRow extends CommandRow<'activation_preparation'> {
+  capturedInputDigest: string;
+}
+
 export interface ProgramCycleStatus {
-  programRunnerOwnerEpoch: string;
   cycleGeneration: number;
-  state: 'idle_after_reset' | 'starting' | 'running' | 'stopping'
+  state: 'idle_after_reset' | 'starting' | 'running'
     | 'resetting' | 'terminal_awaiting_reset' | 'recovery_required';
-  programRunId: string | null;
+  programRunId: number | null;
   cycleClaimGeneration: number | null;
   terminalOrSettlementReference: string | null;
   runRevision: number | null;
   nodeStatusRevision: number | null;
   runtimeControlRevision: number | null;
   executionControlRevision: number;
-  causalCorrelationId: string | null;
-  causalSessionId: string | null;
-  causalClientSequence: string | null;
+  /** Key of the command that last changed the cycle (32 hex), when known. */
+  causalRequestKey: string | null;
+  /** Headless's display of that key (1.16.2), null without a key. */
+  causalDisplay: string | null;
   currentCommandKind: string | null;
+  /**
+   * The Program runner's command in progress (OD-144: at most one; another
+   * runner command is refused while it is set) and its last ended commands.
+   */
+  runnerCommands: CommandRows<RunnerCommandRowKind>;
   failure: Record<string, JsonValue> | null;
   /** Why the cycle's last run ended (also on `run`). */
   runEnd?: ProgramRunEnd | null;
@@ -879,11 +959,16 @@ export interface PersistentKeyValueEdit {
   /** Null when a change covers every key of the Scenario. */
   key: string | null;
   action: 'set' | 'reset' | 'clear' | 'dropped' | 'fault';
-  requestId: string | null;
+  /**
+   * The application start that wrote the change: run and attempt numbers
+   * restart with every start, so they are read with it.
+   */
+  applicationStartId: ApplicationStartId;
+  requestKey: string | null;
   sourceLabel: string;
-  programRunId: string | null;
+  programRunId: number | null;
   nodeInstanceId: string | null;
-  nodeAttemptId: string | null;
+  nodeAttemptId: number | null;
   /** Why a value was dropped, or the fault (`applied_program_not_observed`). */
   reason: string | null;
   detail: string | null;
@@ -896,28 +981,17 @@ export interface PersistentKeyValues {
   projectPath: string;
   programRevision: string;
   /** The live run that currently holds the values, if any. */
-  programRunId: string | null;
+  programRunId: number | null;
   /** Register sequence when read: advances with every stored-value change. */
   sequence: number;
   keys: PersistentKeyValue[];
   edits: PersistentKeyValueEdit[];
-  /**
-   * The stored values could not be brought in line with the committed Apply;
-   * until they are, no stored value is shown or restored.
-   */
-  storageFault: { code: string; message: string } | null;
   /**
    * Committed Applies of this Scenario the Program runner never observed.
    * Values were kept and checked against the current Program; the missed
    * notification is a defect to find and fix.
    */
   applyObservationFault: { code: string; recordDigests: string[] } | null;
-}
-
-export interface PersistentKeyValuesCleared {
-  requestId: string;
-  projectPath: string;
-  removed: number;
 }
 
 /** The facts of one automatic motion retry, parsed strictly from its audit event. */
@@ -946,7 +1020,7 @@ export interface AutomaticRetryAuditEvent {
 export interface TakeoverFallbackAuditFacts {
   /** The newcomer node whose takeover fell back. */
   nodeInstanceId: string;
-  incumbentOperationId: string;
+  incumbentOperationId: number;
   path: 'spring_back_hold' | 'ordinary_containment';
   /** The Kernel's reason; null when it named none. */
   code: string | null;
@@ -978,8 +1052,8 @@ export type RuntimeControlAuditEvent =
   | GenericRuntimeControlAuditEvent;
 
 export interface ProgramRuntimeControlsSnapshot {
-  schemaVersion: 'manyforge.program_runtime_controls.v3';
-  programRunId: string;
+  schemaVersion: 'manyforge.program_runtime_controls.v4';
+  programRunId: number;
   runtimeControlRevision: number;
   recoveryFences: {
     programGeneration: number;
@@ -1008,18 +1082,18 @@ export interface CycleRecoveryAction {
 }
 
 export interface CycleRecoveryOffer {
-  schemaVersion: 'manyforge.cycle_recovery_offer.v5';
+  schemaVersion: 'manyforge.cycle_recovery_offer.v6';
   offerId: string;
   offerRevision: number;
   generatedAtNs: Nanoseconds;
   kernelAssessmentRevision: number;
   controlCommandEpoch: number;
-  operationId: string | null;
+  operationId: number | null;
   operationRevision: number | null;
-  programRunId: string;
+  programRunId: number;
   programBindingId: string;
   nodeInstanceId: string;
-  nodeAttemptId: string;
+  nodeAttemptId: number;
   participants: JsonValue[];
   graphRevision: string;
   retainedBundleId: string;
@@ -1028,10 +1102,6 @@ export interface CycleRecoveryOffer {
   deploymentGeneration: number;
   sceneAdmissionEpoch: number;
   poseSourceApplyGeneration: number;
-  stopId: string | null;
-  stopGeneration: number | null;
-  stopCertificateId: string | null;
-  stopCertificateRevision: number | null;
   status: string;
   recoveryClass: string;
   actions: CycleRecoveryAction[];
@@ -1056,7 +1126,7 @@ export interface CycleRecoveryOffer {
 }
 
 export interface ProgramExecutionSelectionControls {
-  selectionRevision: number;
+  holdRevision: number;
   /** Owner proof that every effectful node is held, with no Stop pending or faulted. */
   motionHeld: boolean;
   groups: Array<{
@@ -1096,10 +1166,9 @@ export interface ProgramRecoveryHold {
 }
 
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v9';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v10';
   ownerId: string;
-  ownerEpoch: string;
-  programRunId: string;
+  programRunId: number;
   runRevision: number;
   runtimeControls: ProgramRuntimeControlsSnapshot;
   /** The focused offer (also covers an operator Stop); Retry/Continue use `recoveryHolds`. */
@@ -1114,12 +1183,6 @@ export type ProgramWorkspaceTransitionStatus =
   | 'applied'
   | 'loaded'
   | 'reverted';
-
-export interface ProgramWorkspaceTransitionResponse {
-  status: ProgramWorkspaceTransitionStatus;
-  headless: Record<string, JsonValue> | null;
-  workspace: ProgramWorkspaceResponse;
-}
 
 export interface NodeImplementationAvailability {
   nodeId: string;
@@ -1151,16 +1214,13 @@ export interface SourceModelProjectionSource {
   freshness: 'fresh';
   known_gaps: [];
   projection_generation: number;
-  projection_owner_epoch: string;
   receiver_age_ns: number;
   selection_projection_generation: number;
   selection_source_content_digest: string;
   selection_source_generation: number;
-  selection_source_owner_epoch: string;
   selection_source_owner_id: string;
   source_content_digest: string;
   source_generation: number;
-  source_owner_epoch: string;
   source_owner_id: string;
   source_owner_kind: 'source_model_projection';
 }
@@ -1255,7 +1315,7 @@ export interface SourceModelComponent {
 }
 
 export interface SourceModelProjection {
-  schema_version: 'manyforge.source_model_projection.v3';
+  schema_version: 'manyforge.source_model_projection.v4';
   cell_id: string;
   retained_bundle_id: string;
   graph_revision: string;
@@ -1666,11 +1726,11 @@ export type SceneTransactionOperation =
 interface SceneTransactionRequestBase {
   /** Opt-in composite fence for Close's carried-object detach. */
   expected_authoring_workspace?: AuthoringWorkspaceIdentity;
+  /** The application start the Scene projection belongs to (`A`, 16 hex). */
+  application_start_id: ApplicationStartId;
   request_context: {
-    request_id: string;
-    request_owner_epoch: string;
+    request_key: string;
     source_label: 'composer_ui';
-    correlation_id: string | null;
   };
   expected_projection_revision: ProjectionRevision;
 }
@@ -1700,14 +1760,13 @@ export type SceneTransactionRequest = SceneTransactionRequestBase & (
 );
 
 export interface SceneTransactionResponse {
-  api_version: 'manyforge.manager_command_response.v2';
+  api_version: 'manyforge.manager_command_response.v3';
   committed_projection_revision: ProjectionRevision;
   error: null;
   ok: true;
   projection_status: string;
   replay_status: string;
-  request_id: string;
-  request_owner_epoch: string;
+  request_key: string;
   transaction_sequence: number;
   update_status: string;
 }
@@ -1716,8 +1775,8 @@ export interface DraftFenceRequest {
   draftId: string;
   expectedDraftRevision: number;
   expectedAdmissionGeneration: number;
-  requestOwnerEpoch: string;
-  requestId: string;
+  applicationStartId: ApplicationStartId;
+  requestKey: string;
 }
 
 /**
@@ -1741,7 +1800,7 @@ export interface ScenarioDocumentFenceRequest extends LocalWorkspaceFenceRequest
 }
 
 export interface ManagerDeploymentCandidateReceipt {
-  schema_version: 'manyforge.manager_deployment_candidate_receipt.v2';
+  schema_version: 'manyforge.manager_deployment_candidate_receipt.v3';
   deployment_artifact_id: string;
   deployment_revision: string;
   prepared_activation_id: string;
@@ -1752,7 +1811,6 @@ export interface ManagerDeploymentCandidateReceipt {
     retained_bundle_id: string;
   };
   expected_admission_generation: number;
-  manager_owner_epoch: string;
   /** Digest of the Manager's authoritative impact; destructive changes or
    * required component bring-up are accepted only by echoing it. */
   impact_digest: string;
@@ -1817,7 +1875,7 @@ export interface ManagerDeploymentRecordDiff {
 }
 
 export interface ManagerDeploymentCandidatePreviewResponse {
-  apiVersion: 'manyforge.manager_command_response.v2';
+  apiVersion: 'manyforge.manager_command_response.v3';
   candidateReceipt: ManagerDeploymentCandidateReceipt;
   converged: boolean;
   diff: Record<string, ManagerDeploymentRecordDiff>;
@@ -1826,13 +1884,11 @@ export interface ManagerDeploymentCandidatePreviewResponse {
 
 export interface ManagerSourceMetadata {
   projectionGeneration: number;
-  projectionOwnerEpoch: string;
   available: boolean;
   freshness: 'fresh' | 'stale' | 'unavailable';
   knownGaps: string[];
   receiverAgeNs: number | null;
   sourceGeneration: number | null;
-  sourceOwnerEpoch: string | null;
   sourceOwnerId: string | null;
   sourceContentDigest: string | null;
 }
@@ -1867,7 +1923,7 @@ export type ManagerApplyPhase =
 export interface ManagerApplyRecord {
   sceneInitialization: 'preserve' | 'initialize';
   applyGeneration: number;
-  applyId: string;
+  applyId: number;
   candidateGraphRevision: string;
   candidateRetainedBundleId: string;
   committed: boolean;
@@ -1890,9 +1946,7 @@ export interface ManagerApplyRecord {
   intentDigest: string;
   phase: ManagerApplyPhase;
   request: {
-    correlationId: string | null;
-    requestId: string;
-    requestOwnerEpoch: string;
+    requestKey: string;
     sourceLabel: string;
   };
   terminalState: 'succeeded' | 'failed' | 'unknown_effect' | null;
@@ -1911,10 +1965,10 @@ export interface ManagerRuntimeProjection {
 }
 
 export interface ManagerStatusProjection {
-  schemaVersion: 'manyforge.manager_status_projection.v1';
+  schemaVersion: 'manyforge.manager_status_projection.v2';
   source: ManagerSourceMetadata;
   status: {
-    apiVersion: 'manyforge.manager_source.v1';
+    apiVersion: 'manyforge.manager_source.v2';
     active: ManagerActiveProjection;
     apply: ManagerApplyAvailability;
     cellId: string;
@@ -1924,7 +1978,7 @@ export interface ManagerStatusProjection {
 }
 
 export interface ManagerGraphProjection {
-  schemaVersion: 'manyforge.manager_graph_projection.v1';
+  schemaVersion: 'manyforge.manager_graph_projection.v2';
   source: ManagerSourceMetadata;
   graphRevision: string;
   retainedBundleId: string;
@@ -1932,7 +1986,7 @@ export interface ManagerGraphProjection {
 }
 
 export interface ManagerDiffProjection {
-  schemaVersion: 'manyforge.manager_diff_projection.v1';
+  schemaVersion: 'manyforge.manager_diff_projection.v2';
   source: ManagerSourceMetadata;
   converged: boolean;
   desiredUnits: JsonValue[];
@@ -1984,9 +2038,9 @@ export interface ManagerApplyFailure {
 
 export interface ManagerApplyStatus {
   sceneInitialization: 'preserve' | 'initialize';
-  apiVersion: 'manyforge.manager_command_response.v2';
+  apiVersion: 'manyforge.manager_command_response.v3';
   applyGeneration: number;
-  applyId: string;
+  applyId: number;
   candidateProjectionRevision: ProjectionRevision | null;
   error: null;
   failure: ManagerApplyFailure | null;
@@ -1997,56 +2051,50 @@ export interface ManagerApplyStatus {
   ok: true;
   phase: ManagerApplyLifecyclePhase;
   preparedActivation: ManagerApplyPreparedActivation;
-  requestId: string;
-  requestOwnerEpoch: string;
+  requestKey: string;
   state: 'pending' | 'succeeded' | 'failed' | 'unknown_effect';
   failureAcknowledgement: 'available' | 'acknowledged' | 'unavailable';
 }
 
 /** Audit attribution for one operator-triggered failed-Apply acknowledgement. */
 export interface ManagerApplyAcknowledgementContext {
-  request_id: string;
+  request_key: string;
   source_label: string;
-  request_owner_epoch?: string;
-  correlation_id?: string;
 }
 
 export interface ManagerApplyPendingResponse {
-  apiVersion: 'manyforge.manager_command_response.v2';
+  apiVersion: 'manyforge.manager_command_response.v3';
   applyGeneration: number;
-  applyId: string;
+  applyId: number;
   candidateProjectionRevision: null;
   error: null;
   ok: true;
   replayStatus: ManagerApplyReplayStatus;
-  requestId: string;
-  requestOwnerEpoch: string;
+  requestKey: string;
   state: 'pending';
 }
 
 export interface ManagerApplySucceededResponse {
-  apiVersion: 'manyforge.manager_command_response.v2';
+  apiVersion: 'manyforge.manager_command_response.v3';
   applyGeneration: number;
-  applyId: string;
+  applyId: number;
   candidateProjectionRevision: ProjectionRevision;
   error: null;
   ok: true;
   replayStatus: ManagerApplyReplayStatus;
-  requestId: string;
-  requestOwnerEpoch: string;
+  requestKey: string;
   state: 'succeeded';
 }
 
 export interface ManagerApplyTerminalFailureResponse {
-  apiVersion: 'manyforge.manager_command_response.v2';
+  apiVersion: 'manyforge.manager_command_response.v3';
   applyGeneration: number;
-  applyId: string;
+  applyId: number;
   candidateProjectionRevision: null;
   error: null;
   ok: true;
   replayStatus: ManagerApplyReplayStatus;
-  requestId: string;
-  requestOwnerEpoch: string;
+  requestKey: string;
   state: 'failed' | 'unknown_effect';
 }
 
@@ -2062,17 +2110,17 @@ export interface ProposedNodeInput {
 }
 
 export interface ProgramNodeCorrectionPreviewRequest {
-  schema_version: 'manyforge.program_node_correction_preview_request.v1';
-  request_id: string;
-  program_run_id: string;
-  /** The Program runner's owner epoch of the held run. */
-  expected_owner_epoch: string;
+  schema_version: 'manyforge.program_node_correction_preview_request.v2';
+  request_key: string;
+  /** The application start the run belongs to (`A`, 16 hex). */
+  application_start_id: ApplicationStartId;
+  program_run_id: number;
   program_id: string;
   program_revision: string;
   program_binding_id: string;
   node_instance_id: string;
   /** The held attempt the proposal corrects. */
-  node_attempt_id: string;
+  node_attempt_id: number;
   proposed_inputs: ProposedNodeInput[];
 }
 
@@ -2081,15 +2129,15 @@ export interface ProgramNodeCorrectionPreviewRequest {
  * It grants no Retry, Reset, Draft or Apply authority (D4).
  */
 export interface ProgramNodeCorrectionPreview {
-  schemaVersion: 'manyforge.program_node_correction_preview.v2';
-  requestId: string;
-  programRunId: string;
+  schemaVersion: 'manyforge.program_node_correction_preview.v3';
+  requestKey: string;
+  applicationStartId: ApplicationStartId;
+  programRunId: number;
   programId: string;
   programRevision: string;
   programBindingId: string;
   nodeInstanceId: string;
-  nodeAttemptId: string;
-  programRunnerOwnerEpoch: string;
+  nodeAttemptId: number;
   runRevision: number;
   retainedBundleId: string;
   graphRevision: string;
@@ -2111,11 +2159,10 @@ export interface ProgramNodeCorrectionPreview {
 
 /** Composer's bounded log record of one confirmed Apply after Reset. */
 export interface ResetApplyContext {
-  schemaVersion: 'manyforge.composer_reset_apply_context.v1';
+  schemaVersion: 'manyforge.composer_reset_apply_context.v2';
   correlationId: string;
   document: 'program' | 'deployment';
-  programRunId: string;
-  programRunnerOwnerEpoch: string;
+  programRunId: number;
   cycleGeneration: number;
   draftId: string;
   draftRevision: number;

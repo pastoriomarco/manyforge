@@ -34,13 +34,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_transaction_intents (
         transaction_sequence > 0
         AND transaction_sequence <= 9007199254740991
     ),
-    request_owner_epoch TEXT NOT NULL CHECK (
-        length(request_owner_epoch) > 0
-        AND length(request_owner_epoch) <= 256
-    ),
-    request_id TEXT NOT NULL CHECK (
-        length(request_id) > 0 AND length(request_id) <= 256
-    ),
+    request_key BLOB NOT NULL CHECK (length(request_key) = 16),
     request_digest TEXT NOT NULL CHECK (
         length(request_digest) = 71
         AND substr(request_digest, 1, 7) = 'sha256:'
@@ -80,12 +74,11 @@ CREATE TABLE IF NOT EXISTS logical_scene_transaction_intents (
         required_projection_count >= 0
         AND required_projection_count <= 256
     ),
-    UNIQUE (request_owner_epoch, request_id)
+    UNIQUE (request_key)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS logical_scene_request_outcomes (
-    request_owner_epoch TEXT NOT NULL,
-    request_id TEXT NOT NULL,
+    request_key BLOB NOT NULL CHECK (length(request_key) = 16),
     request_digest TEXT NOT NULL CHECK (
         length(request_digest) = 71
         AND substr(request_digest, 1, 7) = 'sha256:'
@@ -107,7 +100,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_request_outcomes (
     error_code TEXT,
     error_message TEXT,
     error_details_json TEXT,
-    PRIMARY KEY (request_owner_epoch, request_id),
+    PRIMARY KEY (request_key),
     FOREIGN KEY (transaction_sequence)
         REFERENCES logical_scene_transaction_intents (transaction_sequence),
     CHECK (

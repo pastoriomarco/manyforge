@@ -250,6 +250,14 @@ read-only and declared by the Deployment automatically. It becomes `true` on
 loss and becomes `false` on the next attach by that gripper, a Program detach,
 or cell Reset. Detach-on-loss does not clear it.
 
+A motion step that itself watches this signal (a move until signal, or an
+interrupt on it) while `stop_motion` is on can end in either of two ways: on
+the signal, as that step defines, or stopped with `carried_object_lost`. The
+signal and the Stop are sent one after the other, and which one acts first is
+not fixed. The robot stops in both cases. To make such a step always end on
+the signal, set `stop_motion: false` (and `raise_alarm: false`) on the
+attachment.
+
 For an explicit Program-managed detach, set `detach: false` and a writable
 `set_key` on the attachment. A parallel Program branch can wait for that key
 and run a **Detach object** node for the carried part. The explicit detach
@@ -291,10 +299,12 @@ moves.
 
 The same current-Run write is available through
 `POST /api/program/runs/{program_run_id}/blackboard-values`; include the live
-Run's `program_run_id`, `expected_owner_epoch`, and `expected_run_revision`,
-plus `key` and the JSON boolean `value: true`, and the ordinary request
-attribution fields (`request_id`, `request_owner_epoch`, `source_label`, and
-`correlation_id`).
+Run's `program_run_id` and `expected_run_revision`, plus `key` and the JSON
+boolean `value: true`, the application start identity the run belongs to
+(`application_start_id`), a fresh `request_key` (32 hexadecimal characters)
+and a `source_label`. The reply comes when the write is accepted
+(`manyforge.program_command_reply.v1`, the command's row); whether it was
+applied is the row's `end` in `runner_commands` of `GET /api/cycle/status`.
 
 **Isaac measured-loss example:**
 [`examples/sim_ur10e_grasp_lost_recovery.scenario`](../../examples/sim_ur10e_grasp_lost_recovery.scenario)
@@ -334,11 +344,11 @@ during the current Run.
 | (c) Stop, then the node fails and the tree's Fallback runs at once | `on_signal: failure`, a global rule with `on_trip: stop` and `after_stop: fail_node`, or `on_grasp_lost: {stop_motion: true}`, each with the node's default `recovery_policy` |
 | (d) Stop and hold the node for the operator | As (c), plus the node's `recovery_policy: {allow_intervention: true, max_retries: N}`: the Run holds with Retry from the stopped state (at most `N` times; `0` is unlimited), Continue (the node fails, then the Fallback runs) and Reset |
 | (e) Stop and hold the run until the condition clears | A global rule with `on_trip: stop` and `after_stop: hold` (the default); the operator Resumes once the rule no longer holds |
-| (f) Stop the whole cell | A global `stop` rule with scope `everything`: a cell Full Stop |
+| (f) Stop the whole cell | A global `stop` rule with scope `everything`: every operation in the cell stops, like Stop all |
 
 (b) to (d) hold only when the Stop held at its first stage. An escalated
-Stop, a lost source, or an operator Stop joining it keeps the operation held
-for the operator. A Stop requested through the public Stop API is always an
+Stop, a lost source, or an operator Stop, Stop all, Halt or Cell Stop that
+also covers the robot keeps the operation held for the operator. A Stop requested through the public Stop API is always an
 operator Stop.
 
 ### Interrupts are operational
@@ -366,7 +376,7 @@ A condition compares values. Each comparison reads one of these:
 - **A system key**: `node_outcome.<node>` or `interrupt_state.<rule>`
   (section 6). These never need `initial:`, because the system defines their
   start value. A global rule cannot read `interrupt_state.*` keys (section 4);
-  node rules can.
+  node rules can, but may miss a very short trip of that rule (section 6).
 
 Program parameters cannot be read by a condition. They never change during a
 run.
@@ -450,6 +460,39 @@ What happens:
   Its outcome key becomes `no_signal_trip`.
 - **The stop failed or cannot be proven, or the signal source was lost**: the
   node fails.
+- **The signal is already on at the start** with `require_inactive_at_arm`:
+  the move does not start and the node fails with "Interrupt signal already
+  active" (`motion_interrupt_source_active_at_arm`).
+- **The move is stopped before its rule starts watching** (a Stop or Halt
+  just as the move starts): the rule plays no part; the node is handled as
+  any stopped move, with that Stop's reason.
+
+**When a move takes over a moving robot.** A Move until signal or a Probe
+search can take over a robot that is still running an earlier Program move,
+and can itself be taken over, like any other move. The robot keeps the
+earlier move until it switches to the new one, and each rule watches its own
+part:
+
+- The earlier move's rule keeps watching until the robot switches, although
+  its node has already ended as `preempted`. If it trips before the switch,
+  the robot stops as that rule says and the new move is cancelled. No node
+  reports that signal.
+- When the take-over is cancelled before the switch (by the earlier move's
+  rule or by a Stop), the new node ends as any move stopped at that point:
+  stopped, or, if the new move may already have been sent to the robot,
+  intervention required with its effect uncertain.
+- The new move's rule watches from the moment the new move is sent to the
+  robot. If it trips before the switch, the robot is stopped as that rule
+  says right after the switch.
+- If the new move's signal is already on when it is sent: with
+  `require_inactive_at_arm` the new move is not sent, the robot stops, and
+  the new move fails as any move whose signal is on at its start (when the
+  robot can start it again from rest, it does so if the signal has cleared by
+  then); with `trip_if_already_active` the robot switches and is stopped at
+  once by the rule; with `fresh_edge_after_arm` only a later change counts.
+- When both moves watch the same signal, the robot stops either way; whether
+  the earlier or the new rule acts depends on whether the signal comes before
+  or after the switch.
 
 In the Composer node editor, **When the signal trips** sets these fields in
 one Draft edit:
@@ -512,8 +555,8 @@ their defaults until set.
 - `{execution_groups: [left, right]}`: the robots of these execution groups
   of the Applied Program (sorted, no duplicates). Not available when no
   Program is applied.
-- `everything`: the cell Full Stop: all motion and all other commands stop,
-  including outputs and grippers. While such a rule holds, output writes are
+- `everything`: the whole cell, like Stop all: all motion and all other
+  commands stop, including outputs and grippers. While such a rule holds, output writes are
   refused too.
 
 **Activation.** An inactive rule doesn't watch, trip, Stop or hold; its state
@@ -529,7 +572,9 @@ included). A rule meant to guard the cell at all times needs
 **What a trip does (`on_trip`):**
 
 - `stop`: the same Stop as the operator's Stop on the rule's scope (scope
-  `everything`: the Full Stop), starting from `stop_entry_stage_id`. Then,
+  `everything`: every operation in the cell), starting from
+  `stop_entry_stage_id`. A rule never pauses the Program tree the way Halt
+  does. Then,
   while the condition holds, the rule holds its scope: Resume, Execute and
   new motion in scope (also manual motion) are refused with `rule_holds`,
   naming the rule, and the GUI shows them disabled. When the condition is no
@@ -650,10 +695,19 @@ One per global rule.
 
 - When it has a value, the key is current also between Runs, while a Run is
   held or halted, and when no Run exists.
+- The key and the Global rules panel follow the rule's current state as the
+  execution host reports it from memory, without waiting for History to be
+  written. A trip that starts and ends between two of these reports never
+  shows `tripped` there, for `stop` and `notify` rules alike, so a node rule
+  on Move until signal or Probe search that reads the key may not react to
+  it. The Stop and the hold of a `stop` rule do not depend on the key.
+  History still lists every transition.
 - It has no value until the rule's sources have reported for the first time
-  (the Global rules panel shows "pending"), while a key rule waits for a
-  Program, and while the rule can't watch its signals (section 4). A fresh,
-  evaluable reading restores it.
+  (the Global rules panel shows "can't watch (its scope is held)"), while a
+  key rule waits for a Program (the panel shows that rule as "waiting for a
+  Program that declares ..." and the Deployment's other rules as "pending"),
+  and while the rule can't watch its signals (section 4). A fresh, evaluable
+  reading restores it.
 - Reset doesn't change the condition; it returns the rule to its
   `active_at_start`, which can change the key between `inactive` and the
   rule's current state.
@@ -710,7 +764,7 @@ Wait for input node instead.
 **First reading.** Until every signal a global rule reads has a fresh
 reading, the rule can't watch: motion in its scope is refused with
 `rule_holds`, naming the rule, and the Global rules panel shows the rule as
-"pending" until its state is known. Sources report right after their
+"can't watch (its scope is held)" with the reason. Sources report right after their
 component is enabled, so this is normally short. User keys don't cause it.
 
 **Source loss.** If a signal source of a global rule is lost (or its readings

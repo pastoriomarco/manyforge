@@ -1,16 +1,18 @@
 """Client of the execution host's event subscription stream.
 
 One SEQPACKET connection to ``execution-events.sock`` carries one
-subscription: the client sends ``subscribe_events {after_cursor,
-owner_epoch}`` and then receives one message per packet: ``snapshot`` (first,
-and after a ``gap``; events continue strictly after its ``cursor``),
+subscription: the client sends ``subscribe_events {after_cursor}`` and then
+receives one message per packet: ``snapshot`` (first; events continue
+strictly after its ``cursor``),
 ``event`` (one journal row as in an ``events`` page), ``state`` (the
 ``events`` reply facts without page and progress, when they change),
 ``progress`` (the reply's ``operation_progress`` rows, when they change),
-``heartbeat`` (every second, with the cursor sent so far), ``gap`` or
-``error``. ``follow_execution_events`` keeps one subscription alive: it
+``heartbeat`` (every second, with the cursor sent so far) or ``error``.
+No message names an owner: one Kernel and one journal per application start.
+``follow_execution_events`` keeps one subscription alive: it
 resumes from the last cursor it delivered, treats three seconds without any
-message as a dead link and reconnects with backoff.
+message as a dead link and reconnects with backoff. The sliced receive and the
+reconnect loop are the shared private stream client (``private_stream``).
 """
 
 from __future__ import annotations
@@ -19,29 +21,26 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import logging
 from pathlib import Path
-import select
 import socket
 from threading import Event
-import time
 from typing import Any, Final
 
 import rfc8785
 
 from .native import HeadlessApiError, strict_json_object
+from .private_stream import TIMED_OUT, PrivateStreamSubscription, follow_private_stream
 from .private_transport import PinnedRunRoot, PrivateTransportCapabilityError
 
 EXECUTION_EVENTS_SOCKET_FILE: Final = "execution-events.sock"
-EVENT_STREAM_API_VERSION: Final = "manyforge.execution_event_stream.v1"
+EVENT_STREAM_API_VERSION: Final = "manyforge.execution_event_stream.v4"
 EVENT_STREAM_MESSAGE_TYPES: Final = frozenset(
-    {"snapshot", "event", "state", "progress", "heartbeat", "gap"}
+    {"snapshot", "event", "state", "progress", "heartbeat"}
 )
 # Heartbeats arrive every second; three missed ones are a dead link.
 DEAD_LINK_SECONDS: Final = 3.0
 RECONNECT_BACKOFF_SECONDS: Final = (0.1, 2.0)
 MAX_EVENT_STREAM_MESSAGE_BYTES: Final = 4 * 1024 * 1024
 _MAX_SAFE: Final = 9_007_199_254_740_991
-# A stop is seen within one receive slice.
-_RECEIVE_SLICE_SECONDS: Final = 0.25
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,11 +75,8 @@ def decode_event_stream_message(payload: bytes) -> dict[str, Any]:
             code if isinstance(code, str) and code else "execution_event_stream_failed",
             text if isinstance(text, str) else "event stream ended",
         )
-    owner_epoch = message.get("owner_epoch")
     if (
         kind not in EVENT_STREAM_MESSAGE_TYPES
-        or not isinstance(owner_epoch, str)
-        or not owner_epoch
         or (kind in ("snapshot", "heartbeat") and _counter(message.get("cursor")) is None)
         or (kind in ("snapshot", "state") and not isinstance(message.get("state"), dict))
         or (kind == "progress" and not isinstance(message.get("operation_progress"), list))
@@ -102,69 +98,48 @@ class ExecutionEventSubscription:
     """One open subscription; ``receive`` returns the next message."""
 
     def __init__(self, client: socket.socket, *, dead_link_seconds: float) -> None:
-        self._client = client
+        self._stream = PrivateStreamSubscription(
+            client,
+            max_bytes=MAX_EVENT_STREAM_MESSAGE_BYTES,
+            decode=decode_event_stream_message,
+            unavailable_code="execution_owner_unavailable",
+            invalid_code="execution_event_stream_invalid",
+            label="event stream",
+        )
         self._dead_link_seconds = dead_link_seconds
 
     def receive(self, stop: Event | None = None) -> dict[str, Any] | None:
         """The next message; None once ``stop`` is set. Raises on EOF, a dead
         link (no message for ``dead_link_seconds``), or an ``error``."""
 
-        deadline = time.monotonic() + self._dead_link_seconds
-        while True:
-            if stop is not None and stop.is_set():
-                return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HeadlessApiError(
-                    "execution_event_stream_dead",
-                    "event stream sent no message or heartbeat in time",
-                )
-            readable, _write, _error = select.select(
-                [self._client], [], [], min(remaining, _RECEIVE_SLICE_SECONDS)
-            )
-            if readable:
-                break
-        try:
-            payload, _ancillary, flags, _address = self._client.recvmsg(
-                MAX_EVENT_STREAM_MESSAGE_BYTES
-            )
-        except OSError as error:
+        message = self._stream.receive(stop, self._dead_link_seconds)
+        if message is TIMED_OUT:
             raise HeadlessApiError(
-                "execution_owner_unavailable", f"event stream failed: {error}"
-            ) from error
-        if not payload:
-            raise HeadlessApiError("execution_owner_unavailable", "event stream closed")
-        if flags & socket.MSG_TRUNC:
-            raise HeadlessApiError(
-                "execution_event_stream_invalid", "event stream message is oversized"
+                "execution_event_stream_dead",
+                "event stream sent no message or heartbeat in time",
             )
-        return decode_event_stream_message(payload)
+        return message
 
     def close(self) -> None:
-        self._client.close()
+        self._stream.close()
 
 
 @contextmanager
 def open_event_subscription(
     run_root: PinnedRunRoot,
     after_cursor: int,
-    owner_epoch: str | None,
     *,
     dead_link_seconds: float = DEAD_LINK_SECONDS,
 ) -> Iterator[ExecutionEventSubscription]:
-    """Connect and subscribe strictly after ``after_cursor`` of
-    ``owner_epoch`` (None: the current owner)."""
+    """Connect and subscribe strictly after ``after_cursor``."""
 
-    if _counter(after_cursor) is None or (
-        owner_epoch is not None and (not owner_epoch or len(owner_epoch.encode()) > 2_048)
-    ):
+    if _counter(after_cursor) is None:
         raise ValueError("event subscription cursor exceeds its fixed bounds")
     request = rfc8785.dumps(
         {
             "after_cursor": after_cursor,
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": "subscribe_events",
-            "owner_epoch": owner_epoch,
         }
     )
     client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -197,7 +172,7 @@ def open_event_subscription(
         subscription.close()
 
 
-Subscribe = Callable[[int, "str | None"], Any]
+Subscribe = Callable[[int], Any]
 
 
 def follow_execution_events(
@@ -209,49 +184,39 @@ def follow_execution_events(
     backoff_seconds: tuple[float, float] = RECONNECT_BACKOFF_SECONDS,
 ) -> None:
     """Keep one subscription until ``stop``: deliver each message in order,
-    resume from the last delivered cursor and owner epoch after any failure
-    (connect, dead link, EOF, error message, or ``on_message`` raising), with
-    backoff doubling up to its bound. ``subscribe(after_cursor,
-    owner_epoch)`` returns a context manager yielding a subscription."""
+    resume from the last delivered cursor after any failure (connect, dead
+    link, EOF, error message, or ``on_message`` raising), with backoff
+    doubling up to its bound. ``subscribe(after_cursor)`` returns a context
+    manager yielding a subscription."""
 
-    cursor, owner_epoch = 0, None
-    delay = backoff_seconds[0]
-    while not stop.is_set():
-        try:
-            with subscribe(cursor, owner_epoch) as subscription:
-                while True:
-                    message = subscription.receive(stop)
-                    if message is None:
-                        return
-                    on_message(message)
-                    # Advance only after the message was applied.
-                    kind = message["type"]
-                    if kind != "gap":  # A gap's snapshot sets the new owner.
-                        owner_epoch = message["owner_epoch"]
-                    if kind in ("snapshot", "heartbeat"):
-                        cursor = message["cursor"]
-                    elif kind == "event":
-                        cursor = message["event"]["sequence"]
-                    delay = backoff_seconds[0]
-        except Exception as error:
-            _LOGGER.warning("execution event stream reconnects: %s", error)
-            if on_disconnect is not None:
-                try:
-                    on_disconnect(error)
-                except Exception:
-                    _LOGGER.exception("event stream disconnect handler failed")
-        if stop.wait(delay):
-            return
-        delay = min(delay * 2, backoff_seconds[1])
+    cursor = 0
+
+    def apply(message: Mapping[str, Any]) -> None:
+        nonlocal cursor
+        on_message(message)
+        # Advance only after the message was applied.
+        kind = message["type"]
+        if kind in ("snapshot", "heartbeat"):
+            cursor = message["cursor"]
+        elif kind == "event":
+            cursor = message["event"]["sequence"]
+
+    follow_private_stream(
+        lambda: subscribe(cursor),
+        apply,
+        stop,
+        backoff_seconds=backoff_seconds,
+        on_disconnect=on_disconnect,
+        label="execution event stream",
+        logger=_LOGGER,
+    )
 
 
 def run_root_subscriber(run_root: Path | PinnedRunRoot) -> Subscribe:
     """A ``subscribe`` callable for ``follow_execution_events``."""
 
     pinned = run_root if isinstance(run_root, PinnedRunRoot) else PinnedRunRoot(run_root)
-    return lambda after_cursor, owner_epoch: open_event_subscription(
-        pinned, after_cursor, owner_epoch
-    )
+    return lambda after_cursor: open_event_subscription(pinned, after_cursor)
 
 
 __all__ = [

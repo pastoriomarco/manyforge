@@ -13,6 +13,7 @@ API, `http://127.0.0.1:9020`.
 | --- | --- | --- |
 | `./scripts/compose-dev.sh start` fails | Image missing, port occupied, Docker daemon down | Read the start output; see the [workbench troubleshooting table](DEVELOPMENT_WORKBENCH.md#operation-and-troubleshooting) |
 | `start` refuses the site settings | Relative path, missing file, unknown field, bad folder or address | See [§Site file errors](#site-file-errors) below |
+| `start` fails with `disk_space_below_floor` | The disk that holds ManyForge's runtime state has less free space than ManyForge needs, or no free inodes | Free the amount the message names on that disk; see [Disk limits](DEVELOPMENT_WORKBENCH.md#disk-limits) |
 | `start` succeeds but Execute is disabled | A component not enabled, in fault or offline; the cell latched | Read Execute's tooltip, or `GET /api/program/readiness` and `GET /api/cell/latch`; Execute offers **Activate and execute** when components only need Prepare/Enable |
 | Start never reports ready | First start compiles the C++ targets; container died | `docker logs --tail 200 manyforge-development-workbench`; lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory |
 | Tree runs but nothing moves | Motion groups still held (press **Run**), pending recovery offer, active alarm | See [`STACK_SETUP.md`](STACK_SETUP.md) §Troubleshooting |
@@ -20,6 +21,8 @@ API, `http://127.0.0.1:9020`.
 | Retry/Resume/Reset only works on the second press | Stale recovery offer or a lifecycle command still pending; this is not expected UX | Save cycle status, alarm snapshot, and execution history; see [§Alarm and recovery behavior](#alarm-and-recovery-behavior) |
 | Motion refused with `validation_collision` | Stale pose source, scene drift, or genuine collision | See [§Collision rejection](#collision-rejection) below |
 | Motion stopped with **Robot position feedback lost** (`runtime_monitor_observation_lost`) | The robot's measured joint states stopped arriving or became too old during motion, typically because the robot controller faulted or its connection dropped; nothing was detected in contact | Inspect the operation alarm in Runtime and its History entry; check the robot component's state and controller connection, then Recover the component |
+| Motion stopped with **Collision checks stopped** (`runtime_monitor_checks_stopped`) | The robot's collision checks did not run in time during motion, typically because the controller computer was overloaded; nothing was detected in contact, and the robot's position feedback was still arriving | Inspect the operation alarm in Runtime and its History entry; check the load on the controller computer (other programs, a model being served), then Recover |
+| A **Component fault** alarm is listed (`manyforge.runtime.component_fault`) | A component's state shows a fault; the alarm's headline is the fault's own text. One alarm per component (simulators have none); it is Resolved when the fault ends and stays listed until acknowledged. While the cell is latched it is shown inside the latch item | Read the fault on the component and use the action it names; acknowledging the alarm clears nothing and gates nothing |
 | AI tab disabled or chat request fails | No AI assistant or `ai_model` component, one of them not enabled, a Program run exists, model server down or still loading, wrong model name (HTTP 404), token variable unset, slow model (timeout) | See [§AI assistant](#ai-assistant) below |
 | Isaac robot shows **Simulation not playing**; the run holds with "Waiting for Run · Simulation not playing" | Simulation paused or stopped, or the workbench can't reach Isaac (DDS) | See [§Simulation not playing](#simulation-not-playing) below |
 | Isaac moves abort with `aborted_path_tolerance` ("State tolerances failed for joint …") although the plan is slow | Isaac runs slower than real time (overloaded host); the arm controller runs on wall-clock time | See [§Isaac slower than real time](#isaac-slower-than-real-time) |
@@ -221,8 +224,11 @@ with a message (exit 64) before it starts anything:
 | `Development site settings must be an absolute path` | Export the absolute host path, e.g. `export MANYFORGE_DEV_SITE_SETTINGS=$HOME/manyforge.site.json`. |
 | `Development site settings file is unavailable: <path>` | The file doesn't exist at that path on the host. |
 | `project_folder_invalid: site settings file must be JSON: …` | Fix the JSON syntax. |
-| `project_folder_invalid: site settings schema must be manyforge.site.v1` | Add `"schema": "manyforge.site.v1"`. |
-| `project_folder_invalid: site settings has unknown fields: …` | Only `schema`, `device_addresses` and `project_folders` are accepted. |
+| `project_folder_invalid: site settings schema must be manyforge.site.v2` | Add `"schema": "manyforge.site.v2"`. |
+| `project_folder_invalid: site settings <member> needs schema manyforge.site.v2: …` | A `manyforge.site.v1` file has a disk limit: change the first line's schema to `manyforge.site.v2`. |
+| `project_folder_invalid: site settings <member> must be an integer from … to …` | Fix the disk limit; see [Site settings](DEVELOPMENT_WORKBENCH.md#site-settings). |
+| `project_folder_invalid: site settings has unknown fields: …` | Only `schema`, `device_addresses`, `project_folders`, `disk_max_percent`, `disk_always_free_bytes` and `disk_machine_minimum_bytes` are accepted. |
+| `<variable> is no longer read: set <member> in the site settings file …` | Unset `MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT` / `MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES`; put the value in the named site settings member. |
 | `project_folder_invalid: project folder must be an existing absolute directory: …` | Create the folder, fix the path, or remove it from `project_folders`. |
 | `project_folder_invalid: project_folders repeats …` / `unsupported project folder …` | List each folder once; paths can't contain `:` and folder names can't contain `,`. |
 
@@ -358,7 +364,12 @@ seconds up to about 30 s; New or Load may be refused meanwhile
 I/O timeout. Every process waiting on that disk stalls, including the ManyForge
 Manager, which writes its status files with a sync every 500 ms. A move already
 sent to the controller keeps executing; ManyForge's supervision may be delayed
-while it waits on the disk (being reviewed).
+while it waits on the disk (being reviewed). The execution host's actions and
+Stops never wait for its operation journal; during a stall its rows, and
+History, appear late. A stall long enough to fill the journal's queue drops
+records: the alarm "Operation records are being lost" shows, History and the
+previous-session report have gaps, and motion is not affected. The alarm
+clears by itself when the journal writes again.
 
 **Steps**:
 
@@ -438,9 +449,10 @@ for the full capture recipe. The minimum bundle:
 
 ```bash
 RUN_ID=<program_run_id from Runtime/history>
+START=<application_start_id of that run: 16 hex characters>
 API=http://127.0.0.1:9020
-curl -s "$API/api/debug/export?run_id=${RUN_ID}" > debug-export.json
-curl -s "$API/api/execution/history?program_run_id=${RUN_ID}" > history.json
+curl -s "$API/api/debug/export?run_id=${RUN_ID}&application_start_id=${START}" > debug-export.json
+curl -s "$API/api/execution/history?program_run_id=${RUN_ID}&application_start_id=${START}" > history.json
 curl -s "$API/api/execution/alarms" > alarms.json
 curl -s "$API/api/cycle/status" > cycle-status.json
 docker logs --tail 2000 manyforge-development-workbench > workbench.log

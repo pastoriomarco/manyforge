@@ -1,15 +1,15 @@
 {
   "local_delta": {
-    "schema_version": "manyforge.execution_control.v2",
+    "schema_version": "manyforge.execution_control.v4",
     "message_kind": "delta",
-    "control_session_id": "control-session.test-1",
+    "control_session_number": 1,
     "server_sequence": "3",
     "event_class": "cold",
     "control": null,
     "shell": {
-      "schema_version": "manyforge.composer_headless_state.v2",
+      "schema_version": "manyforge.composer_headless_state.v4",
       "complete": false,
-      "receiver_epoch": "receiver.epoch.1",
+      "application_start_id": "3f9a0000000000a1",
       "snapshot_sequence": 3,
       "authoring_workspace": {
         "workspace_epoch": "workspace.epoch.1",
@@ -19,7 +19,22 @@
         "deployment_draft_id": "deployment-draft-1",
         "deployment_draft_revision": 4
       },
-      "authoring_workspace_containment": null
+      "authoring_workspace_containment": null,
+      "apply_commands": {
+        "in_progress": {
+          "kind": "deployment_apply",
+          "request_key": "0123456789abcdef0123456789abcdef",
+          "step": "applying",
+          "accepted_at_ns": "1763112345678901234",
+          "end": null,
+          "step_source": {
+            "status": "manager_apply",
+            "apply_id": 4,
+            "apply_generation": 2
+          }
+        },
+        "ended": []
+      }
     }
   },
   "invalid_overlays": [

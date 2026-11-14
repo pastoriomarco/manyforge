@@ -1166,7 +1166,8 @@ seal_runtime_participant_stop_readiness(
     const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
-    const core::RuntimeParticipantBinding &participant_binding) {
+    const core::RuntimeParticipantBinding &participant_binding,
+    const core::Duration hard_stop_completion_timeout_ns) {
   if (!verify_retained_bundle_identity(retained_bundle) ||
       plan.retained_bundle_id != retained_bundle.retained_bundle_id())
     return readiness_error<core::RuntimeParticipantStopReadiness>(
@@ -1181,7 +1182,7 @@ seal_runtime_participant_stop_readiness(
       core::RuntimeParticipantStopReadinessDTO{
           participant_binding.value().controllable_component_id,
           component_lifecycle_generation, expected_domain.value(),
-          std::move(plan)},
+          std::move(plan), hard_stop_completion_timeout_ns},
       participant_binding, expected_domain);
 }
 

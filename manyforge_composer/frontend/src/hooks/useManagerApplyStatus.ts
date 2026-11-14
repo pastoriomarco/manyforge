@@ -13,7 +13,9 @@ import {
 import type { ManagerApplyStatus } from '../types/api';
 import type { HeadlessSourceSection } from '../types/headless';
 import type { ControlTransportStatus } from './useHeadlessState';
-import { browserRequestIdentity } from '../utils/requestIdentity';
+import { newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
+
+const START_IDENTITY_UNAVAILABLE = 'Execution owner identity is unavailable.';
 
 interface ManagerApplyStatusResult {
   status: ManagerApplyStatus | null;
@@ -42,6 +44,8 @@ export function useManagerApplyStatus(
   advertised: ManagerApplyIdentity | null,
   manager: HeadlessSourceSection | null,
   transportStatus: ControlTransportStatus,
+  /** The application start (`A`) of the current snapshot; reads and acknowledgements carry it. */
+  applicationStartId: ApplicationStartId | null,
 ): ManagerApplyStatusResult {
   const [status, setStatus] = useState<ManagerApplyStatus | null>(null);
   const [synchronizing, setSynchronizing] = useState(advertised !== null);
@@ -62,8 +66,10 @@ export function useManagerApplyStatus(
   const applyGeneration = target?.applyGeneration ?? null;
   const [refresh, setRefresh] = useState(0);
   const readStatus = useCallback((identity: ManagerApplyIdentity, signal?: AbortSignal) => (
-    api.manager.applyStatus(identity.applyId, identity.applyGeneration, signal)
-  ), []);
+    applicationStartId === null
+      ? Promise.reject(new Error(START_IDENTITY_UNAVAILABLE))
+      : api.manager.applyStatus(identity.applyId, identity.applyGeneration, applicationStartId, signal)
+  ), [applicationStartId]);
   const refreshStatus = useCallback(async (
     identity?: ManagerApplyIdentity,
     afterAcknowledgement = false,
@@ -145,6 +151,9 @@ export function useManagerApplyStatus(
           : 'Manager reports acknowledgement unavailable. That does not prove the Apply holds nothing, so the notice stays. Nothing was sent.',
       };
     }
+    if (applicationStartId === null) {
+      return { confirmed: false, noFailedApply: false, message: START_IDENTITY_UNAVAILABLE };
+    }
     let confirmed = false;
     let message: string | null = null;
     let postOutcomeUnknown = false;
@@ -154,8 +163,9 @@ export function useManagerApplyStatus(
       const candidate = await api.manager.acknowledgeApply(
         current.applyId,
         current.applyGeneration,
+        applicationStartId,
         {
-          request_id: browserRequestIdentity('composer-manager-apply-ack'),
+          request_key: newRequestKey(),
           source_label: 'manyforge_composer',
         },
       );
@@ -230,7 +240,7 @@ export function useManagerApplyStatus(
         : `${message ?? 'Acknowledgement was not confirmed.'} Follow-up Apply status refresh failed.`;
     }
     return { confirmed, message, noFailedApply: false };
-  }, [outcomeUnknownIdentity, readStatus, refreshStatus, status]);
+  }, [applicationStartId, outcomeUnknownIdentity, readStatus, refreshStatus, status]);
   const reconnectPending = useRef(false);
   const inventory = manager?.payload?.apply;
   const observedApplyId = applyId ?? acknowledgementResolutionIdentity?.applyId ?? null;
@@ -260,7 +270,7 @@ export function useManagerApplyStatus(
   // Owner generation and observation counters are heartbeats, not Apply progress.
   // Only this operation and its source availability wake the exact HTTP read.
   const wakeKey = JSON.stringify([
-    manager?.sourceOwnerId, manager?.sourceOwnerEpoch, manager?.available,
+    manager?.sourceOwnerId, applicationStartId, manager?.available,
     manager?.freshness, manager?.knownGaps, observation,
   ]);
 

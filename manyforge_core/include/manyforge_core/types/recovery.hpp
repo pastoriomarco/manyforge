@@ -4,6 +4,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/interrupt.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <optional>
 #include <string>
 #include <vector>
@@ -182,7 +183,7 @@ struct ObservedStateEvidenceDTO {
 /// Built from one coherent authority capture under
 /// lifecycle ordering; published as an immutable copy under a leaf lock.
 struct KernelRecoveryAssessmentDTO {
-  std::string schema_version = "manyforge.kernel_recovery_assessment.v1";
+  std::string schema_version = "manyforge.kernel_recovery_assessment.v2";
   /// Strictly increasing whenever identity, authority, actionability,
   /// status, allowed actions, or reason changes. Equally admissible
   /// observation samples do not churn this revision.
@@ -197,10 +198,16 @@ struct KernelRecoveryAssessmentDTO {
   std::string policy_id;
   InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
   bool stop_owner_active = false;
-  std::uint64_t stop_owner_generation = 0;
+  /// Every participant of the operation is `StopPhase::kStopped` (K20).
   bool backend_stop_confirmed = false;
-  std::string stop_certificate_id;
-  std::uint64_t stop_certificate_revision = 0;
+  /// The event that started the newest stop attempt; 0 when never stopped.
+  std::uint64_t stop_event_id = 0;
+  /// Wire token of `StopPhase` over the operation's participants: the
+  /// weakest-known phase (`stopping` if any stops, else `failed` if any
+  /// failed, else `stopped`); empty when never stopped.
+  std::string stop_phase;
+  /// Containing stage id of the stopped participant(s); empty when none.
+  std::string containing_stage_id;
   /// Observation facts. `observed_state_available=false` until a provider wires
   /// the dedicated publication; freshness/at-rest are then fail-closed.
   bool observed_state_available = false;
@@ -230,14 +237,12 @@ struct KernelRecoveryAssessmentDTO {
 
 /// Request for the single generation-bound kernel recovery command.
 struct KernelRecoveryActionRequestDTO {
-  std::string request_id;
+  RequestKey request_key;
   RecoveryAction action = RecoveryAction::kRetryMotionFromCurrentState;
   std::string principal_id;
   std::uint64_t expected_assessment_revision = 0;
   std::uint64_t expected_control_command_epoch = 0;
   std::uint64_t expected_execution_id = 0;
-  std::string expected_stop_certificate_id;
-  std::uint64_t expected_stop_owner_generation = 0;
   std::string reason;
   /// The addressed owner requires exact captured node scope and effect proof.
   /// False preserves manual recovery continuation; close_operation requires false.
@@ -248,7 +253,7 @@ struct KernelRecoveryActionRequestDTO {
 /// certificate, stop owner, backend command, and control epoch are unchanged
 /// and `resulting_assessment` carries the newest assessment.
 struct KernelRecoveryActionResultDTO {
-  std::string request_id;
+  RequestKey request_key;
   RecoveryAction action = RecoveryAction::kRetryMotionFromCurrentState;
   bool accepted = false;
   KernelRecoveryAssessmentDTO resulting_assessment;

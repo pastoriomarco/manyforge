@@ -184,9 +184,13 @@ _PATTERNS = {
 _PATTERNS[".hpp"] = _PATTERNS[".cpp"]
 # C++ `{"reason", "..."}` / `{"reason_code", "..."}` pair in an ErrorDTO or
 # detail initializer; the closing brace keeps out field lists such as
-# `shape(v, {"reason", "last_accepted_source_sequence", ...})`.
+# `shape(v, {"reason", "last_accepted_source_sequence", ...})`, and a pair
+# that is a later argument closing a call keeps out a two-name list such as
+# `closed(fact, {"reason_code", "later_count"})` (a sole argument such as
+# `details.insert({"reason_code", ...})` still counts).
 _CPP_REASON_MEMBER = re.compile(
-    r"\{\s*\"reason(?:_code)?\"\s*,\s*(?:std::string\s*\(\s*)?\"(" + _CODE + r")\"\s*\)?\s*\}"
+    r"(,\s*)?\{\s*\"reason(?:_code)?\"\s*,\s*(?:std::string\s*\(\s*)?\"(" + _CODE + r")\""
+    r"\s*\)?\s*\}(\s*\))?"
 )
 # File -> {helper: zero-based argument index} for local C++ helpers whose code
 # is not the first literal argument (for example `reject<T>("message", "code")`
@@ -243,7 +247,6 @@ _MESSAGE_FIRST = {
     "manyforge_roboplan/src/cartesian_planning_contract.cpp": {
         "fail": 1, "cartesian_incomplete_error": 1, "set_path_parameterization_error": 1},
     "manyforge_roboplan/src/managed_projection_registry.cpp": {"WorkerFailure": 2},
-    "manyforge_roboplan/src/owner_settlement_readers.cpp": {"Rejected": 1},
     "manyforge_roboplan/src/process_contained_candidate_client.cpp": {"error": 2},
     "manyforge_roboplan/src/product_backed_runtime_participant_resolver.cpp": {"Reject": 1},
     "manyforge_roboplan/src/retained_focused_adapters.cpp": {"adapter_error": 2},
@@ -323,7 +326,14 @@ _INDIRECT_CODES = {
     "manyforge_core/src/resource_addressed_kernel_status.cpp": (
         "operation_recovery_invalid",
     ),
-    "manyforge_core/src/sqlite_operation_journal.cpp": ("operation_journal_busy",),
+    "manyforge_core/src/sqlite_operation_journal.cpp": (
+        "operation_journal_busy",
+        "operation_journal_start_invalid",
+    ),
+    "manyforge_core/src/prepared_operation_participant_codec.cpp": (
+        "program_run_id_invalid",
+    ),
+    "manyforge_headless_api/identity.py": ("start_identity_required",),
     "manyforge_deployment/src/io_signal_catalog.cpp": (
         "ai_model_configuration_invalid",
     ),
@@ -464,7 +474,9 @@ def _file_codes(relative: str, suffix: str, text: str):
         for match in pattern.finditer(text):
             yield match.group(1)
     if suffix in {".cpp", ".hpp"}:
-        yield from (match.group(1) for match in _CPP_REASON_MEMBER.finditer(text))
+        for match in _CPP_REASON_MEMBER.finditer(text):
+            if not (match.group(1) and match.group(3)):
+                yield match.group(2)
         yield from _message_first_codes(text, _MESSAGE_FIRST.get(relative, {}))
         for name in _REASON_VARS.get(relative, ()):
             assignment = re.compile(

@@ -27,13 +27,14 @@ from manyforge_headless_api.tests.test_component_model import (
     _state,
 )
 from manyforge_headless_api.tests.test_execution_event_stream import (
-    _EPOCH,
     _SubscribedExecution,
     _host_snapshot,
     _host_state,
     _message,
 )
 from manyforge_headless_api.tests.test_execution_events import _RecordingCore
+
+_APPLICATION_START_ID = "3f9a0000000000a1"
 
 
 def _result(action: str, outcome: str, started: int, error: dict[str, str] | None = None):
@@ -121,7 +122,9 @@ def _model(*states: dict[str, Any]) -> dict[str, Any]:
 
 def test_the_pump_records_each_new_last_action_once_after_its_baseline() -> None:
     core = _PumpCore()
-    pump = ExecutionEventPump(core, _SubscribedExecution())  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, _SubscribedExecution(), application_start_id=_APPLICATION_START_ID
+    )
     old = _result("prepare", "succeeded", 1)
     pump._record_finished_actions(_model(_state("lite6", last_action=old)))  # noqa: SLF001
     assert core.activity == []  # Finished before this Headless: not recorded again.
@@ -145,7 +148,9 @@ def test_a_lost_history_record_never_breaks_the_pump() -> None:
         raise RuntimeError("historian queue closed")
 
     core.record_activity = fail  # type: ignore[method-assign]
-    pump = ExecutionEventPump(core, _SubscribedExecution())  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, _SubscribedExecution(), application_start_id=_APPLICATION_START_ID
+    )
     pump._record_finished_actions(_model())  # noqa: SLF001
     pump._record_finished_actions(_model(  # noqa: SLF001
         _state("lite6", last_action=_result("prepare", "succeeded", 1))))
@@ -156,11 +161,13 @@ def test_the_running_pump_records_an_action_the_host_finished() -> None:
     finished = _result("prepare", "failed", 3, {"code": "component_launch_not_settled",
                                                 "message": "lite6 didn't start"})
     execution = _SubscribedExecution(_host_snapshot())
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01
+    )
     pump.start()
     try:
         assert core.completed.wait(3.0)  # The first model is the baseline.
-        execution.script.append(_message("state", _EPOCH, state={
+        execution.script.append(_message("state", state={
             **_host_state(), "component_states": [_state("lite6", "not_prepared",
                                                          last_action=finished)]}))
         deadline = time.monotonic() + 3.0

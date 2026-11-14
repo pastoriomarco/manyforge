@@ -16,14 +16,13 @@ import {
 
 function snapshot(): ComposerHeadlessState {
   return {
-    receiverEpoch: 'receiver.1',
+    applicationStartId: '3f9a0000000000a1',
     runtime: {
       sections: {
         manager: {
           available: true,
           freshness: 'fresh',
           knownGaps: [],
-          sourceOwnerEpoch: 'manager.1',
           sourceOwnerId: 'component-manager.cell',
           payload: {
             active: {
@@ -40,7 +39,6 @@ function snapshot(): ComposerHeadlessState {
       capabilities: ['Execute / Control', 'Observe / Render'],
       components: [{
         id: 'execution_owner',
-        ownerEpoch: 'kernel.1',
         ownerId: 'execution-owner.cell',
         reasonCode: null,
         required: true,
@@ -199,9 +197,9 @@ function activeManager(): ComposerHeadlessState {
   payload.runtime = { converged: true };
   const active = payload.active as Record<string, unknown>;
   active.publication = { transaction: {
-    kind: 'named_apply', apply_id: 'apply.1', apply_generation: 1,
+    kind: 'named_apply', apply_id: 1, apply_generation: 1,
   } };
-  payload.apply = { records: [currentApplyRecord('apply.1', 1)] };
+  payload.apply = { records: [currentApplyRecord(1, 1)] };
   state.componentOverview.maintenanceOperation = null;
   return state;
 }
@@ -211,7 +209,7 @@ function managerPayload(state: ComposerHeadlessState): Record<string, unknown> {
 }
 
 function currentApplyRecord(
-  applyId: string,
+  applyId: number,
   applyGeneration: number,
   retainedBundleId = 'sha256:bundle',
   graphRevision = 'sha256:graph',
@@ -231,7 +229,7 @@ function currentApplyRecord(
   };
 }
 
-function setCurrentApply(state: ComposerHeadlessState, applyId: string, applyGeneration: number): void {
+function setCurrentApply(state: ComposerHeadlessState, applyId: number, applyGeneration: number): void {
   const payload = managerPayload(state);
   const active = payload.active as Record<string, unknown>;
   active.publication = { transaction: {
@@ -255,7 +253,7 @@ describe('managerActivationSettlementKey', () => {
 
     const maintenance = activeManager();
     maintenance.componentOverview.maintenanceOperation = {
-      applyId: 'apply.1',
+      applyId: 1,
       applyGeneration: 1,
       phase: 'intent_persisted',
       affectedRuntimeUnitIds: [],
@@ -421,7 +419,7 @@ describe('managerReadinessTransientRetryKey', () => {
     expect(currentRetryKey(missingGeneration)).toBeNull();
 
     const missingOwner = structuredClone(settled);
-    missingOwner.runtime.sections.manager.sourceOwnerEpoch = null;
+    missingOwner.runtime.sections.manager.sourceOwnerId = null;
     expect(currentRetryKey(missingOwner)).toBeNull();
 
     const missingCurrentRecord = structuredClone(settled);
@@ -433,7 +431,7 @@ describe('managerReadinessTransientRetryKey', () => {
     const failedNewerApply = structuredClone(settled);
     const failedPayload = managerPayload(failedNewerApply);
     const apply = failedPayload.apply as { records: Record<string, unknown>[] };
-    apply.records.push(currentApplyRecord('apply.failed', 1, 'sha256:failed', 'sha256:failed', {
+    apply.records.push(currentApplyRecord(9, 1, 'sha256:failed', 'sha256:failed', {
       committed: false,
       terminal_state: 'failed',
     }));
@@ -445,26 +443,26 @@ describe('managerReadinessTransientRetryKey', () => {
     const distinctApplyIdsSameGeneration = structuredClone(settled);
     const distinctPayload = managerPayload(distinctApplyIdsSameGeneration);
     (distinctPayload.apply as { records: Record<string, unknown>[] }).records.push(
-      currentApplyRecord('apply.2', 1),
+      currentApplyRecord(2, 1),
     );
     (distinctPayload.active as Record<string, unknown>).publication = { transaction: {
-      kind: 'named_apply', apply_id: 'apply.2', apply_generation: 1,
+      kind: 'named_apply', apply_id: 2, apply_generation: 1,
     } };
     const apply2Key = currentRetryKey(distinctApplyIdsSameGeneration);
     expect(apply2Key).not.toBeNull();
     expect(apply2Key).not.toBe(key);
-    expect(apply2Key).toContain('"applyId":"apply.2"');
+    expect(apply2Key).toContain('"applyId":2');
 
     const duplicateCurrentApply = structuredClone(distinctApplyIdsSameGeneration);
     (managerPayload(duplicateCurrentApply).apply as { records: Record<string, unknown>[] })
-      .records.push(currentApplyRecord('apply.2', 1));
+      .records.push(currentApplyRecord(2, 1));
     expect(currentRetryKey(duplicateCurrentApply)).toBeNull();
 
     const failedCurrentApply = structuredClone(failedNewerApply);
     const failedCurrentPayload = managerPayload(failedCurrentApply);
     const failedActive = failedCurrentPayload.active as Record<string, unknown>;
     failedActive.publication = { transaction: {
-      kind: 'named_apply', apply_id: 'apply.failed', apply_generation: 1,
+      kind: 'named_apply', apply_id: 9, apply_generation: 1,
     } };
     expect(currentRetryKey(failedCurrentApply)).toBeNull();
 
@@ -487,9 +485,14 @@ describe('managerReadinessTransientRetryKey', () => {
     bootstrapPayload.apply = { records: [] };
     expect(currentRetryKey(bootstrap)).toBeNull();
 
+    // A UI receiver reconnect within the same start sees the same identity;
+    // a new start renumbers Apply ids, so its key differs.
     const uiReceiverReconnect = structuredClone(settled);
-    uiReceiverReconnect.receiverEpoch = 'receiver.2';
     expect(currentRetryKey(uiReceiverReconnect)).toBe(key);
+    const newStart = structuredClone(settled);
+    newStart.applicationStartId = '3f9a0000000000a2';
+    expect(currentRetryKey(newStart)).not.toBeNull();
+    expect(currentRetryKey(newStart)).not.toBe(key);
   });
 });
 
@@ -553,15 +556,15 @@ describe('refreshTransientResourcesOnManagerReadiness', () => {
     attempts = refreshTransientResourcesOnManagerReadiness(
       attempts, firstKey, transientFailure, idleResource,
     );
+    // A receiver reconnect within the same start keeps the start identity.
     const reconnect = structuredClone(active);
-    reconnect.receiverEpoch = 'receiver.2';
     attempts = refreshTransientResourcesOnManagerReadiness(
       attempts, currentRetryKey(reconnect), transientFailure, idleResource,
     );
     expect(retryCatalog).toHaveBeenCalledOnce();
 
     const secondApply = structuredClone(active);
-    setCurrentApply(secondApply, 'apply.2', 1);
+    setCurrentApply(secondApply, 2, 1);
     const secondKey = currentRetryKey(secondApply);
     expect(secondKey).not.toBe(firstKey);
     attempts = refreshTransientResourcesOnManagerReadiness(

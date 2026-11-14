@@ -287,8 +287,7 @@ moving_request(const ProcessFixture &fixture, double remaining_budget_s) {
   auto input = request(fixture);
   const auto width = fixture.binding.resources.size();
   input.moving_replacement = MovingReplacementInputDTO{
-      ExecutionGoalKey{ControllerGoalId("source-goal"),
-                       ControllerGoalGeneration(2U)},
+      ControllerGoalId{OperationNumber(901U), 1U, 2U},
       ExecutionBindingEpoch(1U),
       1.0,
       TrajectoryDTO{

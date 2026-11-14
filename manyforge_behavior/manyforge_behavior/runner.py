@@ -7,6 +7,7 @@ import math
 from typing import Any, Literal
 
 from .kernel_client import ActionSpan, KernelClient, KernelClientResponseError
+from .request_keys import format_request_key
 
 
 class OrchestratorRunner:
@@ -14,7 +15,7 @@ class OrchestratorRunner:
 
     Program execution identity comes from the Applied Program binding this
     run was admitted with, never from the execution owner's status: the
-    owner reports runtime identity only (execution_identity.v2).
+    owner reports runtime identity only (execution_identity.v3).
     """
 
     def __init__(
@@ -68,7 +69,7 @@ class OrchestratorRunner:
             )
         if any(
             not isinstance(status.get(field), str) or not status[field]
-            for field in ("owner_epoch", "graph_revision", "retained_bundle_id")
+            for field in ("graph_revision", "retained_bundle_id")
         ):
             raise KernelClientResponseError(
                 "headless execution status has an incomplete runtime identity"
@@ -87,16 +88,15 @@ class OrchestratorRunner:
     def submit_joint_goal(
         self,
         *,
-        request_id: str,
-        program_run_id: str,
+        request_key: bytes,
+        program_run_id: int,
         target: Mapping[str, str],
         base_frame: Mapping[str, str],
         node_instance_id: str,
-        node_attempt_id: str,
+        node_attempt_id: int,
         move_id: str,
         joint_names: Sequence[str],
         positions_rad: Sequence[float],
-        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         """Resolve selection from owner status and submit one portable goal."""
 
@@ -121,17 +121,15 @@ class OrchestratorRunner:
         status = self._selected_status()
         span = ActionSpan(
             action_source="program_node",
-            action_span_id=node_attempt_id,
+            action_span_id=str(node_attempt_id),
             program_run_id=program_run_id,
             node_instance_id=node_instance_id,
             node_attempt_id=node_attempt_id,
         )
         intent = {
             "request_context": {
-                "request_id": request_id,
-                "request_owner_epoch": status["owner_epoch"],
+                "request_key": format_request_key(request_key),
                 "source_label": "manyforge_behavior",
-                "correlation_id": correlation_id,
             },
             "program_id": self._binding["program_id"],
             "program_revision": self._binding["program_revision"],
@@ -192,18 +190,17 @@ class OrchestratorRunner:
     def submit_gripper_position(
         self,
         *,
-        request_id: str,
-        program_run_id: str,
+        request_key: bytes,
+        program_run_id: int,
         target: Mapping[str, str],
         node_instance_id: str,
-        node_attempt_id: str,
+        node_attempt_id: int,
         position_kind: Literal["angular_rad", "linear_m"],
         position: float,
         max_effort: float | None = None,
         command_duration_s: float = 0.0,
         wait_for_duration: bool = False,
         completion_timeout_s: float = 5.0,
-        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit one unit-tagged gripper target through the addressed owner."""
 
@@ -267,17 +264,15 @@ class OrchestratorRunner:
 
         span = ActionSpan(
             action_source="program_node",
-            action_span_id=node_attempt_id,
+            action_span_id=str(node_attempt_id),
             program_run_id=program_run_id,
             node_instance_id=node_instance_id,
             node_attempt_id=node_attempt_id,
         )
         intent = {
             "request_context": {
-                "request_id": request_id,
-                "request_owner_epoch": status["owner_epoch"],
+                "request_key": format_request_key(request_key),
                 "source_label": "manyforge_behavior",
-                "correlation_id": correlation_id,
             },
             "program_id": self._binding["program_id"],
             "program_revision": self._binding["program_revision"],
@@ -321,42 +316,28 @@ class OrchestratorRunner:
         }
         return self._kernel.execute(intent)
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
+    def operation(self, operation_id: int) -> dict[str, Any]:
         return self._kernel.operation(operation_id)
 
-    def _request_context(
-        self,
-        *,
-        request_id: str,
-        correlation_id: str | None,
-    ) -> dict[str, str | None]:
-        status = self._kernel.identity().get("identity")
-        owner_epoch = status.get("owner_epoch") if isinstance(status, dict) else None
-        if not isinstance(owner_epoch, str) or not owner_epoch:
-            raise KernelClientResponseError(
-                "headless execution status has no owner epoch"
-            )
+    @staticmethod
+    def _request_context(*, request_key: bytes) -> dict[str, str]:
         return {
-            "request_id": request_id,
-            "request_owner_epoch": owner_epoch,
+            "request_key": format_request_key(request_key),
             "source_label": "manyforge_behavior",
-            "correlation_id": correlation_id,
         }
 
     def _control_operation(
         self,
         control: str,
         *,
-        request_id: str,
-        operation_id: str,
+        request_key: bytes,
+        operation_id: int,
         expected_operation_revision: int,
         reason: str | None,
-        correlation_id: str | None,
     ) -> dict[str, Any]:
         request = {
             "request_context": self._request_context(
-                request_id=request_id,
-                correlation_id=correlation_id,
+                request_key=request_key,
             ),
             "operation_id": operation_id,
             "expected_operation_revision": expected_operation_revision,
@@ -373,61 +354,53 @@ class OrchestratorRunner:
     def reset_operation(
         self,
         *,
-        request_id: str,
-        operation_id: str,
+        request_key: bytes,
+        operation_id: int,
         expected_operation_revision: int,
         reason: str | None = None,
-        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         return self._control_operation(
             "reset",
-            request_id=request_id,
+            request_key=request_key,
             operation_id=operation_id,
             expected_operation_revision=expected_operation_revision,
             reason=reason,
-            correlation_id=correlation_id,
         )
 
     def acknowledge_completed_operation(
         self,
         *,
-        request_id: str,
-        operation_id: str,
+        request_key: bytes,
+        operation_id: int,
         expected_operation_revision: int,
         reason: str | None = None,
-        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         return self._control_operation(
             "acknowledge_completed",
-            request_id=request_id,
+            request_key=request_key,
             operation_id=operation_id,
             expected_operation_revision=expected_operation_revision,
             reason=reason,
-            correlation_id=correlation_id,
         )
 
     def stop_operation(
         self,
         *,
-        request_id: str,
-        operation_id: str,
+        request_key: bytes,
+        operation_id: int,
         expected_operation_revision: int,
-        expected_stop_generation: int,
         reason: str | None = None,
-        correlation_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit one scoped Stop; owner projections settle its outcome."""
 
         request = {
             "request_context": self._request_context(
-                request_id=request_id,
-                correlation_id=correlation_id,
+                request_key=request_key,
             ),
             "operations": [
                 {
                     "operation_id": operation_id,
                     "expected_operation_revision": expected_operation_revision,
-                    "expected_stop_generation": expected_stop_generation,
                 }
             ],
             "reason": reason,

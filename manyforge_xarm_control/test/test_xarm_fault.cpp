@@ -30,9 +30,6 @@ TEST(XArmFault, CatalogueCodesMapToTheirFaultAndKeepTheVendorCode) {
     FaultCode fault;
     FaultOperatorAction action;
   } rows[] = {
-      {1, FaultCode::kEstop, FaultOperatorAction::kRecover},
-      {2, FaultCode::kEstop, FaultOperatorAction::kRecover},
-      {3, FaultCode::kEstop, FaultOperatorAction::kRecover},
       {31, FaultCode::kProtectiveStop, FaultOperatorAction::kRecover},
       {23, FaultCode::kLimitViolation, FaultOperatorAction::kRecover},
       {24, FaultCode::kLimitViolation, FaultOperatorAction::kRecover},
@@ -56,7 +53,6 @@ TEST(XArmFault, CatalogueCodesMapToTheirFaultAndKeepTheVendorCode) {
     EXPECT_EQ(fault->vendor_text, std::string(xarm_error_text(row.code)));
     EXPECT_EQ(fault->since_ns, 42);
   }
-  EXPECT_EQ(xarm_fault(2, 0)->vendor_text, "Emergency IO of Control Box is triggered");
 }
 
 TEST(XArmFault, UnmappedCodesPassThroughAsVendorFaultAndZeroIsNoFault) {

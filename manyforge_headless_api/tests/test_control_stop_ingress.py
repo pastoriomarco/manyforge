@@ -1,6 +1,8 @@
 """A recognized Stop on the control WebSocket or /api/control/commands whose
-payload is invalid is a Full Stop, as on the Stop HTTP routes; other commands
-keep their refusal. Both transports share one dispatch; the stamp names it."""
+payload is invalid is still a Stop, as on the Stop HTTP routes: the Kernel
+widens it from the route it names (PD-1: Halt stays Halt, the others become
+Stop all); other commands keep their refusal. Both transports share one
+dispatch; the stamp names it."""
 
 from __future__ import annotations
 
@@ -15,32 +17,58 @@ from manyforge_headless_api.control_protocol import (
     ExecutionCommandRequestDTO,
     ExecutionIngressStamp,
 )
+from manyforge_headless_api.identity import RequestAdmission
 from manyforge_headless_api.native import HeadlessApiError
 
+APPLICATION_START_ID = "3f9a0000000000a1"
+# A Headless key: class 1 (0x40), part 0, minter 5 (contract 1.4).
+HEADLESS_KEY_PREFIX = "40" + "00000000000005"
 
-def _command(kind: str, payload: dict[str, Any]) -> ExecutionCommandRequestDTO:
+
+def _command(
+    kind: str, payload: dict[str, Any], transport_kind: str
+) -> ExecutionCommandRequestDTO:
+    """A WebSocket command of session 1, or the session-less REST form,
+    which carries this start's ``A`` (contract 1.6)."""
+
     authority = ControlFreshnessAuthority(
         clock_ns=lambda: 1_000_000_000,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
+    websocket = transport_kind == "websocket"
     return ExecutionCommandRequestDTO.model_validate(
         {
             "command_envelope": {
                 "schema_version": EXECUTION_COMMAND_SCHEMA,
                 "command_kind": kind,
-                "correlation_id": "request.invalid",
                 "source_label": "test",
-                "control_session_id": None,
-                "client_sequence": None,
+                "control_session_number": 1 if websocket else None,
+                "client_sequence": "1" if websocket else None,
                 "freshness": authority.issue(
-                    semantic_owner_epoch="runner.1", execution_control_revision=7
+                    execution_control_revision=7
                 ).model_dump(mode="json"),
-                "expected_semantic_owner_epoch": "runner.1",
                 "expected_execution_control_revision": 7,
             },
-            "payload": payload,
+            "payload": (
+                payload
+                if websocket
+                else {**payload, "application_start_id": APPLICATION_START_ID}
+            ),
         }
+    )
+
+
+def _dispatch(service: Any) -> HeadlessExecutionControlDispatch:
+    return HeadlessExecutionControlDispatch(
+        service, RequestAdmission(APPLICATION_START_ID)
+    )
+
+
+def _stamp(transport_kind: str) -> ExecutionIngressStamp:
+    return ExecutionIngressStamp(
+        transport_kind=transport_kind,  # type: ignore[arg-type]
+        received_server_sequence=1,
+        received_monotonic_ns=1,
     )
 
 
@@ -54,120 +82,114 @@ class _MalformedStopService:
     def program_cycle_status() -> dict[str, Any]:
         raise AssertionError("recognized Stop synchronously read Program state")
 
-    def execution_recognized_malformed_stop(self, **call: Any) -> dict[str, Any]:
+    def execution_recognized_stop(self, **call: Any) -> dict[str, Any]:
         self.malformed.append(call)
+        route = call["recognized_route"]
+        applied = "halt" if route == "/api/execution/halt" else "stop_all"
+        # The Kernel records the kind the route names (contract §5.1).
+        requested = {"/api/execution/stops": "operation"}.get(route, applied)
         return {
             "ok": True,
-            "command": "stop",
+            "command": "recognized_stop",
             "accepted": {
-                "request_id": call["request_id"],
-                "resolution_disposition": "promoted_to_full",
-                "resolution_reason": "malformed_ordinary_intent",
+                "request_key": call["request_key"],
+                "requested": requested,
+                "applied": applied,
+                "widen_reason": "malformed",
             },
         }
 
     def _unexpected(self, *args: Any) -> Any:
         raise AssertionError("an invalid payload reached its owner call")
 
-    execution_stop = execution_full_stop = _unexpected
-    program_run_stop = program_run_full_stop = program_run_motion_stop = _unexpected
+    execution_stop = execution_stop_all = execution_halt = _unexpected
+    program_run_motion_stop = _unexpected
     execution_reset = _unexpected
 
 
-_OWNER_FENCE = {"expected_execution_owner_epoch": "kernel.epoch.1"}
-_CONTEXT = {
-    "request_id": "request.invalid",
-    "request_owner_epoch": "kernel.epoch.1",
-    "source_label": "test",
-    "correlation_id": None,
-}
+_CONTEXT = {"source_label": "test"}
 
 
 @pytest.mark.parametrize("transport_kind", ["websocket", "rest"])
 @pytest.mark.parametrize(
-    "kind,payload,route",
+    "kind,payload,route,applied",
     [
         (
             "operation_stop",
             {
-                **_OWNER_FENCE,
                 "request_context": _CONTEXT,
                 "operations": [
-                    {"operation_id": "b", "expected_operation_revision": 1,
-                     "expected_stop_generation": 0},
-                    {"operation_id": "a", "expected_operation_revision": 1,
-                     "expected_stop_generation": 0},
+                    {"operation_id": 2, "expected_operation_revision": 1},
+                    {"operation_id": 1, "expected_operation_revision": 1},
                 ],
             },
             "/api/execution/stops",
+            "stop_all",
         ),
         (
-            "cell_full_stop",
-            {**_OWNER_FENCE, "request_context": _CONTEXT, "expected_stop_generation": -1},
-            "/api/execution/full-stop",
+            "stop_all",
+            {"request_context": _CONTEXT, "expected_stop_generation": 0},
+            "/api/execution/stop-all",
+            "stop_all",
         ),
-        ("program_stop", {"request_id": "request.invalid"}, "/api/execution/stops"),
         (
-            "program_full_stop",
-            {"request_id": "request.invalid"},
-            "/api/execution/full-stop",
+            "halt",
+            {"request_context": _CONTEXT, "program_run_id": 1},
+            "/api/execution/halt",
+            "halt",
         ),
         (
             "program_motion_stop",
-            {"request_id": "request.invalid", "program_run_id": "program-run.1"},
+            {"program_run_id": "program-run.1"},
             "/api/execution/stops",
+            "stop_all",
         ),
     ],
 )
-def test_control_stop_with_invalid_payload_is_a_full_stop(
-    transport_kind: str, kind: str, payload: dict[str, Any], route: str
+def test_control_stop_with_invalid_payload_is_widened_by_its_route(
+    transport_kind: str, kind: str, payload: dict[str, Any], route: str, applied: str
 ) -> None:
     service = _MalformedStopService()
-    stamp = ExecutionIngressStamp(
-        transport_kind=transport_kind,
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
-    dispatch = HeadlessExecutionControlDispatch(service)  # type: ignore[arg-type]
-    first, result = dispatch(_command(kind, payload), stamp)
+    stamp = _stamp(transport_kind)
+    dispatch = _dispatch(service)
+    first, result = dispatch(_command(kind, payload, transport_kind), stamp)
     assert first.disposition == "received"
     assert result is not None
-    assert result["accepted"]["resolution_disposition"] == "promoted_to_full"
-    assert result["accepted"]["resolution_reason"] == "malformed_ordinary_intent"
-    # A repeat is its own request: the Kernel joins it to the Full Stop that
-    # is still running (Kernel test StopWithUnusableIdentityPromotes...).
-    repeat, _ = dispatch(_command(kind, payload), stamp)
+    assert result["accepted"]["applied"] == applied
+    assert result["accepted"]["widen_reason"] == "malformed"
+    # A repeat is its own request with its own key: a new Stop event.
+    repeat, _ = dispatch(_command(kind, payload, transport_kind), stamp)
     assert repeat.disposition == "received"
     assert [call["recognized_route"] for call in service.malformed] == [route, route]
     assert {call["reason"] for call in service.malformed} == {
         "recognized_stop_payload_invalid"
     }
-    first_id, second_id = (call["request_id"] for call in service.malformed)
-    assert first_id.startswith("malformed-stop.") and first_id != second_id
+    # The envelope's validated label is the caller's label.
+    assert {call["source_label"] for call in service.malformed} == {"test"}
+    # Each acts with its own fresh Headless key (class 1, minter 5).
+    first_key, second_key = (call["request_key"] for call in service.malformed)
+    assert first_key.startswith(HEADLESS_KEY_PREFIX)
+    assert second_key.startswith(HEADLESS_KEY_PREFIX) and first_key != second_key
 
 
 @pytest.mark.parametrize("transport_kind", ["websocket", "rest"])
 def test_control_non_stop_with_invalid_payload_is_still_refused(transport_kind: str) -> None:
-    stamp = ExecutionIngressStamp(
-        transport_kind=transport_kind,
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
+    stamp = _stamp(transport_kind)
     invalid_reset = _command(
         "operation_reset",
-        {**_OWNER_FENCE, "request_context": _CONTEXT, "operation_id": "operation-1",
-         "expected_operation_revision": 0},
+        {"request_context": {**_CONTEXT, "request_key": "ab" * 16},
+         "operation_id": 1, "expected_operation_revision": 0},
+        transport_kind,
     )
 
     class Available(_MalformedStopService):
         @staticmethod
-        def program_cycle_status() -> dict[str, Any]:
+        def program_cycle_status(*, before_command: bool = False) -> dict[str, Any]:
+            del before_command
             return {}
 
     service = Available()
-    dispatch = HeadlessExecutionControlDispatch(service)  # type: ignore[arg-type]
+    dispatch = _dispatch(service)
     dispatch._availability = lambda cycle, kind: (True, None)  # type: ignore[method-assign]
     dispatch._manual_scope_conflict = lambda request, cycle: None  # type: ignore[method-assign]
     with pytest.raises(HeadlessApiError) as refused:
@@ -177,7 +199,7 @@ def test_control_non_stop_with_invalid_payload_is_still_refused(transport_kind: 
 
 
 class _OrdinaryStopService(_MalformedStopService):
-    """Records the ordinary Stop calls an owner-fence-free Stop makes."""
+    """Records the ordinary Stop calls a valid Stop makes."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -188,98 +210,66 @@ class _OrdinaryStopService(_MalformedStopService):
         self.ordinary.append(("stop", request))
         return {"ok": True, "command": "stop", "accepted": {}}
 
-    def execution_full_stop(self, request: Any, attribution: Any) -> dict[str, Any]:
+    def execution_stop_all(self, request: Any, attribution: Any) -> dict[str, Any]:
         del attribution
-        self.ordinary.append(("full_stop", request))
-        return {"ok": True, "command": "full_stop", "accepted": {}}
+        self.ordinary.append(("stop_all", request))
+        return {"ok": True, "command": "stop_all", "accepted": {}}
+
+    def execution_halt(self, request: Any, attribution: Any) -> dict[str, Any]:
+        del attribution
+        self.ordinary.append(("halt", request))
+        return {"ok": True, "command": "halt", "accepted": {}}
 
 
 _STOP_PAYLOADS = {
     "operation_stop": {
         "request_context": _CONTEXT,
-        "operations": [
-            {"operation_id": "a", "expected_operation_revision": 1,
-             "expected_stop_generation": 0},
-        ],
+        "operations": [{"operation_id": 1, "expected_operation_revision": 1}],
     },
-    "cell_full_stop": {"request_context": _CONTEXT, "expected_stop_generation": 0},
+    "stop_all": {"request_context": _CONTEXT},
+    "halt": {"request_context": _CONTEXT},
 }
 
 
 @pytest.mark.parametrize("transport_kind", ["websocket", "rest"])
-@pytest.mark.parametrize("kind", ["operation_stop", "cell_full_stop"])
-def test_control_stop_without_owner_fence_is_an_ordinary_stop(
+@pytest.mark.parametrize("kind", ["operation_stop", "stop_all", "halt"])
+def test_control_stop_without_key_is_an_ordinary_stop(
     transport_kind: str, kind: str
 ) -> None:
     service = _OrdinaryStopService()
-    stamp = ExecutionIngressStamp(
-        transport_kind=transport_kind,
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
-    disposition, _ = HeadlessExecutionControlDispatch(service)(  # type: ignore[arg-type]
-        _command(kind, dict(_STOP_PAYLOADS[kind])), stamp
+    disposition, _ = _dispatch(service)(
+        _command(kind, dict(_STOP_PAYLOADS[kind]), transport_kind),
+        _stamp(transport_kind),
     )
     assert disposition.disposition == "received"
     assert service.malformed == []
     ((called, request),) = service.ordinary
-    assert called == ("stop" if kind == "operation_stop" else "full_stop")
-    # The caller's own epoch stays; the Kernel resolves the Stop on its own.
-    assert request.request_context.request_owner_epoch == (
-        _command(kind, {}).command_envelope.freshness.receiver_incarnation
-    )
-
-
-@pytest.mark.parametrize("transport_kind", ["websocket", "rest"])
-@pytest.mark.parametrize("kind", ["operation_stop", "cell_full_stop"])
-@pytest.mark.parametrize("owner", ["", "o" * 300, 7, None])
-def test_control_stop_with_invalid_owner_fence_is_a_full_stop(
-    transport_kind: str, kind: str, owner: Any
-) -> None:
-    service = _MalformedStopService()
-    stamp = ExecutionIngressStamp(
-        transport_kind=transport_kind,
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
-    payload = {**_STOP_PAYLOADS[kind], "expected_execution_owner_epoch": owner}
-    disposition, result = HeadlessExecutionControlDispatch(service)(  # type: ignore[arg-type]
-        _command(kind, payload), stamp
-    )
-    assert disposition.disposition == "received"
-    assert result is not None
-    assert result["accepted"]["resolution_disposition"] == "promoted_to_full"
-    assert len(service.malformed) == 1
-
-
-@pytest.mark.parametrize("transport_kind", ["websocket", "rest"])
-def test_control_non_stop_without_owner_fence_is_still_refused(transport_kind: str) -> None:
-    stamp = ExecutionIngressStamp(
-        transport_kind=transport_kind,
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
-
-    class Available(_MalformedStopService):
-        @staticmethod
-        def program_cycle_status() -> dict[str, Any]:
-            return {}
-
-    service = Available()
-    dispatch = HeadlessExecutionControlDispatch(service)  # type: ignore[arg-type]
-    dispatch._availability = lambda cycle, kind: (True, None)  # type: ignore[method-assign]
-    dispatch._manual_scope_conflict = lambda request, cycle: None  # type: ignore[method-assign]
-    with pytest.raises(HeadlessApiError) as refused:
-        dispatch(
-            _command(
-                "operation_reset",
-                {"request_context": _CONTEXT, "operation_id": "operation-1",
-                 "expected_operation_revision": 1},
-            ),
-            stamp,
+    assert called == ("stop" if kind == "operation_stop" else kind)
+    if transport_kind == "websocket":
+        # Class 0: the session and its client sequence are the key.
+        assert request.request_context.request_key == (
+            "00" + "00000000000001" + "0000000000000001"
         )
-    assert refused.value.code == "execution_control_payload_invalid"
-    assert service.malformed == []
+        assert disposition.request_key == request.request_context.request_key
+    else:
+        # A Stop without a key acts as a fresh Stop with a Headless key (Q8).
+        assert request.request_context.request_key.startswith(HEADLESS_KEY_PREFIX)
+        assert disposition.request_key == request.request_context.request_key
+
+
+@pytest.mark.parametrize("kind", ["stop_all", "halt"])
+def test_stop_all_and_halt_need_no_program_and_no_start_value(kind: str) -> None:
+    """Stop all and Halt name no run: they never read the Program cycle
+    (``program_cycle_status`` fails the test) and a session-less one needs no
+    ``A``, so they act with no Program loaded."""
+
+    service = _OrdinaryStopService()
+    request = ExecutionCommandRequestDTO.model_validate(
+        {
+            **_command(kind, {}, "rest").model_dump(mode="json"),
+            "payload": {"request_context": _CONTEXT},
+        }
+    )
+    disposition, _ = _dispatch(service)(request, _stamp("rest"))
+    assert disposition.disposition == "received"
+    assert [called for called, _ in service.ordinary] == [kind]

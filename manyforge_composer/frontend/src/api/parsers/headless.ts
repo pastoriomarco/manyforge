@@ -31,9 +31,10 @@ import {
   stringArrayAt,
   stringAt,
 } from './shared';
-import { MANAGER_APPLY_PHASES } from './manager';
+import { applicationStartIdAt, MANAGER_APPLY_PHASES } from './manager';
 import { parseAuthoringWorkspaceContainment, parseAuthoringWorkspaceIdentity } from './workspace';
 import { parseProgramCycleStatus } from './programRuntime';
+import { parseApplyCommands } from './commandRows';
 import { parseExecutionControlStatus } from './execution';
 
 function parseHeadlessSourceSection(
@@ -52,10 +53,6 @@ function parseHeadlessSourceSection(
       record.source_generation,
       `${path}.source_generation`,
     ),
-    sourceOwnerEpoch: nullableStringAt(
-      record.source_owner_epoch,
-      `${path}.source_owner_epoch`,
-    ),
     sourceOwnerId: nullableStringAt(
       record.source_owner_id,
       `${path}.source_owner_id`,
@@ -72,10 +69,10 @@ export function parseHeadlessRuntimeSnapshot(
 ): HeadlessRuntimeSnapshot {
   const record = objectAt(value, 'runtime');
   const schemaVersion = stringAt(record.schema_version, 'runtime.schema_version');
-  if (schemaVersion !== 'manyforge.headless_runtime_snapshot.v1') {
+  if (schemaVersion !== 'manyforge.headless_runtime_snapshot.v3') {
     return fail(
       'runtime.schema_version',
-      'manyforge.headless_runtime_snapshot.v1',
+      'manyforge.headless_runtime_snapshot.v3',
     );
   }
   const sections = objectAt(record.sections, 'runtime.sections');
@@ -98,10 +95,6 @@ export function parseHeadlessRuntimeSnapshot(
     projectionGeneration: integerAt(
       record.projection_generation,
       'runtime.projection_generation',
-    ),
-    projectionOwnerEpoch: stringAt(
-      record.projection_owner_epoch,
-      'runtime.projection_owner_epoch',
     ),
     projectionOwnerId: stringAt(
       record.projection_owner_id,
@@ -149,7 +142,6 @@ function parseKernelAlarmAttention(value: unknown): KernelAlarmAttention | null 
   const record = objectAt(value, 'alarms.kernel_attention');
   const configuration = record.active_configuration;
   return {
-    ownerEpoch: stringAt(record.owner_epoch, 'alarms.kernel_attention.owner_epoch'),
     generation: integerAt(record.generation, 'alarms.kernel_attention.generation'),
     reconciled: booleanAt(record.reconciled, 'alarms.kernel_attention.reconciled'),
     activeConfiguration: configuration === null
@@ -271,17 +263,16 @@ export function parseOperatorAlarmSnapshot(
 ): OperatorAlarmSnapshot {
   const record = objectAt(value, 'alarms');
   const schemaVersion = stringAt(record.schema_version, 'alarms.schema_version');
-  if (schemaVersion !== 'manyforge.operator_alarm_snapshot.v2') {
+  if (schemaVersion !== 'manyforge.operator_alarm_snapshot.v3') {
     return fail(
       'alarms.schema_version',
-      'manyforge.operator_alarm_snapshot.v2',
+      'manyforge.operator_alarm_snapshot.v3',
     );
   }
   const health = objectAt(record.health, 'alarms.health');
   return {
     schemaVersion,
     ownerId: stringAt(record.owner_id, 'alarms.owner_id'),
-    ownerEpoch: stringAt(record.owner_epoch, 'alarms.owner_epoch'),
     generation: integerAt(record.generation, 'alarms.generation'),
     stateRevision: integerAt(record.state_revision, 'alarms.state_revision'),
     reconciled: booleanAt(record.reconciled, 'alarms.reconciled'),
@@ -333,8 +324,8 @@ export function parseComponentOverviewProjection(
     'components', 'maintenance_operation', 'basis',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.component_overview.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.component_overview.v2');
+  if (schemaVersion !== 'manyforge.component_overview.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.component_overview.v3');
   }
   const readiness = stringAt(record.readiness, `${path}.readiness`);
   if (!['ready', 'waiting', 'degraded', 'fault', 'offline'].includes(readiness)) {
@@ -349,7 +340,7 @@ export function parseComponentOverviewProjection(
       const component = objectAt(valueAtIndex, componentPath);
       exactKeysAt(component, [
         'id', 'label', 'status', 'detail', 'required', 'required_for',
-        'owner_id', 'owner_epoch', 'generation', 'reason_code', 'scope',
+        'owner_id', 'generation', 'reason_code', 'scope',
         'contributor_ids',
       ], componentPath);
       const status = stringAt(component.status, `${componentPath}.status`);
@@ -364,7 +355,6 @@ export function parseComponentOverviewProjection(
         required: booleanAt(component.required, `${componentPath}.required`),
         requiredFor: stringArrayAt(component.required_for, `${componentPath}.required_for`),
         ownerId: nullableStringAt(component.owner_id, `${componentPath}.owner_id`),
-        ownerEpoch: nullableStringAt(component.owner_epoch, `${componentPath}.owner_epoch`),
         generation: component.generation === null
           ? null : integerAt(component.generation, `${componentPath}.generation`),
         reasonCode: nullableStringAt(component.reason_code, `${componentPath}.reason_code`),
@@ -379,13 +369,10 @@ export function parseComponentOverviewProjection(
   const basisPath = `${path}.basis`;
   const basis = objectAt(record.basis, basisPath);
   const basisKeys = [
-    'runtime_projection_owner_epoch', 'runtime_projection_generation',
-    'manager_source_owner_epoch', 'logical_scene_source_owner_epoch',
-    'logical_scene_source_generation', 'scene_runtime_source_owner_epoch',
-    'scene_runtime_source_generation', 'alarm_owner_epoch', 'alarm_generation',
-    'alarm_state_revision', 'admission_generation', 'program_runner_owner_epoch',
-    'program_cycle_generation', 'applied_program_owner_epoch',
-    'applied_program_generation', 'execution_owner_epoch',
+    'runtime_projection_generation', 'logical_scene_source_generation',
+    'scene_runtime_source_generation', 'alarm_generation',
+    'alarm_state_revision', 'admission_generation',
+    'program_cycle_generation', 'applied_program_generation',
     'execution_publication_generation',
   ];
   exactKeysAt(basis, basisKeys, basisPath);
@@ -419,7 +406,7 @@ export function parseComponentOverviewProjection(
         );
       }
       return {
-        applyId: stringAt(operation.apply_id, `${operationPath}.apply_id`),
+        applyId: positiveIntegerAt(operation.apply_id, `${operationPath}.apply_id`),
         applyGeneration: positiveIntegerAt(
           operation.apply_generation,
           `${operationPath}.apply_generation`,
@@ -444,46 +431,14 @@ export function parseComponentOverviewProjection(
     components,
     maintenanceOperation,
     basis: {
-      runtimeProjectionOwnerEpoch: nullableStringAt(
-        basis.runtime_projection_owner_epoch,
-        `${basisPath}.runtime_projection_owner_epoch`,
-      ),
       runtimeProjectionGeneration: nullableGeneration('runtime_projection_generation'),
-      managerSourceOwnerEpoch: nullableStringAt(
-        basis.manager_source_owner_epoch,
-        `${basisPath}.manager_source_owner_epoch`,
-      ),
-      logicalSceneSourceOwnerEpoch: nullableStringAt(
-        basis.logical_scene_source_owner_epoch,
-        `${basisPath}.logical_scene_source_owner_epoch`,
-      ),
       logicalSceneSourceGeneration: nullableGeneration('logical_scene_source_generation'),
-      sceneRuntimeSourceOwnerEpoch: nullableStringAt(
-        basis.scene_runtime_source_owner_epoch,
-        `${basisPath}.scene_runtime_source_owner_epoch`,
-      ),
       sceneRuntimeSourceGeneration: nullableGeneration('scene_runtime_source_generation'),
-      alarmOwnerEpoch: nullableStringAt(
-        basis.alarm_owner_epoch,
-        `${basisPath}.alarm_owner_epoch`,
-      ),
       alarmGeneration: nullableGeneration('alarm_generation'),
       alarmStateRevision: nullableGeneration('alarm_state_revision'),
       admissionGeneration: nullableGeneration('admission_generation'),
-      programRunnerOwnerEpoch: nullableStringAt(
-        basis.program_runner_owner_epoch,
-        `${basisPath}.program_runner_owner_epoch`,
-      ),
       programCycleGeneration: nullableGeneration('program_cycle_generation'),
-      appliedProgramOwnerEpoch: nullableStringAt(
-        basis.applied_program_owner_epoch,
-        `${basisPath}.applied_program_owner_epoch`,
-      ),
       appliedProgramGeneration: nullableGeneration('applied_program_generation'),
-      executionOwnerEpoch: nullableStringAt(
-        basis.execution_owner_epoch,
-        `${basisPath}.execution_owner_epoch`,
-      ),
       executionPublicationGeneration: nullableGeneration(
         'execution_publication_generation',
       ),
@@ -498,18 +453,18 @@ export function parseComposerHeadlessState(
   exactKeysAt(record, [
     'schema_version', 'runtime', 'alarms', 'component_overview', 'authoring_admission',
     'held_run_draft_edit_allowed',
-    'execution_targets', 'execution_control_state', 'program_cycle',
-    'authoring_workspace', 'authoring_workspace_containment', 'receiver_epoch',
+    'execution_targets', 'execution_control_state', 'program_cycle', 'apply_commands',
+    'authoring_workspace', 'authoring_workspace_containment', 'application_start_id',
     'snapshot_sequence', 'complete',
   ], 'headlessState');
   const schemaVersion = stringAt(
     record.schema_version,
     'headlessState.schema_version',
   );
-  if (schemaVersion !== 'manyforge.composer_headless_state.v2') {
+  if (schemaVersion !== 'manyforge.composer_headless_state.v4') {
     return fail(
       'headlessState.schema_version',
-      'manyforge.composer_headless_state.v2',
+      'manyforge.composer_headless_state.v4',
     );
   }
   const admission = objectAt(record.authoring_admission, 'headlessState.authoring_admission');
@@ -541,6 +496,7 @@ export function parseComposerHeadlessState(
           record.execution_control_state,
         ),
     programCycle: parseProgramCycleStatus(record.program_cycle),
+    applyCommands: parseApplyCommands(record.apply_commands, 'headlessState.apply_commands'),
     authoringWorkspace: parseAuthoringWorkspaceIdentity(
       record.authoring_workspace,
       'headlessState.authoring_workspace',
@@ -549,7 +505,10 @@ export function parseComposerHeadlessState(
       record.authoring_workspace_containment,
       'headlessState.authoring_workspace_containment',
     ),
-    receiverEpoch: stringAt(record.receiver_epoch, 'headlessState.receiver_epoch'),
+    applicationStartId: applicationStartIdAt(
+      record.application_start_id,
+      'headlessState.application_start_id',
+    ),
     snapshotSequence: positiveIntegerAt(record.snapshot_sequence, 'headlessState.snapshot_sequence'),
   };
 }

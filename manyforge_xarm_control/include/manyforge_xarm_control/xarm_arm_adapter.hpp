@@ -63,8 +63,12 @@ struct XArmArmAdapterPorts final {
   /// the vendor plugin arms the robot (`clean_error`, `clean_warn`,
   /// `motion_enable`, `set_mode(1)`, `set_state(0)`), and the joint state
   /// broadcaster is switched on with it; on deactivation it selects position
-  /// mode.
-  std::function<core::ActionResult(bool active, std::stop_token)> hardware;
+  /// mode. `step_deadline`: Enable's lifecycle deadline, which bounds every
+  /// controller-manager call of the switch (none: each call's own cap).
+  std::function<core::ActionResult(
+      bool active, std::optional<std::chrono::steady_clock::time_point> step_deadline,
+      std::stop_token)>
+      hardware;
   /// The controller manager reports the arm's hardware component active.
   std::function<bool()> hardware_active;
   /// Between reads of a wait (production: 20 ms).
@@ -206,9 +210,12 @@ private:
 
   /// Disable: the lane's disable, then the hardware off.
   [[nodiscard]] core::ActionResult Disable(std::stop_token stop);
-  /// The hardware on or off, reported as `action`.
-  [[nodiscard]] core::ActionResult Hardware(bool active, core::ComponentAction action,
-                                            std::stop_token stop);
+  /// The hardware on or off, reported as `action`, within `step_deadline`
+  /// (none: each controller-manager call's own cap).
+  [[nodiscard]] core::ActionResult
+  Hardware(bool active, core::ComponentAction action,
+           std::optional<std::chrono::steady_clock::time_point> step_deadline,
+           std::stop_token stop);
 
   [[nodiscard]] bool Fresh(const XArmObservedState &observed, std::int64_t now_ns) const;
   [[nodiscard]] std::int64_t Now() const;

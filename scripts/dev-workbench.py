@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 # `docker exec` does not inherit shell exports made by the container
 # entrypoint. Keep this tool and every service it starts self-contained.
@@ -33,7 +33,15 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
 ).rstrip(os.pathsep)
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
-from scripts.lib.export_retention import create_host_ros_log_session
+from manyforge_operator.application_processes import (
+    MANAGER_STOPPED,
+    START_AFTER_BASELINE,
+    ApplicationProcess,
+    parent_death_preexec,
+    request_manager_shutdown,
+    write_document as write_application_processes,
+)
+from scripts.lib.export_retention import _LEGACY_SESSION_ENTRIES, create_host_ros_log_session, run_session
 from scripts.lib.workbench_session import Session
 
 
@@ -41,6 +49,11 @@ WORKSPACE = Path("/workspace")
 CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
 STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state"))
+# Removed disk-limit variables and the site settings member that replaced each.
+REMOVED_DISK_VARIABLES = {
+    "MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT": "disk_max_percent",
+    "MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES": "disk_always_free_bytes",
+}
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
 # The Core Python module (manyforge_core_py): Headless reference validation
@@ -78,6 +91,8 @@ ALARM_CATALOG = (
 FRONTEND_ROOT = WORKSPACE / "manyforge_composer/frontend"
 # Written by the native build step; serve reports it beside its readiness time.
 NATIVE_BUILD_TIMING = BUILD_ROOT / "native-build-timing.json"
+# How often the wait for the Manager's exit passes further stop requests on.
+MANAGER_STOP_POLL_SECONDS = 0.25
 
 
 class WorkbenchError(RuntimeError):
@@ -160,8 +175,9 @@ def _run(
         )
 
 
-def _persistent_key_register_path() -> Path:
-    """Installation state beside the Composer settings, owned by the runner."""
+def _persistent_key_register_directory() -> Path:
+    """Installation state beside the Composer settings, owned by the runner,
+    which names its register file in here by format version."""
 
     state_dir = os.environ.get("MANYFORGE_STATE_DIR", "").strip()
     if not state_dir or not Path(state_dir).is_absolute():
@@ -169,7 +185,7 @@ def _persistent_key_register_path() -> Path:
             "MANYFORGE_STATE_DIR must name the persistent installation state "
             "directory (scripts/compose-dev.sh sets it)"
         )
-    return Path(state_dir) / "program-runner" / "persistent-keys.json"
+    return Path(state_dir) / "program-runner"
 
 
 def _build_jobs() -> str:
@@ -660,59 +676,6 @@ def _port_available(port: int) -> bool:
     return True
 
 
-def _wait_until(
-    description: str,
-    predicate: Callable[[], Any],
-    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
-    *,
-    timeout_seconds: float | None = 20.0,
-) -> Any:
-    deadline = (
-        None if timeout_seconds is None else time.monotonic() + timeout_seconds
-    )
-    last_error: Exception | None = None
-    while deadline is None or time.monotonic() < deadline:
-        for name, process in processes:
-            if process.poll() is not None:
-                raise WorkbenchError(
-                    f"{name} exited with status {process.returncode} while waiting "
-                    f"for {description}"
-                )
-        try:
-            result = predicate()
-            if result:
-                return result
-        except Exception as error:
-            last_error = error
-        time.sleep(0.05)
-    suffix = f": {last_error}" if last_error is not None else ""
-    raise WorkbenchError(f"timed out waiting for {description}{suffix}")
-
-
-def _manager_projection_ready(status: dict[str, Any], diff: dict[str, Any]) -> bool:
-    """Accept only the existing fully converged Manager baseline."""
-
-    source = status.get("source")
-    payload = status.get("status")
-    runtime = payload.get("runtime") if isinstance(payload, dict) else None
-    diff_source = diff.get("source")
-    return bool(
-        isinstance(source, dict)
-        and source.get("available") is True
-        and source.get("freshness") == "fresh"
-        and source.get("known_gaps") == []
-        and isinstance(diff_source, dict)
-        and diff_source.get("available") is True
-        and diff_source.get("freshness") == "fresh"
-        and diff_source.get("known_gaps") == []
-        and isinstance(payload, dict)
-        and payload.get("manager_ready") is True
-        and isinstance(runtime, dict)
-        and runtime.get("converged") is True
-        and diff.get("converged") is True
-    )
-
-
 def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, Any]:
     """Read Composer readiness and, when selected, the exact active project."""
 
@@ -787,16 +750,6 @@ def query_operator_status(*, headless_port: int, runner_port: int,
             "program_runner": runner, "composer": composer, "timing": timing}
 
 
-def _startup_cycle_state(client: HeadlessHttpClient) -> str:
-    """Accept only contained startup states; terminal state remains resettable."""
-
-    cycle = client.program_cycle_status()
-    state = cycle.get("state")
-    if state not in {"idle_after_reset", "terminal_awaiting_reset"}:
-        raise WorkbenchError(f"Program cycle is not contained at startup: {state!r}")
-    return state
-
-
 class Workbench:
     def __init__(
         self,
@@ -820,7 +773,6 @@ class Workbench:
         operator_instance_id: str | None = None,
         node_catalog_path: Path | None = None,
         alarm_catalog_path: Path | None = None,
-        operator_readiness_timeout: float = 60.0,
     ) -> None:
         self.project_path = project_path
         self.headless_port = headless_port
@@ -841,29 +793,25 @@ class Workbench:
         self.operator_instance_id = operator_instance_id
         self.node_catalog_path = node_catalog_path or NODE_CATALOG
         self.alarm_catalog_path = alarm_catalog_path or ALARM_CATALOG
-        if not 0 < operator_readiness_timeout <= 600:
-            raise WorkbenchError("operator readiness timeout must be in (0, 600]")
-        self.operator_readiness_timeout = operator_readiness_timeout
-        self._readiness_deadline: float | None = None
         self.scenario_id: str | None = None
-        self.processes: list[tuple[str, subprocess.Popen[bytes]]] = []
+        self.manager: subprocess.Popen[bytes] | None = None
+        # Dev mode only: Vite HMR, this launcher's own child (not listed).
+        self._vite_command: tuple[str, ...] | None = None
+        self.vite: subprocess.Popen[bytes] | None = None
+        self._ready_reported = False
         self.stop_requested = False
+        # SIGTERM/SIGINT received; each one after the first is passed on to
+        # the Manager, where a second stop request forces its stop (OD-187).
+        self.stop_requests = 0
         self.session: Session | None = None
+        for variable, member in REMOVED_DISK_VARIABLES.items():
+            if variable in os.environ:
+                raise WorkbenchError(
+                    f"{variable} is no longer read: set {member} in the site settings file "
+                    "(MANYFORGE_DEV_SITE_SETTINGS) and unset the variable")
+        # The disk limits: the site settings file's, or the defaults.
+        self.disk_limits = run_session.read_site_disk_limits(site_settings)
         self.runtime_root = STATE_ROOT / "current"
-
-    def _spawn(
-        self,
-        name: str,
-        command: Sequence[str],
-        *,
-        cwd: Path | None = None,
-        environment: dict[str, str] | None = None,
-    ) -> None:
-        print(f"starting {name}: {' '.join(command)}", flush=True)
-        process = subprocess.Popen(
-            command, cwd=cwd, env={**os.environ, **(environment or {})}
-        )
-        self.processes.append((name, process))
 
     def _paths(self) -> dict[str, Path]:
         paths = {
@@ -871,7 +819,6 @@ class Workbench:
             "manager_run": self.runtime_root / "manager-run",
             "execution_state": self.runtime_root / "execution-state",
             "execution_run": self.runtime_root / "execution-run",
-            "publications": self.runtime_root / "publications",
             "artifacts": self.runtime_root / "artifacts",
             "composer_authoring": self.runtime_root / "composer-authoring",
         }
@@ -916,15 +863,8 @@ class Workbench:
         _regular_file(config, "Isaac Program simulation site configuration")
         return ("--simulation-control-config", str(config))
 
-    def _wait_until(self, description: str, predicate: Callable[[], Any],
-                    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
-                    *, timeout_seconds: float | None = 20.0) -> Any:
-        if self._readiness_deadline is not None:
-            timeout_seconds = max(0.0, self._readiness_deadline - time.monotonic())
-        return _wait_until(description, predicate, processes, timeout_seconds=timeout_seconds)
-
     def _site_manager_arguments(self) -> tuple[str, ...]:
-        # Machine facts only (manyforge.site.v1); the Manager validates the file.
+        # Machine facts only (manyforge.site.v2); the Manager validates the file.
         if self.site_settings is None:
             return ()
         _regular_file(self.site_settings, "site settings")
@@ -1004,8 +944,6 @@ class Workbench:
             _ensure_frontend_dependencies()
         paths = self._paths()
         readiness_started = time.monotonic()
-        if operator_mode:
-            self._readiness_deadline = readiness_started + self.operator_readiness_timeout
         installed = self.runtime_root / "installed-targets"
         installed.mkdir(parents=True, exist_ok=True)
         manager = installed / "manyforge_manager_daemon"
@@ -1032,43 +970,30 @@ class Workbench:
             # held by this launcher for its entire owner lifetime.
             ros_logs = create_host_ros_log_session(self.runtime_root)
             os.environ["ROS_LOG_DIR"] = str(ros_logs)
-        # Bring up the two reconciliation services before Manager.  A new
-        # Manager must be able to reconcile the retained Program Runner owner
-        # on its first heartbeat; starting Manager first creates a needless
-        # dependency cycle in which its native child can expire while the
-        # Runner is still waiting for Headless cell-admission recovery.
-        self._spawn(
-            "Program runner",
-            (
-                sys.executable,
-                "-m",
-                "manyforge_program_runner",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.runner_port),
-                "--headless-url",
-                f"http://127.0.0.1:{self.headless_port}",
-                "--execution-run-root",
-                str(paths["execution_run"]),
-                "--cycle-journal-path",
-                str(self.runtime_root / "program-cycle.sqlite3"),
-                "--manager-liveness-socket",
-                str(runner_socket),
-                "--cell-id",
-                cell_id,
-                "--owner-id",
-                f"program-runner.{self.operator_instance_id or 'development-workbench'}",
-                "--persistent-key-register-path",
-                str(_persistent_key_register_path()),
-                "--snapshot-url",
-                f"http://127.0.0.1:{self.composer_port}/api/scene/snapshot/render",
-                *self._simulation_control_arguments(),
+        base_url = f"http://127.0.0.1:{self.headless_port}"
+        history_directory = STATE_ROOT / "history"
+        history_directory.mkdir(parents=True, exist_ok=True)
+        composer_environment = {
+            "MANYFORGE_CORS_ORIGINS": (
+                f"http://localhost:{self.frontend_port},"
+                f"http://127.0.0.1:{self.frontend_port}"
             ),
-        )
-        self._spawn(
-            "Headless API",
-            (
+        }
+        previous_report = self._previous_session_report()
+        if previous_report is not None:
+            composer_environment["MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"] = str(previous_report)
+        composer_roots = _composer_filesystem_roots(self.artifact_root)
+        composer_environment["MANYFORGE_FS_ROOTS"] = composer_roots
+        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = composer_roots
+        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = composer_roots
+        # The Manager starts, watches and stops every application process
+        # (spec 3.3, S3); none depends on another being up first. Composer
+        # starts after the Manager's first converged baseline, so a --project
+        # Load meets a ready Manager (4.7). Composer owns only process-lifetime
+        # Draft state; its installation settings persist under the inherited
+        # MANYFORGE_STATE_DIR (composer/).
+        processes = [
+            ApplicationProcess("headless", (
                 sys.executable,
                 "-m",
                 "manyforge_headless_api",
@@ -1077,8 +1002,6 @@ class Workbench:
                 "127.0.0.1",
                 "--port",
                 str(self.headless_port),
-                "--projection-root",
-                str(paths["publications"]),
                 "--install-root",
                 str(bootstrap_root),
                 "--canonical-empty-admission-filename",
@@ -1091,17 +1014,19 @@ class Workbench:
                 str(NODE_ENVIRONMENT_MANIFEST),
                 "--alarm-catalog-path",
                 str(self.alarm_catalog_path),
-                "--historian-database-path",
-                str(STATE_ROOT / "history.sqlite3"),
+                "--historian-directory",
+                str(history_directory),
                 *self._previous_session_arguments(),
                 "--manager-run-root",
                 str(paths["manager_run"]),
                 "--execution-run-root",
                 str(paths["execution_run"]),
+                "--disk-free-floor-bytes",
+                str(self.disk_limits.floor_bytes),
+                "--disk-free-margin-bytes",
+                str(run_session.DISK_FLOOR_CLEAR_MARGIN_BYTES),
                 "--cell-id",
                 cell_id,
-                "--owner-id",
-                f"headless-api.{self.operator_instance_id or 'development-workbench'}",
                 "--freshness-ms",
                 "2000",
                 "--manager-timeout-s",
@@ -1114,26 +1039,57 @@ class Workbench:
                 str(WORKSPACE),
                 "--activation-preparer-activation-root",
                 str(paths["artifacts"]),
+            )),
+            ApplicationProcess("program_runner", (
+                sys.executable,
+                "-m",
+                "manyforge_program_runner",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.runner_port),
+                "--headless-url",
+                base_url,
+                "--execution-run-root",
+                str(paths["execution_run"]),
+                "--cycle-journal-path",
+                str(self.runtime_root / "program-cycle.sqlite3"),
+                "--manager-liveness-socket",
+                str(runner_socket),
+                "--cell-id",
+                cell_id,
+                "--persistent-key-register-directory",
+                str(_persistent_key_register_directory()),
+                "--snapshot-url",
+                f"http://127.0.0.1:{self.composer_port}/api/scene/snapshot/render",
+                *self._simulation_control_arguments(),
+            )),
+            ApplicationProcess(
+                "composer",
+                tuple(self._composer_command(base_url)),
+                composer_environment,
+                START_AFTER_BASELINE,
             ),
+        ]
+        if not operator_mode:
+            # Vite is development tooling, not an application process: the
+            # list holds only the three roles of contract 1.1. This launcher
+            # starts it once Composer is ready and keeps it as its own child.
+            node = shutil.which("node")
+            if node is None:
+                raise WorkbenchError("Vite HMR requires node on PATH")
+            self._vite_command = (
+                node,
+                str(FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(self.frontend_port),
+            )
+        process_list = write_application_processes(
+            self.runtime_root / "application-processes.json", processes
         )
-        base_url = f"http://127.0.0.1:{self.headless_port}"
-
-        def reconciliation_services_ready() -> bool:
-            with HeadlessHttpClient(
-                f"http://127.0.0.1:{self.runner_port}", timeout_seconds=0.5
-            ) as client:
-                runner = client.request("GET", "/api/program/health")
-            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
-                api = client.runtime()
-            return bool(runner.get("started") is True and api.get("schema_version"))
-
-        self._wait_until(
-            "Program Runner and Headless reconciliation services",
-            reconciliation_services_ready,
-            self.processes,
-        )
-        self._spawn(
-            "Manager",
+        self._spawn_manager(
             (
                 str(manager),
                 "--install-root",
@@ -1150,14 +1106,12 @@ class Workbench:
                 str(paths["execution_run"]),
                 "--logical-scene-database",
                 str(self.runtime_root / "logical-scene.sqlite3"),
-                "--program-cycle-journal",
-                str(self.runtime_root / "program-cycle.sqlite3"),
-                "--projection-root",
-                str(paths["publications"]),
                 "--canonical-empty-admission-filename",
                 bootstrap_admission,
                 "--program-runner-liveness-socket",
                 str(runner_socket),
+                "--application-processes",
+                str(process_list),
                 # Development value only: relative Program scene meshes such
                 # as examples/<name>/meshes/*.obj resolve below the checkout.
                 "--scene-asset-root",
@@ -1171,155 +1125,76 @@ class Workbench:
                 "MANYFORGE_HEADLESS_API_URL": base_url,
             },
         )
-        self._wait_until(
-            "Manager command socket",
-            manager_socket.is_socket,
-            self.processes,
-        )
+        self._operator_mode = operator_mode
+        self._timing = timing
+        self._timing_path = timing_path
+        self._readiness_started = readiness_started
 
-        # Projection rebuild and composition materialization are asynchronous.
-        # Their total duration depends on the retained model and host load, so
-        # keep waiting while the managed processes remain alive; do not turn a
-        # slow but healthy operation into a startup failure.
-        while True:
-            if self._readiness_deadline is not None and time.monotonic() >= self._readiness_deadline:
-                raise WorkbenchError("timed out waiting for fresh Manager readiness")
-            for name, process in self.processes:
-                if process.poll() is not None:
-                    raise WorkbenchError(
-                        f"{name} exited with status {process.returncode} while "
-                        "waiting for fresh converged Manager baseline"
-                    )
-            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
-                status = client.manager_status()
-                diff = {} if operator_mode else client.manager_diff()
-            if (_operator_manager_ready(status) if operator_mode else _manager_projection_ready(status, diff)):
-                break
-            # Manager reconciliation itself runs at 500 ms. Polling faster
-            # only reserializes two large status documents and competes with
-            # the projection work without discovering completion sooner.
-            time.sleep(0.5)
+    def _start_vite_when_composer_ready(self) -> None:
+        """Start Vite HMR once, after Composer answers (dev mode only)."""
 
-        def contained_startup_cycle() -> str | None:
-            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
-                try:
-                    return _startup_cycle_state(client)
-                except WorkbenchError:
-                    # Manager rebuilds the exact retained native product on its
-                    # existing asynchronous builder lane.  A replacement Runner
-                    # stays fenced until that product can certify containment;
-                    # treat the intervening active state as startup progress,
-                    # never as permission to continue the old run.
-                    return None
-
-        if not operator_mode:
-            self._wait_until(
-                "contained Program-cycle startup reconciliation",
-                contained_startup_cycle,
-                self.processes,
-                timeout_seconds=None,
-            )
-
-        composer_environment = os.environ.copy()
-        previous_report = self._previous_session_report()
-        if previous_report is not None:
-            composer_environment["MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"] = str(previous_report)
-        else:
-            composer_environment.pop("MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT", None)
-        composer_environment["MANYFORGE_CORS_ORIGINS"] = (
-            f"http://localhost:{self.frontend_port},"
-            f"http://127.0.0.1:{self.frontend_port}"
-        )
-        composer_roots = _composer_filesystem_roots(self.artifact_root)
-        composer_environment["MANYFORGE_FS_ROOTS"] = composer_roots
-        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = composer_roots
-        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = composer_roots
-        print("starting Composer backend", flush=True)
-        # Composer owns only process-lifetime Draft state. Runtime transitions
-        # are durable Manager operations and need no Composer state root.
-        # Installation presentation settings are the one exception: they
-        # persist under the inherited MANYFORGE_STATE_DIR (composer/).
-        composer_command = self._composer_command(base_url)
-        composer = subprocess.Popen(
-            composer_command,
-            env=composer_environment,
-        )
-        self.processes.append(("Composer backend", composer))
-
-        def composer_ready() -> bool:
+        if self._vite_command is None or self.vite is not None:
+            return
+        try:
             with HeadlessHttpClient(
                 f"http://127.0.0.1:{self.composer_port}", timeout_seconds=0.5
             ) as client:
-                return bool(client.health())
-
-        self._wait_until(
-            "Composer backend",
-            composer_ready,
-            self.processes,
-            timeout_seconds=None,
-        )
-
-        if self.scenario_id is not None:
-            def exact_status() -> dict[str, Any] | None:
-                result = query_status(
-                    scenario_id=self.scenario_id,
-                    composer_port=self.composer_port,
-                )
-                return result if result["ready"] else None
-
-            self._wait_until(
-                "exact current Scenario project",
-                exact_status,
-                self.processes,
-                timeout_seconds=None,
-            )
-        if operator_mode:
-            timing["readiness_elapsed_seconds"] = time.monotonic() - readiness_started
-            timing_path.write_text(_json(timing) + "\n", encoding="utf-8")
-            print(_json({"ready": True, "url": f"http://localhost:{self.composer_port}",
-                         "timing": timing}), flush=True)
+                if not client.health():
+                    return
+        except (HeadlessClientError, OSError, ValueError):
             return
-        vite_environment = os.environ.copy()
-        vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
-            f"http://127.0.0.1:{self.composer_port}"
-        )
         print("starting Vite HMR", flush=True)
-        vite = subprocess.Popen(
-            (
-                "node",
-                str(FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.frontend_port),
-            ),
+        self.vite = subprocess.Popen(
+            self._vite_command,
             cwd=FRONTEND_ROOT,
-            env=vite_environment,
+            env={**os.environ,
+                 "MANYFORGE_COMPOSER_PROXY_TARGET": f"http://127.0.0.1:{self.composer_port}"},
+            preexec_fn=parent_death_preexec(),
         )
-        self.processes.append(("Vite HMR", vite))
 
-        def frontend_ready() -> bool:
-            with socket.create_connection(
-                ("127.0.0.1", self.frontend_port), timeout=0.5
-            ):
-                return True
+    def _report_ready(self) -> None:
+        """Print the ready line once the owners report ready.
 
-        self._wait_until("Vite HMR", frontend_ready, self.processes)
-        print(
-            _json(
-                {
-                    "ready": True,
-                    "url": f"http://localhost:{self.frontend_port}",
-                    "scenario_id": self.scenario_id,
-                    "project_path": self.project_path,
-                    "classification": (
-                        "development workbench; repository source; "
-                        "simulated execution only"
+        Reporting only: it never decides anything about the application and
+        never stops a process; the Manager supervises them (spec 3.3).
+        """
+
+        if self._ready_reported:
+            return
+        try:
+            if self._operator_mode:
+                if not query_operator_status(headless_port=self.headless_port,
+                                             runner_port=self.runner_port,
+                                             composer_port=self.composer_port)["ready"]:
+                    return
+                self._timing["readiness_elapsed_seconds"] = time.monotonic() - self._readiness_started
+                self._timing_path.write_text(_json(self._timing) + "\n", encoding="utf-8")
+                print(_json({"ready": True, "url": f"http://localhost:{self.composer_port}",
+                             "timing": self._timing}), flush=True)
+            else:
+                if self.vite is None or not query_status(
+                        scenario_id=self.scenario_id, composer_port=self.composer_port)["ready"]:
+                    return
+                with socket.create_connection(("127.0.0.1", self.frontend_port), timeout=0.5):
+                    pass
+                print(
+                    _json(
+                        {
+                            "ready": True,
+                            "url": f"http://localhost:{self.frontend_port}",
+                            "scenario_id": self.scenario_id,
+                            "project_path": self.project_path,
+                            "classification": (
+                                "development workbench; repository source; "
+                                "simulated execution only"
+                            ),
+                        }
                     ),
-                }
-            ),
-            flush=True,
-        )
+                    flush=True,
+                )
+        except (HeadlessClientError, OSError, ValueError, WorkbenchError):
+            return
+        self._ready_reported = True
 
     def _previous_session_report(self) -> Path | None:
         previous = self.session.marker.get("previous_session") if self.session is not None else None
@@ -1332,91 +1207,68 @@ class Workbench:
         previous = self.session.marker.get("previous_session")
         return arguments + (("--workbench-previous-session-id", previous["session_id"]) if previous else ())
 
-    def _shutdown_manager(self) -> bool:
-        manager = next(
-            (process for name, process in self.processes if name == "Manager"),
-            None,
+    def _spawn_manager(self, command: Sequence[str], *, environment: dict[str, str]) -> None:
+        """Start the Manager, the one application supervisor; it dies with us."""
+
+        print(f"starting Manager: {' '.join(command)}", flush=True)
+        self.manager = subprocess.Popen(
+            command,
+            env={**os.environ, **environment},
+            preexec_fn=parent_death_preexec(),
         )
-        if manager is None or manager.poll() is not None:
-            return False
-        request = (
-            b'{"api_version":"manyforge.manager_command.v1",'
-            b'"command":"shutdown_runtime"}'
-        )
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                client.settimeout(1.0)
-                client.connect(str(self.runtime_root / "manager-run/manager-command.sock"))
-                client.sendall(request)
-                response = client.recv(16 * 1024)
-                receipt = json.loads(response)
-                if not isinstance(receipt, dict) or receipt.get("ok") is not True or receipt != {
-                    "api_version": "manyforge.manager_command_response.v2",
-                    "manager_source_generation": None,
-                    "ok": True,
-                    "operation": "shutdown_runtime",
-                    "scene_source_generation": None,
-                    "scene_runtime_source_generation": None,
-                }:
-                    raise WorkbenchError("Manager rejected bounded shutdown")
-            manager.wait(timeout=5)
-            return manager.returncode == 0
-        except (OSError, ValueError, subprocess.TimeoutExpired, WorkbenchError):
-            return False
 
     def _stop_manager(self) -> bool:
-        """Stop Manager before waiting for the Runner's short lease."""
+        """Ask the Manager to end the application; True when it stopped cleanly.
 
-        contained = self._shutdown_manager()
-        manager = next(
-            (process for name, process in self.processes if name == "Manager"),
-            None,
-        )
-        if manager is not None:
-            # The bounded command is preferred, but a failed command must not
-            # leave Manager running until the container disappears.
-            self._terminate(manager)
-        return contained
+        The Manager halts the robots, stops Composer, the Program runner and
+        Headless in reverse list order, then the execution host, then exits
+        (spec 3.3 point 5). The wait for its exit has no time limit (OD-187):
+        the request stands for the first stop request this workbench got;
+        each later SIGTERM or SIGINT is passed on as one SIGTERM, and a second
+        stop request forces the Manager's stop. The container's stop limit
+        stays the outer end. A status other than "stopped" (a forced or
+        incomplete stop) is not a clean stop.
+        """
 
-    @staticmethod
-    def _terminate(process: subprocess.Popen[bytes]) -> bool:
-        if process.poll() is not None:
-            return True
-        process.terminate()
+        manager = self.manager
+        if manager is None:
+            return False
+        if manager.poll() is None:
+            passed_on = 1 if self.stop_requests else 0
+            request_manager_shutdown(
+                self.runtime_root / "manager-run/manager-command.sock", timeout_seconds=1.0
+            )
+            while True:
+                while passed_on < self.stop_requests:
+                    manager.send_signal(signal.SIGTERM)
+                    passed_on += 1
+                try:
+                    manager.wait(timeout=MANAGER_STOP_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        return manager.returncode == MANAGER_STOPPED
+
+    def _stop_vite(self) -> bool:
+        vite = self.vite
+        if vite is None or vite.poll() is not None:
+            return vite is None
+        vite.terminate()
         try:
-            process.wait(timeout=5)
+            vite.wait(timeout=5)
             return True
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            vite.kill()
+            vite.wait(timeout=5)
             return False
 
     def close(self) -> None:
-        verified = self.stop_requested and all(process.poll() is None for _, process in self.processes)
-        for name in ("Vite HMR", "Composer backend"):
-            for process_name, process in reversed(self.processes):
-                if process_name == name:
-                    verified = self._terminate(process) and verified
-        # Stop the alarm owner before the providers it evaluates. Headless
-        # treats Manager sources going stale after a complete baseline as an
-        # unexplained provider loss; stopping Manager first raised one
-        # provider_unavailable alarm on every workbench stop.
-        for process_name, process in reversed(self.processes):
-            if process_name == "Headless API":
-                verified = self._terminate(process) and verified
+        verified = (self.stop_requested and self.manager is not None and self.manager.poll() is None
+                    and (self.vite is None or self.vite.poll() is None))
+        # The Manager first: its stop begins with the robots' Halt, which
+        # waits for nothing else (OD-187); Vite serves only the frontend.
         verified = self._stop_manager() and verified
-        for process_name, process in reversed(self.processes):
-            if process_name == "Program runner":
-                verified = self._terminate(process) and verified
-        for name, process in reversed(self.processes):
-            if name not in {
-                "Vite HMR",
-                "Composer backend",
-                "Program runner",
-                "Manager",
-                "Headless API",
-            }:
-                verified = self._terminate(process) and verified
+        verified = self._stop_vite() and verified
         if self.session is not None:
             try:
                 self.session.stopped(verified=verified)
@@ -1427,22 +1279,37 @@ class Workbench:
     def serve(self) -> None:
         def request_stop(_signum: int, _frame: Any) -> None:
             self.stop_requested = True
+            self.stop_requests += 1
 
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         try:
             STATE_ROOT.mkdir(parents=True, exist_ok=True)
             selected = os.environ.get("MANYFORGE_DEV_COLD_SESSION_ID")
-            self.session = Session(STATE_ROOT, selected) if selected else Session.direct(STATE_ROOT)
+            self.session = Session(STATE_ROOT, selected) if selected else Session.direct(STATE_ROOT, self.disk_limits)
             self.start()
+            next_prune = time.monotonic() + run_session.DISK_PRUNE_PERIOD_SECONDS
+            # Wait on the Manager for its whole life. It ends the application
+            # when any application process exits and has printed which one.
             while not self.stop_requested:
-                for name, process in self.processes:
-                    if process.poll() is not None:
-                        raise WorkbenchError(
-                            f"{name} exited unexpectedly with status "
-                            f"{process.returncode}"
-                        )
-                time.sleep(0.2)
+                try:
+                    status = self.manager.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    # A Vite exit ends the session as before: close() stops
+                    # the Manager, which ends the application.
+                    if self.vite is not None and self.vite.poll() is not None:
+                        raise WorkbenchError(f"Vite HMR exited with status {self.vite.returncode}")
+                    self._start_vite_when_composer_ready()
+                    self._report_ready()
+                    # ManyForge's own obsolete files, only above their limits.
+                    if time.monotonic() >= next_prune:
+                        next_prune = time.monotonic() + run_session.DISK_PRUNE_PERIOD_SECONDS
+                        run_session.prune_while_running(self.session.root, self.session.fd, self.disk_limits,
+                                                        legacy_entries=_LEGACY_SESSION_ENTRIES)
+                    continue
+                if status != MANAGER_STOPPED:
+                    raise WorkbenchError(f"Manager ended the application with status {status}")
+                return
         finally:
             self.close()
 
@@ -1468,7 +1335,6 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--operator-install-root", type=Path)
             command.add_argument("--operator-cell-id")
             command.add_argument("--operator-instance-id")
-            command.add_argument("--operator-readiness-timeout", type=float, default=60.0)
             command.add_argument("--node-catalog-path", type=Path)
             command.add_argument("--alarm-catalog-path", type=Path)
             command.add_argument("--canonical-empty-admission-filename")
@@ -1528,9 +1394,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             operator_instance_id=args.operator_instance_id,
             node_catalog_path=args.node_catalog_path,
             alarm_catalog_path=args.alarm_catalog_path,
-            operator_readiness_timeout=args.operator_readiness_timeout,
         ).serve()
         return 0
+    except run_session.DiskBelowFloor as error:
+        print(f"{error.code}: {error}", file=sys.stderr)
+        return 69
     except (HeadlessClientError, OSError, ValueError, WorkbenchError) as error:
         print(f"development_workbench_unavailable: {error}", file=sys.stderr)
         return 69

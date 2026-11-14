@@ -74,7 +74,7 @@ function sample(signalId: string, patch: Partial<SignalSample> = {}): SignalSamp
 function receipt(patch: Partial<MockIoInputReceipt> = {}): MockIoInputReceipt {
   return {
     reading: reading({ value: true }), modelValue: true,
-    publishedCursor: { ownerEpoch: 'owner.1', catalogGeneration: '1', sourceId: 'station_mock', recordSequence: '10' },
+    publishedCursor: { catalogGeneration: '1', sourceId: 'station_mock', recordSequence: '10' },
     publicationError: null, ...patch,
   };
 }
@@ -284,7 +284,7 @@ describe('ToolIoPanel', () => {
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
     await act(async () => {
-      root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
+      root.render(<ToolIoPanel enabled applicationStartId="owner.1" retainedBundleId="bundle.1"
         controlSource={cellSource(state)} />);
     });
     await act(async () => { await Promise.resolve(); });
@@ -322,7 +322,7 @@ describe('ToolIoPanel', () => {
     try {
       await act(async () => { find((props) => props['aria-label'] === 'Set part_present true').onClick?.(); });
       expect(api.setMockIoInput).toHaveBeenCalledExactlyOnceWith({
-        ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present',
+        programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present',
       }, '3', true);
       expect(find((props) => props['data-io-receipt'] === 'delivered')).toBeTruthy();
     } finally {
@@ -331,9 +331,9 @@ describe('ToolIoPanel', () => {
   });
 
   it('shows why nothing is shown before the owner or a bound signal exists', () => {
-    expect(renderToStaticMarkup(<ToolIoPanel enabled ownerEpoch={null} retainedBundleId="bundle.1" />))
+    expect(renderToStaticMarkup(<ToolIoPanel enabled applicationStartId={null} retainedBundleId="bundle.1" />))
       .toContain('Waiting for the execution owner');
-    expect(renderToStaticMarkup(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1" />))
+    expect(renderToStaticMarkup(<ToolIoPanel enabled applicationStartId="owner.1" retainedBundleId="bundle.1" />))
       .toContain('No applied Program binding');
     expect(ioSignalBindingsFromProgramBinding(binding)).toHaveLength(1);
   });
@@ -354,7 +354,7 @@ describe('ToolIoPanel on a shipped Mock example', () => {
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
     await act(async () => {
-      root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1" ioSignalBindings={bindings}
+      root.render(<ToolIoPanel enabled applicationStartId="owner.1" retainedBundleId="bundle.1" ioSignalBindings={bindings}
         controlSource={cellSource({ components: null, readiness: null, latch: { latched: false, causes: [] }, io: [] })} />);
     });
     await act(async () => { await Promise.resolve(); });
@@ -402,11 +402,11 @@ describe('ToolIoPanel on a shipped Mock example', () => {
 });
 
 describe('parseIoSignalResponse', () => {
-  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
+  const selector = { programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
   const response = (value: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
-    api_version: 'manyforge.execution_command_response.v4', ok: true, command: 'query_target',
+    api_version: 'manyforge.execution_command_response.v6', ok: true, command: 'query_target',
     target_observation: {
-      schema_version: 'manyforge.target_observation.v2', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
+      schema_version: 'manyforge.target_observation.v3', program_binding_id: BINDING_ID,
       signal: { component_id: 'station', signal_name: 'part_present' }, kind: 'io_signal',
       evaluated_at_ns: 5000, value, ...extra,
     },
@@ -462,7 +462,7 @@ describe('parseIoSignalResponse', () => {
 });
 
 describe('parseMockIoInputReceipt', () => {
-  const selector = { ownerEpoch: 'owner.1', programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
+  const selector = { programBindingId: BINDING_ID, componentId: 'station', signalName: 'part_present' };
   const unavailable = {
     liveness: { mode: 'in_process', warning: null },
     signal_name: 'part_present', value_type: 'bool', value: null, quality: 'unavailable', source_id: 'station_mock',
@@ -471,11 +471,11 @@ describe('parseMockIoInputReceipt', () => {
   };
   const fresh = { ...unavailable, value: true, quality: 'fresh', source_epoch: '3', source_sequence: '10',
     receipt_age_ns: 0, error: null };
-  const cursor = { owner_epoch: 'owner.1', catalog_generation: '1', source_id: 'station_mock', record_sequence: '10' };
+  const cursor = { catalog_generation: '1', source_id: 'station_mock', record_sequence: '10' };
   const body = (value: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
-    api_version: 'manyforge.execution_command_response.v4', ok: true, command: 'set_mock_io_input',
+    api_version: 'manyforge.execution_command_response.v6', ok: true, command: 'set_mock_io_input',
     target_observation: {
-      schema_version: 'manyforge.target_observation.v2', owner_epoch: 'owner.1', program_binding_id: BINDING_ID,
+      schema_version: 'manyforge.target_observation.v3', program_binding_id: BINDING_ID,
       signal: { component_id: 'station', signal_name: 'part_present' }, kind: 'io_signal', evaluated_at_ns: 5000, value,
     },
     model_value: true, published_cursor: cursor, ...extra,
@@ -484,7 +484,7 @@ describe('parseMockIoInputReceipt', () => {
   it('parses a delivered toggle with its exact cursor', () => {
     expect(parseMockIoInputReceipt(body(fresh), selector, true)).toMatchObject({
       modelValue: true, publicationError: null,
-      publishedCursor: { ownerEpoch: 'owner.1', catalogGeneration: '1', sourceId: 'station_mock', recordSequence: '10' },
+      publishedCursor: { catalogGeneration: '1', sourceId: 'station_mock', recordSequence: '10' },
       reading: { quality: 'fresh', value: true },
     });
   });
@@ -508,7 +508,7 @@ describe('parseMockIoInputReceipt', () => {
     ['a non-canonical sequence', body(fresh, { published_cursor: { ...cursor, record_sequence: '010' } })],
     ['a numeric counter', body(fresh, { published_cursor: { ...cursor, catalog_generation: 1 } })],
     ['a zero record sequence', body(fresh, { published_cursor: { ...cursor, record_sequence: '0' } })],
-    ['another owner epoch', body(fresh, { published_cursor: { ...cursor, owner_epoch: 'owner.2' } })],
+    ['a retired owner epoch member', body(fresh, { published_cursor: { ...cursor, owner_epoch: 'owner.1' } })],
     ['another source', body(fresh, { published_cursor: { ...cursor, source_id: 'other' } })],
     ['an extra cursor field', body(fresh, { published_cursor: { ...cursor, source_epoch: '3' } })],
     ['a cursor with an error', body(fresh, { publication_error: { code: 'x', message: 'y' } })],
@@ -554,20 +554,20 @@ describe('ioSignalBindingsAt', () => {
 describe('execution targets io_signal_bindings', () => {
   const identity = {
     active_publication_generation: 1, cell_id: 'cell', control_management_mode: 'direct',
-    graph_revision: REVISION, owner_epoch: 'owner.1', retained_bundle_id: 'bundle.1',
-    schema_version: 'manyforge.execution_identity.v2',
+    graph_revision: REVISION, application_start_id: 'owner.1', retained_bundle_id: 'bundle.1',
+    schema_version: 'manyforge.execution_identity.v3',
   };
   const targets = (extra: Record<string, unknown>) => ({
-    api_version: 'manyforge.execution_command_response.v4', command: 'targets', ok: true, identity,
-    targets: { components: [], schema_version: 'manyforge.execution_targets.v4', ...extra },
+    api_version: 'manyforge.execution_command_response.v6', command: 'targets', ok: true, identity,
+    targets: { components: [], schema_version: 'manyforge.execution_targets.v5', ...extra },
   });
   const control = {
-    api_version: 'manyforge.execution_command_response.v4', command: 'control_state', ok: true, identity,
+    api_version: 'manyforge.execution_command_response.v6', command: 'control_state', ok: true, identity,
     control_state: {
-      cell_stop_action: { available: false, expected_stop_generation: 1, latest_terminal: null,
-        unavailable_reason: 'No motion target.' },
+      cell_stop_action: { available: true, last_event_id: null, last_completed: null,
+        unavailable_reason: null },
       manual_operations: [], observed_targets: [], runtime_scale_control: null,
-      schema_version: 'manyforge.execution_control_state.v7',
+      schema_version: 'manyforge.execution_control_state.v8',
     },
   };
   const stationTarget = { component_id: 'station', command_target_id: 'io' };

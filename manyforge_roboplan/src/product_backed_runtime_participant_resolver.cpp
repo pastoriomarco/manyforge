@@ -277,18 +277,49 @@ void InsertProviderOccurrence(
       physical.value().runtime_unit_epochs, std::move(provider_epochs)};
 }
 
+struct HeldRunSources final {
+  std::shared_ptr<const deployment::ProgramBinding> binding;
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
+};
+
+// OD-234: the held run's Program and Binding as verified at its capture, only
+// when they are exactly this Binding, its Program and this product; otherwise
+// none, and the caller reads and verifies its sources.
+[[nodiscard]] HeldRunSources
+HeldRunSourcesFor(const core::ProgramRunResolutionContext &held_run,
+                  const core::ProgramBindingId &program_binding_id,
+                  const deployment::RetainedBundle &bundle) {
+  const auto *sources = detail::SealedProgramRunSourcesOf(held_run);
+  if (sources == nullptr || !sources->binding || !sources->program) return {};
+  const auto &binding = sources->binding->value();
+  const auto &program = sources->program->value();
+  if (sources->binding->program_binding_id() != program_binding_id ||
+      binding.retained_bundle_id != bundle.retained_bundle_id() ||
+      binding.graph_revision != bundle.value().cell_graph.graph_revision ||
+      program.program_id != binding.program_id ||
+      program.program_revision != binding.program_revision)
+    return {};
+  return {sources->binding, sources->program};
+}
+
 } // namespace
 
 core::Result<core::ProgramTargetBindingDTO>
 ProductBackedRuntimeParticipantResolver::ResolveOperationTarget(
     const core::ProgramBindingId &program_binding_id,
-    const core::ProgramTargetReferenceDTO &target_ref) const {
+    const core::ProgramTargetReferenceDTO &target_ref,
+    const core::ProgramRunResolutionContext &held_run) const {
   try {
-    const auto binding = LoadProgramBinding(program_binding_id);
+    // OD-234: a query of the held run reads the copy verified at its capture.
+    auto held = HeldRunSourcesFor(held_run, program_binding_id, *retained_bundle_);
+    const auto binding =
+        held.binding ? std::move(held.binding) : LoadProgramBinding(program_binding_id);
     if (!binding)
       throw std::invalid_argument("no exact retained Program Binding");
-    const auto program = LoadProgram(binding->value().program_id,
-                                     binding->value().program_revision);
+    const auto program =
+        held.program ? std::move(held.program)
+                     : LoadProgram(binding->value().program_id,
+                                   binding->value().program_revision);
     if (!program ||
         program->value().node_environment != binding->value().node_environment)
       throw std::invalid_argument("no exact canonical Program");
@@ -1051,7 +1082,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
     const core::OperationIntentDTO &operation,
     const std::size_t participant_index,
     const RobotTcpReader &supplied_robot_tcps,
-    std::optional<core::PreviewTcpCapture> *preview_tcp_capture) const {
+    std::optional<core::PreviewTcpCapture> *preview_tcp_capture,
+    const core::ProgramRunResolutionContext &held_run) const {
   if (preview_tcp_capture) preview_tcp_capture->reset();
   const RobotTcpReader robot_tcps =
       supplied_robot_tcps ? supplied_robot_tcps : RobotTcpReader(ReadHostRobotTcps);
@@ -1137,7 +1169,14 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           *precomposed, collision_body_aliases_);
     }
 
-    const auto binding = LoadProgramBinding(operation.program_binding_id);
+    // OD-234: work of the held run uses the copy verified at its capture;
+    // any other operation reads and verifies its sources.
+    auto held = HeldRunSourcesFor(held_run, operation.program_binding_id,
+                                  *retained_bundle_);
+    auto binding = std::move(held.binding);
+    auto program = std::move(held.program);
+    if (binding == nullptr)
+      binding = LoadProgramBinding(operation.program_binding_id);
     if (binding == nullptr ||
         binding->value().program_id != operation.program_id ||
         binding->value().program_revision != operation.program_revision) {
@@ -1147,8 +1186,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           "runtime_program_binding_unavailable",
           core::ErrorCode::kMissingReference);
     }
-    const auto program =
-        LoadProgram(operation.program_id, operation.program_revision);
+    if (program == nullptr)
+      program = LoadProgram(operation.program_id, operation.program_revision);
     if (program == nullptr || program->value().node_environment !=
                                   binding->value().node_environment) {
       return Reject<core::RuntimeParticipantBinding>(
@@ -1268,9 +1307,11 @@ core::Result<RetainedResolvedParticipant>
 ProductBackedRuntimeParticipantResolver::ResolveExecutionParticipant(
     const core::OperationIntentDTO &operation,
     const std::size_t participant_index,
+    const core::ProgramRunResolutionContext &held_run,
     const RobotTcpReader &robot_tcps) const {
   std::optional<core::PreviewTcpCapture> preview_tcp_capture;
-  auto binding = Resolve(operation, participant_index, robot_tcps, &preview_tcp_capture);
+  auto binding = Resolve(operation, participant_index, robot_tcps,
+                         &preview_tcp_capture, held_run);
   if (!binding.ok())
     return core::Result<RetainedResolvedParticipant>::Err(binding.error());
   // B7: the endpoint frame's owner (the motion component or a tool mounted on

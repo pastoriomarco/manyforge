@@ -5,16 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import OrderedDict
 from copy import deepcopy
-import hashlib
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Mapping, NoReturn
-import uuid
 
 from fastapi import HTTPException
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.held_run_authoring import held_run_draft_edit_allowed
-import rfc8785
 
+from .application_identity import format_application_start_id
 from .authoring_identity import canonical_digest
 from .draft_session import DraftSessionError
 from .scenario_artifacts import ScenarioArtifactError
@@ -31,20 +29,36 @@ if TYPE_CHECKING:
 _LOCAL_MUTATION_SESSIONS = frozenset(
     {"program", "deployment", "project", "whole-workspace"}
 )
-_TRANSACTION_DOMAIN = b"manyforge.composer.local-authoring.v1\0"
-_CONTENT_IDENTITY_DOMAIN = b"manyforge.content-identity.v1"
-_OWNER_ROLE_ORDER = (
-    "program_runner",
-    "authoring_owner",
-    "manager",
-    "component_lifecycle_owner",
-    "authored_scene_owner",
-    "manual_operation_owner",
-    "intervention_or_recovery_owner",
-)
 PARTIAL_EFFECT_OBSERVATION_CODES = frozenset(
     {"manager_apply_submission_uncertain", "manager_apply_acceptance_invalid"}
 )
+# Headless client codes for a reply the Composer never received.
+_REPLY_LOST_CODES = frozenset(
+    {"headless_http_timeout", "headless_http_unavailable", "headless_transport_error"}
+)
+
+
+def _answer_lost(error: Exception) -> bool:
+    """Whether a claim request failed without a definite owner answer.
+
+    A lost Composer→Headless reply, or Headless's own lost Kernel answer
+    (``details.outcome_unknown``), leaves the claim's state unknown; any other
+    typed refusal is the owner's definite answer.
+    """
+
+    if not isinstance(error, HeadlessClientError):
+        return True
+    return error.code in _REPLY_LOST_CODES or error.details.get("outcome_unknown") is True
+
+
+def _release_not_exact(error: Exception) -> bool:
+    """The Kernel's definite answer that the exact claim is no longer held."""
+
+    return (
+        isinstance(error, HeadlessClientError)
+        and error.code == "stale_generation"
+        and error.details.get("reason") == "claim_release_not_exact"
+    )
 
 
 class AuthoringOperationError(RuntimeError):
@@ -228,21 +242,18 @@ def headless_client_http_exception(
     return HTTPException(status_code=status_code, detail=detail)
 
 
-def owner_transaction_id(request_owner_epoch: str, request_id: str) -> str:
-    digest = hashlib.sha256(
-        _TRANSACTION_DOMAIN
-        + request_owner_epoch.encode("utf-8")
-        + b"\0"
-        + request_id.encode("utf-8")
-    ).hexdigest()
-    return f"composer-local-authoring.{digest}"
-
-
 @dataclass(frozen=True, slots=True)
 class AuthoringMutationEnvelope:
+    """One browser authoring request: its admission evidence, `A` and key.
+
+    ``application_start_id`` is the browser's `A` (forwarded unchanged to
+    Headless, which alone checks it); ``request_key`` names the browser's
+    request in the submission-outcome readback.
+    """
+
     expected_admission_generation: int
-    request_owner_epoch: str
-    request_id: str
+    application_start_id: int
+    request_key: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,18 +268,24 @@ class _PendingLocalClaim:
     owner_transaction_id: str
     operation_kind: str
     payload_digest: str
+    # The release carries the key of the request that causes it (contract
+    # 1.15.2), so a resent settlement reuses it.
+    settle_request_key: bytes
     claim: dict[str, Any] | None = None
     settlement_kind: str = "proven_no_effect"
     publish_wake: Callable[[], None] | None = None
+    # The Manager request naming this claim as its parent was sent: from then
+    # on the Manager owns the claim, and Composer never releases it.
+    sent: bool = False
 
 
 class AuthoringAdmissionCoordinator:
     """One process-lifetime local claim owner with no disk replay ledger."""
 
-    def __init__(self, client: HeadlessHttpClient) -> None:
+    def __init__(self, client: HeadlessHttpClient, application_start_id: int) -> None:
         self._client = client
-        self.owner_epoch = f"composer-authoring-{uuid.uuid4().hex}"
-        self.receiver_epoch = f"composer-snapshot-{uuid.uuid4().hex}"
+        # Composer's own `A`: the authoring owner is (authoring_owner, A).
+        self.application_start_id = application_start_id
         self._ready = True
         self._blocked_reason: str | None = None
         self._local_claim_lock = threading.Lock()
@@ -283,11 +300,12 @@ class AuthoringAdmissionCoordinator:
         with self._outcome_lock:
             outcome = deepcopy(self._outcomes.get(envelope))
         return {
-            "schema_version": "manyforge.authoring_submission_outcome.v1",
-            "request_owner_epoch": envelope.request_owner_epoch,
-            "request_id": envelope.request_id,
+            "schema_version": "manyforge.authoring_submission_outcome.v2",
+            "application_start_id": format_application_start_id(
+                envelope.application_start_id
+            ),
+            "request_key": envelope.request_key.hex(),
             "expected_admission_generation": envelope.expected_admission_generation,
-            "owner_epoch": self.owner_epoch,
             "outcome": outcome,
         }
 
@@ -320,6 +338,42 @@ class AuthoringAdmissionCoordinator:
         with self._local_claim_lock:
             return self._pending_local_claim is not None
 
+    def manager_submission_sent(self, claim: Mapping[str, Any]) -> None:
+        """Record that the Manager request naming ``claim`` is being sent.
+
+        Called by the submitter immediately before the Manager request leaves
+        Composer. From here on the Manager owns the claim: it releases it when
+        its Apply ends, and New releases it after a failed Apply.
+        """
+
+        with self._local_claim_lock:
+            pending = self._pending_local_claim
+            if pending is not None and pending.claim == dict(claim):
+                pending.sent = True
+
+    def settle_before_preparation(self) -> None:
+        """Settle a claim left by a lost answer before a preparation reads admission.
+
+        An Apply, Load or New prepares its candidate before the coordinator
+        runs, and that preparation waits for open admission; a claim this
+        process may still hold would refuse it. A contained authoring state
+        keeps its claim for diagnosis and is refused by the coordinator.
+        """
+
+        with self._local_mutation_lock:
+            if self._ready:
+                self._settle_pending_local_claim()
+
+    def _forget_sent_claim(self) -> None:
+        """Drop the record of a claim the Manager now owns."""
+
+        with self._local_claim_lock:
+            self._pending_local_claim = None
+
+    def _claim_sent(self) -> bool:
+        with self._local_claim_lock:
+            return self._pending_local_claim is not None and self._pending_local_claim.sent
+
     def _block(self, reason: str) -> None:
         self._ready = False
         self._blocked_reason = reason
@@ -338,6 +392,17 @@ class AuthoringAdmissionCoordinator:
                     "code": "composer_authoring_recovery_blocked",
                     "message": self._blocked_reason or "authoring is contained",
                 },
+            )
+
+    def _require_authoring_allowed(self) -> None:
+        admission = self._client.authoring_admission()
+        if admission.get("authoring_allowed") is not True:
+            raise refused_before_effect(
+                409, {"code": "authoring_not_ready", "message": (
+                    "Authoring is locked by the backend: a run, a manual operation or "
+                    "an unfinished Apply holds it. Nothing changed. A failed Apply is "
+                    "cleared with New; if nothing is in progress and New does not "
+                    "help, restart ManyForge.")}
             )
 
     @staticmethod
@@ -372,130 +437,6 @@ class AuthoringAdmissionCoordinator:
             )
         except Exception:
             return False
-
-    def recover(self) -> None:
-        """Settle this process' claim, then replace an obsolete owner epoch."""
-
-        self._settle_pending_local_claim()
-        self._reconcile_owner_epoch()
-        self._ready = True
-        self._blocked_reason = None
-
-    def _reconcile_owner_epoch(self) -> None:
-        """Rotate only the short-lived authoring owner from an exact inventory."""
-
-        probe_id = "composer-authoring-owner-inventory"
-        probe_digest = canonical_digest(
-            {"owner_epoch": self.owner_epoch, "probe": probe_id}
-        )
-        intent = {
-            "claim_kind": "authoring_mutation",
-            "owner_role": "authoring_owner",
-            "owner_epoch": self.owner_epoch,
-            "owner_transaction_id": probe_id,
-            "request_id": probe_id,
-            "request_payload_digest": probe_digest,
-            "expected_admission_generation": 1,
-            "scope": {"resources": [], "configurations": []},
-            "program_cycle_evidence": None,
-            "intervention_evidence": None,
-        }
-        try:
-            response = self._client.recover_authoring_transaction(
-                {
-                    "intent": intent,
-                    "expected_claim": None,
-                    "expected_release": None,
-                }
-            )
-        except HeadlessClientError as error:
-            self._block(f"authoring owner inventory is unavailable: {error}")
-            raise self._unavailable(error.code, str(error)) from error
-        receipt = response.get("recovery_receipt")
-        if not isinstance(receipt, Mapping):
-            self._block("authoring owner inventory is malformed")
-            raise self._unavailable(
-                "composer_authoring_recovery_invalid",
-                "Headless omitted the authoring owner inventory",
-            )
-        kernel_epoch = receipt.get("kernel_owner_epoch")
-        held_claims = receipt.get("held_claims")
-        owners = receipt.get("current_owner_epochs")
-        if (
-            not isinstance(kernel_epoch, str)
-            or not kernel_epoch
-            or not isinstance(held_claims, list)
-            or not isinstance(owners, list)
-        ):
-            self._block("authoring owner inventory is malformed")
-            raise self._unavailable(
-                "composer_authoring_recovery_invalid",
-                "Headless returned a malformed authoring owner inventory",
-            )
-        current_authoring = [
-            owner
-            for owner in owners
-            if isinstance(owner, Mapping)
-            and owner.get("owner_role") == "authoring_owner"
-        ]
-        if len(current_authoring) == 1 and current_authoring[0].get(
-            "owner_epoch"
-        ) == self.owner_epoch:
-            return
-        if len(current_authoring) > 1:
-            self._block("authoring owner inventory is ambiguous")
-            raise self._unavailable(
-                "composer_authoring_recovery_invalid",
-                "Headless returned more than one authoring owner",
-            )
-        next_owners = [dict(owner) for owner in owners if isinstance(owner, Mapping)]
-        if len(next_owners) != len(owners):
-            self._block("authoring owner inventory is malformed")
-            raise self._unavailable(
-                "composer_authoring_recovery_invalid",
-                "Headless returned a malformed owner row",
-            )
-        if current_authoring:
-            for owner in next_owners:
-                if owner.get("owner_role") == "authoring_owner":
-                    owner["owner_epoch"] = self.owner_epoch
-        else:
-            next_owners.append(
-                {"owner_role": "authoring_owner", "owner_epoch": self.owner_epoch}
-            )
-        order = {role: index for index, role in enumerate(_OWNER_ROLE_ORDER)}
-        try:
-            next_owners.sort(key=lambda owner: order[owner["owner_role"]])
-        except (KeyError, TypeError) as error:
-            self._block("authoring owner inventory names an unknown role")
-            raise self._unavailable(
-                "composer_authoring_recovery_invalid",
-                "Headless returned an unknown admission owner role",
-            ) from error
-        evidence_payload = rfc8785.dumps(
-            {"owner_epoch": self.owner_epoch, "owner_role": "authoring_owner"}
-        )
-        evidence_preimage = b"\0".join(
-            (
-                _CONTENT_IDENTITY_DOMAIN,
-                b"cell-admission-owner-epoch-reconciliation-evidence",
-                b"1.0",
-                evidence_payload,
-            )
-        )
-        evidence_digest = "sha256:" + hashlib.sha256(evidence_preimage).hexdigest()
-        try:
-            self._client.reconcile_authoring_owner(
-                {
-                    "kernel_owner_epoch": kernel_epoch,
-                    "retained_claims": held_claims,
-                    "current_owner_epochs": next_owners,
-                    "reconciliation_evidence_digest": evidence_digest,
-                }
-            )
-        except HeadlessClientError as error:
-            self._block(f"authoring owner reconciliation failed: {error}")
-            raise self._unavailable(error.code, str(error)) from error
 
     def execute_local_mutation(
         self,
@@ -608,8 +549,8 @@ class AuthoringAdmissionCoordinator:
                 validate()
             context = AuthoringOperationContext(
                 operation=operation_kind,
-                request_owner_epoch=envelope.request_owner_epoch,
-                request_id=envelope.request_id,
+                application_start_id=envelope.application_start_id,
+                request_key=envelope.request_key,
             )
             if session == "scenario":
                 # Both Drafts in one whole-workspace commit; each install
@@ -664,7 +605,7 @@ class AuthoringAdmissionCoordinator:
         effects: OperationEffects | None = None,
         workspace: "AuthoringWorkspace | None" = None,
     ) -> Any:
-        """Fence one immutable submission; Manager owns it after acceptance.
+        """Fence one immutable submission; Manager owns its claim once sent.
 
         ``effects`` is the operation's effect record (see
         :meth:`execute_local_mutation`); a committed ``commit_before_submit``
@@ -679,6 +620,7 @@ class AuthoringAdmissionCoordinator:
         with self._local_mutation_lock:
             self._settle_pending_local_claim()
             self._require_mutation_ready()
+            self._require_authoring_allowed()
             payload_digest = canonical_digest(
                 {
                     "operation_kind": operation_kind,
@@ -688,9 +630,8 @@ class AuthoringAdmissionCoordinator:
                 }
             )
             claim = self._acquire_local_claim(
-                transaction_id=owner_transaction_id(
-                    envelope.request_owner_epoch, envelope.request_id
-                ),
+                envelope=envelope,
+                claim_key=envelope.request_key,
                 payload_digest=payload_digest,
                 expected_admission_generation=envelope.expected_admission_generation,
                 operation_kind=operation_kind,
@@ -717,11 +658,19 @@ class AuthoringAdmissionCoordinator:
             try:
                 result = submit(claim)
             except Exception as error:
-                if getattr(error, "code", None) == "manager_apply_rejected":
+                if (
+                    getattr(error, "code", None) == "manager_apply_rejected"
+                    or not self._claim_sent()
+                ):
+                    # A definite refusal, or a failure before the Manager
+                    # request was sent: Composer still owns the claim.
                     self._settle_failed_operation(envelope, operation_kind, effects)
                 else:
+                    # Sent with an uncertain outcome: the Manager owns the
+                    # claim (released when its Apply ends, or by New after a
+                    # failed one), so Composer forgets it and never releases it.
                     effects.submitted()
-                    self._block("Manager submission outcome requires observation")
+                    self._forget_sent_claim()
                 raise
             # An accepted Manager operation adopts this exact claim as its
             # parent admission.  Releasing it here would race the asynchronous
@@ -730,8 +679,8 @@ class AuthoringAdmissionCoordinator:
             if (
                 isinstance(result, Mapping)
                 and result.get("status") == "accepted"
-                and isinstance(result.get("apply_id"), str)
-                and bool(result["apply_id"])
+                and type(result.get("apply_id")) is int
+                and result["apply_id"] > 0
                 and type(result.get("apply_generation")) is int
                 and result["apply_generation"] > 0
             ):
@@ -744,7 +693,13 @@ class AuthoringAdmissionCoordinator:
             ):
                 self._settle_pending_local_claim("owner_commit")
             else:
-                self._block("Manager submission returned an unverified outcome")
+                # Neither accepted nor applied: an unsent claim is released
+                # now; a sent one is the Manager's.
+                if self._claim_sent():
+                    effects.submitted()
+                    self._forget_sent_claim()
+                else:
+                    self._settle_failed_operation(envelope, operation_kind, effects)
                 raise self._unavailable(
                     "manager_apply_acceptance_invalid",
                     "Manager submission outcome cannot be safely classified",
@@ -799,22 +754,14 @@ class AuthoringAdmissionCoordinator:
         )
         self._settle_pending_local_claim()
         self._require_mutation_ready()
-        admission = self._client.authoring_admission()
-        if admission.get("authoring_allowed") is not True:
-            raise refused_before_effect(
-                409, {"code": "authoring_not_ready", "message": (
-                    "Authoring is locked by the backend: a run, a manual operation or "
-                    "an unfinished Apply holds it. Nothing changed. If none is in "
-                    "progress, restart the workbench.")}
-            )
+        self._require_authoring_allowed()
         # The envelope's admission generation is claim evidence only; the
         # Kernel admits the claim on its current facts.
         revision_before = workspace.revision
-        transaction_id = owner_transaction_id(
-            envelope.request_owner_epoch, envelope.request_id
-        )
+        claim_key = envelope.request_key
         self._acquire_local_claim(
-            transaction_id=transaction_id,
+            envelope=envelope,
+            claim_key=claim_key,
             payload_digest=payload_digest,
             expected_admission_generation=envelope.expected_admission_generation,
             operation_kind=operation_kind,
@@ -856,9 +803,9 @@ class AuthoringAdmissionCoordinator:
                 # the commit, so a containment reports the written file.
                 context=AuthoringOperationContext(
                     operation=operation_kind,
-                    request_owner_epoch=envelope.request_owner_epoch,
-                    request_id=envelope.request_id,
-                    owner_transaction_id=transaction_id,
+                    application_start_id=envelope.application_start_id,
+                    request_key=envelope.request_key,
+                    owner_transaction_id=claim_key.hex(),
                     written_path=effects.destination,
                 ),
             )
@@ -930,19 +877,24 @@ class AuthoringAdmissionCoordinator:
     def _acquire_local_claim(
         self,
         *,
-        transaction_id: str,
+        envelope: AuthoringMutationEnvelope,
+        claim_key: bytes,
         payload_digest: str,
         expected_admission_generation: int,
         operation_kind: str,
     ) -> dict[str, Any]:
+        # The claim carries the key of the request it derives from (the
+        # browser's, or Composer's own for a server request; contract 1.15.2);
+        # the browser's `A` is forwarded
+        # unchanged so Headless refuses a request built against another start.
+        transaction_id = claim_key.hex()
         request = {
-            "request_id": transaction_id,
-            "request_owner_epoch": self.owner_epoch,
+            "request_key": transaction_id,
+            "application_start_id": format_application_start_id(
+                envelope.application_start_id
+            ),
             "source_label": "manyforge_composer",
-            "correlation_id": None,
             "expected_admission_generation": expected_admission_generation,
-            "request_payload_digest": payload_digest,
-            "owner_transaction_id": transaction_id,
         }
         with self._local_claim_lock:
             self._pending_local_claim = _PendingLocalClaim(
@@ -950,17 +902,16 @@ class AuthoringAdmissionCoordinator:
                 owner_transaction_id=transaction_id,
                 operation_kind=operation_kind,
                 payload_digest=payload_digest,
+                settle_request_key=claim_key,
             )
         try:
             response = self._client.acquire_authoring_transaction(request)
         except HeadlessClientError as error:
-            if error.code in {
-                "headless_http_timeout", "headless_http_unavailable", "headless_transport_error"
-            }:
-                self._block(f"local authoring acquire is uncertain: {error}")
-            else:
+            if not _answer_lost(error):
                 with self._local_claim_lock:
                     self._pending_local_claim = None
+            # A lost answer keeps the exact request: the next action replays
+            # it and settles what it finds.
             raise self._unavailable(error.code, str(error)) from error
         claim = response.get("claim")
         if not isinstance(claim, dict):
@@ -1013,7 +964,13 @@ class AuthoringAdmissionCoordinator:
                     pending.acquire_request
                 )
             except Exception as error:
-                self._block(f"local authoring acquire is unresolved: {error}")
+                if not _answer_lost(error):
+                    # The Kernel refused the exact replay: this request holds
+                    # no claim (released, expired or never admitted).
+                    with self._local_claim_lock:
+                        self._pending_local_claim = None
+                    return None
+                # Still no answer: this attempt is refused, the record kept.
                 raise self._unavailable(
                     "composer_authoring_claim_uncertain",
                     "the exact local claim remains unresolved",
@@ -1027,17 +984,26 @@ class AuthoringAdmissionCoordinator:
         try:
             response = self._client.settle_authoring_transaction(
                 {
+                    "request_key": pending.settle_request_key.hex(),
+                    "application_start_id": pending.acquire_request[
+                        "application_start_id"
+                    ],
                     "claim": pending.claim,
                     "settlement_kind": pending.settlement_kind,
                     "evidence_digest": self._release_evidence(pending),
                 }
             )
         except Exception as error:
-            self._block(f"local authoring settlement is uncertain: {error}")
-            raise self._unavailable(
-                "composer_authoring_release_uncertain",
-                "the exact local claim remains unsettled",
-            ) from error
+            if not _release_not_exact(error):
+                # No definite answer: this attempt is refused, the record kept
+                # for the next action's release.
+                raise self._unavailable(
+                    "composer_authoring_release_uncertain",
+                    "the exact local claim remains unsettled",
+                ) from error
+            # The Kernel no longer holds the exact claim (an earlier release
+            # whose answer was lost): it is settled.
+            response = None
         with self._local_claim_lock:
             self._pending_local_claim = None
         if pending.publish_wake is not None:

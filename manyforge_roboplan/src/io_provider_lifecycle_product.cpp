@@ -123,6 +123,7 @@ struct IoProviderDriverRecord::Driver final {
     fault_owner.reset();
   }
   std::function<std::optional<core::ErrorDTO>()> process_fault_source;
+  ProcessRestartHook process_restart;
   std::vector<std::unique_ptr<core::StreamRecorder>> observer_streams;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
   std::optional<core::ErrorDTO> last_rebind_error;
@@ -167,7 +168,7 @@ struct IoProviderDriverRecord::Driver final {
   }
 
   // The supervised process's exit, never latched into `fault`: the
-  // restarted process's source replaces it at the next Apply.
+  // restarted process's source replaces it (Prepare, Recover or an Apply).
   std::optional<core::ErrorDTO> ProcessFault() const {
     if (retired || !process_fault_source)
       return std::nullopt;
@@ -958,7 +959,7 @@ core::ComponentState IoProviderDriverRecord::State(const std::int64_t now_ns) co
       result.fault = core::Fault{
           core::FaultCode::kOwnerStalled,
           "ROS transport owner " + stalled->owner + " stalled in " + stalled->task,
-          true, core::FaultOperatorAction::kRecover, std::nullopt, std::nullopt, {}, now_ns};
+          false, core::FaultOperatorAction::kNone, std::nullopt, std::nullopt, {}, now_ns};
       return result;
     }
   }
@@ -987,8 +988,11 @@ core::ComponentState IoProviderDriverRecord::State(const std::int64_t now_ns) co
     state.lifecycle = core::ComponentLifecycle::kNotPrepared;
     return state;
   }
+  // Recover starts an exited process again where the host gave the restart.
   if (const auto exited = state_->ProcessFault())
-    return fault(core::FaultCode::kProcessExited, *exited, core::FaultOperatorAction::kNone);
+    return fault(core::FaultCode::kProcessExited, *exited,
+                 state_->process_restart ? core::FaultOperatorAction::kRecover
+                                         : core::FaultOperatorAction::kNone);
   if (state_->fault)
     return fault(core::FaultCode::kCommunication, *state_->fault,
                  core::FaultOperatorAction::kRecover);
@@ -1125,6 +1129,21 @@ core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction actio
     return refused("driver_not_prepared");
   if ((prepare || enable) && (state_->fault || state_->senders_lost))
     return refused("driver_fault_present");
+  // As an xArm's driver: Prepare and Recover start an exited supervised
+  // process again through the host's driver-restart entry, which waits for
+  // it and installs its exit source here; then the action runs on it.
+  bool restarted = false;
+  if ((prepare || recover) && state_->process_restart && state_->ProcessFault()) {
+    const auto restart = state_->process_restart;
+    lock.unlock();
+    auto started = restart(stop);
+    if (!started.ok())
+      return action_result(Outcome::kFailed, std::move(started.error()));
+    lock.lock();
+    if (state_->retired || !state_->installed)
+      return refused("driver_resources_absent");
+    restarted = true;
+  }
   if (!disable && state_->ProcessFault())
     return refused("driver_process_exited");
   if (!disable && !state_->TransportReady())
@@ -1153,7 +1172,8 @@ core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction actio
     return true;
   };
   lock.unlock();
-  if ((enable || disable || recover) && !inputs.empty() && lifecycle) {
+  // A restarted device's inputs end paused: the runtime is told, as by Recover.
+  if ((enable || disable || recover || restarted) && !inputs.empty() && lifecycle) {
     const auto planned = lifecycle(!enable);
     lock.lock();
     if (!same_inputs() || state_->generation != initial_generation) {
@@ -1296,6 +1316,16 @@ void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
   state_->process_fault_source = std::move(source);
 }
 
+void IoProviderDriverRecord::SetSupervisedProcessRestart(ProcessRestartHook restart) {
+  auto lock = AcquireDelivery();
+  state_->process_restart = std::move(restart);
+}
+
+bool IoProviderDriverRecord::TransportReported() const {
+  auto lock = AcquireDelivery();
+  return state_->TransportReady() && !state_->SendersGone();
+}
+
 bool IoProviderDriverRecord::stream_observer() const noexcept {
   const auto &id = state_->manifest.provider_manifest_id.value();
   return id == kPoseSourceProviderManifestId || id == kAiModelProviderManifestId;
@@ -1318,7 +1348,7 @@ IoProviderDriverRecord::SetInputsStreamLocked(const std::optional<std::int64_t> 
     auto declared = host_component_stream_health()->Declare(
         state_->domain.provider()->provider.controllable_component_id,
         {std::string(kIoDeviceInputsStreamId), *budget_ns, core::StreamSeverityDTO::kFault,
-         core::StreamRecoveryDTO::kAuto, core::StreamTimestampSourceDTO::kArrival});
+         core::StreamTimestampSourceDTO::kArrival});
     if (!declared.ok())
       return Reply::Err(declared.error());
     state_->inputs_stream = std::move(declared.value());

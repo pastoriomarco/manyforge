@@ -4,7 +4,7 @@
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
-#include <manyforge_core/stop_terminal_reducer.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -76,6 +76,16 @@ V number(std::uint64_t n, bool positive = true) {
   require(n <= kSafe && (!positive || n), "unsafe evidence number");
   return V(static_cast<double>(n));
 }
+OperationParticipantId participant_from(const V& v) {
+  const auto parsed = ParseOperationParticipantId(v);
+  require(parsed.has_value(), "invalid evidence participant");
+  return *parsed;
+}
+ControllerGoalId goal_from(const V& v) {
+  const auto parsed = ParseControllerGoalId(v);
+  require(parsed.has_value(), "invalid evidence controller goal");
+  return *parsed;
+}
 TimePoint stamp(const V& v) {
   const auto n = counter(v, false);
   require(n <= static_cast<std::uint64_t>(INT64_MAX), "evidence time overflow");
@@ -124,15 +134,13 @@ std::optional<ErrorDTO> error(const V& e) {
   return optional<ErrorDTO>(e, error_from);
 }
 V cursor_value(const IoSourceCursorDTO& c) {
-  return V(V::Object{{"owner_epoch", idv(c.owner_epoch)},
-                     {"catalog_generation", count(c.catalog_generation, false)},
+  return V(V::Object{{"catalog_generation", count(c.catalog_generation, false)},
                      {"source_id", idv(c.source_id)},
                      {"record_sequence", count(c.record_sequence, false)}});
 }
 IoSourceCursorDTO cursor_from(const V& v) {
-  shape(v, {"owner_epoch", "catalog_generation", "source_id", "record_sequence"});
-  return {id<RequestOwnerEpoch>(get(v, "owner_epoch")),
-          counter(get(v, "catalog_generation"), false), id<InterruptSourceId>(get(v, "source_id")),
+  shape(v, {"catalog_generation", "source_id", "record_sequence"});
+  return {counter(get(v, "catalog_generation"), false), id<InterruptSourceId>(get(v, "source_id")),
           counter(get(v, "record_sequence"), false)};
 }
 V registration_value(const IoRuleRegistrationDTO& r) {
@@ -140,8 +148,7 @@ V registration_value(const IoRuleRegistrationDTO& r) {
   if (!s) {
     const auto& activation = std::get<IoActivationRuleScopeDTO>(r.scope);
     return V(
-        V::Object{{"owner_epoch", idv(r.owner_epoch)},
-                  {"catalog_generation", count(r.catalog_generation, false)},
+        V::Object{{"catalog_generation", count(r.catalog_generation, false)},
                   {"registration_id", count(r.registration_id)},
                   {"policy_id", idv(r.policy_id)},
                   {"scope", V(V::Object{{"kind", V("activation")},
@@ -149,49 +156,45 @@ V registration_value(const IoRuleRegistrationDTO& r) {
                                         {"graph_revision", idv(activation.graph_revision)}})}});
   }
   return V(V::Object{
-      {"owner_epoch", idv(r.owner_epoch)},
       {"catalog_generation", count(r.catalog_generation, false)},
       {"registration_id", count(r.registration_id)},
       {"policy_id", idv(r.policy_id)},
       {"scope",
        V(V::Object{{"kind", V("operation")},
-                   {"operation_id", idv(s->operation_id)},
+                   {"operation_id", number(s->operation_id.value())},
                    {"operation_revision", number(s->operation_revision.value())},
-                   {"participant_id", idv(s->participant_id)},
+                   {"participant_id", OperationParticipantIdValue(s->participant_id)},
                    {"controllable_component_id", idv(s->controllable_component_id)},
                    {"command_target_id", idv(s->command_target_id)},
-                   {"controller_goal_id", idv(s->controller_goal_id)},
-                   {"controller_goal_generation", number(s->controller_goal_generation.value())},
+                   {"controller_goal_id", ControllerGoalIdValue(s->controller_goal_id)},
                    {"preparation_id", count(s->preparation_id)},
                    {"prepared_contract_digest", idv(s->prepared_contract_digest)},
                    {"motion_interrupt_scope_id", idv(s->motion_interrupt_scope_id)}})}});
 }
 IoRuleRegistrationDTO registration_from(const V& v) {
-  shape(v, {"owner_epoch", "catalog_generation", "registration_id", "policy_id", "scope"});
+  shape(v, {"catalog_generation", "registration_id", "policy_id", "scope"});
   const auto& s = get(v, "scope");
   if (text(get(s, "kind")) == "activation") {
     shape(s, {"kind", "retained_bundle_id", "graph_revision"});
-    return {id<RequestOwnerEpoch>(get(v, "owner_epoch")),
-            counter(get(v, "catalog_generation"), false), counter(get(v, "registration_id")),
+    return {counter(get(v, "catalog_generation"), false), counter(get(v, "registration_id")),
             id<InterruptPolicyId>(get(v, "policy_id")),
             IoActivationRuleScopeDTO{id<RetainedBundleId>(get(s, "retained_bundle_id")),
                                      id<GraphRevision>(get(s, "graph_revision"))}};
   }
   shape(s, {"kind", "operation_id", "operation_revision", "participant_id",
             "controllable_component_id", "command_target_id", "controller_goal_id",
-            "controller_goal_generation", "preparation_id", "prepared_contract_digest",
+            "preparation_id", "prepared_contract_digest",
             "motion_interrupt_scope_id"});
   require(text(get(s, "kind")) == "operation", "activation scope is not an operation result");
   return {
-      id<RequestOwnerEpoch>(get(v, "owner_epoch")), counter(get(v, "catalog_generation"), false),
+      counter(get(v, "catalog_generation"), false),
       counter(get(v, "registration_id")), id<InterruptPolicyId>(get(v, "policy_id")),
-      IoOperationRuleScopeDTO{id<OperationId>(get(s, "operation_id")),
+      IoOperationRuleScopeDTO{OperationNumber(safe(get(s, "operation_id"))),
                               OperationRevision(safe(get(s, "operation_revision"))),
-                              id<OperationParticipantId>(get(s, "participant_id")),
+                              participant_from(get(s, "participant_id")),
                               id<ControllableComponentId>(get(s, "controllable_component_id")),
                               id<CommandTargetId>(get(s, "command_target_id")),
-                              id<ControllerGoalId>(get(s, "controller_goal_id")),
-                              ControllerGoalGeneration(safe(get(s, "controller_goal_generation"))),
+                              goal_from(get(s, "controller_goal_id")),
                               counter(get(s, "preparation_id")),
                               id<ContentDigest>(get(s, "prepared_contract_digest")),
                               id<MotionInterruptScopeId>(get(s, "motion_interrupt_scope_id"))}};
@@ -238,27 +241,23 @@ IoSignalSampleDTO sample_from(const V& v) {
 V bb_scope_value(const IoProgramBlackboardScopeDTO& s) {
   require(s.claim_generation.has_value() == s.program_run_id.has_value(), "partial BB Run scope");
   return V(V::Object{
-      {"owner_epoch", idv(s.request_owner_epoch)},
-      {"program_runner_owner_epoch", idv(s.program_runner_owner_epoch)},
       {"program_binding_id", idv(s.program_binding_id)},
       {"active_publication_generation", number(s.active_publication_generation.value())},
       {"cycle_generation", number(s.cycle_generation)},
       {"claim_generation", opt(s.claim_generation, [](auto x) { return number(x.value()); })},
-      {"program_run_id", opt(s.program_run_id, [](const auto& x) { return idv(x); })}});
+      {"program_run_id", opt(s.program_run_id, [](auto x) { return number(x.value()); })}});
 }
 IoProgramBlackboardScopeDTO bb_scope_from(const V& v) {
-  shape(v, {"owner_epoch", "program_runner_owner_epoch", "program_binding_id",
+  shape(v, {"program_binding_id",
             "active_publication_generation", "cycle_generation", "claim_generation",
             "program_run_id"});
   IoProgramBlackboardScopeDTO s{
-      id<RequestOwnerEpoch>(get(v, "owner_epoch")),
-      id<RequestOwnerEpoch>(get(v, "program_runner_owner_epoch")),
       safe(get(v, "cycle_generation")),
       optional<CellAdmissionClaimGeneration>(
           get(v, "claim_generation"),
           [](const V& x) { return CellAdmissionClaimGeneration(safe(x)); }),
-      optional<ProgramRunId>(get(v, "program_run_id"),
-                             [](const V& x) { return id<ProgramRunId>(x); }),
+      optional<ProgramRunNumber>(get(v, "program_run_id"),
+                             [](const V& x) { return ProgramRunNumber(safe(x)); }),
       id<ProgramBindingId>(get(v, "program_binding_id")),
       ActiveBundlePublicationGeneration(safe(get(v, "active_publication_generation")))};
   (void)bb_scope_value(s);
@@ -470,7 +469,7 @@ const char* failure_name(IoRuleSourceFailureKind k) {
   bad("unknown source failure kind");
 }
 void cursor_registration(const IoSourceCursorDTO& c, const IoRuleRegistrationDTO& r) {
-  require(c.owner_epoch == r.owner_epoch && c.catalog_generation == r.catalog_generation,
+  require(c.catalog_generation == r.catalog_generation,
           "cursor registration mismatch");
 }
 V trip_value(const IoRuleTripEvidenceDTO& t) {
@@ -519,8 +518,7 @@ V trip_value(const IoRuleTripEvidenceDTO& t) {
               {"evaluated_at_ns", time(t.evaluated_at_ns)}};
   if (t.blackboard) {
     const auto& b = *t.blackboard;
-    require(b.scope.request_owner_epoch == t.registration.owner_epoch &&
-                sources.contains(b.source_id) && b.trusted_received_at_ns <= t.evaluated_at_ns,
+    require(sources.contains(b.source_id) && b.trusted_received_at_ns <= t.evaluated_at_ns,
             "BB trip provenance mismatch");
     if (t.triggering_acquisition && t.triggering_acquisition->source_id == b.source_id)
       require(t.triggering_acquisition->incarnation == b.incarnation &&
@@ -576,8 +574,7 @@ V loss_value(const IoRuleSourceLossEvidenceDTO& l) {
               {"evaluated_at_ns", time(l.evaluated_at_ns)}};
   if (l.blackboard) {
     const auto& b = *l.blackboard;
-    require(b.scope.request_owner_epoch == l.registration.owner_epoch &&
-                b.source_id == l.source_id && b.incarnation == l.incarnation,
+    require(b.source_id == l.source_id && b.incarnation == l.incarnation,
             "BB loss provenance mismatch");
     if (l.source_loss)
       require(b.last_accepted_message_sequence == l.source_loss->last_accepted_source_sequence,
@@ -622,18 +619,10 @@ const char* arbitration(IoRuleArbitrationDispositionDTO v) {
   }
   bad("unknown arbitration disposition");
 }
-const char* stop_result(StopCertificateResultDTO v) {
-  switch (v) {
-    case StopCertificateResultDTO::kSucceededNominal:
-      return "succeeded_nominal";
-    case StopCertificateResultDTO::kSucceededEscalated:
-      return "succeeded_escalated";
-    case StopCertificateResultDTO::kPartial:
-      return "partial";
-    case StopCertificateResultDTO::kFailedUncontained:
-      return "failed_uncontained";
-  }
-  bad("unknown Stop result");
+std::string stop_result(StopEventResult v) {
+  const auto token = to_string(v);
+  if (token.empty()) bad("unknown Stop result");
+  return std::string(token);
 }
 const char* cause(MotionExecutionTerminalCause v) {
   switch (v) {
@@ -654,11 +643,9 @@ const char* cause(MotionExecutionTerminalCause v) {
 V outcome_value(const IoMotionRuleOutcomeDTO& o) {
   require(std::holds_alternative<IoOperationRuleScopeDTO>(o.registration.scope),
           "activation scope is not an operation result");
-  require(o.stop_id.has_value() == o.stop_generation.has_value(), "partial Stop identity");
-  require(o.stop_certificate_id.has_value() == o.stop_certificate_revision.has_value() &&
-              o.stop_certificate_id.has_value() == o.stop_result.has_value() &&
-              (!o.stop_result || o.stop_id),
-          "partial certificate identity");
+  require((!o.stop_event_id || o.stop_event_id->nonzero()) &&
+              (!o.stop_result || o.stop_event_id),
+          "partial Stop event identity");
   require(o.evidence.state == IoRuleRegistrationState::kArmed ||
               o.evidence.state == IoRuleRegistrationState::kRetired,
           "invalid registration state");
@@ -679,11 +666,7 @@ V outcome_value(const IoMotionRuleOutcomeDTO& o) {
   V::Object row{
       {"registration", registration_value(o.registration)},
       {"evidence", std::move(evidence)},
-      {"stop_id", opt(o.stop_id, [](const auto& x) { return idv(x); })},
-      {"stop_generation", opt(o.stop_generation, [](auto x) { return number(x.value()); })},
-      {"stop_certificate_id", opt(o.stop_certificate_id, [](const auto& x) { return idv(x); })},
-      {"stop_certificate_revision",
-       opt(o.stop_certificate_revision, [](auto x) { return number(x.value()); })},
+      {"stop_event_id", opt(o.stop_event_id, [](auto x) { return number(x.value()); })},
       {"stop_result", opt(o.stop_result, [](auto x) { return V(stop_result(x)); })},
       {"terminal_cause", opt(o.terminal_cause, [](auto x) { return V(cause(x)); })},
       {"error", error(o.error)}};
@@ -693,8 +676,7 @@ V outcome_value(const IoMotionRuleOutcomeDTO& o) {
 }
 IoMotionRuleOutcomeDTO outcome_from(const V& v) {
   shape(v,
-        {"registration", "evidence", "stop_id", "stop_generation", "stop_certificate_id",
-         "stop_certificate_revision", "stop_result", "terminal_cause", "error"},
+        {"registration", "evidence", "stop_event_id", "stop_result", "terminal_cause", "error"},
         {"arbitration_disposition"});
   const auto& e = get(v, "evidence");
   shape(e, {"state", "trip", "source_losses", "evaluation_error"});
@@ -708,20 +690,13 @@ IoMotionRuleOutcomeDTO outcome_from(const V& v) {
        error(get(e, "evaluation_error"))}};
   for (const auto& l : array(get(e, "source_losses")))
     o.evidence.source_losses.push_back(loss_from(l));
-  o.stop_id = optional<StopId>(get(v, "stop_id"), [](const V& x) { return id<StopId>(x); });
-  o.stop_generation = optional<StopGeneration>(get(v, "stop_generation"),
-                                               [](const V& x) { return StopGeneration(safe(x)); });
-  o.stop_certificate_id = optional<StopCertificateId>(
-      get(v, "stop_certificate_id"), [](const V& x) { return id<StopCertificateId>(x); });
-  o.stop_certificate_revision = optional<StopCertificateRevision>(
-      get(v, "stop_certificate_revision"),
-      [](const V& x) { return StopCertificateRevision(safe(x)); });
+  o.stop_event_id = optional<StopEventId>(get(v, "stop_event_id"),
+                                          [](const V& x) { return StopEventId(safe(x)); });
   if (!get(v, "stop_result").is_null()) {
     bool found = false;
-    for (auto x :
-         {StopCertificateResultDTO::kSucceededNominal,
-          StopCertificateResultDTO::kSucceededEscalated, StopCertificateResultDTO::kPartial,
-          StopCertificateResultDTO::kFailedUncontained})
+    for (auto x : {StopEventResult::kPending, StopEventResult::kNoEffect,
+                   StopEventResult::kStopped, StopEventResult::kStoppedEscalated,
+                   StopEventResult::kSomeFailed})
       if (text(get(v, "stop_result")) == stop_result(x)) {
         o.stop_result = x;
         found = true;
@@ -765,10 +740,9 @@ Result<std::string> EncodeIoRuleOutcomes(std::span<const IoMotionRuleOutcomeDTO>
   try {
     require(!outcomes.empty(), "empty rule extension");
     V::Array rows;
-    std::set<std::tuple<RequestOwnerEpoch, std::uint64_t, std::uint64_t>> ids;
+    std::set<std::tuple<std::uint64_t, std::uint64_t>> ids;
     for (const auto& o : outcomes) {
-      require(ids.emplace(o.registration.owner_epoch, o.registration.catalog_generation,
-                          o.registration.registration_id)
+      require(ids.emplace(o.registration.catalog_generation, o.registration.registration_id)
                   .second,
               "duplicate rule registration");
       rows.push_back(outcome_value(o));
@@ -792,10 +766,10 @@ Result<std::vector<IoMotionRuleOutcomeDTO>> DecodeIoRuleOutcomes(std::string_vie
   }
 }
 Result<void> ValidateIoRuleOutcomeParticipant(
-    const OperationId& operation, OperationRevision revision,
+    const OperationNumber& operation, OperationRevision revision,
     const OperationParticipantId& participant, const ControllableComponentId& component,
     const CommandTargetId& target, const ControllerGoalId& goal,
-    ControllerGoalGeneration goal_generation, std::span<const IoMotionRuleOutcomeDTO> outcomes) {
+    std::span<const IoMotionRuleOutcomeDTO> outcomes) {
   try {
     for (const auto& o : outcomes) {
       const auto* s = std::get_if<IoOperationRuleScopeDTO>(&o.registration.scope);
@@ -806,8 +780,7 @@ Result<void> ValidateIoRuleOutcomeParticipant(
                   s->participant_id == participant &&
                   s->controllable_component_id == component &&
                   s->command_target_id == target &&
-                  s->controller_goal_id == goal &&
-                  s->controller_goal_generation == goal_generation,
+                  s->controller_goal_id == goal,
               "rule registration does not match containing operation participant");
     }
     return Result<void>::Ok();
@@ -815,11 +788,11 @@ Result<void> ValidateIoRuleOutcomeParticipant(
     return Result<void>::Err(failure(e));
   }
 }
-Result<void> ValidateIoRuleOutcomeParticipant(const OperationId& operation,
+Result<void> ValidateIoRuleOutcomeParticipant(const OperationNumber& operation,
                                               OperationRevision revision,
                                               const OperationParticipantStateDTO& p) {
   return ValidateIoRuleOutcomeParticipant(
       operation, revision, p.participant_id, p.controllable_component_id, p.command_target_id,
-      p.command_id, p.command_generation, p.io_rule_outcomes);
+      p.command_id, p.io_rule_outcomes);
 }
 }  // namespace manyforge::core

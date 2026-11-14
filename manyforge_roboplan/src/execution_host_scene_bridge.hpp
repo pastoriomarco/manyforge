@@ -11,7 +11,6 @@
 namespace manyforge::roboplan_backend::host_detail {
 
 struct ManagerSceneRead final {
-  core::RequestOwnerEpoch request_owner_epoch;
   core::ProjectionRevisionDTO projection_revision;
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene;
 };
@@ -32,9 +31,6 @@ public:
   PreviewResolvedSceneCandidate(
       const core::ResolvedSceneCandidatePreviewRequestDTO &request,
       const core::CollisionWorldLeaseInventory &predecessor) const override;
-
-  [[nodiscard]] core::RequestOwnerEpoch
-  CurrentRequestOwnerEpoch() const override;
 
   [[nodiscard]] core::ProjectionRevisionDTO
   CurrentProjectionRevision() const override;

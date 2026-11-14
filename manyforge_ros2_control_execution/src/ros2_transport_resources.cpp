@@ -114,10 +114,11 @@ Ros2TransportResources::Ros2TransportResources(
   options.context(context_).use_clock_thread(false);
   node_ = std::make_shared<rclcpp::Node>(std::move(node_name),
                                          std::move(node_namespace), options);
-  owner_stall_snapshot_ = std::make_shared<OwnerStallSnapshot>();
-  owner_stall_snapshot_->owner = node_->get_fully_qualified_name();
-  // Storing the first fault must not allocate while a caller is reporting it.
-  owner_stall_snapshot_->task.reserve(255);
+  owner_name_ = node_->get_fully_qualified_name();
+  // Storing a stall must not allocate while a caller is reporting it.
+  next_owner_stall_ = std::make_shared<OwnerStallSnapshot>();
+  next_owner_stall_->owner = owner_name_;
+  next_owner_stall_->task.reserve(255);
   rclcpp::ExecutorOptions executor_options;
   executor_options.context = context_;
   // The thread-count argument remains for source compatibility with callers.
@@ -573,23 +574,45 @@ bool Ros2TransportResources::on_owner_thread() {
 
 std::shared_ptr<const Ros2TransportResources::OwnerStallSnapshot>
 Ros2TransportResources::owner_stall() const noexcept {
-  if (!owner_stall_published_.load(std::memory_order_acquire))
-    return {};
-  return owner_stall_snapshot_;
+  return owner_stall_.load(std::memory_order_acquire);
 }
 
-bool Ros2TransportResources::record_owner_stall_locked() {
-  if (owner_stall_published_.load(std::memory_order_relaxed))
-    return false;
+// Returns the stall when this call raised it, null when one is already current.
+std::shared_ptr<const Ros2TransportResources::OwnerStallSnapshot>
+Ros2TransportResources::record_owner_stall_locked(
+    const std::chrono::steady_clock::time_point wait_began) {
+  ++owner_stall_waiters_;
+  if (owner_stall_.load(std::memory_order_relaxed))
+    return {};
   const char *name = active_task_ ? active_task_->site.function_name()
                                   : owner_notification_active_ ? "owner_notification"
                                                                : "unknown";
   if (*name == '\0')
     name = "unknown_task";
   const auto bounded_name = std::string_view(name).substr(0, 255);
-  owner_stall_snapshot_->task.assign(bounded_name.data(), bounded_name.size());
-  owner_stall_published_.store(true, std::memory_order_release);
-  return true;
+  next_owner_stall_->task.assign(bounded_name.data(), bounded_name.size());
+  owner_stall_began_ = wait_began;
+  std::shared_ptr<const OwnerStallSnapshot> raised = std::move(next_owner_stall_);
+  owner_stall_.store(raised, std::memory_order_release);
+  return raised;
+}
+
+// A caller whose wait exceeded the bound no longer waits on the owner. The
+// stall ends with the last such caller, when the owner has moved on (this
+// caller's task ran, or the owner exited); a caller that withdrew while the
+// owner was closing leaves it standing. Returns the stall when it ended here.
+std::shared_ptr<const Ros2TransportResources::OwnerStallSnapshot>
+Ros2TransportResources::end_owner_stall_locked(const bool owner_moved_on,
+                                               std::chrono::steady_clock::duration &lasted) {
+  if (--owner_stall_waiters_ != 0 || !owner_moved_on)
+    return {};
+  // Non-null: a waiter is counted only once a stall is current.
+  auto ended = owner_stall_.exchange(nullptr, std::memory_order_acq_rel);
+  lasted = std::chrono::steady_clock::now() - owner_stall_began_;
+  next_owner_stall_ = std::make_shared<OwnerStallSnapshot>();
+  next_owner_stall_->owner = owner_name_;
+  next_owner_stall_->task.reserve(255);
+  return ended;
 }
 
 void Ros2TransportResources::invoke(std::function<void()> work,
@@ -651,17 +674,17 @@ void Ros2TransportResources::invoke_impl(std::function<void()> work,
   bool observed_stall = false;
   const auto wait_for_owner = [&](auto predicate) {
     if (!observed_stall && !dispatch_cv_.wait_until(lock, deadline, predicate)) {
-      const bool first = record_owner_stall_locked();
+      const auto raised = record_owner_stall_locked(deadline - owner_wait_bound_);
       observed_stall = true;
-      if (first) {
+      if (raised) {
         // Neither diagnostics nor readers hold the dispatch lock while the
         // owner continues its ordinary execution.
         lock.unlock();
         (void)std::fprintf(stderr,
                            "manyforge_fault code=component_owner_stalled "
                            "owner=%s task=%s bound_ms=%lld state=waiting_for_operator\n",
-                           owner_stall_snapshot_->owner.c_str(),
-                           owner_stall_snapshot_->task.c_str(),
+                           raised->owner.c_str(),
+                           raised->task.c_str(),
                            static_cast<long long>(std::chrono::duration_cast<
                                std::chrono::milliseconds>(owner_wait_bound_).count()));
         lock.lock();
@@ -670,11 +693,31 @@ void Ros2TransportResources::invoke_impl(std::function<void()> work,
     if (observed_stall)
       dispatch_cv_.wait(lock, predicate);
   };
+  // Called with the lock held once this caller no longer waits on the owner.
+  std::chrono::steady_clock::duration stall_lasted{};
+  const auto end_observed_stall_locked = [&](const bool owner_moved_on) {
+    return observed_stall ? end_owner_stall_locked(owner_moved_on, stall_lasted)
+                          : std::shared_ptr<const OwnerStallSnapshot>{};
+  };
+  // Printed with no lock held, once per stall, by the caller that ended it.
+  const auto print_stall_end = [&](const std::shared_ptr<const OwnerStallSnapshot> &ended) {
+    if (!ended)
+      return;
+    (void)std::fprintf(stderr,
+                       "manyforge_fault code=component_owner_stalled "
+                       "owner=%s task=%s lasted_ms=%lld state=ended\n",
+                       ended->owner.c_str(), ended->task.c_str(),
+                       static_cast<long long>(std::chrono::duration_cast<
+                           std::chrono::milliseconds>(stall_lasted).count()));
+  };
   wait_for_owner([this] { return !dispatch_starting_; });
   if (!started() && !dispatch_stopping_) {
+    // Start has finished without a spinning owner: nothing is left to wait on.
+    const auto ended = end_observed_stall_locked(true);
     prestart_inline_threads_.insert(thread_id);
     ++foreign_invocations_;
     lock.unlock();
+    print_stall_end(ended);
     try { task.work(); } catch (...) { task.error = std::current_exception(); }
     lock.lock();
     prestart_inline_threads_.erase(thread_id);
@@ -716,9 +759,13 @@ void Ros2TransportResources::invoke_impl(std::function<void()> work,
   }
   const bool ran = task.ran;
   const bool notifier_failed = notifier_fault_.has_value();
+  // The owner moved on when it ran this task or exited; a creation withdrawn
+  // while the owner closes did not see it move on.
+  const auto ended = end_observed_stall_locked(ran || owner_exited_);
   // A fault or teardown can release a selected slot only after spin exits.
   // The caller then uses the same locked adapter path as before start.
   lock.unlock();
+  print_stall_end(ended);
   if (!ran) {
     try {
       if (creation && (notifier_failed ||

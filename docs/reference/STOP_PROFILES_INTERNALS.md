@@ -27,10 +27,18 @@ ManyForge uses one addressed owner and prepared participant-local realization:
 1. Kernel Prepare maps the typed source-joint profile into one immutable
    participant Stop invocation plan before physical dispatch
    (`manyforge_core/src/stop_profile_mapper.cpp`).
-1. Public Stop/Full Stop is resolved and captured by
-   `ResourceAddressedExecutionKernel`; the emergency reserve and resource-slot
-   fence commit recognition without waiting for storage or backend I/O.
-1. A fixed `BoundedStopControlExecutor` progresses the transaction. Independent
+1. Every Stop (Stop, Stop all, Halt, the Program's Cell Stop and every
+   Kernel-internal Stop) enters one function,
+   `ResourceAddressedExecutionKernel::request_stop_locked`
+   (`manyforge_core/src/resource_addressed_kernel_stop.cpp`). Under the Kernel
+   lock it recognises a repeated request key in a fixed ring of Stop event
+   records, widens an invalid request (an invalid Stop becomes Stop all, an
+   invalid Halt stays a Halt), raises the claimed Program run's hold, fences
+   the affected resource slots and starts each covered participant's Stop. It
+   never refuses and never waits for storage or backend I/O; the journal rows
+   (`stop_event_accepted`, `stop_event_completed`) are written afterwards.
+1. A fixed `BoundedStopControlExecutor` progresses each participant's Stop
+   on its Stop lane. Independent
    `BoundedStopStageAttemptExecutor` lanes invoke the exact
    `IControlDomainExecutionPort::TranslateStopStage` contract with the remaining
    phase budget, so one bounded provider lane cannot block another participant
@@ -39,9 +47,11 @@ ManyForge uses one addressed owner and prepared participant-local realization:
    (`manyforge_core/src/participant_stop_stage_helper.cpp`) runs the stage:
    it plans the Stop trajectory from the trip state, sends it to JTC as a
    replacement goal and waits for the controller's result (section 6).
-1. The pure terminal reducer (`ReduceStopTerminal`) consumes immutable
-   stage/evidence history and emits one Stop certificate. Journal projection
-   occurs after containment and cannot rewrite that certificate.
+1. Each participant ends `stopped` or `failed`, with its containing stage and
+   whether the Stop escalated. The event completes when every participant it
+   covers has ended; its result is `stopped`, `stopped_escalated`,
+   `some_failed` or `no_effect`. `read_stop(event_id)` reads it while it is
+   resident in the ring.
 
 The stop math is in `manyforge_core/src/soft_on_path_stop_planner.cpp` and
 `manyforge_core/include/manyforge_core/motion_interrupt/stop_replacement.hpp`.
@@ -132,7 +142,7 @@ Profile shape is validated at retained policy decode
 compile (`manyforge_deployment/src/activation_deployment_compiler_internal.cpp`)
 and at Prepare-time mapping (`manyforge_core/src/stop_profile_mapper.cpp`).
 
-Clients may display retained profile and certificate facts, but they cannot
+Clients may display retained profile and Stop event facts, but they cannot
 edit a prepared participant or select a fallback while a Stop is in flight.
 
 ## 4. Operator And Fault Call Chains
@@ -141,17 +151,32 @@ Public addressed Stop:
 
 ```text
 Headless / Program / Robot Control client
-  -> POST /api/execution/stops or /api/execution/full-stop
-  -> ResourceAddressedExecutionKernel::stop()/full_stop()
-  -> StopScopeResolver + EmergencyStopAcceptanceReserve
+  -> POST /api/execution/stops, /api/execution/stop-all or /api/execution/halt
+  -> ResourceAddressedExecutionKernel::stop()/stop_all()/halt()
+  -> request_stop_locked() (event ring, hold, cover and start)
   -> ResourceSlotTable::stop_fence_batch()
-  -> BoundedStopControlExecutor
+  -> BoundedStopControlExecutor (Stop lane)
   -> BoundedStopStageAttemptExecutor
   -> IControlDomainExecutionPort::TranslateStopStage()
   -> ParticipantStopStageHelper (robot) / gripper command backend (tool)
-  -> ReduceStopTerminal()
-  -> terminal/checkpoint journal projection
+  -> participant stopped/failed; event complete
+  -> stop_event_accepted / stop_event_completed journal rows
 ```
+
+The Program panel's group Stop reaches the same core through
+`POST /api/program/runs/{program_run_id}/motion-stop`, and the Program's Cell
+Stop node through the internal `cell_stop` command. The three levels differ
+only in what they hold:
+
+| Level | Stops | Program run | Manual moves afterwards |
+| --- | --- | --- | --- |
+| Stop (groups) | the selected groups' Program operations | the selected groups held; tree keeps running | a manual move in progress keeps moving |
+| Stop all | every operation in the cell, manual ones included | every group held; tree keeps running | allowed |
+| Halt | as Stop all | every group held and the run frozen until Execute (`release_halt`) or Reset | blocked while the run is frozen (`manual_handover_program_halted`) |
+| Cell Stop (Program node) | as Stop all | not held | allowed |
+
+Execute after Halt lowers the freeze only; the group holds stay until Resume.
+With no Program run, Stop all and Halt stop every operation and hold nothing.
 
 Runtime collision and global interrupt rules with `on_trip: stop`:
 
@@ -160,7 +185,7 @@ collision observation or rule trip
   -> addressed Kernel event sink
   -> deterministic internal operation-scoped Stop
   -> declared coordination-policy expansion
-  -> same sole Stop transaction path above
+  -> the same request_stop_locked() path above
 ```
 
 The important behavioral invariant is that product Stop has one authority.
@@ -171,8 +196,14 @@ identity from fresh state; it never resumes stale controller trajectory state.
 
 ## 4.1 Stops And The Cell Latch
 
-A Stop never latches the cell by itself, and nothing acknowledges its
-settlement. After a Stop, the cell latch (`get_cell_latch`) is
+A Stop that completes never latches the cell by itself, and nothing
+acknowledges its settlement. A participant whose Stop ends `failed` raises a
+Halt (Stop kind `stop_failed_halt`, operator attribution, once per failure;
+a failure inside that Halt raises none), and marks its component
+stop-unconfirmed: the component shows `activity: unknown` with reason
+`stop_unconfirmed` until a state of it arriving after the failure reports
+idle (`manyforge_core/src/resource_addressed_kernel_cell_latch.cpp`); Reset
+and Recover do not clear it. After a Stop, the cell latch (`get_cell_latch`) is
 derived from component states: it holds while any component in the cell is
 in `fault` or `offline`, or reports `activity: unknown` (for a robot: a goal
 whose result cannot come back or is overdue,

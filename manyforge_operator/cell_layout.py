@@ -1,4 +1,18 @@
-"""Pinned one-cell storage layout created only by the operator launcher."""
+"""Pinned one-cell storage layout created only by the operator launcher.
+
+Version 2 (build spec 2026-11-12, 4.2) splits saved data from running state:
+
+- ``data/``: saved user data (persistent Program values, Composer settings,
+  the Program workspace); kept across starts.
+- ``history/``: the History database; kept (capped by its own store).
+- ``operator/``: the launcher's own record and instance lock.
+- ``current/``: every running-state store and socket of one start. The
+  launcher moves it to ``previous-runs/<id>`` before any process starts
+  (``run_session``) and creates it fresh and empty; it is therefore not pinned.
+
+A version 1 root (``state/`` and ``run/`` pinned by inode) is refused with
+guidance; nothing is converted.
+"""
 
 from __future__ import annotations
 
@@ -10,29 +24,19 @@ import stat
 from typing import Any, Final
 
 
-CELL_LAYOUT_SCHEMA: Final = "manyforge.cell_instance_layout.v1"
+CELL_LAYOUT_SCHEMA: Final = "manyforge.cell_instance_layout.v2"
+_CELL_LAYOUT_SCHEMA_V1: Final = "manyforge.cell_instance_layout.v1"
 CELL_LAYOUT_MARKER: Final = ".manyforge-cell-layout.json"
 CELL_LAYOUT_INITIALIZER: Final = ".manyforge-cell-layout.initializing"
 CELL_LAYOUT_MARKER_MAX_BYTES: Final = 64 * 1024
-SEMANTIC_OWNERS: Final = (
-    "alarm-history",
-    "composer-authoring",
-    "execution-host",
-    "logical-scene",
-    "manager",
-    "operator",
-    "program-runner",
-    "program-selection",
-)
-RUN_DOMAINS: Final = (
-    "composer",
-    "execution-host",
-    "headless",
-    "manager",
-    "operator",
-    "program-runner",
-)
-_TOP_LEVEL_ROOTS: Final = ("artifacts", "state", "projections", "run")
+# Pinned kept roots, in marker order.
+_TOP_LEVEL_ROOTS: Final = ("data", "history", "operator")
+# Entries the shared run selection keeps beside them (run_session).
+SESSION_ROOT_ENTRIES: Final = frozenset({
+    "current", "previous-runs", "session-reports",
+    ".legacy-session-transition.json", ".session-selection.json",
+    "..legacy-session-transition.json.next", "..session-selection.json.next",
+})
 
 
 class CellLayoutError(RuntimeError):
@@ -330,10 +334,23 @@ def _read_marker(path: Path) -> tuple[dict[str, Any], os.stat_result]:
 
 
 def _expected_root_names() -> list[str]:
-    return (
-        list(_TOP_LEVEL_ROOTS)
-        + [f"state/{owner}" for owner in SEMANTIC_OWNERS]
-        + [f"run/{domain}" for domain in RUN_DOMAINS]
+    return list(_TOP_LEVEL_ROOTS)
+
+
+def _refuse_version_1(observed: dict[str, Any], *, cell_root: Path) -> None:
+    if observed.get("schema_version") != _CELL_LAYOUT_SCHEMA_V1:
+        return
+    raise CellLayoutError(
+        f"cell root {cell_root} uses the earlier layout {_CELL_LAYOUT_SCHEMA_V1}, "
+        f"which kept running state across starts; it is not opened or converted. "
+        f"Start a new instance (another --instance-id or --state-root); it begins "
+        f"with an empty cell. The persistent Program values in "
+        f"{cell_root / 'state/program-runner/persistent-keys.json'} can be kept "
+        f"only if that file is in the current register format: then copy it "
+        f"into the new instance's data/program-runner/ as "
+        f"persistent-keys.v<N>.json, N being the number at the end of its "
+        f"schema_version, before its first start. A file in an older format "
+        f"is not read."
     )
 
 
@@ -417,6 +434,7 @@ class CellInstanceLayout:
             Path(cell_root), writable=True
         )
         observed, marker_stat = _read_marker(cell_root / CELL_LAYOUT_MARKER)
+        _refuse_version_1(observed, cell_root=cell_root)
         decoded = _decode_marker(observed, cell_root=cell_root)
         layout = cls(
             decoded[0],
@@ -590,8 +608,6 @@ class CellInstanceLayout:
                 f"cannot persist cell-layout initializer: {exc}"
             ) from exc
 
-        state_descriptor = -1
-        run_descriptor = -1
         try:
             typed_paths: list[tuple[str, Path, tuple[int, int]]] = []
             for child in _TOP_LEVEL_ROOTS:
@@ -602,57 +618,6 @@ class CellInstanceLayout:
                 )
                 typed_paths.append(
                     (child, path, (metadata.st_dev, metadata.st_ino))
-                )
-            state_descriptor = os.open(
-                "state",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=root_descriptor,
-            )
-            run_descriptor = os.open(
-                "run",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=root_descriptor,
-            )
-            top_level_identities = {
-                name: identity for name, _path, identity in typed_paths
-            }
-            for name, descriptor in (
-                ("state", state_descriptor),
-                ("run", run_descriptor),
-            ):
-                metadata = os.fstat(descriptor)
-                _validate_directory_metadata(
-                    cell_root / name, metadata, writable=True
-                )
-                if (metadata.st_dev, metadata.st_ino) != top_level_identities[name]:
-                    raise CellLayoutError(
-                        f"new cell-layout {name} root changed while opening"
-                    )
-            for owner in SEMANTIC_OWNERS:
-                path = cell_root / "state" / owner
-                os.mkdir(owner, mode=0o700, dir_fd=state_descriptor)
-                _canonical, metadata = _canonical_plain_directory(
-                    path, writable=True
-                )
-                typed_paths.append(
-                    (
-                        f"state/{owner}",
-                        path,
-                        (metadata.st_dev, metadata.st_ino),
-                    )
-                )
-            for domain in RUN_DOMAINS:
-                path = cell_root / "run" / domain
-                os.mkdir(domain, mode=0o700, dir_fd=run_descriptor)
-                _canonical, metadata = _canonical_plain_directory(
-                    path, writable=True
-                )
-                typed_paths.append(
-                    (
-                        f"run/{domain}",
-                        path,
-                        (metadata.st_dev, metadata.st_ino),
-                    )
                 )
             root_identities_list: list[tuple[str, int, int]] = []
             for name, path, created_identity in typed_paths:
@@ -696,8 +661,6 @@ class CellInstanceLayout:
                 os.fsync(marker_descriptor)
             finally:
                 os.close(marker_descriptor)
-            os.fsync(state_descriptor)
-            os.fsync(run_descriptor)
             os.fsync(root_descriptor)
             os.unlink(CELL_LAYOUT_INITIALIZER, dir_fd=root_descriptor)
             os.fsync(root_descriptor)
@@ -708,10 +671,6 @@ class CellInstanceLayout:
                 raise
             raise CellLayoutError(f"cannot create complete cell layout: {exc}") from exc
         finally:
-            if state_descriptor >= 0:
-                os.close(state_descriptor)
-            if run_descriptor >= 0:
-                os.close(run_descriptor)
             os.close(root_descriptor)
         return cls.open_existing(cell_root)
 
@@ -759,18 +718,11 @@ class CellInstanceLayout:
             or observed != expected
         ):
             raise CellLayoutError("the pinned cell-layout marker was replaced or changed")
-        if _directory_entries(self.cell_root) != set(_TOP_LEVEL_ROOTS) | {
-            CELL_LAYOUT_MARKER
-        }:
+        entries = _directory_entries(self.cell_root)
+        if not set(_TOP_LEVEL_ROOTS) | {CELL_LAYOUT_MARKER} <= entries or (
+            entries - set(_TOP_LEVEL_ROOTS) - {CELL_LAYOUT_MARKER} - SESSION_ROOT_ENTRIES
+        ):
             raise CellLayoutError("marked cell layout has unexpected or missing roots")
-        if _directory_entries(self.cell_root / "state") != set(SEMANTIC_OWNERS):
-            raise CellLayoutError(
-                "marked cell layout has unexpected or missing roots under state"
-            )
-        if _directory_entries(self.cell_root / "run") != set(RUN_DOMAINS):
-            raise CellLayoutError(
-                "marked cell layout has unexpected or missing roots under run"
-            )
         for name, device, inode in self.root_identities:
             _canonical, metadata = _canonical_plain_directory(
                 self.cell_root / name, writable=True
@@ -781,18 +733,17 @@ class CellInstanceLayout:
                 )
 
     @property
-    def artifact_root(self) -> Path:
-        return self.cell_root / "artifacts"
+    def data_root(self) -> Path:
+        return self.cell_root / "data"
 
     @property
-    def projection_root(self) -> Path:
-        return self.cell_root / "projections"
+    def history_root(self) -> Path:
+        return self.cell_root / "history"
 
     @property
-    def run_root(self) -> Path:
-        return self.cell_root / "run"
+    def operator_root(self) -> Path:
+        return self.cell_root / "operator"
 
-    def owner_state_root(self, owner: str) -> Path:
-        if owner not in SEMANTIC_OWNERS:
-            raise CellLayoutError(f"unknown semantic-owner root: {owner}")
-        return self.cell_root / "state" / owner
+    @property
+    def current_root(self) -> Path:
+        return self.cell_root / "current"

@@ -13,8 +13,8 @@ from typing import Any, Callable, Final, Mapping
 from manyforge_headless_api.client import HeadlessHttpClient
 
 
-OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v4"
-OBSERVATION_CREDIT_SCHEMA: Final = "manyforge.execution_observation_credit.v1"
+OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v5"
+OBSERVATION_CREDIT_SCHEMA: Final = "manyforge.execution_observation_credit.v2"
 OBSERVATION_DEMAND_LEASE_SECONDS: Final = 45.0
 MAXIMUM_OBSERVATION_CLIENTS: Final = 16
 _MAXIMUM_SAFE_INTEGER: Final = 9_007_199_254_740_991
@@ -89,7 +89,7 @@ def project_execution_observation(
     error = response.get("error")
     if (
         set(response) == {"api_version", "error", "ok"}
-        and response.get("api_version") == "manyforge.execution_command_response.v4"
+        and response.get("api_version") == "manyforge.execution_command_response.v6"
         and response.get("ok") is False
         and isinstance(error, dict)
         and isinstance(error.get("code"), str)
@@ -100,7 +100,7 @@ def project_execution_observation(
         # it is not a malformed envelope.
         raise ExecutionObservationOwnerRefused(error["code"], error["message"])
     if set(response) != {"api_version", "command", "observation", "ok"} or (
-        response.get("api_version") != "manyforge.execution_command_response.v4"
+        response.get("api_version") != "manyforge.execution_command_response.v6"
         or response.get("command") != "observation"
         or response.get("ok") is not True
     ):
@@ -111,17 +111,17 @@ def project_execution_observation(
     if (
         set(observed)
         != {
+            "application_start_id",
             "cell_id",
             "graph_revision",
             "measured_targets",
-            "owner_epoch",
             "retained_bundle_id",
             "schema_version",
             "source_epoch",
             "source_sequence",
             "targets",
         }
-        or observed.get("schema_version") != "manyforge.execution_observation.v4"
+        or observed.get("schema_version") != "manyforge.execution_observation.v5"
     ):
         raise ExecutionObservationProjectionError(
             "execution observation schema is unsupported"
@@ -144,7 +144,9 @@ def project_execution_observation(
     received = _safe_integer(received_at_monotonic_us, "received_at_monotonic_us")
     return {
         "schema_version": OBSERVATION_FRAME_SCHEMA,
-        "owner_epoch": _text(observed.get("owner_epoch"), "observation.owner_epoch"),
+        "application_start_id": _text(
+            observed.get("application_start_id"), "observation.application_start_id"
+        ),
         "cell_id": _text(observed.get("cell_id"), "observation.cell_id"),
         "retained_bundle_id": _text(
             observed.get("retained_bundle_id"), "observation.retained_bundle_id"
@@ -269,7 +271,7 @@ def _targets_signature(targets: list[dict[str, Any]]) -> tuple[Any, ...]:
 
 def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
     return (
-        frame["owner_epoch"],
+        frame["application_start_id"],
         frame["cell_id"],
         frame["retained_bundle_id"],
         frame["graph_revision"],
@@ -283,8 +285,10 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
 class ExecutionObservationSubscription:
     wake: asyncio.Event
     payload: str | None = None
-    last_applied: tuple[str, str, int, int] | None = None
-    outstanding: tuple[str, str, int, int] | None = None
+    # Credit cursor (source_epoch, source_sequence, delivery_sequence); the
+    # start is the same for every frame of this backend process.
+    last_applied: tuple[str, int, int] | None = None
+    outstanding: tuple[str, int, int] | None = None
     offered_at: float = 0.0
     credit: bool = False
     closed: bool = False
@@ -293,7 +297,7 @@ class ExecutionObservationSubscription:
 
 def observation_identity(frame: Mapping[str, Any]) -> tuple[str, str, int]:
     return (
-        str(frame["owner_epoch"]),
+        str(frame["application_start_id"]),
         str(frame["source_epoch"]),
         int(frame["source_sequence"]),
     )
@@ -305,17 +309,17 @@ def observation_cursor(
     if identity is None:
         return None
     return {
-        "owner_epoch": identity[0],
+        "application_start_id": identity[0],
         "source_epoch": identity[1],
         "source_sequence": identity[2],
     }
 
 
 def _is_newer(
-    candidate: tuple[str, str, int, int],
-    applied: tuple[str, str, int, int] | None,
+    candidate: tuple[str, int, int],
+    applied: tuple[str, int, int] | None,
 ) -> bool:
-    return applied is None or candidate[3] > applied[3]
+    return applied is None or candidate[2] > applied[2]
 
 
 class ExecutionObservationSource:
@@ -418,7 +422,7 @@ class ExecutionObservationSource:
     def grant_credit(
         self,
         subscription: ExecutionObservationSubscription,
-        last_applied: tuple[str, str, int, int] | None,
+        last_applied: tuple[str, int, int] | None,
     ) -> None:
         wakes: list[ExecutionObservationSubscription] = []
         with self._condition:
@@ -536,7 +540,7 @@ class ExecutionObservationSource:
             or subscription.outstanding is not None
             or self._last_payload is None
             or self._last_identity is None
-            or not _is_newer((*self._last_identity, self._delivery_sequence), subscription.last_applied)
+            or not _is_newer((*self._last_identity[1:], self._delivery_sequence), subscription.last_applied)
         ):
             return False
         frame = json.loads(self._last_payload)
@@ -549,7 +553,7 @@ class ExecutionObservationSource:
         frame["delivery_sequence"] = self._delivery_sequence
         subscription.payload = encode_execution_observation_frame(frame)
         subscription.offered_at = self._monotonic()
-        subscription.outstanding = (*self._last_identity, self._delivery_sequence)
+        subscription.outstanding = (*self._last_identity[1:], self._delivery_sequence)
         subscription.credit = False
         return True
 

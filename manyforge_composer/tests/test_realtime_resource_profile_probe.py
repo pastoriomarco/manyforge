@@ -97,6 +97,133 @@ def test_composer_probe_rejects_python_thread_on_rt_policy_or_reserved_cpu():
     assert any("VmLck is zero" in item for item in evidence["failed_checks"])
 
 
+def _composer(probe: Any, *threads: Any) -> Any:
+    return probe.ProcessObservation(
+        pid=1,
+        command_line="python -m manyforge_composer",
+        locked_memory_bytes=64 * 1024 * 1024,
+        main_policy="SCHED_OTHER",
+        main_priority=0,
+        main_affinity=(0, 1),
+        threads=(
+            probe.ThreadObservation(1, "python", "SCHED_OTHER", 0, (0, 1)),
+            *threads,
+        ),
+    )
+
+
+def _scheduler(probe: Any, first_tid: int) -> tuple[Any, ...]:
+    """One strict-profile scheduler: three RT role threads, three idle lanes."""
+    return (
+        probe.ThreadObservation(first_tid, "mf_sched_ctrl", "SCHED_FIFO", 45, (2,)),
+        probe.ThreadObservation(first_tid + 1, "mf_sched_safe", "SCHED_FIFO", 40, (3,)),
+        probe.ThreadObservation(first_tid + 2, "mf_sched_stop", "SCHED_FIFO", 48, (5,)),
+        probe.ThreadObservation(first_tid + 3, "mf_sched_life", "SCHED_OTHER", 0, (0, 1)),
+        probe.ThreadObservation(first_tid + 4, "mf_sched_mon", "SCHED_OTHER", 0, (0, 1)),
+        probe.ThreadObservation(first_tid + 5, "mf_sched_bg", "SCHED_OTHER", 0, (0, 1)),
+    )
+
+
+def _robot_checks(probe: Any, first_tid: int, robots: int) -> tuple[Any, ...]:
+    """Each robot's collision scheduler: its RT RuntimeSafety thread and five
+    idle lanes, two of them with RT role names but SCHED_OTHER."""
+    threads: list[Any] = []
+    for robot in range(robots):
+        tid = first_tid + 10 * robot
+        threads += [
+            probe.ThreadObservation(tid, "mf_sched_safe", "SCHED_FIFO", 40, (3,)),
+            probe.ThreadObservation(tid + 1, "mf_sched_ctrl", "SCHED_OTHER", 0, (0, 1)),
+            probe.ThreadObservation(tid + 2, "mf_sched_stop", "SCHED_OTHER", 0, (0, 1)),
+            probe.ThreadObservation(tid + 3, "mf_sched_life", "SCHED_OTHER", 0, (0, 1)),
+            probe.ThreadObservation(tid + 4, "mf_sched_mon", "SCHED_OTHER", 0, (0, 1)),
+            probe.ThreadObservation(tid + 5, "mf_sched_bg", "SCHED_OTHER", 0, (0, 1)),
+        ]
+    return tuple(threads)
+
+
+def test_composer_probe_accepts_several_schedulers_with_idle_same_named_lanes():
+    probe = _load_probe()
+    observation = _composer(
+        probe, *_scheduler(probe, 10), *_scheduler(probe, 20), *_robot_checks(probe, 100, 2)
+    )
+
+    evidence = probe.build_evidence("composer", observation, _environment(), robots=2)
+
+    assert evidence["passed"] is True, evidence["failed_checks"]
+    assert evidence["contract"]["schedulers"] == 2
+    assert evidence["contract"]["robot_check_threads"] == 2
+
+
+def test_composer_probe_rejects_a_required_role_without_its_rt_thread():
+    probe = _load_probe()
+    threads = tuple(
+        thread
+        if thread.name != "mf_sched_stop"
+        else probe.ThreadObservation(thread.tid, thread.name, "SCHED_OTHER", 0, (0, 1))
+        for thread in _scheduler(probe, 10)
+    )
+
+    evidence = probe.build_evidence("composer", _composer(probe, *threads), _environment())
+
+    assert evidence["passed"] is False
+    assert any(
+        item.startswith("stop_control: expected a mf_sched_stop thread")
+        for item in evidence["failed_checks"]
+    )
+
+
+def test_composer_probe_rejects_a_same_named_rt_thread_with_the_wrong_priority_or_cpus():
+    probe = _load_probe()
+    for wrong in (
+        probe.ThreadObservation(30, "mf_sched_ctrl", "SCHED_FIFO", 44, (2,)),
+        probe.ThreadObservation(30, "mf_sched_ctrl", "SCHED_FIFO", 45, (4,)),
+    ):
+        observation = _composer(probe, *_scheduler(probe, 10), wrong)
+
+        evidence = probe.build_evidence("composer", observation, _environment())
+
+        assert evidence["passed"] is False
+        assert any(
+            item.startswith("controller_command: mf_sched_ctrl:30 expected")
+            for item in evidence["failed_checks"]
+        )
+
+
+def test_composer_probe_rejects_an_idle_lane_on_an_rt_cpu():
+    probe = _load_probe()
+    observation = _composer(
+        probe,
+        *_scheduler(probe, 10),
+        probe.ThreadObservation(30, "mf_sched_ctrl", "SCHED_OTHER", 0, (2,)),
+    )
+
+    evidence = probe.build_evidence("composer", observation, _environment())
+
+    assert evidence["passed"] is False
+    assert any(
+        "escaped the NRT CPU set" in item and "mf_sched_ctrl:30" in item
+        for item in evidence["failed_checks"]
+    )
+
+
+def test_composer_probe_counts_one_collision_check_thread_per_robot():
+    probe = _load_probe()
+    complete = _composer(probe, *_scheduler(probe, 10), *_robot_checks(probe, 100, 3))
+    missing = _composer(probe, *_scheduler(probe, 10), *_robot_checks(probe, 100, 2))
+
+    assert probe.build_evidence("composer", complete, _environment(), robots=3)["passed"]
+    evidence = probe.build_evidence("composer", missing, _environment(), robots=3)
+    assert evidence["passed"] is False
+    assert any(
+        item.startswith("runtime_safety: expected 1 scheduler thread(s) plus 3 robot")
+        for item in evidence["failed_checks"]
+    )
+    # Without the robot count the probe reports what it found.
+    unknown = probe.build_evidence("composer", missing, _environment())
+    assert unknown["passed"] is True
+    assert unknown["contract"]["robot_check_threads"] == 2
+
+
 def test_controller_probe_requires_one_highest_update_thread_and_memory_lock():
     probe = _load_probe()
     observation = probe.ProcessObservation(

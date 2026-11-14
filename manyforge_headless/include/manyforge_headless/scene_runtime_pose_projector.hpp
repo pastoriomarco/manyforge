@@ -5,6 +5,7 @@
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_deployment/model_source.hpp>
 
 #include <cstdint>
@@ -132,9 +133,7 @@ struct SceneRuntimeCarriedObjectLoss final {
   /// system signal of `controllable_component_id`.
   manyforge::core::CommandTargetId command_target_id;
   manyforge::core::GraphRevision graph_revision;
-  /// Unique per observation; the Stop request id.
-  std::string request_id;
-  /// The loss `event_id` and the attachment's stored
+  /// The loss `event_id` (the observation's scene request key, 32 hex) and the attachment's stored
   /// `on_grasp_lost.set_key`, carried into the host's loss row.
   std::string loss_event_id{};
   std::optional<std::string> set_key{};
@@ -167,9 +166,14 @@ using SceneRuntimeCarriedObjectLostSignalPublisher =
     std::function<std::optional<manyforge::core::ErrorDTO>(
         const SceneRuntimeCarriedObjectLoss &)>;
 
+/// Mints one Manager class 1 request key (contract 1.4) from the Manager's
+/// own counter; each scene request of this adapter takes a fresh key.
+using SceneRuntimeRequestKeyMinter =
+    std::function<manyforge::core::RequestKey()>;
+
 struct SceneRuntimePoseApplicationResult final {
   SceneRuntimePoseApplicationStatus status;
-  std::optional<manyforge::core::RequestId> scene_request_id;
+  std::optional<manyforge::core::RequestKey> scene_request_key;
   std::optional<manyforge::core::ProjectionRevisionDTO> projection_revision;
   std::optional<manyforge::core::SceneUpdateStatusDTO> update_status;
   std::optional<SceneRuntimePoseMeasurement> pose_measurement;
@@ -209,6 +213,7 @@ public:
   SceneRuntimePoseProjector(
       manyforge::core::ISceneAuthority &scene_authority,
       manyforge::core::CellId cell_id,
+      SceneRuntimeRequestKeyMinter mint_request_key,
       SceneRuntimeReferenceLinkResolver reference_resolver = {},
       SceneRuntimeCarrierStopRequester carrier_stop_requester = {},
       SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher = {});
@@ -229,14 +234,14 @@ public:
 
 private:
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
-  Commit(manyforge::core::RequestId request_id,
+  Commit(manyforge::core::RequestKey request_key,
          const manyforge::core::ProjectionRevisionDTO &projection,
          manyforge::core::SceneOperationRequestDTO operation);
   [[nodiscard]] manyforge::core::Result<SceneRuntimePoseApplicationResult>
   CarriedObjectLost(const manyforge::core::CarriedObjectAttachmentDTO &attachment,
                     const SceneRuntimePoseDistance &distance,
                     const manyforge::core::ProjectionRevisionDTO &projection,
-                    const manyforge::core::RequestId &request_id,
+                    manyforge::core::RequestKey request_key,
                     const manyforge::core::Pose3DTO &observed_in_cell,
                     std::optional<SceneRuntimePoseMeasurement>
                         pose_measurement = std::nullopt);
@@ -264,6 +269,7 @@ private:
 
   manyforge::core::ISceneAuthority &scene_authority_;
   manyforge::core::CellId cell_id_;
+  SceneRuntimeRequestKeyMinter mint_request_key_;
   SceneRuntimeReferenceLinkResolver reference_resolver_;
   SceneRuntimeCarrierStopRequester carrier_stop_requester_;
   SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher_;

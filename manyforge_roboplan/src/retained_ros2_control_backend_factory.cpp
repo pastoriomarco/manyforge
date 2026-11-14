@@ -32,7 +32,7 @@ void declare_gripper_feedback_stream(RetainedRos2ControlBackendConfig &config,
   core::StreamDeclarationDTO defaults{
       "gripper_feedback",
       static_cast<core::Duration>(gripper.state_freshness_timeout_s * 1e9),
-      gripper.feedback_stream_severity, gripper.feedback_stream_recovery,
+      gripper.feedback_stream_severity,
       core::StreamTimestampSourceDTO::kArrival};
   if (gripper.transport_kind == "ros_gripper_command") {
     if (config.arm.measured_joint_state_lane) {

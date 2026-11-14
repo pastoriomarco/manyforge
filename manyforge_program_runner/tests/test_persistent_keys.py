@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 from pathlib import Path
 from types import MappingProxyType
 
@@ -20,8 +18,12 @@ from manyforge_program_runner.persistent_keys import (
     PersistentKeyRegister,
     PersistentKeyRegisterError,
     PersistentKeyRegisterVersionError,
-    PersistentKeyStorageUncertainError,
+    REGISTER_FILE_NAME,
 )
+
+# Two application starts: run and attempt numbers restart with each.
+_A = "3f9a00000000002a"
+_B = "7c1e000000000003"
 
 
 def _declaration(
@@ -86,18 +88,25 @@ def _reconciled(
     return activation
 
 
+def _reopened(register: PersistentKeyRegister, start: str = _A) -> PersistentKeyRegister:
+    """What a next start reads: the file, once the writer has written it."""
+
+    assert register.wait_written(5.0)
+    return PersistentKeyRegister(register.path.parent, application_start_id=start)
+
+
 def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "state" / "persistent-keys.json"
-    register = PersistentKeyRegister(path)
+    path = tmp_path / "state" / "persistent-keys.v4.json"
+    register = PersistentKeyRegister(path.parent, application_start_id=_A)
     manager = _Manager()
     _reconciled(register, manager, "/cells/b/cell.scenario", _declaration("index"))
     register.commit("/cells/b/cell.scenario", _declaration("index"), 9)
     _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
     register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
 
-    reopened = PersistentKeyRegister(path)
+    reopened = _reopened(register)
     assert reopened.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {
         "index": 3
     }
@@ -105,7 +114,7 @@ def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
     assert reopened.restore("/cells/b/cell.scenario", {"index": _declaration("index")}) == {}
     assert reopened.values("/cells/b/cell.scenario")["index"]["value"] == 9
     document = json.loads(path.read_text())
-    assert document["schema_version"] == "manyforge.persistent_key_register.v3"
+    assert document["schema_version"] == "manyforge.persistent_key_register.v4"
     assert document["activation"] == {
         "record_digest": "h.apply.2",
         "project_path": "/cells/a/cell.scenario",
@@ -116,7 +125,7 @@ def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
 def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
     tmp_path: Path,
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     _reconciled(register, manager, "/cells/other/cell.scenario", _declaration("gone"))
     register.commit("/cells/other/cell.scenario", _declaration("gone"), 5)
@@ -157,7 +166,7 @@ def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
     assert register.restore("/cells/a/cell.scenario", activation.declarations) == {"kept": 4}
     # Another Scenario's rows are untouched while all its Applies were seen.
     assert set(register.values("/cells/other/cell.scenario")) == {"gone"}
-    reopened = PersistentKeyRegister(register.path)
+    reopened = _reopened(register)
     assert set(reopened.values("/cells/a/cell.scenario")) == {"kept"}
     assert [
         (edit["action"], edit["key"], edit["reason"], edit["source_label"])
@@ -171,7 +180,7 @@ def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
 
 
 def test_structure_compatibility_includes_fields(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     before = _declaration("bundle", "model_response", fields={"reason": "string"})
     after = _declaration("bundle", "model_response", fields={"reason": "bool"})
@@ -187,7 +196,7 @@ def test_an_observed_delete_apply_drops_the_value_for_good(tmp_path: Path) -> No
     """Delete pallet_index (stored 9), Apply, re-add it with initial 0, Apply:
     with both Applies observed the re-added key starts empty (from 0)."""
 
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     pallet = _declaration("pallet_index")
     _reconciled(register, manager, "/cells/a/cell.scenario", pallet, _declaration("layer"))
@@ -203,7 +212,7 @@ def test_an_observed_delete_apply_drops_the_value_for_good(tmp_path: Path) -> No
 
 
 def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     pallet = _declaration("pallet_index")
     _reconciled(register, manager, "/cells/a/cell.scenario", pallet, _declaration("layer"))
@@ -222,7 +231,7 @@ def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> No
         "pallet_index": 9,
         "layer": 2,
     }
-    reopened = PersistentKeyRegister(register.path)
+    reopened = _reopened(register)
     assert reopened.unobserved_applies("/cells/a/cell.scenario") == (missed.record_digest,)
     (fault,) = [e for e in reopened.edits("/cells/a/cell.scenario") if e["action"] == "fault"]
     assert fault["reason"] == "applied_program_not_observed"
@@ -235,7 +244,7 @@ def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> No
 
 
 def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     narrow = _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("x"))
     assert register.reconcile(narrow).outcome == "duplicate"
@@ -255,7 +264,7 @@ def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
 
 
 def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     first = _Manager("first")
     _reconciled(register, first, "/cells/b/cell.scenario", _declaration("count"))
     register.commit("/cells/b/cell.scenario", _declaration("count"), 1)
@@ -282,7 +291,7 @@ def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> 
 
 
 def test_manager_eviction_continues_the_history(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager(retain=4)
     index = _declaration("index")
     _reconciled(register, manager, "/cells/a/cell.scenario", index)
@@ -306,7 +315,7 @@ def test_manager_eviction_continues_the_history(tmp_path: Path) -> None:
         register.reconcile(manager.apply("/cells/a/cell.scenario", index))
     assert register.unobserved_applies("/cells/b/cell.scenario") == ()
     assert [e["action"] for e in register.edits("/cells/b/cell.scenario")].count("fault") == 1
-    reopened = PersistentKeyRegister(register.path)
+    reopened = _reopened(register)
     assert reopened.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
 
     # A register that lagged until its last activation was evicted cannot
@@ -321,7 +330,7 @@ def test_manager_eviction_continues_the_history(tmp_path: Path) -> None:
 
 
 def test_nothing_is_restored_before_the_scenario_is_reconciled(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     assert register.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {}
     register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
     assert register.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {}
@@ -334,13 +343,14 @@ def test_nothing_is_restored_before_the_scenario_is_reconciled(tmp_path: Path) -
     assert register.restore("/cells/a/cell.scenario", activation.declarations) == {"index": 3}
 
 
-def test_a_failed_cleanup_keeps_the_register_and_retries(
+def test_a_cleanup_whose_file_write_fails_is_made_in_memory_and_written_later(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
     register.commit("/cells/a/cell.scenario", _declaration("index"), 5)
+    assert register.wait_written(5.0)
     removed = manager.apply("/cells/a/cell.scenario")
 
     def refuse(*_args, **_kwargs):
@@ -348,20 +358,25 @@ def test_a_failed_cleanup_keeps_the_register_and_retries(
 
     replace = persistent_keys.os.replace
     monkeypatch.setattr(persistent_keys.os, "replace", refuse)
-    with pytest.raises(PersistentKeyRegisterError, match="could not be written"):
-        register.reconcile(removed)
-    # Unchanged, and the stale row is still not restorable for the new Apply.
-    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 5
-    assert register.activation["record_digest"] == "h.apply.1"
-    monkeypatch.setattr(persistent_keys.os, "replace", replace)
+    # Memory is the authority: the cleanup is made, the disk does not refuse it.
     assert register.reconcile(removed).outcome == "reconciled"
     assert register.values("/cells/a/cell.scenario") == {}
+    assert register.activation["record_digest"] == "h.apply.2"
+    assert register.wait_written(5.0)
+    assert register.write_failures == 1
+    assert register.reconcile(removed).outcome == "duplicate"
+    monkeypatch.setattr(persistent_keys.os, "replace", replace)
+    # The close writes the latest state again.
+    assert register.close(5.0)
+    reopened = PersistentKeyRegister(tmp_path, application_start_id=_A)
+    assert reopened.values("/cells/a/cell.scenario") == {}
+    assert reopened.activation["record_digest"] == "h.apply.2"
 
 
 def test_drop_forgets_a_refused_restored_value_with_a_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     _reconciled(register, _Manager(), "/cells/a/cell.scenario", _declaration("pose"))
     register.commit("/cells/a/cell.scenario", _declaration("pose"), 1)
 
@@ -370,7 +385,8 @@ def test_drop_forgets_a_refused_restored_value_with_a_notice(
         "pose",
         reason="value_invalid",
         detail="frame not allowed",
-        edit={"program_run_id": "run.1"},
+        # A run's edit names its run number, kept as the integer it is.
+        edit={"program_run_id": 1},
     )
 
     assert register.values("/cells/a/cell.scenario") == {}
@@ -381,47 +397,71 @@ def test_drop_forgets_a_refused_restored_value_with_a_notice(
     assert (dropped["reason"], dropped["detail"], dropped["program_run_id"]) == (
         "value_invalid",
         "frame not allowed",
-        "run.1",
+        1,
     )
     assert dropped["source_label"] == "run_start"
 
-    # A removal that fails still leaves the notice for the run's audit.
+    # A removal whose file write fails is made in memory with its notice.
     register.commit("/cells/a/cell.scenario", _declaration("pose"), 2)
+    assert register.wait_written(5.0)
     monkeypatch.setattr(
         persistent_keys.os,
         "replace",
         lambda *_args: (_ for _ in ()).throw(OSError("read-only")),
     )
-    with pytest.raises(PersistentKeyRegisterError):
-        register.drop("/cells/a/cell.scenario", "pose", reason="value_invalid")
+    register.drop("/cells/a/cell.scenario", "pose", reason="value_invalid")
+    assert register.values("/cells/a/cell.scenario") == {}
     assert [notice.key for notice in register.take_notices()] == ["pose"]
+    assert register.wait_written(5.0)
+    assert register.write_failures == 1
 
 
-def test_failed_write_keeps_the_previous_visible_value(
+def test_a_failed_file_write_fails_no_change_and_is_counted_once_per_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
-    register.commit("/cells/a/cell.scenario", _declaration("index"), 1)
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
+    declarations = {"index": _declaration("index")}
+    _reconciled(register, _Manager(), "/cells/a/cell.scenario", declarations["index"])
+    register.commit("/cells/a/cell.scenario", declarations["index"], 1)
+    assert register.wait_written(5.0)
+    written = register.path.read_bytes()
 
     def refuse(*_args, **_kwargs):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(persistent_keys.os, "replace", refuse)
-    with pytest.raises(PersistentKeyRegisterError, match="could not be written"):
-        register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
-    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 1
+    edit = PersistentKeyEdit("request.1", "ui")
+    # Every kind of change is made and answers; each write attempt that
+    # fails is counted once.
+    changes = [
+        lambda: register.commit("/cells/a/cell.scenario", declarations["index"], 2, edit=edit),
+        lambda: register.remove("/cells/a/cell.scenario", "index", edit=edit),
+        lambda: register.commit("/cells/a/cell.scenario", declarations["index"], 3),
+        lambda: register.clear("/cells/a/cell.scenario", declarations, edit=edit),
+        lambda: register.commit("/cells/a/cell.scenario", declarations["index"], 4),
+        lambda: register.reset_to_initial("/cells/a/cell.scenario", declarations, edit=edit),
+    ]
+    for count, change in enumerate(changes, start=1):
+        change()
+        assert register.wait_written(5.0)
+        assert register.write_failures == count
+    assert register.values("/cells/a/cell.scenario") == {}
+    assert register.sequence == 8
+    # The file still holds the last state written.
+    assert register.path.read_bytes() == written
 
 
 def test_an_unchanged_value_is_not_written_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     before = _declaration("bundle", "model_response", fields={"reason": "string"})
     after = _declaration("bundle", "model_response", fields={"reason": "bool"})
     value = {"reason": "ok", "score": 1}
     register.commit(
         "/cells/a/cell.scenario", before, value, edit=PersistentKeyEdit("request.1", "ui")
     )
+    assert register.wait_written(5.0)
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("an unchanged value rewrote the register")
@@ -435,9 +475,11 @@ def test_an_unchanged_value_is_not_written_again(
         edit=PersistentKeyEdit("request.2", "ui"),
     )
     assert register.sequence == 1
-    assert [row["request_id"] for row in register.edits("/cells/a/cell.scenario")] == [
+    assert [row["request_key"] for row in register.edits("/cells/a/cell.scenario")] == [
         "request.1"
     ]
+    assert register.wait_written(5.0)
+    assert register.write_failures == 0
     monkeypatch.undo()
     # A new structure is a change even when the value is the same.
     register.commit("/cells/a/cell.scenario", after, value)
@@ -447,7 +489,7 @@ def test_an_unchanged_value_is_not_written_again(
 def test_bounds_and_non_persistent_writes_are_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     with pytest.raises(PersistentKeyRegisterError, match="not persistent"):
         register.commit("/cells/a/cell.scenario", _declaration("index", persistence="run"), 1)
     with pytest.raises(PersistentKeyRegisterError, match="exceeds"):
@@ -463,7 +505,7 @@ def test_bounds_and_non_persistent_writes_are_refused(
 
 
 def test_remove_and_clear_forget_only_the_named_scenario(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     declarations = {
         "index": _declaration("index"),
         "layer": _declaration("layer", access="write"),
@@ -480,21 +522,21 @@ def test_remove_and_clear_forget_only_the_named_scenario(tmp_path: Path) -> None
     assert register.clear("/cells/a/cell.scenario", declarations) == 1
     assert set(register.values("/cells/a/cell.scenario")) == {"limit"}
     assert register.clear("/cells/a/cell.scenario", declarations) == 0
-    assert set(PersistentKeyRegister(register.path).values("/cells/b/cell.scenario")) == {"index"}
+    assert set(_reopened(register).values("/cells/b/cell.scenario")) == {"index"}
 
 
 def test_malformed_register_is_refused_not_replaced(tmp_path: Path) -> None:
-    path = tmp_path / "keys.json"
-    path.write_text('{"schema_version": "manyforge.persistent_key_register.v3"}')
+    path = tmp_path / REGISTER_FILE_NAME
+    path.write_text('{"schema_version": "manyforge.persistent_key_register.v4"}')
     with pytest.raises(PersistentKeyRegisterError, match="unsupported layout"):
-        PersistentKeyRegister(path)
-    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v3"}'
+        PersistentKeyRegister(path.parent, application_start_id=_A)
+    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v4"}'
 
 
 def test_another_register_version_is_refused_by_name_and_left_untouched(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "keys.json"
+    path = tmp_path / REGISTER_FILE_NAME
     earlier = json.dumps(
         {
             "schema_version": "manyforge.persistent_key_register.v1",
@@ -505,39 +547,98 @@ def test_another_register_version_is_refused_by_name_and_left_untouched(
     )
     path.write_text(earlier)
     with pytest.raises(PersistentKeyRegisterVersionError) as refused:
-        PersistentKeyRegister(path)
+        PersistentKeyRegister(path.parent, application_start_id=_A)
     assert refused.value.code == "persistent_key_register_version_unsupported"
     assert "'manyforge.persistent_key_register.v1'" in str(refused.value)
     assert path.read_text() == earlier
 
 
-def test_the_superseded_scenario_keyed_register_is_moved_aside_not_migrated(
+def test_the_register_file_is_named_by_its_format_version() -> None:
+    assert REGISTER_FILE_NAME == "persistent-keys.v4.json"
+    assert persistent_keys.SCHEMA_VERSION == "manyforge.persistent_key_register.v4"
+
+
+@pytest.mark.parametrize(
+    ("older_name", "schema_version"),
+    [
+        ("persistent-keys.json", "manyforge.persistent_key_register.v4"),
+        ("persistent-keys.json", "manyforge.persistent_key_register.v2"),
+        ("persistent-keys.v3.json", "manyforge.persistent_key_register.v3"),
+    ],
+)
+def test_an_older_register_file_is_left_in_place_and_named_once(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    older_name: str,
+    schema_version: str,
 ) -> None:
-    path = tmp_path / "keys.json"
+    older = tmp_path / older_name
     earlier = json.dumps(
         {
-            "schema_version": "manyforge.persistent_key_register.v2",
+            "schema_version": schema_version,
             "sequence": 1,
             "rows": [
-                {"scenario_id": "cell", "key": "index", "fingerprint": "x",
-                 "value": 3, "sequence": 1}
+                {"project_path": "/cells/a/cell.scenario", "key": "index",
+                 "fingerprint": "x", "value": 3, "sequence": 1}
             ],
         }
-    )
-    path.write_text(earlier)
-    register = PersistentKeyRegister(path)
-    assert not path.exists()
-    assert (tmp_path / "keys.json.v2.superseded").read_text() == earlier
+    ).encode()
+    older.write_bytes(earlier)
+    before = older.stat()
+    with caplog.at_level("DEBUG", logger=persistent_keys.__name__):
+        register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     assert register.sequence == 0
     assert register.activation is None
     assert register.values("/cells/a/cell.scenario") == {}
+    assert [record.getMessage() for record in caplog.records] == [
+        f"stored values start empty: {older} is in an older format and was "
+        "left in place"
+    ]
+    assert older.read_bytes() == earlier
+    assert older.stat().st_mtime_ns == before.st_mtime_ns
+    assert older.stat().st_ino == before.st_ino
+    assert sorted(path.name for path in tmp_path.iterdir()) == [older_name]
+
+    # A first change creates only the versioned file; the older one stays.
+    manager = _Manager()
+    _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 5)
+    assert register.wait_written(5.0)
+    assert older.read_bytes() == earlier
+    assert (tmp_path / REGISTER_FILE_NAME).is_file()
+
+
+def test_no_older_register_file_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A newer or unrelated name is not an older register file.
+    (tmp_path / "persistent-keys.v5.json").write_text("{}")
+    (tmp_path / "persistent-keys.json.bak").write_text("{}")
+    with caplog.at_level("DEBUG", logger=persistent_keys.__name__):
+        PersistentKeyRegister(tmp_path, application_start_id=_A)
+        PersistentKeyRegister(tmp_path / "absent", application_start_id=_A)
+    assert caplog.records == []
+
+
+def test_an_older_file_beside_an_existing_register_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
+    manager = _Manager()
+    _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 5)
+    assert register.wait_written(5.0)
+    (tmp_path / "persistent-keys.json").write_text("{}")
+    with caplog.at_level("DEBUG", logger=persistent_keys.__name__):
+        reopened = PersistentKeyRegister(tmp_path, application_start_id=_A)
+    assert reopened.values("/cells/a/cell.scenario")["index"]["value"] == 5
+    assert caplog.records == []
 
 
 def test_same_named_projects_in_different_folders_keep_separate_values(
     tmp_path: Path,
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     first, second = "/site/line1/pick.scenario", "/site/line2/pick.scenario"
     _reconciled(register, manager, first, _declaration("index"))
@@ -550,13 +651,13 @@ def test_same_named_projects_in_different_folders_keep_separate_values(
         register, manager, "/site/line1/renamed.scenario", _declaration("index")
     )
     assert register.restore("/site/line1/renamed.scenario", moved.declarations) == {}
-    reopened = PersistentKeyRegister(register.path)
+    reopened = _reopened(register)
     assert reopened.values(first)["index"]["value"] == 4
     assert reopened.values(second)["index"]["value"] == 7
 
 
 def test_a_project_path_is_bounded_to_4096_bytes(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     longest = "/" + "p" * 4095
     _reconciled(register, _Manager(), longest, _declaration("index"))
     register.commit(longest, _declaration("index"), 1)
@@ -567,7 +668,7 @@ def test_a_project_path_is_bounded_to_4096_bytes(tmp_path: Path) -> None:
 def test_operator_edits_are_audited_with_the_change_and_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     edit = PersistentKeyEdit("request.1", "operator_ui")
     register.commit("/cells/a/cell.scenario", _declaration("index"), 1, edit=edit)
     # Unattributed writes are ordered by row sequence only.
@@ -580,13 +681,14 @@ def test_operator_edits_are_audited_with_the_change_and_bounded(
         edit=PersistentKeyEdit("request.3", "ui"),
     )
 
-    assert PersistentKeyRegister(register.path).edits("/cells/a/cell.scenario") == [
+    assert _reopened(register).edits("/cells/a/cell.scenario") == [
         {
             "sequence": 1,
             "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "set",
-            "request_id": "request.1",
+            "application_start_id": _A,
+            "request_key": "request.1",
             "source_label": "operator_ui",
             "program_run_id": None,
             "node_instance_id": None,
@@ -599,7 +701,8 @@ def test_operator_edits_are_audited_with_the_change_and_bounded(
             "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "reset",
-            "request_id": "request.2",
+            "application_start_id": _A,
+            "request_key": "request.2",
             "source_label": "ui",
             "program_run_id": None,
             "node_instance_id": None,
@@ -616,73 +719,111 @@ def test_operator_edits_are_audited_with_the_change_and_bounded(
     monkeypatch.setattr(persistent_keys, "MAX_EDITS", 2)
     register.commit("/cells/a/cell.scenario", _declaration("index"), 5, edit=edit)
     assert [row["sequence"] for row in register.edits("/cells/a/cell.scenario")] == [6]
+    assert register.wait_written(5.0)
     assert len(json.loads(register.path.read_text())["edits"]) == 2
 
 
 def test_a_run_write_is_audited_with_its_run_node_and_attempt(tmp_path: Path) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     register.commit(
         "/cells/a/cell.scenario",
         _declaration("index"),
         1,
         edit={
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "node_id": "logic.set_value",
             "node_instance_id": "set_index",
-            "node_attempt_id": "attempt.1",
+            "node_attempt_id": 4,
         },
     )
-    assert PersistentKeyRegister(register.path).edits("/cells/a/cell.scenario") == [
+    assert _reopened(register).edits("/cells/a/cell.scenario") == [
         {
             "sequence": 1,
             "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "set",
-            "request_id": None,
+            "application_start_id": _A,
+            "request_key": None,
             "source_label": "program_node",
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "node_instance_id": "set_index",
-            "node_attempt_id": "attempt.1",
+            "node_attempt_id": 4,
             "reason": None,
             "detail": None,
         }
     ]
-    with pytest.raises(PersistentKeyRegisterError, match="node_attempt_id"):
-        register.commit(
-            "/cells/a/cell.scenario",
-            _declaration("index"),
-            2,
-            edit={"program_run_id": "run.1", "node_attempt_id": "x" * 300},
-        )
+    # Run and attempt numbers are integers, never text.
+    for refused in ({"node_attempt_id": "4"}, {"node_attempt_id": 0}, {"program_run_id": "run.1"}):
+        with pytest.raises(PersistentKeyRegisterError, match="positive integer"):
+            register.commit(
+                "/cells/a/cell.scenario",
+                _declaration("index"),
+                2,
+                edit={"program_run_id": 1, "node_attempt_id": 4, **refused},
+            )
     assert register.values("/cells/a/cell.scenario")["index"]["value"] == 1
 
 
-def test_a_write_that_may_not_be_durable_is_distinct_and_reconciled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_change_keeps_the_application_start_that_wrote_it(tmp_path: Path) -> None:
+    """Run numbers restart at every start: each change records its start."""
+
+    path = tmp_path / REGISTER_FILE_NAME
+    register = PersistentKeyRegister(path.parent, application_start_id=_A)
+    register.commit(
+        "/cells/a/cell.scenario",
+        _declaration("index"),
+        1,
+        edit={"program_run_id": 3, "node_instance_id": "set_index", "node_attempt_id": 1},
+    )
+    assert register.wait_written(5.0)
+    document = json.loads(path.read_text())
+    assert document["schema_version"] == "manyforge.persistent_key_register.v4"
+    assert [edit["application_start_id"] for edit in document["edits"]] == [_A]
+
+    # A later start reads the change with the start that wrote it, and its
+    # own changes record the later start.
+    later = PersistentKeyRegister(path.parent, application_start_id=_B)
+    later.commit(
+        "/cells/a/cell.scenario",
+        _declaration("index"),
+        2,
+        edit={"program_run_id": 3, "node_instance_id": "set_index", "node_attempt_id": 1},
+    )
+    assert [
+        (edit["application_start_id"], edit["program_run_id"])
+        for edit in _reopened(later, _B).edits("/cells/a/cell.scenario")
+    ] == [(_A, 3), (_B, 3)]
+
+
+@pytest.mark.parametrize("start", ["3F9A00000000002A", "3f9a", "0" * 16, None])
+def test_the_register_requires_the_application_start_in_its_text_form(
+    tmp_path: Path, start: object
 ) -> None:
-    register = PersistentKeyRegister(tmp_path / "keys.json")
-    register.commit("/cells/a/cell.scenario", _declaration("index"), 1)
-    failing = [True]
-    sync = persistent_keys.os.fsync
+    with pytest.raises(PersistentKeyRegisterError, match="application_start_id"):
+        PersistentKeyRegister(tmp_path, application_start_id=start)  # type: ignore[arg-type]
 
-    def fsync(descriptor: int) -> None:
-        if failing[0] and stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise OSError("I/O error")
-        sync(descriptor)
 
-    monkeypatch.setattr(persistent_keys.os, "fsync", fsync)
-    with pytest.raises(PersistentKeyStorageUncertainError, match="may not be durable"):
-        register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
-    # The file was replaced: memory follows it, it does not claim "unchanged".
-    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 2
-    assert PersistentKeyRegister(register.path).values("/cells/a/cell.scenario")["index"]["value"] == 2
+def test_a_v3_register_is_refused_by_name_and_left_untouched(tmp_path: Path) -> None:
+    """The current-format file naming another format can only be damaged or
+    hand-edited: it is refused by name and left untouched."""
 
-    # Every change is refused, as an ordinary refusal, until reconciled.
-    with pytest.raises(PersistentKeyRegisterError, match="not reconciled") as refused:
-        register.remove("/cells/a/cell.scenario", "index")
-    assert not isinstance(refused.value, PersistentKeyStorageUncertainError)
-    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 2
-
-    failing[0] = False
-    register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
-    assert PersistentKeyRegister(register.path).values("/cells/a/cell.scenario")["index"]["value"] == 3
+    path = tmp_path / REGISTER_FILE_NAME
+    earlier = json.dumps(
+        {
+            "schema_version": "manyforge.persistent_key_register.v3",
+            "sequence": 1,
+            "rows": [
+                {"project_path": "/cells/a/cell.scenario", "key": "index",
+                 "fingerprint": "x", "value": 3, "sequence": 1}
+            ],
+            "edits": [],
+            "activation": None,
+            "reconciled_applies": [],
+            "unobserved_applies": [],
+        }
+    )
+    path.write_text(earlier)
+    with pytest.raises(PersistentKeyRegisterVersionError) as refused:
+        PersistentKeyRegister(path.parent, application_start_id=_A)
+    assert refused.value.code == "persistent_key_register_version_unsupported"
+    assert path.read_text() == earlier

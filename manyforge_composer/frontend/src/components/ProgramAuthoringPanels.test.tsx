@@ -950,7 +950,8 @@ describe('Program authoring panels', () => {
       operationalLimit: { maximumTcpLinearSpeedMps: 0.15 },
     };
     const deployment: DeploymentWorkspaceResponse = {
-      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+      applyCommands: { inProgress: null, ended: [] },
       authoringWorkspace: { workspaceEpoch: 'workspace', workspaceRevision: 1,
         programDraftId: 'program', programDraftRevision: 1,
         deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
@@ -1617,6 +1618,7 @@ describe('Program authoring panels', () => {
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
       composerRefusalReason: null,
+      runnerBusyReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1627,8 +1629,9 @@ describe('Program authoring panels', () => {
       groupRuntimeScales: {},
       setGroupRuntimeScale: vi.fn(),
       commitGroupRuntimeScale: vi.fn(),
-      fullStop: vi.fn(),
-      resumeFullStop: vi.fn(),
+      stopAll: vi.fn(),
+      halt: vi.fn(),
+      resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
@@ -1636,6 +1639,7 @@ describe('Program authoring panels', () => {
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
+      applicationStartId: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace
@@ -1805,6 +1809,7 @@ describe('Program authoring panels', () => {
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
       composerRefusalReason: null,
+      runnerBusyReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1815,8 +1820,9 @@ describe('Program authoring panels', () => {
       groupRuntimeScales: {},
       setGroupRuntimeScale: vi.fn(),
       commitGroupRuntimeScale: vi.fn(),
-      fullStop: vi.fn(),
-      resumeFullStop: vi.fn(),
+      stopAll: vi.fn(),
+      halt: vi.fn(),
+      resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
@@ -1824,6 +1830,7 @@ describe('Program authoring panels', () => {
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
+      applicationStartId: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>

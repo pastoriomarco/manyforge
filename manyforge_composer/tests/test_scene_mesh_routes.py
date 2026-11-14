@@ -620,7 +620,6 @@ class _SceneClient:
     def __init__(self, source_uri: str) -> None:
         self.source_uri = source_uri
         self.generation = 7
-        self.owner_epoch = "scene.epoch.1"
         self.cell_id = "cell.1"
         self.freshness = "fresh"
         self.removed = False
@@ -629,12 +628,11 @@ class _SceneClient:
 
     def scene(self) -> dict[str, object]:
         return {
-            "schema_version": "manyforge.scene_projection.v1",
+            "schema_version": "manyforge.scene_projection.v2",
             "logical_scene": {
                 "available": True,
                 "freshness": self.freshness,
                 "known_gaps": [],
-                "source_owner_epoch": self.owner_epoch,
                 "source_generation": self.generation,
                 "payload": {
                     "api_version": "manyforge.logical_scene_source.v1",
@@ -719,15 +717,14 @@ def test_owner_mesh_url_is_content_addressed_and_stable_across_owner_changes(
     assert "x-manyforge-scene-generation" not in converted.headers
     assert "x-manyforge-scene-owner-epoch" not in converted.headers
 
-    # Pose-only generation changes and owner-epoch rotation (transaction-log
-    # compaction) keep the same URL valid with identical bytes.
+    # Pose-only generation changes and a generation restart keep the same
+    # URL valid with identical bytes.
     state.headless_client.generation = 8
     state.headless_client.pose_x = 0.5
     after_pose = client.get(url)
     assert after_pose.status_code == 200
     assert after_pose.content == converted.content
 
-    state.headless_client.owner_epoch = "scene.epoch.2"
     state.headless_client.generation = 0
     after_rotation = client.get(url)
     assert after_rotation.status_code == 200

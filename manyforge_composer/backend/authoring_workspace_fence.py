@@ -26,6 +26,7 @@ from fastapi import HTTPException
 
 from .authoring_admission import (
     AuthoringAdmissionCoordinator,
+    AuthoringMutationEnvelope,
     LocalAuthoringCommit,
     OperationEffects,
     refused_before_effect,
@@ -132,19 +133,21 @@ def commit_draft_edit(
     install: Callable[[], bool],
     session: str = "program",
     validate: Callable[[], None] | None = None,
+    envelope: AuthoringMutationEnvelope | None = None,
 ) -> LocalAuthoringCommit:
     """Commit one Draft-only edit (no cell claim; see ``execute_draft_edit``).
 
     The same composite and domain fences as :func:`commit_local_authoring`
     apply; admission is an Idle Program cycle or a held run whose motion is
-    confirmed stopped, never Kernel authoring admission.
+    confirmed stopped, never Kernel authoring admission. ``envelope`` is given
+    by a caller whose body carries no browser envelope (an assistant callback).
     """
 
     coordinator = _require_coordinator(state)
     identity: "AuthoringWorkspaceIdentity" = state.authoring_workspace.identity()
     body.require_workspace_fence(identity)
     return coordinator.execute_draft_edit(
-        body.admission_envelope(),
+        body.admission_envelope() if envelope is None else envelope,
         operation_kind=operation_kind,
         workspace=state.authoring_workspace,
         draft_id=body.draft_id,

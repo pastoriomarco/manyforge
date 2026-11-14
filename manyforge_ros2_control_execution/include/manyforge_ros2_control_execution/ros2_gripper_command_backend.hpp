@@ -70,9 +70,8 @@ struct Ros2GripperActionConfig {
   /// Feedback staleness threshold (no code default; must be positive): the
   /// budget of the component's `gripper_feedback` stream row.
   double state_freshness_timeout_s{};
-  /// That row's severity/recovery, used when the host declares the stream.
+  /// That row's severity, used when the host declares the stream.
   core::StreamSeverityDTO feedback_stream_severity{};
-  core::StreamRecoveryDTO feedback_stream_recovery{};
   /// The `gripper_feedback` stream of the owning component, declared by the
   /// host. When set it records every matched feedback sample and owns the
   /// staleness judgement (the readiness snapshot no longer ages feedback).

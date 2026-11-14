@@ -124,22 +124,9 @@ ManagerPackageGeneration::manifest_set() const noexcept {
   return manifest_set_;
 }
 
-void ManagerPackageGeneration::RequireCurrent(
-    const RuntimeContractManifestSetDTO &observed) {
+void ManagerPackageGeneration::RequireCurrent() {
   if (latched_error_.has_value()) {
     throw ManagerPackageGenerationRestartRequired(*latched_error_);
-  }
-  // The pinned set was digest-verified at construction and verification is a
-  // pure function of the value, so an exactly equal observation is already
-  // verified. Only a differing set is re-verified, to decide whether its
-  // digest may be reported.
-  if (observed != manifest_set_) {
-    const auto verified =
-        manyforge::core::VerifyRuntimeContractManifestSet(observed);
-    LatchAndThrow("manifest_set_mismatch",
-                  verified.ok()
-                      ? std::optional{observed.manifest_set_digest}
-                      : std::nullopt);
   }
 
   try {
@@ -168,10 +155,7 @@ void ManagerPackageGeneration::RequireCurrent(
   }
 }
 
-[[noreturn]] void ManagerPackageGeneration::LatchAndThrow(
-    std::string reason,
-    std::optional<manyforge::core::RuntimeContractManifestSetDigest>
-        observed_digest) {
+[[noreturn]] void ManagerPackageGeneration::LatchAndThrow(std::string reason) {
   std::map<std::string, std::string> details{
       {"expected_manifest_set_digest",
        manifest_set_.manifest_set_digest.value()},
@@ -179,10 +163,6 @@ void ManagerPackageGeneration::RequireCurrent(
       {"required_action", "complete_stack_stop_start"},
       {"retryable", "false"},
   };
-  if (observed_digest.has_value()) {
-    details.emplace("observed_manifest_set_digest",
-                    observed_digest->value());
-  }
   latched_error_ = ErrorDTO{
       "full_stack_restart_required",
       "Manager package generation changed; complete stack restart required",

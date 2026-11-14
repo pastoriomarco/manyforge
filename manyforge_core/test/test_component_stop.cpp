@@ -34,7 +34,7 @@ TEST(ComponentStopTest, StopIsUnhealthyAndOwnerIsNotUsable) {
   EXPECT_FALSE(owner_usable(owner));
   EXPECT_EQ(to_string(owner.stop->code), "estop");
   EXPECT_EQ(parse_stop_code("estop"), StopCode::kEstop);
-  EXPECT_FALSE(parse_stop_code("fault_estop"));
+  EXPECT_FALSE(parse_stop_code("fault_protective_stop"));
 }
 TEST(ComponentStopTest, StoppedOwnerProjectsMemberWithoutInventingIdle) {
   auto owner = Owner();

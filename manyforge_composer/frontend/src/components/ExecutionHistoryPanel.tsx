@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import { HistoryDiscovery } from './HistoryDiscovery';
 import type { HistorianListQuery } from '../api/client';
+import { fullId, parseIdFilter, type ApplicationStartId, type DisplayIdKind } from '../api/applicationIdentity';
 import type { HistorianDetail, HistorianRetention } from '../types/headless';
 import { parseProgramRunEnd } from '../api/parsers/components';
 import { runEndPresentation, type RunEndPresentation } from '../state/componentPresentation';
@@ -33,8 +34,10 @@ export interface ExecutionHistoryEventView {
   channel: string;
   message: string;
   executionId?: number | null;
-  programRunId?: string | null;
-  operationId?: string | null;
+  programRunId?: number | null;
+  operationId?: number | null;
+  /** The application start the row belongs to. */
+  applicationStartId?: ApplicationStartId;
   type: string;
   alarmPhase?: HistoryAlarmPhase;
   details?: unknown;
@@ -57,6 +60,52 @@ export function historySeverityGroup(
   return 'info';
 }
 
+/**
+ * A typed run or operation filter: the display form (`3f9a/op7`), the full
+ * form (`<16 hex>/op7`) or the bare number. The full form names its own
+ * start; the other two name the current start, so a display prefix of
+ * another start names nothing. Null for text that names nothing.
+ */
+function historyIdFilter(
+  text: string,
+  kind: DisplayIdKind,
+  current: ApplicationStartId | null,
+): { value: number; applicationStartId: ApplicationStartId } | null {
+  const parsed = parseIdFilter(text, kind);
+  if (parsed === null) return null;
+  if (parsed.applicationStartId !== null) {
+    return { value: parsed.value, applicationStartId: parsed.applicationStartId };
+  }
+  if (current === null
+    || (parsed.applicationStartPrefix !== null && !current.startsWith(parsed.applicationStartPrefix))) return null;
+  return { value: parsed.value, applicationStartId: current };
+}
+
+/**
+ * The start selector's entries: the current start first, then the earlier
+ * starts that have History rows, newest first (as discovery lists them).
+ * An earlier start is labelled with the recorded UTC time of its last event
+ * once that row is loaded (`lastEventUtcNs`), else with its 4-hex prefix.
+ */
+export function historyStartOptions(
+  current: ApplicationStartId | null,
+  discovered: readonly string[],
+  lastEventUtcNs: Readonly<Record<string, string | null>> = {},
+): { value: ApplicationStartId | ''; label: string; title?: string }[] {
+  const earlier = discovered.filter((start) => start !== current);
+  return [
+    { value: '', label: 'Current start', title: current ?? undefined },
+    ...earlier.map((start, index) => {
+      const last = lastEventUtcNs[start];
+      const label = last == null
+        ? `Earlier start ${start.slice(0, 4)}`
+        : `Earlier start, last event ${new Date(Number(BigInt(last) / 1_000_000n)).toLocaleString()}`;
+      return { value: start, label: `${label}${index === 0 ? ' (previous start)' : ''}`, title: start };
+    }),
+  ];
+}
+
+/** The backend query, or null when a run or operation filter names nothing. */
 export function historyFilterQuery(options: {
   severity: HistorySeverityFilter;
   alarmView: HistoryAlarmFilter;
@@ -66,8 +115,23 @@ export function historyFilterQuery(options: {
   search: string;
   programRunId: string;
   operationId: string;
+  /** The current start, for the display form and the bare number. */
+  applicationStartId: ApplicationStartId | null;
+  /** The start chosen in the start selector; null is the current start. */
+  startFilter?: ApplicationStartId | null;
   correlations?: Partial<HistorianListQuery>;
-}): HistorianListQuery {
+}): HistorianListQuery | null {
+  const startFilter = options.startFilter ?? null;
+  const base = startFilter ?? options.applicationStartId;
+  const run = options.programRunId.trim() === ''
+    ? undefined : historyIdFilter(options.programRunId, 'run', base);
+  const operation = options.operationId.trim() === ''
+    ? undefined : historyIdFilter(options.operationId, 'op', base);
+  if (run === null || operation === null
+    || (run !== undefined && operation !== undefined
+      && run.applicationStartId !== operation.applicationStartId)
+    || (startFilter !== null && (run ?? operation) !== undefined
+      && (run ?? operation)!.applicationStartId !== startFilter)) return null;
   return {
     ...options.correlations,
     limit: HISTORIAN_PAGE_LIMIT,
@@ -76,8 +140,9 @@ export function historyFilterQuery(options: {
     alarmPhase: { all: undefined, lifecycle: 'all', activation: 'activated', return: 'returned', acknowledgement: 'acknowledged', raw: 'raw' }[options.alarmView] as HistorianListQuery['alarmPhase'],
     components: options.component.trim() ? [options.component.trim()] : undefined,
     eventTypes: options.eventType.trim() ? [options.eventType.trim()] : undefined,
-    programRunId: options.programRunId.trim() || undefined,
-    operationId: options.operationId.trim() || undefined,
+    programRunId: run?.value,
+    operationId: operation?.value,
+    applicationStartId: (run ?? operation)?.applicationStartId ?? startFilter ?? undefined,
     search: options.search.trim() || undefined,
   };
 }
@@ -99,7 +164,9 @@ interface ExecutionHistoryPanelProps {
   loading?: boolean;
   error?: string | null;
   retention?: HistorianRetention | null;
-  currentProgramRunId?: string | null;
+  currentProgramRunId?: number | null;
+  /** The current application-start id (`A`); run and operation filters need it. */
+  applicationStartId?: ApplicationStartId | null;
   embedded?: boolean;
   onReload?: (query: HistorianListQuery) => void;
   onLoadOlder?: () => void;
@@ -125,6 +192,7 @@ export function ExecutionHistoryPanel({
   error = null,
   retention = null,
   currentProgramRunId,
+  applicationStartId = null,
   embedded = false,
   onReload,
   onLoadOlder,
@@ -146,12 +214,52 @@ export function ExecutionHistoryPanel({
   const [operationId, setOperationId] = useState('');
   const [currentOnly, setCurrentOnly] = useState(false);
   const [correlations, setCorrelations] = useState<Partial<HistorianListQuery>>({});
-  const query = (): HistorianListQuery => historyFilterQuery({
+  const [startFilter, setStartFilter] = useState<ApplicationStartId | null>(null);
+  const [earlierStarts, setEarlierStarts] = useState<string[]>([]);
+  const [startsError, setStartsError] = useState<string | null>(null);
+  const [lastEventUtcNs, setLastEventUtcNs] = useState<Record<string, string | null>>({});
+  // The starts with History rows, one bounded page, read when the page opens;
+  // then each listed start's last event (one row), one query at a time. A
+  // failed label read leaves that start's fallback label.
+  useEffect(() => {
+    if (!open) return undefined;
+    const request = new AbortController();
+    void (async () => {
+      let starts: string[];
+      try {
+        starts = (await api.history.discovery('application_start_id', '', request.signal)).values;
+      } catch (reason) {
+        if (!request.signal.aborted) setStartsError(reason instanceof Error ? reason.message : String(reason));
+        return;
+      }
+      if (request.signal.aborted) return;
+      setEarlierStarts(starts);
+      setStartsError(null);
+      for (const start of starts) {
+        if (start === applicationStartId) continue;
+        try {
+          const page = await api.history.list({ applicationStartId: start, limit: 1 }, request.signal);
+          if (request.signal.aborted) return;
+          const last = page.events[0]?.event.occurredAtUtcNs ?? null;
+          setLastEventUtcNs((known) => ({ ...known, [start]: last }));
+        } catch {
+          if (request.signal.aborted) return;
+        }
+      }
+    })();
+    return () => request.abort();
+  }, [open, applicationStartId]);
+  const query = historyFilterQuery({
     severity, alarmView, timeWindow, component, eventType, search, operationId,
-    programRunId: currentOnly && currentProgramRunId ? currentProgramRunId : programRunId,
+    programRunId: currentOnly && currentProgramRunId ? String(currentProgramRunId) : programRunId,
+    applicationStartId,
+    startFilter,
     correlations,
   });
   const validSearch = search.trim() === '' || Array.from(search.trim()).length >= 3;
+  // The start a run or operation filter names, else the current start: run
+  // numbers, the run list and rows are read against it.
+  const selectedStart = query?.applicationStartId ?? applicationStartId;
   if (!open) return null;
 
   return (
@@ -165,7 +273,7 @@ export function ExecutionHistoryPanel({
           <h2 id="history-title">Runtime history</h2>
         </div>
         <div className="button-row">
-          {onReload && <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Refresh</button>}
+          {onReload && <button type="button" disabled={loading || !validSearch || query === null} onClick={() => { if (query !== null) onReload(query); }}>Refresh</button>}
           {!embedded && <button type="button" onClick={onClose}>Close</button>}
         </div>
       </header>
@@ -180,6 +288,18 @@ export function ExecutionHistoryPanel({
             <option value="minute">Latest minute</option>
             <option value="five_minutes">Latest 5 minutes</option>
             <option value="hour">Latest hour</option>
+          </select>
+        </label>
+        <label>
+          <span>Start</span>
+          <select
+            value={startFilter ?? ''}
+            title={startFilter ?? applicationStartId ?? undefined}
+            onChange={(event) => setStartFilter(event.target.value === '' ? null : event.target.value)}
+          >
+            {historyStartOptions(applicationStartId, earlierStarts, lastEventUtcNs).map((option) => (
+              <option key={option.value} value={option.value} title={option.title}>{option.label}</option>
+            ))}
           </select>
         </label>
         <label>
@@ -216,7 +336,7 @@ export function ExecutionHistoryPanel({
             value={programRunId}
             disabled={currentOnly && Boolean(currentProgramRunId)}
             onChange={(event) => setProgramRunId(event.target.value)}
-            placeholder="program-run…"
+            placeholder="Run number"
           />
         </label>
         <label>
@@ -224,7 +344,7 @@ export function ExecutionHistoryPanel({
           <input
             value={operationId}
             onChange={(event) => setOperationId(event.target.value)}
-            placeholder="operation…"
+            placeholder="Operation number"
           />
         </label>
         <label>
@@ -255,18 +375,23 @@ export function ExecutionHistoryPanel({
           Current Program run
         </label>
         {onReload && (
-          <button type="button" disabled={loading || !validSearch} onClick={() => onReload(query())}>Apply filters</button>
+          <button type="button" disabled={loading || !validSearch || query === null} onClick={() => { if (query !== null) onReload(query); }}>Apply filters</button>
         )}
       </div>
-      <HistoryDiscovery onSelect={(kind, value) => {
-        if (kind === 'program_run_id') { setCurrentOnly(false); setProgramRunId(value); }
+      <HistoryDiscovery key={selectedStart ?? ''} applicationStartId={selectedStart} onSelect={(kind, value) => {
+        if (kind === 'program_run_id') {
+          setCurrentOnly(false);
+          setProgramRunId(selectedStart !== null && selectedStart !== (startFilter ?? applicationStartId)
+            ? fullId(selectedStart, 'run', Number(value)) : value);
+        }
         else if (kind === 'component') setComponent(value);
         else if (kind === 'event_type') setEventType(value);
         else setCorrelations({ ...correlations, channel: value });
       }} />
-      {validSearch && <p>
-        <a href={api.history.exportUrl(query())} download="manyforge-debug.json">Export filtered diagnostic bundle</a>
-        {' · '}<a href={api.history.exportUrl(query(), true)} download="manyforge-trace.json">Normalized trace</a>
+      {startsError && <p role="alert" className="error-state notice severity-error">{startsError}</p>}
+      {validSearch && query !== null && <p>
+        <a href={api.history.exportUrl(query)} download="manyforge-debug.json">Export filtered diagnostic bundle</a>
+        {' · '}<a href={api.history.exportUrl(query, true)} download="manyforge-trace.json">Normalized trace</a>
         {' '}<span className="muted">Up to 256 retained events; coverage and continuation are included.</span>
       </p>}
       <details className="history-correlation-filters">
@@ -289,6 +414,9 @@ export function ExecutionHistoryPanel({
         <summary>Retention and recorded-time coverage</summary>
         <p className="muted">Bounded local history, not a permanent archive. Important events and routine progress have independent limits. Export evidence before it is pruned.</p>
         {!retention.priorPruningKnown && <p className="muted">Legacy history did not retain pruning counts; coverage before this migration is unknown.</p>}
+        {retention.olderHistoryFiles.map((file) => <p key={file.fileName} className="muted">
+          Earlier history{file.format === null ? '' : ` (format ${file.format})`} is in <code>{file.fileName}</code> and is not shown here.
+        </p>)}
         {retention.partitions.map((part) => <p key={part.partition}>
           <strong>{part.partition}</strong>: {part.retainedCount} retained; {part.prunedCount} pruned{part.lossCounterSaturated ? ' (at least)' : ''}.
           {' '}Recorded UTC: {part.firstRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.firstRecordedUtcNs) / 1_000_000n)).toISOString()}
@@ -323,7 +451,11 @@ export function ExecutionHistoryPanel({
               <strong>{event.message || event.type}</strong>
               <time title={event.timestamp ? `Original recorded wall time: ${event.timestamp}` : undefined}>{eventTime(event)}{event.wallClockRegressed ? ' · clock moved backward' : ''}</time>
             </header>
-            <small>{event.channel} · {event.type}</small>
+            <small>
+              {event.channel} · {event.type}
+              {event.applicationStartId !== undefined && event.applicationStartId !== selectedStart
+                && <> · start {event.applicationStartId.slice(0, 4)}</>}
+            </small>
           </button>
         ))}
         {(hasNewer || hasOlder) && (

@@ -9,7 +9,6 @@ import pytest
 from manyforge_headless_api.control_dispatch import HeadlessExecutionControlDispatch
 from manyforge_headless_api.control_protocol import (
     EXECUTION_COMMAND_SCHEMA,
-    MAXIMUM_U64,
     ControlFreshnessAuthority,
     ControlProtocolError,
     ExecutionCommandRequestDTO,
@@ -17,6 +16,9 @@ from manyforge_headless_api.control_protocol import (
     ExecutionIngressStamp,
 )
 from manyforge_headless_api.execution_control import ExecutionControlIngress
+from manyforge_headless_api.identity import RequestAdmission
+
+APPLICATION_START_ID = "3f9a0000000000a1"
 
 
 @dataclass
@@ -33,7 +35,6 @@ def _ingress(
     stamps: list[ExecutionIngressStamp] = []
     authority = ControlFreshnessAuthority(
         clock_ns=clock,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
 
@@ -43,7 +44,6 @@ def _ingress(
             ExecutionIngressResult(
                 disposition="received",
                 code=f"{request.command_envelope.command_kind}_received",
-                semantic_owner_epoch="runner.1",
                 execution_control_revision=7,
                 current_identity={"cycle_generation": 3},
             ),
@@ -52,8 +52,9 @@ def _ingress(
 
     return (
         ExecutionControlIngress(
-            projection=lambda: ("runner.1", 7),
+            projection=lambda: 7,
             dispatch=dispatch,
+            application_start_id=APPLICATION_START_ID,
             authority=authority,
             clock_ns=clock,
         ),
@@ -65,24 +66,41 @@ def _request(
     ingress: ExecutionControlIngress,
     *,
     kind: str = "program_run",
-    correlation: str = "request.1",
+    client_sequence: int = 1,
+    session: bool = True,
+    payload: dict[str, Any] | None = None,
 ) -> ExecutionCommandRequestDTO:
+    """A WebSocket command of session 1 by default; ``session=False`` is the
+    session-less (HTTP) form."""
+
     freshness = ingress.current_freshness()
     return ExecutionCommandRequestDTO.model_validate(
         {
             "command_envelope": {
                 "schema_version": EXECUTION_COMMAND_SCHEMA,
                 "command_kind": kind,
-                "correlation_id": correlation,
                 "source_label": "test",
-                "control_session_id": None,
-                "client_sequence": None,
+                "control_session_number": 1 if session else None,
+                "client_sequence": str(client_sequence) if session else None,
                 "freshness": freshness.model_dump(mode="json"),
-                "expected_semantic_owner_epoch": "runner.1",
                 "expected_execution_control_revision": 7,
             },
-            "payload": {},
+            "payload": {} if payload is None else payload,
         }
+    )
+
+
+def _dispatch(service: Any) -> HeadlessExecutionControlDispatch:
+    return HeadlessExecutionControlDispatch(
+        service, RequestAdmission(APPLICATION_START_ID)
+    )
+
+
+def _stamp(transport_kind: str = "websocket") -> ExecutionIngressStamp:
+    return ExecutionIngressStamp(
+        transport_kind=transport_kind,  # type: ignore[arg-type]
+        received_server_sequence=1,
+        received_monotonic_ns=1,
     )
 
 
@@ -92,7 +110,7 @@ def test_rest_and_local_adapters_share_one_ingress_and_result_contract() -> None
 
     async def submit_rest():
         return await ingress.submit(
-            _request(ingress, correlation="request.rest"),
+            _request(ingress, client_sequence=1),
             transport_kind="rest",
             trusted_principal_id="operator.1",
             assurance="externally_authenticated",
@@ -100,7 +118,7 @@ def test_rest_and_local_adapters_share_one_ingress_and_result_contract() -> None
 
     async def submit_local():
         return await ingress.submit(
-            _request(ingress, correlation="request.local"),
+            _request(ingress, client_sequence=2),
             transport_kind="local",
             trusted_principal_id="plc.1",
             assurance="configured_local_adapter",
@@ -129,7 +147,7 @@ def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_contain
     clock = _Clock()
     ingress, stamps = _ingress(clock)
     ordinary = _request(ingress, kind="program_run")
-    stop = _request(ingress, kind="program_stop", correlation="request.stop")
+    stop = _request(ingress, kind="program_motion_stop", client_sequence=2)
     clock.now_ns += ordinary.command_envelope.freshness.valid_for_ns + 1
 
     async def exercise():
@@ -144,7 +162,7 @@ def test_expired_ordinary_command_fails_before_dispatch_but_stop_remains_contain
         ingress.close()
 
     assert expired.value.code == "control_freshness_expired"
-    assert contained.receipt.code == "program_stop_received"
+    assert contained.receipt.code == "program_motion_stop_received"
     assert len(stamps) == 1
     assert stamps[0].transport_kind == "local"
     assert stamps[0].valid_until_monotonic_ns is None
@@ -174,23 +192,21 @@ def test_stop_is_stamped_at_lane_admission_without_a_program_projection_read() -
     stamps: list[ExecutionIngressStamp] = []
     authority = ControlFreshnessAuthority(
         clock_ns=clock,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
 
-    def projection() -> tuple[str, int]:
+    def projection() -> int:
         nonlocal projection_calls
         projection_calls += 1
         clock.now_ns += 100_000_000
-        return "runner.1", 7
+        return 7
 
     def dispatch(_request, stamp):
         stamps.append(stamp)
         return (
             ExecutionIngressResult(
                 disposition="received",
-                code="program_stop_received",
-                semantic_owner_epoch="runner.1",
+                code="program_motion_stop_received",
                 execution_control_revision=7,
             ),
             None,
@@ -199,10 +215,11 @@ def test_stop_is_stamped_at_lane_admission_without_a_program_projection_read() -
     ingress = ExecutionControlIngress(
         projection=projection,
         dispatch=dispatch,
+        application_start_id=APPLICATION_START_ID,
         authority=authority,
         clock_ns=clock,
     )
-    stop = _request(ingress, kind="program_stop", correlation="request.stop")
+    stop = _request(ingress, kind="program_motion_stop")
     projection_calls = 0
     clock.now_ns = 2_000_000_000
 
@@ -225,12 +242,13 @@ def test_program_stop_dispatch_never_resamples_program_projection() -> None:
             self.request = None
 
         @staticmethod
-        def program_cycle_status() -> dict[str, Any]:
+        def program_cycle_status(**_kwargs: Any) -> dict[str, Any]:
             raise AssertionError("recognized Stop synchronously read Program state")
 
-        def program_run_motion_stop(self, program_run_id, request):
+        def program_run_motion_stop(self, request, attribution):
+            del attribution
             self.request = request
-            assert program_run_id == "program-run.1"
+            assert request.program_run_id == 1
             return {"accepted": True}
 
     clock = _Clock()
@@ -239,36 +257,24 @@ def test_program_stop_dispatch_never_resamples_program_projection() -> None:
         request = _request(
             ingress,
             kind="program_motion_stop",
-            correlation="request.motion-stop",
-        ).model_copy(
-            update={
-                "payload": {
-                    "request_id": "request.motion-stop",
-                    "program_run_id": "program-run.1",
-                    "expected_owner_epoch": "runner.1",
-                    "reason": "operator Stop",
-                }
-            }
+            client_sequence=4,
+            payload={"program_run_id": 1, "reason": "operator Stop"},
         )
     finally:
         ingress.close()
     service = Service()
-    disposition, result = HeadlessExecutionControlDispatch(service)(  # type: ignore[arg-type]
-        request,
-        ExecutionIngressStamp(
-            transport_kind="websocket",
-            receiver_incarnation="receiver.1",
-            received_server_sequence=1,
-            received_monotonic_ns=1,
-        ),
-    )
+    disposition, result = _dispatch(service)(request, _stamp())
 
     assert disposition.disposition == "received"
-    assert disposition.semantic_owner_epoch == "runner.1"
     assert disposition.execution_control_revision == 7
     assert disposition.current_identity is None
     assert result == {"accepted": True}
     assert service.request is not None
+    # The selection Stop's key is class 0: session 1, client sequence 4.
+    assert service.request.request_key == "00" + "00000000000001" + "0000000000000004"
+    # A WebSocket command's receipt names its key too (OD-214).
+    assert disposition.request_key == service.request.request_key
+    assert disposition.command is None
 
 
 def test_completed_commands_leave_no_live_receipt_history_or_count_limit() -> None:
@@ -278,7 +284,7 @@ def test_completed_commands_leave_no_live_receipt_history_or_count_limit() -> No
     async def exercise() -> None:
         for index in range(2_048):
             submission = await ingress.submit(
-                _request(ingress, correlation=f"request.{index + 1}"),
+                _request(ingress, client_sequence=index + 1),
                 transport_kind="local",
             )
             assert submission.receipt.disposition == "received"
@@ -293,29 +299,6 @@ def test_completed_commands_leave_no_live_receipt_history_or_count_limit() -> No
     assert not hasattr(ingress, "_request_ledger")
 
 
-def test_control_sequences_rotate_together_only_after_the_last_session_closes() -> None:
-    clock = _Clock()
-    ingress, _stamps = _ingress(clock)
-    original_incarnation = ingress.receiver_incarnation
-    ingress.open_control_session()
-    ingress._authority._sequence = MAXIMUM_U64  # noqa: SLF001
-    ingress._received_sequence = MAXIMUM_U64  # noqa: SLF001
-
-    try:
-        with pytest.raises(ControlProtocolError) as blocked:
-            ingress.current_freshness()
-        assert blocked.value.code == "control_sequence_rollover_required"
-        assert ingress.receiver_incarnation == original_incarnation
-
-        ingress.close_control_session()
-        assert ingress.active_control_sessions == 0
-        assert ingress.receiver_incarnation != original_incarnation
-        assert ingress._received_sequence == 0  # noqa: SLF001
-        assert ingress.current_freshness().issued_server_sequence == "1"
-    finally:
-        ingress.close()
-
-
 def test_native_command_uses_projected_execution_owner_fence_and_surfaces_rejection() -> (
     None
 ):
@@ -325,9 +308,8 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
             self.request = None
 
         @staticmethod
-        def program_cycle_status() -> dict[str, Any]:
+        def program_cycle_status(**_kwargs: Any) -> dict[str, Any]:
             return {
-                "program_runner_owner_epoch": "runner.1",
                 "execution_control_revision": 7,
                 "cycle_generation": 3,
                 "program_run_id": None,
@@ -349,23 +331,13 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
     def command() -> ExecutionCommandRequestDTO:
         ingress, _stamps = _ingress(_Clock())
         try:
-            request = _request(
-                ingress,
-                kind="runtime_scale",
-                correlation="request.scale",
-            )
+            request = _request(ingress, kind="runtime_scale", client_sequence=9)
         finally:
             ingress.close()
         return request.model_copy(
             update={
                 "payload": {
-                    "expected_execution_owner_epoch": "kernel.epoch.4",
-                    "request_context": {
-                        "request_id": "request.scale.intent",
-                        "request_owner_epoch": "kernel.epoch.4",
-                        "source_label": "test",
-                        "correlation_id": "request.scale",
-                    },
+                    "request_context": {"source_label": "test"},
                     "selector": {
                         "program_binding_id": "binding.1",
                         "component_id": "controlled_component",
@@ -377,36 +349,25 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
             }
         )
 
-    stamp = ExecutionIngressStamp(
-        transport_kind="websocket",
-        receiver_incarnation="receiver.1",
-        received_server_sequence=1,
-        received_monotonic_ns=1,
-    )
+    stamp = _stamp()
     accepted_service = Service({"ok": True, "accepted": {}})
-    accepted, _ = HeadlessExecutionControlDispatch(accepted_service)(  # type: ignore[arg-type]
-        command(), stamp
-    )
+    accepted, _ = _dispatch(accepted_service)(command(), stamp)
     assert accepted.disposition == "received"
-    assert accepted_service.request.request_context.request_owner_epoch == (
-        "kernel.epoch.4"
+    # The nested context is formed once, here: the session's class 0 key.
+    assert accepted_service.request.request_context.request_key == (
+        "00" + "00000000000001" + "0000000000000009"
     )
-    assert accepted_service.request.request_context.request_id == (
-        "request.scale.intent"
-    )
-    assert accepted_service.request.request_context.correlation_id == ("request.scale")
+    assert accepted_service.request.request_context.source_label == "test"
 
     rejected_service = Service(
         {
             "ok": False,
-            "error": {"code": "stale_request_owner_epoch", "message": "stale"},
+            "error": {"code": "request_id_conflict", "message": "conflict"},
         }
     )
-    rejected, result = HeadlessExecutionControlDispatch(rejected_service)(  # type: ignore[arg-type]
-        command(), stamp
-    )
+    rejected, result = _dispatch(rejected_service)(command(), stamp)
     assert rejected.disposition == "rejected"
-    assert rejected.code == "stale_request_owner_epoch"
+    assert rejected.code == "request_id_conflict"
     assert result == rejected_service.result
 
 
@@ -417,7 +378,6 @@ def test_native_command_uses_projected_execution_owner_fence_and_surfaces_reject
         ("operation_acknowledge_completed", "current"),
         ("operation_reset", "other_operation"),
         ("operation_reset", "old_revision"),
-        ("operation_reset", "old_owner"),
         ("operation_reset", "retired"),
         ("operation_reset", "not_allowed"),
         ("operation_reset", "recovery"),
@@ -428,12 +388,11 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
 
     class Service:
         @staticmethod
-        def program_cycle_status():
+        def program_cycle_status(**_kwargs):
             return {
-                "program_runner_owner_epoch": "runner.1",
                 "execution_control_revision": 7,
                 "cycle_generation": 3,
-                "program_run_id": "program.1",
+                "program_run_id": 1,
                 "state": "recovery_required" if case == "recovery" else "running",
                 "allowed_commands": [
                     {
@@ -448,17 +407,15 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
         def execution_control_state():
             calls.append("projection")
             return {
-                "identity": {
-                    "owner_epoch": "old" if case == "old_owner" else "kernel.1"
-                },
+                "identity": {"application_start_id": "3f9a0000000000a1"},
                 "control_state": {
-                    "schema_version": "manyforge.execution_control_state.v7",
+                    "schema_version": "manyforge.execution_control_state.v8",
                     "manual_operations": [
                         {
                             "resident": case != "retired",
                             "operation": {
                                 "operation_id": (
-                                    "other" if case == "other_operation" else "manual.1"
+                                    8 if case == "other_operation" else 7
                                 ),
                                 "operation_revision": (
                                     2 if case == "old_revision" else 3
@@ -473,35 +430,29 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
         def execute_control(request, attribution):
             del attribution
             calls.append("effect")
-            assert request.operation_id == "manual.1"
+            assert request.operation_id == 7
             assert request.expected_operation_revision == 3
-            assert request.request_context.request_owner_epoch == "kernel.1"
+            assert request.request_context.request_key == (
+                "00" + "00000000000001" + "0000000000000001"
+            )
             return {"ok": True, "accepted": {}}
 
         execution_reset = execution_acknowledge_completed = execute_control
 
     ingress, _ = _ingress(_Clock())
     try:
-        request = _request(ingress, kind=kind).model_copy(
-            update={
-                "payload": {
-                    "expected_execution_owner_epoch": "kernel.1",
-                    "operation_id": "manual.1",
-                    "expected_operation_revision": 3,
-                }
-            }
+        request = _request(
+            ingress,
+            kind=kind,
+            payload={
+                "request_context": {"source_label": "test"},
+                "operation_id": 7,
+                "expected_operation_revision": 3,
+            },
         )
     finally:
         ingress.close()
-    result, _ = HeadlessExecutionControlDispatch(Service())(
-        request,
-        ExecutionIngressStamp(
-            transport_kind="websocket",
-            receiver_incarnation="receiver.1",
-            received_server_sequence=1,
-            received_monotonic_ns=1,
-        ),
-    )
+    result, _ = _dispatch(Service())(request, _stamp())
     # Like Stop, a Reset resolves to the operation's current revision.
     if case in {"current", "recovery", "old_revision"}:
         assert result.disposition == "received"
@@ -521,12 +472,11 @@ def test_held_manual_start_requires_context_and_native_decision(context_present)
 
     class Service:
         @staticmethod
-        def program_cycle_status():
+        def program_cycle_status(**_kwargs):
             return {
-                "program_runner_owner_epoch": "runner.1",
                 "execution_control_revision": 7,
                 "cycle_generation": 3,
-                "program_run_id": "program.1",
+                "program_run_id": 1,
                 "state": "running",
                 "allowed_commands": [
                     {
@@ -546,30 +496,18 @@ def test_held_manual_start_requires_context_and_native_decision(context_present)
             return {"ok": False, "error": {"code": "manual_handover_scope_stale"}}
 
     payload = _direct_command_request().model_dump(mode="json")
-    payload["expected_execution_owner_epoch"] = "kernel.1"
     if context_present:
         payload["manual_handover"] = {
-            "program_runner_owner_epoch": "runner.1",
-            "program_run_id": "program.1",
+            "program_run_id": 1,
             "claim_generation": 1,
-            "selection_revision": 0,
+            "hold_revision": 0,
         }
     ingress, _ = _ingress(_Clock())
     try:
-        request = _request(ingress, kind="operation_start").model_copy(
-            update={"payload": payload}
-        )
+        request = _request(ingress, kind="operation_start", payload=payload)
     finally:
         ingress.close()
-    result, _ = HeadlessExecutionControlDispatch(Service())(
-        request,
-        ExecutionIngressStamp(
-            transport_kind="websocket",
-            receiver_incarnation="receiver.1",
-            received_server_sequence=1,
-            received_monotonic_ns=1,
-        ),
-    )
+    result, _ = _dispatch(Service())(request, _stamp())
     assert result.disposition == "rejected"
     assert result.code == (
         "manual_handover_scope_stale" if context_present else "manual_handover_required"
@@ -583,15 +521,14 @@ def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decisi
 
     submitted = []
     native_result = (
-        {"ok": True, "accepted": {"operation_id": "manual.pneumatic"}}
+        {"ok": True, "accepted": {"operation_id": 5}}
         if native_ok else {"ok": False, "error": {"code": "component_not_ready"}}
     )
 
     class Service:
         @staticmethod
-        def program_cycle_status():
+        def program_cycle_status(**_kwargs):
             return {
-                "program_runner_owner_epoch": "runner.1",
                 "execution_control_revision": 7,
                 "cycle_generation": 3,
                 "program_run_id": None,
@@ -613,21 +550,12 @@ def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decisi
             return native_result
 
     payload = _direct_command_request().model_dump(mode="json")
-    payload["expected_execution_owner_epoch"] = "kernel.1"
     ingress, _ = _ingress(_Clock())
     try:
-        request = _request(ingress, kind="operation_start").model_copy(
-            update={"payload": payload}
-        )
+        request = _request(ingress, kind="operation_start", payload=payload)
     finally:
         ingress.close()
-    result, response = HeadlessExecutionControlDispatch(Service())(
-        request,
-        ExecutionIngressStamp(
-            transport_kind="websocket", receiver_incarnation="receiver.1",
-            received_server_sequence=1, received_monotonic_ns=1,
-        ),
-    )
+    result, response = _dispatch(Service())(request, _stamp())
     assert len(submitted) == 1
     forwarded = submitted[0][0].model_dump(mode="json")
     assert forwarded["participants"] == payload["participants"]
@@ -637,7 +565,9 @@ def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decisi
     ):
         assert forwarded[key] == payload[key]
     assert forwarded.get("manual_handover") is None
-    assert forwarded["request_context"]["request_owner_epoch"] == "kernel.1"
+    assert forwarded["request_context"]["request_key"] == (
+        "00" + "00000000000001" + "0000000000000001"
+    )
     assert response is native_result
     assert result.disposition == ("received" if native_ok else "rejected")
     assert result.code == (
@@ -652,15 +582,116 @@ def test_reset_join_requires_exact_accepted_options(accepted, requested):
     ingress, _stamps = _ingress(clock)
     try:
         request = _request(ingress, kind="program_reset").model_copy(update={"payload": {
-            "program_run_id": None, "expected_owner_epoch": "runner.1", "expected_cycle_generation": 3,
+            "program_run_id": None, "expected_cycle_generation": 3,
             "reload_initial_scene": requested[0], "reset_robot_position": requested[1],
         }})
-        cycle = {"program_runner_owner_epoch": "runner.1", "execution_control_revision": 7,
+        cycle = {"execution_control_revision": 7,
                  "cycle_generation": 3, "program_run_id": None, "state": "resetting",
                  "reset_options": {"reload_initial_scene": accepted[0], "reset_robot_position": accepted[1]}}
-        disposition, projection = HeadlessExecutionControlDispatch(object())._reduce_unavailable(request, cycle, None)
+        disposition, projection = _dispatch(object())._reduce_unavailable(request, cycle, None)
         assert disposition.disposition == ("joined" if accepted == requested else "rejected")
         assert disposition.code == ("program_reset_already_current" if accepted == requested else "program_run_request_conflict")
         assert projection == {"program_cycle": cycle}
     finally:
         ingress.close()
+
+
+def test_receipt_names_the_formed_key_and_the_runner_row() -> None:
+    """Every forwarded command's receipt names the key it was forwarded with
+    (BS 2.8; OD-214: WebSocket commands too) and a runner command's row."""
+
+    class Service:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        @staticmethod
+        def program_cycle_status(**_kwargs: Any) -> dict[str, Any]:
+            return {
+                "execution_control_revision": 7,
+                "cycle_generation": 3,
+                "program_run_id": None,
+                "state": "idle_after_reset",
+                "allowed_commands": [
+                    {"command_kind": "program_run", "allowed": True, "disabled_reason": None}
+                ],
+            }
+
+        def program_run_start(self, request):
+            self.requests.append(request)
+            # The runner's reply at acceptance (OD-214): the row it took.
+            return {
+                "schema_version": "manyforge.program_command_reply.v1",
+                "command": {
+                    "kind": "start",
+                    "request_key": request.request_key,
+                    "step": "admitting",
+                    "accepted_at_ns": "1763112345678901234",
+                    "end": None,
+                },
+            }
+
+        def execution_stop_all(self, request, attribution):
+            del attribution
+            self.requests.append(request)
+            return {"ok": True, "accepted": {}}
+
+    service = Service()
+    dispatch = _dispatch(service)
+    ingress = ExecutionControlIngress(
+        projection=lambda: 7,
+        dispatch=dispatch,
+        application_start_id=APPLICATION_START_ID,
+        authority=ControlFreshnessAuthority(clock_ns=_Clock(), secret=b"x" * 32),
+        clock_ns=_Clock(),
+    )
+    digest = "sha256:" + "a" * 64
+    run = {
+        "scenario_id": "cell.demo",
+        "source_document_digest": digest,
+        "expected_applied_record_digest": digest,
+        "draft_program_revision": digest,
+    }
+    client_key = "ff" + "0123456789abcd" + "0011223344556677"
+
+    async def exercise():
+        rest = await ingress.submit(
+            _request(ingress, session=False, payload={**run, "request_key": client_key}),
+            transport_kind="rest",
+        )
+        websocket = await ingress.submit(
+            _request(ingress, client_sequence=3, payload=run),
+            transport_kind="websocket",
+        )
+        stop = await ingress.submit(
+            _request(
+                ingress,
+                kind="stop_all",
+                session=False,
+                payload={"request_context": {"source_label": "test"}},
+            ),
+            transport_kind="rest",
+        )
+        return rest, websocket, stop
+
+    try:
+        rest, websocket, stop = asyncio.run(exercise())
+    finally:
+        ingress.close()
+
+    # Class 3, part 0: the client's bytes 1-15 with byte 0 overwritten.
+    assert rest.receipt.request_key == "c0" + client_key[2:]
+    assert service.requests[0].request_key == rest.receipt.request_key
+    # Both receipts carry the runner's row, found again by the same key.
+    assert rest.receipt.schema_version == "manyforge.execution_command_receipt.v3"
+    assert rest.receipt.disposition == "received"
+    assert rest.receipt.command == rest.result["command"]
+    assert rest.receipt.command["request_key"] == rest.receipt.request_key
+    assert websocket.receipt.request_key == "00" + "00000000000001" + "0000000000000003"
+    assert service.requests[1].request_key == websocket.receipt.request_key
+    assert websocket.receipt.command["request_key"] == websocket.receipt.request_key
+    # A Stop without a key acts with a fresh Headless key: class 1, minter 5.
+    key = stop.receipt.request_key
+    assert stop.receipt.command is None
+    assert key is not None and key[:16] == "40" + "00000000000005"
+    assert int(key[16:], 16) >= 1
+    assert service.requests[2].request_context.request_key == key

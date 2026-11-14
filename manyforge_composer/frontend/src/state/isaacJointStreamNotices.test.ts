@@ -21,7 +21,6 @@ function sceneRuntimeSection(): HeadlessSourceSection {
     knownGaps: wire.known_gaps as string[],
     payload: payload,
     sourceGeneration: wire.source_generation as number | null,
-    sourceOwnerEpoch: wire.source_owner_epoch as string | null,
     sourceOwnerId: wire.source_owner_id as string | null,
     receiverAgeNs: wire.receiver_age_ns as number | null,
   };

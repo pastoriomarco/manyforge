@@ -183,7 +183,7 @@ class RecordingReceiver final : public IStopControlWorkReceiver {
 TEST(BoundedStopControlExecutorTest, ConstructionPublishesReadinessAndEnforcesFixedCapacity) {
   SteadyClock clock;
   RecordingReceiver receiver;
-  EXPECT_THROW(BoundedStopControlExecutor(1U, clock, receiver), std::invalid_argument);
+  EXPECT_THROW(BoundedStopControlExecutor(0U, clock, receiver), std::invalid_argument);
   EXPECT_THROW(BoundedStopControlExecutor(kMaximumStopControlWorkSlots + 1U, clock, receiver),
                std::invalid_argument);
 

@@ -165,7 +165,7 @@ def test_model_sources_resolve_to_the_same_files_from_any_project(tmp_path: Path
 
 
 def test_catalog_route_is_read_only_and_uses_the_draft_project(tmp_path: Path) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     app = FastAPI()
     app.include_router(create_deployment_draft_router(state))
     client = TestClient(app)

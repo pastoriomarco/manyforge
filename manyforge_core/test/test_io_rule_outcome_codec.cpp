@@ -18,7 +18,7 @@ TEST(IoRuleOutcomeCodecTest, PreservesFullWidthUsedValuesAndIndependentStopFacts
   ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   EXPECT_EQ(decoded.value(), outcomes);
   const auto& actual = decoded.value().front();
-  EXPECT_EQ(actual.stop_result, StopCertificateResultDTO::kSucceededEscalated);
+  EXPECT_EQ(actual.stop_result, StopEventResult::kStoppedEscalated);
   EXPECT_EQ(actual.terminal_cause, MotionExecutionTerminalCause::kSignalTrip);
   EXPECT_EQ(actual.evidence.trip->blackboard->values.size(), 5U);
   EXPECT_EQ(std::get<std::string>(*actual.evidence.trip->blackboard->values.back()->value).size(),
@@ -47,7 +47,7 @@ TEST(IoRuleOutcomeCodecTest, CausalSignalAndSupportingBlackboardRemainDistinctWi
   auto& trip = *outcome.evidence.trip;
   const InterruptSourceId physical("door.source");
   const IoSourceIncarnation epoch("door.epoch");
-  const IoSourceCursorDTO cursor{outcome.registration.owner_epoch, UINT64_MAX, physical,
+  const IoSourceCursorDTO cursor{UINT64_MAX, physical,
                                  UINT64_MAX};
   trip.source_cursors.push_back(cursor);
   trip.matched_samples.push_back({{{ControllableComponentId("robot.1"), "door"},
@@ -92,7 +92,7 @@ TEST(IoRuleOutcomeCodecTest, CausalSignalAndSupportingBlackboardRemainDistinctWi
 TEST(IoRuleOutcomeCodecTest, RejectsRelabelingNullEntriesAndContradictoryFrames) {
   const auto original = rule_codec_test::State();
   auto state = original;
-  state.participants.front().command_generation = ControllerGoalGeneration(2U);
+  state.participants.front().command_id.generation = 2U;
   EXPECT_FALSE(ValidateIoRuleOutcomeParticipant(state.operation_id, state.operation_revision,
                                                 state.participants.front())
                    .ok());
@@ -119,11 +119,10 @@ TEST(IoRuleOutcomeCodecTest, RejectsRelabelingNullEntriesAndContradictoryFrames)
   EXPECT_FALSE(EncodeIoRuleOutcomes(state.participants.front().io_rule_outcomes).ok());
 }
 TEST(IoRuleOutcomeCodecTest, HistoricalOriginPrecedesControlRevisionWithoutRelabeling) {
-  const RequestOwnerEpoch owner("owner.1");
   for (const auto origin : {1U, 2U}) {
     auto state = rule_codec_test::State();
     state.operation_revision = OperationRevision(origin);
-    state.participants.front().io_rule_outcomes = {rule_codec_test::Outcome(state, owner)};
+    state.participants.front().io_rule_outcomes = {rule_codec_test::Outcome(state)};
     const auto original = state.participants.front().io_rule_outcomes;
     const auto before = EncodeIoRuleOutcomes(original);
     ASSERT_TRUE(before.ok());
@@ -138,7 +137,7 @@ TEST(IoRuleOutcomeCodecTest, HistoricalOriginPrecedesControlRevisionWithoutRelab
     EXPECT_TRUE(ValidateIoRuleOutcomeParticipant(
                     state.operation_id, state.operation_revision, participant.participant_id,
                     participant.controllable_component_id, participant.command_target_id,
-                    participant.command_id, participant.command_generation,
+                    participant.command_id,
                     participant.io_rule_outcomes).ok());
     const auto after = EncodeIoRuleOutcomes(state.participants.front().io_rule_outcomes);
     ASSERT_TRUE(after.ok());
@@ -149,8 +148,8 @@ TEST(IoRuleOutcomeCodecTest, HistoricalOriginPrecedesControlRevisionWithoutRelab
     const auto& scope = std::get<IoOperationRuleScopeDTO>(decoded.value().front().registration.scope);
     EXPECT_EQ(scope.operation_revision, OperationRevision(origin));
     EXPECT_EQ(scope.controller_goal_id, state.participants.front().command_id);
-    EXPECT_EQ(scope.controller_goal_generation,
-              state.participants.front().command_generation);
+    EXPECT_EQ(scope.controller_goal_id.generation,
+              state.participants.front().command_id.generation);
   }
 }
 TEST(IoRuleOutcomeCodecTest, HistoricalContainmentRejectsZeroFutureAndForeignIdentities) {
@@ -171,10 +170,10 @@ TEST(IoRuleOutcomeCodecTest, HistoricalContainmentRejectsZeroFutureAndForeignIde
     EXPECT_FALSE(valid(state));
   }
   state = historical;
-  state.operation_id = OperationId("foreign.operation");
+  state.operation_id = OperationNumber(1001U);
   EXPECT_FALSE(valid(state));
   state = historical;
-  state.participants.front().participant_id = OperationParticipantId("foreign.participant");
+  state.participants.front().participant_id = OperationParticipantId{OperationNumber(902U), 1U};
   EXPECT_FALSE(valid(state));
   state = historical;
   state.participants.front().controllable_component_id = ControllableComponentId("foreign.robot");
@@ -183,10 +182,10 @@ TEST(IoRuleOutcomeCodecTest, HistoricalContainmentRejectsZeroFutureAndForeignIde
   state.participants.front().command_target_id = CommandTargetId("foreign.target");
   EXPECT_FALSE(valid(state));
   state = historical;
-  state.participants.front().command_id = ControllerGoalId("foreign.goal");
+  state.participants.front().command_id = ControllerGoalId{OperationNumber(901U), 1U, 1U};
   EXPECT_FALSE(valid(state));
   state = historical;
-  state.participants.front().command_generation = ControllerGoalGeneration(2U);
+  state.participants.front().command_id.generation = 2U;
   EXPECT_FALSE(valid(state));
 }
 TEST(IoRuleOutcomeCodecTest, ClosedDecoderRejectsCoercionOverflowAndExtraFields) {

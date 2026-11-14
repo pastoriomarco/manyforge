@@ -10,7 +10,11 @@ namespace manyforge::core {
 
 /// Process-wide "something an events reader sees may have changed" signal:
 /// raised after every committed operation-journal write, after a global rule
-/// state projection or catalog install, and by the execution host's
+/// state projection or catalog install, after every Kernel change of a
+/// Program-run fence fact (claim run, capture, Stop install, terminal,
+/// release, selection revision, retire to ended), after the unlock of every
+/// Kernel section that changes an operation's state, residence or pending
+/// control (`KernelStateMutex`), and by the execution host's
 /// carried-object-lost store. The event stream writers wait on it instead of
 /// polling. A spurious raise only costs one re-read.
 class ExecutionEventChangeSignal final {

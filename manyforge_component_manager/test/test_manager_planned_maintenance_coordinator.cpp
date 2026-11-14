@@ -49,19 +49,19 @@ ManagedRow(const std::string &runtime_unit_id,
       ContentDigest(std::string(kDigestOne)),
       ContentDigest(std::string(kDigestTwo)),
       std::move(dependencies),
-      {RuntimeRoleId("manager_fixture")},
+      {RuntimeRoleId("ros2_control_execution")},
       EndpointRoleId("status"),
-      "manyforge.reference-runtime-status",
+      "manyforge.ros2_control_execution.status",
       "status-revision-1",
       "private-controller",
-      "manyforge.posix_sh.retained_script",
+      "manyforge.installed_execution_target",
       "adapter-revision-1",
       "retained-raw-artifact",
       "retrieval-revision-1",
       ContentDigest(std::string(kDigestThree)),
       1U,
       "linux",
-      "posix.1-2017",
+      "manyforge.ros2_control_execution_host.abi.v1",
       requirement.value(),
       qualified.offer().offer_digest,
   };
@@ -78,7 +78,7 @@ ManagedRow(const std::string &runtime_unit_id,
       ActiveBundlePublicationReceiptDTO{
           ActiveBundlePublicationRequestDTO{
               NamedApplyPublicationTransactionDTO{
-                  ApplyId("apply.active"), ApplyGeneration(1U)},
+                  ApplyId(9U), ApplyGeneration(1U)},
               projection,
               projection.retained_bundle_id,
               projection.graph_revision,
@@ -248,16 +248,15 @@ public:
 };
 
 [[nodiscard]] ManagerApplyIntentDTO Intent(
-    std::string apply_id = "apply-1",
+    const std::uint64_t apply_id = 1U,
     const std::uint64_t generation = 1U) {
   return {
       PublicRequestContextDTO{
-          RequestId("request-1"),
-          RequestOwnerEpoch("owner-epoch-1"),
+          RequestKey::Make(RequestKeyClass::kInternal, 0U,
+                           static_cast<std::uint64_t>(RequestKeyMinter::kManager), 1U),
           "component-manager-test",
-          std::optional<std::string>("correlation-1"),
       },
-      ApplyId(std::move(apply_id)),
+      ApplyId(apply_id),
       ApplyGeneration(generation),
       CellId("cell-1"),
       ProjectionRevisionDTO{
@@ -548,7 +547,7 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   // A content observed absent outside a planned transition is contained fault
   // evidence: the read surface must report it and must never restart it.
   static_cast<void>(fixture.ports_.EnsureStopped(RuntimeUnitConvergenceQueryDTO{
-      ApplyId("apply.active"),
+      ApplyId(9U),
       ApplyGeneration(1U),
       RetainedBundleId("bundle.active"),
       GraphRevision("graph.active"),

@@ -254,7 +254,7 @@ namespace {
 /// What a stale stream means is the lane's. A simulated robot's
 /// or tool's stream going stale is simulator state (a warning that clears by
 /// itself); on every other lane it faults the component.
-std::pair<core::StreamSeverityDTO, core::StreamRecoveryDTO> retained_component_stream_meaning(
+core::StreamSeverityDTO retained_component_stream_meaning(
     const deployment::ros2_control_execution_runtime_contract::Configuration
         &configuration,
     const core::ControllableComponentId &component) {
@@ -262,8 +262,8 @@ std::pair<core::StreamSeverityDTO, core::StreamRecoveryDTO> retained_component_s
       configuration.controller_profiles.begin(), configuration.controller_profiles.end(),
       [&](const auto &row) { return row.controllable_component_id == component; });
   if (profile != configuration.controller_profiles.end() && profile->lane == "isaac")
-    return {core::StreamSeverityDTO::kWarning, core::StreamRecoveryDTO::kAuto};
-  return {core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck};
+    return core::StreamSeverityDTO::kWarning;
+  return core::StreamSeverityDTO::kFault;
 }
 
 } // namespace
@@ -276,11 +276,11 @@ RetainedMeasuredJointStateLane retained_measured_joint_state_lane(
   const auto &row = retained_component_stream(
       configuration, component,
       deployment::ros2_control_execution_runtime_contract::kMeasuredJointsStreamId);
-  const auto [severity, recovery] = retained_component_stream_meaning(configuration, component);
+  const auto severity = retained_component_stream_meaning(configuration, component);
   return RetainedMeasuredJointStateLane{
       std::move(absolute_topic), row.budget_ns,
       core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId), severity, recovery, std::nullopt};
+      std::string(kMeasuredJointStateProfileId), severity, std::nullopt};
 }
 
 core::Duration retained_ros2_control_motion_state_budget_ns(
@@ -486,8 +486,7 @@ void configure_retained_gripper_output_mode(
         deployment::ros2_control_execution_runtime_contract::kGripperFeedbackStreamId);
     config.gripper->state_freshness_timeout_s =
         static_cast<double>(feedback.budget_ns) / 1e9;
-    std::tie(config.gripper->feedback_stream_severity,
-             config.gripper->feedback_stream_recovery) =
+    config.gripper->feedback_stream_severity =
         retained_component_stream_meaning(configuration,
                                           binding.value().controllable_component_id);
   }
@@ -638,6 +637,13 @@ make_retained_mock_ros2_control_backend_config(
         compiled_joints[index], found->second);
   }
   return config;
+}
+
+core::Duration retained_lane_hard_stop_completion_timeout_ns(const ModelLaneRow &row) {
+  constexpr std::string_view key = "hard_stop_completion_timeout_s";
+  if (!row.adapter_keys.contains(key)) return 0;
+  // The same conversion as `participant.stop.hard_stop_completion_timeout_ns`.
+  return static_cast<core::Duration>(row_number(row, key) * 1e9);
 }
 
 RealLaneRowGates real_lane_row_gates(const ModelLaneRow &row) {

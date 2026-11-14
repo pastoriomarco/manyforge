@@ -8,17 +8,7 @@ constexpr std::int64_t kPageSizeBytes = 4096;
 constexpr std::int64_t kMaximumPageCount =
     kMaximumSceneStoreDatabasePageImageBytes / kPageSizeBytes;
 
-constexpr std::int64_t kExpectedBaseSchemaObjectCardinality = 24;
-
-constexpr std::int64_t kExpectedTransactionSchemaObjectCardinality = 42;
-
-constexpr std::int64_t kExpectedNativeHandoffSchemaObjectCardinality = 66;
-
-constexpr std::int64_t kExpectedBoundedHistorySchemaObjectCardinality = 71;
-
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 60;
-
-constexpr std::int64_t kExpectedInitialSceneSchemaObjectCardinality = 72;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 63;
 
 constexpr std::int64_t kMaximumSchemaObjectCardinality = 80;
 
@@ -182,7 +172,9 @@ SchemaObjects ReadSchemaObjects(sqlite3 *database) {
   return objects;
 }
 
-SchemaObjects BuildExpectedSchemaObjects(const std::int64_t schema_version) {
+/// The current schema: the numbered resources applied in order, as for a new
+/// store.
+SchemaObjects BuildExpectedSchemaObjects() {
   sqlite3 *database = nullptr;
   const auto result = sqlite3_open_v2(
       ":memory:", &database,
@@ -199,35 +191,14 @@ SchemaObjects BuildExpectedSchemaObjects(const std::int64_t schema_version) {
   }
   try {
     Exec(database, detail::kEmbeddedCanonicalEmptySceneSchema);
-    if (schema_version >= kLogicalSceneTransactionStoreSchemaVersion) {
-      Exec(database, detail::kEmbeddedLogicalSceneTransactionMigration);
-    }
-    if (schema_version >= kNativeProjectionHandoffStoreSchemaVersion) {
-      Exec(database, detail::kEmbeddedNativeProjectionHandoffMigration);
-    }
-    if (schema_version >= kBoundedHistoryStoreSchemaVersion) {
-      Exec(database, detail::kEmbeddedBoundedHistoryMigration);
-    }
-    if (schema_version >= kMaintenanceInitializationSchemaVersion) {
-      Exec(database, detail::kEmbeddedMaintenanceInitializationMigration);
-    }
-    if (schema_version >= kInitialSceneBaselineSchemaVersion) {
-      Exec(database, detail::kEmbeddedInitialSceneBaselineMigration);
-    }
+    Exec(database, detail::kEmbeddedLogicalSceneTransactionMigration);
+    Exec(database, detail::kEmbeddedNativeProjectionHandoffMigration);
+    Exec(database, detail::kEmbeddedBoundedHistoryMigration);
+    Exec(database, detail::kEmbeddedMaintenanceInitializationMigration);
+    Exec(database, detail::kEmbeddedInitialSceneBaselineMigration);
     auto objects = ReadSchemaObjects(database);
-    const auto expected_count =
-        schema_version == kCanonicalEmptySceneStoreSchemaVersion
-            ? kExpectedBaseSchemaObjectCardinality
-        : schema_version == kLogicalSceneTransactionStoreSchemaVersion
-            ? kExpectedTransactionSchemaObjectCardinality
-        : schema_version == kNativeProjectionHandoffStoreSchemaVersion
-            ? kExpectedNativeHandoffSchemaObjectCardinality
-        : schema_version == kBoundedHistoryStoreSchemaVersion
-            ? kExpectedBoundedHistorySchemaObjectCardinality
-        : schema_version == kMaintenanceInitializationSchemaVersion
-            ? kExpectedSchemaObjectCardinality
-            : kExpectedInitialSceneSchemaObjectCardinality;
-    if (objects.size() != static_cast<std::size_t>(expected_count)) {
+    if (objects.size() !=
+        static_cast<std::size_t>(kExpectedSchemaObjectCardinality)) {
       throw LogicalSceneOwnerError(
           "embedded logical-scene schema cardinality is invalid");
     }
@@ -239,39 +210,8 @@ SchemaObjects BuildExpectedSchemaObjects(const std::int64_t schema_version) {
   }
 }
 
-const SchemaObjects &ExpectedBaseSchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kCanonicalEmptySceneStoreSchemaVersion);
-  return expected;
-}
-
-const SchemaObjects &ExpectedTransactionSchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kLogicalSceneTransactionStoreSchemaVersion);
-  return expected;
-}
-
-const SchemaObjects &ExpectedNativeHandoffSchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kNativeProjectionHandoffStoreSchemaVersion);
-  return expected;
-}
-
-const SchemaObjects &ExpectedBoundedHistorySchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kBoundedHistoryStoreSchemaVersion);
-  return expected;
-}
-
 const SchemaObjects &ExpectedSchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kLogicalSceneStoreSchemaVersion);
-  return expected;
-}
-
-const SchemaObjects &ExpectedMaintenanceSchemaObjects() {
-  static const SchemaObjects expected =
-      BuildExpectedSchemaObjects(kMaintenanceInitializationSchemaVersion);
+  static const SchemaObjects expected = BuildExpectedSchemaObjects();
   return expected;
 }
 
@@ -309,22 +249,6 @@ void ValidateDigest(const std::string_view value,
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
-
-RequestOwnerEpoch
-CompactedRequestOwnerEpoch(const SceneId &scene_id,
-                           const std::uint64_t request_epoch_generation) {
-  if (scene_id.empty() || request_epoch_generation <= 1U ||
-      request_epoch_generation > kMaximumSafeIntegral) {
-    throw LogicalSceneOwnerIntegrityError(
-        "cannot derive a bounded logical-scene request owner epoch");
-  }
-  const auto epoch_digest = manyforge::content_identity::sha256_digest(
-      "manyforge.scene.request-owner-epoch.v1\n" + scene_id.value() + "\n" +
-      std::to_string(request_epoch_generation));
-  RequestOwnerEpoch epoch("scene-request:" + epoch_digest);
-  ValidateBoundedIdentity(epoch.value(), "compacted request owner epoch");
-  return epoch;
-}
 
 std::int64_t CheckedSafeCounter(const std::uint64_t value,
                                 const std::string_view label) {
@@ -434,9 +358,8 @@ std::string CurrentSchemaArtifactDigest() {
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
-/// Returns the exact Scene-owned current native binding set. A maintenance
-/// completion supplies the complete set; only a pre-UA4 store falls back to
-/// its immutable migration snapshot.
+/// Returns the exact Scene-owned current native binding set: the one of the
+/// latest published maintenance completion, else none.
 [[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
 ActiveExecutionHostBindings(const DurableState &state) {
   for (auto initialization = state.maintenance_initializations.rbegin();
@@ -446,14 +369,7 @@ ActiveExecutionHostBindings(const DurableState &state) {
       return initialization->bindings;
     }
   }
-  const auto &bindings = state.active_execution_host_bindings;
-  if (!std::is_sorted(bindings.begin(), bindings.end(),
-                      core::CanonicalProjectionNativeBindingLess) ||
-      std::adjacent_find(bindings.begin(), bindings.end()) != bindings.end()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "finalized native projection set is not canonical and unique");
-  }
-  return bindings;
+  return {};
 }
 
 } // namespace manyforge::scene::logical_scene_owner_detail
@@ -463,8 +379,7 @@ namespace {
 
 struct StoredSceneIntent final {
   std::uint64_t transaction_sequence;
-  std::string request_owner_epoch;
-  RequestId request_id;
+  RequestKey request_key;
   ContentDigest request_digest;
   std::string request_json;
   ProjectionRevisionDTO prior;
@@ -482,15 +397,10 @@ struct StoredSceneIntent final {
 namespace manyforge::scene::logical_scene_owner_detail {
 
 [[nodiscard]] BoundedHistoryState ReadBoundedHistoryState(sqlite3 *database) {
-  if (ScalarInteger(database, "PRAGMA user_version") <
-      kMaintenanceInitializationSchemaVersion) {
-    return {};
-  }
   Statement statement(
-      database, "SELECT compaction_generation,request_epoch_generation,"
-                "request_owner_epoch,compacted_through_transaction_sequence,"
+      database, "SELECT compaction_generation,"
+                "compacted_through_transaction_sequence,"
                 "compacted_through_owner_event_sequence,"
-                "compacted_structural_completion_count,"
                 "compacted_maintenance_completion_count,"
                 "recovered_through_transaction_sequence,"
                 "checkpoint_retained_bundle_id,"
@@ -513,24 +423,12 @@ namespace manyforge::scene::logical_scene_owner_detail {
   };
   BoundedHistoryState state;
   state.compaction_generation = nonnegative(0, "compaction generation");
-  state.request_epoch_generation = nonnegative(1, "request epoch generation");
-  if (!statement.IsNull(2)) {
-    ValidateBoundedIdentity(statement.Text(2), "stored request owner epoch");
-    state.request_owner_epoch = RequestOwnerEpoch(statement.Text(2));
-  }
   state.compacted_through_transaction_sequence =
-      nonnegative(3, "transaction watermark");
+      nonnegative(1, "transaction watermark");
   state.compacted_through_owner_event_sequence =
-      nonnegative(4, "owner-event watermark");
-  const auto completion_count = nonnegative(5, "structural completion count");
-  if (completion_count > kMaximumMigratedStructuralCompletions) {
-    throw LogicalSceneOwnerIntegrityError(
-        "bounded logical-scene structural completion count exceeds its bound");
-  }
-  state.compacted_structural_completion_count =
-      static_cast<std::size_t>(completion_count);
+      nonnegative(2, "owner-event watermark");
   const auto maintenance_count =
-      nonnegative(6, "maintenance completion count");
+      nonnegative(3, "maintenance completion count");
   if (maintenance_count > kMaximumMaintenanceInitializations) {
     throw LogicalSceneOwnerIntegrityError(
         "bounded logical-scene maintenance completion count exceeds its bound");
@@ -538,27 +436,27 @@ namespace manyforge::scene::logical_scene_owner_detail {
   state.compacted_maintenance_completion_count =
       static_cast<std::size_t>(maintenance_count);
   state.recovered_through_transaction_sequence =
-      nonnegative(7, "recovered transaction watermark");
-  const bool checkpoint_present = !statement.IsNull(8);
-  for (int column = 9; column <= 13; ++column) {
+      nonnegative(4, "recovered transaction watermark");
+  const bool checkpoint_present = !statement.IsNull(5);
+  for (int column = 6; column <= 10; ++column) {
     if (statement.IsNull(column) == checkpoint_present) {
       throw LogicalSceneOwnerIntegrityError(
           "bounded logical-scene checkpoint has partial presence");
     }
   }
   if (checkpoint_present) {
-    const auto revision_id = statement.Integer(11);
+    const auto revision_id = statement.Integer(8);
     if (revision_id <= 0) {
       throw LogicalSceneOwnerIntegrityError(
           "bounded logical-scene checkpoint revision is invalid");
     }
     ProjectionRevisionDTO projection{
-        RetainedBundleId(statement.Text(8)), GraphRevision(statement.Text(9)),
-        SceneRevision{SceneId(statement.Text(10)),
+        RetainedBundleId(statement.Text(5)), GraphRevision(statement.Text(6)),
+        SceneRevision{SceneId(statement.Text(7)),
                       static_cast<std::uint64_t>(revision_id),
-                      ContentDigest(statement.Text(12))}};
+                      ContentDigest(statement.Text(9))}};
     auto snapshot =
-        logical_scene_codec_internal::DecodeSnapshot(statement.Text(13));
+        logical_scene_codec_internal::DecodeSnapshot(statement.Text(10));
     if (!projection.valid() || snapshot.revision != projection.scene_revision) {
       throw LogicalSceneOwnerIntegrityError(
           "bounded logical-scene checkpoint content is inconsistent");
@@ -566,9 +464,7 @@ namespace manyforge::scene::logical_scene_owner_detail {
     state.checkpoint_projection = std::move(projection);
     state.checkpoint_snapshot = std::move(snapshot);
   }
-  if (statement.Integer(14) != 0 || statement.Step() ||
-      (state.request_epoch_generation == 0U) !=
-          !state.request_owner_epoch.has_value() ||
+  if (statement.Integer(11) != 0 || statement.Step() ||
       (state.compaction_generation == 0U) !=
           !state.checkpoint_projection.has_value() ||
       state.checkpoint_projection.has_value() !=
@@ -576,25 +472,9 @@ namespace manyforge::scene::logical_scene_owner_detail {
     throw LogicalSceneOwnerIntegrityError(
         "bounded logical-scene history state violates its closed shape");
   }
-  if (state.compaction_generation == 0U) {
-    if (state.request_epoch_generation != 0U) {
-      throw LogicalSceneOwnerIntegrityError(
-          "uncompacted logical-scene history carries a request epoch");
-    }
-  } else {
-    // Compaction keeps the epoch in force: the bootstrap epoch, or the last
-    // epoch rotated by a store compacted before compaction became transparent.
-    const auto &scene_id = state.checkpoint_projection->scene_revision.scene_id;
-    if (state.compaction_generation >= kMaximumSafeIntegral ||
-        state.request_epoch_generation < 2U ||
-        state.request_epoch_generation > state.compaction_generation + 1U ||
-        (*state.request_owner_epoch != RequestOwnerEpoch(scene_id.value()) &&
-         *state.request_owner_epoch !=
-             CompactedRequestOwnerEpoch(scene_id,
-                                        state.request_epoch_generation))) {
-      throw LogicalSceneOwnerIntegrityError(
-          "compacted logical-scene request epoch is not deterministic");
-    }
+  if (state.compaction_generation >= kMaximumSafeIntegral) {
+    throw LogicalSceneOwnerIntegrityError(
+        "compacted logical-scene history generation is exhausted");
   }
   return state;
 }
@@ -682,31 +562,27 @@ ProjectionRevisionDTO ReadProjectionColumns(const Statement &statement,
 namespace manyforge::scene::logical_scene_owner_detail {
 
 std::optional<StoredSceneOutcome>
-ReadOutcomeForRequest(sqlite3 *database,
-                      const std::string_view request_owner_epoch,
-                      const RequestId &request_id) {
+ReadOutcomeForRequest(sqlite3 *database, const RequestKey &request_key) {
   Statement statement(database,
-                      "SELECT request_owner_epoch,request_id,request_digest,"
+                      "SELECT request_key,request_digest,"
                       "transaction_sequence,success,projection_status,"
                       "attempted_projection_count,error_code,error_message,"
                       "error_details_json FROM logical_scene_request_outcomes "
-                      "WHERE request_owner_epoch=? AND request_id=? LIMIT 2");
-  statement.Bind(1, request_owner_epoch);
-  statement.Bind(2, request_id.value());
+                      "WHERE request_key=? LIMIT 2");
+  statement.Bind(1, request_key);
   if (!statement.Step()) {
     return std::nullopt;
   }
   StoredSceneOutcome outcome{
-      statement.Text(0),
-      RequestId(statement.Text(1)),
-      ContentDigest(statement.Text(2)),
-      statement.IsNull(3)
+      statement.Key(0),
+      ContentDigest(statement.Text(1)),
+      statement.IsNull(2)
           ? std::nullopt
           : std::optional<std::uint64_t>(
-                static_cast<std::uint64_t>(statement.Integer(3))),
-      statement.Integer(4) == 1,
-      DecodeProjectionStatus(statement.Text(5)),
-      static_cast<std::size_t>(statement.Integer(6)),
+                static_cast<std::uint64_t>(statement.Integer(2))),
+      statement.Integer(3) == 1,
+      DecodeProjectionStatus(statement.Text(4)),
+      static_cast<std::size_t>(statement.Integer(5)),
       std::nullopt,
   };
   if (outcome.transaction_sequence.has_value() &&
@@ -715,25 +591,24 @@ ReadOutcomeForRequest(sqlite3 *database,
         "stored scene outcome has a zero transaction sequence");
   }
   if (outcome.success) {
-    if (!statement.IsNull(7) || !statement.IsNull(8) || !statement.IsNull(9)) {
+    if (!statement.IsNull(6) || !statement.IsNull(7) || !statement.IsNull(8)) {
       throw LogicalSceneOwnerIntegrityError(
           "successful scene outcome carries an error");
     }
   } else {
-    if (statement.IsNull(7) || statement.IsNull(8) || statement.IsNull(9)) {
+    if (statement.IsNull(6) || statement.IsNull(7) || statement.IsNull(8)) {
       throw LogicalSceneOwnerIntegrityError(
           "failed scene outcome lacks its error");
     }
     outcome.error = ErrorDTO{
+        statement.Text(6),
         statement.Text(7),
-        statement.Text(8),
-        logical_scene_codec_internal::DecodeErrorDetails(statement.Text(9)),
+        logical_scene_codec_internal::DecodeErrorDetails(statement.Text(8)),
     };
   }
   if (statement.Step() ||
       !core::IsExactLowercaseSha256Digest(outcome.request_digest.value()) ||
-      outcome.request_owner_epoch != request_owner_epoch ||
-      outcome.request_id != request_id ||
+      outcome.request_key != request_key ||
       (outcome.success && (outcome.projection_status !=
                                SceneProjectionCommitStatusDTO::kCommitted ||
                            !outcome.transaction_sequence.has_value() ||
@@ -746,6 +621,38 @@ ReadOutcomeForRequest(sqlite3 *database,
   return outcome;
 }
 
+std::optional<StoredSceneOutcome>
+ReadOutcomeForRequest(const SceneStoreMemory &memory,
+                      const RequestKey &request_key) {
+  const auto found = memory.outcomes.find(request_key);
+  if (found == memory.outcomes.end()) {
+    return std::nullopt;
+  }
+  return found->second;
+}
+
+void BindRequestKey(persistence::SqliteRecord &record, const int index,
+                    const RequestKey &key) {
+  record.BindBlob(index,
+                  std::string_view(
+                      reinterpret_cast<const char *>(key.bytes.data()),
+                      key.bytes.size()));
+}
+
+void BindRequestKey(SizedRow &row, const int index, const RequestKey &key) {
+  row.BindBlob(index, std::string_view(
+                          reinterpret_cast<const char *>(key.bytes.data()),
+                          key.bytes.size()));
+}
+
+std::uint64_t SceneFileBytes(const SceneStoreMemory &memory) {
+  auto bytes = memory.transaction_file_bytes;
+  for (const auto &[sequence, rows] : memory.maintenance_file_bytes) {
+    bytes += rows;
+  }
+  return bytes;
+}
+
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
@@ -754,7 +661,7 @@ namespace {
 std::optional<StoredSceneOutcome>
 ReadOutcomeForSequence(sqlite3 *database,
                        const std::uint64_t transaction_sequence) {
-  Statement key(database, "SELECT request_owner_epoch,request_id FROM "
+  Statement key(database, "SELECT request_key FROM "
                           "logical_scene_transaction_intents WHERE "
                           "transaction_sequence=? LIMIT 2");
   key.Bind(1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
@@ -762,13 +669,12 @@ ReadOutcomeForSequence(sqlite3 *database,
     throw LogicalSceneOwnerIntegrityError(
         "scene outcome lookup has no matching intent");
   }
-  const auto epoch = key.Text(0);
-  const RequestId request_id(key.Text(1));
+  const auto request_key = key.Key(0);
   if (key.Step()) {
     throw LogicalSceneOwnerIntegrityError(
         "scene intent sequence is not unique");
   }
-  return ReadOutcomeForRequest(database, epoch, request_id);
+  return ReadOutcomeForRequest(database, request_key);
 }
 
 struct ProjectionEvidenceState final {
@@ -895,6 +801,39 @@ ReadProjectionEvidenceState(sqlite3 *database,
   return evidence;
 }
 
+// The same summary from the memory rows; the per-row shape checks ran when
+// each result was recorded or, for a reopened store, at open.
+ProjectionEvidenceState
+ReadProjectionEvidenceState(const SceneTransactionRecord &record) {
+  ProjectionEvidenceState evidence;
+  evidence.attempt_count = record.projection_attempt_count;
+  for (const auto state : record.projection_results) {
+    switch (state) {
+    case core::ProjectionCommitResultStateDTO::kCommitted:
+      evidence.any_result_committed = true;
+      evidence.all_results_rollback_proven = false;
+      break;
+    case core::ProjectionCommitResultStateDTO::kRejectedRollbackProven:
+      evidence.all_results_committed = false;
+      break;
+    case core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain:
+      evidence.all_results_committed = false;
+      evidence.all_results_rollback_proven = false;
+      evidence.any_result_uncertain = true;
+      break;
+    case core::ProjectionCommitResultStateDTO::kAccepted:
+      throw LogicalSceneOwnerIntegrityError(
+          "stored projection result state is invalid");
+    }
+    ++evidence.result_count;
+  }
+  if (evidence.result_count == 0U) {
+    evidence.all_results_committed = false;
+    evidence.all_results_rollback_proven = false;
+  }
+  return evidence;
+}
+
 } // namespace
 } // namespace manyforge::scene::logical_scene_owner_detail
 
@@ -911,11 +850,6 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   const auto &bootstrap_projection = durable_state.accepted->target;
   const auto &bootstrap_snapshot = durable_state.accepted->snapshot;
   const auto history = ReadBoundedHistoryState(database);
-  if (history.compacted_structural_completion_count >
-      durable_state.migrated_structural_completions.size()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene checkpoint names absent structural history");
-  }
   std::vector<const MaintenanceInitializationState *> completed_maintenance;
   for (const auto &initialization :
        durable_state.maintenance_initializations) {
@@ -942,11 +876,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
           "logical-scene checkpoint is outside the accepted lineage");
     }
   }
-  const RequestOwnerEpoch request_owner_epoch =
-      history.request_owner_epoch.value_or(
-          RequestOwnerEpoch(bootstrap_snapshot.revision.scene_id.value()));
-  if (request_owner_epoch.empty() ||
-      history.compacted_through_transaction_sequence >= kMaximumSafeIntegral ||
+  if (history.compacted_through_transaction_sequence >= kMaximumSafeIntegral ||
       history.compacted_through_owner_event_sequence >= kMaximumSafeIntegral) {
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene history watermarks cannot admit another record");
@@ -954,7 +884,6 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   SceneTransactionStoreState state{
       replay_projection,
       replay_snapshot,
-      request_owner_epoch,
       history.compacted_through_transaction_sequence + 1U,
       history.compacted_through_owner_event_sequence + 1U,
       0U,
@@ -1015,7 +944,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   std::vector<StoredSceneRecord> records;
   Statement statement(
       database,
-      "SELECT transaction_sequence,request_owner_epoch,request_id,"
+      "SELECT transaction_sequence,request_key,"
       "request_digest,request_json,prior_retained_bundle_id,"
       "prior_graph_revision,prior_scene_id,prior_scene_revision_id,"
       "prior_scene_content_hash,proposed_retained_bundle_id,"
@@ -1047,33 +976,28 @@ ReadSceneTransactionStoreState(sqlite3 *database,
     }
     StoredSceneIntent intent{
         expected_sequence,
-        statement.Text(1),
-        RequestId(statement.Text(2)),
-        ContentDigest(statement.Text(3)),
-        statement.Text(4),
-        ReadProjectionColumns(statement, 5),
-        ReadProjectionColumns(statement, 10),
-        statement.Text(15),
-        statement.IsNull(16)
+        statement.Key(1),
+        ContentDigest(statement.Text(2)),
+        statement.Text(3),
+        ReadProjectionColumns(statement, 4),
+        ReadProjectionColumns(statement, 9),
+        statement.Text(14),
+        statement.IsNull(15)
             ? std::nullopt
-            : std::optional<ContentDigest>(ContentDigest(statement.Text(16))),
-        logical_scene_codec_internal::DecodeSnapshot(statement.Text(17)),
-        DecodeUpdateStatus(statement.Text(18)),
-        static_cast<std::size_t>(statement.Integer(19)),
+            : std::optional<ContentDigest>(ContentDigest(statement.Text(15))),
+        logical_scene_codec_internal::DecodeSnapshot(statement.Text(16)),
+        DecodeUpdateStatus(statement.Text(17)),
+        static_cast<std::size_t>(statement.Integer(18)),
     };
     const auto stored_request =
         logical_scene_codec_internal::DecodeRequest(intent.request_json);
-    if (intent.request_owner_epoch != request_owner_epoch.value() ||
-        intent.request_id.empty() ||
-        !core::IsExactLowercaseSha256Digest(intent.request_digest.value()) ||
+    if (!core::IsExactLowercaseSha256Digest(intent.request_digest.value()) ||
         intent.request_json.empty() ||
         intent.request_json.size() > kMaximumLogicalSceneTransactionBytes ||
         manyforge::content_identity::sha256_digest(
             logical_scene_codec_internal::EncodeRequestDigestInput(
                 stored_request)) != intent.request_digest.value() ||
-        stored_request.request_context.request_owner_epoch.value() !=
-            intent.request_owner_epoch ||
-        stored_request.request_context.request_id != intent.request_id ||
+        stored_request.request_context.request_key != intent.request_key ||
         !ExpectedProjectionAdmitsActive(stored_request, intent.prior) ||
         intent.resolved_operation_json.empty() ||
         intent.resolved_operation_json.size() >
@@ -1163,13 +1087,11 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   }
 
   std::vector<bool> transaction_event_seen(records.size(), false);
-  std::vector<bool> structural_completion_event_seen(
-      durable_state.migrated_structural_completions.size(), false);
   Statement events(
       database,
-      "SELECT owner_event_sequence,event_kind,transaction_sequence,"
-      "structural_completion_sequence FROM logical_scene_owner_events "
-      "WHERE owner_event_sequence>? ORDER BY owner_event_sequence LIMIT 513");
+      "SELECT owner_event_sequence,event_kind,transaction_sequence "
+      "FROM logical_scene_owner_events "
+      "WHERE owner_event_sequence>? ORDER BY owner_event_sequence LIMIT 257");
   events.Bind(1, static_cast<std::int64_t>(
                      history.compacted_through_owner_event_sequence));
   std::uint64_t expected_event_sequence = state.next_owner_event_sequence;
@@ -1190,7 +1112,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
     }
     const auto kind = events.Text(1);
     if (kind == "scene_transaction_intent") {
-      if (events.IsNull(2) || !events.IsNull(3)) {
+      if (events.IsNull(2)) {
         throw LogicalSceneOwnerIntegrityError(
             "scene transaction owner event has invalid referent presence");
       }
@@ -1232,39 +1154,6 @@ ReadSceneTransactionStoreState(sqlite3 *database,
                      history.recovered_through_transaction_sequence) {
         history_sealed = true;
       }
-    } else if (kind == "migrated_structural_completion") {
-      if (!events.IsNull(2) || events.IsNull(3)) {
-        throw LogicalSceneOwnerIntegrityError(
-          "migrated structural event has invalid referent presence");
-      }
-      const auto lineage = events.Integer(3);
-      const auto completion = std::ranges::find_if(
-          durable_state.migrated_structural_completions,
-          [lineage](const MigratedStructuralCompletionState &candidate) {
-            return lineage > 0 && candidate.completion_sequence ==
-                                      static_cast<std::uint64_t>(lineage);
-          });
-      if (completion == durable_state.migrated_structural_completions.end()) {
-        throw LogicalSceneOwnerIntegrityError(
-            "migrated structural event references an absent completion");
-      }
-      const auto index = static_cast<std::size_t>(std::distance(
-          durable_state.migrated_structural_completions.begin(), completion));
-      if (index < history.compacted_structural_completion_count) {
-        throw LogicalSceneOwnerIntegrityError(
-            "migrated structural event repeats compacted history");
-      }
-      if (structural_completion_event_seen[index]) {
-        throw LogicalSceneOwnerIntegrityError(
-            "migrated structural completion event is duplicated");
-      }
-      structural_completion_event_seen[index] = true;
-      state.active_projection = completion->target;
-      if (state.active_snapshot.revision !=
-          state.active_projection.scene_revision) {
-        throw LogicalSceneOwnerIntegrityError(
-            "migrated structural event changes logical-scene content");
-      }
     } else {
       throw LogicalSceneOwnerIntegrityError(
           "logical-scene owner event kind is invalid");
@@ -1277,17 +1166,6 @@ ReadSceneTransactionStoreState(sqlite3 *database,
     if (!transaction_event_seen[index]) {
       throw LogicalSceneOwnerIntegrityError(
           "logical-scene intent lacks its owner-order event");
-    }
-  }
-  for (std::size_t index = 0U;
-       index < durable_state.migrated_structural_completions.size();
-       ++index) {
-    if (index < history.compacted_structural_completion_count) {
-      continue;
-    }
-    if (!structural_completion_event_seen[index]) {
-      throw LogicalSceneOwnerIntegrityError(
-          "migrated structural completion lacks its owner-order event");
     }
   }
   static_cast<void>(apply_maintenance_until(std::nullopt, 0U));
@@ -1310,116 +1188,374 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   return state;
 }
 
-void InsertSceneOutcome(sqlite3 *database,
-                        const std::string_view request_owner_epoch,
-                        const RequestId &request_id,
+// The same replay over the memory rows. Checks of stored bytes (types,
+// encodings, digests of the stored JSON) ran at open; the replay checks stay.
+SceneTransactionStoreState
+ReadSceneTransactionStoreState(const SceneStoreMemory &memory,
+                               const DurableState &durable_state) {
+  if (!durable_state.accepted.has_value() ||
+      !durable_state.finalization_receipt.has_value()) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene transaction history requires finalized bootstrap");
+  }
+  const auto &bootstrap_projection = durable_state.accepted->target;
+  const auto &bootstrap_snapshot = durable_state.accepted->snapshot;
+  const auto &history = memory.history;
+  std::vector<const MaintenanceInitializationState *> completed_maintenance;
+  for (const auto &initialization :
+       durable_state.maintenance_initializations) {
+    if (initialization.publication_receipt.has_value()) {
+      completed_maintenance.push_back(&initialization);
+    }
+  }
+  if (history.compacted_maintenance_completion_count >
+      completed_maintenance.size()) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene checkpoint names absent maintenance history");
+  }
+  ProjectionRevisionDTO replay_projection = bootstrap_projection;
+  LogicalSceneSnapshotDTO replay_snapshot = bootstrap_snapshot;
+  if (history.checkpoint_projection.has_value()) {
+    replay_projection = *history.checkpoint_projection;
+    replay_snapshot = *history.checkpoint_snapshot;
+    if (replay_snapshot.cell_id != bootstrap_snapshot.cell_id ||
+        replay_snapshot.revision.scene_id !=
+            bootstrap_snapshot.revision.scene_id ||
+        replay_snapshot.transaction_sequence >
+            history.compacted_through_transaction_sequence) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene checkpoint is outside the accepted lineage");
+    }
+  }
+  if (history.compacted_through_transaction_sequence >= kMaximumSafeIntegral ||
+      history.compacted_through_owner_event_sequence >= kMaximumSafeIntegral) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene history watermarks cannot admit another record");
+  }
+  SceneTransactionStoreState state{
+      replay_projection,
+      replay_snapshot,
+      history.compacted_through_transaction_sequence + 1U,
+      history.compacted_through_owner_event_sequence + 1U,
+      0U,
+      false,
+      false,
+      std::nullopt,
+      std::nullopt,
+  };
+  std::size_t next_maintenance_completion =
+      history.compacted_maintenance_completion_count;
+  // See the file replay above: completions captured before a committed
+  // transaction precede it, and a no-op revision is not crossed.
+  const auto apply_maintenance_until =
+      [&](const std::optional<ProjectionRevisionDTO> &expected,
+          const std::uint64_t committed_sequence) {
+        while (next_maintenance_completion < completed_maintenance.size()) {
+          const auto &initialization =
+              *completed_maintenance[next_maintenance_completion];
+          const bool captured_before_commit =
+              committed_sequence != 0U &&
+              initialization.authoritative_snapshot.transaction_sequence <
+                  committed_sequence;
+          if (expected.has_value() && state.active_projection == *expected &&
+              !captured_before_commit &&
+              !(initialization.predecessor == state.active_projection &&
+                initialization.target == state.active_projection &&
+                initialization.authoritative_snapshot.transaction_sequence ==
+                    state.active_snapshot.transaction_sequence)) {
+            break;
+          }
+          if (initialization.predecessor != state.active_projection ||
+              initialization.predecessor.scene_revision !=
+                  state.active_snapshot.revision ||
+              initialization.authoritative_snapshot.revision !=
+                  initialization.target.scene_revision ||
+              initialization.authoritative_snapshot.cell_id !=
+                  state.active_snapshot.cell_id ||
+              initialization.authoritative_snapshot.transaction_sequence !=
+                  state.active_snapshot.transaction_sequence ||
+              (initialization.initial_baseline_request_digest.has_value() &&
+               !initialization.initial_baseline_installed)) {
+            throw LogicalSceneOwnerIntegrityError(
+                "maintenance completion does not follow the authoritative "
+                "Scene head");
+          }
+          state.active_projection = initialization.target;
+          state.active_snapshot = initialization.authoritative_snapshot;
+          ++next_maintenance_completion;
+        }
+        return !expected.has_value() || state.active_projection == *expected;
+      };
+  struct ReplayedRecord final {
+    const SceneTransactionRecord *intent;
+    std::optional<StoredSceneOutcome> outcome;
+  };
+  std::vector<ReplayedRecord> records;
+  std::uint64_t expected_sequence = state.next_transaction_sequence;
+  for (const auto &intent : memory.transactions) {
+    if (intent.transaction_sequence <=
+        history.compacted_through_transaction_sequence) {
+      continue;
+    }
+    if (!records.empty() &&
+        (!records.back().outcome.has_value() ||
+         (records.back().outcome->projection_status ==
+              SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+          records.back().intent->transaction_sequence >
+              history.recovered_through_transaction_sequence))) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene history continues after an unresolved or "
+          "desynchronized transaction");
+    }
+    if (intent.transaction_sequence != expected_sequence) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene transaction sequence is not contiguous");
+    }
+    if (intent.required_projection_count > 256U ||
+        intent.proposed.retained_bundle_id != intent.prior.retained_bundle_id ||
+        intent.proposed.graph_revision != intent.prior.graph_revision ||
+        intent.proposed.scene_revision.scene_id !=
+            intent.prior.scene_revision.scene_id ||
+        intent.prior.scene_revision.scene_id !=
+            bootstrap_snapshot.revision.scene_id) {
+      throw LogicalSceneOwnerIntegrityError(
+          "durable logical-scene transaction intent is invalid");
+    }
+    const auto projection_evidence = ReadProjectionEvidenceState(intent);
+    const auto attempts = projection_evidence.attempt_count;
+    const auto results = projection_evidence.result_count;
+    if (attempts > intent.required_projection_count || results > attempts) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene projection evidence cardinality is invalid");
+    }
+    const auto outcome = ReadOutcomeForRequest(memory, intent.request_key);
+    if (!outcome.has_value()) {
+      state.unresolved_transaction_sequence = expected_sequence;
+      if (attempts != 0U || results != 0U ||
+          intent.required_projection_count != 0U) {
+        state.projection_desynchronized = true;
+      }
+      state.unresolved_native_attempt = true;
+    } else {
+      if (outcome->transaction_sequence != expected_sequence ||
+          outcome->request_digest != intent.request_digest ||
+          outcome->attempted_projection_count != attempts ||
+          (outcome->projection_status !=
+               SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+           results != attempts)) {
+        throw LogicalSceneOwnerIntegrityError(
+            "logical-scene outcome does not match its durable intent");
+      }
+      if (outcome->success && attempts != intent.required_projection_count) {
+        throw LogicalSceneOwnerIntegrityError(
+            "successful scene outcome lacks complete projection evidence");
+      }
+      if ((outcome->success && !projection_evidence.all_results_committed &&
+           attempts != 0U) ||
+          (outcome->projection_status ==
+               SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
+           !projection_evidence.all_results_rollback_proven) ||
+          (outcome->projection_status ==
+               SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+           !projection_evidence.any_result_uncertain &&
+           !projection_evidence.any_result_committed && results == attempts)) {
+        throw LogicalSceneOwnerIntegrityError(
+            "scene outcome contradicts its native projection evidence");
+      }
+      if (outcome->projection_status ==
+          SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
+        state.latest_uncertain_transaction_sequence = expected_sequence;
+        if (expected_sequence >
+            history.recovered_through_transaction_sequence) {
+          state.projection_desynchronized = true;
+        }
+      }
+    }
+    records.push_back(ReplayedRecord{&intent, outcome});
+    ++expected_sequence;
+    state.next_transaction_sequence = expected_sequence;
+  }
+  state.resident_transaction_count = records.size();
+  if (records.size() > kMaximumLogicalSceneTransactions) {
+    throw LogicalSceneOwnerLimitError(
+        "logical-scene transaction ledger exceeds its fixed bound");
+  }
+  if (history.recovered_through_transaction_sequence >=
+      state.next_transaction_sequence) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene recovery watermark exceeds durable transaction "
+        "history");
+  }
+
+  std::vector<bool> transaction_event_seen(records.size(), false);
+  std::uint64_t expected_event_sequence = state.next_owner_event_sequence;
+  std::size_t resident_event_count = 0U;
+  bool history_sealed = false;
+  for (const auto &event : memory.owner_events) {
+    if (event.owner_event_sequence <=
+        history.compacted_through_owner_event_sequence) {
+      continue;
+    }
+    if (history_sealed) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene owner history continues after an unresolved or "
+          "desynchronized event");
+    }
+    if (++resident_event_count > kMaximumLogicalSceneOwnerEvents ||
+        expected_event_sequence > kMaximumSafeIntegral ||
+        event.owner_event_sequence != expected_event_sequence) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene owner event sequence is invalid");
+    }
+    const auto sequence = event.transaction_sequence;
+    if (sequence == 0U ||
+        sequence <= history.compacted_through_transaction_sequence ||
+        sequence >= expected_sequence) {
+      throw LogicalSceneOwnerIntegrityError(
+          "scene transaction owner event references an absent intent");
+    }
+    const auto index = static_cast<std::size_t>(
+        sequence - history.compacted_through_transaction_sequence - 1U);
+    if (index >= records.size()) {
+      throw LogicalSceneOwnerIntegrityError(
+          "scene transaction owner event exceeds resident history");
+    }
+    auto &record = records[index];
+    const std::uint64_t committed_sequence =
+        record.outcome.has_value() && record.outcome->success
+            ? record.intent->transaction_sequence
+            : 0U;
+    if (transaction_event_seen[index] ||
+        !apply_maintenance_until(record.intent->prior, committed_sequence)) {
+      throw LogicalSceneOwnerIntegrityError(
+          "scene transaction event does not follow the active composite");
+    }
+    transaction_event_seen[index] = true;
+    if (!record.outcome.has_value()) {
+      history_sealed = true;
+    } else if (record.outcome->success) {
+      state.active_projection = record.intent->proposed;
+      state.active_snapshot = logical_scene_codec_internal::DecodeSnapshot(
+          record.intent->candidate_snapshot_json);
+    } else if (record.outcome->projection_status ==
+                   SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
+               record.intent->transaction_sequence >
+                   history.recovered_through_transaction_sequence) {
+      history_sealed = true;
+    }
+    ++expected_event_sequence;
+  }
+  state.next_owner_event_sequence = expected_event_sequence;
+
+  for (std::size_t index = 0U; index < records.size(); ++index) {
+    if (!transaction_event_seen[index]) {
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene intent lacks its owner-order event");
+    }
+  }
+  static_cast<void>(apply_maintenance_until(std::nullopt, 0U));
+  if (!durable_state.active_projection.has_value() ||
+      durable_state.active_projection->retained_bundle_id !=
+          state.active_projection.retained_bundle_id ||
+      durable_state.active_projection->graph_revision !=
+          state.active_projection.graph_revision ||
+      durable_state.active_projection->scene_revision.scene_id !=
+          state.active_projection.scene_revision.scene_id ||
+      durable_state.active_projection->scene_revision.revision_id >
+          state.active_projection.scene_revision.revision_id ||
+      (durable_state.active_projection->scene_revision.revision_id ==
+           state.active_projection.scene_revision.revision_id &&
+       durable_state.active_projection->scene_revision.content_hash !=
+           state.active_projection.scene_revision.content_hash)) {
+    throw LogicalSceneOwnerIntegrityError(
+        "typed structural head disagrees with owner-event replay");
+  }
+  return state;
+}
+
+void InsertSceneOutcome(SceneStoreMemory &memory,
+                        persistence::SqliteRecord &record,
+                        const RequestKey &request_key,
                         const ContentDigest &request_digest,
                         const std::optional<std::uint64_t> transaction_sequence,
                         const bool success,
                         const SceneProjectionCommitStatusDTO projection_status,
                         const std::size_t attempted_projection_count,
                         const std::optional<ErrorDTO> &error) {
-  Statement statement(
-      database,
+  SizedRow row(
+      record,
       "INSERT INTO logical_scene_request_outcomes("
-      "request_owner_epoch,request_id,request_digest,transaction_sequence,"
+      "request_key,request_digest,transaction_sequence,"
       "success,projection_status,attempted_projection_count,error_code,"
-      "error_message,error_details_json) VALUES(?,?,?,?,?,?,?,?,?,?)");
-  statement.Bind(1, request_owner_epoch);
-  statement.Bind(2, request_id.value());
-  statement.Bind(3, request_digest.value());
+      "error_message,error_details_json) VALUES(?,?,?,?,?,?,?,?,?)");
+  BindRequestKey(row, 1, request_key);
+  row.Bind(2, request_digest.value());
   if (transaction_sequence.has_value()) {
-    statement.Bind(
-        4, CheckedSafeCounter(*transaction_sequence, "transaction_sequence"));
+    row.Bind(
+        3, CheckedSafeCounter(*transaction_sequence, "transaction_sequence"));
   } else {
-    statement.BindNull(4);
+    row.BindNull(3);
   }
-  statement.Bind(5, success ? 1 : 0);
-  statement.Bind(6, core::to_string(projection_status));
-  statement.Bind(7, static_cast<std::int64_t>(attempted_projection_count));
+  row.Bind(4, std::int64_t{success ? 1 : 0});
+  row.Bind(5, core::to_string(projection_status));
+  row.Bind(6, static_cast<std::int64_t>(attempted_projection_count));
+  // Memory holds the error as the file returns it: details decoded from
+  // their stored encoding.
+  std::optional<ErrorDTO> stored_error;
   if (error.has_value()) {
-    statement.Bind(8, error->code);
-    statement.Bind(9, error->message);
-    statement.Bind(
-        10, logical_scene_codec_internal::EncodeErrorDetails(error->details));
+    auto details_json =
+        logical_scene_codec_internal::EncodeErrorDetails(error->details);
+    stored_error = ErrorDTO{
+        error->code, error->message,
+        logical_scene_codec_internal::DecodeErrorDetails(details_json)};
+    row.Bind(7, error->code);
+    row.Bind(8, error->message);
+    row.Bind(9, details_json);
   } else {
-    statement.BindNull(8);
-    statement.BindNull(9);
-    statement.BindNull(10);
+    row.BindNull(7);
+    row.BindNull(8);
+    row.BindNull(9);
   }
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene outcome insert unexpectedly returned a row");
-  }
+  memory.transaction_file_bytes += SceneRowFileBytes(
+      row.record_bytes(), SceneTable("logical_scene_request_outcomes"));
+  memory.outcomes.emplace(
+      request_key,
+      StoredSceneOutcome{request_key, request_digest, transaction_sequence,
+                         success, projection_status,
+                         attempted_projection_count, std::move(stored_error)});
 }
 
-} // namespace manyforge::scene::logical_scene_owner_detail
-
-namespace manyforge::scene::logical_scene_owner_detail {
-namespace {
-
-ProjectionRevisionDTO ReadProposedProjection(sqlite3 *database,
-                                             const std::uint64_t sequence) {
-  Statement statement(
-      database,
-      "SELECT proposed_retained_bundle_id,proposed_graph_revision,"
-      "proposed_scene_id,proposed_scene_revision_id,"
-      "proposed_scene_content_hash FROM logical_scene_transaction_intents "
-      "WHERE transaction_sequence=? LIMIT 2");
-  statement.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
-  if (!statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene result references an absent transaction intent");
-  }
-  auto result = ReadProjectionColumns(statement, 0);
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene transaction sequence is not unique");
-  }
-  return result;
-}
-
-SceneUpdateStatusDTO ReadStoredUpdateStatus(sqlite3 *database,
-                                            const std::uint64_t sequence) {
-  Statement statement(
-      database,
-      "SELECT update_status FROM logical_scene_transaction_intents WHERE "
-      "transaction_sequence=? LIMIT 2");
-  statement.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
-  if (!statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene result update status is absent");
-  }
-  const auto result = DecodeUpdateStatus(statement.Text(0));
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene result update status is not unique");
-  }
-  return result;
-}
-
-} // namespace
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
 SceneCommitResultDTO
-ResultFromStoredOutcome(sqlite3 *database, const StoredSceneOutcome &outcome,
+ResultFromStoredOutcome(const SceneStoreMemory &memory,
+                        const StoredSceneOutcome &outcome,
                         const core::RequestReplayStatusDTO replay_status) {
   if (!outcome.success) {
-    return FailedSceneResult(outcome.request_id, replay_status, *outcome.error,
+    return FailedSceneResult(outcome.request_key, replay_status, *outcome.error,
                              outcome.projection_status);
   }
   const auto sequence = *outcome.transaction_sequence;
+  const auto intent = std::find_if(
+      memory.transactions.begin(), memory.transactions.end(),
+      [&](const SceneTransactionRecord &record) {
+        return record.transaction_sequence == sequence;
+      });
+  if (intent == memory.transactions.end()) {
+    throw LogicalSceneOwnerIntegrityError(
+        "scene result references an absent transaction intent");
+  }
   SceneCommitResultDTO result{
-      outcome.request_id,
+      outcome.request_key,
       replay_status,
       true,
       std::nullopt,
       sequence,
-      ReadProposedProjection(database, sequence),
+      intent->proposed,
       SceneProjectionCommitStatusDTO::kCommitted,
-      ReadStoredUpdateStatus(database, sequence),
+      intent->update_status,
   };
   if (!result.presence_valid()) {
     throw LogicalSceneOwnerIntegrityError(
@@ -1577,44 +1713,49 @@ bool ReadRebuild(sqlite3 *database,
   return true;
 }
 
-std::optional<ActiveBundlePublicationReceiptDTO>
-ReadFinalization(sqlite3 *database,
-                 const std::optional<AcceptedState> &accepted,
-                 const bool rebuilt) {
-  Statement statement(
-      database,
-      "SELECT bootstrap_id,bootstrap_generation,publication_generation,"
-      "publication_bootstrap_id,publication_bootstrap_generation,"
-      "candidate_retained_bundle_id,candidate_graph_revision,"
-      "candidate_scene_id,candidate_scene_revision_id,"
-      "candidate_scene_content_hash,request_candidate_retained_bundle_id,"
-      "request_candidate_graph_revision,"
-      "private_materialization_content_digest,"
-      "retired_command_surfaces_evidence_digest,"
-      "durable_public_pointer_content_digest "
-      "FROM canonical_empty_scene_finalization ORDER BY singleton LIMIT 2");
-  if (!statement.Step()) {
-    return std::nullopt;
-  }
-  const auto bootstrap_id = statement.Text(0);
-  const auto bootstrap_generation = statement.Integer(1);
-  const auto publication_generation = statement.Integer(2);
-  const auto publication_bootstrap_id = statement.Text(3);
-  const auto publication_bootstrap_generation = statement.Integer(4);
-  const auto candidate_retained_bundle_id = statement.Text(5);
-  const auto candidate_graph_revision = statement.Text(6);
-  const auto candidate_scene_id = statement.Text(7);
-  const auto candidate_scene_revision_id = statement.Integer(8);
-  const auto candidate_scene_content_hash = statement.Text(9);
-  const auto request_retained_bundle_id = statement.Text(10);
-  const auto request_graph_revision = statement.Text(11);
-  const auto private_materialization_digest = statement.Text(12);
-  const auto compatibility_materialization_digest = statement.Text(13);
-  const auto public_pointer_digest = statement.Text(14);
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene finalization cardinality exceeds one");
-  }
+// The columns of the finalization row.
+struct FinalizationColumns final {
+  std::string bootstrap_id;
+  std::int64_t bootstrap_generation;
+  std::int64_t publication_generation;
+  std::string publication_bootstrap_id;
+  std::int64_t publication_bootstrap_generation;
+  std::string candidate_retained_bundle_id;
+  std::string candidate_graph_revision;
+  std::string candidate_scene_id;
+  std::int64_t candidate_scene_revision_id;
+  std::string candidate_scene_content_hash;
+  std::string request_retained_bundle_id;
+  std::string request_graph_revision;
+  std::string private_materialization_digest;
+  std::string compatibility_materialization_digest;
+  std::string public_pointer_digest;
+};
+
+// The receipt the finalization row stands for, checked against its
+// acceptance.
+ActiveBundlePublicationReceiptDTO
+FinalizationReceipt(const FinalizationColumns &row,
+                    const std::optional<AcceptedState> &accepted,
+                    const bool rebuilt) {
+  const auto &bootstrap_id = row.bootstrap_id;
+  const auto bootstrap_generation = row.bootstrap_generation;
+  const auto publication_generation = row.publication_generation;
+  const auto &publication_bootstrap_id = row.publication_bootstrap_id;
+  const auto publication_bootstrap_generation =
+      row.publication_bootstrap_generation;
+  const auto &candidate_retained_bundle_id = row.candidate_retained_bundle_id;
+  const auto &candidate_graph_revision = row.candidate_graph_revision;
+  const auto &candidate_scene_id = row.candidate_scene_id;
+  const auto candidate_scene_revision_id = row.candidate_scene_revision_id;
+  const auto &candidate_scene_content_hash = row.candidate_scene_content_hash;
+  const auto &request_retained_bundle_id = row.request_retained_bundle_id;
+  const auto &request_graph_revision = row.request_graph_revision;
+  const auto &private_materialization_digest =
+      row.private_materialization_digest;
+  const auto &compatibility_materialization_digest =
+      row.compatibility_materialization_digest;
+  const auto &public_pointer_digest = row.public_pointer_digest;
   if (!accepted.has_value() || !rebuilt || publication_generation != 1 ||
       bootstrap_id != accepted->bootstrap_id.value() ||
       publication_bootstrap_id != bootstrap_id ||
@@ -1668,105 +1809,37 @@ ReadFinalization(sqlite3 *database,
   return receipt;
 }
 
-std::vector<MigratedStructuralCompletionState>
-ReadMigratedStructuralCompletions(sqlite3 *database) {
+std::optional<ActiveBundlePublicationReceiptDTO>
+ReadFinalization(sqlite3 *database,
+                 const std::optional<AcceptedState> &accepted,
+                 const bool rebuilt) {
   Statement statement(
       database,
-      "SELECT completion_sequence,apply_id,apply_generation,"
-      "target_retained_bundle_id,target_graph_revision,target_scene_id,"
-      "target_scene_revision_id,target_scene_content_hash FROM "
-      "logical_scene_migrated_structural_completions "
-      "ORDER BY completion_sequence LIMIT 257");
-  std::vector<MigratedStructuralCompletionState> completions;
-  std::uint64_t previous_sequence = 0U;
-  while (statement.Step()) {
-    const auto sequence = statement.Integer(0);
-    const auto generation = statement.Integer(2);
-    const auto scene_revision = statement.Integer(6);
-    if (sequence <= 0 || generation <= 0 || scene_revision <= 0 ||
-        static_cast<std::uint64_t>(sequence) <= previous_sequence ||
-        completions.size() >= kMaximumMigratedStructuralCompletions) {
-      throw LogicalSceneOwnerIntegrityError(
-          "migrated structural completion is invalid");
-    }
-    MigratedStructuralCompletionState completion{
-        static_cast<std::uint64_t>(sequence),
-        ApplyId(statement.Text(1)),
-        ApplyGeneration(static_cast<std::uint64_t>(generation)),
-        ProjectionRevisionDTO{
-            RetainedBundleId(statement.Text(3)),
-            GraphRevision(statement.Text(4)),
-            SceneRevision{SceneId(statement.Text(5)),
-                          static_cast<std::uint64_t>(scene_revision),
-                          ContentDigest(statement.Text(7))}}};
-    if (completion.apply_id.empty() || !completion.target.valid()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "migrated structural completion identity is invalid");
-    }
-    previous_sequence = completion.completion_sequence;
-    completions.push_back(std::move(completion));
-  }
-  return completions;
-}
-
-[[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
-ReadActiveExecutionHostBindings(sqlite3 *database) {
-  Statement statement(
-      database,
-      "SELECT binding_ordinal,provider_binding_id,"
-      "provider_binding_revision,runtime_unit_id,runtime_epoch FROM "
-      "logical_scene_migrated_active_execution_host_bindings "
-      "ORDER BY binding_ordinal LIMIT 257");
-  std::vector<core::ProjectionExecutionHostBindingDTO> bindings;
-  while (statement.Step()) {
-    if (bindings.size() >= kMaximumNativeProjectionBindings ||
-        statement.Integer(0) != static_cast<std::int64_t>(bindings.size())) {
-      throw LogicalSceneOwnerIntegrityError(
-          "active native binding order or cardinality is invalid");
-    }
-    const auto provider_binding_id = statement.Text(1);
-    const auto provider_binding_revision = statement.Text(2);
-    const auto runtime_unit_id = statement.Text(3);
-    const auto runtime_epoch = statement.Text(4);
-    ValidateBoundedIdentity(provider_binding_id,
-                            "stored active provider binding ID");
-    ValidateBoundedIdentity(provider_binding_revision,
-                            "stored active provider binding revision");
-    ValidateBoundedIdentity(runtime_unit_id,
-                            "stored active runtime unit ID");
-    ValidateBoundedIdentity(runtime_epoch, "stored active runtime epoch");
-    bindings.push_back({
-        core::CapabilityProviderBindingId(provider_binding_id),
-        core::CapabilityProviderBindingRevision(provider_binding_revision),
-        core::RuntimeUnitId(runtime_unit_id),
-        core::RuntimeEpoch(runtime_epoch),
-    });
-  }
-  if (!std::is_sorted(bindings.begin(), bindings.end(),
-                      core::CanonicalProjectionNativeBindingLess) ||
-      std::adjacent_find(bindings.begin(), bindings.end()) != bindings.end()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "active native bindings are not exact and canonical");
-  }
-  return bindings;
-}
-
-[[nodiscard]] bool
-ReadLegacyNativeEffectsUncertain(sqlite3 *database) {
-  Statement statement(
-      database,
-      "SELECT legacy_native_effects_uncertain FROM "
-      "logical_scene_maintenance_migration_state WHERE singleton=1 LIMIT 2");
+      "SELECT bootstrap_id,bootstrap_generation,publication_generation,"
+      "publication_bootstrap_id,publication_bootstrap_generation,"
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "candidate_scene_id,candidate_scene_revision_id,"
+      "candidate_scene_content_hash,request_candidate_retained_bundle_id,"
+      "request_candidate_graph_revision,"
+      "private_materialization_content_digest,"
+      "retired_command_surfaces_evidence_digest,"
+      "durable_public_pointer_content_digest "
+      "FROM canonical_empty_scene_finalization ORDER BY singleton LIMIT 2");
   if (!statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "projection maintenance current state is missing");
+    return std::nullopt;
   }
-  const auto uncertain = statement.Integer(0);
-  if ((uncertain != 0 && uncertain != 1) || statement.Step()) {
+  const FinalizationColumns row{
+      statement.Text(0),  statement.Integer(1), statement.Integer(2),
+      statement.Text(3),  statement.Integer(4), statement.Text(5),
+      statement.Text(6),  statement.Text(7),    statement.Integer(8),
+      statement.Text(9),  statement.Text(10),   statement.Text(11),
+      statement.Text(12), statement.Text(13),   statement.Text(14),
+  };
+  if (statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
-        "projection maintenance current state is malformed");
+        "logical-scene finalization cardinality exceeds one");
   }
-  return uncertain != 0;
+  return FinalizationReceipt(row, accepted, rebuilt);
 }
 
 LogicalSceneSnapshotDTO ReadMaintenanceSnapshot(
@@ -1836,7 +1909,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
     }
     MaintenanceInitializationState state{
         static_cast<std::uint64_t>(sequence),
-        ApplyId(intents.Text(1)),
+        ApplyId(static_cast<std::uint64_t>(intents.Integer(1))),
         ApplyGeneration(static_cast<std::uint64_t>(generation)),
         ProjectionRevisionDTO{
             RetainedBundleId(intents.Text(3)), GraphRevision(intents.Text(4)),
@@ -1862,8 +1935,9 @@ ReadMaintenanceInitializations(sqlite3 *database,
         true,
         std::nullopt,
         false,
+        false,
     };
-    if (state.apply_id.empty() || !state.apply_generation.nonzero() ||
+    if (!state.apply_id.nonzero() || !state.apply_generation.nonzero() ||
         !state.predecessor.valid() || !state.target.valid() ||
         state.authoritative_snapshot.cell_id != expected_cell_id ||
         state.authoritative_snapshot.revision != state.target.scene_revision) {
@@ -1898,94 +1972,92 @@ ReadMaintenanceInitializations(sqlite3 *database,
           "maintenance initialization binding set is inconsistent");
     }
 
-    if (ScalarInteger(database, "PRAGMA user_version", statements) >=
-        kInitialSceneBaselineSchemaVersion) {
-      Statement baseline_request(
+    Statement baseline_request(
+        database,
+        "SELECT request_digest FROM logical_scene_initial_baseline_requests "
+        "WHERE initialization_sequence=? LIMIT 2", statements);
+    baseline_request.Bind(1, sequence);
+    if (baseline_request.Step()) {
+      state.initial_baseline_request_digest =
+          ContentDigest(baseline_request.Text(0));
+      state.initial_baseline_installed = false;
+      if (!core::IsExactLowercaseSha256Digest(
+              state.initial_baseline_request_digest->value()) ||
+          baseline_request.Step()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "initial Scene request digest is invalid");
+      }
+      Statement baseline_intent(
           database,
-          "SELECT request_digest FROM logical_scene_initial_baseline_requests "
-          "WHERE initialization_sequence=? LIMIT 2", statements);
-      baseline_request.Bind(1, sequence);
-      if (baseline_request.Step()) {
-        state.initial_baseline_request_digest =
-            ContentDigest(baseline_request.Text(0));
-        state.initial_baseline_installed = false;
-        if (!core::IsExactLowercaseSha256Digest(
-                state.initial_baseline_request_digest->value()) ||
-            baseline_request.Step()) {
+          "SELECT target_retained_bundle_id,target_graph_revision,"
+          "target_scene_id,target_scene_revision_id,"
+          "target_scene_content_hash,snapshot_json FROM "
+          "logical_scene_initial_baseline_intents WHERE "
+          "initialization_sequence=? LIMIT 2", statements);
+      baseline_intent.Bind(1, sequence);
+      std::optional<ProjectionRevisionDTO> final_target;
+      std::optional<LogicalSceneSnapshotDTO> final_snapshot;
+      if (baseline_intent.Step()) {
+        state.initial_baseline_intent_recorded = true;
+        const auto revision_id = baseline_intent.Integer(3);
+        if (revision_id <= 0) {
           throw LogicalSceneOwnerIntegrityError(
-              "initial Scene request digest is invalid");
+              "initial Scene baseline revision is invalid");
         }
-        Statement baseline_intent(
-            database,
-            "SELECT target_retained_bundle_id,target_graph_revision,"
-            "target_scene_id,target_scene_revision_id,"
-            "target_scene_content_hash,snapshot_json FROM "
-            "logical_scene_initial_baseline_intents WHERE "
-            "initialization_sequence=? LIMIT 2", statements);
-        baseline_intent.Bind(1, sequence);
-        std::optional<ProjectionRevisionDTO> final_target;
-        std::optional<LogicalSceneSnapshotDTO> final_snapshot;
-        if (baseline_intent.Step()) {
-          const auto revision_id = baseline_intent.Integer(3);
-          if (revision_id <= 0) {
-            throw LogicalSceneOwnerIntegrityError(
-                "initial Scene baseline revision is invalid");
-          }
-          final_target = ProjectionRevisionDTO{
-              RetainedBundleId(baseline_intent.Text(0)),
-              GraphRevision(baseline_intent.Text(1)),
-              SceneRevision{SceneId(baseline_intent.Text(2)),
-                            static_cast<std::uint64_t>(revision_id),
-                            ContentDigest(baseline_intent.Text(4))}};
-          const auto baseline_bytes = baseline_intent.Text(5);
-          final_snapshot = ReadMaintenanceSnapshot(cache, sequence, true,
-                                                   baseline_bytes);
-          if (!final_target->valid() ||
-              final_target->retained_bundle_id != state.target.retained_bundle_id ||
-              final_target->graph_revision != state.target.graph_revision ||
-              final_target->scene_revision.scene_id !=
-                  state.target.scene_revision.scene_id ||
-              final_target->scene_revision.revision_id <=
-                  state.target.scene_revision.revision_id ||
-              final_snapshot->revision != final_target->scene_revision ||
-              final_snapshot->cell_id != expected_cell_id ||
-              ReadMaintenanceSnapshotHash(cache, sequence, baseline_bytes,
-                                          *final_snapshot) !=
-                  final_target->scene_revision.content_hash ||
-              baseline_intent.Step()) {
-            throw LogicalSceneOwnerIntegrityError(
-                "initial Scene baseline target is not an exact successor");
-          }
+        final_target = ProjectionRevisionDTO{
+            RetainedBundleId(baseline_intent.Text(0)),
+            GraphRevision(baseline_intent.Text(1)),
+            SceneRevision{SceneId(baseline_intent.Text(2)),
+                          static_cast<std::uint64_t>(revision_id),
+                          ContentDigest(baseline_intent.Text(4))}};
+        const auto baseline_bytes = baseline_intent.Text(5);
+        final_snapshot = ReadMaintenanceSnapshot(cache, sequence, true,
+                                                 baseline_bytes);
+        if (!final_target->valid() ||
+            final_target->retained_bundle_id != state.target.retained_bundle_id ||
+            final_target->graph_revision != state.target.graph_revision ||
+            final_target->scene_revision.scene_id !=
+                state.target.scene_revision.scene_id ||
+            final_target->scene_revision.revision_id <=
+                state.target.scene_revision.revision_id ||
+            final_snapshot->revision != final_target->scene_revision ||
+            final_snapshot->cell_id != expected_cell_id ||
+            ReadMaintenanceSnapshotHash(cache, sequence, baseline_bytes,
+                                        *final_snapshot) !=
+                final_target->scene_revision.content_hash ||
+            baseline_intent.Step()) {
+          throw LogicalSceneOwnerIntegrityError(
+              "initial Scene baseline target is not an exact successor");
         }
-        Statement baseline_result(
-            database,
-            "SELECT state,first_error_code,first_error_message FROM "
-            "logical_scene_initial_baseline_results WHERE "
-            "initialization_sequence=? LIMIT 2", statements);
-        baseline_result.Bind(1, sequence);
+      }
+      Statement baseline_result(
+          database,
+          "SELECT state,first_error_code,first_error_message FROM "
+          "logical_scene_initial_baseline_results WHERE "
+          "initialization_sequence=? LIMIT 2", statements);
+      baseline_result.Bind(1, sequence);
+      if (baseline_result.Step()) {
+        const auto result_state = baseline_result.Text(0);
+        if (result_state == "installed" && final_target.has_value() &&
+            baseline_result.IsNull(1) && baseline_result.IsNull(2)) {
+          state.target = *final_target;
+          state.authoritative_snapshot = *final_snapshot;
+          state.initial_baseline_installed = true;
+        } else if ((result_state == "failed" ||
+                    result_state == "interrupted") &&
+                   !baseline_result.IsNull(1) &&
+                   !baseline_result.IsNull(2)) {
+          state.initial_baseline_error = ErrorDTO{
+              baseline_result.Text(1), baseline_result.Text(2), {}};
+          state.initial_baseline_effects_unknown =
+              result_state == "interrupted";
+        } else {
+          throw LogicalSceneOwnerIntegrityError(
+              "initial Scene baseline result is contradictory");
+        }
         if (baseline_result.Step()) {
-          const auto result_state = baseline_result.Text(0);
-          if (result_state == "installed" && final_target.has_value() &&
-              baseline_result.IsNull(1) && baseline_result.IsNull(2)) {
-            state.target = *final_target;
-            state.authoritative_snapshot = *final_snapshot;
-            state.initial_baseline_installed = true;
-          } else if ((result_state == "failed" ||
-                      result_state == "interrupted") &&
-                     !baseline_result.IsNull(1) &&
-                     !baseline_result.IsNull(2)) {
-            state.initial_baseline_error = ErrorDTO{
-                baseline_result.Text(1), baseline_result.Text(2), {}};
-            state.initial_baseline_effects_unknown =
-                result_state == "interrupted";
-          } else {
-            throw LogicalSceneOwnerIntegrityError(
-                "initial Scene baseline result is contradictory");
-          }
-          if (baseline_result.Step()) {
-            throw LogicalSceneOwnerIntegrityError(
-                "initial Scene baseline result is duplicated");
-          }
+          throw LogicalSceneOwnerIntegrityError(
+              "initial Scene baseline result is duplicated");
         }
       }
     }
@@ -2077,46 +2149,6 @@ ReadMaintenanceInitializations(sqlite3 *database,
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
-
-bool SettleInterruptedMaintenanceInitializations(sqlite3 *database) {
-  Transaction settlement(database, "BEGIN IMMEDIATE");
-  Statement initialized(
-      database,
-      "UPDATE logical_scene_maintenance_initialization_results SET "
-      "state='interrupted',"
-      "first_error_code='scene_initialization_interrupted',"
-      "first_error_message='Scene owner reopened before maintenance completion',"
-      "effects_unknown=1 WHERE state='initialized' AND NOT EXISTS(SELECT 1 "
-      "FROM logical_scene_maintenance_initialization_completions AS c WHERE "
-      "c.initialization_sequence="
-      "logical_scene_maintenance_initialization_results.initialization_sequence)");
-  if (initialized.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "initialized maintenance settlement returned a row");
-  }
-  const auto initialized_changes = sqlite3_changes(database);
-  Statement interrupted(
-      database,
-      "INSERT INTO logical_scene_maintenance_initialization_results("
-      "initialization_sequence,state,first_error_code,first_error_message,"
-      "effects_unknown) SELECT i.initialization_sequence,'interrupted',"
-      "'scene_initialization_interrupted',"
-      "'Scene owner reopened before maintenance completion',"
-      "1 FROM logical_scene_maintenance_initialization_intents AS i "
-      "LEFT JOIN logical_scene_maintenance_initialization_results AS r "
-      "USING(initialization_sequence) WHERE r.initialization_sequence IS NULL");
-  if (interrupted.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "interrupted maintenance settlement returned a row");
-  }
-  const auto intent_changes = sqlite3_changes(database);
-  settlement.Commit();
-  return initialized_changes != 0 || intent_changes != 0;
-}
-
-} // namespace manyforge::scene::logical_scene_owner_detail
-
-namespace manyforge::scene::logical_scene_owner_detail {
 namespace {
 
 DurableState
@@ -2129,24 +2161,11 @@ ReadDurableState(sqlite3 *database,
   state.rebuilt = ReadRebuild(database, state.accepted);
   state.finalization_receipt =
       ReadFinalization(database, state.accepted, state.rebuilt);
-  if (ScalarInteger(database, "PRAGMA user_version") >=
-      kMaintenanceInitializationSchemaVersion) {
-    state.migrated_structural_completions =
-        ReadMigratedStructuralCompletions(database);
-    state.maintenance_initializations =
-        ReadMaintenanceInitializations(database, fixed_query.cell_id, cache,
-                                       statements);
-    state.active_execution_host_bindings =
-        ReadActiveExecutionHostBindings(database);
-    state.legacy_native_effects_uncertain =
-        ReadLegacyNativeEffectsUncertain(database);
-  }
+  state.maintenance_initializations = ReadMaintenanceInitializations(
+      database, fixed_query.cell_id, cache, statements);
   if (state.accepted.has_value() && state.finalization_receipt.has_value()) {
     state.active_projection = state.accepted->target;
     state.active_scene_snapshot = state.accepted->snapshot;
-    for (const auto &completion : state.migrated_structural_completions) {
-      state.active_projection = completion.target;
-    }
     for (const auto &initialization : state.maintenance_initializations) {
       if (initialization.publication_receipt.has_value()) {
         state.active_projection = initialization.target;
@@ -2156,21 +2175,155 @@ ReadDurableState(sqlite3 *database,
   return state;
 }
 
+DurableState ReadDurableState(const SceneStoreMemory &memory) {
+  DurableState state;
+  state.accepted = memory.accepted;
+  state.rebuilt = memory.rebuilt;
+  state.finalization_receipt = memory.finalization_receipt;
+  state.maintenance_initializations = memory.maintenance_initializations;
+  if (state.accepted.has_value() && state.finalization_receipt.has_value()) {
+    state.active_projection = state.accepted->target;
+    state.active_scene_snapshot = state.accepted->snapshot;
+    for (const auto &initialization : state.maintenance_initializations) {
+      if (initialization.publication_receipt.has_value()) {
+        state.active_projection = initialization.target;
+      }
+    }
+  }
+  return state;
+}
+
+core::ProjectionCommitResultStateDTO
+DecodeProjectionResultState(const std::string_view value) {
+  if (value == "committed") {
+    return core::ProjectionCommitResultStateDTO::kCommitted;
+  }
+  if (value == "rejected_rollback_proven") {
+    return core::ProjectionCommitResultStateDTO::kRejectedRollbackProven;
+  }
+  if (value == "failed_projection_uncertain") {
+    return core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain;
+  }
+  throw LogicalSceneOwnerIntegrityError(
+      "stored projection result state is invalid");
+}
+
 } // namespace
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
-DurableState ReadCompleteDurableState(
+SceneStoreMemory LoadSceneStoreMemory(
     sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    MaintenanceSnapshotCache *cache,
-    PersistentStatementCache *statements) {
-  auto state = ReadDurableState(database, fixed_query, cache, statements);
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
+  SceneStoreMemory memory;
+  auto durable = ReadDurableState(database, fixed_query);
+  memory.accepted = std::move(durable.accepted);
+  memory.rebuilt = durable.rebuilt;
+  memory.finalization_receipt = std::move(durable.finalization_receipt);
+  memory.maintenance_initializations =
+      std::move(durable.maintenance_initializations);
+  memory.history = ReadBoundedHistoryState(database);
+
+  Statement intents(
+      database,
+      "SELECT transaction_sequence,request_key,request_digest,request_json,"
+      "prior_retained_bundle_id,prior_graph_revision,prior_scene_id,"
+      "prior_scene_revision_id,prior_scene_content_hash,"
+      "proposed_retained_bundle_id,proposed_graph_revision,"
+      "proposed_scene_id,proposed_scene_revision_id,"
+      "proposed_scene_content_hash,candidate_snapshot_json,update_status,"
+      "required_projection_count FROM logical_scene_transaction_intents "
+      "ORDER BY transaction_sequence");
+  while (intents.Step()) {
+    const auto sequence = intents.Integer(0);
+    Statement attempts(database,
+                       "SELECT count(*) FROM logical_scene_projection_attempts "
+                       "WHERE transaction_sequence=?");
+    attempts.Bind(1, sequence);
+    if (!attempts.Step()) {
+      throw LogicalSceneOwnerIntegrityError("SQLite scalar row is missing");
+    }
+    const auto attempt_count = attempts.Integer(0);
+    std::vector<core::ProjectionCommitResultStateDTO> results;
+    Statement result_rows(
+        database,
+        "SELECT result_state FROM logical_scene_projection_results WHERE "
+        "transaction_sequence=? ORDER BY projection_ordinal");
+    result_rows.Bind(1, sequence);
+    while (result_rows.Step()) {
+      results.push_back(DecodeProjectionResultState(result_rows.Text(0)));
+    }
+    memory.transactions.push_back(SceneTransactionRecord{
+        static_cast<std::uint64_t>(sequence),
+        intents.Key(1),
+        ContentDigest(intents.Text(2)),
+        intents.Text(3),
+        ReadProjectionColumns(intents, 4),
+        ReadProjectionColumns(intents, 9),
+        intents.Text(14),
+        DecodeUpdateStatus(intents.Text(15)),
+        static_cast<std::size_t>(intents.Integer(16)),
+        static_cast<std::size_t>(attempt_count),
+        std::move(results),
+    });
+  }
+
+  Statement outcomes(database,
+                     "SELECT request_key FROM logical_scene_request_outcomes");
+  while (outcomes.Step()) {
+    const auto request_key = outcomes.Key(0);
+    if (auto outcome = ReadOutcomeForRequest(database, request_key)) {
+      memory.outcomes.emplace(request_key, std::move(*outcome));
+    }
+  }
+
+  Statement events(database,
+                   "SELECT owner_event_sequence,transaction_sequence FROM "
+                   "logical_scene_owner_events ORDER BY owner_event_sequence");
+  while (events.Step()) {
+    memory.owner_events.push_back(SceneOwnerEventRecord{
+        static_cast<std::uint64_t>(events.Integer(0)),
+        static_cast<std::uint64_t>(events.Integer(1)),
+    });
+  }
+  // The file bytes of every row, sized as the insert that made it sized it.
+  // A maintenance row's first column is its initialization sequence.
+  for (const auto &table : kSceneRowTables) {
+    Statement rows(database, "SELECT * FROM " + std::string(table.name));
+    while (rows.Step()) {
+      RecordSize size;
+      for (int column = 0; column < rows.Columns(); ++column) {
+        switch (rows.Type(column)) {
+        case SQLITE_INTEGER:
+          size.Integer(rows.Integer(column));
+          break;
+        case SQLITE_NULL:
+          size.Null();
+          break;
+        default:
+          size.Text(rows.Bytes(column));
+          break;
+        }
+      }
+      const auto bytes = SceneRowFileBytes(size.bytes(), table);
+      if (table.maintenance) {
+        memory.maintenance_file_bytes[static_cast<std::uint64_t>(
+            rows.Integer(0))] += bytes;
+      } else {
+        memory.transaction_file_bytes += bytes;
+      }
+    }
+  }
+  return memory;
+}
+
+DurableState ReadCompleteDurableState(const SceneStoreMemory &memory) {
+  auto state = ReadDurableState(memory);
   if (!state.finalization_receipt.has_value()) {
     return state;
   }
-  const auto transactions = ReadSceneTransactionStoreState(database, state);
+  const auto transactions = ReadSceneTransactionStoreState(memory, state);
   state.active_projection = transactions.active_projection;
   state.active_scene_snapshot = transactions.active_snapshot;
   for (const auto &initialization : state.maintenance_initializations) {
@@ -2188,97 +2341,6 @@ DurableState ReadCompleteDurableState(
   return state;
 }
 
-bool RecoverIncompleteSceneTransaction(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
-  Transaction recovery(database, "BEGIN IMMEDIATE");
-  const auto durable_state = ReadDurableState(database, fixed_query);
-  if (!durable_state.finalization_receipt.has_value()) {
-    recovery.Commit();
-    return false;
-  }
-  const auto transactions =
-      ReadSceneTransactionStoreState(database, durable_state);
-  if (!transactions.unresolved_transaction_sequence.has_value()) {
-    recovery.Commit();
-    return false;
-  }
-  const auto sequence = *transactions.unresolved_transaction_sequence;
-  Statement intent(
-      database,
-      "SELECT request_owner_epoch,request_id,request_digest,"
-      "required_projection_count,proposed_retained_bundle_id,"
-      "proposed_graph_revision,proposed_scene_id,"
-      "proposed_scene_revision_id,proposed_scene_content_hash FROM "
-      "logical_scene_transaction_intents WHERE transaction_sequence=? "
-      "LIMIT 2");
-  intent.Bind(1, CheckedSafeCounter(sequence, "transaction_sequence"));
-  if (!intent.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "unresolved scene transaction intent is absent");
-  }
-  const auto request_owner_epoch = intent.Text(0);
-  const RequestId request_id(intent.Text(1));
-  const ContentDigest request_digest(intent.Text(2));
-  const auto required_count_value = intent.Integer(3);
-  const auto proposed = ReadProjectionColumns(intent, 4);
-  if (intent.Step() || required_count_value < 0 || required_count_value > 256) {
-    throw LogicalSceneOwnerIntegrityError(
-        "unresolved scene transaction intent is invalid");
-  }
-  const auto required_count = static_cast<std::size_t>(required_count_value);
-  const auto evidence =
-      ReadProjectionEvidenceState(database, sequence, proposed);
-
-  bool success = false;
-  SceneProjectionCommitStatusDTO status =
-      SceneProjectionCommitStatusDTO::kNotAttempted;
-  std::optional<ErrorDTO> error;
-  if (evidence.attempt_count == 0U) {
-    if (required_count == 0U) {
-      success = true;
-      status = SceneProjectionCommitStatusDTO::kCommitted;
-    } else {
-      error = SceneError(
-          "scene_request_recovered_before_projection",
-          "scene request was durably accepted but no native projection call "
-          "began before owner restart");
-    }
-  } else if (evidence.result_count == evidence.attempt_count &&
-             evidence.attempt_count == required_count &&
-             evidence.all_results_committed) {
-    success = true;
-    status = SceneProjectionCommitStatusDTO::kCommitted;
-  } else if (evidence.result_count == evidence.attempt_count &&
-             evidence.all_results_rollback_proven) {
-    status = SceneProjectionCommitStatusDTO::kRejectedRollbackProven;
-    error = SceneError(
-        "scene_projection_rejected_rollback_proven",
-        "restart verified that every invoked projection retained the "
-        "predecessor state");
-  } else {
-    status = SceneProjectionCommitStatusDTO::kFailedProjectionUncertain;
-    error =
-        SceneError("scene_projection_recovery_uncertain",
-                   "restart cannot prove a common native predecessor after the "
-                   "interrupted scene transaction");
-  }
-  InsertSceneOutcome(database, request_owner_epoch, request_id, request_digest,
-                     sequence, success, status, evidence.attempt_count, error);
-  const auto recovered = ReadCompleteDurableState(database, fixed_query);
-  if (recovered.unresolved_scene_transaction ||
-      (success && (!recovered.active_projection.has_value() ||
-                   *recovered.active_projection != proposed)) ||
-      (!success &&
-       status == SceneProjectionCommitStatusDTO::kFailedProjectionUncertain &&
-       !recovered.projection_desynchronized)) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene transaction recovery did not settle the durable owner state");
-  }
-  recovery.Commit();
-  return true;
-}
-
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
@@ -2288,19 +2350,14 @@ void ValidateMetadata(
     sqlite3 *database,
     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
     const ContentDigest &admission_digest) {
-  const auto completion_bound_column =
-      ScalarInteger(database, "PRAGMA user_version") >=
-              kMaintenanceInitializationSchemaVersion
-          ? "maximum_migrated_structural_completions"
-          : "maximum_named_apply_stages";
   Statement statement(
       database,
-      std::string("SELECT schema_id,schema_version,schema_artifact_digest,") +
-          "canonical_empty_admission_digest,cell_id,"
-          "canonical_empty_retained_bundle_id,canonical_empty_graph_revision,"
-          "maximum_identifier_bytes,maximum_database_page_image_bytes,"
-          "maximum_wal_bytes," + completion_bound_column +
-          " FROM logical_scene_store_metadata ORDER BY singleton LIMIT 2");
+      "SELECT schema_id,schema_version,schema_artifact_digest,"
+      "canonical_empty_admission_digest,cell_id,"
+      "canonical_empty_retained_bundle_id,canonical_empty_graph_revision,"
+      "maximum_identifier_bytes,maximum_database_page_image_bytes,"
+      "maximum_wal_bytes"
+      " FROM logical_scene_store_metadata ORDER BY singleton LIMIT 2");
   if (!statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene metadata row is missing");
@@ -2315,7 +2372,6 @@ void ValidateMetadata(
   const auto maximum_identifier_bytes = statement.Integer(7);
   const auto maximum_database_bytes = statement.Integer(8);
   const auto maximum_wal_bytes = statement.Integer(9);
-  const auto maximum_structural_completions = statement.Integer(10);
   if (statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene metadata cardinality exceeds one");
@@ -2331,9 +2387,7 @@ void ValidateMetadata(
       maximum_identifier_bytes !=
           static_cast<std::int64_t>(kMaximumSceneStoreIdentifierBytes) ||
       maximum_database_bytes != kMaximumSceneStoreDatabasePageImageBytes ||
-      maximum_wal_bytes != kMaximumSceneStoreWalBytes ||
-      maximum_structural_completions !=
-          static_cast<std::int64_t>(kMaximumMigratedStructuralCompletions)) {
+      maximum_wal_bytes != kMaximumSceneStoreWalBytes) {
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene metadata does not match the fixed v2 owner");
   }
@@ -2359,30 +2413,6 @@ void ValidateMechanicalDatabaseIntegrity(sqlite3 *database) {
 }
 
 } // namespace
-} // namespace manyforge::scene::logical_scene_owner_detail
-
-namespace manyforge::scene::logical_scene_owner_detail {
-
-void ValidateBaseDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kCanonicalEmptySceneStoreSchemaVersion) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene SQLite base application/schema version is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  if (ReadSchemaObjects(database) != ExpectedBaseSchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene base schema differs from its exact v2 artifact");
-  }
-  ValidateMetadata(database, fixed_query, admission_digest);
-  static_cast<void>(ReadDurableState(database, fixed_query));
-}
-
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
@@ -2506,89 +2536,32 @@ void ValidateInitialSceneBaselineMigrationMetadata(sqlite3 *database) {
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
-void ValidateTransactionDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kLogicalSceneTransactionStoreSchemaVersion) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene SQLite transaction schema version is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  if (ReadSchemaObjects(database) != ExpectedTransactionSchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v4 artifacts");
-  }
-  ValidateMetadata(database, fixed_query, admission_digest);
-  ValidateMigrationMetadata(database);
-  const auto durable_state = ReadDurableState(database, fixed_query);
-  if (durable_state.finalization_receipt.has_value()) {
-    static_cast<void>(ReadSceneTransactionStoreState(database, durable_state));
-  }
-}
-
-void ValidateNativeHandoffDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kNativeProjectionHandoffStoreSchemaVersion) {
-    throw LogicalSceneOwnerIntegrityError(
-        "native projection handoff SQLite schema version is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  if (ReadSchemaObjects(database) != ExpectedNativeHandoffSchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v5 artifacts");
-  }
-  ValidateMetadata(database, fixed_query, admission_digest);
-  ValidateMigrationMetadata(database);
-  ValidateNativeHandoffMigrationMetadata(database);
-  const auto durable_state = ReadDurableState(database, fixed_query);
-  if (durable_state.finalization_receipt.has_value()) {
-    static_cast<void>(ReadSceneTransactionStoreState(database, durable_state));
-  }
-}
-
-void ValidateBoundedHistoryDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kBoundedHistoryStoreSchemaVersion ||
-      ReadSchemaObjects(database) != ExpectedBoundedHistorySchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "bounded-history logical-scene schema is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  ValidateMetadata(database, fixed_query, admission_digest);
-  ValidateMigrationMetadata(database);
-  ValidateNativeHandoffMigrationMetadata(database);
-  ValidateBoundedHistoryMigrationMetadata(database);
-}
-
 void ValidateDatabase(
     sqlite3 *database,
     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
     const ContentDigest &admission_digest) {
   if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kLogicalSceneStoreSchemaVersion) {
+      kCanonicalEmptySceneSqliteApplicationId) {
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene SQLite application/schema version is invalid");
+  }
+  // Formats are versioned: a store of another version is refused, never
+  // converted. Both launchers create the store inside the run folder, which
+  // every start moves to previous-runs/, so a new run opens a new store.
+  if (const auto version = ScalarInteger(database, "PRAGMA user_version");
+      version != kLogicalSceneStoreSchemaVersion) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene SQLite application/schema version is invalid: the "
+        "store has schema version " +
+        std::to_string(version) + ", this ManyForge reads only version " +
+        std::to_string(kLogicalSceneStoreSchemaVersion) +
+        "; it is not converted. Start a new run, which creates a new Scene "
+        "store; the old file is kept with its run under previous-runs/");
   }
   ValidateMechanicalDatabaseIntegrity(database);
   if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
     throw LogicalSceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v10 artifacts");
+        "logical-scene schema differs from its exact v12 artifacts");
   }
   ValidateMetadata(database, fixed_query, admission_digest);
   ValidateMigrationMetadata(database);
@@ -2619,199 +2592,10 @@ void ValidateDatabase(
                            "SELECT count(*) FROM logical_scene_owner_events") !=
                  0 ||
              history.compaction_generation != 0U ||
-             history.request_epoch_generation != 0U ||
              history.recovered_through_transaction_sequence != 0U) {
     throw LogicalSceneOwnerIntegrityError(
         "scene transaction history exists before bootstrap finalization");
   }
-}
-
-void ValidateMaintenanceDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kMaintenanceInitializationSchemaVersion ||
-      ReadSchemaObjects(database) != ExpectedMaintenanceSchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene v8 schema is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  ValidateMetadata(database, fixed_query, admission_digest);
-  ValidateMigrationMetadata(database);
-  ValidateNativeHandoffMigrationMetadata(database);
-  ValidateBoundedHistoryMigrationMetadata(database);
-  ValidateMaintenanceInitializationMigrationMetadata(database);
-  const auto durable = ReadDurableState(database, fixed_query);
-  if (durable.finalization_receipt.has_value()) {
-    static_cast<void>(ReadSceneTransactionStoreState(database, durable));
-  }
-}
-
-void ValidateInitialSceneBaselineDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest) {
-  if (ScalarInteger(database, "PRAGMA application_id") !=
-          kCanonicalEmptySceneSqliteApplicationId ||
-      ScalarInteger(database, "PRAGMA user_version") !=
-          kInitialSceneBaselineSchemaVersion ||
-      ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene v9 schema is invalid");
-  }
-  ValidateMechanicalDatabaseIntegrity(database);
-  ValidateMetadata(database, fixed_query, admission_digest);
-  ValidateMigrationMetadata(database);
-  ValidateNativeHandoffMigrationMetadata(database);
-  ValidateBoundedHistoryMigrationMetadata(database);
-  ValidateMaintenanceInitializationMigrationMetadata(database);
-  ValidateInitialSceneBaselineMigrationMetadata(database);
-}
-
-// v9 provider evidence also carried the provider observation sequence, receive
-// time, source timestamp and freshness budget, and every stored content hash
-// and pose-update request digest covered them. Strip those fields from every
-// stored document, recompute the content hash of each changed snapshot and the
-// digest of each changed request, and rename every column value that names an
-// old hash or digest. The immutability triggers are dropped for this rewrite
-// and recreated verbatim, so the schema objects stay exactly the v9 ones.
-void ConvertProviderObservationEvidence(sqlite3 *database) {
-  std::vector<std::pair<std::string, std::string>> triggers;
-  {
-    Statement statement(
-        database, "SELECT name,sql FROM sqlite_master WHERE type='trigger'");
-    while (statement.Step()) {
-      triggers.emplace_back(statement.Text(0), statement.Text(1));
-    }
-  }
-  for (const auto &[name, sql] : triggers) {
-    Exec(database, "DROP TRIGGER " + name);
-  }
-
-  // Rewrites `column` of every row whose document carries retired fields.
-  const auto rewrite = [&](const std::string &table, const std::string &key,
-                           const std::string &column, const auto &convert) {
-    std::vector<std::pair<std::int64_t, std::string>> rows;
-    {
-      Statement select(database, "SELECT " + key + "," + column + " FROM " +
-                                     table + " WHERE " + column +
-                                     " IS NOT NULL");
-      while (select.Step()) {
-        rows.emplace_back(select.Integer(0), select.Text(1));
-      }
-    }
-    for (const auto &[row, document] : rows) {
-      const auto stripped =
-          logical_scene_codec_internal::StripRetiredProviderEvidenceFields(
-              document);
-      if (!stripped.has_value()) {
-        continue;
-      }
-      Statement update(database, "UPDATE " + table + " SET " + column +
-                                     "=? WHERE " + key + "=?");
-      update.Bind(1, convert(*stripped, row));
-      update.Bind(2, row);
-      if (update.Step()) {
-        throw LogicalSceneOwnerIntegrityError(
-            "provider evidence conversion update returned a row");
-      }
-    }
-  };
-  const auto unchanged = [](const std::string &document, std::int64_t) {
-    return document;
-  };
-
-  std::map<std::string, std::string> content_hashes;
-  const auto snapshot = [&](const std::string &document, std::int64_t) {
-    auto value = logical_scene_codec_internal::DecodeSnapshot(document, false);
-    auto content_hash =
-        core::logical_scene_identity::ComputeLogicalSceneContentHash(value);
-    content_hashes.insert_or_assign(value.revision.content_hash.value(),
-                                    content_hash.value());
-    value.revision.content_hash = std::move(content_hash);
-    return logical_scene_codec_internal::EncodeSnapshot(value);
-  };
-  rewrite("logical_scene_transaction_intents", "transaction_sequence",
-          "candidate_snapshot_json", snapshot);
-  rewrite("logical_scene_history_state", "singleton",
-          "checkpoint_snapshot_json", snapshot);
-  rewrite("logical_scene_maintenance_initialization_intents",
-          "initialization_sequence", "authoritative_snapshot_json", snapshot);
-  rewrite("logical_scene_initial_baseline_intents", "initialization_sequence",
-          "snapshot_json", snapshot);
-  rewrite("logical_scene_transaction_intents", "transaction_sequence",
-          "resolved_operation_json", unchanged);
-
-  std::map<std::string, std::string> request_digests;
-  const auto request = [&](const std::string &document,
-                           const std::int64_t sequence) {
-    Statement digest(database,
-                     "SELECT request_digest FROM "
-                     "logical_scene_transaction_intents WHERE "
-                     "transaction_sequence=?");
-    digest.Bind(1, sequence);
-    if (!digest.Step()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "converted scene request has no stored digest");
-    }
-    const auto converted = manyforge::content_identity::sha256_digest(
-        logical_scene_codec_internal::EncodeRequestDigestInput(
-            logical_scene_codec_internal::DecodeRequest(document)));
-    request_digests.insert_or_assign(digest.Text(0), converted);
-    return document;
-  };
-  rewrite("logical_scene_transaction_intents", "transaction_sequence",
-          "request_json", request);
-
-  const auto rename = [&](const std::map<std::string, std::string> &values,
-                          const std::vector<std::pair<std::string_view,
-                                                      std::string_view>>
-                              &columns) {
-    for (const auto &[before, after] : values) {
-      for (const auto &[table, column] : columns) {
-        Statement update(database, "UPDATE " + std::string(table) + " SET " +
-                                       std::string(column) + "=? WHERE " +
-                                       std::string(column) + "=?");
-        update.Bind(1, after);
-        update.Bind(2, before);
-        if (update.Step()) {
-          throw LogicalSceneOwnerIntegrityError(
-              "provider evidence conversion rename returned a row");
-        }
-      }
-    }
-  };
-  rename(content_hashes,
-         {
-             {"logical_scene_transaction_intents", "prior_scene_content_hash"},
-             {"logical_scene_transaction_intents",
-              "proposed_scene_content_hash"},
-             {"logical_scene_projection_results",
-              "acknowledged_scene_content_hash"},
-             {"logical_scene_maintenance_initialization_intents",
-              "predecessor_scene_content_hash"},
-             {"logical_scene_maintenance_initialization_intents",
-              "target_scene_content_hash"},
-             {"logical_scene_migrated_structural_completions",
-              "target_scene_content_hash"},
-             {"logical_scene_history_state", "checkpoint_scene_content_hash"},
-             {"logical_scene_initial_baseline_intents",
-              "target_scene_content_hash"},
-         });
-  rename(request_digests,
-         {
-             {"logical_scene_transaction_intents", "request_digest"},
-             {"logical_scene_request_outcomes", "request_digest"},
-         });
-
-  for (const auto &trigger : triggers) {
-    Exec(database, trigger.second);
-  }
-  Exec(database, "PRAGMA user_version = " +
-                     std::to_string(kLogicalSceneStoreSchemaVersion));
 }
 
 void InsertMetadata(sqlite3 *database,
@@ -2824,8 +2608,8 @@ void InsertMetadata(sqlite3 *database,
       "canonical_empty_admission_digest,cell_id,"
       "canonical_empty_retained_bundle_id,canonical_empty_graph_revision,"
       "maximum_identifier_bytes,maximum_database_page_image_bytes,"
-      "maximum_wal_bytes,maximum_named_apply_stages) "
-      "VALUES(1,?,?,?,?,?,?,?,?,?,?,?)");
+      "maximum_wal_bytes) "
+      "VALUES(1,?,?,?,?,?,?,?,?,?,?)");
   statement.Bind(1, kCanonicalEmptySceneStoreSchemaId);
   statement.Bind(2, kCanonicalEmptySceneStoreSchemaVersion);
   statement.Bind(3, BaseSchemaArtifactDigest());
@@ -2837,8 +2621,6 @@ void InsertMetadata(sqlite3 *database,
                  static_cast<std::int64_t>(kMaximumSceneStoreIdentifierBytes));
   statement.Bind(9, kMaximumSceneStoreDatabasePageImageBytes);
   statement.Bind(10, kMaximumSceneStoreWalBytes);
-  statement.Bind(
-      11, static_cast<std::int64_t>(kMaximumMigratedStructuralCompletions));
   if (statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
         "metadata insert unexpectedly returned a row");
@@ -2957,7 +2739,11 @@ void ConfigureDurability(sqlite3 *database) {
     throw LogicalSceneOwnerError(
         "logical-scene database did not enter WAL mode");
   }
-  Exec(database, "PRAGMA synchronous=FULL");
+  Exec(database, "PRAGMA synchronous=NORMAL");
+  if (ScalarInteger(database, "PRAGMA synchronous") != 1) {
+    throw LogicalSceneOwnerError(
+        "logical-scene database did not enter synchronous NORMAL mode");
+  }
   Exec(database, "PRAGMA wal_autocheckpoint=1000");
   Exec(database, "PRAGMA journal_size_limit=16777216");
   Statement maximum_pages(database, "PRAGMA max_page_count=16384");
@@ -3140,9 +2926,9 @@ MintAcceptedState(const ProjectionBootstrapIntentDTO &intent,
   }
 }
 
-void InsertAcceptance(sqlite3 *database, const AcceptedState &accepted) {
-  Statement statement(
-      database,
+void InsertAcceptance(persistence::SqliteRecord &statement,
+                      const AcceptedState &accepted) {
+  statement.Statement(
       "INSERT INTO canonical_empty_scene_acceptance("
       "singleton,bootstrap_id,bootstrap_generation,cell_id,"
       "retained_bundle_id,graph_revision,scene_id,scene_revision_id,"
@@ -3173,28 +2959,21 @@ void InsertAcceptance(sqlite3 *database, const AcceptedState &accepted) {
           accepted.snapshot.configured_collision_policy.revision.revision_id));
   statement.Bind(
       14, accepted.snapshot.configured_collision_policy.revision.content_hash);
-  statement.Bind(15, 0);
-  statement.Bind(16, 0);
-  statement.Bind(17, 0);
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "acceptance insert unexpectedly returned a row");
-  }
+  statement.Bind(15, std::int64_t{0});
+  statement.Bind(16, std::int64_t{0});
+  statement.Bind(17, std::int64_t{0});
 }
 
-void InsertRebuild(sqlite3 *database, const AcceptedState &accepted) {
-  Statement statement(
-      database, "INSERT INTO canonical_empty_scene_rebuild("
-                "singleton,bootstrap_id,bootstrap_generation,"
-                "native_rebuild_result_count,aggregate_health_state,"
-                "aggregate_native_health_count) VALUES(1,?,?,0,'healthy',0)");
+void InsertRebuild(persistence::SqliteRecord &statement,
+                   const AcceptedState &accepted) {
+  statement.Statement(
+      "INSERT INTO canonical_empty_scene_rebuild("
+      "singleton,bootstrap_id,bootstrap_generation,"
+      "native_rebuild_result_count,aggregate_health_state,"
+      "aggregate_native_health_count) VALUES(1,?,?,0,'healthy',0)");
   statement.Bind(1, accepted.bootstrap_id.value());
   statement.Bind(2, CheckedSafeCounter(accepted.bootstrap_generation.value(),
                                        "bootstrap_generation"));
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "rebuild insert unexpectedly returned a row");
-  }
 }
 
 void ValidateFinalizeRequest(const ProjectionBootstrapFinalizeDTO &request,
@@ -3221,8 +3000,9 @@ void ValidateFinalizeRequest(const ProjectionBootstrapFinalizeDTO &request,
       "durable public-pointer content digest");
 }
 
-void InsertFinalization(sqlite3 *database,
-                        const ProjectionBootstrapFinalizeDTO &finalize) {
+// The finalization row a Finalize request stores.
+FinalizationColumns
+FinalizationRow(const ProjectionBootstrapFinalizeDTO &finalize) {
   const auto *transaction = std::get_if<BootstrapPublicationTransactionDTO>(
       &finalize.publication_receipt.request.transaction_ref);
   if (transaction == nullptr) {
@@ -3232,8 +3012,31 @@ void InsertFinalization(sqlite3 *database,
   const auto &receipt = finalize.publication_receipt;
   const auto &publication_request = receipt.request;
   const auto &target = publication_request.candidate_projection_revision;
-  Statement statement(
-      database,
+  return {
+      finalize.bootstrap_id.value(),
+      CheckedSafeCounter(finalize.bootstrap_generation.value(),
+                         "bootstrap_generation"),
+      CheckedSafeCounter(receipt.publication_generation.value(),
+                         "publication_generation"),
+      transaction->bootstrap_id.value(),
+      CheckedSafeCounter(transaction->bootstrap_generation.value(),
+                         "publication bootstrap_generation"),
+      target.retained_bundle_id.value(),
+      target.graph_revision.value(),
+      target.scene_revision.scene_id.value(),
+      static_cast<std::int64_t>(target.scene_revision.revision_id),
+      target.scene_revision.content_hash.value(),
+      publication_request.candidate_retained_bundle_id.value(),
+      publication_request.candidate_graph_revision.value(),
+      publication_request.private_materialization_content_digest.value(),
+      publication_request.private_materialization_content_digest.value(),
+      receipt.durable_public_pointer_content_digest.value(),
+  };
+}
+
+void InsertFinalization(persistence::SqliteRecord &statement,
+                        const FinalizationColumns &row) {
+  statement.Statement(
       "INSERT INTO canonical_empty_scene_finalization("
       "singleton,bootstrap_id,bootstrap_generation,publication_generation,"
       "publication_bootstrap_id,publication_bootstrap_generation,"
@@ -3245,33 +3048,21 @@ void InsertFinalization(sqlite3 *database,
       "retired_command_surfaces_evidence_digest,"
       "durable_public_pointer_content_digest) "
       "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  statement.Bind(1, finalize.bootstrap_id.value());
-  statement.Bind(2, CheckedSafeCounter(finalize.bootstrap_generation.value(),
-                                       "bootstrap_generation"));
-  statement.Bind(3, CheckedSafeCounter(receipt.publication_generation.value(),
-                                       "publication_generation"));
-  statement.Bind(4, transaction->bootstrap_id.value());
-  statement.Bind(5,
-                 CheckedSafeCounter(transaction->bootstrap_generation.value(),
-                                    "publication bootstrap_generation"));
-  statement.Bind(6, target.retained_bundle_id.value());
-  statement.Bind(7, target.graph_revision.value());
-  statement.Bind(8, target.scene_revision.scene_id.value());
-  statement.Bind(9,
-                 static_cast<std::int64_t>(target.scene_revision.revision_id));
-  statement.Bind(10, target.scene_revision.content_hash.value());
-  statement.Bind(11, publication_request.candidate_retained_bundle_id.value());
-  statement.Bind(12, publication_request.candidate_graph_revision.value());
-  statement.Bind(
-      13, publication_request.private_materialization_content_digest.value());
-  statement.Bind(14,
-                 publication_request.private_materialization_content_digest
-                     .value());
-  statement.Bind(15, receipt.durable_public_pointer_content_digest.value());
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "finalization insert unexpectedly returned a row");
-  }
+  statement.Bind(1, row.bootstrap_id);
+  statement.Bind(2, row.bootstrap_generation);
+  statement.Bind(3, row.publication_generation);
+  statement.Bind(4, row.publication_bootstrap_id);
+  statement.Bind(5, row.publication_bootstrap_generation);
+  statement.Bind(6, row.candidate_retained_bundle_id);
+  statement.Bind(7, row.candidate_graph_revision);
+  statement.Bind(8, row.candidate_scene_id);
+  statement.Bind(9, row.candidate_scene_revision_id);
+  statement.Bind(10, row.candidate_scene_content_hash);
+  statement.Bind(11, row.request_retained_bundle_id);
+  statement.Bind(12, row.request_graph_revision);
+  statement.Bind(13, row.private_materialization_digest);
+  statement.Bind(14, row.compatibility_materialization_digest);
+  statement.Bind(15, row.public_pointer_digest);
 }
 
 ProjectionAggregateHealthDTO NoProjectionHealth(const AcceptedState &accepted) {
@@ -3317,23 +3108,31 @@ namespace manyforge::scene::logical_scene_owner_detail {
 CanonicalEmptySceneAccessStatus AccessStatus(const DurableState &state) {
   const bool has_active = state.active_projection.has_value();
   const auto *maintenance = state.LatestMaintenanceInitialization();
+  // The newest row is open while it has no receipt and no result other than
+  // `initialized`.
   const bool maintenance_open =
-      maintenance != nullptr && !maintenance->publication_receipt.has_value();
+      maintenance != nullptr && !maintenance->publication_receipt.has_value() &&
+      (!maintenance->result_state.has_value() ||
+       *maintenance->result_state ==
+           ProjectionMaintenanceInitializationState::kInitialized);
   const bool transition_open = maintenance_open;
-  const auto *latest_maintenance = state.LatestMaintenanceInitialization();
-  const bool legacy_uncertainty_repaired =
-      !state.legacy_native_effects_uncertain ||
-      (latest_maintenance != nullptr &&
-       latest_maintenance->publication_receipt.has_value());
-  const bool projection_available = legacy_uncertainty_repaired &&
-                                    !state.projection_desynchronized &&
+  const bool projection_available = !state.projection_desynchronized &&
                                     !state.unresolved_scene_transaction;
+  // An ended newest row takes no part: the phase is the one before it.
+  const bool any_completed = std::ranges::any_of(
+      state.maintenance_initializations,
+      [](const MaintenanceInitializationState &row) {
+        return row.publication_receipt.has_value();
+      });
   return {
       maintenance == nullptr
           ? state.phase()
-          : (maintenance->publication_receipt.has_value()
-                 ? CanonicalEmptySceneBootstrapPhase::kMaintenanceCompleted
-                 : CanonicalEmptySceneBootstrapPhase::kMaintenanceInitializing),
+          : (maintenance_open
+                 ? CanonicalEmptySceneBootstrapPhase::kMaintenanceInitializing
+                 : (any_completed
+                        ? CanonicalEmptySceneBootstrapPhase::
+                              kMaintenanceCompleted
+                        : state.phase())),
       has_active && !transition_open && projection_available,
       has_active && !transition_open && projection_available,
       state.active_projection,
@@ -3449,6 +3248,19 @@ FindSceneObject(const LogicalSceneSnapshotDTO &snapshot,
 
 namespace manyforge::scene {
 
+LogicalSceneOwner::LogicalSceneOwner(
+    std::filesystem::path database_path,
+    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
+    const core::IActiveBundlePublicationReader &publication_reader,
+    const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
+    const core::IPlannerSceneProjectionResolver &projection_resolver,
+    core::IKernelCellAdmissionPort &cell_admission,
+    persistence::SqliteRecordWriter *record_writer)
+    : impl_(std::make_unique<Impl>(
+          std::move(database_path), admission, publication_reader,
+          retained_bundle_source, projection_resolver, cell_admission,
+          record_writer)) {}
+
 ProjectionBootstrapPrerequisiteStatusDTO
 LogicalSceneOwner::ObserveProjectionBootstrapPrerequisites(
     const ProjectionBootstrapPrerequisiteQueryDTO &query) const {
@@ -3506,10 +3318,8 @@ LogicalSceneOwner::BeginProjectionBootstrap(
                                impl_->admitted_bundle_);
   std::lock_guard lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
-  auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE",
-                          &impl_->maintenance_snapshot_cache_);
-  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  impl_->RequireOpen();
+  const auto state = ReadCompleteDurableState(impl_->memory_);
   if (state.accepted.has_value()) {
     if (state.accepted->bootstrap_id != intent.bootstrap_id ||
         state.accepted->bootstrap_generation != intent.bootstrap_generation) {
@@ -3517,7 +3327,6 @@ LogicalSceneOwner::BeginProjectionBootstrap(
           "a different canonical-empty bootstrap already owns this scene "
           "lineage");
     }
-    transaction.Commit();
     return AcceptedResult(*state.accepted);
   }
   if (state.phase() !=
@@ -3529,16 +3338,11 @@ LogicalSceneOwner::BeginProjectionBootstrap(
         "Begin atomic prerequisite recheck is not command-fenced empty");
   }
   const auto accepted = MintAcceptedState(intent, impl_->fixed_query_);
-  InsertAcceptance(database, accepted);
-  state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  if (!state.accepted.has_value() || state.rebuilt ||
-      state.finalization_receipt.has_value() ||
-      state.accepted->target != accepted.target) {
-    throw LogicalSceneOwnerIntegrityError(
-        "durable Begin acceptance did not replay exactly");
-  }
-  transaction.Commit();
-  return AcceptedResult(*state.accepted);
+  persistence::SqliteRecord record;
+  InsertAcceptance(record, accepted);
+  impl_->memory_.accepted = accepted;
+  impl_->Post(std::move(record));
+  return AcceptedResult(accepted);
 }
 
 ProjectionBootstrapRebuildResultDTO
@@ -3549,10 +3353,8 @@ LogicalSceneOwner::RebuildProjectionBootstrap(
   }
   std::lock_guard lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
-  auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE",
-                          &impl_->maintenance_snapshot_cache_);
-  auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  impl_->RequireOpen();
+  const auto state = ReadCompleteDurableState(impl_->memory_);
   if (!state.accepted.has_value() ||
       request.bootstrap_id != state.accepted->bootstrap_id ||
       request.bootstrap_generation != state.accepted->bootstrap_generation ||
@@ -3560,13 +3362,9 @@ LogicalSceneOwner::RebuildProjectionBootstrap(
     throw LogicalSceneOwnerConflictError(
         "Rebuild does not match the exact durable Begin acceptance");
   }
+  persistence::SqliteRecord record;
   if (!state.rebuilt) {
-    InsertRebuild(database, *state.accepted);
-    state = ReadCompleteDurableState(database, impl_->fixed_query_);
-  }
-  if (!state.rebuilt) {
-    throw LogicalSceneOwnerIntegrityError(
-        "zero-native Rebuild was not durably recorded");
+    InsertRebuild(record, *state.accepted);
   }
   const auto evidence = NoProjectionEvidence(*state.accepted);
   ProjectionBootstrapRebuildResultDTO result{
@@ -3582,7 +3380,10 @@ LogicalSceneOwner::RebuildProjectionBootstrap(
     throw LogicalSceneOwnerIntegrityError(
         "cannot represent exact healthy zero-native Rebuild evidence");
   }
-  transaction.Commit();
+  if (!state.rebuilt) {
+    impl_->memory_.rebuilt = true;
+    impl_->Post(std::move(record));
+  }
   return result;
 }
 
@@ -3691,25 +3492,31 @@ LogicalSceneOwner::FinalizeProjectionBootstrap(
         "the independently reread current receipt is not byte-equivalent");
   }
 
-  auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN IMMEDIATE",
-                          &impl_->maintenance_snapshot_cache_);
-  state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  impl_->RequireOpen();
+  state = ReadCompleteDurableState(impl_->memory_);
   if (!state.accepted.has_value() || !state.rebuilt) {
     throw LogicalSceneOwnerIntegrityError(
         "durable bootstrap state changed before Finalize commit");
   }
   ValidateFinalizeRequest(request, *state.accepted);
+  persistence::SqliteRecord record;
   if (!state.finalization_receipt.has_value()) {
-    InsertFinalization(database, request);
-    state = ReadCompleteDurableState(database, impl_->fixed_query_);
+    // The receipt is the one the stored row stands for, as the file
+    // returned it.
+    const auto row = FinalizationRow(request);
+    InsertFinalization(record, row);
+    state.finalization_receipt =
+        FinalizationReceipt(row, state.accepted, state.rebuilt);
   }
   if (!state.finalization_receipt.has_value() ||
       *state.finalization_receipt != request.publication_receipt) {
     throw LogicalSceneOwnerIntegrityError(
         "Finalize receipt was not durably recorded exactly");
   }
-  transaction.Commit();
+  if (!record.empty()) {
+    impl_->memory_.finalization_receipt = state.finalization_receipt;
+    impl_->Post(std::move(record));
+  }
 
   ProjectionBootstrapFinalizeResultDTO result{
       state.accepted->bootstrap_id,
@@ -3730,69 +3537,63 @@ LogicalSceneOwner::FinalizeProjectionBootstrap(
 
 std::optional<SceneCommitResultDTO> LogicalSceneOwner::ReadCommitResult(
     const SceneTransactionRequestDTO &request) const {
-  ValidateBoundedIdentity(request.request_context.request_id.value(),
-                          "request_id");
-  ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
-                          "request_owner_epoch");
   const ContentDigest digest(manyforge::content_identity::sha256_digest(
       logical_scene_codec_internal::EncodeRequestDigestInput(request)));
   std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
   const auto result = ReadOutcomeForRequest(
-      impl_->database(), request.request_context.request_owner_epoch.value(),
-      request.request_context.request_id);
+      impl_->memory_, request.request_context.request_key);
   if (!result.has_value())
     return std::nullopt;
   if (result->request_digest != digest)
     throw LogicalSceneOwnerConflictError(
         "scene result lookup changed the exact request");
-  return ResultFromStoredOutcome(impl_->database(), *result,
+  return ResultFromStoredOutcome(impl_->memory_, *result,
                                  core::RequestReplayStatusDTO::kReplayedExact);
 }
 
+std::uint64_t LogicalSceneOwner::record_file_bytes() const {
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  return SceneFileBytes(impl_->memory_);
+}
+
+// Reports the memory rows. The file's own checks (schema, metadata,
+// quick_check, page ceiling) run when the store is opened.
 CanonicalEmptySceneStoreIntegrityReport
 LogicalSceneOwner::VerifyIntegrity() const {
   std::lock_guard lock(impl_->mutex_);
-  auto *database = impl_->database();
-  Transaction transaction(database, "BEGIN",
-                          &impl_->maintenance_snapshot_cache_);
-  ValidateDatabase(database, impl_->fixed_query_, impl_->admission_digest_);
-  const auto state = ReadCompleteDurableState(database, impl_->fixed_query_);
+  impl_->RequireOpen();
+  const auto &memory = impl_->memory_;
+  const auto state = ReadCompleteDurableState(memory);
+  std::int64_t attempt_count = 0;
+  std::int64_t result_count = 0;
+  for (const auto &transaction : memory.transactions) {
+    attempt_count +=
+        static_cast<std::int64_t>(transaction.projection_attempt_count);
+    result_count +=
+        static_cast<std::int64_t>(transaction.projection_results.size());
+  }
   CanonicalEmptySceneStoreIntegrityReport report{
       impl_->fixed_query_,
       std::string(kLogicalSceneStoreSchemaId),
       kLogicalSceneStoreSchemaVersion,
       CurrentSchemaArtifactDigest(),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM canonical_empty_scene_acceptance"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM canonical_empty_scene_rebuild"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM canonical_empty_scene_finalization"),
-      ScalarInteger(
-          database,
-          "SELECT count(*) FROM logical_scene_migrated_structural_completions"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM logical_scene_transaction_intents"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM logical_scene_request_outcomes"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM logical_scene_projection_attempts"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM logical_scene_projection_results"),
-      ScalarInteger(database,
-                    "SELECT count(*) FROM logical_scene_owner_events"),
-      state.projection_desynchronized || state.unresolved_scene_transaction ||
-          state.legacy_native_effects_uncertain,
+      memory.accepted.has_value() ? 1 : 0,
+      memory.rebuilt ? 1 : 0,
+      memory.finalization_receipt.has_value() ? 1 : 0,
+      static_cast<std::int64_t>(memory.transactions.size()),
+      static_cast<std::int64_t>(memory.outcomes.size()),
+      attempt_count,
+      result_count,
+      static_cast<std::int64_t>(memory.owner_events.size()),
+      state.projection_desynchronized || state.unresolved_scene_transaction,
       AccessStatus(state),
   };
-  transaction.Commit();
   if (!report.access.valid() || report.acceptance_row_count < 0 ||
       report.acceptance_row_count > 1 || report.rebuild_row_count < 0 ||
       report.rebuild_row_count > 1 || report.finalization_row_count < 0 ||
       report.finalization_row_count > 1 ||
-      report.migrated_structural_completion_count < 0 ||
-      report.migrated_structural_completion_count >
-          static_cast<std::int64_t>(kMaximumMigratedStructuralCompletions) ||
       report.transaction_intent_count < 0 ||
       report.transaction_intent_count >
           static_cast<std::int64_t>(kMaximumLogicalSceneTransactions) ||

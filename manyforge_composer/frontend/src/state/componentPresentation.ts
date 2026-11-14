@@ -326,6 +326,7 @@ export function latchCauseText(cause: CellLatch['causes'][number]): string {
   }
   if (cause.kind === 'stop') return `${cause.component_id}: ${cause.stop === undefined ? 'E-stop' : stopText(cause.stop)}`;
   if (cause.kind === 'offline') return `${cause.component_id}: offline`;
+  if (cause.reason !== undefined) return `${cause.component_id}: ${codedErrorText(cause.reason)}`;
   return `${cause.component_id}: can't report whether it is still moving`;
 }
 
@@ -363,6 +364,34 @@ export interface RunEndPresentation {
   label: string;
   tone: PresentationTone;
   text: string;
+}
+
+/** The late execution host's Halt (Manager source label). */
+const EXECUTION_HOST_LATE_SOURCE = 'manager.execution_host_late';
+/** The disk check's Halt (Headless source label, OD-215). */
+const DISK_CANNOT_KEEP_RECORDS_SOURCE = 'headless.disk_cannot_keep_records';
+
+/**
+ * Why the run is halted, from the Stop that froze it (run status `halt`);
+ * null for a kind with no operator text (planned stop, Program end, unknown).
+ */
+export function haltCauseText(halt: { kind: string; sourceLabel: string | null } | null): string | null {
+  switch (halt?.kind) {
+    case 'halt':
+      if (halt.sourceLabel === EXECUTION_HOST_LATE_SOURCE) return 'Halted: the execution host was late.';
+      if (halt.sourceLabel === DISK_CANNOT_KEEP_RECORDS_SOURCE) {
+        return "Halted: the disk cannot keep ManyForge's records.";
+      }
+      return 'Halted by the operator.';
+    case 'internal_fault':
+      return 'Halted: internal fault.';
+    case 'stop_failed_halt':
+      return 'Halted: a stop was not confirmed.';
+    case 'runner_loss':
+      return 'Halted: the Program runner stopped answering.';
+    default:
+      return null;
+  }
 }
 
 /** Why a run ended. */

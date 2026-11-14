@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 #include <manyforge_core/admission_timing_diagnostic.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
@@ -87,8 +88,7 @@ using core::ProductId;
 using core::ProjectionRevisionDTO;
 using core::ProjectionStageGeneration;
 using core::PublicRequestContextDTO;
-using core::RequestId;
-using core::RequestOwnerEpoch;
+using core::RequestKey;
 using core::RequestReplayStatusDTO;
 using core::ResourceId;
 using core::RetainedBundleId;
@@ -101,11 +101,11 @@ using core::SceneId;
 using core::SceneRevision;
 
 constexpr std::string_view kDigestDomain =
-    "manyforge.component-manager-apply-intent.v2";
+    "manyforge.component-manager-apply-intent.v3";
 constexpr std::string_view kAffectedScopeDigestDomain =
     "manyforge.component-manager-apply-affected-scope.v2";
 constexpr std::string_view kFenceAttemptDigestDomain =
-    "manyforge.component-manager-apply-fence-attempt.v2";
+    "manyforge.component-manager-apply-fence-attempt.v3";
 constexpr std::string_view kFenceAcceptanceDigestDomain =
     "manyforge.component-manager-apply-fence-acceptance.v2";
 constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
@@ -355,6 +355,14 @@ public:
     return Blob(column);
   }
 
+  [[nodiscard]] int Columns() const noexcept {
+    return sqlite3_column_count(statement_);
+  }
+
+  [[nodiscard]] int Type(const int column) const noexcept {
+    return sqlite3_column_type(statement_, column);
+  }
+
 private:
   sqlite3 *database_;
   sqlite3_stmt *statement_{};
@@ -479,6 +487,12 @@ const SchemaObjects &ExpectedSchemaObjects() {
   return expected;
 }
 
+void ValidateBoundedIdentity(const ApplyId value, const std::string_view label) {
+  constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
+  if (!value.nonzero() || value.value() > kMaximumSafeInteger)
+    throw std::invalid_argument(std::string(label) + " must be a positive safe integer");
+}
+
 void ValidateBoundedIdentity(const std::string_view value,
                              const std::string_view label) {
   if (value.empty() ||
@@ -583,6 +597,31 @@ void AppendField(std::string &record, const std::string_view name,
   record.push_back('\n');
 }
 
+// The Apply number (contract 1.16.1) in a digest record: decimal text.
+void AppendField(std::string &record, const std::string_view name,
+                 const ApplyId apply_id) {
+  AppendField(record, name, std::to_string(apply_id.value()));
+}
+
+// A request key (contract 1.4) in a digest record: 32 lowercase hex.
+void AppendField(std::string &record, const std::string_view name,
+                 const core::RequestKey &key) {
+  const auto text = core::FormatRequestKey(key);
+  AppendField(record, name, std::string_view(text.data(), text.size()));
+}
+
+[[nodiscard]] std::string_view KeyBytes(const core::RequestKey &key) {
+  return {reinterpret_cast<const char *>(key.bytes.data()), key.bytes.size()};
+}
+
+[[nodiscard]] core::RequestKey KeyFromBytes(const std::string &bytes) {
+  if (bytes.size() != 16U)
+    throw std::runtime_error("Manager Apply journal request key is not 16 bytes");
+  core::RequestKey key;
+  std::copy(bytes.begin(), bytes.end(), key.bytes.begin());
+  return key;
+}
+
 /// The bounded cause details of a retained failure, length-prefixed in key
 /// order like the digest records (`AppendField`); empty for no details.
 [[nodiscard]] std::string EncodeCauseDetails(
@@ -668,18 +707,9 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
   if (!intent.valid()) {
     throw std::invalid_argument("manager Apply intent is invalid");
   }
-  ValidateBoundedIdentity(intent.request_context.request_id.value(),
-                          "request_id");
-  ValidateBoundedIdentity(intent.request_context.request_owner_epoch.value(),
-                          "request_owner_epoch");
   ValidateBoundedText(intent.request_context.source_label,
                       kMaximumManagerApplySourceLabelBytes, "source_label");
-  if (intent.request_context.correlation_id.has_value()) {
-    ValidateBoundedText(*intent.request_context.correlation_id,
-                        kMaximumManagerApplyCorrelationIdBytes,
-                        "correlation_id");
-  }
-  ValidateBoundedIdentity(intent.apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(intent.apply_id, "apply_id");
   ValidateBoundedIdentity(intent.cell_id.value(), "cell_id");
   ValidateBoundedIdentity(
       intent.expected_active_projection_revision.retained_bundle_id.value(),
@@ -737,17 +767,11 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
 
   std::string record;
   AppendField(record, "domain", kDigestDomain);
-  AppendField(record, "request_id", intent.request_context.request_id.value());
-  AppendField(record, "request_owner_epoch",
-              intent.request_context.request_owner_epoch.value());
+  AppendField(record, "request_key", intent.request_context.request_key);
   AppendField(record, "source_label", intent.request_context.source_label);
-  AppendField(record, "correlation_id_present",
-              intent.request_context.correlation_id.has_value() ? "1" : "0");
-  AppendField(record, "correlation_id",
-              intent.request_context.correlation_id.value_or(""));
   AppendField(record, "scene_initialization",
               ToString(intent.scene_initialization));
-  AppendField(record, "apply_id", intent.apply_id.value());
+  AppendField(record, "apply_id", intent.apply_id);
   AppendField(record, "apply_generation", std::to_string(generation));
   AppendField(record, "cell_id", intent.cell_id.value());
   AppendField(
@@ -1153,13 +1177,10 @@ std::string EncodeFenceReconciliationEvidence(
                           "Kernel runtime_unit_id");
   ValidateBoundedIdentity(evidence.execution_host_epoch.runtime_epoch.value(),
                           "Kernel runtime_epoch");
-  ValidateBoundedIdentity(
-      evidence.execution_host_epoch.request_owner_epoch.value(),
-      "Kernel request_owner_epoch");
   ValidateDigest(
       evidence.execution_host_epoch.durable_stop_fence_ledger_digest.value(),
       "durable_stop_fence_ledger_digest");
-  ValidateBoundedIdentity(evidence.owner_transaction.apply_id.value(),
+  ValidateBoundedIdentity(evidence.owner_transaction.apply_id,
                           "apply_id");
   ValidateBoundedIdentity(evidence.configuration_fence_id.value(),
                           "configuration_fence_id");
@@ -1207,10 +1228,9 @@ std::string EncodeFenceReconciliationEvidence(
   return EncodeTokens({
       evidence.execution_host_epoch.runtime_unit_id.value(),
       evidence.execution_host_epoch.runtime_epoch.value(),
-      evidence.execution_host_epoch.request_owner_epoch.value(),
       evidence.execution_host_epoch.durable_stop_fence_ledger_digest.value(),
       std::to_string(host_publication_generation),
-      evidence.owner_transaction.apply_id.value(),
+      std::to_string(evidence.owner_transaction.apply_id.value()),
       std::to_string(apply_generation),
       evidence.configuration_fence_id.value(),
       std::to_string(fence_generation),
@@ -1236,8 +1256,8 @@ std::string EncodeFenceReconciliationEvidence(
 
 ConfigurationFenceReconciliationEvidenceDTO
 DecodeFenceReconciliationEvidence(const std::string &encoding) {
-  const auto tokens = DecodeTokens(encoding, 26U, "fence reconciliation");
-  if (tokens.size() != 26U) {
+  const auto tokens = DecodeTokens(encoding, 25U, "fence reconciliation");
+  if (tokens.size() != 25U) {
     throw ManagerApplyJournalIntegrityError(
         "stored fence reconciliation tuple cardinality is invalid");
   }
@@ -1245,39 +1265,38 @@ DecodeFenceReconciliationEvidence(const std::string &encoding) {
       core::ExecutionHostEpochDTO{
           RuntimeUnitId(tokens[0]),
           RuntimeEpoch(tokens[1]),
-          RequestOwnerEpoch(tokens[2]),
-          ContentDigest(tokens[3]),
+          ContentDigest(tokens[2]),
           ActiveBundlePublicationGeneration(ParseCanonicalSqliteUnsigned(
-              tokens[4], "Kernel publication generation", true)),
+              tokens[3], "Kernel publication generation", true)),
       },
       core::ApplyFenceOwnerDTO{
-          ApplyId(tokens[5]),
+          ApplyId(ParseCanonicalSqliteUnsigned(tokens[4], "Apply number", true)),
           ApplyGeneration(ParseCanonicalSqliteUnsigned(
-              tokens[6], "release Apply generation", true)),
+              tokens[5], "release Apply generation", true)),
       },
-      ConfigurationFenceId(tokens[7]),
+      ConfigurationFenceId(tokens[6]),
       ConfigurationFenceGeneration(ParseCanonicalSqliteUnsigned(
-          tokens[8], "release fence generation", true)),
-      DecodeScope(tokens[9], tokens[10], tokens[11], tokens[12]),
-      ParseCanonicalSqliteUnsigned(tokens[13], "operation generation", false),
-      GraphRevision(tokens[14]),
+          tokens[7], "release fence generation", true)),
+      DecodeScope(tokens[8], tokens[9], tokens[10], tokens[11]),
+      ParseCanonicalSqliteUnsigned(tokens[12], "operation generation", false),
+      GraphRevision(tokens[13]),
       ProjectionRevisionDTO{
-          RetainedBundleId(tokens[15]),
-          GraphRevision(tokens[16]),
+          RetainedBundleId(tokens[14]),
+          GraphRevision(tokens[15]),
           SceneRevision{
-              SceneId(tokens[17]),
-              ParseCanonicalSqliteUnsigned(tokens[18], "active scene revision",
+              SceneId(tokens[16]),
+              ParseCanonicalSqliteUnsigned(tokens[17], "active scene revision",
                                            true),
-              ContentDigest(tokens[19]),
+              ContentDigest(tokens[18]),
           },
       },
       ActiveBundlePublicationGeneration(ParseCanonicalSqliteUnsigned(
-          tokens[20], "active publication generation", true)),
-      ContentDigest(tokens[21]),
-      DecodeActiveConfigurations(tokens[22]),
-      ParseCanonicalSqliteUnsigned(tokens[23], "affected queued count", false),
-      ParseCanonicalSqliteUnsigned(tokens[24], "affected active count", false),
-      ContentDigest(tokens[25]),
+          tokens[19], "active publication generation", true)),
+      ContentDigest(tokens[20]),
+      DecodeActiveConfigurations(tokens[21]),
+      ParseCanonicalSqliteUnsigned(tokens[22], "affected queued count", false),
+      ParseCanonicalSqliteUnsigned(tokens[23], "affected active count", false),
+      ContentDigest(tokens[24]),
   };
   if (!evidence.valid() ||
       EncodeFenceReconciliationEvidence(evidence) != encoding) {
@@ -1293,22 +1312,19 @@ EncodeFenceReleaseRequest(const ConfigurationFenceReleaseDTO &request) {
     throw std::invalid_argument(
         "configuration-fence release request is invalid");
   }
-  ValidateBoundedIdentity(request.manager_runtime_epoch.value(),
-                          "manager_runtime_epoch");
   return EncodeTokens(
-      {EncodeFenceReconciliationEvidence(request.reconciliation_evidence),
-       request.manager_runtime_epoch.value()});
+      {EncodeFenceReconciliationEvidence(request.reconciliation_evidence)});
 }
 
 ConfigurationFenceReleaseDTO
 DecodeFenceReleaseRequest(const std::string &encoding) {
-  const auto tokens = DecodeTokens(encoding, 2U, "fence release request");
-  if (tokens.size() != 2U) {
+  const auto tokens = DecodeTokens(encoding, 1U, "fence release request");
+  if (tokens.size() != 1U) {
     throw ManagerApplyJournalIntegrityError(
         "stored fence release-request tuple cardinality is invalid");
   }
   ConfigurationFenceReleaseDTO request{
-      DecodeFenceReconciliationEvidence(tokens[0]), RuntimeEpoch(tokens[1])};
+      DecodeFenceReconciliationEvidence(tokens[0])};
   if (!request.valid() || EncodeFenceReleaseRequest(request) != encoding) {
     throw ManagerApplyJournalIntegrityError(
         "stored fence release request is invalid or noncanonical");
@@ -1330,7 +1346,6 @@ std::string EncodeFenceReleased(const ConfigurationFenceReleasedDTO &released) {
       EncodeFenceReleaseRequest(released.request),
       released.execution_host_epoch.runtime_unit_id.value(),
       released.execution_host_epoch.runtime_epoch.value(),
-      released.execution_host_epoch.request_owner_epoch.value(),
       released.execution_host_epoch.durable_stop_fence_ledger_digest.value(),
       std::to_string(host_publication_generation),
       std::to_string(released.released_at_ns),
@@ -1340,8 +1355,8 @@ std::string EncodeFenceReleased(const ConfigurationFenceReleasedDTO &released) {
 }
 
 ConfigurationFenceReleasedDTO DecodeFenceReleased(const std::string &encoding) {
-  const auto tokens = DecodeTokens(encoding, 9U, "fence released receipt");
-  if (tokens.size() != 9U) {
+  const auto tokens = DecodeTokens(encoding, 8U, "fence released receipt");
+  if (tokens.size() != 8U) {
     throw ManagerApplyJournalIntegrityError(
         "stored fence-released tuple cardinality is invalid");
   }
@@ -1350,15 +1365,14 @@ ConfigurationFenceReleasedDTO DecodeFenceReleased(const std::string &encoding) {
       core::ExecutionHostEpochDTO{
           RuntimeUnitId(tokens[1]),
           RuntimeEpoch(tokens[2]),
-          RequestOwnerEpoch(tokens[3]),
-          ContentDigest(tokens[4]),
+          ContentDigest(tokens[3]),
           ActiveBundlePublicationGeneration(ParseCanonicalSqliteUnsigned(
-              tokens[5], "released Kernel publication generation", true)),
+              tokens[4], "released Kernel publication generation", true)),
       },
       static_cast<std::int64_t>(
-          ParseCanonicalSqliteUnsigned(tokens[6], "released_at_ns", false)),
-      DecodeAcceptedReplayStatus(tokens[7]),
-      ContentDigest(tokens[8]),
+          ParseCanonicalSqliteUnsigned(tokens[5], "released_at_ns", false)),
+      DecodeAcceptedReplayStatus(tokens[6]),
+      ContentDigest(tokens[7]),
   };
   if (!released.valid() || EncodeFenceReleased(released) != encoding) {
     throw ManagerApplyJournalIntegrityError(
@@ -1395,7 +1409,7 @@ EncodeFenceReleaseIntent(const ManagerApplyFenceReleaseIntentDTO &intent) {
               intent.scene_completion_digest.value());
   AppendField(record, "fence_acceptance_digest",
               intent.fence_acceptance_digest.value());
-  AppendField(record, "apply_id", owner.apply_id.value());
+  AppendField(record, "apply_id", owner.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "release_request_encoding", encoded.release_request);
@@ -1427,7 +1441,7 @@ EncodeFenceReleasedRecord(const ManagerApplyFenceReleasedDTO &record_value) {
   AppendField(digest_record, "domain", kFenceReleasedDigestDomain);
   AppendField(digest_record, "fence_release_intent_digest",
               record_value.fence_release_intent_digest.value());
-  AppendField(digest_record, "apply_id", owner.apply_id.value());
+  AppendField(digest_record, "apply_id", owner.apply_id);
   AppendField(digest_record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(digest_record, "released_fence_encoding", encoded.released_fence);
@@ -1447,7 +1461,7 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
   if (!outcome.valid()) {
     throw std::invalid_argument("Manager terminal Apply outcome is invalid");
   }
-  ValidateBoundedIdentity(outcome.apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(outcome.apply_id, "apply_id");
   EncodedTerminalOutcome encoded{
       CheckedSigned(outcome.apply_generation.value(), "apply_generation"),
       std::nullopt,
@@ -1456,7 +1470,7 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
   };
   std::string record;
   AppendField(record, "domain", kTerminalOutcomeDigestDomain);
-  AppendField(record, "apply_id", outcome.apply_id.value());
+  AppendField(record, "apply_id", outcome.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "outcome_state", encoded.state);
@@ -1617,7 +1631,7 @@ EncodeAffectedScope(const ContentDigest &intent_digest,
     throw std::invalid_argument("Apply affected scope is invalid");
   }
   ValidateDigest(intent_digest.value(), "intent_digest");
-  ValidateBoundedIdentity(affected_scope.apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(affected_scope.apply_id, "apply_id");
   EncodedAffectedScope encoded{
       CheckedSigned(affected_scope.apply_generation.value(),
                     "apply_generation"),
@@ -1633,7 +1647,7 @@ EncodeAffectedScope(const ContentDigest &intent_digest,
   std::string record;
   AppendField(record, "domain", kAffectedScopeDigestDomain);
   AppendField(record, "intent_digest", intent_digest.value());
-  AppendField(record, "apply_id", affected_scope.apply_id.value());
+  AppendField(record, "apply_id", affected_scope.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "components_encoding", encoded.components);
@@ -1685,19 +1699,9 @@ EncodeFenceAttempt(const ContentDigest &intent_digest,
   }
   ValidateDigest(intent_digest.value(), "intent_digest");
   ValidateDigest(affected_scope_digest.value(), "affected_scope_digest");
-  ValidateBoundedIdentity(intent.owner_request_context.request_id.value(),
-                          "request_id");
-  ValidateBoundedIdentity(
-      intent.owner_request_context.request_owner_epoch.value(),
-      "request_owner_epoch");
   ValidateBoundedText(intent.owner_request_context.source_label,
                       kMaximumManagerApplySourceLabelBytes, "source_label");
-  if (intent.owner_request_context.correlation_id.has_value()) {
-    ValidateBoundedText(*intent.owner_request_context.correlation_id,
-                        kMaximumManagerApplyCorrelationIdBytes,
-                        "correlation_id");
-  }
-  ValidateBoundedIdentity(intent.owner_transaction.apply_id.value(),
+  ValidateBoundedIdentity(intent.owner_transaction.apply_id,
                           "apply_id");
   ValidateBoundedIdentity(intent.expected_retained_bundle_id.value(),
                           "expected_retained_bundle_id");
@@ -1723,19 +1727,12 @@ EncodeFenceAttempt(const ContentDigest &intent_digest,
   AppendField(record, "domain", kFenceAttemptDigestDomain);
   AppendField(record, "intent_digest", intent_digest.value());
   AppendField(record, "affected_scope_digest", affected_scope_digest.value());
-  AppendField(record, "apply_id", intent.owner_transaction.apply_id.value());
+  AppendField(record, "apply_id", intent.owner_transaction.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
-  AppendField(record, "request_id",
-              intent.owner_request_context.request_id.value());
-  AppendField(record, "request_owner_epoch",
-              intent.owner_request_context.request_owner_epoch.value());
+  AppendField(record, "request_key", intent.owner_request_context.request_key);
   AppendField(record, "source_label",
               intent.owner_request_context.source_label);
-  AppendField(record, "correlation_id_present",
-              intent.owner_request_context.correlation_id ? "1" : "0");
-  AppendField(record, "correlation_id",
-              intent.owner_request_context.correlation_id.value_or(""));
   AppendField(record, "components_encoding", encoded.components);
   AppendField(record, "domains_encoding", encoded.domains);
   AppendField(record, "bindings_encoding", encoded.bindings);
@@ -1787,7 +1784,7 @@ EncodeFenceAcceptance(const ApplyId &apply_id,
   if (!accepted.valid()) {
     throw std::invalid_argument("configuration-fence acceptance is invalid");
   }
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   ValidateDigest(fence_attempt_digest.value(), "fence_attempt_digest");
   ValidateBoundedIdentity(accepted.configuration_fence_id.value(),
                           "configuration_fence_id");
@@ -1805,7 +1802,7 @@ EncodeFenceAcceptance(const ApplyId &apply_id,
   std::string record;
   AppendField(record, "domain", kFenceAcceptanceDigestDomain);
   AppendField(record, "fence_attempt_digest", fence_attempt_digest.value());
-  AppendField(record, "apply_id", apply_id.value());
+  AppendField(record, "apply_id", apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "configuration_fence_id",
@@ -2162,7 +2159,7 @@ EncodedRuntimeConvergenceIntent EncodeRuntimeConvergenceIntent(
   std::string record;
   AppendField(record, "domain", kRuntimeConvergenceIntentDigestDomain);
   AppendField(record, "intent_digest", intent_digest.value());
-  AppendField(record, "apply_id", intent.apply_id.value());
+  AppendField(record, "apply_id", intent.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "candidate_retained_bundle_id",
@@ -2208,7 +2205,7 @@ EncodedRuntimeStagedReady EncodeRuntimeStagedReady(
   AppendField(record, "domain", kRuntimeStagedReadyDigestDomain);
   AppendField(record, "runtime_convergence_intent_digest",
               staged_ready.runtime_convergence_intent_digest.value());
-  AppendField(record, "apply_id", staged_ready.apply_id.value());
+  AppendField(record, "apply_id", staged_ready.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   AppendField(record, "staged_ready_generation",
@@ -2251,7 +2248,7 @@ EncodedPrivateMaterialization EncodePrivateMaterialization(
   AppendField(record, "domain", kPrivateMaterializationDigestDomain);
   AppendField(record, "authoritative_scene_snapshot_digest",
               materialization.authoritative_scene_snapshot_digest.value());
-  AppendField(record, "apply_id", materialization.apply_id.value());
+  AppendField(record, "apply_id", materialization.apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   const auto &candidate = materialization.candidate_projection_revision;
@@ -2309,7 +2306,7 @@ EncodePublicationReceipt(const ManagerApplyPublicationReceiptDTO &publication) {
   AppendField(record, "domain", kPublicationReceiptDigestDomain);
   AppendField(record, "private_materialization_content_digest",
               publication.private_materialization_content_digest.value());
-  AppendField(record, "apply_id", transaction->apply_id.value());
+  AppendField(record, "apply_id", transaction->apply_id);
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
   const auto &candidate = receipt.request.candidate_projection_revision;
@@ -2485,6 +2482,223 @@ void PreflightApplyJournal(const std::filesystem::path &database_path,
   }
 }
 
+// SQLITE_LIMIT_LENGTH as Configure sets it.
+constexpr std::size_t kSqliteLengthLimitBytes = 1024U * 1024U;
+constexpr std::int64_t kMaximumStoredAdmissionGeneration = 9007199254740991LL;
+constexpr std::size_t kMaximumComponentDeltaCharacters = 262144U;
+
+// SQLite's refusals that a record passing every C++ check can still meet.
+// Memory decides them now, with the text SQLite gave.
+constexpr std::string_view kSqliteTooBig =
+    ": SQLite storage ceiling exhausted: string or blob too big";
+constexpr std::string_view kAdmissionGenerationCheckFailed =
+    "step SQLite statement: CHECK constraint failed: "
+    "expected_admission_generation IS NULL\n"
+    "            OR (\n"
+    "                expected_admission_generation > 0\n"
+    "                AND expected_admission_generation <= 9007199254740991\n"
+    "            )";
+constexpr std::string_view kComponentDeltaCheckFailed =
+    "step SQLite statement: CHECK constraint failed: "
+    "length(component_delta_encoding) BETWEEN 2 AND 262144";
+constexpr std::string_view kFenceAcceptanceUniqueFailed =
+    "step SQLite statement: UNIQUE constraint failed: "
+    "manager_apply_fence_acceptances.configuration_fence_id, "
+    "manager_apply_fence_acceptances.configuration_fence_generation";
+
+// One value bound to a posted statement.
+struct SqlValue final {
+  enum class Kind { kNull, kInteger, kText, kBlob };
+  Kind kind;
+  std::int64_t integer;
+  std::string bytes;
+};
+
+SqlValue SqlNull() { return {SqlValue::Kind::kNull, 0, {}}; }
+
+SqlValue SqlInteger(const std::int64_t value) {
+  return {SqlValue::Kind::kInteger, value, {}};
+}
+
+SqlValue SqlInteger(const ApplyId &apply_id) {
+  return SqlInteger(static_cast<std::int64_t>(apply_id.value()));
+}
+
+SqlValue SqlText(const std::string_view value) {
+  return {SqlValue::Kind::kText, 0, std::string(value)};
+}
+
+SqlValue SqlBlob(const std::string_view value) {
+  return {SqlValue::Kind::kBlob, 0, std::string(value)};
+}
+
+// One statement of a posted record, its values in parameter order.
+struct SqlWrite final {
+  std::string sql;
+  std::vector<SqlValue> values;
+  std::optional<int> expected_changes;
+};
+
+// Binding a text or blob longer than SQLITE_LIMIT_LENGTH fails as it did.
+void ThrowIfValueTooBig(const std::vector<SqlValue> &values) {
+  for (const auto &value : values) {
+    if (value.bytes.size() > kSqliteLengthLimitBytes) {
+      throw ManagerApplyJournalLimitError(
+          std::string(value.kind == SqlValue::Kind::kBlob ? "bind SQLite blob"
+                                                          : "bind SQLite text") +
+          std::string(kSqliteTooBig));
+    }
+  }
+}
+
+std::uint64_t SqliteVarintLength(std::uint64_t value) {
+  std::uint64_t length = 1U;
+  while (value > 0x7FU && length < 9U) {
+    value >>= 7U;
+    ++length;
+  }
+  return length;
+}
+
+// A row record longer than SQLITE_LIMIT_LENGTH fails as it did; the size
+// follows SQLite's record format: a header of serial types, then the values.
+// Returns that size.
+std::uint64_t ThrowIfRecordTooBig(const std::vector<SqlValue> &columns) {
+  std::uint64_t header = 0U;
+  std::uint64_t body = 0U;
+  for (const auto &column : columns) {
+    std::uint64_t type = 0U;
+    std::uint64_t size = 0U;
+    if (column.kind == SqlValue::Kind::kInteger) {
+      const auto value = column.integer;
+      const auto magnitude =
+          static_cast<std::uint64_t>(value < 0 ? ~value : value);
+      if (value == 0 || value == 1) {
+        type = 8U + static_cast<std::uint64_t>(value);
+      } else if (magnitude <= 0x7FU) {
+        type = 1U;
+        size = 1U;
+      } else if (magnitude <= 0x7FFFU) {
+        type = 2U;
+        size = 2U;
+      } else if (magnitude <= 0x7FFFFFU) {
+        type = 3U;
+        size = 3U;
+      } else if (magnitude <= 0x7FFFFFFFU) {
+        type = 4U;
+        size = 4U;
+      } else if (magnitude <= 0x7FFFFFFFFFFFU) {
+        type = 5U;
+        size = 6U;
+      } else {
+        type = 6U;
+        size = 8U;
+      }
+    } else if (column.kind != SqlValue::Kind::kNull) {
+      size = column.bytes.size();
+      type = 2U * size + (column.kind == SqlValue::Kind::kText ? 13U : 12U);
+    }
+    header += SqliteVarintLength(type);
+    body += size;
+  }
+  if (header <= 126U) {
+    header += 1U;
+  } else {
+    const auto length = SqliteVarintLength(header);
+    header += length;
+    if (length < SqliteVarintLength(header)) {
+      ++header;
+    }
+  }
+  if (header + body > kSqliteLengthLimitBytes) {
+    throw ManagerApplyJournalLimitError("step SQLite statement" +
+                                        std::string(kSqliteTooBig));
+  }
+  return header + body;
+}
+
+// The tables of one Apply's records, children first (every foreign key points
+// at a table later in the list), each with its number of UNIQUE constraints.
+struct ApplyTable final {
+  std::string_view name;
+  std::uint64_t unique_indexes;
+};
+constexpr std::array<ApplyTable, 12> kApplyTables{{
+    {"manager_apply_failed_release", 0U},
+    {"manager_apply_terminal_outcomes", 1U},
+    {"manager_apply_fence_released_records", 1U},
+    {"manager_apply_fence_release_intents", 1U},
+    {"manager_apply_publication_receipts", 2U},
+    {"manager_apply_private_materializations", 1U},
+    {"manager_apply_runtime_staged_ready_sets", 1U},
+    {"manager_apply_runtime_convergence_intents", 1U},
+    {"manager_apply_fence_acceptances", 2U},
+    {"manager_apply_fence_attempts", 1U},
+    {"manager_apply_affected_scopes", 1U},
+    {"manager_apply_intents", 3U},
+}};
+
+consteval std::uint64_t UniqueIndexes(const std::string_view table) {
+  for (const auto &entry : kApplyTables) {
+    if (entry.name == table) {
+      return entry.unique_indexes;
+    }
+  }
+  throw "not an Apply-journal table";
+}
+
+// Every UNIQUE index entry is at most this long: two or three integers with
+// one 16-byte request key, one 71-byte digest or one identifier of at most
+// 256 bytes.
+constexpr std::uint64_t kMaximumIndexEntryBytes = 300U;
+
+// The file bytes one row of `record` bytes and its `unique_indexes` index
+// entries can take on pages of `page_size` bytes (SQLite file format, index
+// b-tree pages, which hold WITHOUT ROWID rows): an over-count.
+//  - A cell of P bytes stays in its page when P <= X = (U-12)*64/255-23
+//    (U = page size); otherwise M = (U-12)*32/255-23 to X bytes stay and the
+//    rest goes to at most ceil((P-M)/(U-4)) overflow pages. Counting M bytes
+//    and ceil((P-M)/(U-4)) whole pages counts one page more whenever more
+//    than M bytes stay, which covers those up to X-M bytes three times.
+//  - A cell takes at most 13 bytes more in its page: its 2-byte pointer, a
+//    size of at most 3 bytes (1 MiB records), and 4-byte page numbers of a
+//    child (interior page) and of the first overflow page.
+//  - The in-page bytes count three times: SQLite rebalances a page that is
+//    less than one third full.
+std::uint64_t RowFileBytes(const std::uint64_t record,
+                           const std::uint64_t unique_indexes,
+                           const std::uint64_t page_size) {
+  constexpr std::uint64_t kCellOverhead = 13U;
+  constexpr std::uint64_t kPageFill = 3U;
+  const auto in_page = (page_size - 12U) * 64U / 255U - 23U;
+  const auto minimum_in_page = (page_size - 12U) * 32U / 255U - 23U;
+  const auto per_overflow_page = page_size - 4U;
+  const auto row =
+      record <= in_page
+          ? kPageFill * (record + kCellOverhead)
+          : kPageFill * (minimum_in_page + kCellOverhead) +
+                page_size * ((record - minimum_in_page + per_overflow_page - 1U) /
+                             per_overflow_page);
+  return row +
+         unique_indexes * kPageFill * (kMaximumIndexEntryBytes + kCellOverhead);
+}
+
+// SQLite's length() of a TEXT value: UTF-8 characters before the first NUL.
+std::size_t SqliteTextLength(const std::string_view text) {
+  std::size_t length = 0U;
+  std::size_t index = 0U;
+  while (index < text.size() && text[index] != '\0') {
+    ++length;
+    if (static_cast<unsigned char>(text[index++]) >= 0xC0U) {
+      while (index < text.size() &&
+             (static_cast<unsigned char>(text[index]) & 0xC0U) == 0x80U) {
+        ++index;
+      }
+    }
+  }
+  return length;
+}
+
 } // namespace
 
 ContentDigest
@@ -2529,18 +2743,24 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
   return "unknown";
 }
 
+// An ended failure: New releases whatever the Kernel still holds for it.
+static bool IsFailedTerminal(const PersistedManagerApplyStatus &status) noexcept {
+  if (!status.terminal_outcome) return false;
+  const auto &terminal = status.terminal_outcome->terminal_outcome;
+  return terminal.state != ManagerApplyTerminalOutcomeState::kSucceeded && terminal.failure;
+}
+
 // Durable evidence remains valid if the set of failures offered to operators
 // is narrowed in a later version. Scope policy belongs at the attempt boundary.
 // A failed Apply that still holds its accepted fence and published nothing:
-// releasable before effect (acknowledgement) or, whatever it changed, by New.
+// releasable before effect by acknowledgement.
 static bool HasFailedApplyReleaseEvidence(const PersistedManagerApplyStatus &status) noexcept {
   if (!status.terminal_outcome || !status.affected_scope || !status.fence_attempt ||
       !status.fence_acceptance || status.publication_receipt ||
       status.fence_release_intent || status.fence_released ||
       !status.affected_scope->affected_scope.component_delta.valid())
     return false;
-  const auto &terminal = status.terminal_outcome->terminal_outcome;
-  return terminal.state != ManagerApplyTerminalOutcomeState::kSucceeded && terminal.failure;
+  return IsFailedTerminal(status);
 }
 
 // Runtime staging is no effect: a host that refused the staged candidate
@@ -2555,7 +2775,7 @@ bool FailedApplyAcknowledgementEligible(const PersistedManagerApplyStatus &statu
 }
 
 bool FailedApplyNewReleaseEligible(const PersistedManagerApplyStatus &status) noexcept {
-  return HasFailedApplyReleaseEvidence(status);
+  return IsFailedTerminal(status);
 }
 
 ManagerApplyProgressDTO DeriveManagerApplyProgress(
@@ -2617,15 +2837,11 @@ bool ManagerApplyIntentDTO::valid() const noexcept {
                       parent_authoring_claim->intent.claim_kind ==
                           core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
                       parent_authoring_claim->intent.owner_role ==
-                          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+                          core::ApplicationRole::kAuthoringOwner;
   return (scene_initialization == ManagerSceneInitialization::kPreserve ||
           scene_initialization == ManagerSceneInitialization::kInitialize) &&
-         (direct || parent) && !request_context.request_id.empty() &&
-         !request_context.request_owner_epoch.empty() &&
-         !request_context.source_label.empty() &&
-         (!request_context.correlation_id.has_value() ||
-          !request_context.correlation_id->empty()) &&
-         !apply_id.empty() && apply_generation.nonzero() && !cell_id.empty() &&
+         (direct || parent) && !request_context.source_label.empty() &&
+         apply_id.nonzero() && apply_generation.nonzero() && !cell_id.empty() &&
          expected_active_projection_revision.valid() &&
          !candidate_retained_bundle_id.empty() &&
          !candidate_graph_revision.empty() && prepared_activation.valid();
@@ -2633,9 +2849,26 @@ bool ManagerApplyIntentDTO::valid() const noexcept {
 
 class SqliteManagerApplyJournal::Impl final {
 public:
-  Impl(std::filesystem::path database_path, CellId cell_id)
+  // (Apply number, Apply generation): the file's key order.
+  using ApplyKey = std::pair<std::uint64_t, std::int64_t>;
+
+  // Every record of one Apply generation, as the file holds it.
+  struct ApplyRecords final {
+    PersistedManagerApplyStatus status;
+    std::map<std::int64_t, PersistedManagerApplyRuntimeStagedReady>
+        staged_ready;
+    std::optional<PersistedFailedApplyRelease> failed_release;
+    std::optional<std::string> release_request_encoding;
+    std::optional<std::string> released_fence_encoding;
+    std::int64_t accepted_sequence;
+    // The file bytes its rows take, by RowFileBytes.
+    std::uint64_t file_bytes;
+  };
+
+  Impl(std::filesystem::path database_path, CellId cell_id,
+       persistence::SqliteRecordWriter *record_writer)
       : database_path_(ValidateDatabasePath(std::move(database_path))),
-        cell_id_(std::move(cell_id)) {
+        cell_id_(std::move(cell_id)), writer_(record_writer) {
     ValidateBoundedIdentity(cell_id_.value(), "cell_id");
     if (sqlite3_libversion_number() < 3037000) {
       throw ManagerApplyJournalError(
@@ -2679,23 +2912,30 @@ public:
       validation.Commit();
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
-      static_cast<void>(VerifyIntegrityLocked());
+      {
+        const auto verified_reads = UseVerifiedReadsLocked();
+        static_cast<void>(VerifyIntegrityLocked());
+        LoadLocked();
+      }
+      change_gated_reads_.reset();
       transaction.Commit();
     } catch (...) {
       sqlite3_close(database_);
       database_ = nullptr;
       throw;
     }
+    if (writer_ == nullptr) {
+      owned_writer_ = std::make_unique<persistence::SqliteRecordWriter>();
+      writer_ = owned_writer_.get();
+    }
+    // From here on only the writer thread uses the connection.
+    slot_ = writer_->RegisterConnection(
+        database_,
+        "manager-apply-journal",
+        "UPDATE apply_journal_metadata SET records_lost = 1 WHERE singleton = 1");
   }
 
-  // A non-owning view of the already-open read-only settlement snapshot.
-  // It reuses the exact uncached decoders and never configures or closes it.
-  Impl(sqlite3 *borrowed_database, const CellId &cell_id)
-      : cell_id_(cell_id), database_(borrowed_database), borrowed_(true) {}
-
   ~Impl() {
-    if (borrowed_)
-      return;
     try {
       Close();
     } catch (...) {
@@ -2709,6 +2949,10 @@ public:
   }
 
   void Close() {
+    // An owned writer writes every queued record before the connection closes.
+    if (owned_writer_ != nullptr) {
+      owned_writer_->DrainAndStop();
+    }
     auto startup_lock =
         sqlite_startup_internal::AcquireManagerSqliteStoreStartupLockForClose();
     std::lock_guard lock(mutex_);
@@ -2750,10 +2994,10 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     }
-    Exec(database_, "PRAGMA synchronous = FULL");
-    if (ScalarInteger(database_, "PRAGMA synchronous") != 2) {
+    Exec(database_, "PRAGMA synchronous = NORMAL");
+    if (ScalarInteger(database_, "PRAGMA synchronous") != 1) {
       throw ManagerApplyJournalIntegrityError(
-          "SQLite FULL synchronous mode is required");
+          "SQLite NORMAL synchronous mode is required");
     }
     Exec(database_, "PRAGMA trusted_schema = OFF");
     if (ScalarInteger(database_, "PRAGMA trusted_schema") != 0) {
@@ -2795,6 +3039,10 @@ public:
           "SQLite main database page ceiling could not be enforced");
     }
     sqlite3_limit(database_, SQLITE_LIMIT_LENGTH, 1024 * 1024);
+    page_size_ = static_cast<std::uint64_t>(page_size);
+    file_byte_budget_ =
+        static_cast<std::uint64_t>(maximum_pages * page_size -
+                                   kManagerApplyJournalReservedFileBytes);
   }
 
   void InitializeOrValidateSchema() {
@@ -2882,26 +3130,127 @@ public:
     ValidateApplyJournalMetadata(database_, cell_id_);
   }
 
-  std::optional<std::int64_t>
-  GenerationHighWaterLocked(const ApplyId &apply_id) const {
-    Statement row(database_,
-                  "SELECT apply_generation FROM manager_apply_intents "
-                  "WHERE apply_id=? ORDER BY apply_generation DESC LIMIT 1");
-    row.Bind(1, apply_id.value());
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto generation = row.Integer(0);
-    if (generation <= 0 || row.Step()) {
-      throw ManagerApplyJournalIntegrityError(
-          "Apply generation high-water row is invalid");
-    }
-    return generation;
+  // The records of one Apply generation, or null when none are held.
+  ApplyRecords *HeldLocked(const ApplyId &apply_id,
+                           const std::int64_t apply_generation) {
+    const auto found = applies_.find({apply_id.value(), apply_generation});
+    return found == applies_.end() ? nullptr : &found->second;
   }
 
-  // Bound the journal by eviction instead of refusal. Delete, inside the
-  // caller's write transaction, the oldest Apply (all generations of one
-  // Apply ID, rows in every table) that no owner can still read:
+  const ApplyRecords *HeldLocked(const ApplyId &apply_id,
+                                 const std::int64_t apply_generation) const {
+    const auto found = applies_.find({apply_id.value(), apply_generation});
+    return found == applies_.end() ? nullptr : &found->second;
+  }
+
+  template <typename Predicate>
+  std::size_t CountLocked(Predicate predicate) const {
+    return static_cast<std::size_t>(
+        std::count_if(applies_.begin(), applies_.end(),
+                      [&](const auto &entry) { return predicate(entry.second); }));
+  }
+
+  // Removes every generation of one Apply and its request keys.
+  void EraseApplyLocked(const std::uint64_t apply_id) {
+    for (auto found = applies_.lower_bound(
+             {apply_id, std::numeric_limits<std::int64_t>::min()});
+         found != applies_.end() && found->first.first == apply_id;) {
+      requests_.erase(found->second.status.intent.intent.request_context.request_key);
+      file_bytes_ -= found->second.file_bytes;
+      found = applies_.erase(found);
+    }
+  }
+
+  // The file bytes a row of `record` bytes takes in this journal's tables.
+  [[nodiscard]] std::uint64_t
+  RowFileBytesLocked(const std::uint64_t record,
+                     const std::uint64_t unique_indexes) const {
+    return RowFileBytes(record, unique_indexes, page_size_);
+  }
+
+  // Makes room in the file's byte limit for `bytes` more before memory
+  // accepts them (od212): deletes, one after the other, the Apply the
+  // eviction rule chooses, until they fit or no Apply qualifies. Never the
+  // Apply `writing`, which the caller is writing to. Returns the deletions,
+  // which the caller posts ahead of its own write in one record.
+  [[nodiscard]] std::vector<SqlWrite>
+  MakeRoomLocked(const std::uint64_t bytes,
+                 const std::optional<std::uint64_t> writing) {
+    std::vector<SqlWrite> writes;
+    while (file_bytes_ + bytes > file_byte_budget_) {
+      const auto victim = EvictionVictimLocked(writing);
+      if (!victim.has_value()) {
+        break;
+      }
+      auto deletes = EvictionWrites(*victim);
+      writes.insert(writes.end(), std::make_move_iterator(deletes.begin()),
+                    std::make_move_iterator(deletes.end()));
+      EraseApplyLocked(*victim);
+    }
+    return writes;
+  }
+
+  // Memory accepts a row of one held Apply: its file bytes change from
+  // `before` to `after`; the write goes to the file after `writes`.
+  void AcceptRowLocked(ApplyRecords &held, const std::uint64_t before,
+                       const std::uint64_t after, std::vector<SqlWrite> writes,
+                       SqlWrite write) {
+    held.file_bytes = held.file_bytes - before + after;
+    file_bytes_ = file_bytes_ - before + after;
+    writes.push_back(std::move(write));
+    PostLocked(writes);
+  }
+
+  // Posts one write unit while mutex_ is held, so the file order equals the
+  // memory order. The writer counts a record it drops or cannot write.
+  void PostLocked(const std::vector<SqlWrite> &writes) {
+    persistence::SqliteRecord record;
+    for (const auto &write : writes) {
+      record.Statement(write.sql);
+      for (std::size_t index = 0U; index < write.values.size(); ++index) {
+        const auto parameter = static_cast<int>(index + 1U);
+        const auto &value = write.values[index];
+        switch (value.kind) {
+        case SqlValue::Kind::kNull:
+          record.BindNull(parameter);
+          break;
+        case SqlValue::Kind::kInteger:
+          record.Bind(parameter, value.integer);
+          break;
+        case SqlValue::Kind::kText:
+          record.Bind(parameter, std::string_view(value.bytes));
+          break;
+        case SqlValue::Kind::kBlob:
+          record.BindBlob(parameter, value.bytes);
+          break;
+        }
+      }
+      if (write.expected_changes.has_value()) {
+        record.ExpectChanges(*write.expected_changes);
+      }
+    }
+    static_cast<void>(writer_->Post(slot_, std::move(record)));
+  }
+
+  void PostLocked(SqlWrite write) {
+    std::vector<SqlWrite> writes;
+    writes.push_back(std::move(write));
+    PostLocked(writes);
+  }
+
+  std::optional<std::int64_t>
+  GenerationHighWaterLocked(const ApplyId &apply_id) const {
+    auto found = applies_.upper_bound(
+        {apply_id.value(), std::numeric_limits<std::int64_t>::max()});
+    if (found == applies_.begin() || (--found)->first.first != apply_id.value()) {
+      return std::nullopt;
+    }
+    return found->first.second;
+  }
+
+  // Bound the journal by eviction instead of refusal. Choose, for the caller's
+  // insert, the oldest Apply (all generations of one Apply ID, records of
+  // every kind) that no owner can still read:
   //  - it is terminal and holds no fence: none was accepted, its release is
   //    recorded, or its failed-Apply release was acknowledged;
   //  - its Kernel admission claim is provably settled, because the Kernel
@@ -2918,59 +3267,58 @@ public:
   //    published Apply (current-product, settlement-retry and replay
   //    readers), and if newer than the newest success it accepted no fence
   //    (a failed candidate the host may still run is looked up by Apply).
-  // Returns false when every retained Apply is still needed.
-  bool EvictOneApplyLocked() {
+  // Returns none when every retained Apply is still needed. Never returns
+  // `writing`, the Apply a byte-limit deletion makes room for (MakeRoomLocked).
+  std::optional<std::uint64_t> EvictionVictimLocked(
+      const std::optional<std::uint64_t> writing = std::nullopt) const {
     struct Row final {
-      std::string apply_id;
+      std::int64_t apply_id{};
       std::int64_t sequence{};
       bool terminal{}, succeeded{}, known_accepted{}, known_unfenced{};
       bool authoring{}, admitted{}, fence_held{}, acknowledged{};
       std::optional<std::int64_t> publication;
     };
-    Statement select(
-        database_,
-        "SELECT i.apply_id,i.accepted_sequence,t.outcome_state,"
-        "t.effect_disposition,t.failure_phase,"
-        "i.parent_authoring_claim IS NOT NULL,"
-        "EXISTS(SELECT 1 FROM manager_apply_affected_scopes x WHERE "
-        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
-        "EXISTS(SELECT 1 FROM manager_apply_fence_acceptances x WHERE "
-        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
-        "EXISTS(SELECT 1 FROM manager_apply_fence_released_records x WHERE "
-        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
-        "EXISTS(SELECT 1 FROM manager_apply_failed_release x WHERE "
-        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation "
-        "AND x.acknowledged=1),"
-        "(SELECT x.publication_generation FROM "
-        "manager_apply_publication_receipts x WHERE "
-        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation) "
-        "FROM manager_apply_intents i "
-        "LEFT JOIN manager_apply_terminal_outcomes t "
-        "ON t.apply_id=i.apply_id AND t.apply_generation=i.apply_generation "
-        "ORDER BY i.accepted_sequence");
+    // Every Apply generation in accepted order, as the file's
+    // ORDER BY accepted_sequence returned them.
+    std::vector<const ApplyRecords *> accepted;
+    accepted.reserve(applies_.size());
+    for (const auto &entry : applies_) {
+      accepted.push_back(&entry.second);
+    }
+    std::sort(accepted.begin(), accepted.end(), [](const auto *lhs, const auto *rhs) {
+      return lhs->accepted_sequence < rhs->accepted_sequence;
+    });
     std::vector<Row> rows;
     rows.reserve(kMaximumManagerApplyIntents);
-    while (select.Step()) {
+    for (const auto *held : accepted) {
+      const auto &status = held->status;
+      const auto &terminal = status.terminal_outcome;
+      const auto *failure = terminal && terminal->terminal_outcome.failure
+                                ? &*terminal->terminal_outcome.failure
+                                : nullptr;
       Row row;
-      row.apply_id = select.Text(0);
-      row.sequence = select.Integer(1);
-      row.terminal = !select.IsNull(2);
-      row.succeeded = row.terminal && select.Text(2) == "succeeded";
-      const bool known = !select.IsNull(3) && select.Text(3) == "known";
-      row.known_accepted =
-          known && !select.IsNull(4) && select.Text(4) == "accepted";
-      row.authoring = select.Integer(5) != 0;
-      row.admitted = select.Integer(6) != 0 && !row.authoring;
-      const bool fenced = select.Integer(7) != 0;
-      row.acknowledged = select.Integer(9) != 0;
-      row.fence_held = fenced && select.Integer(8) == 0 && !row.acknowledged;
+      row.apply_id = static_cast<std::int64_t>(status.intent.intent.apply_id.value());
+      row.sequence = held->accepted_sequence;
+      row.terminal = terminal.has_value();
+      row.succeeded = row.terminal && terminal->terminal_outcome.state ==
+                                          ManagerApplyTerminalOutcomeState::kSucceeded;
+      const bool known = failure != nullptr &&
+                         failure->effect_disposition == ManagerApplyEffectDisposition::kKnown;
+      row.known_accepted = known && failure->phase == ManagerApplyPhase::kAccepted;
+      row.authoring = status.intent.intent.parent_authoring_claim.has_value();
+      row.admitted = status.affected_scope.has_value() && !row.authoring;
+      const bool fenced = status.fence_acceptance.has_value();
+      row.acknowledged = held->failed_release && held->failed_release->acknowledged;
+      row.fence_held = fenced && !status.fence_released && !row.acknowledged;
       row.known_unfenced = known && !fenced;
-      if (!select.IsNull(10))
-        row.publication = select.Integer(10);
+      if (status.publication_receipt)
+        row.publication = static_cast<std::int64_t>(
+            status.publication_receipt->publication.publication_receipt
+                .publication_generation.value());
       rows.push_back(std::move(row));
     }
     if (rows.empty())
-      return false;
+      return std::nullopt;
 
     std::int64_t newest_terminal = 0, newest_success = 0, latest_admitted = 0;
     std::int64_t newest_publication_sequence = 0, newest_publication = 0;
@@ -3007,37 +3355,35 @@ public:
         return true;
       return later_success != 0 && latest_admitted > later_success;
     };
-    std::map<std::string, bool> candidates;
-    std::vector<std::string> order;
+    std::map<std::int64_t, bool> candidates;
+    std::vector<std::int64_t> order;
     for (std::size_t index = 0U; index < rows.size(); ++index) {
       const auto [entry, inserted] =
           candidates.emplace(rows[index].apply_id, true);
       if (inserted)
         order.push_back(rows[index].apply_id);
-      entry->second =
-          entry->second && evictable(rows[index], next_success[index]);
+      entry->second = entry->second &&
+                      rows[index].apply_id != static_cast<std::int64_t>(
+                                                  writing.value_or(0U)) &&
+                      evictable(rows[index], next_success[index]);
     }
     const auto victim = std::find_if(order.begin(), order.end(),
                                      [&](const auto &id) { return candidates[id]; });
     if (victim == order.end())
-      return false;
-    // Children first: every foreign key points at a table deleted later.
-    for (const char *table :
-         {"manager_apply_failed_release", "manager_apply_terminal_outcomes",
-          "manager_apply_fence_released_records",
-          "manager_apply_fence_release_intents",
-          "manager_apply_publication_receipts",
-          "manager_apply_private_materializations",
-          "manager_apply_runtime_staged_ready_sets",
-          "manager_apply_runtime_convergence_intents",
-          "manager_apply_fence_acceptances", "manager_apply_fence_attempts",
-          "manager_apply_affected_scopes", "manager_apply_intents"}) {
-      Statement remove(database_, std::string("DELETE FROM ") + table +
-                                      " WHERE apply_id=?");
-      remove.Bind(1, *victim);
-      static_cast<void>(remove.Step());
+      return std::nullopt;
+    return static_cast<std::uint64_t>(*victim);
+  }
+
+  // The eviction's deletes, children first: every foreign key points at a
+  // table deleted later.
+  static std::vector<SqlWrite> EvictionWrites(const std::uint64_t victim) {
+    std::vector<SqlWrite> writes;
+    for (const auto &table : kApplyTables) {
+      writes.push_back({"DELETE FROM " + std::string(table.name) + " WHERE apply_id=?",
+                        {SqlInteger(static_cast<std::int64_t>(victim))},
+                        std::nullopt});
     }
-    return true;
+    return writes;
   }
 
   ManagerApplyIntentWriteResult
@@ -3048,31 +3394,25 @@ public:
           "Apply intent belongs to a different cell");
     }
 
-    if (const auto existing =
-            IntentLocked(intent.apply_id, encoded.apply_generation);
-        existing.has_value()) {
-      if (existing->intent != intent ||
-          existing->intent_digest.value() != encoded.intent_digest) {
+    if (const auto *existing =
+            HeldLocked(intent.apply_id, encoded.apply_generation);
+        existing != nullptr) {
+      if (existing->status.intent.intent != intent ||
+          existing->status.intent.intent_digest.value() !=
+              encoded.intent_digest) {
         throw ManagerApplyJournalConflictError(
             "Apply identity conflicts with the durable intent");
       }
-      return {*existing, false};
+      return {existing->status.intent, false};
     }
     if (const auto existing_request =
-            RequestLocked(intent.request_context.request_owner_epoch,
-                          intent.request_context.request_id);
+            RequestLocked(intent.request_context.request_key);
         existing_request.has_value()) {
       throw ManagerApplyJournalConflictError(
           "public request identity already names another Apply intent");
     }
 
     const auto high_water = GenerationHighWaterLocked(intent.apply_id);
-    if (high_water.has_value()) {
-      const auto predecessor = IntentUncachedLocked(intent.apply_id, *high_water);
-      ++record_verifications_;
-      if (!predecessor)
-        throw ManagerApplyJournalIntegrityError("Apply high-water intent missing");
-    }
     if (high_water.has_value() &&
         *high_water == std::numeric_limits<std::int64_t>::max()) {
       throw ManagerApplyJournalLimitError(
@@ -3085,24 +3425,24 @@ public:
           "Apply generation must advance its durable high-water mark by "
           "exactly one");
     }
-    const auto intent_count =
-        ScalarInteger(database_, "SELECT COUNT(*) FROM manager_apply_intents");
-    if (intent_count >=
-            static_cast<std::int64_t>(kMaximumManagerApplyIntents) &&
-        !EvictOneApplyLocked()) {
-      throw ManagerApplyJournalLimitError(
-          "Apply intent inventory reached its fixed limit");
+    std::optional<std::uint64_t> victim;
+    if (applies_.size() >= kMaximumManagerApplyIntents) {
+      victim = EvictionVictimLocked();
+      if (!victim.has_value()) {
+        throw ManagerApplyJournalLimitError(
+            "Apply intent inventory reached its fixed limit");
+      }
     }
-    // The newest Apply is never evicted, so this stays strictly increasing.
-    const auto accepted_sequence = ScalarInteger(
-        database_, "SELECT COALESCE(MAX(accepted_sequence),0)+1 "
-                   "FROM manager_apply_intents");
+    // The newest Apply is never evicted, so this stays strictly increasing
+    // and equals the file's MAX(accepted_sequence)+1.
+    const auto accepted_sequence = newest_accepted_sequence_ + 1;
 
-    Statement insert(
-        database_,
+    const auto &predecessor = intent.expected_active_projection_revision;
+    const auto &prepared = intent.prepared_activation;
+    SqlWrite insert{
         "INSERT INTO manager_apply_intents ("
-        "apply_id,apply_generation,request_id,request_owner_epoch,"
-        "source_label,correlation_id,predecessor_retained_bundle_id,"
+        "apply_id,apply_generation,request_key,"
+        "source_label,predecessor_retained_bundle_id,"
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
@@ -3111,61 +3451,86 @@ public:
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
         "intent_digest,scene_initialization,accepted_sequence"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    insert.Bind(1, intent.apply_id.value());
-    insert.Bind(2, encoded.apply_generation);
-    insert.Bind(3, intent.request_context.request_id.value());
-    insert.Bind(4, intent.request_context.request_owner_epoch.value());
-    insert.Bind(5, intent.request_context.source_label);
-    if (intent.request_context.correlation_id.has_value()) {
-      insert.Bind(6, *intent.request_context.correlation_id);
-    } else {
-      insert.BindNull(6);
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        {
+            SqlInteger(intent.apply_id),
+            SqlInteger(encoded.apply_generation),
+            SqlBlob(KeyBytes(intent.request_context.request_key)),
+            SqlText(intent.request_context.source_label),
+            SqlText(predecessor.retained_bundle_id.value()),
+            SqlText(predecessor.graph_revision.value()),
+            SqlText(predecessor.scene_revision.scene_id.value()),
+            SqlInteger(encoded.predecessor_scene_revision_id),
+            SqlText(predecessor.scene_revision.content_hash.value()),
+            SqlText(intent.candidate_retained_bundle_id.value()),
+            SqlText(intent.candidate_graph_revision.value()),
+            SqlText(prepared.captured_input_digest.value()),
+            SqlText(prepared.deployment_artifact_id.value()),
+            SqlText(prepared.deployment_revision.value()),
+            prepared.program_binding_id.has_value()
+                ? SqlText(prepared.program_binding_id->value())
+                : SqlNull(),
+            SqlText(prepared.prepared_activation_id.value()),
+            SqlText(prepared.canonical_receipt_json),
+            encoded.expected_admission_generation.has_value()
+                ? SqlInteger(*encoded.expected_admission_generation)
+                : SqlNull(),
+            encoded.parent_authoring_claim.has_value()
+                ? SqlBlob(*encoded.parent_authoring_claim)
+                : SqlNull(),
+            SqlText(encoded.intent_digest),
+            SqlText(ToString(intent.scene_initialization)),
+            SqlInteger(accepted_sequence),
+        },
+        std::nullopt};
+    ThrowIfValueTooBig(insert.values);
+    if (encoded.expected_admission_generation.has_value() &&
+        *encoded.expected_admission_generation >
+            kMaximumStoredAdmissionGeneration) {
+      throw ManagerApplyJournalConflictError(
+          std::string(kAdmissionGenerationCheckFailed));
     }
-    insert.Bind(
-        7,
-        intent.expected_active_projection_revision.retained_bundle_id.value());
-    insert.Bind(
-        8, intent.expected_active_projection_revision.graph_revision.value());
-    insert.Bind(9, intent.expected_active_projection_revision.scene_revision
-                       .scene_id.value());
-    insert.Bind(10, encoded.predecessor_scene_revision_id);
-    insert.Bind(11, intent.expected_active_projection_revision.scene_revision
-                        .content_hash.value());
-    insert.Bind(12, intent.candidate_retained_bundle_id.value());
-    insert.Bind(13, intent.candidate_graph_revision.value());
-    insert.Bind(14, intent.prepared_activation.captured_input_digest.value());
-    insert.Bind(15, intent.prepared_activation.deployment_artifact_id.value());
-    insert.Bind(16, intent.prepared_activation.deployment_revision.value());
-    if (intent.prepared_activation.program_binding_id.has_value()) {
-      insert.Bind(17, intent.prepared_activation.program_binding_id->value());
-    } else {
-      insert.BindNull(17);
-    }
-    insert.Bind(18, intent.prepared_activation.prepared_activation_id.value());
-    insert.Bind(19, intent.prepared_activation.canonical_receipt_json);
-    if (encoded.expected_admission_generation.has_value()) {
-      insert.Bind(20, *encoded.expected_admission_generation);
-    } else {
-      insert.BindNull(20);
-    }
-    if (encoded.parent_authoring_claim.has_value()) {
-      insert.BindBlob(21, *encoded.parent_authoring_claim);
-    } else {
-      insert.BindNull(21);
-    }
-    insert.Bind(22, encoded.intent_digest);
-    insert.Bind(23, ToString(intent.scene_initialization));
-    insert.Bind(24, accepted_sequence);
-    static_cast<void>(insert.Step());
+    const auto file_bytes = RowFileBytesLocked(
+        ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_intents"));
 
-    const auto stored = IntentLocked(intent.apply_id, encoded.apply_generation);
-    if (!stored.has_value() || stored->intent != intent ||
-        stored->intent_digest.value() != encoded.intent_digest) {
-      throw ManagerApplyJournalIntegrityError(
-          "inserted Apply intent cannot be verified");
+    std::vector<SqlWrite> writes;
+    if (victim.has_value()) {
+      writes = EvictionWrites(*victim);
+      EraseApplyLocked(*victim);
     }
-    return {*stored, true};
+    auto room = MakeRoomLocked(file_bytes, std::nullopt);
+    writes.insert(writes.end(), std::make_move_iterator(room.begin()),
+                  std::make_move_iterator(room.end()));
+    if (file_bytes_ + file_bytes > file_byte_budget_) {
+      // Every retained Apply is still needed, as at the count limit. The
+      // deletions made so far stand.
+      if (!writes.empty()) {
+        PostLocked(writes);
+      }
+      throw ManagerApplyJournalLimitError(
+          "Apply intent inventory reached its fixed limit");
+    }
+    writes.push_back(std::move(insert));
+    PersistedManagerApplyIntent record{intent,
+                                       ContentDigest(encoded.intent_digest)};
+    const ApplyKey key{intent.apply_id.value(), encoded.apply_generation};
+    applies_.emplace(
+        key, ApplyRecords{
+                 PersistedManagerApplyStatus{
+                     record, std::nullopt, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, std::nullopt},
+                 {},
+                 std::nullopt,
+                 std::nullopt,
+                 std::nullopt,
+                 accepted_sequence,
+                 file_bytes});
+    file_bytes_ += file_bytes;
+    requests_.emplace(intent.request_context.request_key, key);
+    newest_accepted_sequence_ = accepted_sequence;
+    PostLocked(writes);
+    return {record, true};
   }
 
   using VerifiedReadKey = std::tuple<ApplyId, std::int64_t, std::int64_t>;
@@ -3184,31 +3549,8 @@ public:
       VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
       VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>>;
 
-  // Generation predecessors are checked only during writes. Read the
-  // immediate predecessor through the uncached decoder, without recursively
-  // walking the generation history.
-  class WriteVerificationScope final {
-  public:
-    explicit WriteVerificationScope(Impl &impl) noexcept : impl_(impl) {
-      impl_.verify_write_generation_predecessors_ = true;
-    }
-    ~WriteVerificationScope() {
-      impl_.verify_write_generation_predecessors_ = false;
-    }
-    WriteVerificationScope(const WriteVerificationScope &) = delete;
-    WriteVerificationScope &operator=(const WriteVerificationScope &) = delete;
-
-  private:
-    Impl &impl_;
-  };
-
-  /// Installs the change-gated verified-record cache for one public read
-  /// transaction. Must be called first inside that transaction: reading
-  /// `data_version` opens its read snapshot. Any commit through another
-  /// connection changes `data_version`; any write through this connection
-  /// changes its total change count. Either discards every cached result, so
-  /// a changed or corrupted record is re-read and re-verified by the very
-  /// next read. A failed read discards the cache as well.
+  /// Installs the verified-record cache for the verification and load at
+  /// open, called first in that transaction; a failed read discards it.
   class VerifiedReadScope final {
   public:
     explicit VerifiedReadScope(const Impl &impl) noexcept
@@ -3240,10 +3582,8 @@ public:
     return VerifiedReadScope(*this);
   }
 
-  // Public reads reuse verified records while the database is provably
-  // unchanged (see UseVerifiedReadsLocked). Writes and integrity verification
-  // reuse verified predecessors only within their own locked operation; no
-  // result survives that operation.
+  // The verification and load at open reuse records already verified; any
+  // other call decodes afresh.
   template <typename Record, typename Reader>
   std::optional<Record> ReadVerifiedRecord(const VerifiedReadKey &key,
                                            Reader &&read) const {
@@ -3271,17 +3611,7 @@ public:
                const std::int64_t apply_generation) const {
     return ReadVerifiedRecord<PersistedManagerApplyIntent>(
         {apply_id, apply_generation, 0}, [&] {
-          auto result = IntentUncachedLocked(apply_id, apply_generation);
-          if (result && verify_write_generation_predecessors_ &&
-              apply_generation > 1) {
-            const auto predecessor =
-                IntentUncachedLocked(apply_id, apply_generation - 1);
-            ++record_verifications_;
-            if (!predecessor)
-              throw ManagerApplyJournalIntegrityError(
-                  "Apply predecessor intent missing");
-          }
-          return result;
+          return IntentUncachedLocked(apply_id, apply_generation);
         });
   }
 
@@ -3315,8 +3645,8 @@ public:
                        const std::int64_t apply_generation) const {
     Statement row(
         database_,
-        "SELECT apply_id,apply_generation,request_id,request_owner_epoch,"
-        "source_label,correlation_id,predecessor_retained_bundle_id,"
+        "SELECT apply_id,apply_generation,request_key,"
+        "source_label,predecessor_retained_bundle_id,"
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
@@ -3332,28 +3662,26 @@ public:
     if (!row.Step()) {
       return std::nullopt;
     }
-    const auto stored_apply_id = row.Text(0);
+    const auto stored_apply_id = row.Integer(0);
     const auto stored_generation = row.Integer(1);
-    const auto request_id = row.Text(2);
-    const auto request_owner_epoch = row.Text(3);
-    const auto source_label = row.Text(4);
-    const auto correlation_id = row.OptionalText(5);
-    const auto predecessor_retained_bundle_id = row.Text(6);
-    const auto predecessor_graph_revision = row.Text(7);
-    const auto predecessor_scene_id = row.Text(8);
-    const auto predecessor_scene_revision_id = row.Integer(9);
-    const auto predecessor_scene_content_hash = row.Text(10);
-    const auto candidate_retained_bundle_id = row.Text(11);
-    const auto candidate_graph_revision = row.Text(12);
-    const auto captured_input_digest = row.Text(13);
-    const auto deployment_artifact_id = row.Text(14);
-    const auto deployment_revision = row.Text(15);
-    const auto program_binding_id = row.OptionalText(16);
-    const auto prepared_activation_id = row.Text(17);
-    const auto prepared_activation_receipt_json = row.Text(18);
+    const auto request_key = KeyFromBytes(row.Blob(2));
+    const auto source_label = row.Text(3);
+    const auto predecessor_retained_bundle_id = row.Text(4);
+    const auto predecessor_graph_revision = row.Text(5);
+    const auto predecessor_scene_id = row.Text(6);
+    const auto predecessor_scene_revision_id = row.Integer(7);
+    const auto predecessor_scene_content_hash = row.Text(8);
+    const auto candidate_retained_bundle_id = row.Text(9);
+    const auto candidate_graph_revision = row.Text(10);
+    const auto captured_input_digest = row.Text(11);
+    const auto deployment_artifact_id = row.Text(12);
+    const auto deployment_revision = row.Text(13);
+    const auto program_binding_id = row.OptionalText(14);
+    const auto prepared_activation_id = row.Text(15);
+    const auto prepared_activation_receipt_json = row.Text(16);
     std::optional<core::AdmissionGeneration> expected_admission_generation;
-    if (!row.IsNull(19)) {
-      const auto stored_admission_generation = row.Integer(19);
+    if (!row.IsNull(17)) {
+      const auto stored_admission_generation = row.Integer(17);
       if (stored_admission_generation <= 0) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply admission generation is invalid");
@@ -3361,9 +3689,9 @@ public:
       expected_admission_generation.emplace(
           static_cast<std::uint64_t>(stored_admission_generation));
     }
-    const auto parent_authoring_claim = row.OptionalBlob(20);
-    const auto stored_digest = row.Text(21);
-    const auto scene_initialization = row.Text(22);
+    const auto parent_authoring_claim = row.OptionalBlob(18);
+    const auto stored_digest = row.Text(19);
+    const auto scene_initialization = row.Text(20);
     if (scene_initialization != "preserve" &&
         scene_initialization != "initialize") {
       throw ManagerApplyJournalIntegrityError(
@@ -3379,13 +3707,8 @@ public:
     }
 
     ManagerApplyIntentDTO intent{
-        PublicRequestContextDTO{
-            RequestId(request_id),
-            RequestOwnerEpoch(request_owner_epoch),
-            source_label,
-            correlation_id,
-        },
-        ApplyId(stored_apply_id),
+        PublicRequestContextDTO{request_key, source_label},
+        ApplyId(static_cast<std::uint64_t>(stored_apply_id)),
         ApplyGeneration(static_cast<std::uint64_t>(stored_generation)),
         cell_id_,
         ProjectionRevisionDTO{
@@ -3433,28 +3756,12 @@ public:
   }
 
   std::optional<PersistedManagerApplyIntent>
-  RequestLocked(const RequestOwnerEpoch &request_owner_epoch,
-                const RequestId &request_id) const {
-    Statement row(database_,
-                  "SELECT apply_id,apply_generation FROM manager_apply_intents "
-                  "WHERE request_owner_epoch=? AND request_id=?");
-    row.Bind(1, request_owner_epoch.value());
-    row.Bind(2, request_id.value());
-    if (!row.Step()) {
+  RequestLocked(const RequestKey &request_key) const {
+    const auto found = requests_.find(request_key);
+    if (found == requests_.end()) {
       return std::nullopt;
     }
-    const auto apply_id = ApplyId(row.Text(0));
-    const auto generation = row.Integer(1);
-    if (generation <= 0 || row.Step()) {
-      throw ManagerApplyJournalIntegrityError(
-          "Apply request identity is not unique");
-    }
-    const auto intent = IntentLocked(apply_id, generation);
-    if (!intent.has_value()) {
-      throw ManagerApplyJournalIntegrityError(
-          "Apply request identity references a missing intent");
-    }
-    return intent;
+    return applies_.at(found->second).status.intent;
   }
 
   std::optional<PersistedManagerApplyAffectedScope>
@@ -3537,8 +3844,8 @@ public:
                              const std::int64_t apply_generation) const {
     Statement row(
         database_,
-        "SELECT intent_digest,affected_scope_digest,request_id,"
-        "request_owner_epoch,source_label,correlation_id,components_encoding,"
+        "SELECT intent_digest,affected_scope_digest,request_key,"
+        "source_label,components_encoding,"
         "domains_encoding,bindings_encoding,resources_encoding,"
         "busy_disposition,expected_retained_bundle_id,"
         "expected_graph_revision,expected_operation_resource_generation,"
@@ -3552,22 +3859,20 @@ public:
     }
     const auto intent_digest = row.Text(0);
     const auto affected_scope_digest = row.Text(1);
-    const auto request_id = row.Text(2);
-    const auto owner_epoch = row.Text(3);
-    const auto source_label = row.Text(4);
-    const auto correlation_id = row.OptionalText(5);
-    const auto components = row.Text(6);
-    const auto domains = row.Text(7);
-    const auto bindings = row.Text(8);
-    const auto resources = row.Text(9);
-    const auto busy_disposition = row.Text(10);
-    const auto retained_bundle = row.Text(11);
-    const auto graph_revision = row.Text(12);
-    const auto operation_generation = row.Integer(13);
-    const auto fence_generation = row.Integer(14);
-    const auto active_configurations = row.Text(15);
-    const auto reason = row.Text(16);
-    const auto stored_digest = row.Text(17);
+    const auto request_key = KeyFromBytes(row.Blob(2));
+    const auto source_label = row.Text(3);
+    const auto components = row.Text(4);
+    const auto domains = row.Text(5);
+    const auto bindings = row.Text(6);
+    const auto resources = row.Text(7);
+    const auto busy_disposition = row.Text(8);
+    const auto retained_bundle = row.Text(9);
+    const auto graph_revision = row.Text(10);
+    const auto operation_generation = row.Integer(11);
+    const auto fence_generation = row.Integer(12);
+    const auto active_configurations = row.Text(13);
+    const auto reason = row.Text(14);
+    const auto stored_digest = row.Text(15);
     if (row.Step() || operation_generation < 0 || fence_generation < 0) {
       throw ManagerApplyJournalIntegrityError(
           "stored Apply-fence attempt is structurally invalid");
@@ -3576,12 +3881,7 @@ public:
       const auto configurations =
           DecodeActiveConfigurations(active_configurations);
       ApplyConfigurationFenceIntentDTO intent{
-          PublicRequestContextDTO{
-              RequestId(request_id),
-              RequestOwnerEpoch(owner_epoch),
-              source_label,
-              correlation_id,
-          },
+          PublicRequestContextDTO{request_key, source_label},
           core::ApplyFenceOwnerDTO{
               apply_id,
               ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
@@ -3805,34 +4105,8 @@ public:
                            const std::int64_t staged_ready_generation) const {
     return ReadVerifiedRecord<PersistedManagerApplyRuntimeStagedReady>(
         {apply_id, apply_generation, staged_ready_generation}, [&] {
-          if (verify_write_generation_predecessors_) {
-            Statement count(database_,
-                "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets "
-                "WHERE apply_id=? AND apply_generation=?");
-            count.Bind(1, apply_id.value());
-            count.Bind(2, apply_generation);
-            if (!count.Step() || count.Integer(0) > static_cast<std::int64_t>(
-                                      kMaximumRuntimeStagedReadySetsPerApply))
-              throw ManagerApplyJournalIntegrityError(
-                  "stored runtime staged-ready inventory exceeds its ceiling");
-          }
-          auto result = RuntimeStagedReadyUncachedLocked(
+          return RuntimeStagedReadyUncachedLocked(
               apply_id, apply_generation, staged_ready_generation);
-          if (result && verify_write_generation_predecessors_ &&
-              staged_ready_generation > static_cast<std::int64_t>(
-                                            kMaximumRuntimeStagedReadySetsPerApply))
-            throw ManagerApplyJournalIntegrityError(
-                "stored runtime staged-ready generation exceeds its ceiling");
-          if (result && verify_write_generation_predecessors_ &&
-              staged_ready_generation > 1) {
-            const auto predecessor = RuntimeStagedReadyUncachedLocked(
-                apply_id, apply_generation, staged_ready_generation - 1);
-            ++record_verifications_;
-            if (!predecessor)
-              throw ManagerApplyJournalIntegrityError(
-                  "staged-ready predecessor record missing");
-          }
-          return result;
         });
   }
 
@@ -3937,8 +4211,7 @@ public:
 
   std::optional<PersistedManagerApplyRuntimeStagedReady>
   LatestRuntimeStagedReadyLocked(const ApplyId &apply_id,
-                                 const std::int64_t apply_generation,
-                                 const bool predecessor_only = false) const {
+                                 const std::int64_t apply_generation) const {
     Statement row(database_, "SELECT staged_ready_generation "
                              "FROM manager_apply_runtime_staged_ready_sets "
                              "WHERE apply_id=? AND apply_generation=? "
@@ -3952,46 +4225,6 @@ public:
     if (generation <= 0 || row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "runtime staged-ready high-water row is invalid");
-    }
-    if (predecessor_only) {
-      if (generation > static_cast<std::int64_t>(
-                           kMaximumRuntimeStagedReadySetsPerApply))
-        throw ManagerApplyJournalIntegrityError(
-            "stored runtime staged-ready generation exceeds its ceiling");
-      auto result = RuntimeStagedReadyUncachedLocked(apply_id, apply_generation,
-                                                      generation);
-      ++record_verifications_;
-      return result;
-    }
-    return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
-  }
-
-  // Scene-stage intent records the exact staged-ready digest that justified
-  // the irreversible scene transition.  Runtime recovery may append a newer
-  // staged-ready observation (for example after the Manager recreates a
-  // native child with a new process epoch), so looking up the scene evidence
-  // by the high-water generation would incorrectly make the immutable stage
-  // intent appear corrupt.
-  std::optional<PersistedManagerApplyRuntimeStagedReady>
-  RuntimeStagedReadyByDigestLocked(const ApplyId &apply_id,
-                                   const std::int64_t apply_generation,
-                                   const ContentDigest &staged_ready_digest) const {
-    Statement rows(
-        database_,
-        "SELECT staged_ready_generation "
-        "FROM manager_apply_runtime_staged_ready_sets "
-        "WHERE apply_id=? AND apply_generation=? AND staged_ready_digest=? "
-        "ORDER BY staged_ready_generation");
-    rows.Bind(1, apply_id.value());
-    rows.Bind(2, apply_generation);
-    rows.Bind(3, staged_ready_digest.value());
-    if (!rows.Step()) {
-      return std::nullopt;
-    }
-    const auto generation = rows.Integer(0);
-    if (generation <= 0 || rows.Step()) {
-      throw ManagerApplyJournalIntegrityError(
-          "runtime staged-ready digest does not identify exactly one row");
     }
     return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
   }
@@ -4448,7 +4681,7 @@ public:
                            const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT terminal_outcome_digest,fence_acceptance_digest,"
-                  "acknowledgement_request_id,acknowledgement_source_label,"
+                  "acknowledgement_request_key,acknowledgement_source_label,"
                   "release_request_encoding,released_fence_encoding,acknowledged "
                   "FROM manager_apply_failed_release "
                   "WHERE apply_id=? AND apply_generation=?");
@@ -4456,46 +4689,63 @@ public:
     row.Bind(2, apply_generation);
     if (!row.Step()) return std::nullopt;
     const auto terminal_digest = row.Text(0);
-    const auto acceptance_digest = row.Text(1);
-    const auto acknowledgement_request_id = row.Text(2);
+    const auto acceptance_digest = row.OptionalText(1);
+    const auto acknowledgement_request_key = KeyFromBytes(row.Blob(2));
     const auto acknowledgement_source_label = row.Text(3);
-    ValidateBoundedIdentity(acknowledgement_request_id, "acknowledgement_request_id");
     ValidateBoundedText(acknowledgement_source_label, kMaximumManagerApplySourceLabelBytes,
                         "acknowledgement_source_label");
-    const auto request = DecodeFenceReleaseRequest(row.Text(4));
+    const auto request_encoding = row.OptionalText(4);
+    std::optional<ConfigurationFenceReleaseDTO> request;
+    if (request_encoding) request = DecodeFenceReleaseRequest(*request_encoding);
     const auto released_encoding = row.OptionalText(5);
     const auto acknowledged = row.Integer(6);
     if (row.Step() || apply_generation <= 0 || acknowledged < 0 || acknowledged > 1 ||
-        (acknowledged == 1 && !released_encoding))
+        (released_encoding && !request) ||
+        (acknowledged == 1 && !released_encoding && request))
       throw ManagerApplyJournalIntegrityError("failed Apply release row is invalid");
     const auto status = StatusLocked(apply_id, apply_generation);
-    if (!status || !HasFailedApplyReleaseEvidence(*status) ||
+    if (!status || !IsFailedTerminal(*status) ||
         status->terminal_outcome->terminal_outcome_digest.value() != terminal_digest ||
-        status->fence_acceptance->acceptance_digest.value() != acceptance_digest)
+        (acceptance_digest && (!status->fence_acceptance ||
+                               status->fence_acceptance->acceptance_digest.value() != *acceptance_digest)))
       throw ManagerApplyJournalIntegrityError("failed Apply release has no before-effect owner evidence");
-    const auto &evidence = request.reconciliation_evidence;
-    const auto &accepted = status->fence_acceptance->accepted_fence;
-    const auto &predecessor = status->intent.intent.expected_active_projection_revision;
-    if (evidence.owner_transaction.apply_id != apply_id ||
-        evidence.owner_transaction.apply_generation.value() != static_cast<std::uint64_t>(apply_generation) ||
-        evidence.configuration_fence_id != accepted.configuration_fence_id ||
-        evidence.configuration_fence_generation != accepted.configuration_fence_generation ||
-        evidence.reconciled_scope != accepted.captured_scope ||
-        evidence.active_projection_revision.retained_bundle_id != predecessor.retained_bundle_id ||
-        evidence.active_projection_revision.graph_revision != predecessor.graph_revision ||
-        evidence.active_projection_revision.scene_revision.scene_id != predecessor.scene_revision.scene_id)
-      throw ManagerApplyJournalIntegrityError("failed Apply release does not name its held predecessor");
+    if (request) {
+      const auto &evidence = request->reconciliation_evidence;
+      const auto &intent = status->intent.intent;
+      const auto &predecessor = intent.expected_active_projection_revision;
+      const auto &active = evidence.active_projection_revision;
+      // The release names the fence New found by its attempt when no acceptance is recorded.
+      const bool fence_named =
+          status->fence_acceptance
+              ? evidence.configuration_fence_id == status->fence_acceptance->accepted_fence.configuration_fence_id &&
+                    evidence.configuration_fence_generation ==
+                        status->fence_acceptance->accepted_fence.configuration_fence_generation &&
+                    evidence.reconciled_scope == status->fence_acceptance->accepted_fence.captured_scope
+              : status->fence_attempt && evidence.reconciled_scope == status->fence_attempt->fence_intent.scope;
+      // After a publication receipt the active Deployment may be the published candidate.
+      const bool names_predecessor = active.retained_bundle_id == predecessor.retained_bundle_id &&
+                                     active.graph_revision == predecessor.graph_revision;
+      const bool names_candidate = status->publication_receipt &&
+                                   active.retained_bundle_id == intent.candidate_retained_bundle_id &&
+                                   active.graph_revision == intent.candidate_graph_revision;
+      if (evidence.owner_transaction.apply_id != apply_id ||
+          evidence.owner_transaction.apply_generation.value() != static_cast<std::uint64_t>(apply_generation) ||
+          !fence_named || !(names_predecessor || names_candidate) ||
+          active.scene_revision.scene_id != predecessor.scene_revision.scene_id)
+        throw ManagerApplyJournalIntegrityError("failed Apply release does not name its held predecessor");
+    }
     std::optional<ConfigurationFenceReleasedDTO> released;
     if (released_encoding) {
       released = DecodeFenceReleased(*released_encoding);
-      if (released->request != request)
+      if (released->request != *request)
         throw ManagerApplyJournalIntegrityError("failed Apply release receipt differs from its request");
     }
-    return PersistedFailedApplyRelease{ContentDigest(terminal_digest),
-                                       ContentDigest(acceptance_digest),
-                                       RequestId(acknowledgement_request_id),
-                                       acknowledgement_source_label, request,
-                                       std::move(released), acknowledged == 1};
+    return PersistedFailedApplyRelease{
+        ContentDigest(terminal_digest),
+        acceptance_digest ? std::optional(ContentDigest(*acceptance_digest)) : std::nullopt,
+        acknowledgement_request_key,
+        acknowledgement_source_label, request,
+        std::move(released), acknowledged == 1};
   }
 
   std::optional<PersistedManagerApplyStatus>
@@ -4507,54 +4757,204 @@ public:
     return status;
   }
 
-  // Writes retain the existing page-image and cardinality limits without
-  // decoding unrelated historical records. Full verification runs at open
-  // and on explicit VerifyIntegrity, including startup after a crash.
-  void VerifyWriteLimitsLocked() const {
-    const auto page_count = ScalarInteger(database_, "PRAGMA page_count");
-    const auto page_size = ScalarInteger(database_, "PRAGMA page_size");
-    if (page_count < 0 || page_size <= 0 ||
-        page_count >
-            kMaximumManagerApplyJournalDatabasePageImageBytes / page_size) {
-      throw ManagerApplyJournalLimitError(
-          "SQLite main database page image exceeds its ceiling");
+  // Fills memory from a file that already holds records (a reopen), through
+  // the verified readers above. Runs once, at open.
+  void LoadLocked() {
+    Statement rows(database_,
+                   "SELECT apply_id,apply_generation,accepted_sequence "
+                   "FROM manager_apply_intents ORDER BY apply_id,apply_generation");
+    while (rows.Step()) {
+      const ApplyId apply_id(static_cast<std::uint64_t>(rows.Integer(0)));
+      const auto generation = rows.Integer(1);
+      ApplyRecords held{*StatusLocked(apply_id, generation), {}, std::nullopt,
+                        std::nullopt, std::nullopt, rows.Integer(2), 0U};
+      Statement staged(database_,
+                       "SELECT staged_ready_generation "
+                       "FROM manager_apply_runtime_staged_ready_sets "
+                       "WHERE apply_id=? AND apply_generation=?");
+      staged.Bind(1, static_cast<std::int64_t>(apply_id.value()));
+      staged.Bind(2, generation);
+      while (staged.Step()) {
+        const auto staged_generation = staged.Integer(0);
+        held.staged_ready.emplace(
+            staged_generation,
+            *RuntimeStagedReadyLocked(apply_id, generation, staged_generation));
+      }
+      if (auto release = FailedApplyReleaseLocked(apply_id, generation)) {
+        if (release->request) {
+          held.release_request_encoding =
+              EncodeFenceReleaseRequest(*release->request);
+        }
+        if (release->released) {
+          held.released_fence_encoding = EncodeFenceReleased(*release->released);
+        }
+        held.failed_release = std::move(release);
+      }
+      newest_accepted_sequence_ =
+          std::max(newest_accepted_sequence_, held.accepted_sequence);
+      const ApplyKey key{apply_id.value(), generation};
+      requests_.emplace(held.status.intent.intent.request_context.request_key,
+                        key);
+      applies_.emplace(key, std::move(held));
     }
-    const auto intent_count =
-        ScalarInteger(database_, "SELECT COUNT(*) FROM manager_apply_intents");
-    if (intent_count < 0 ||
-        intent_count > static_cast<std::int64_t>(kMaximumManagerApplyIntents)) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored Apply-journal cardinality is invalid");
+    // The file bytes of every row, sized as the write that made it sized it.
+    for (const auto &table : kApplyTables) {
+      Statement stored(database_, "SELECT * FROM " + std::string(table.name));
+      while (stored.Step()) {
+        std::vector<SqlValue> columns;
+        for (int column = 0; column < stored.Columns(); ++column) {
+          switch (stored.Type(column)) {
+          case SQLITE_INTEGER:
+            columns.push_back(SqlInteger(stored.Integer(column)));
+            break;
+          case SQLITE_TEXT:
+            columns.push_back(SqlText(stored.Text(column)));
+            break;
+          case SQLITE_BLOB:
+            columns.push_back(SqlBlob(stored.Blob(column)));
+            break;
+          default:
+            columns.push_back(SqlNull());
+            break;
+          }
+        }
+        auto &held = applies_.at(
+            {static_cast<std::uint64_t>(columns[0].integer), columns[1].integer});
+        const auto bytes = RowFileBytesLocked(ThrowIfRecordTooBig(columns),
+                                              table.unique_indexes);
+        held.file_bytes += bytes;
+        file_bytes_ += bytes;
+      }
     }
+  }
 
-    const auto check_count = [&](const char *sql, const std::size_t maximum) {
-      const auto count = ScalarInteger(database_, sql);
-      if (count < 0 || count > static_cast<std::int64_t>(maximum))
-        throw ManagerApplyJournalIntegrityError(
-            "stored Apply-fence journal cardinality is invalid");
+  // The checks a failed-release row passed when read back: it names its
+  // failed terminal, its fence evidence and its held predecessor.
+  void CheckFailedReleaseLocked(const ApplyId &apply_id,
+                                const std::int64_t apply_generation,
+                                const PersistedFailedApplyRelease &release) const {
+    const auto *held = HeldLocked(apply_id, apply_generation);
+    const auto *status = held == nullptr ? nullptr : &held->status;
+    if (status == nullptr || !IsFailedTerminal(*status) ||
+        status->terminal_outcome->terminal_outcome_digest !=
+            release.terminal_outcome_digest ||
+        (release.fence_acceptance_digest &&
+         (!status->fence_acceptance ||
+          status->fence_acceptance->acceptance_digest !=
+              *release.fence_acceptance_digest)))
+      throw ManagerApplyJournalIntegrityError("failed Apply release has no before-effect owner evidence");
+    if (release.request) {
+      const auto &evidence = release.request->reconciliation_evidence;
+      const auto &intent = status->intent.intent;
+      const auto &predecessor = intent.expected_active_projection_revision;
+      const auto &active = evidence.active_projection_revision;
+      // The release names the fence New found by its attempt when no acceptance is recorded.
+      const bool fence_named =
+          status->fence_acceptance
+              ? evidence.configuration_fence_id == status->fence_acceptance->accepted_fence.configuration_fence_id &&
+                    evidence.configuration_fence_generation ==
+                        status->fence_acceptance->accepted_fence.configuration_fence_generation &&
+                    evidence.reconciled_scope == status->fence_acceptance->accepted_fence.captured_scope
+              : status->fence_attempt && evidence.reconciled_scope == status->fence_attempt->fence_intent.scope;
+      // After a publication receipt the active Deployment may be the published candidate.
+      const bool names_predecessor = active.retained_bundle_id == predecessor.retained_bundle_id &&
+                                     active.graph_revision == predecessor.graph_revision;
+      const bool names_candidate = status->publication_receipt &&
+                                   active.retained_bundle_id == intent.candidate_retained_bundle_id &&
+                                   active.graph_revision == intent.candidate_graph_revision;
+      if (evidence.owner_transaction.apply_id != apply_id ||
+          evidence.owner_transaction.apply_generation.value() != static_cast<std::uint64_t>(apply_generation) ||
+          !fence_named || !(names_predecessor || names_candidate) ||
+          active.scene_revision.scene_id != predecessor.scene_revision.scene_id)
+        throw ManagerApplyJournalIntegrityError("failed Apply release does not name its held predecessor");
+    }
+    if (release.released && release.released->request != *release.request)
+      throw ManagerApplyJournalIntegrityError("failed Apply release receipt differs from its request");
+  }
+
+  // The failed-release record, checked as every read of the row checked it.
+  std::optional<PersistedFailedApplyRelease>
+  HeldFailedReleaseLocked(const ApplyId &apply_id,
+                          const std::int64_t apply_generation) const {
+    const auto *held = HeldLocked(apply_id, apply_generation);
+    if (held == nullptr || !held->failed_release) {
+      return std::nullopt;
+    }
+    CheckFailedReleaseLocked(apply_id, apply_generation, *held->failed_release);
+    return held->failed_release;
+  }
+
+  // The full failed-release row a write leaves behind, in column order.
+  static std::vector<SqlValue>
+  FailedReleaseColumns(const ApplyKey &key,
+                       const PersistedFailedApplyRelease &release,
+                       const std::optional<std::string> &request_encoding,
+                       const std::optional<std::string> &released_encoding) {
+    return {
+        SqlInteger(static_cast<std::int64_t>(key.first)),
+        SqlInteger(key.second),
+        SqlText(release.terminal_outcome_digest.value()),
+        release.fence_acceptance_digest
+            ? SqlText(release.fence_acceptance_digest->value())
+            : SqlNull(),
+        SqlBlob(KeyBytes(release.acknowledgement_request_key)),
+        SqlText(release.acknowledgement_source_label),
+        request_encoding ? SqlText(*request_encoding) : SqlNull(),
+        released_encoding ? SqlText(*released_encoding) : SqlNull(),
+        SqlInteger(release.acknowledged ? 1 : 0),
     };
-    check_count("SELECT COUNT(*) FROM manager_apply_affected_scopes",
-                kMaximumManagerApplyAffectedScopes);
-    check_count("SELECT COUNT(*) FROM manager_apply_fence_attempts",
-                kMaximumManagerApplyFenceAttempts);
-    check_count("SELECT COUNT(*) FROM manager_apply_fence_acceptances",
-                kMaximumManagerApplyFenceAttempts);
-    check_count("SELECT COUNT(*) FROM manager_apply_runtime_convergence_intents",
-                kMaximumManagerApplyIntents);
-    check_count("SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets",
-                kMaximumRuntimeStagedReadySets);
-    check_count("SELECT COUNT(*) FROM manager_apply_private_materializations",
-                kMaximumManagerApplyPrivateMaterializations);
-    check_count("SELECT COUNT(*) FROM manager_apply_publication_receipts",
-                kMaximumManagerApplyPublicationReceipts);
-    check_count("SELECT COUNT(*) FROM manager_apply_fence_release_intents",
-                kMaximumManagerApplyFenceReleaseIntents);
-    check_count("SELECT COUNT(*) FROM manager_apply_fence_released_records",
-                kMaximumManagerApplyFenceReleasedRecords);
-    check_count("SELECT COUNT(*) FROM manager_apply_terminal_outcomes",
-                kMaximumManagerApplyTerminalOutcomes);
-    check_count("SELECT COUNT(*) FROM manager_apply_failed_release",
-                kMaximumManagerApplyTerminalOutcomes);
+  }
+
+  // The file bytes of the failed-release row one held Apply generation has.
+  [[nodiscard]] std::uint64_t
+  FailedReleaseFileBytesLocked(const std::uint64_t apply_id,
+                               const std::int64_t apply_generation,
+                               const ApplyRecords &held) const {
+    return RowFileBytesLocked(
+        ThrowIfRecordTooBig(FailedReleaseColumns(
+            {apply_id, apply_generation}, *held.failed_release,
+            held.release_request_encoding, held.released_fence_encoding)),
+        UniqueIndexes("manager_apply_failed_release"));
+  }
+
+  ManagerApplyJournalIntegrityReport HeldIntegrityReportLocked() const {
+    std::set<std::uint64_t> apply_ids;
+    std::int64_t scopes = 0, attempts = 0, acceptances = 0, runtime_intents = 0,
+                 staged_ready = 0, materializations = 0, publications = 0,
+                 release_intents = 0, released = 0, terminals = 0;
+    for (const auto &[key, held] : applies_) {
+      const auto &status = held.status;
+      apply_ids.insert(key.first);
+      scopes += status.affected_scope ? 1 : 0;
+      attempts += status.fence_attempt ? 1 : 0;
+      acceptances += status.fence_acceptance ? 1 : 0;
+      runtime_intents += status.runtime_convergence_intent ? 1 : 0;
+      staged_ready += static_cast<std::int64_t>(held.staged_ready.size());
+      materializations += status.private_materialization ? 1 : 0;
+      publications += status.publication_receipt ? 1 : 0;
+      release_intents += status.fence_release_intent ? 1 : 0;
+      released += status.fence_released ? 1 : 0;
+      terminals += status.terminal_outcome ? 1 : 0;
+    }
+    return {
+        cell_id_,
+        std::string(kManagerApplyJournalSchemaId),
+        kManagerApplyJournalSchemaVersion,
+        RawDigest(detail::kEmbeddedManagerApplyJournalSchema),
+        static_cast<std::int64_t>(applies_.size()),
+        static_cast<std::int64_t>(apply_ids.size()),
+        static_cast<std::int64_t>(requests_.size()),
+        scopes,
+        attempts,
+        acceptances,
+        runtime_intents,
+        staged_ready,
+        materializations,
+        publications,
+        release_intents,
+        released,
+        terminals,
+    };
   }
 
   ManagerApplyJournalIntegrityReport VerifyIntegrityLocked() const {
@@ -4598,12 +4998,12 @@ public:
 
     Statement rows(
         database_,
-        "SELECT apply_id,apply_generation,request_owner_epoch,request_id "
+        "SELECT apply_id,apply_generation,request_key "
         "FROM manager_apply_intents "
         "ORDER BY apply_id,apply_generation LIMIT ?");
     rows.Bind(1, static_cast<std::int64_t>(kMaximumManagerApplyIntents + 1U));
     std::map<ApplyId, std::int64_t> expected_generations;
-    std::set<std::pair<RequestOwnerEpoch, RequestId>> request_identities;
+    std::set<RequestKey> request_identities;
     std::int64_t observed = 0;
     while (rows.Step()) {
       ++observed;
@@ -4611,17 +5011,16 @@ public:
         throw ManagerApplyJournalIntegrityError(
             "stored Apply intent inventory exceeds its ceiling");
       }
-      const auto apply_id = ApplyId(rows.Text(0));
+      const auto apply_id = ApplyId(static_cast<std::uint64_t>(rows.Integer(0)));
       const auto generation = rows.Integer(1);
-      const auto request_owner_epoch = RequestOwnerEpoch(rows.Text(2));
-      const auto request_id = RequestId(rows.Text(3));
+      const auto request_key = KeyFromBytes(rows.Blob(2));
       auto [expected, inserted] = expected_generations.emplace(apply_id, 1);
       if (generation != expected->second) {
         throw ManagerApplyJournalIntegrityError(
             "Apply generations are not contiguous for one Apply identity");
       }
       ++expected->second;
-      if (!request_identities.emplace(request_owner_epoch, request_id).second) {
+      if (!request_identities.emplace(request_key).second) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply request identity is duplicated");
       }
@@ -4710,7 +5109,7 @@ public:
       ++observed_affected_scopes;
       if (observed_affected_scopes >
               static_cast<std::int64_t>(kMaximumManagerApplyAffectedScopes) ||
-          !AffectedScopeLocked(ApplyId(affected_scopes.Text(0)),
+          !AffectedScopeLocked(ApplyId(static_cast<std::uint64_t>(affected_scopes.Integer(0))),
                                affected_scopes.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4728,7 +5127,7 @@ public:
       ++observed_attempts;
       if (observed_attempts >
               static_cast<std::int64_t>(kMaximumManagerApplyFenceAttempts) ||
-          !FenceAttemptLocked(ApplyId(attempts.Text(0)), attempts.Integer(1))
+          !FenceAttemptLocked(ApplyId(static_cast<std::uint64_t>(attempts.Integer(0))), attempts.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply-fence attempt inventory is inconsistent");
@@ -4745,7 +5144,7 @@ public:
       ++observed_acceptances;
       if (observed_acceptances >
               static_cast<std::int64_t>(kMaximumManagerApplyFenceAttempts) ||
-          !FenceAcceptanceLocked(ApplyId(acceptances.Text(0)),
+          !FenceAcceptanceLocked(ApplyId(static_cast<std::uint64_t>(acceptances.Integer(0))),
                                  acceptances.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4769,7 +5168,7 @@ public:
       ++observed_runtime_intents;
       if (observed_runtime_intents >
               static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
-          !RuntimeConvergenceIntentLocked(ApplyId(runtime_intents.Text(0)),
+          !RuntimeConvergenceIntentLocked(ApplyId(static_cast<std::uint64_t>(runtime_intents.Integer(0))),
                                           runtime_intents.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4788,7 +5187,7 @@ public:
         expected_staged_ready_generations;
     while (staged_ready_sets.Step()) {
       ++observed_staged_ready;
-      const auto apply = ApplyId(staged_ready_sets.Text(0));
+      const auto apply = ApplyId(static_cast<std::uint64_t>(staged_ready_sets.Integer(0)));
       const auto apply_generation = staged_ready_sets.Integer(1);
       const auto staged_generation = staged_ready_sets.Integer(2);
       auto [expected, inserted] = expected_staged_ready_generations.emplace(
@@ -4796,8 +5195,6 @@ public:
       if (observed_staged_ready >
               static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
           staged_generation != expected->second ||
-          staged_generation > static_cast<std::int64_t>(
-                                  kMaximumRuntimeStagedReadySetsPerApply) ||
           !RuntimeStagedReadyLocked(apply, apply_generation, staged_generation)
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4825,7 +5222,7 @@ public:
               static_cast<std::int64_t>(
                   kMaximumManagerApplyPrivateMaterializations) ||
           !PrivateMaterializationLocked(
-               ApplyId(private_materializations.Text(0)),
+               ApplyId(static_cast<std::uint64_t>(private_materializations.Integer(0))),
                private_materializations.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4845,7 +5242,7 @@ public:
       if (observed_publication_receipts >
               static_cast<std::int64_t>(
                   kMaximumManagerApplyPublicationReceipts) ||
-          !PublicationReceiptLocked(ApplyId(publication_receipts.Text(0)),
+          !PublicationReceiptLocked(ApplyId(static_cast<std::uint64_t>(publication_receipts.Integer(0))),
                                     publication_receipts.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4870,7 +5267,7 @@ public:
       if (observed_fence_release_intents >
               static_cast<std::int64_t>(
                   kMaximumManagerApplyFenceReleaseIntents) ||
-          !FenceReleaseIntentLocked(ApplyId(fence_release_intents.Text(0)),
+          !FenceReleaseIntentLocked(ApplyId(static_cast<std::uint64_t>(fence_release_intents.Integer(0))),
                                     fence_release_intents.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4890,7 +5287,7 @@ public:
       if (observed_fence_released >
               static_cast<std::int64_t>(
                   kMaximumManagerApplyFenceReleasedRecords) ||
-          !FenceReleasedLocked(ApplyId(fence_released_records.Text(0)),
+          !FenceReleasedLocked(ApplyId(static_cast<std::uint64_t>(fence_released_records.Integer(0))),
                                fence_released_records.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4908,7 +5305,7 @@ public:
       ++observed_terminal_outcomes;
       if (observed_terminal_outcomes >
               static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes) ||
-          !TerminalOutcomeLocked(ApplyId(terminal_outcomes.Text(0)),
+          !TerminalOutcomeLocked(ApplyId(static_cast<std::uint64_t>(terminal_outcomes.Integer(0))),
                                  terminal_outcomes.Integer(1))
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
@@ -4928,7 +5325,7 @@ public:
     std::size_t failed_release_count = 0U;
     while (failed_releases.Step()) {
       if (++failed_release_count > kMaximumManagerApplyTerminalOutcomes ||
-          !FailedApplyReleaseLocked(ApplyId(failed_releases.Text(0)), failed_releases.Integer(1)))
+          !FailedApplyReleaseLocked(ApplyId(static_cast<std::uint64_t>(failed_releases.Integer(0))), failed_releases.Integer(1)))
         throw ManagerApplyJournalIntegrityError("stored failed Apply release inventory is inconsistent");
     }
     // These are table cardinalities already read by the integrity check. The
@@ -4971,9 +5368,7 @@ public:
   sqlite3 *database_{};
   mutable std::mutex mutex_;
   mutable VerifiedReads *verified_reads_{};
-  bool verify_write_generation_predecessors_{};
   bool closed_{};
-  bool borrowed_{};
 
   /// Verified records of the last read transactions and the database change
   /// identity they were read under. Guarded by `mutex_`.
@@ -4984,12 +5379,26 @@ public:
   };
   mutable std::optional<ChangeGatedReads> change_gated_reads_;
   mutable std::uint64_t record_verifications_{};
+
+  // The authority after open, guarded by `mutex_`; the file follows it.
+  std::map<ApplyKey, ApplyRecords> applies_;
+  std::map<RequestKey, ApplyKey> requests_;
+  std::int64_t newest_accepted_sequence_{};
+  // The file bytes the held rows take (RowFileBytes) and the part of the
+  // page limit they may take (od212). Set at open.
+  std::uint64_t file_bytes_{};
+  std::uint64_t file_byte_budget_{};
+  std::uint64_t page_size_{};
+  std::unique_ptr<persistence::SqliteRecordWriter> owned_writer_;
+  persistence::SqliteRecordWriter *writer_;
+  persistence::SqliteRecordWriter::StoreSlot slot_{};
 };
 
 SqliteManagerApplyJournal::SqliteManagerApplyJournal(
-    std::filesystem::path database_path, CellId cell_id)
+    std::filesystem::path database_path, CellId cell_id,
+    persistence::SqliteRecordWriter *record_writer)
     : impl_(std::make_unique<Impl>(std::move(database_path),
-                                   std::move(cell_id))) {}
+                                   std::move(cell_id), record_writer)) {}
 
 SqliteManagerApplyJournal::~SqliteManagerApplyJournal() = default;
 
@@ -5018,63 +5427,33 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
   }
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto result = impl_->EnsureIntentValueLocked(intent);
-  if (result.inserted)
-    static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return result;
+  return impl_->EnsureIntentValueLocked(intent);
 }
 
 std::optional<PersistedManagerApplyIntent>
 SqliteManagerApplyJournal::ReadIntent(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->IntentLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.intent;
 }
 
 std::vector<PersistedManagerApplyStatus>
 SqliteManagerApplyJournal::ReadStatusInventory() const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-
-  Statement rows(impl_->database_,
-                 "SELECT apply_id,apply_generation FROM manager_apply_intents "
-                 "ORDER BY apply_id,apply_generation LIMIT ?");
-  rows.Bind(1, static_cast<std::int64_t>(kMaximumManagerApplyIntents + 1U));
-  std::vector<std::pair<ApplyId, std::int64_t>> keys;
-  keys.reserve(kMaximumManagerApplyIntents);
-  while (rows.Step()) {
-    if (keys.size() == kMaximumManagerApplyIntents) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored Apply status inventory exceeds its ceiling");
-    }
-    keys.emplace_back(ApplyId(rows.Text(0)), rows.Integer(1));
-  }
-
   std::vector<PersistedManagerApplyStatus> result;
-  result.reserve(keys.size());
-  for (const auto &[apply_id, generation] : keys) {
-    auto status = impl_->StatusLocked(apply_id, generation);
-    if (!status.has_value()) {
-      throw ManagerApplyJournalIntegrityError(
-          "Apply status inventory references a missing intent");
-    }
-    result.push_back(std::move(*status));
+  result.reserve(impl_->applies_.size());
+  for (const auto &entry : impl_->applies_) {
+    result.push_back(entry.second.status);
   }
-  transaction.Commit();
   return result;
 }
 
@@ -5083,46 +5462,40 @@ std::uint64_t SqliteManagerApplyJournal::record_verification_count() const {
   return impl_->record_verifications_;
 }
 
+std::uint64_t SqliteManagerApplyJournal::record_file_bytes() const {
+  std::lock_guard lock(impl_->mutex_);
+  return impl_->file_bytes_;
+}
+
 std::optional<PersistedManagerApplyStatus>
 SqliteManagerApplyJournal::ReadStatus(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  auto status = impl_->StatusLocked(apply_id, generation);
-  transaction.Commit();
-  return status;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status;
 }
 
 std::optional<PersistedManagerApplyIntent>
-SqliteManagerApplyJournal::ReadRequest(
-    const RequestOwnerEpoch &request_owner_epoch,
-    const RequestId &request_id) const {
-  ValidateBoundedIdentity(request_owner_epoch.value(), "request_owner_epoch");
-  ValidateBoundedIdentity(request_id.value(), "request_id");
+SqliteManagerApplyJournal::ReadRequest(const RequestKey &request_key) const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->RequestLocked(request_owner_epoch, request_id);
-  transaction.Commit();
-  return result;
+  return impl_->RequestLocked(request_key);
 }
 
 std::optional<ApplyGeneration>
 SqliteManagerApplyJournal::ReadApplyGenerationHighWater(
     const ApplyId &apply_id) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->GenerationHighWaterLocked(apply_id);
-  transaction.Commit();
   if (!result.has_value()) {
     return std::nullopt;
   }
@@ -5136,77 +5509,76 @@ SqliteManagerApplyJournal::EnsureAffectedScope(
   const auto encoded = EncodeAffectedScope(intent_digest, affected_scope);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto parent =
-      impl_->IntentLocked(affected_scope.apply_id, encoded.apply_generation);
-  if (!parent.has_value() || parent->intent_digest != intent_digest) {
+  auto *held = impl_->HeldLocked(affected_scope.apply_id, encoded.apply_generation);
+  if (held == nullptr || held->status.intent.intent_digest != intent_digest) {
     throw ManagerApplyJournalConflictError(
         "Apply affected scope does not name its exact durable intent");
   }
-  if (const auto existing = impl_->AffectedScopeLocked(
-          affected_scope.apply_id, encoded.apply_generation);
-      existing.has_value()) {
+  if (const auto &existing = held->status.affected_scope; existing.has_value()) {
     if (existing->intent_digest != intent_digest ||
         existing->affected_scope_digest.value() != encoded.digest ||
         existing->affected_scope != affected_scope) {
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different affected scope");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count = ScalarInteger(
-      impl_->database_, "SELECT COUNT(*) FROM manager_apply_affected_scopes");
-  if (count >= static_cast<std::int64_t>(kMaximumManagerApplyAffectedScopes)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.affected_scope.has_value();
+      }) >= kMaximumManagerApplyAffectedScopes) {
     throw ManagerApplyJournalLimitError(
         "Apply affected-scope inventory reached its fixed limit");
   }
-  Statement insert(
-      impl_->database_,
+  SqlWrite insert{
       "INSERT INTO manager_apply_affected_scopes ("
       "apply_id,apply_generation,intent_digest,components_encoding,"
       "domains_encoding,bindings_encoding,resources_encoding,"
       "busy_disposition,affected_scope_digest,component_delta_encoding) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, affected_scope.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, intent_digest.value());
-  insert.Bind(4, encoded.components);
-  insert.Bind(5, encoded.domains);
-  insert.Bind(6, encoded.bindings);
-  insert.Bind(7, encoded.resources);
-  insert.Bind(8, encoded.busy_disposition);
-  insert.Bind(9, encoded.digest);
-  insert.Bind(10, encoded.component_delta);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->AffectedScopeLocked(affected_scope.apply_id,
-                                                 encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->affected_scope_digest.value() != encoded.digest ||
-      stored->affected_scope != affected_scope) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted Apply affected scope cannot be verified");
+      "VALUES (?,?,?,?,?,?,?,?,?,?)",
+      {
+          SqlInteger(affected_scope.apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(intent_digest.value()),
+          SqlText(encoded.components),
+          SqlText(encoded.domains),
+          SqlText(encoded.bindings),
+          SqlText(encoded.resources),
+          SqlText(encoded.busy_disposition),
+          SqlText(encoded.digest),
+          SqlText(encoded.component_delta),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto delta_length = SqliteTextLength(encoded.component_delta);
+  if (delta_length < 2U || delta_length > kMaximumComponentDeltaCharacters) {
+    throw ManagerApplyJournalConflictError(
+        std::string(kComponentDeltaCheckFailed));
   }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_affected_scopes"));
+  const PersistedManagerApplyAffectedScope record{
+      affected_scope, intent_digest, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.affected_scope = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyAffectedScope>
 SqliteManagerApplyJournal::ReadAffectedScope(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->AffectedScopeLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.affected_scope;
 }
 
 ManagerApplyFenceAttemptWriteResult
@@ -5219,16 +5591,13 @@ SqliteManagerApplyJournal::EnsureFenceAttempt(
   const auto &apply_id = fence_intent.owner_transaction.apply_id;
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto parent = impl_->IntentLocked(apply_id, encoded.apply_generation);
-  if (!parent.has_value() || parent->intent_digest != intent_digest) {
+  auto *held = impl_->HeldLocked(apply_id, encoded.apply_generation);
+  if (held == nullptr || held->status.intent.intent_digest != intent_digest) {
     throw ManagerApplyJournalConflictError(
         "Apply-fence attempt does not name its exact durable intent");
   }
-  const auto affected_scope =
-      impl_->AffectedScopeLocked(apply_id, encoded.apply_generation);
+  const auto *parent = &held->status.intent;
+  const auto &affected_scope = held->status.affected_scope;
   if (!affected_scope.has_value() ||
       affected_scope->affected_scope_digest != affected_scope_digest ||
       affected_scope->affected_scope.scope != fence_intent.scope ||
@@ -5245,9 +5614,7 @@ SqliteManagerApplyJournal::EnsureFenceAttempt(
     throw ManagerApplyJournalConflictError(
         "Apply-fence attempt conflicts with its durable Apply intent");
   }
-  if (const auto existing =
-          impl_->FenceAttemptLocked(apply_id, encoded.apply_generation);
-      existing.has_value()) {
+  if (const auto &existing = held->status.fence_attempt; existing.has_value()) {
     if (existing->intent_digest != intent_digest ||
         existing->affected_scope_digest != affected_scope_digest ||
         existing->fence_attempt_digest.value() != encoded.digest ||
@@ -5255,79 +5622,71 @@ SqliteManagerApplyJournal::EnsureFenceAttempt(
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different durable fence attempt");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto attempt_count = ScalarInteger(
-      impl_->database_, "SELECT COUNT(*) FROM manager_apply_fence_attempts");
-  if (attempt_count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyFenceAttempts)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.fence_attempt.has_value();
+      }) >= kMaximumManagerApplyFenceAttempts) {
     throw ManagerApplyJournalLimitError(
         "Apply-fence attempt inventory reached its fixed limit");
   }
-  Statement insert(
-      impl_->database_,
+  SqlWrite insert{
       "INSERT INTO manager_apply_fence_attempts ("
-      "apply_id,apply_generation,intent_digest,affected_scope_digest,request_"
-      "id,"
-      "request_owner_epoch,source_label,correlation_id,"
+      "apply_id,apply_generation,intent_digest,affected_scope_digest,"
+      "request_key,source_label,"
       "components_encoding,domains_encoding,bindings_encoding,"
       "resources_encoding,busy_disposition,expected_retained_bundle_id,"
       "expected_graph_revision,expected_operation_resource_generation,"
       "expected_fence_generation,active_configurations_encoding,reason,"
-      "fence_attempt_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, intent_digest.value());
-  insert.Bind(4, affected_scope_digest.value());
-  insert.Bind(5, fence_intent.owner_request_context.request_id.value());
-  insert.Bind(6,
-              fence_intent.owner_request_context.request_owner_epoch.value());
-  insert.Bind(7, fence_intent.owner_request_context.source_label);
-  if (fence_intent.owner_request_context.correlation_id.has_value()) {
-    insert.Bind(8, *fence_intent.owner_request_context.correlation_id);
-  } else {
-    insert.BindNull(8);
-  }
-  insert.Bind(9, encoded.components);
-  insert.Bind(10, encoded.domains);
-  insert.Bind(11, encoded.bindings);
-  insert.Bind(12, encoded.resources);
-  insert.Bind(13, core::to_string(fence_intent.busy_disposition));
-  insert.Bind(14, fence_intent.expected_retained_bundle_id.value());
-  insert.Bind(15, fence_intent.expected_graph_revision.value());
-  insert.Bind(16, encoded.operation_generation);
-  insert.Bind(17, encoded.fence_generation);
-  insert.Bind(18, encoded.active_configurations);
-  insert.Bind(19, fence_intent.reason);
-  insert.Bind(20, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->FenceAttemptLocked(apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->fence_attempt_digest.value() != encoded.digest ||
-      !SameFenceIntent(stored->fence_intent, fence_intent)) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted Apply-fence attempt cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+      "fence_attempt_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      {
+          SqlInteger(apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(intent_digest.value()),
+          SqlText(affected_scope_digest.value()),
+          SqlBlob(KeyBytes(fence_intent.owner_request_context.request_key)),
+          SqlText(fence_intent.owner_request_context.source_label),
+          SqlText(encoded.components),
+          SqlText(encoded.domains),
+          SqlText(encoded.bindings),
+          SqlText(encoded.resources),
+          SqlText(core::to_string(fence_intent.busy_disposition)),
+          SqlText(fence_intent.expected_retained_bundle_id.value()),
+          SqlText(fence_intent.expected_graph_revision.value()),
+          SqlInteger(encoded.operation_generation),
+          SqlInteger(encoded.fence_generation),
+          SqlText(encoded.active_configurations),
+          SqlText(fence_intent.reason),
+          SqlText(encoded.digest),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_fence_attempts"));
+  const PersistedManagerApplyFenceAttempt record{
+      fence_intent, intent_digest, affected_scope_digest,
+      ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.fence_attempt = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyFenceAttempt>
 SqliteManagerApplyJournal::ReadFenceAttempt(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->FenceAttemptLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.fence_attempt;
 }
 
 ManagerApplyFenceAcceptanceWriteResult
@@ -5339,12 +5698,11 @@ SqliteManagerApplyJournal::EnsureFenceAcceptance(
       apply_id, apply_generation, fence_attempt_digest, accepted_fence);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto attempt =
-      impl_->FenceAttemptLocked(apply_id, encoded.apply_generation);
-  if (!attempt.has_value() ||
+  auto *held = impl_->HeldLocked(apply_id, encoded.apply_generation);
+  const auto *attempt = held != nullptr && held->status.fence_attempt
+                            ? &*held->status.fence_attempt
+                            : nullptr;
+  if (attempt == nullptr ||
       attempt->fence_attempt_digest != fence_attempt_digest) {
     throw ManagerApplyJournalConflictError(
         "Apply-fence acceptance does not name its exact durable attempt");
@@ -5353,8 +5711,7 @@ SqliteManagerApplyJournal::EnsureFenceAcceptance(
     throw ManagerApplyJournalConflictError(
         "Apply-fence acceptance does not match its exact attempt");
   }
-  if (const auto existing =
-          impl_->FenceAcceptanceLocked(apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.fence_acceptance;
       existing.has_value()) {
     if (existing->fence_attempt_digest != fence_attempt_digest ||
         existing->acceptance_digest.value() != encoded.digest ||
@@ -5362,63 +5719,76 @@ SqliteManagerApplyJournal::EnsureFenceAcceptance(
       throw ManagerApplyJournalConflictError(
           "Apply generation already has different durable fence acceptance");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto acceptance_count = ScalarInteger(
-      impl_->database_, "SELECT COUNT(*) FROM manager_apply_fence_acceptances");
-  if (acceptance_count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyFenceAttempts)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.fence_acceptance.has_value();
+      }) >= kMaximumManagerApplyFenceAttempts) {
     throw ManagerApplyJournalLimitError(
         "Apply-fence acceptance inventory reached its fixed limit");
   }
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_fence_acceptances ("
-                   "apply_id,apply_generation,fence_attempt_digest,"
-                   "configuration_fence_id,configuration_fence_generation,"
-                   "captured_components_encoding,captured_domains_encoding,"
-                   "captured_bindings_encoding,captured_resources_encoding,"
-                   "accepted_at_ns,replay_status,acceptance_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, fence_attempt_digest.value());
-  insert.Bind(4, accepted_fence.configuration_fence_id.value());
-  insert.Bind(5, encoded.fence_generation);
-  insert.Bind(6, encoded.components);
-  insert.Bind(7, encoded.domains);
-  insert.Bind(8, encoded.bindings);
-  insert.Bind(9, encoded.resources);
-  insert.Bind(10, accepted_fence.accepted_at_ns);
-  insert.Bind(11, encoded.replay_status);
-  insert.Bind(12, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->FenceAcceptanceLocked(apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->acceptance_digest.value() != encoded.digest ||
-      !SameAcceptedFence(stored->accepted_fence, accepted_fence)) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted Apply-fence acceptance cannot be verified");
+  SqlWrite insert{"INSERT INTO manager_apply_fence_acceptances ("
+                  "apply_id,apply_generation,fence_attempt_digest,"
+                  "configuration_fence_id,configuration_fence_generation,"
+                  "captured_components_encoding,captured_domains_encoding,"
+                  "captured_bindings_encoding,captured_resources_encoding,"
+                  "accepted_at_ns,replay_status,acceptance_digest) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                  {
+                      SqlInteger(apply_id),
+                      SqlInteger(encoded.apply_generation),
+                      SqlText(fence_attempt_digest.value()),
+                      SqlText(accepted_fence.configuration_fence_id.value()),
+                      SqlInteger(encoded.fence_generation),
+                      SqlText(encoded.components),
+                      SqlText(encoded.domains),
+                      SqlText(encoded.bindings),
+                      SqlText(encoded.resources),
+                      SqlInteger(accepted_fence.accepted_at_ns),
+                      SqlText(encoded.replay_status),
+                      SqlText(encoded.digest),
+                  },
+                  std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  // UNIQUE (configuration_fence_id, configuration_fence_generation).
+  if (impl_->CountLocked([&](const auto &other) {
+        return other.status.fence_acceptance &&
+               other.status.fence_acceptance->accepted_fence
+                       .configuration_fence_id ==
+                   accepted_fence.configuration_fence_id &&
+               other.status.fence_acceptance->accepted_fence
+                       .configuration_fence_generation ==
+                   accepted_fence.configuration_fence_generation;
+      }) != 0U) {
+    throw ManagerApplyJournalConflictError(
+        std::string(kFenceAcceptanceUniqueFailed));
   }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_fence_acceptances"));
+  const PersistedManagerApplyFenceAcceptance record{
+      apply_id, apply_generation, fence_attempt_digest, accepted_fence,
+      ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.fence_acceptance = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyFenceAcceptance>
 SqliteManagerApplyJournal::ReadFenceAcceptance(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->FenceAcceptanceLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.fence_acceptance;
 }
 
 ManagerApplyRuntimeConvergenceIntentWriteResult
@@ -5429,22 +5799,17 @@ SqliteManagerApplyJournal::EnsureRuntimeConvergenceIntent(
       EncodeRuntimeConvergenceIntent(intent_digest, runtime_intent);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto parent =
-      impl_->IntentLocked(runtime_intent.apply_id, encoded.apply_generation);
-  const auto acceptance = impl_->FenceAcceptanceLocked(
-      runtime_intent.apply_id, encoded.apply_generation);
-  if (!parent.has_value() || parent->intent_digest != intent_digest ||
-      !acceptance.has_value() ||
-      acceptance->acceptance_digest != runtime_intent.fence_acceptance_digest) {
+  auto *held =
+      impl_->HeldLocked(runtime_intent.apply_id, encoded.apply_generation);
+  if (held == nullptr || held->status.intent.intent_digest != intent_digest ||
+      !held->status.fence_acceptance.has_value() ||
+      held->status.fence_acceptance->acceptance_digest !=
+          runtime_intent.fence_acceptance_digest) {
     throw ManagerApplyJournalConflictError(
         "runtime convergence intent does not name its exact durable "
         "Apply/fence acceptance");
   }
-  if (const auto existing = impl_->RuntimeConvergenceIntentLocked(
-          runtime_intent.apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.runtime_convergence_intent;
       existing.has_value()) {
     if (existing->intent_digest != intent_digest ||
         existing->runtime_convergence_intent != runtime_intent ||
@@ -5453,62 +5818,61 @@ SqliteManagerApplyJournal::EnsureRuntimeConvergenceIntent(
           "Apply generation already has a different runtime convergence "
           "intent");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_runtime_convergence_intents");
-  if (count >= static_cast<std::int64_t>(kMaximumManagerApplyIntents)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.runtime_convergence_intent.has_value();
+      }) >= kMaximumManagerApplyIntents) {
     throw ManagerApplyJournalLimitError(
         "runtime convergence-intent inventory reached its fixed limit");
   }
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_runtime_convergence_intents ("
-                   "apply_id,apply_generation,intent_digest,"
-                   "candidate_retained_bundle_id,candidate_graph_revision,"
-                   "fence_acceptance_digest,predecessor_publication_generation,"
-                   "predecessor_public_pointer_digest,runtime_units_encoding,"
-                   "runtime_convergence_intent_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, runtime_intent.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, intent_digest.value());
-  insert.Bind(4, runtime_intent.candidate_retained_bundle_id.value());
-  insert.Bind(5, runtime_intent.candidate_graph_revision.value());
-  insert.Bind(6, runtime_intent.fence_acceptance_digest.value());
-  insert.Bind(7, encoded.predecessor_publication_generation);
-  insert.Bind(8, runtime_intent.predecessor_public_pointer_digest.value());
-  insert.Bind(9, encoded.runtime_units);
-  insert.Bind(10, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->RuntimeConvergenceIntentLocked(
-      runtime_intent.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->runtime_convergence_intent != runtime_intent ||
-      stored->runtime_convergence_intent_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted runtime convergence intent cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  SqlWrite insert{
+      "INSERT INTO manager_apply_runtime_convergence_intents ("
+      "apply_id,apply_generation,intent_digest,"
+      "candidate_retained_bundle_id,candidate_graph_revision,"
+      "fence_acceptance_digest,predecessor_publication_generation,"
+      "predecessor_public_pointer_digest,runtime_units_encoding,"
+      "runtime_convergence_intent_digest) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?)",
+      {
+          SqlInteger(runtime_intent.apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(intent_digest.value()),
+          SqlText(runtime_intent.candidate_retained_bundle_id.value()),
+          SqlText(runtime_intent.candidate_graph_revision.value()),
+          SqlText(runtime_intent.fence_acceptance_digest.value()),
+          SqlInteger(encoded.predecessor_publication_generation),
+          SqlText(runtime_intent.predecessor_public_pointer_digest.value()),
+          SqlText(encoded.runtime_units),
+          SqlText(encoded.digest),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_runtime_convergence_intents"));
+  const PersistedManagerApplyRuntimeConvergenceIntent record{
+      runtime_intent, intent_digest, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.runtime_convergence_intent = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
 SqliteManagerApplyJournal::ReadRuntimeConvergenceIntent(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result =
-      impl_->RuntimeConvergenceIntentLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.runtime_convergence_intent;
 }
 
 ManagerApplyRuntimeStagedReadyWriteResult
@@ -5517,12 +5881,12 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
   const auto encoded = EncodeRuntimeStagedReady(staged_ready);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto intent = impl_->RuntimeConvergenceIntentLocked(
-      staged_ready.apply_id, encoded.apply_generation);
-  if (!intent.has_value() ||
+  auto *held =
+      impl_->HeldLocked(staged_ready.apply_id, encoded.apply_generation);
+  const auto *intent = held != nullptr && held->status.runtime_convergence_intent
+                           ? &*held->status.runtime_convergence_intent
+                           : nullptr;
+  if (intent == nullptr ||
       intent->runtime_convergence_intent_digest !=
           staged_ready.runtime_convergence_intent_digest ||
       intent->runtime_convergence_intent.predecessor_publication_generation !=
@@ -5533,86 +5897,74 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
         "runtime staged-ready set does not name its exact convergence "
         "intent/publication");
   }
-  if (const auto existing = impl_->RuntimeStagedReadyLocked(
-          staged_ready.apply_id, encoded.apply_generation,
-          encoded.staged_ready_generation);
-      existing.has_value()) {
-    if (existing->staged_ready != staged_ready ||
-        existing->staged_ready_digest.value() != encoded.digest) {
+  if (const auto existing =
+          held->staged_ready.find(encoded.staged_ready_generation);
+      existing != held->staged_ready.end()) {
+    if (existing->second.staged_ready != staged_ready ||
+        existing->second.staged_ready_digest.value() != encoded.digest) {
       throw ManagerApplyJournalConflictError(
           "staged-ready generation already has different evidence");
     }
-    transaction.Commit();
-    return {*existing, false};
+    return {existing->second, false};
   }
-  // A scene-stage intent freezes the scene transition, not the Manager's
-  // observation of the runtime child.  If the Manager restarts after scene
-  // staging/activation, the native child can legitimately receive a new
-  // process epoch; append a fresh staged-ready row while retaining the
-  // original digest as the immutable scene-stage parent.
-  const auto latest = impl_->LatestRuntimeStagedReadyLocked(
-      staged_ready.apply_id, encoded.apply_generation, true);
-  const auto expected_generation =
-      latest.has_value() ? latest->staged_ready.staged_ready_generation + 1U
-                         : 1U;
-  if (staged_ready.staged_ready_generation != expected_generation ||
-      staged_ready.staged_ready_generation >
-          kMaximumRuntimeStagedReadySetsPerApply) {
+  if (staged_ready.staged_ready_generation != 1U) {
     throw ManagerApplyJournalConflictError(
         "runtime staged-ready generations must be contiguous and bounded");
   }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets");
-  if (count >= static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets)) {
+  std::size_t count = 0U;
+  for (const auto &entry : impl_->applies_) {
+    count += entry.second.staged_ready.size();
+  }
+  if (count >= kMaximumRuntimeStagedReadySets) {
     throw ManagerApplyJournalLimitError(
         "runtime staged-ready inventory reached its fixed limit");
   }
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_runtime_staged_ready_sets ("
-                   "apply_id,apply_generation,staged_ready_generation,"
-                   "runtime_convergence_intent_digest,"
-                   "predecessor_publication_generation,"
-                   "predecessor_public_pointer_digest,evaluated_at_ns,"
-                   "runtime_evidence_encoding,staged_ready_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, staged_ready.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, encoded.staged_ready_generation);
-  insert.Bind(4, staged_ready.runtime_convergence_intent_digest.value());
-  insert.Bind(5, encoded.predecessor_publication_generation);
-  insert.Bind(6, staged_ready.predecessor_public_pointer_digest.value());
-  insert.Bind(7, encoded.evaluated_at_ns);
-  insert.Bind(8, encoded.runtime_evidence);
-  insert.Bind(9, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->RuntimeStagedReadyLocked(
-      staged_ready.apply_id, encoded.apply_generation,
-      encoded.staged_ready_generation);
-  if (!stored.has_value() || stored->staged_ready != staged_ready ||
-      stored->staged_ready_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted runtime staged-ready set cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  SqlWrite insert{"INSERT INTO manager_apply_runtime_staged_ready_sets ("
+                  "apply_id,apply_generation,staged_ready_generation,"
+                  "runtime_convergence_intent_digest,"
+                  "predecessor_publication_generation,"
+                  "predecessor_public_pointer_digest,evaluated_at_ns,"
+                  "runtime_evidence_encoding,staged_ready_digest) "
+                  "VALUES (?,?,?,?,?,?,?,?,?)",
+                  {
+                      SqlInteger(staged_ready.apply_id),
+                      SqlInteger(encoded.apply_generation),
+                      SqlInteger(encoded.staged_ready_generation),
+                      SqlText(staged_ready.runtime_convergence_intent_digest.value()),
+                      SqlInteger(encoded.predecessor_publication_generation),
+                      SqlText(staged_ready.predecessor_public_pointer_digest.value()),
+                      SqlInteger(encoded.evaluated_at_ns),
+                      SqlText(encoded.runtime_evidence),
+                      SqlText(encoded.digest),
+                  },
+                  std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_runtime_staged_ready_sets"));
+  const PersistedManagerApplyRuntimeStagedReady record{
+      staged_ready, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->staged_ready.emplace(encoded.staged_ready_generation, record);
+  held->status.latest_runtime_staged_ready = held->staged_ready.rbegin()->second;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyRuntimeStagedReady>
 SqliteManagerApplyJournal::ReadLatestRuntimeStagedReady(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result =
-      impl_->LatestRuntimeStagedReadyLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.latest_runtime_staged_ready;
 }
 
 ManagerApplyPrivateMaterializationWriteResult
@@ -5621,12 +5973,10 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
   const auto encoded = EncodePrivateMaterialization(private_materialization);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto intent = impl_->IntentLocked(
-      private_materialization.apply_id, encoded.apply_generation);
-  if (!intent.has_value() ||
+  auto *held = impl_->HeldLocked(private_materialization.apply_id,
+                                 encoded.apply_generation);
+  const auto *intent = held == nullptr ? nullptr : &held->status.intent;
+  if (intent == nullptr ||
       private_materialization.authoritative_scene_snapshot_digest !=
           private_materialization.candidate_projection_revision.scene_revision
               .content_hash ||
@@ -5640,8 +5990,7 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
         "private materialization does not match its exact Apply and "
         "authoritative Scene snapshot");
   }
-  if (const auto existing = impl_->PrivateMaterializationLocked(
-          private_materialization.apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.private_materialization;
       existing.has_value()) {
     if (existing->private_materialization != private_materialization ||
         existing->private_materialization_content_digest.value() !=
@@ -5650,70 +5999,65 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
           "Apply generation already has a different private "
           "materialization");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_private_materializations");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyPrivateMaterializations)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.private_materialization.has_value();
+      }) >= kMaximumManagerApplyPrivateMaterializations) {
     throw ManagerApplyJournalLimitError(
         "private-materialization inventory reached its fixed limit");
   }
   const auto &candidate = private_materialization.candidate_projection_revision;
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_private_materializations ("
-                   "apply_id,apply_generation,authoritative_scene_snapshot_digest,"
-                   "candidate_retained_bundle_id,"
-                   "candidate_graph_revision,candidate_scene_id,"
-                   "candidate_scene_revision_id,candidate_scene_content_hash,"
-                   "retained_bundle_canonical_content_digest,"
-                   "retained_bundle_canonical_byte_size,"
-                   "private_materialization_content_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, private_materialization.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3,
-              private_materialization.authoritative_scene_snapshot_digest.value());
-  insert.Bind(4, candidate.retained_bundle_id.value());
-  insert.Bind(5, candidate.graph_revision.value());
-  insert.Bind(6, candidate.scene_revision.scene_id.value());
-  insert.Bind(7, encoded.candidate_scene_revision_id);
-  insert.Bind(8, candidate.scene_revision.content_hash.value());
-  insert.Bind(
-      9,
-      private_materialization.retained_bundle_canonical_content_digest.value());
-  insert.Bind(10, encoded.retained_bundle_canonical_byte_size);
-  insert.Bind(11, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->PrivateMaterializationLocked(
-      private_materialization.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->private_materialization != private_materialization ||
-      stored->private_materialization_content_digest.value() !=
-          encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted private materialization cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  SqlWrite insert{
+      "INSERT INTO manager_apply_private_materializations ("
+      "apply_id,apply_generation,authoritative_scene_snapshot_digest,"
+      "candidate_retained_bundle_id,"
+      "candidate_graph_revision,candidate_scene_id,"
+      "candidate_scene_revision_id,candidate_scene_content_hash,"
+      "retained_bundle_canonical_content_digest,"
+      "retained_bundle_canonical_byte_size,"
+      "private_materialization_content_digest) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+      {
+          SqlInteger(private_materialization.apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(private_materialization.authoritative_scene_snapshot_digest.value()),
+          SqlText(candidate.retained_bundle_id.value()),
+          SqlText(candidate.graph_revision.value()),
+          SqlText(candidate.scene_revision.scene_id.value()),
+          SqlInteger(encoded.candidate_scene_revision_id),
+          SqlText(candidate.scene_revision.content_hash.value()),
+          SqlText(private_materialization.retained_bundle_canonical_content_digest.value()),
+          SqlInteger(encoded.retained_bundle_canonical_byte_size),
+          SqlText(encoded.digest),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_private_materializations"));
+  const PersistedManagerApplyPrivateMaterialization stored{
+      private_materialization, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.private_materialization = stored;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {stored, true};
 }
 
 std::optional<PersistedManagerApplyPrivateMaterialization>
 SqliteManagerApplyJournal::ReadPrivateMaterialization(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->PrivateMaterializationLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.private_materialization;
 }
 
 ManagerApplyPublicationReceiptWriteResult
@@ -5729,12 +6073,12 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
   }
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto materialization = impl_->PrivateMaterializationLocked(
-      named->apply_id, encoded.apply_generation);
-  if (!materialization.has_value() ||
+  auto *held = impl_->HeldLocked(named->apply_id, encoded.apply_generation);
+  const auto *materialization =
+      held != nullptr && held->status.private_materialization
+          ? &*held->status.private_materialization
+          : nullptr;
+  if (materialization == nullptr ||
       materialization->private_materialization_content_digest !=
           publication.private_materialization_content_digest ||
       publication.private_materialization_content_digest !=
@@ -5742,43 +6086,33 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
     throw ManagerApplyJournalConflictError(
         "publication receipt does not match exact private materialization");
   }
-  if (const auto existing = impl_->PublicationReceiptLocked(
-          named->apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.publication_receipt;
       existing.has_value()) {
     if (existing->publication != publication ||
         existing->publication_receipt_digest.value() != encoded.digest) {
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different publication receipt");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  Statement generation_owner(
-      impl_->database_,
-      "SELECT apply_id,apply_generation FROM "
-      "manager_apply_publication_receipts WHERE publication_generation=?");
-  generation_owner.Bind(1, encoded.publication_generation);
-  if (generation_owner.Step()) {
-    const ApplyId owner_id(generation_owner.Text(0));
-    const auto owner_generation = generation_owner.Integer(1);
-    if (owner_generation <= 0 || generation_owner.Step() ||
-        !impl_->PublicationReceiptLocked(owner_id, owner_generation))
-      throw ManagerApplyJournalIntegrityError(
-          "publication generation owner is invalid");
+  if (impl_->CountLocked([&](const auto &other) {
+        return other.status.publication_receipt &&
+               static_cast<std::int64_t>(
+                   other.status.publication_receipt->publication
+                       .publication_receipt.publication_generation.value()) ==
+                   encoded.publication_generation;
+      }) != 0U) {
     throw ManagerApplyJournalConflictError(
         "publication generation already belongs to another Apply");
   }
-  const auto count =
-      ScalarInteger(impl_->database_,
-                    "SELECT COUNT(*) FROM manager_apply_publication_receipts");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyPublicationReceipts)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.publication_receipt.has_value();
+      }) >= kMaximumManagerApplyPublicationReceipts) {
     throw ManagerApplyJournalLimitError(
         "Apply-publication inventory reached its fixed limit");
   }
   const auto &candidate = request.candidate_projection_revision;
-  Statement insert(
-      impl_->database_,
+  SqlWrite insert{
       "INSERT INTO manager_apply_publication_receipts ("
       "apply_id,apply_generation,"
       "candidate_retained_bundle_id,"
@@ -5787,45 +6121,48 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
       "expected_previous_publication_generation,"
       "private_materialization_content_digest,publication_generation,"
       "durable_public_pointer_content_digest,publication_receipt_digest) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, named->apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, candidate.retained_bundle_id.value());
-  insert.Bind(4, candidate.graph_revision.value());
-  insert.Bind(5, candidate.scene_revision.scene_id.value());
-  insert.Bind(6, encoded.candidate_scene_revision_id);
-  insert.Bind(7, candidate.scene_revision.content_hash.value());
-  insert.Bind(8, encoded.expected_previous_publication_generation);
-  insert.Bind(9, request.private_materialization_content_digest.value());
-  insert.Bind(10, encoded.publication_generation);
-  insert.Bind(11, receipt.durable_public_pointer_content_digest.value());
-  insert.Bind(12, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->PublicationReceiptLocked(named->apply_id,
-                                                      encoded.apply_generation);
-  if (!stored.has_value() || stored->publication != publication ||
-      stored->publication_receipt_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted Apply publication receipt cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+      {
+          SqlInteger(named->apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(candidate.retained_bundle_id.value()),
+          SqlText(candidate.graph_revision.value()),
+          SqlText(candidate.scene_revision.scene_id.value()),
+          SqlInteger(encoded.candidate_scene_revision_id),
+          SqlText(candidate.scene_revision.content_hash.value()),
+          SqlInteger(encoded.expected_previous_publication_generation),
+          SqlText(request.private_materialization_content_digest.value()),
+          SqlInteger(encoded.publication_generation),
+          SqlText(receipt.durable_public_pointer_content_digest.value()),
+          SqlText(encoded.digest),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_publication_receipts"));
+  const PersistedManagerApplyPublicationReceipt record{
+      publication, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.publication_receipt = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyPublicationReceipt>
 SqliteManagerApplyJournal::ReadPublicationReceipt(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->PublicationReceiptLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.publication_receipt;
 }
 
 ManagerApplyFenceReleaseIntentWriteResult
@@ -5836,13 +6173,13 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
                           .reconciliation_evidence.owner_transaction;
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto acceptance =
-      impl_->FenceAcceptanceLocked(owner.apply_id, encoded.apply_generation);
-  const auto publication =
-      impl_->PublicationReceiptLocked(owner.apply_id, encoded.apply_generation);
+  auto *held = impl_->HeldLocked(owner.apply_id, encoded.apply_generation);
+  const std::optional<PersistedManagerApplyFenceAcceptance> no_acceptance;
+  const std::optional<PersistedManagerApplyPublicationReceipt> no_publication;
+  const auto &acceptance =
+      held == nullptr ? no_acceptance : held->status.fence_acceptance;
+  const auto &publication =
+      held == nullptr ? no_publication : held->status.publication_receipt;
   const auto &evidence =
       fence_release_intent.release_request.reconciliation_evidence;
   if (!publication.has_value() ||
@@ -5868,63 +6205,60 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
         "fence-release intent does not match exact completed, fence, and "
         "publication evidence");
   }
-  if (const auto existing = impl_->FenceReleaseIntentLocked(
-          owner.apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.fence_release_intent;
       existing.has_value()) {
     if (existing->fence_release_intent != fence_release_intent ||
         existing->fence_release_intent_digest.value() != encoded.digest) {
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different fence-release intent");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count =
-      ScalarInteger(impl_->database_,
-                    "SELECT COUNT(*) FROM manager_apply_fence_release_intents");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyFenceReleaseIntents)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.fence_release_intent.has_value();
+      }) >= kMaximumManagerApplyFenceReleaseIntents) {
     throw ManagerApplyJournalLimitError(
         "fence-release intent inventory reached its fixed limit");
   }
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_fence_release_intents ("
-                   "apply_id,apply_generation,scene_completion_digest,"
-                   "fence_acceptance_digest,release_request_encoding,"
-                   "fence_release_intent_digest) VALUES (?,?,?,?,?,?)");
-  insert.Bind(1, owner.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, fence_release_intent.scene_completion_digest.value());
-  insert.Bind(4, fence_release_intent.fence_acceptance_digest.value());
-  insert.Bind(5, encoded.release_request);
-  insert.Bind(6, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->FenceReleaseIntentLocked(owner.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->fence_release_intent != fence_release_intent ||
-      stored->fence_release_intent_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted fence-release intent cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+  SqlWrite insert{"INSERT INTO manager_apply_fence_release_intents ("
+                  "apply_id,apply_generation,scene_completion_digest,"
+                  "fence_acceptance_digest,release_request_encoding,"
+                  "fence_release_intent_digest) VALUES (?,?,?,?,?,?)",
+                  {
+                      SqlInteger(owner.apply_id),
+                      SqlInteger(encoded.apply_generation),
+                      SqlText(fence_release_intent.scene_completion_digest.value()),
+                      SqlText(fence_release_intent.fence_acceptance_digest.value()),
+                      SqlText(encoded.release_request),
+                      SqlText(encoded.digest),
+                  },
+                  std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_fence_release_intents"));
+  const PersistedManagerApplyFenceReleaseIntent record{
+      fence_release_intent, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.fence_release_intent = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyFenceReleaseIntent>
 SqliteManagerApplyJournal::ReadFenceReleaseIntent(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->FenceReleaseIntentLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.fence_release_intent;
 }
 
 ManagerApplyFenceReleasedWriteResult
@@ -5935,12 +6269,11 @@ SqliteManagerApplyJournal::EnsureFenceReleased(
                           .reconciliation_evidence.owner_transaction;
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto intent =
-      impl_->FenceReleaseIntentLocked(owner.apply_id, encoded.apply_generation);
-  if (!intent.has_value() ||
+  auto *held = impl_->HeldLocked(owner.apply_id, encoded.apply_generation);
+  const auto *intent = held != nullptr && held->status.fence_release_intent
+                           ? &*held->status.fence_release_intent
+                           : nullptr;
+  if (intent == nullptr ||
       intent->fence_release_intent_digest !=
           fence_released.fence_release_intent_digest ||
       intent->fence_release_intent.release_request !=
@@ -5948,61 +6281,59 @@ SqliteManagerApplyJournal::EnsureFenceReleased(
     throw ManagerApplyJournalConflictError(
         "fence release receipt does not match its exact durable intent");
   }
-  if (const auto existing =
-          impl_->FenceReleasedLocked(owner.apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.fence_released;
       existing.has_value()) {
     if (existing->fence_released != fence_released ||
         existing->fence_released_digest.value() != encoded.digest) {
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different fence release receipt");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_fence_released_records");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyFenceReleasedRecords)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.fence_released.has_value();
+      }) >= kMaximumManagerApplyFenceReleasedRecords) {
     throw ManagerApplyJournalLimitError(
         "fence-released inventory reached its fixed limit");
   }
-  Statement insert(
-      impl_->database_,
+  SqlWrite insert{
       "INSERT INTO manager_apply_fence_released_records ("
       "apply_id,apply_generation,fence_release_intent_digest,"
-      "released_fence_encoding,fence_released_digest) VALUES (?,?,?,?,?)");
-  insert.Bind(1, owner.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, fence_released.fence_release_intent_digest.value());
-  insert.Bind(4, encoded.released_fence);
-  insert.Bind(5, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->FenceReleasedLocked(owner.apply_id, encoded.apply_generation);
-  if (!stored.has_value() || stored->fence_released != fence_released ||
-      stored->fence_released_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted fence release receipt cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+      "released_fence_encoding,fence_released_digest) VALUES (?,?,?,?,?)",
+      {
+          SqlInteger(owner.apply_id),
+          SqlInteger(encoded.apply_generation),
+          SqlText(fence_released.fence_release_intent_digest.value()),
+          SqlText(encoded.released_fence),
+          SqlText(encoded.digest),
+      },
+      std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_fence_released_records"));
+  const PersistedManagerApplyFenceReleased record{
+      fence_released, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.fence_released = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyFenceReleased>
 SqliteManagerApplyJournal::ReadFenceReleased(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->FenceReleasedLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.fence_released;
 }
 
 ManagerApplyTerminalOutcomeWriteResult
@@ -6011,16 +6342,17 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   const auto encoded = EncodeTerminalOutcome(terminal_outcome);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  auto *held =
+      impl_->HeldLocked(terminal_outcome.apply_id, encoded.apply_generation);
   const bool succeeded =
       terminal_outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded;
   if (succeeded) {
-    const auto released = impl_->FenceReleasedLocked(terminal_outcome.apply_id,
-                                                     encoded.apply_generation);
-    const auto publication = impl_->PublicationReceiptLocked(
-        terminal_outcome.apply_id, encoded.apply_generation);
+    const std::optional<PersistedManagerApplyFenceReleased> no_released;
+    const std::optional<PersistedManagerApplyPublicationReceipt> no_publication;
+    const auto &released =
+        held == nullptr ? no_released : held->status.fence_released;
+    const auto &publication =
+        held == nullptr ? no_publication : held->status.publication_receipt;
     if (!released.has_value() ||
         released->fence_released_digest !=
             terminal_outcome.fence_released_digest ||
@@ -6038,34 +6370,56 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   } else {
     // A destructive failure is retained against the exact accepted intent and
     // is never repaired, retried, rolled back or repaired from current state.
-    const auto intent = impl_->IntentLocked(terminal_outcome.apply_id,
-                                            encoded.apply_generation);
-    if (!intent.has_value() ||
-        intent->intent_digest != terminal_outcome.failure->intent_digest) {
+    if (held == nullptr ||
+        held->status.intent.intent_digest !=
+            terminal_outcome.failure->intent_digest) {
       throw ManagerApplyJournalConflictError(
           "terminal Apply failure does not match its exact durable intent");
     }
   }
-  if (const auto existing = impl_->TerminalOutcomeLocked(
-          terminal_outcome.apply_id, encoded.apply_generation);
+  if (const auto &existing = held->status.terminal_outcome;
       existing.has_value()) {
     if (existing->terminal_outcome != terminal_outcome ||
         existing->terminal_outcome_digest.value() != encoded.digest) {
       throw ManagerApplyJournalConflictError(
           "Apply generation already has a different terminal outcome");
     }
-    transaction.Commit();
     return {*existing, false};
   }
-  const auto count = ScalarInteger(
-      impl_->database_, "SELECT COUNT(*) FROM manager_apply_terminal_outcomes");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes)) {
+  if (impl_->CountLocked([](const auto &other) {
+        return other.status.terminal_outcome.has_value();
+      }) >= kMaximumManagerApplyTerminalOutcomes) {
     throw ManagerApplyJournalLimitError(
         "terminal Apply outcome inventory reached its fixed limit");
   }
-  Statement insert(
-      impl_->database_,
+  std::vector<SqlValue> values(21U, SqlNull());
+  values[0] = SqlInteger(terminal_outcome.apply_id);
+  values[1] = SqlInteger(encoded.apply_generation);
+  if (succeeded) {
+    const auto &candidate = *terminal_outcome.candidate_projection_revision;
+    values[2] = SqlText(terminal_outcome.fence_released_digest->value());
+    values[3] = SqlText(terminal_outcome.scene_completion_digest->value());
+    values[4] = SqlText(terminal_outcome.publication_receipt_digest->value());
+    values[5] = SqlText(candidate.retained_bundle_id.value());
+    values[6] = SqlText(candidate.graph_revision.value());
+    values[7] = SqlText(candidate.scene_revision.scene_id.value());
+    values[8] = SqlInteger(*encoded.candidate_scene_revision_id);
+    values[9] = SqlText(candidate.scene_revision.content_hash.value());
+  } else {
+    const auto &failure = *terminal_outcome.failure;
+    values[10] = SqlText(failure.intent_digest.value());
+    values[11] = SqlText(ToString(failure.phase));
+    values[12] = SqlText(failure.failure_code);
+    values[13] = SqlText(failure.failure_message);
+    values[14] = SqlText(ToString(failure.effect_disposition));
+    values[17] = SqlText(failure.cause_code);
+    values[18] = SqlText(EncodeCauseDetails(failure.cause_details));
+    values[19] = SqlText(failure.producer);
+    values[20] = SqlText(ToString(failure.effect_boundary));
+  }
+  values[15] = SqlText(encoded.state);
+  values[16] = SqlText(encoded.digest);
+  SqlWrite insert{
       "INSERT INTO manager_apply_terminal_outcomes ("
       "apply_id,apply_generation,fence_released_digest,"
       "scene_completion_digest,publication_receipt_digest,"
@@ -6075,792 +6429,190 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
       "failure_message,effect_disposition,"
       "outcome_state,terminal_outcome_digest,cause_code,cause_details,"
       "producer,effect_boundary) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, terminal_outcome.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  if (succeeded) {
-    const auto &candidate = *terminal_outcome.candidate_projection_revision;
-    insert.Bind(3, terminal_outcome.fence_released_digest->value());
-    insert.Bind(4, terminal_outcome.scene_completion_digest->value());
-    insert.Bind(5, terminal_outcome.publication_receipt_digest->value());
-    insert.Bind(6, candidate.retained_bundle_id.value());
-    insert.Bind(7, candidate.graph_revision.value());
-    insert.Bind(8, candidate.scene_revision.scene_id.value());
-    insert.Bind(9, *encoded.candidate_scene_revision_id);
-    insert.Bind(10, candidate.scene_revision.content_hash.value());
-    insert.BindNull(11);
-    insert.BindNull(12);
-    insert.BindNull(13);
-    insert.BindNull(14);
-    insert.BindNull(15);
-    insert.BindNull(18);
-    insert.BindNull(19);
-    insert.BindNull(20);
-    insert.BindNull(21);
-  } else {
-    const auto &failure = *terminal_outcome.failure;
-    insert.BindNull(3);
-    insert.BindNull(4);
-    insert.BindNull(5);
-    insert.BindNull(6);
-    insert.BindNull(7);
-    insert.BindNull(8);
-    insert.BindNull(9);
-    insert.BindNull(10);
-    insert.Bind(11, failure.intent_digest.value());
-    insert.Bind(12, ToString(failure.phase));
-    insert.Bind(13, failure.failure_code);
-    insert.Bind(14, failure.failure_message);
-    insert.Bind(15, ToString(failure.effect_disposition));
-    insert.Bind(18, failure.cause_code);
-    insert.Bind(19, EncodeCauseDetails(failure.cause_details));
-    insert.Bind(20, failure.producer);
-    insert.Bind(21, ToString(failure.effect_boundary));
-  }
-  insert.Bind(16, encoded.state);
-  insert.Bind(17, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->TerminalOutcomeLocked(terminal_outcome.apply_id,
-                                                   encoded.apply_generation);
-  if (!stored.has_value() || stored->terminal_outcome != terminal_outcome ||
-      stored->terminal_outcome_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted terminal Apply outcome cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*stored, true};
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      std::move(values), std::nullopt};
+  ThrowIfValueTooBig(insert.values);
+  const auto file_bytes = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(insert.values), UniqueIndexes("manager_apply_terminal_outcomes"));
+  const PersistedManagerApplyTerminalOutcome record{
+      terminal_outcome, ContentDigest(encoded.digest)};
+  auto room = impl_->MakeRoomLocked(
+      file_bytes, static_cast<std::uint64_t>(insert.values[0].integer));
+  held->status.terminal_outcome = record;
+  impl_->AcceptRowLocked(*held, 0U, file_bytes, std::move(room),
+                         std::move(insert));
+  return {record, true};
 }
 
 std::optional<PersistedManagerApplyTerminalOutcome>
 SqliteManagerApplyJournal::ReadTerminalOutcome(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation =
       CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->TerminalOutcomeLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  const auto *held = impl_->HeldLocked(apply_id, generation);
+  if (held == nullptr) {
+    return std::nullopt;
+  }
+  return held->status.terminal_outcome;
 }
 
 void SqliteManagerApplyJournal::BeginFailedApplyRelease(
     const ApplyId &apply_id, const ApplyGeneration apply_generation,
-    const RequestId &acknowledgement_request_id,
+    const RequestKey &acknowledgement_request_key,
     const std::string &acknowledgement_source_label,
-    const ConfigurationFenceReleaseDTO &request) {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  ValidateBoundedIdentity(acknowledgement_request_id.value(), "request_id");
+    const std::optional<ConfigurationFenceReleaseDTO> &request, const bool for_new) {
+  ValidateBoundedIdentity(apply_id, "apply_id");
   ValidateBoundedText(acknowledgement_source_label, kMaximumManagerApplySourceLabelBytes,
                       "source_label");
   const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
-  const auto encoded = EncodeFenceReleaseRequest(request);
+  const auto encoded = request ? std::optional(EncodeFenceReleaseRequest(*request)) : std::nullopt;
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto status = impl_->StatusLocked(apply_id, generation);
-  if (!status || !HasFailedApplyReleaseEvidence(*status) ||
-      impl_->FailedApplyReleaseLocked(apply_id, generation))
+  auto *held = impl_->HeldLocked(apply_id, generation);
+  const auto existing = impl_->HeldFailedReleaseLocked(apply_id, generation);
+  // New begins an incomplete attempt (its own or an acknowledgement's) again.
+  const bool again = for_new && existing && !existing->released && !existing->acknowledged;
+  if (held == nullptr ||
+      !(for_new ? IsFailedTerminal(held->status) : HasFailedApplyReleaseEvidence(held->status)) ||
+      (existing && !again))
     throw ManagerApplyJournalConflictError("failed Apply cannot start another release attempt");
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_failed_release "
-                   "(apply_id,apply_generation,terminal_outcome_digest,fence_acceptance_digest,"
-                   "acknowledgement_request_id,acknowledgement_source_label,"
-                   "release_request_encoding,released_fence_encoding) VALUES (?,?,?,?,?,?,?,NULL)");
-  insert.Bind(1, apply_id.value());
-  insert.Bind(2, generation);
-  insert.Bind(3, status->terminal_outcome->terminal_outcome_digest.value());
-  insert.Bind(4, status->fence_acceptance->acceptance_digest.value());
-  insert.Bind(5, acknowledgement_request_id.value());
-  insert.Bind(6, acknowledgement_source_label);
-  insert.Bind(7, encoded);
-  static_cast<void>(insert.Step());
-  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
+  const auto &status = held->status;
+  const auto terminal_digest =
+      again ? existing->terminal_outcome_digest : status.terminal_outcome->terminal_outcome_digest;
+  const auto acceptance_digest =
+      again ? existing->fence_acceptance_digest
+            : (status.fence_acceptance ? std::optional(status.fence_acceptance->acceptance_digest)
+                                       : std::nullopt);
+  SqlWrite write{again ? "UPDATE manager_apply_failed_release SET "
+                         "acknowledgement_request_key=?3,acknowledgement_source_label=?4,"
+                         "release_request_encoding=?5 WHERE apply_id=?1 AND apply_generation=?2 "
+                         "AND released_fence_encoding IS NULL AND acknowledged=0"
+                       : "INSERT INTO manager_apply_failed_release "
+                         "(apply_id,apply_generation,acknowledgement_request_key,"
+                         "acknowledgement_source_label,release_request_encoding,"
+                         "terminal_outcome_digest,fence_acceptance_digest,released_fence_encoding) "
+                         "VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)",
+                 {
+                     SqlInteger(apply_id),
+                     SqlInteger(generation),
+                     SqlBlob(KeyBytes(acknowledgement_request_key)),
+                     SqlText(acknowledgement_source_label),
+                     encoded ? SqlText(*encoded) : SqlNull(),
+                 },
+                 again ? std::optional(1) : std::nullopt};
+  if (!again) {
+    write.values.push_back(SqlText(terminal_digest.value()));
+    write.values.push_back(acceptance_digest ? SqlText(acceptance_digest->value()) : SqlNull());
+  }
+  ThrowIfValueTooBig(write.values);
+  // The row as read back afterwards: its request decoded from the encoding.
+  const PersistedFailedApplyRelease next{
+      terminal_digest,
+      acceptance_digest,
+      acknowledgement_request_key,
+      acknowledgement_source_label,
+      encoded ? std::optional(DecodeFenceReleaseRequest(*encoded)) : std::nullopt,
+      std::nullopt,
+      false};
+  const auto after = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(Impl::FailedReleaseColumns({apply_id.value(), generation}, next,
+                                                     encoded, std::nullopt)),
+      UniqueIndexes("manager_apply_failed_release"));
+  impl_->CheckFailedReleaseLocked(apply_id, generation, next);
+  const auto before =
+      existing ? impl_->FailedReleaseFileBytesLocked(apply_id.value(), generation, *held) : 0U;
+  auto room = impl_->MakeRoomLocked(after > before ? after - before : 0U, apply_id.value());
+  held->failed_release = next;
+  held->release_request_encoding = encoded;
+  held->released_fence_encoding.reset();
+  impl_->AcceptRowLocked(*held, before, after, std::move(room), std::move(write));
 }
 
 void SqliteManagerApplyJournal::CompleteFailedApplyRelease(
     const ApplyId &apply_id, const ApplyGeneration apply_generation,
     const ConfigurationFenceReleasedDTO &released) {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
   const auto encoded = EncodeFenceReleased(released);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto existing = impl_->FailedApplyReleaseLocked(apply_id, generation);
+  const auto existing = impl_->HeldFailedReleaseLocked(apply_id, generation);
   if (!existing || existing->request != released.request)
     throw ManagerApplyJournalConflictError("failed Apply release receipt does not match its attempt");
   if (existing->released) {
     if (*existing->released != released)
       throw ManagerApplyJournalConflictError("failed Apply release already has another receipt");
-    transaction.Commit();
     return;
   }
-  Statement update(impl_->database_,
-                   "UPDATE manager_apply_failed_release SET released_fence_encoding=? "
-                   "WHERE apply_id=? AND apply_generation=? AND released_fence_encoding IS NULL");
-  update.Bind(1, encoded);
-  update.Bind(2, apply_id.value());
-  update.Bind(3, generation);
-  static_cast<void>(update.Step());
-  if (sqlite3_changes(impl_->database_) != 1)
-    throw ManagerApplyJournalConflictError("failed Apply release completion changed concurrently");
-  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
+  auto *held = impl_->HeldLocked(apply_id, generation);
+  SqlWrite write{"UPDATE manager_apply_failed_release SET released_fence_encoding=? "
+                 "WHERE apply_id=? AND apply_generation=? AND released_fence_encoding IS NULL",
+                 {SqlText(encoded), SqlInteger(apply_id), SqlInteger(generation)},
+                 1};
+  ThrowIfValueTooBig(write.values);
+  auto next = *existing;
+  next.released = DecodeFenceReleased(encoded);
+  const auto after = impl_->RowFileBytesLocked(
+      ThrowIfRecordTooBig(Impl::FailedReleaseColumns({apply_id.value(), generation}, next,
+                                                     held->release_request_encoding, encoded)),
+      UniqueIndexes("manager_apply_failed_release"));
+  impl_->CheckFailedReleaseLocked(apply_id, generation, next);
+  const auto before = impl_->FailedReleaseFileBytesLocked(apply_id.value(), generation, *held);
+  auto room = impl_->MakeRoomLocked(after > before ? after - before : 0U, apply_id.value());
+  held->failed_release = std::move(next);
+  held->released_fence_encoding = encoded;
+  impl_->AcceptRowLocked(*held, before, after, std::move(room), std::move(write));
 }
 
 void SqliteManagerApplyJournal::CompleteFailedApplyAcknowledgement(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto existing = impl_->FailedApplyReleaseLocked(apply_id, generation);
-  if (!existing || !existing->released)
+  const auto existing = impl_->HeldFailedReleaseLocked(apply_id, generation);
+  // An attempt that found no held fence has no fence release to complete.
+  if (!existing || (existing->request && !existing->released))
     throw ManagerApplyJournalConflictError("failed Apply has no completed fence release");
   if (existing->acknowledged) {
-    transaction.Commit();
     return;
   }
-  Statement update(impl_->database_,
-                   "UPDATE manager_apply_failed_release SET acknowledged=1 "
-                   "WHERE apply_id=? AND apply_generation=? AND acknowledged=0 "
-                   "AND released_fence_encoding IS NOT NULL");
-  update.Bind(1, apply_id.value());
-  update.Bind(2, generation);
-  static_cast<void>(update.Step());
-  if (sqlite3_changes(impl_->database_) != 1)
-    throw ManagerApplyJournalConflictError("failed Apply acknowledgement changed concurrently");
-  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
+  auto *held = impl_->HeldLocked(apply_id, generation);
+  SqlWrite write{"UPDATE manager_apply_failed_release SET acknowledged=1 "
+                 "WHERE apply_id=? AND apply_generation=? AND acknowledged=0 "
+                 "AND (released_fence_encoding IS NOT NULL OR release_request_encoding IS NULL)",
+                 {SqlInteger(apply_id), SqlInteger(generation)},
+                 1};
+  auto next = *existing;
+  next.acknowledged = true;
+  ThrowIfRecordTooBig(Impl::FailedReleaseColumns({apply_id.value(), generation}, next,
+                                                 held->release_request_encoding,
+                                                 held->released_fence_encoding));
+  impl_->CheckFailedReleaseLocked(apply_id, generation, next);
+  held->failed_release = std::move(next);
+  impl_->PostLocked(std::move(write));
 }
 
 std::optional<PersistedFailedApplyRelease>
 SqliteManagerApplyJournal::ReadFailedApplyRelease(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(apply_id, "apply_id");
   const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->FailedApplyReleaseLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
+  return impl_->HeldFailedReleaseLocked(apply_id, generation);
 }
 
 ManagerApplyJournalIntegrityReport
 SqliteManagerApplyJournal::VerifyIntegrity() const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto report = impl_->VerifyIntegrityLocked();
-  transaction.Commit();
-  return report;
+  return impl_->HeldIntegrityReportLocked();
 }
 
 void SqliteManagerApplyJournal::Close() { impl_->Close(); }
-
-namespace {
-
-core::Result<void> WithReadOnlyApplySnapshot(const std::filesystem::path &path,
-                                             const core::CellId &cell_id,
-                                             auto &&inspect) {
-  sqlite3 *database = nullptr;
-  try {
-    PreflightApplyJournal(path, cell_id);
-    const auto opened = sqlite3_open_v2(
-        path.string().c_str(), &database,
-        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-        nullptr);
-    Check(database, opened, "open read-only configuration Apply proof");
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only configuration Apply timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, path);
-      inspect(database);
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    return core::Result<void>::Ok();
-  } catch (const std::exception &error) {
-    if (database)
-      sqlite3_close(database);
-    return core::Result<void>::Err(core::ErrorDTO{
-        "configuration_apply_proof_unavailable",
-        "exact Manager Apply proof is unavailable",
-        {{"reason", std::string(error.what()).substr(0U, 512U)}}});
-  }
-}
-
-void RequireExactManagerApplyClaim(const core::CellAdmissionClaimDTO &claim,
-                                   const PersistedManagerApplyStatus &status) {
-  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
-      !claim.claim_generation.nonzero() || claim.accepted_at_ns < 0 ||
-      !status.intent.intent.expected_admission_generation ||
-      status.intent.intent.parent_authoring_claim) {
-    throw ManagerApplyJournalIntegrityError(
-        "configuration_apply_claim_invalid");
-  }
-  const core::CellAdmissionClaimIntentDTO expected{
-      core::CellAdmissionClaimKindDTO::kManagerApply,
-      core::CellAdmissionOwnerRoleDTO::kManager,
-      status.intent.intent.request_context.request_owner_epoch,
-      status.intent.intent.apply_id.value(),
-      status.intent.intent.request_context.request_id,
-      status.intent.intent_digest,
-      *status.intent.intent.expected_admission_generation,
-      {},
-      std::nullopt,
-      std::nullopt,
-      std::nullopt};
-  if (claim.intent != expected)
-    throw ManagerApplyJournalIntegrityError(
-        "configuration_apply_claim_identity_mismatch");
-}
-
-} // namespace
-
-core::Result<void> ValidateTerminalManagerApplyClaimsReadOnly(
-    const std::filesystem::path &database_path, const core::CellId &cell_id,
-    const std::span<const core::CellAdmissionClaimDTO> old_claims) {
-  if (old_claims.size() > core::kMaximumCellAdmissionClaims ||
-      !std::is_sorted(old_claims.begin(), old_claims.end(),
-                      [](const auto &a, const auto &b) {
-                        return a.claim_generation < b.claim_generation;
-                      }) ||
-      std::adjacent_find(old_claims.begin(), old_claims.end(),
-                         [](const auto &a, const auto &b) {
-                           return a.claim_generation == b.claim_generation;
-                         }) != old_claims.end()) {
-    return core::Result<void>::Err(
-        core::ErrorDTO{"invalid_request",
-                       "old Apply claim inventory is not bounded and canonical",
-                       {}});
-  }
-  return WithReadOnlyApplySnapshot(
-      database_path, cell_id, [&](sqlite3 *database) {
-        SqliteManagerApplyJournal::Impl view(database, cell_id);
-        for (const auto &claim : old_claims) {
-          const auto intent = view.RequestLocked(claim.intent.owner_epoch,
-                                                 claim.intent.request_id);
-          if (!intent)
-            throw ManagerApplyJournalIntegrityError(
-                "configuration_apply_original_intent_missing");
-          const auto status = view.StatusWithFailedReleaseLocked(
-              intent->intent.apply_id,
-              CheckedSigned(intent->intent.apply_generation.value(),
-                            "apply_generation"));
-          if (!status)
-            throw ManagerApplyJournalIntegrityError(
-                "configuration_apply_original_status_missing");
-          RequireExactManagerApplyClaim(claim, *status);
-          if (!status->terminal_outcome)
-            throw ManagerApplyJournalIntegrityError(
-                "configuration_apply_holder_live");
-          if (status->terminal_outcome->terminal_outcome.succeeded())
-            throw ManagerApplyJournalIntegrityError(
-                "configuration_apply_holder_requires_success_accounting");
-        }
-      });
-}
-
-core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
-    const std::filesystem::path &database_path, const core::CellId &cell_id,
-    const core::CellAdmissionClaimDTO &fresh_claim,
-    const core::CellAdmissionClaimReleaseDTO &release) {
-  if (!core::ValidateCellAdmissionClaimRelease(release).ok() ||
-      release !=
-          core::CellAdmissionClaimReleaseDTO{
-              fresh_claim.intent.owner_role, fresh_claim.intent.owner_epoch,
-              fresh_claim.intent.owner_transaction_id,
-              fresh_claim.intent.request_id,
-              fresh_claim.intent.request_payload_digest,
-              fresh_claim.acquired_admission_generation,
-              fresh_claim.claim_generation, release.settlement} ||
-      release.settlement.settlement_kind !=
-          core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        "invalid_request", "fresh Apply success release identity differs", {}});
-  }
-  return WithReadOnlyApplySnapshot(
-      database_path, cell_id, [&](sqlite3 *database) {
-        SqliteManagerApplyJournal::Impl view(database, cell_id);
-        const auto intent = view.RequestLocked(fresh_claim.intent.owner_epoch,
-                                               fresh_claim.intent.request_id);
-        if (!intent)
-          throw ManagerApplyJournalIntegrityError(
-              "fresh_apply_original_intent_missing");
-        const auto status = view.StatusWithFailedReleaseLocked(
-            intent->intent.apply_id,
-            CheckedSigned(intent->intent.apply_generation.value(),
-                          "apply_generation"));
-        if (!status)
-          throw ManagerApplyJournalIntegrityError(
-              "fresh_apply_original_status_missing");
-        RequireExactManagerApplyClaim(fresh_claim, *status);
-        if (!status->terminal_outcome ||
-            !status->terminal_outcome->terminal_outcome.succeeded() ||
-            status->terminal_outcome->terminal_outcome_digest !=
-                release.settlement.evidence_digest) {
-          throw ManagerApplyJournalIntegrityError(
-              "fresh_apply_success_terminal_not_exact");
-        }
-      });
-}
-
-core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path, const core::CellId &cell_id,
-    const core::CellAdmissionClaimDTO &claim,
-    const core::CellAdmissionClaimReleaseDTO &release) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        "invariant_violation",
-        "Manager Apply cell-admission settlement is not owner-proven",
-        {{"reason", std::move(reason)}}});
-  };
-  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
-      claim.intent.claim_kind != core::CellAdmissionClaimKindDTO::kManagerApply ||
-      claim.intent.owner_role != core::CellAdmissionOwnerRoleDTO::kManager ||
-      release.owner_role != claim.intent.owner_role ||
-      release.owner_epoch != claim.intent.owner_epoch ||
-      release.owner_transaction_id != claim.intent.owner_transaction_id ||
-      release.request_id != claim.intent.request_id ||
-      release.request_payload_digest != claim.intent.request_payload_digest ||
-      release.acquired_admission_generation !=
-          claim.acquired_admission_generation ||
-      release.claim_generation != claim.claim_generation ||
-      release.settlement.settlement_kind !=
-          core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
-    return rejected("manager_apply_release_identity_mismatch");
-  }
-
-  sqlite3 *database = nullptr;
-  const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
-                    SQLITE_OPEN_NOFOLLOW;
-  const auto opened = sqlite3_open_v2(database_path.string().c_str(), &database,
-                                      flags, nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr) {
-      sqlite3_close(database);
-    }
-    return rejected("manager_apply_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only settlement timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<std::string> digest;
-    bool duplicate = false;
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      Statement row(
-          database,
-          "SELECT t.terminal_outcome_digest,i.apply_generation,t.outcome_state,"
-          "t.failure_phase FROM manager_apply_intents i "
-          "JOIN manager_apply_terminal_outcomes t "
-          "ON t.apply_id=i.apply_id AND "
-          "t.apply_generation=i.apply_generation "
-          // A completed release (no-effect acknowledgement, or New for any
-          // failure) also settles a held failed Apply. Its recorded
-          // request and receipt are verified below, not by this existence
-          // check alone.
-          "AND (t.outcome_state='succeeded' OR "
-          "(t.outcome_state='failed' AND t.effect_disposition='known' "
-          "AND t.failure_phase='accepted') OR "
-          "(t.outcome_state<>'succeeded' AND EXISTS "
-          "(SELECT 1 FROM manager_apply_failed_release f "
-          "WHERE f.apply_id=t.apply_id AND f.apply_generation=t.apply_generation "
-          "AND f.released_fence_encoding IS NOT NULL))) "
-          "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
-          "AND i.intent_digest=? AND i.expected_admission_generation=? "
-          "AND i.parent_authoring_claim IS NULL");
-      row.Bind(1, claim.intent.owner_transaction_id);
-      row.Bind(2, claim.intent.owner_epoch.value());
-      row.Bind(3, claim.intent.request_id.value());
-      row.Bind(4, claim.intent.request_payload_digest.value());
-      row.Bind(5, CheckedSigned(claim.intent.expected_admission_generation.value(),
-                                "expected_admission_generation"));
-      const bool found = row.Step();
-      digest = found ? std::optional<std::string>(row.Text(0)) : std::nullopt;
-      if (found && row.Text(2) != "succeeded" &&
-          !(row.Text(2) == "failed" && row.Text(3) == "accepted")) {
-        const auto acknowledged = view.FailedApplyReleaseLocked(
-            ApplyId(claim.intent.owner_transaction_id), row.Integer(1));
-        if (!acknowledged || !acknowledged->released ||
-            acknowledged->terminal_outcome_digest.value() != *digest)
-          throw ManagerApplyJournalIntegrityError(
-              "failed Apply has no completed release");
-      }
-      duplicate = found && row.Step();
-      snapshot.Commit();
-    }
-    const auto close_result = sqlite3_close(database);
-    if (close_result != SQLITE_OK)
-      ThrowSqlite(database, close_result, "close read-only settlement database");
-    database = nullptr;
-    if (!digest.has_value() || duplicate ||
-        *digest != release.settlement.evidence_digest.value()) {
-      return rejected("manager_apply_terminal_evidence_mismatch");
-    }
-    return core::Result<void>::Ok();
-  } catch (const std::exception &) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("manager_apply_journal_read_failed");
-  }
-}
-
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnlyForTesting(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NamedApplyPublicationTransactionDTO &apply,
-    std::uint64_t *lookup_count) {
-  using Reply = core::Result<PersistedManagerApplyStatus>;
-  const auto rejected = [] {
-    return Reply::Err({"manager_apply_read_unavailable",
-                       "The exact retained Apply cannot be verified read-only",
-                       {{"reason", "manager_apply_read_invalid"}}});
-  };
-  if (!apply.valid())
-    return rejected();
-  sqlite3 *raw = nullptr;
-  try {
-    PreflightApplyJournal(database_path, cell_id);
-    if (sqlite3_open_v2(database_path.string().c_str(), &raw,
-                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
-                            SQLITE_OPEN_NOFOLLOW,
-                        nullptr) != SQLITE_OK) {
-      if (raw)
-        sqlite3_close(raw);
-      raw = nullptr;
-      return rejected();
-    }
-    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
-                                                                sqlite3_close);
-    raw = nullptr;
-    Check(database.get(),
-          sqlite3_busy_timeout(database.get(), kBusyTimeoutMilliseconds),
-          "configure read-only Apply timeout");
-    Exec(database.get(), "PRAGMA query_only=ON");
-    Transaction snapshot(database.get(), "BEGIN");
-    ValidateApplyJournalIdentityAndSchema(database.get(), cell_id,
-                                          database_path);
-    SqliteManagerApplyJournal::Impl view(database.get(), cell_id);
-    auto status = view.StatusWithFailedReleaseLocked(
-        apply.apply_id,
-        CheckedSigned(apply.apply_generation.value(), "apply_generation"));
-    if (!status)
-      return rejected();
-    snapshot.Commit();
-    if (lookup_count != nullptr)
-      *lookup_count = view.record_verifications_;
-    return Reply::Ok(std::move(*status));
-  } catch (const std::exception &) {
-    if (raw)
-      sqlite3_close(raw);
-    return rejected();
-  }
-}
-
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NamedApplyPublicationTransactionDTO &apply) {
-  return ReadManagerApplyStatusReadOnlyForTesting(database_path, cell_id,
-                                                   apply, nullptr);
-}
-
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusByClaimIntentReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::CellAdmissionClaimIntentDTO &parent_claim_intent) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<PersistedManagerApplyStatus>::Err(core::ErrorDTO{
-        "manager_apply_configuration_read_unavailable",
-        "the exact retained configuration Apply parent cannot be observed",
-        {{"reason", std::move(reason)}}});
-  };
-  if (!core::ValidateCellAdmissionClaimIntent(parent_claim_intent).ok() ||
-      parent_claim_intent.claim_kind != core::CellAdmissionClaimKindDTO::kManagerApply ||
-      parent_claim_intent.owner_role != core::CellAdmissionOwnerRoleDTO::kManager)
-    return rejected("parent_claim_intent_invalid");
-  try {
-    PreflightApplyJournal(database_path, cell_id);
-  } catch (const std::exception &) {
-    return rejected("parent_journal_preflight_failed");
-  }
-  sqlite3 *database = nullptr;
-  const auto opened = sqlite3_open_v2(
-      database_path.string().c_str(), &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-      nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only parent timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<PersistedManagerApplyStatus> result;
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      const auto intent = view.RequestLocked(parent_claim_intent.owner_epoch,
-                                             parent_claim_intent.request_id);
-      if (!intent ||
-          intent->intent.apply_id.value() != parent_claim_intent.owner_transaction_id ||
-          intent->intent.expected_admission_generation !=
-              std::optional(parent_claim_intent.expected_admission_generation) ||
-          intent->intent.parent_authoring_claim)
-        throw ManagerApplyJournalIntegrityError("retained parent claim intent mismatch");
-      result = view.StatusWithFailedReleaseLocked(intent->intent.apply_id,
-          CheckedSigned(intent->intent.apply_generation.value(), "apply_generation"));
-      if (!result)
-        throw ManagerApplyJournalIntegrityError("retained parent status missing");
-      const core::CellAdmissionClaimIntentDTO expected{
-          core::CellAdmissionClaimKindDTO::kManagerApply,
-          core::CellAdmissionOwnerRoleDTO::kManager,
-          intent->intent.request_context.request_owner_epoch,
-          intent->intent.apply_id.value(),
-          intent->intent.request_context.request_id,
-          result->intent.intent_digest,
-          *intent->intent.expected_admission_generation,
-          {}, std::nullopt, std::nullopt, std::nullopt};
-      if (parent_claim_intent != expected)
-        throw ManagerApplyJournalIntegrityError("retained original parent claim mismatch");
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    return core::Result<PersistedManagerApplyStatus>::Ok(std::move(*result));
-  } catch (const std::exception &) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_or_identity_invalid");
-  }
-}
-
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyConfigurationStatusReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NamedApplyPublicationTransactionDTO &apply,
-    const core::CellAdmissionClaimDTO &actual_parent_claim) {
-  using ReadResult = core::Result<PersistedManagerApplyStatus>;
-  const auto rejected = [](std::string reason, std::string detail = {}) {
-    auto error = core::ErrorDTO{
-        "manager_apply_configuration_read_unavailable",
-        "the exact retained configuration Apply parent cannot be observed",
-        {{"reason", std::move(reason)}}};
-    if (!detail.empty()) error.details.emplace("integrity_detail", std::move(detail));
-    return ReadResult::Err(std::move(error));
-  };
-  const core::CellAdmissionRecoveryReceiptQueryDTO claim_query{
-      actual_parent_claim.intent, actual_parent_claim, std::nullopt};
-  if (!apply.valid() || !core::ValidateCellAdmissionRecoveryReceiptQuery(claim_query).ok())
-    return rejected("configuration_parent_query_invalid");
-  try {
-    PreflightApplyJournal(database_path, cell_id);
-  } catch (const std::exception &) {
-    return rejected("parent_journal_preflight_failed");
-  }
-  sqlite3 *database = nullptr;
-  const auto opened = sqlite3_open_v2(
-      database_path.string().c_str(), &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only configuration parent timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<PersistedManagerApplyStatus> result;
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      result = view.StatusWithFailedReleaseLocked(apply.apply_id,
-          CheckedSigned(apply.apply_generation.value(), "apply_generation"));
-      if (!result)
-        throw ManagerApplyJournalIntegrityError("ordinary configuration parent missing");
-      if (result->intent.intent.cell_id != cell_id)
-        throw ManagerApplyJournalIntegrityError("configuration parent cell mismatch");
-      const auto &intent = result->intent.intent;
-      if (intent.parent_authoring_claim) {
-        if (intent.expected_admission_generation ||
-            actual_parent_claim.intent.claim_kind != core::CellAdmissionClaimKindDTO::kAuthoringMutation ||
-            actual_parent_claim.intent.owner_role != core::CellAdmissionOwnerRoleDTO::kAuthoringOwner ||
-            *intent.parent_authoring_claim != actual_parent_claim)
-          throw ManagerApplyJournalIntegrityError("configuration authoring parent claim mismatch");
-      } else {
-        if (!intent.expected_admission_generation)
-          throw ManagerApplyJournalIntegrityError("configuration direct admission generation missing");
-        const core::CellAdmissionClaimIntentDTO expected{
-            core::CellAdmissionClaimKindDTO::kManagerApply,
-            core::CellAdmissionOwnerRoleDTO::kManager,
-            intent.request_context.request_owner_epoch, intent.apply_id.value(),
-            intent.request_context.request_id, result->intent.intent_digest,
-            *intent.expected_admission_generation, {}, std::nullopt, std::nullopt, std::nullopt};
-        const auto requested = view.RequestLocked(expected.owner_epoch, expected.request_id);
-        if (actual_parent_claim.intent != expected || !requested || *requested != result->intent)
-          throw ManagerApplyJournalIntegrityError("configuration direct parent intent mismatch");
-      }
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    return ReadResult::Ok(std::move(*result));
-  } catch (const ManagerApplyJournalIntegrityError &error) {
-    if (database != nullptr) sqlite3_close(database);
-    // Only this reader's fixed diagnostic literals may cross the host wire.
-    // Legacy integrity exceptions can include source paths or nested errors.
-    const std::string_view detail(error.what());
-    if (detail == "ordinary configuration parent missing" ||
-        detail == "configuration parent cell mismatch" ||
-        detail == "configuration authoring parent claim mismatch" ||
-        detail == "configuration direct admission generation missing" ||
-        detail == "configuration direct parent intent mismatch") {
-      return rejected("parent_journal_or_identity_invalid", std::string(detail.substr(0, 160U)));
-    }
-    return rejected("parent_journal_or_identity_invalid");
-  } catch (const std::exception &) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_or_identity_invalid");
-  }
-}
-
-core::Result<core::CellAdmissionReconcileValidationDTO>
-ValidateManagerAuthoringOwnerReconciliationReadOnly(
-    const std::filesystem::path &database_path, const core::CellId &cell_id,
-    const std::vector<core::CellAdmissionClaimDTO> &held_claims,
-    const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>
-        &current_owner_epochs,
-    const core::CellAdmissionReconcileDTO &reconcile) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
-        core::ErrorDTO{
-            "invariant_violation",
-            "Composer authoring owner reconciliation is not proven",
-            {{"reason", std::move(reason)}}});
-  };
-  constexpr auto role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
-  if (held_claims != reconcile.retained_claims) {
-    return rejected("authoring_reconciliation_inventory_mismatch");
-  }
-  const auto predecessor = std::find_if(
-      current_owner_epochs.begin(), current_owner_epochs.end(),
-      [](const auto &owner) { return owner.owner_role == role; });
-  const auto successor = std::find_if(
-      reconcile.current_owner_epochs.begin(),
-      reconcile.current_owner_epochs.end(),
-      [](const auto &owner) { return owner.owner_role == role; });
-  if (successor == reconcile.current_owner_epochs.end() ||
-      successor->owner_epoch.empty() ||
-      (predecessor != current_owner_epochs.end() &&
-       predecessor->owner_epoch == successor->owner_epoch)) {
-    return rejected("authoring_reconciliation_successor_invalid");
-  }
-  for (const auto &owner : current_owner_epochs) {
-    if (owner.owner_role == role) {
-      continue;
-    }
-    if (std::find(reconcile.current_owner_epochs.begin(),
-                  reconcile.current_owner_epochs.end(), owner) ==
-        reconcile.current_owner_epochs.end()) {
-      return rejected("authoring_reconciliation_changes_unrelated_owner");
-    }
-  }
-  for (const auto &owner : reconcile.current_owner_epochs) {
-    if (owner.owner_role == role) {
-      continue;
-    }
-    if (std::find(current_owner_epochs.begin(), current_owner_epochs.end(),
-                  owner) == current_owner_epochs.end()) {
-      return rejected("authoring_reconciliation_changes_unrelated_owner");
-    }
-  }
-  const auto expected_evidence =
-      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
-          role, successor->owner_epoch);
-  if (!expected_evidence.ok() ||
-      reconcile.reconciliation_evidence_digest != expected_evidence.value()) {
-    return rejected("authoring_reconciliation_evidence_mismatch");
-  }
-
-  sqlite3 *database = nullptr;
-  const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
-                    SQLITE_OPEN_NOFOLLOW;
-  if (sqlite3_open_v2(database_path.string().c_str(), &database, flags,
-                      nullptr) != SQLITE_OK) {
-    if (database != nullptr) {
-      sqlite3_close(database);
-    }
-    return rejected("manager_apply_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure authoring reconciliation timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    Transaction snapshot(database, "BEGIN");
-    ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-    core::CellAdmissionReconcileValidationDTO validation{
-        reconcile.current_owner_epochs, {}};
-    for (const auto &claim : held_claims) {
-      if (claim.intent.owner_role != role ||
-          (predecessor != current_owner_epochs.end() &&
-           claim.intent.owner_epoch != predecessor->owner_epoch)) {
-        continue;
-      }
-      const auto encoded_claim = EncodeParentAuthoringClaim(claim);
-      Statement operation(
-          database,
-          "SELECT t.outcome_state,t.effect_disposition,t.failure_phase "
-          "FROM manager_apply_intents i "
-          "LEFT JOIN manager_apply_terminal_outcomes t "
-          "ON t.apply_id=i.apply_id AND "
-          "t.apply_generation=i.apply_generation "
-          "WHERE i.parent_authoring_claim=?");
-      operation.BindBlob(1, encoded_claim);
-      const bool transferred = operation.Step();
-      const bool terminal_known =
-          transferred && !operation.IsNull(0) &&
-          (operation.Text(0) == "succeeded" ||
-           (operation.Text(0) == "failed" && !operation.IsNull(1) &&
-            operation.Text(1) == "known" && !operation.IsNull(2) &&
-            operation.Text(2) == "accepted"));
-      const bool duplicate = transferred && operation.Step();
-      if (duplicate || (transferred && !terminal_known)) {
-        throw std::runtime_error(
-            "accepted Manager operation is not known terminal");
-      }
-      validation.settlements.push_back(
-          {claim, role, successor->owner_epoch,
-           core::CellAdmissionSettlementKindDTO::kReconciled,
-           reconcile.reconciliation_evidence_digest});
-    }
-    snapshot.Commit();
-    sqlite3_close(database);
-    return core::Result<core::CellAdmissionReconcileValidationDTO>::Ok(
-        std::move(validation));
-  } catch (const std::exception &) {
-    sqlite3_close(database);
-    return rejected("authoring_reconciliation_manager_evidence_invalid");
-  }
-}
 
 } // namespace manyforge::component_manager

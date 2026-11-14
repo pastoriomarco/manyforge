@@ -19,26 +19,18 @@ struct ManagerCellAdmissionReadinessFacts final {
   std::uint32_t unsettled_effect_count{};
 };
 
-[[nodiscard]] inline bool IsCurrentProgramRunnerOwner(
-    const manyforge::core::ProgramCycleStatusDTO &status,
-    const manyforge::core::RuntimeEpoch &runtime_epoch) {
-  return status.program_runner_owner_epoch.value() == runtime_epoch.value();
-}
-
 /// Attribute one failed contact to a previously qualified active cycle.
 /// Does not classify readiness, liveness expiry, or physical settlement.
 [[nodiscard]] inline std::optional<manyforge::core::ProgramRunnerContactLossDTO>
 MakeProgramRunnerContactLoss(
     const std::optional<manyforge::core::ProgramCycleStatusDTO>
         &established_cycle,
-    const manyforge::core::RequestOwnerEpoch &manager_owner_epoch,
-    const manyforge::core::RuntimeEpoch &manager_runtime_epoch,
     const std::string_view predicate, const std::string_view message) {
   if (!established_cycle)
     return std::nullopt;
   manyforge::core::ProgramRunnerContactLossDTO loss{
-      manager_owner_epoch, manager_runtime_epoch, *established_cycle,
-      std::string(predicate), std::string(message.substr(0U, 1024U))};
+      *established_cycle, std::string(predicate),
+      std::string(message.substr(0U, 1024U))};
   if (!manyforge::core::ValidateProgramRunnerContactLoss(loss).ok()) {
     loss.message = "Program Runner contact failed";
     if (!manyforge::core::ValidateProgramRunnerContactLoss(loss).ok())
@@ -81,8 +73,6 @@ ReduceManagerCellAdmissionReadiness(
   const auto &new_cycle = *after.program_cycle_status;
   if ((new_cycle.state != ProgramCycleStateDTO::kStarting &&
        new_cycle.state != ProgramCycleStateDTO::kRunning) ||
-      old_cycle.program_runner_owner_epoch !=
-          new_cycle.program_runner_owner_epoch ||
       old_cycle.cycle_generation != new_cycle.cycle_generation ||
       !new_cycle.program_run_id || old_cycle.terminal_or_settlement_reference ||
       new_cycle.terminal_or_settlement_reference) {

@@ -113,7 +113,7 @@ TEST(NodeEnvironmentProjection,
   const auto bytes = content_identity::canonical_json(available);
   EXPECT_NE(
       bytes.find(
-          "\"schema_version\":\"manyforge.node_environment_projection.v2\""),
+          "\"schema_version\":\"manyforge.node_environment_projection.v3\""),
       std::string::npos);
   EXPECT_NE(bytes.find("\"portable_authoring_available\":true"),
             std::string::npos);

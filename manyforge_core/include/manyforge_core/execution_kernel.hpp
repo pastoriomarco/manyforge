@@ -70,6 +70,9 @@ inline constexpr double kClearanceStartReleaseToleranceM = 0.0005;
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
 
+  // Names this robot in typed log lines (the component id); nothing else.
+  std::string log_label;
+
   // Lower-priority, bounded future-trajectory collision checking. This never
   // replaces or borrows from the reserved current-state monitor above.
   Duration runtime_collision_lookahead_cycle_budget_ns = 200'000'000;
@@ -224,6 +227,11 @@ struct ExecutionKernelPorts {
   std::shared_ptr<ICollisionTrajectoryProjector> collision_projector;
   std::shared_ptr<const ICollisionDiagnosticComparator> collision_diagnostic_comparator{};
   std::shared_ptr<IPlanningSceneSynchronizer> planning_scene_synchronizer{};
+  /// OD-217: the robot's own collision-check thread (its RuntimeSafety lane
+  /// runs only this engine's per-period check). The engine owns it, so the
+  /// thread ends with the engine. Empty: the engine's scheduler runs the
+  /// checks (fixtures).
+  std::shared_ptr<IScheduler> runtime_collision_check_scheduler{};
 };
 
 /// Per-participant motion execution: planning, validation, preview,
@@ -249,8 +257,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // Admission wait observes deadline; internal cooperative joins use the host watchdog.
   [[nodiscard]] Result<void> detach(std::chrono::steady_clock::time_point deadline);
 
-  AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+  AddressedParticipantStopFenceResult fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept override;
+  void complete_addressed_participant_stop_fence(std::uint64_t execution_id,
+                                                 std::uint8_t closed_gates) noexcept override;
 
   Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
       const AddressedParticipantStopSettlementRequestDTO& request) override;
@@ -270,7 +280,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                const PreparedMotionReplacementSourceDTO& source,
                                                PreparedMotionReplacementCommitDTO commit) override;
   Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
-                                          const StopCertificateDTO& certificate) override;
+                                          const ParticipantStopOutcomeDTO& incumbent) override;
 
   Result<std::uint64_t> PrepareCapabilityCommand(
       ResolvedPreparedCapabilityCommandExecutionRequestDTO request) override;
@@ -278,8 +288,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::uint64_t preparation_id) const override;
   Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
       std::uint64_t preparation_id, const ContentDigest& prepared_contract_digest,
-      const ControllerGoalId& controller_goal_id,
-      ControllerGoalGeneration controller_goal_generation) override;
+      const ControllerGoalId& controller_goal_id) override;
   Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override;
 
   /// Plan and authoritatively validate one already-resolved motion without
@@ -348,7 +357,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const ResolvedRuntimeScaleCommandDTO& command) override;
   void store_runtime_scale_setting(double scale, std::uint64_t sequence) override;
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId& operation_id, const ControlBindingId& control_binding_id) const override;
+      const OperationNumber& operation_id, const ControlBindingId& control_binding_id) const override;
   [[nodiscard]] RuntimeScaleMechanismAvailability runtime_scale_availability()
       const noexcept override;
 
@@ -436,6 +445,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Get current metrics snapshot.
   MetricsSnapshot get_metrics() const;
+
+  /// OD-217: this robot's collision-check timing counters since the engine
+  /// was built, for the diagnostics reply. Relaxed loads of the check
+  /// monitor's own atomics only: no lock, no work for the check thread or
+  /// the motion worker.
+  [[nodiscard]] RuntimeCollisionMonitorTimingMetrics runtime_collision_check_timing()
+      const noexcept;
+  /// The configured check period (fixed at construction).
+  [[nodiscard]] Duration runtime_collision_check_period_ns() const noexcept;
 
  private:
   Result<bool> retire_prepared_motion_membership_for_recovery(std::uint64_t candidate_id,
@@ -633,6 +651,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void emit_contact_policy_violation_event(
       std::uint64_t execution_id, const std::map<std::string, std::string>& source_details,
       std::optional<std::string_view> response_override = std::nullopt);
+  // The runtime monitor's fault fact (a collision, lost position feedback,
+  // or OD-217 checks that did not run): the addressed Kernel opens its
+  // containment Stop. Callers first revoke the look-ahead clear permits.
+  void emit_runtime_monitor_fault(const CollisionCheckResultDTO& check,
+                                  std::map<std::string, std::string> details);
   RuntimeCollisionProtectionSnapshot runtime_collision_protection_snapshot() const;
   bool refresh_published_runtime_collision_snapshot(
       std::map<std::string, std::string>* details = nullptr,
@@ -694,6 +717,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     bool zero_speed_holding{};
     std::int64_t zero_speed_hold_started_ns{};
     bool zero_speed_hold_stop_requested{};
+    // OD-217: the deadman asked for this motion's Stop.
+    bool runtime_checks_stopped_stop_requested{};
     bool terminal_recorded = false;
     std::optional<ErrorDTO> terminal_error;
     std::uint64_t runtime_collision_protection_generation = 0;
@@ -754,6 +779,23 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                             ActiveMotionExecution& motion_state, ErrorDTO error,
                             ParticipantEffectKnowledge effect, const char* reason,
                             std::optional<ExecutionSnapshot> final_snapshot = std::nullopt);
+
+  /// The backend refused the committed send (or its tool-context step)
+  /// because a Stop stage of this participant came first, and an addressed
+  /// Stop fence names this execution.
+  [[nodiscard]] bool send_refused_by_addressed_stop(std::uint64_t exec_id,
+                                                    const ErrorDTO& refusal) const;
+  /// End that refused send as cancelled before dispatch (no effect), the
+  /// fact the Stop's no-effect settlement requires; no local failure.
+  void end_send_refused_by_addressed_stop(const ExecuteRequestDTO& request,
+                                          std::uint64_t exec_id,
+                                          ActiveMotionExecution& motion_state);
+  /// The worker's report of its committed send's outcome: marks it known
+  /// and, when an addressed Stop fence names this execution, emits
+  /// `kParticipantDispatchOutcome`. Non-blocking for the worker beyond the
+  /// event dispatch every worker event already makes; holds no lock.
+  void report_dispatch_outcome(PreparedMotionSession& session, std::uint64_t exec_id,
+                               bool dispatched) noexcept;
 
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st, ExecuteRequestDTO& request,
@@ -836,7 +878,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // state changes or hazard authority is claimed.
   std::atomic<std::uint64_t> runtime_collision_protection_epoch_{0};
   // Bumped by every Stop-side revocation (revoke_runtime_collision_lookahead_
-  // clear_permits, also from fence_addressed_participant_stop); lock-free.
+  // clear_permits, also from complete_addressed_participant_stop_fence); lock-free.
   std::atomic<std::uint64_t> stop_revocation_generation_{0};
 
   // Recovery authority state. Lock order (documented at the admission
@@ -848,7 +890,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // may take recovery_refresh_mutex_ alone before its callback later acquires
   // lifecycle_mutex_; it never holds the leaf across callback execution.
   mutable std::mutex recovery_certificate_mutex_;
-  RecoveryCertificateStore recovery_certificates_;
   mutable std::mutex recovery_assessment_mutex_;
   KernelRecoveryAssessmentDTO recovery_assessment_;
   std::atomic<bool> recovery_assessment_dirty_{false};
@@ -877,6 +918,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   // state from a later lifecycle generation.
   std::optional<AddressedParticipantStopSettlementDTO>
       addressed_participant_stop_settlement_;  // lifecycle-guarded
+  // The containing stage result the addressed owner handed over with that
+  // settlement. A spring successor activates only when this exact stage was
+  // its spring return and the provider reported the spring-back hold mode.
+  std::optional<ParticipantStopStageResultDTO>
+      addressed_stop_containment_;  // lifecycle-guarded
   // Exact process-local eligibility fence installed synchronously by the
   // addressed owner after Stop acceptance and before physical Stop dispatch.
   // It prevents late work from the replaced trajectory from competing with
@@ -911,12 +957,15 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<bool> scheduler_cancels_closed_{false};
   bool scheduler_detach_complete_{false};
   std::atomic<std::size_t> scheduler_calls_in_flight_{0};
+  // OD-217: one typed line per late collision-check episode, written by the
+  // cell scheduler's Monitoring lane (the check thread does no stream I/O).
+  void report_runtime_collision_late_episode(const RuntimeCollisionMonitorLateEpisode& episode);
   [[nodiscard]] std::optional<ScheduleHandle> schedule_scoped_deadline_if_attached(
       TimePoint deadline, std::function<void()> callback, SchedulerPriority priority);
   bool cancel_scoped_deadline_if_attached(ScheduleHandle handle);
   bool cancel_recovery_deadline_if_attached(ScheduleHandle handle);
   bool start_collision_monitor_if_attached();
-  bool stop_collision_monitor_if_attached(bool drain_callbacks);
+  bool stop_collision_monitor_if_attached(RuntimeCollisionMonitor::StopWait wait);
   struct SchedulerCallAdmission {
     ExecutionKernel& owner;
     bool admitted{false};

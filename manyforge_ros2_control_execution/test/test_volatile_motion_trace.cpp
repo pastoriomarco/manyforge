@@ -13,8 +13,9 @@ namespace manyforge::ros2_control_execution {
 namespace {
 using namespace core;
 using V = content_identity::CanonicalValue;
-ExecutionGoalKey Key(const char *name, std::uint64_t generation = 1U) {
-  return {ControllerGoalId(name), ControllerGoalGeneration(generation)};
+// One goal of participant `ordinal` of operation 1.
+ControllerGoalId Key(std::uint32_t ordinal, std::uint32_t generation = 1U) {
+  return {OperationNumber(1U), ordinal, generation};
 }
 VolatileMotionTrace::Goal Goal(double position = 1.0) {
   VolatileMotionTrace::Goal goal;
@@ -33,6 +34,9 @@ const V &Member(const V &value, const char *name) {
   if (!member)
     throw std::logic_error(name);
   return *member;
+}
+double Ordinal(const V &row) {
+  return Member(Member(row, "controller_goal_id"), "ordinal").as_number();
 }
 class MotionTraceFileTest : public ::testing::Test {
 protected:
@@ -62,7 +66,7 @@ protected:
 TEST_F(MotionTraceFileTest, LargeOrdinaryAndReplacementGoalsAreReplayableAcrossOwnerRestart) {
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
-  auto old = trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U), Key("old"), {}, 10, garbage);
+  auto old = trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U), Key(1U), {}, 10, garbage);
   for (const bool replacement : {false, true}) {
     auto goal = Goal(replacement ? -0.125 : 0.125);
     auto point = goal.trajectory.points.front();
@@ -75,7 +79,7 @@ TEST_F(MotionTraceFileTest, LargeOrdinaryAndReplacementGoalsAreReplayableAcrossO
       goal.trajectory.points.push_back(point);
     }
     auto token = replacement ? trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U),
-        Key("new"), old, 20, garbage) : old;
+        Key(2U), old, 20, garbage) : old;
     std::optional<ExecutionReplacementStartDTO> start = replacement
         ? std::optional(ExecutionReplacementStartDTO{ExecutionBindingEpoch(7U), 100000000000LL, {}})
         : std::nullopt;
@@ -88,7 +92,7 @@ TEST_F(MotionTraceFileTest, LargeOrdinaryAndReplacementGoalsAreReplayableAcrossO
                  garbage, replacement, start);
   }
   trace.PublishedScale("/arm/fjt", ExecutionBindingEpoch(7U), 25, 0.5);
-  const auto result = trace.SnapshotFile(RequestOwnerEpoch("owner.old"),
+  const auto result = trace.SnapshotFile(ApplicationStartId{0x3f9a0000000000a1ULL},
       VolatileMotionTrace::kMaximumTraceBytes, directory);
   ASSERT_TRUE(result.ok()) << result.error().message;
   const auto &metadata = result.value();
@@ -99,8 +103,8 @@ TEST_F(MotionTraceFileTest, LargeOrdinaryAndReplacementGoalsAreReplayableAcrossO
   const auto snapshot = content_identity::parse_canonical_json(bytes);
   const auto &goals = Member(snapshot, "goals").as_array();
   ASSERT_EQ(goals.size(), 2U);
-  EXPECT_EQ(Member(goals[0], "controller_goal_id").as_string(), "new");
-  EXPECT_EQ(Member(goals[1], "controller_goal_id").as_string(), "old");
+  EXPECT_EQ(Ordinal(goals[0]), 2.0);
+  EXPECT_EQ(Ordinal(goals[1]), 1.0);
   EXPECT_EQ(Member(Member(goals[0], "trajectory"), "points").as_array().size(), 8000U);
   EXPECT_EQ(Member(Member(goals[1], "trajectory"), "points").as_array().size(), 8000U);
   EXPECT_EQ(Member(Member(goals[0], "replacement_policy"), "schedule").as_string(), "controller_stamp");
@@ -109,11 +113,15 @@ TEST_F(MotionTraceFileTest, LargeOrdinaryAndReplacementGoalsAreReplayableAcrossO
   EXPECT_EQ(Member(policy, "factor").as_number(), 0.5);
   EXPECT_EQ(Member(snapshot, "scale_events").as_array().size(), 1U);
   VolatileMotionTrace restarted;
-  const auto later = restarted.SnapshotFile(RequestOwnerEpoch("owner.new"), 4096U, directory);
+  const auto later = restarted.SnapshotFile(ApplicationStartId{0x3f9a0000000000b2ULL}, 4096U, directory);
   ASSERT_TRUE(later.ok()) << later.error().message;
   EXPECT_EQ(Read(metadata), bytes);
+  EXPECT_EQ(Member(snapshot, "schema_version").as_string(), "manyforge.volatile_motion_trace.v2");
+  EXPECT_EQ(Member(snapshot, "application_start_id").as_string(), "3f9a0000000000a1");
+  EXPECT_EQ(Member(metadata, "schema_version").as_string(), "manyforge.motion_trace_file.v2");
+  EXPECT_EQ(metadata.as_object().size(), 5U);
   EXPECT_EQ(Member(content_identity::parse_canonical_json(Read(later.value())),
-                   "request_owner_epoch").as_string(), "owner.new");
+                   "application_start_id").as_string(), "3f9a0000000000b2");
 }
 TEST_F(MotionTraceFileTest, CountsTemporariesAndEvictsOldestAcrossAllOwners) {
   for (std::size_t i = 0; i < 21U; ++i) Seed(i, 3U * 1024U * 1024U);
@@ -124,12 +132,12 @@ TEST_F(MotionTraceFileTest, CountsTemporariesAndEvictsOldestAcrossAllOwners) {
   VolatileMotionTrace::Garbage garbage;
   for (std::size_t i = 0; i < 16U; ++i) {
     auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-        {ControllerGoalId("goal." + std::to_string(i)), ControllerGoalGeneration(1U)}, {}, 0, garbage);
+        Key(static_cast<std::uint32_t>(i) + 1U), {}, 0, garbage);
     auto goal = Goal();
     goal.trajectory.points.resize(1000U, goal.trajectory.points.front());
     trace.Attach(token, std::move(goal), 1, ExecutionPortDispatch::kDispatched, garbage);
   }
-  const auto result = trace.SnapshotFile(RequestOwnerEpoch("owner"),
+  const auto result = trace.SnapshotFile(ApplicationStartId{1U},
       VolatileMotionTrace::kMaximumTraceBytes, directory);
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_FALSE(std::filesystem::exists(stale));
@@ -147,7 +155,7 @@ TEST_F(MotionTraceFileTest, CountsTemporariesAndEvictsOldestAcrossAllOwners) {
 }
 TEST_F(MotionTraceFileTest, RefusesUnsafeStoresAndConcurrentReaderWithoutLeavingPartialFile) {
   VolatileMotionTrace trace;
-  const auto owner = RequestOwnerEpoch("owner");
+  const auto owner = ApplicationStartId{1U};
   const auto link = directory / ("trace-" + std::string(64U, 'a') + ".json");
   ASSERT_EQ(::symlink("/etc/passwd", link.c_str()), 0);
   EXPECT_FALSE(trace.SnapshotFile(owner, 4096U, directory).ok());
@@ -169,7 +177,7 @@ TEST_F(MotionTraceFileTest, AggregateCapIncludesStaleTemporaryBeforeAnyCleanup) 
   std::ofstream(stale) << std::string(2U * 1024U * 1024U, 'x');
   ASSERT_EQ(::chmod(stale.c_str(), 0600), 0);
   VolatileMotionTrace trace;
-  const auto result = trace.SnapshotFile(RequestOwnerEpoch("owner"), 4096U, directory);
+  const auto result = trace.SnapshotFile(ApplicationStartId{1U}, 4096U, directory);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, "motion_trace_store_full");
   EXPECT_TRUE(std::filesystem::exists(stale));
@@ -178,7 +186,7 @@ TEST(VolatileMotionTraceTest, NegativeZeroGoalExportsWithoutChangingRetainedData
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
   const auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                                 Key("signed.zero"), {}, 1, garbage);
+                                 Key(1U), {}, 1, garbage);
   auto goal = Goal(-0.0);
   auto &point = goal.trajectory.points.front();
   point.velocities = {-0.0, -0.25};
@@ -186,7 +194,7 @@ TEST(VolatileMotionTraceTest, NegativeZeroGoalExportsWithoutChangingRetainedData
   point.effort = {-0.0, 2.5};
   trace.Attach(token, std::move(goal), 2, ExecutionPortDispatch::kDispatched,
                garbage);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"), 4000U);
+  const auto result = trace.Snapshot(ApplicationStartId{1U}, 4000U);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
   const auto &exported = Member(Member(Member(result.value(), "goals").as_array().front(),
                                        "trajectory"), "points").as_array().front();
@@ -200,13 +208,12 @@ TEST(VolatileMotionTraceTest, NegativeZeroGoalExportsWithoutChangingRetainedData
   EXPECT_EQ(Member(exported, "effort").as_array()[1].as_number(), 2.5);
   EXPECT_EQ(Member(exported, "time_sec").as_number(), -1.0);
   EXPECT_LE(content_identity::canonical_json(result.value()).size(), 4000U);
-  EXPECT_FALSE(trace.Snapshot(RequestOwnerEpoch("owner"), 1U).ok());
+  EXPECT_FALSE(trace.Snapshot(ApplicationStartId{1U}, 1U).ok());
 
   // Eviction exposes the retained payload: encoding must not rewrite it.
   for (std::size_t i = 0; i < VolatileMotionTrace::kGoalLimit; ++i)
     trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                {ControllerGoalId("next." + std::to_string(i)),
-                 ControllerGoalGeneration(1U)}, {}, 3, garbage);
+                Key(static_cast<std::uint32_t>(i) + 2U), {}, 3, garbage);
   ASSERT_EQ(garbage.size(), 1U);
   const auto &retained = garbage.front()->trajectory.points.front();
   for (const auto *values : {&retained.positions, &retained.velocities,
@@ -230,7 +237,7 @@ TEST(VolatileMotionTraceTest, NegativeZeroSamplesExportAtTheDiagnosticBoundary) 
     sample.measured_positions_rad = sample.reference_positions_rad;
     sample.measured_velocities_rad_s = sample.reference_positions_rad;
     trace.Sample("/arm/fjt", sample);
-    const auto result = trace.Snapshot(RequestOwnerEpoch("owner"), 4000U);
+    const auto result = trace.Snapshot(ApplicationStartId{1U}, 4000U);
     ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
     const auto &row = Member(result.value(), "controller_samples").as_array().front();
     for (const auto *field : {"reference_p", "reference_v", "reference_a",
@@ -252,7 +259,7 @@ TEST(VolatileMotionTraceTest, NegativeZeroSamplesExportAtTheDiagnosticBoundary) 
 TEST(VolatileMotionTraceTest, NegativeZeroPublishedFactorExportsAsCanonicalZero) {
   VolatileMotionTrace trace;
   trace.PublishedScale("/arm/fjt", ExecutionBindingEpoch(1U), 2, -0.0);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"), 4000U);
+  const auto result = trace.Snapshot(ApplicationStartId{1U}, 4000U);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
   const auto &row = Member(result.value(), "scale_events").as_array().front();
   EXPECT_EQ(Member(row, "kind").as_string(), "published");
@@ -263,14 +270,16 @@ TEST(VolatileMotionTraceTest,
      EarlyFeedbackSurvivesPayloadAttachmentAndSignedPointsRemainWhole) {
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
-  const auto key = Key("goal.one");
+  const auto key = Key(1U);
   auto token =
       trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U), key, {}, 10, garbage);
   ASSERT_TRUE(token);
   ExecutionGoalObservationDTO facts;
   facts.key = key;
   facts.binding_epoch = ExecutionBindingEpoch(7U);
-  facts.mechanism_goal_id = MechanismGoalId("uuid.actual");
+  facts.mechanism_goal_id = MechanismGoalId{{0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                                              0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98,
+                                              0x76, 0x54, 0x32, 0x10}};
   facts.accepted_stamp_ns = 11;
   facts.latest_feedback = ExecutionGoalFeedbackDTO{};
   facts.latest_feedback->local_receipt_stamp_ns = 12;
@@ -278,11 +287,13 @@ TEST(VolatileMotionTraceTest,
   auto goal = Goal();
   trace.Attach(token, std::move(goal), 13, ExecutionPortDispatch::kDispatched,
                garbage);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner.actual"),
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok()) << result.error().message;
   const auto &row = Member(result.value(), "goals").as_array().front();
-  EXPECT_EQ(Member(row, "mechanism_goal_id").as_string(), "uuid.actual");
+  // The 16 bytes are written as hex only in the export.
+  EXPECT_EQ(Member(row, "mechanism_goal_id").as_string(),
+            "0123456789abcdeffedcba9876543210");
   EXPECT_EQ(Member(row, "accepted_at_ns").as_number(), 11.0);
   EXPECT_EQ(Member(row, "first_own_feedback_at_ns").as_number(), 12.0);
   EXPECT_EQ(Member(row, "installation").as_string(), "unknown");
@@ -303,21 +314,22 @@ TEST(VolatileMotionTraceTest,
   VolatileMotionTrace::Garbage garbage;
   auto parent =
       std::make_shared<VolatileMotionTrace::Token>(VolatileMotionTrace::Token{
-          "/arm/fjt", ExecutionBindingEpoch(7U), Key("goal.one"),
-          VolatileMotionTrace::Context{"op.actual", "participant.actual",
-                                       "run.actual", "binding.actual",
+          "/arm/fjt", ExecutionBindingEpoch(7U), Key(1U),
+          VolatileMotionTrace::Context{OperationNumber(1U),
+                                       OperationParticipantId{OperationNumber(1U), 1U},
+                                       ProgramRunNumber(1U), "binding.actual",
                                        "robot.actual", 3U}});
   auto stop = trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U),
-                          Key("goal.one", 2U), parent, 10, garbage);
+                          Key(1U, 2U), parent, 10, garbage);
   auto newcomer = trace.Begin("/arm/fjt", ExecutionBindingEpoch(7U),
-                              Key("goal.new"), parent, 11, garbage);
+                              Key(2U), parent, 11, garbage);
   auto epoch = trace.Begin("/arm/fjt", ExecutionBindingEpoch(8U),
-                           Key("goal.one", 2U), parent, 12, garbage);
+                           Key(1U, 2U), parent, 12, garbage);
   ASSERT_TRUE(stop);
   ASSERT_TRUE(newcomer);
   ASSERT_TRUE(epoch);
   ASSERT_TRUE(stop->context);
-  EXPECT_EQ(stop->context->operation_id, "op.actual");
+  EXPECT_EQ(stop->context->operation_id, OperationNumber(1U));
   EXPECT_FALSE(newcomer->context);
   EXPECT_FALSE(epoch->context);
 }
@@ -325,52 +337,61 @@ TEST(VolatileMotionTraceTest,
      UnsignedIdentityBoundariesRemainExactAndDistinct) {
   constexpr std::uint64_t safe = 9007199254740991ULL;
   const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  constexpr auto top = std::numeric_limits<std::uint32_t>::max();
+  const auto exact = [&](std::uint32_t generation) {
+    return ControllerGoalId{OperationNumber(safe), 1U, generation};
+  };
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
   auto parent =
       std::make_shared<VolatileMotionTrace::Token>(VolatileMotionTrace::Token{
-          "/arm/fjt", ExecutionBindingEpoch(safe + 2U), Key("goal.exact", safe),
-          VolatileMotionTrace::Context{"op.actual", "participant.actual",
-                                       "run.actual", "binding.actual",
+          "/arm/fjt", ExecutionBindingEpoch(safe + 2U), exact(top - 2U),
+          VolatileMotionTrace::Context{OperationNumber(safe),
+                                       OperationParticipantId{OperationNumber(safe), 1U},
+                                       ProgramRunNumber(safe), "binding.actual",
                                        "robot.actual", maximum}});
   auto first = trace.Begin("/arm/fjt", ExecutionBindingEpoch(safe + 2U),
-                           Key("goal.exact", safe + 1U), parent, 10, garbage);
+                           exact(top - 1U), parent, 10, garbage);
   auto second = trace.Begin("/arm/fjt", ExecutionBindingEpoch(safe + 2U),
-                            Key("goal.exact", safe + 2U), first, 11, garbage);
+                            exact(top), first, 11, garbage);
   ASSERT_TRUE(first);
   ASSERT_TRUE(second);
   trace.Attach(first, Goal(), 12, ExecutionPortDispatch::kDispatched, garbage);
   trace.Attach(second, Goal(), 13, ExecutionPortDispatch::kDispatched, garbage);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"),
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok());
   const auto &rows = Member(result.value(), "goals").as_array();
   ASSERT_EQ(rows.size(), 2U);
-  EXPECT_EQ(Member(rows[0], "controller_goal_generation").as_string(),
-            "9007199254740993");
-  EXPECT_EQ(Member(rows[1], "controller_goal_generation").as_string(),
-            "9007199254740992");
+  const auto generation = [](const V &row) {
+    return Member(Member(row, "controller_goal_id"), "generation").as_number();
+  };
+  EXPECT_EQ(generation(rows[0]), static_cast<double>(top));
+  EXPECT_EQ(generation(rows[1]), static_cast<double>(top - 1U));
+  EXPECT_EQ(Member(Member(rows[0], "controller_goal_id"), "operation_id").as_number(),
+            static_cast<double>(safe));
+  EXPECT_EQ(Member(rows[0], "operation_id").as_number(), static_cast<double>(safe));
+  EXPECT_EQ(Member(Member(rows[0], "participant_id"), "operation_id").as_number(),
+            static_cast<double>(safe));
+  EXPECT_EQ(Member(Member(rows[0], "participant_id"), "ordinal").as_number(), 1.0);
   EXPECT_EQ(Member(rows[0], "binding_epoch").as_string(), "9007199254740993");
   EXPECT_EQ(Member(rows[0], "operation_revision").as_string(),
             "18446744073709551615");
-  EXPECT_EQ(Member(Member(rows[0], "predecessor"), "controller_goal_generation")
-                .as_string(),
-            "9007199254740992");
-  EXPECT_EQ(Member(Member(rows[1], "predecessor"), "controller_goal_generation")
-                .as_number(),
-            static_cast<double>(safe));
+  EXPECT_EQ(generation(Member(rows[0], "predecessor")),
+            static_cast<double>(top - 1U));
+  EXPECT_EQ(generation(Member(rows[1], "predecessor")),
+            static_cast<double>(top - 2U));
 }
 TEST(VolatileMotionTraceTest,
      EvictionDetachesPayloadAndCallbackTokenDoesNotPinIt) {
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
-  auto first = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U), Key("first"),
+  auto first = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U), Key(100U),
                            {}, 1, garbage);
   trace.Attach(first, Goal(), 2, ExecutionPortDispatch::kDispatched, garbage);
   for (std::size_t i = 0; i < VolatileMotionTrace::kGoalLimit; ++i) {
     auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                             {ControllerGoalId("goal." + std::to_string(i)),
-                              ControllerGoalGeneration(1U)},
+                             Key(static_cast<std::uint32_t>(i) + 1U),
                              {}, 3, garbage);
     trace.Attach(token, Goal(), 4, ExecutionPortDispatch::kDispatched, garbage);
   }
@@ -379,7 +400,7 @@ TEST(VolatileMotionTraceTest,
   garbage.clear();
   EXPECT_TRUE(retired.expired());
   EXPECT_TRUE(first);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"),
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(Member(result.value(), "goals").as_array().size(), 16U);
@@ -391,14 +412,14 @@ TEST(VolatileMotionTraceTest,
      TinyAllowanceRefusesAndLargerCutoffOmitsWholeGoal) {
   VolatileMotionTrace trace;
   VolatileMotionTrace::Garbage garbage;
-  auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U), Key("large"),
+  auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U), Key(1U),
                            {}, 1, garbage);
   auto goal = Goal();
   goal.trajectory.points.resize(200U, goal.trajectory.points.front());
   trace.Attach(token, std::move(goal), 2, ExecutionPortDispatch::kDispatched,
                garbage);
-  EXPECT_FALSE(trace.Snapshot(RequestOwnerEpoch("owner"), 1U).ok());
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"), 2000U);
+  EXPECT_FALSE(trace.Snapshot(ApplicationStartId{1U}, 1U).ok());
+  const auto result = trace.Snapshot(ApplicationStartId{1U}, 2000U);
   ASSERT_TRUE(result.ok());
   EXPECT_TRUE(Member(result.value(), "goals").as_array().empty());
   EXPECT_TRUE(
@@ -417,8 +438,7 @@ TEST(VolatileMotionTraceTest,
   bool exhausted = false;
   for (int i = 0; i < 160; ++i) {
     auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                             {ControllerGoalId("pinned." + std::to_string(i)),
-                              ControllerGoalGeneration(1U)},
+                             Key(static_cast<std::uint32_t>(i) + 1U),
                              {}, 1, garbage);
     if (!token) {
       exhausted = true;
@@ -429,23 +449,20 @@ TEST(VolatileMotionTraceTest,
   }
   ASSERT_TRUE(exhausted);
   EXPECT_FALSE(trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                           Key("blocked"), {}, 3, garbage));
+                           Key(1000U), {}, 3, garbage));
   pins.clear();
   garbage.clear();
   auto resumed = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                             Key("after_release"), {}, 4, garbage);
+                             Key(1001U), {}, 4, garbage);
   ASSERT_TRUE(resumed);
   trace.Attach(resumed, Goal(), 5, ExecutionPortDispatch::kDispatched, garbage);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"),
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok());
   EXPECT_GE(Member(Member(result.value(), "coverage"), "omitted_captures")
                 .as_number(),
             2.0);
-  EXPECT_EQ(Member(Member(result.value(), "goals").as_array().front(),
-                   "controller_goal_id")
-                .as_string(),
-            "after_release");
+  EXPECT_EQ(Ordinal(Member(result.value(), "goals").as_array().front()), 1001.0);
 }
 TEST(VolatileMotionTraceTest,
      ResidentByteBoundEvictsAndOversizedCaptureHasNoPartialPoints) {
@@ -453,8 +470,7 @@ TEST(VolatileMotionTraceTest,
   VolatileMotionTrace::Garbage garbage;
   for (int i = 0; i < 8; ++i) {
     auto token = trace.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                             {ControllerGoalId("large." + std::to_string(i)),
-                              ControllerGoalGeneration(1U)},
+                             Key(static_cast<std::uint32_t>(i) + 1U),
                              {}, 1, garbage);
     auto goal = Goal();
     goal.trajectory.points.resize(5000U, goal.trajectory.points.front());
@@ -462,7 +478,7 @@ TEST(VolatileMotionTraceTest,
                  garbage);
     garbage.clear();
   }
-  const auto bounded = trace.Snapshot(RequestOwnerEpoch("owner"), 2000U);
+  const auto bounded = trace.Snapshot(ApplicationStartId{1U}, 2000U);
   ASSERT_TRUE(bounded.ok());
   EXPECT_GT(
       Member(Member(bounded.value(), "coverage"), "evicted_goals").as_number(),
@@ -470,13 +486,13 @@ TEST(VolatileMotionTraceTest,
 
   VolatileMotionTrace oversize;
   auto token = oversize.Begin("/arm/fjt", ExecutionBindingEpoch(1U),
-                              Key("oversize"), {}, 1, garbage);
+                              Key(1U), {}, 1, garbage);
   auto goal = Goal();
   goal.trajectory.points.front().positions.resize(
       VolatileMotionTrace::kGoalBytes / sizeof(double) + 1U);
   oversize.Attach(token, std::move(goal), 2, ExecutionPortDispatch::kDispatched,
                   garbage);
-  const auto result = oversize.Snapshot(RequestOwnerEpoch("owner"), 2000U);
+  const auto result = oversize.Snapshot(ApplicationStartId{1U}, 2000U);
   ASSERT_TRUE(result.ok());
   EXPECT_TRUE(Member(result.value(), "goals").as_array().empty());
   const auto &omissions =
@@ -499,7 +515,7 @@ TEST(VolatileMotionTraceTest,
     trace.Sample("/arm/fjt", sample);
   }
   trace.PublishedScale("/arm/fjt", ExecutionBindingEpoch(1U), 2000, 0.25);
-  const auto result = trace.Snapshot(RequestOwnerEpoch("owner"),
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok());
   EXPECT_LE(Member(result.value(), "controller_samples").as_array().size(),

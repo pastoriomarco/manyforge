@@ -12,11 +12,17 @@
 
 #include <manyforge_core/types/projection_common.hpp>
 
+namespace manyforge::persistence {
+class SqliteRecordWriter;
+}  // namespace manyforge::persistence
+
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerBootstrapJournalSchemaId =
-    "manyforge.internal.component-manager.bootstrap-journal.i4.v1";
-inline constexpr std::int64_t kManagerBootstrapJournalSchemaVersion = 1;
+    "manyforge.internal.component-manager.bootstrap-journal.i4.v2";
+/// v2: metadata `records_lost`, set by the record writer when records of this
+/// start were not written.
+inline constexpr std::int64_t kManagerBootstrapJournalSchemaVersion = 2;
 inline constexpr std::int64_t kManagerBootstrapJournalSqliteApplicationId =
     1296450122;
 inline constexpr std::size_t kMaximumBootstrapAttempts = 64U;
@@ -165,11 +171,16 @@ struct ManagerBootstrapJournalIntegrityReport final {
 /// record. New attempts must retain the first BootstrapId and advance its
 /// durable generation high-water mark by exactly one. Every payload conflict
 /// fails without another durable effect.
+///
+/// The journal's records live in memory and every answer comes from memory.
+/// The file is written afterwards by the record writer, in memory order;
+/// without a handed-in writer the journal owns one and drains it at Close.
 class SqliteManagerBootstrapJournal final {
  public:
   SqliteManagerBootstrapJournal(
       std::filesystem::path database_path,
-      manyforge::core::CellId cell_id);
+      manyforge::core::CellId cell_id,
+      manyforge::persistence::SqliteRecordWriter* record_writer = nullptr);
   ~SqliteManagerBootstrapJournal();
 
   SqliteManagerBootstrapJournal(

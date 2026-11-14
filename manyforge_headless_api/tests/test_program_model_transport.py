@@ -99,9 +99,8 @@ def _snapshot_attachment() -> dict[str, object]:
         "source": {
             "height": 480,
             "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
-            "schema_version": "manyforge.program_snapshot_source.v1",
+            "schema_version": "manyforge.program_snapshot_source.v2",
             "viewer_generation": 19,
-            "viewer_owner_epoch": "headless.epoch.1",
             "width": 640,
         },
         "transport": "inline_data_url",

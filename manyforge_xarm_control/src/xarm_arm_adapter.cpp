@@ -189,7 +189,8 @@ core::ComponentState XArmArmAdapter::State(const std::int64_t now_ns) const {
   state.observed_at_ns = now_ns;
   // The lane's own process state (offline, process exited) comes first.
   if (state.lifecycle == ComponentLifecycle::kOffline ||
-      (state.fault && state.fault->code == core::FaultCode::kProcessExited)) {
+      (state.fault && (state.fault->code == core::FaultCode::kProcessExited ||
+                       state.fault->code == core::FaultCode::kRosTransportFailed))) {
     // Its Prepare doesn't survive the process: the next one starts not
     // prepared.
     std::lock_guard lock(mutex_);
@@ -265,9 +266,11 @@ ActionResult XArmArmAdapter::Lane(const ComponentAction lane_action,
   return made;
 }
 
-ActionResult XArmArmAdapter::Hardware(const bool active, const ComponentAction action,
-                                      const std::stop_token stop) {
-  auto made = ports_.hardware(active, stop);
+ActionResult XArmArmAdapter::Hardware(
+    const bool active, const ComponentAction action,
+    const std::optional<std::chrono::steady_clock::time_point> step_deadline,
+    const std::stop_token stop) {
+  auto made = ports_.hardware(active, step_deadline, stop);
   made.action = action;
   return made;
 }
@@ -277,7 +280,7 @@ ActionResult XArmArmAdapter::Disable(const std::stop_token stop) {
   // selects position mode).
   auto disabled = Lane(ComponentAction::kDisable, ComponentAction::kDisable, stop);
   if (disabled.outcome != ActionOutcome::kSucceeded) return disabled;
-  auto off = Hardware(false, ComponentAction::kDisable, stop);
+  auto off = Hardware(false, ComponentAction::kDisable, std::nullopt, stop);
   if (off.outcome == ActionOutcome::kSucceeded) {
     std::lock_guard lock(mutex_);
     prepared_ = true;
@@ -294,7 +297,7 @@ ActionResult XArmArmAdapter::Prepare(const ComponentAction action, const std::st
   const auto deadline = Now() + config_.action_timeout.count();
   auto made = Lane(action, action, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
-  made = Hardware(false, action, stop);
+  made = Hardware(false, action, std::nullopt, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
   // The driver's status report (state, mode, errors), within the action's
   // time.
@@ -328,11 +331,15 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
   // `set_state(0)`, with the joint state broadcaster.
   constexpr auto action = ComponentAction::kEnable;
   const auto deadline = Now() + config_.action_timeout.count();
+  // The same lifecycle command time bounds the hardware switch's
+  // controller-manager calls (they wait on the steady clock): one left
+  // unanswered ends the Enable `unknown` (the switch's own timeout).
+  const auto step_deadline = std::chrono::steady_clock::now() + config_.action_timeout;
   auto made = Lane(ComponentAction::kDisable, action, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
-  made = Hardware(false, action, stop);
+  made = Hardware(false, action, step_deadline, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
-  made = Hardware(true, action, stop);
+  made = Hardware(true, action, step_deadline, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
   const auto mark_armed = [this] {
     std::lock_guard lock(mutex_);
@@ -385,7 +392,7 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
                     "lifecycle timeout");
     if (!requested && Now() - ready_at >= kXArmControllerCycleNs) {
       requested = true;
-      made = Hardware(true, action, stop);
+      made = Hardware(true, action, step_deadline, stop);
       if (made.outcome != ActionOutcome::kSucceeded) return made;
     }
     ports_.pause();

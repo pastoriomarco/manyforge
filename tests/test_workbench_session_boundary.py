@@ -14,6 +14,13 @@ import pytest
 from scripts.lib import workbench_session as sessions
 
 
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch):
+    """Selection checks the free-space floor first; these tests are not about it."""
+    monkeypatch.setattr(sessions.run_session, "read_disk",
+                        lambda _fd: sessions.run_session.DiskReading(10**15, 10**15, 10**6))
+
+
 @pytest.fixture
 def state(tmp_path: Path):
     root = tmp_path / "state"
@@ -63,7 +70,7 @@ def test_killed_direct_launcher_does_not_let_compose_archive_a_live_child(state,
         assert child.poll() is None
         assert journal.stat().st_ino == inode
         assert journal.read_bytes() == b"old owner"
-        assert not (root / "previous-sessions").exists()
+        assert not (root / "previous-runs").exists()
         assert sessions._marker(root / "current")["session_id"] == marker["session_id"]
     finally:
         child.communicate("finish\n", timeout=5)

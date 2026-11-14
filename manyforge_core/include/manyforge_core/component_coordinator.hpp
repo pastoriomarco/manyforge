@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -10,9 +11,12 @@
 #include <manyforge_core/types/component_state.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -119,6 +123,14 @@ class ComponentCoordinator final {
   /// reports it `succeeded` or `unknown`.
   void InterruptActions();
 
+  /// A Stop that names components (stop state model PD-2): interrupts the
+  /// actions in progress on every component `named(component_id)` selects
+  /// and on the owner of such a component (an owner's action runs through
+  /// its members, e.g. "Reset position"). Allocation-free; same result rule as
+  /// `InterruptActions`.
+  template <typename Named>
+  void InterruptActionsOf(const Named& named);
+
   /// Close action admission and wait for every accepted action to finish.
   [[nodiscard]] bool CloseAndDrainActions(std::chrono::steady_clock::time_point deadline);
 
@@ -176,6 +188,19 @@ class ComponentCoordinator final {
     ~ActionCompletion();
   };
 
+  /// Stores an accepted action's thread in its entry while that entry still
+  /// holds the action `accepted`; otherwise (the action already ended, or
+  /// while the thread was being created the entry was replaced or removed or
+  /// the coordinator began closing) stops it and hands it back. A Stop that
+  /// marked the action before the thread was stored is applied here. Returns the thread the caller joins without the lock (the
+  /// previous worker, or this one when it wasn't stored).
+  [[nodiscard]] std::jthread StoreWorker(const std::string& component_id,
+                                         const std::shared_ptr<IComponentAdapter>& adapter,
+                                         const ComponentActionInProgress& accepted,
+                                         std::jthread worker);
+
+  static constexpr std::size_t kStopsWithoutAllocation = 64;
+
   IClock& clock_;
   ComponentStatesSink publish_;
   mutable std::mutex mutex_;
@@ -189,5 +214,34 @@ class ComponentCoordinator final {
   /// runs under it and must not call Submit or Refresh.
   std::mutex refresh_mutex_;
 };
+
+template <typename Named>
+void ComponentCoordinator::InterruptActionsOf(const Named& named) {
+  // The marks are set under the lock; the adapters' stop callbacks run after
+  // it. An action accepted whose thread is not yet stored carries the mark
+  // and is stopped when its thread is stored (StoreWorker). Up to kStopsWithoutAllocation
+  // actions in progress are collected without allocating.
+  alignas(std::stop_source) std::array<std::byte, kStopsWithoutAllocation * sizeof(std::stop_source)>
+      buffer;
+  std::pmr::monotonic_buffer_resource memory(buffer.data(), buffer.size());
+  std::pmr::vector<std::stop_source> stops(&memory);
+  {
+    std::lock_guard lock(mutex_);
+    stops.reserve(entries_.size());
+    for (auto& entry : entries_) {
+      if (!entry.action) continue;
+      bool selected = named(std::string_view(entry.component_id));
+      for (const auto& member : entries_) {
+        if (selected) break;
+        selected = member.owner_id && *member.owner_id == entry.component_id &&
+                   named(std::string_view(member.component_id));
+      }
+      if (!selected) continue;
+      entry.interrupted = true;
+      if (entry.worker.joinable()) stops.push_back(entry.worker.get_stop_source());
+    }
+  }
+  for (auto& stop : stops) stop.request_stop();
+}
 
 }  // namespace manyforge::core

@@ -12,7 +12,7 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kSourceModelProjectionApiVersion =
-    "manyforge.source_model_projection.v3";
+    "manyforge.source_model_projection.v4";
 inline constexpr std::uint64_t kMaximumSourceModelProjectionBytes = 64ULL * 1024ULL * 1024ULL;
 
 class SourceModelProjectionError : public std::runtime_error {

@@ -204,12 +204,14 @@ export function parseCellLatch(value: unknown, path = 'cell_latch'): CellLatch {
     causes: arrayAt(record.causes, `${path}.causes`).map((item, index) => {
       const row = objectAt(item, `${path}.causes[${index}]`);
       const stop = optionalStop(row, 'stop', `${path}.causes[${index}]`);
+      const reason = optionalCodedError(row, 'reason', `${path}.causes[${index}]`);
       return {
         component_id: stringAt(row.component_id, `${path}.causes[${index}].component_id`),
         kind: oneOf(LATCH_CAUSE_KINDS, row.kind, `${path}.causes[${index}].kind`),
         ...(row.fault === undefined || row.fault === null
           ? {} : { fault: parseFault(row.fault, `${path}.causes[${index}].fault`) }),
         ...(stop === undefined ? {} : { stop }),
+        ...(reason === undefined ? {} : { reason }),
       };
     }),
   };
@@ -378,23 +380,28 @@ export function parseApplyResult(value: unknown, path = 'apply_result'): ApplyRe
   const error = optionalCodedError(record, 'error', path);
   return {
     outcome: oneOf(['succeeded', 'failed'] as const, record.outcome, `${path}.outcome`),
-    components: arrayAt(record.components, `${path}.components`).map((item, index) => {
-      const at = `${path}.components[${index}]`;
-      const row = objectAt(item, at);
-      const rowError = optionalCodedError(row, 'error', at);
-      return {
-        component_id: stringAt(row.component_id, `${at}.component_id`),
-        disposition: oneOf(APPLY_DISPOSITIONS, row.disposition, `${at}.disposition`),
-        // A removed component has no lifecycle after the Apply.
-        ...(row.lifecycle_after === undefined || row.lifecycle_after === null ? {} : {
-          lifecycle_after: oneOf(COMPONENT_LIFECYCLES, row.lifecycle_after, `${at}.lifecycle_after`),
-        }),
-        // This component's failed step (the Apply continued with the others).
-        ...(rowError === undefined ? {} : { error: rowError }),
-      };
-    }),
+    components: parseApplyResultComponents(record.components, `${path}.components`),
     ...(error === undefined ? {} : { error }),
   };
+}
+
+/** An Apply's component rows: each affected component's state after it, or its failed step. */
+export function parseApplyResultComponents(value: unknown, path: string): ApplyResult['components'] {
+  return arrayAt(value, path).map((item, index) => {
+    const at = `${path}[${index}]`;
+    const row = objectAt(item, at);
+    const rowError = optionalCodedError(row, 'error', at);
+    return {
+      component_id: stringAt(row.component_id, `${at}.component_id`),
+      disposition: oneOf(APPLY_DISPOSITIONS, row.disposition, `${at}.disposition`),
+      // A removed component has no lifecycle after the Apply.
+      ...(row.lifecycle_after === undefined || row.lifecycle_after === null ? {} : {
+        lifecycle_after: oneOf(COMPONENT_LIFECYCLES, row.lifecycle_after, `${at}.lifecycle_after`),
+      }),
+      // This component's failed step (the Apply continued with the others).
+      ...(rowError === undefined ? {} : { error: rowError }),
+    };
+  });
 }
 
 export function parseEffectiveValues(value: unknown, path = 'effective'): EffectiveValues {

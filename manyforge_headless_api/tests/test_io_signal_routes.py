@@ -25,8 +25,7 @@ HOST_EPOCH = "sha256:" + "5c" * 32
 
 def _read() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.target_observation_query.v2",
-        "owner_epoch": "owner.1",
+        "schema_version": "manyforge.target_observation_query.v3",
         "program_binding_id": BINDING,
         "kind": "io_signal",
         "signal": {"component_id": "station", "signal_name": "part_present"},
@@ -35,8 +34,7 @@ def _read() -> dict[str, Any]:
 
 def _mock(value: bool = True) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.mock_io_input_request.v2",
-        "owner_epoch": "owner.1",
+        "schema_version": "manyforge.mock_io_input_request.v3",
         "program_binding_id": BINDING,
         "signal": {"component_id": "station", "signal_name": "part_present"},
         "expected_source_epoch": "3",
@@ -64,12 +62,12 @@ def _value(value: bool | None = True, quality: str = "fresh") -> dict[str, Any]:
 def _observation(command: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
     echo = {key: item for key, item in _read().items() if key != "schema_version"}
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": True,
         "command": command,
         "target_observation": {
             **echo,
-            "schema_version": "manyforge.target_observation.v2",
+            "schema_version": "manyforge.target_observation.v3",
             "evaluated_at_ns": 1_000,
             "value": value or _value(),
         },
@@ -87,7 +85,6 @@ def _receipt(
     reply["model_value"] = model_value
     reply["published_cursor"] = (
         {
-            "owner_epoch": "owner.1",
             "catalog_generation": "1",
             "source_id": "station_mock",
             "record_sequence": "10",
@@ -146,6 +143,8 @@ def test_read_request_is_exactly_the_io_signal_target_query() -> None:
         {"expected_source_epoch": "s" * 257},
         {"expected_source_epoch": "e\u0301"},
         {"schema_version": "manyforge.mock_io_input_request.v1"},
+        {"schema_version": "manyforge.mock_io_input_request.v2"},
+        {"owner_epoch": "owner.1"},
         {"program_binding_id": "binding.1"},
         {"invert": True},
     ],
@@ -167,7 +166,7 @@ def test_mock_input_wire_uses_internal_attribution_and_checks_the_echo() -> None
     assert response["published_cursor"]["record_sequence"] == "10"
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": "set_mock_io_input",
             "attribution": {
                 "transport": "internal",
@@ -216,7 +215,6 @@ def test_mock_ingress_failure_is_a_publication_error_receipt() -> None:
 
 
 _CURSOR = {
-    "owner_epoch": "owner.1",
     "catalog_generation": "1",
     "source_id": "station_mock",
     "record_sequence": "10",
@@ -233,7 +231,8 @@ _CURSOR = {
         _receipt(cursor={**_CURSOR, "record_sequence": "0"}),
         _receipt(cursor={**_CURSOR, "record_sequence": "010"}),
         _receipt(cursor={**_CURSOR, "catalog_generation": 1}),
-        _receipt(cursor={**_CURSOR, "owner_epoch": "owner.2"}),
+        # The cursor is closed: no owner epoch any more.
+        _receipt(cursor={**_CURSOR, "owner_epoch": "owner.1"}),
         _receipt(cursor={**_CURSOR, "source_id": "other"}),
         _receipt(cursor={**_CURSOR, "source_epoch": "3"}),
         _receipt(publication_error={"code": "x", "message": "y"}),
@@ -252,7 +251,7 @@ def test_mock_receipt_is_exact(reply) -> None:
 def test_mock_input_refusal_keeps_the_host_error_code() -> None:
     client, _sent = _client(
         {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "ok": False,
             "command": "set_mock_io_input",
             "error": {
@@ -308,7 +307,7 @@ def test_routes_forward_one_typed_request_each() -> None:
 def test_mock_route_refusal_is_the_existing_error_envelope() -> None:
     execution = _IoExecution()
     execution.mock_reply = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": False,
         "command": "set_mock_io_input",
         "error": {"code": "io_signal_catalog_stale", "message": "stale", "details": {}},

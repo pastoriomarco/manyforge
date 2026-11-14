@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.source_model_projection.v3"
+_PROJECTION_VERSION = "manyforge.source_model_projection.v4"
 _CONTEXT_VERSION = "manyforge.source_model_context.v1"
 _PROJECTION_IDENTITY_DOMAIN = "manyforge-source-model-projection-semantic"
 _PROJECTION_FIELDS = {
@@ -76,16 +76,13 @@ _SOURCE_FIELDS = {
     "freshness",
     "known_gaps",
     "projection_generation",
-    "projection_owner_epoch",
     "receiver_age_ns",
     "selection_projection_generation",
     "selection_source_content_digest",
     "selection_source_generation",
-    "selection_source_owner_epoch",
     "selection_source_owner_id",
     "source_content_digest",
     "source_generation",
-    "source_owner_epoch",
     "source_owner_id",
     "source_owner_kind",
 }
@@ -205,10 +202,7 @@ def _source(value: Any) -> dict[str, Any]:
             "the active source model projection is incomplete",
         )
     for field in (
-        "projection_owner_epoch",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
-        "source_owner_epoch",
         "source_owner_id",
     ):
         _text(source[field], f"source.{field}")
@@ -746,11 +740,10 @@ def verify_active_source_model(
         "selection_projection_generation",
         "selection_source_content_digest",
         "selection_source_generation",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
     ):
         if source.get(field) != node_source.get(field):
-            raise _invalid("source model and node environment selection epochs disagree")
+            raise _invalid("source model and node environment selections disagree")
 
     _components(projection["components"])
     occurrences = _occurrences(projection["occurrences"])

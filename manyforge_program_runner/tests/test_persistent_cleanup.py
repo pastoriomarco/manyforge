@@ -24,12 +24,13 @@ from manyforge_program_runner.tests.test_persistent_values import (
     _PROJECT,
     _SCENARIO,
     _Headless as _ValuesHeadless,
-    _fail_directory_sync,
     _key,
     _program,
+    _request_key,
     _rows,
 )
 from manyforge_program_runner.tests.test_runtime import (
+    _A_TEXT,
     _DIGEST_A,
     _Admission,
     _Host,
@@ -88,22 +89,19 @@ def _runtime(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
-            owner_epoch=f"runner.{name}",
-            persistent_key_register_path=tmp_path / "persistent-keys.json",
+            application_start_id=0x3F9A00000000002A,
+            persistent_key_register_directory=tmp_path,
         ),
         headless_client=headless,  # type: ignore[arg-type]
         execution_transport=headless,  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
-        cycle_journal=ProgramCycleJournal(
-            tmp_path / f"{name}.sqlite3", owner_epoch=f"runner.{name}"
-        ),
+        cycle_journal=ProgramCycleJournal(tmp_path / f"{name}.sqlite3"),
     )
     runtime._host.shutdown()  # noqa: SLF001
     owner = _ObservationOwner()
     host = _StoreHost(
         owner,
         owner_id=runtime.owner_id,
-        owner_epoch=runtime.owner_epoch,
         headless=headless,
         register=runtime._persistent_keys,  # noqa: SLF001
     )
@@ -118,10 +116,8 @@ def _start(runtime: ProgramRuntime, headless: _Headless) -> dict[str, Any]:
     return runtime.start_run(
         ProgramRunStartRequest.model_validate(
             {
-                "request_id": "request.start",
-                "request_owner_epoch": "composer.epoch.1",
+                "request_key": _request_key("request.start"),
                 "source_label": "operator_ui",
-                "correlation_id": None,
                 "scenario_id": _SCENARIO,
                 "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": headless.current["record_digest"],
@@ -229,7 +225,7 @@ def test_values_survive_a_workbench_restart_when_the_program_still_declares_them
         _start(runtime, restarted)
         # The value the saved Program still declares survived stop/start.
         assert host.stores[0].read("layer") == 4
-        assert _stored_values(tmp_path) == {"layer": 4}
+        assert _stored_values(tmp_path, runtime) == {"layer": 4}
     finally:
         runtime.shutdown()
 
@@ -285,8 +281,12 @@ def test_a_late_notification_never_cleans_against_outdated_declarations(
     assert _stored_values(tmp_path) == {"extra": 1, "layer": 4, "pallet_index": 9}
 
 
-def _stored_values(tmp_path: Path) -> dict[str, Any]:
-    register = persistent_keys.PersistentKeyRegister(tmp_path / "persistent-keys.json")
+def _stored_values(tmp_path: Path, live: ProgramRuntime | None = None) -> dict[str, Any]:
+    """What a next start reads: the file, once ``live``'s writer has written it."""
+
+    if live is not None:
+        assert live._persistent_keys.wait_written(5.0)  # noqa: SLF001
+    register = persistent_keys.PersistentKeyRegister(tmp_path, application_start_id=_A_TEXT)
     return {key: row["value"] for key, row in register.values(_PROJECT).items()}
 
 
@@ -299,7 +299,7 @@ def test_a_program_without_persistent_keys_drops_its_scenarios_rows_at_run_start
     runtime, _host = _runtime(tmp_path, headless, "zero")
     try:
         run = _start(runtime, headless)
-        assert _stored_values(tmp_path) == {}
+        assert _stored_values(tmp_path, runtime) == {}
         assert {
             (event["key"], event["reason"])
             for event in _audit(runtime, run)
@@ -367,7 +367,7 @@ def test_a_restored_value_a_new_rule_refuses_is_dropped_without_blocking_the_run
         ]
         assert (dropped["key"], dropped["reason"]) == ("target", "value_invalid")
         assert "scene resource" in dropped["detail"]
-        assert _stored_values(tmp_path) == {"layer": 4}
+        assert _stored_values(tmp_path, runtime) == {"layer": 4}
         (edit,) = [
             edit
             for edit in runtime._persistent_keys.edits(_PROJECT)  # noqa: SLF001
@@ -379,12 +379,13 @@ def test_a_restored_value_a_new_rule_refuses_is_dropped_without_blocking_the_run
 
 
 @pytest.mark.usefixtures("_no_scene")
-def test_a_cleanup_that_cannot_be_stored_is_a_fault_and_restores_nothing_stale(
+def test_a_cleanup_whose_file_write_fails_is_made_and_written_later(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     headless, _first = _store_pallet_nine(tmp_path)
     headless.apply(_WITHOUT_PALLET)
     runtime, host = _runtime(tmp_path, headless, "fault")
+    register = runtime._persistent_keys  # noqa: SLF001
     replace = persistent_keys.os.replace
     monkeypatch.setattr(
         persistent_keys.os,
@@ -392,113 +393,37 @@ def test_a_cleanup_that_cannot_be_stored_is_a_fault_and_restores_nothing_stale(
         lambda *_args: (_ for _ in ()).throw(OSError("read-only file system")),
     )
     try:
-        # The notification reports the fault; the Apply it follows is done.
-        with pytest.raises(ProgramRunnerError) as fault:
-            runtime.reconcile_persistent_values()
-        assert fault.value.code == "persistent_key_storage_unavailable"
-        # The values page shows the fault and no value it cannot vouch for.
-        headless.apply(_PALLET)
+        # Memory is the authority: the notification follows the Apply and
+        # the disk refuses nothing.
+        assert runtime.reconcile_persistent_values()["dropped"] == [
+            {
+                "project_path": _PROJECT,
+                "key": "pallet_index",
+                "reason": "key_not_declared_persistent",
+            }
+        ]
         listed = runtime.read_persistent_values()
-        assert listed["storage_fault"]["code"] == "persistent_key_storage_unavailable"
-        assert not any(row["stored"] for row in listed["keys"])
-        # A run is refused by name rather than started on unreconciled values.
-        with pytest.raises(ProgramRunnerError) as refused:
-            _start(runtime, headless)
-        assert refused.value.code == "persistent_key_storage_unavailable"
-        assert host.stores == []
-
+        assert _rows(listed)["layer"]["value"] == 4
+        _start(runtime, headless)
+        assert host.stores[0].read("layer") == 4
+        assert register.wait_written(5.0)
+        assert register.write_failures >= 1
+    finally:
         monkeypatch.setattr(persistent_keys.os, "replace", replace)
-        listed = runtime.read_persistent_values()
-        assert listed["storage_fault"] is None
-        # The delete Apply was never reconciled: the value is kept and the
-        # missed Apply is reported, not hidden.
-        assert _rows(listed)["pallet_index"]["value"] == 9
-        assert listed["apply_observation_fault"]["code"] == "applied_program_not_observed"
-    finally:
         runtime.shutdown()
-
-
-@pytest.mark.usefixtures("_no_scene")
-def test_a_reconciliation_that_may_not_be_durable_suppresses_values_until_settled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    headless, _first = _store_pallet_nine(tmp_path)
-    headless.apply(_PALLET)
-    runtime, host = _runtime(tmp_path, headless, "uncertain")
-    # The file is replaced, but its directory entry cannot be made durable.
-    failing = _fail_directory_sync(monkeypatch)
-    try:
-        with pytest.raises(ProgramRunnerError) as first:
-            runtime.reconcile_persistent_values()
-        assert first.value.code == "persistent_key_storage_uncertain"
-        # Memory already counts the activation; that is never a "duplicate"
-        # until the disk is reconciled.
-        with pytest.raises(ProgramRunnerError) as again:
-            runtime.reconcile_persistent_values()
-        assert again.value.code == "persistent_key_storage_unavailable"
-        listed = runtime.read_persistent_values()
-        assert listed["storage_fault"]["code"] == "persistent_key_storage_unavailable"
-        assert not any(row["stored"] for row in listed["keys"])
-        with pytest.raises(ProgramRunnerError) as refused:
-            _start(runtime, headless)
-        assert refused.value.code == "persistent_key_storage_unavailable"
-        assert host.stores == []
-
-        failing[0] = False
-        assert runtime.reconcile_persistent_values()["outcome"] == "duplicate"
-        listed = runtime.read_persistent_values()
-        assert listed["storage_fault"] is None
-        assert _rows(listed)["pallet_index"]["value"] == 9
-    finally:
-        runtime.shutdown()
-    # The refused start ended its cycle; the next Run restores the value.
-    pallet, _runtime_after, _run = _pallet_after_rerun(tmp_path, headless, "settled")
-    assert pallet == 9
-
-
-@pytest.mark.usefixtures("_no_scene")
-def test_a_storage_fault_first_seen_after_the_claim_is_a_started_run_that_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    headless, _first = _store_pallet_nine(tmp_path)
-    headless.apply(_PALLET)
-    runtime, host = _runtime(tmp_path, headless, "late_fault")
-    register = runtime._persistent_keys  # noqa: SLF001
-    admission = runtime._admission  # noqa: SLF001
-    acquire = admission.acquire
-
-    def acquire_then_fail_storage(intent: dict[str, Any]) -> dict[str, Any]:
-        claim = acquire(intent)
-        # Storage reconciled before the claim, then fails once it is held.
-        monkeypatch.setattr(
-            register,
-            "reconcile",
-            lambda *_args: (_ for _ in ()).throw(
-                persistent_keys.PersistentKeyRegisterError("read-only file system")
-            ),
-        )
-        return claim
-
-    monkeypatch.setattr(admission, "acquire", acquire_then_fail_storage)
-    try:
-        with pytest.raises(ProgramRunnerError) as failed:
-            _start(runtime, headless)
-        assert failed.value.code == "program_run_started_then_failed"
-        assert failed.value.details["cause_code"] == "persistent_key_storage_unavailable"
-        assert host.stores == []
-    finally:
-        runtime.shutdown()
+    # The shutdown wrote the latest state.
+    assert _stored_values(tmp_path) == {"layer": 4}
 
 
 def test_another_register_version_refuses_the_runner_by_name(tmp_path: Path) -> None:
-    path = tmp_path / "persistent-keys.json"
+    path = tmp_path / "persistent-keys.v4.json"
     path.write_text('{"schema_version": "manyforge.persistent_key_register.v1"}')
     with pytest.raises(ProgramRunnerError) as refused:
         ProgramRuntime(
             ProgramRunnerConfig(
                 headless_url="http://headless.test",
-                owner_epoch="runner.version",
-                persistent_key_register_path=path,
+                application_start_id=0x3F9A00000000002A,
+                persistent_key_register_directory=tmp_path,
             ),
             headless_client=_Headless(),  # type: ignore[arg-type]
             execution_transport=_Headless(),  # type: ignore[arg-type]

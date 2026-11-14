@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
+import { displayApplyId } from './api/applicationIdentity';
 import { ApiError, api, apiErrorCode } from './api/client';
 import { parseLogicalSceneProjection } from './api/parsers';
 import {
@@ -46,16 +47,16 @@ import { useComponentCatalog } from './hooks/useComponentCatalog';
 import { requestOpenSettings } from './state/settingsNavigation';
 import type { ComponentManagerTab } from './utils/componentManager';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
-import { activationFailureNotice } from './state/activationNotices';
+import { activationFailureNotice, failedApplyHold } from './state/activationNotices';
 import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
 import {
-  robotControlHasActiveOperation,
   robotControlHasTransientPreviewRefusal,
   type RobotControlState,
 } from './state/robotControl';
+import { componentActionRunning, documentMotion, newMotionReason } from './state/heldRunAuthoring';
 import {
   AuthoringAdmissionTooltipProvider,
   authoringAdmissionTooltip,
@@ -217,7 +218,7 @@ export function authoringAdmissionNotices(
   backgroundStep = false,
 ): WorkbenchNotice[] {
   if (manualOperation !== null) return [{
-    id: `authoring-admission.manual.${manualOperation.ownerEpoch}.${manualOperation.operationId}`,
+    id: `authoring-admission.manual.${manualOperation.applicationStartId}.${manualOperation.operationId}`,
     severity: 'info',
     domain: 'program_authoring',
     title: manualOperation.title,
@@ -238,9 +239,9 @@ export function manualPreviewRefusalNotice(
   state: RobotControlState,
 ): WorkbenchNotice | null {
   if (!robotControlHasTransientPreviewRefusal(state)) return null;
-  const ownerEpoch = state.status?.ownerEpoch ?? 'unknown-owner';
+  const applicationStartId = state.status?.applicationStartId ?? 'unknown-owner';
   return {
-    id: `robot-control.preview.${ownerEpoch}.${state.generation}`,
+    id: `robot-control.preview.${applicationStartId}.${state.generation}`,
     severity: 'info',
     domain: 'runtime',
     title: 'Manual preview refused',
@@ -569,8 +570,8 @@ export default function App() {
     headlessEnabled,
     programRuntime.cycleState !== null
       && programRuntime.cycleState !== 'idle_after_reset',
-    ['motion-stop', 'full-stop'].includes(programRuntime.state.pending ?? '')
-      || ['stopping', 'full_stopping'].includes(
+    ['motion-stop', 'stop-all', 'halt'].includes(programRuntime.state.pending ?? '')
+      || ['stopping', 'halting'].includes(
         programRuntime.state.run?.state ?? '',
       ),
     headlessSnapshot,
@@ -586,13 +587,14 @@ export default function App() {
       commandTargetId: row.target!.command_target_id, signalName: row.reference.signal_name,
       direction: 'input' as const, valueType: 'bool' as const })), [referenceValidation.selectorFacts]);
   const systemSignalsNeedApply = referenceValidation.selectorFacts === null;
-  // Robots are moving: a Program run that is not positively held, a starting or
-  // stopping cycle, or an active manual operation. Document actions wait.
-  const documentCycle = headlessSnapshot?.programCycle;
-  const documentMotionActive = robotControlHasActiveOperation(robotControl.state)
-    || documentCycle?.state === 'starting' || documentCycle?.state === 'stopping'
-    || (documentCycle?.state === 'running'
-      && documentCycle.runtimeControls?.executionSelections.motionHeld !== true);
+  // Robots are moving: document actions wait. New waits by its own rule.
+  const documentMotionActive = documentMotion(
+    headlessSnapshot?.programCycle, robotControl.state).moving;
+  // New and Load wait while a component action runs (OD-194).
+  const documentComponentActionActive = componentActionRunning(cellState.components);
+  const documentNewWaitReason = newMotionReason(
+    headlessSnapshot?.programCycle, robotControl.state,
+    headlessSnapshot?.heldRunDraftEditAllowed === true, documentComponentActionActive);
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
     source: 'composer.deployment_workspace',
@@ -727,6 +729,7 @@ export default function App() {
     observedApply,
     headlessSnapshot?.runtime.sections.manager ?? null,
     headlessState.transportStatus,
+    headlessSnapshot?.applicationStartId ?? null,
   );
   const activationStatus = activation.status !== null
     && sameManagerApply(activation.status, observedApply)
@@ -805,10 +808,6 @@ export default function App() {
   useEffect(() => {
     authoringWorkspace.observeApply(activation.status);
   }, [authoringWorkspace, activation.status]);
-  const savedScenarioPath = headlessState.transportStatus === 'connected'
-    && authoringWorkspace.current
-    ? authoringWorkspace.project?.documentPath ?? null
-    : null;
   const authoringAdmissionOpen = headlessSnapshot?.authoringAdmission.authoringAllowed ?? null;
   const authoringCause = headlessEnabled
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
@@ -821,20 +820,22 @@ export default function App() {
     && activationStatus?.state === 'pending'
     ? `${observedApply.applyId}:${observedApply.applyGeneration}`
     : null;
+  const observedApplyShown = observedApply === null
+    ? null
+    : displayApplyId(headlessSnapshot?.applicationStartId, observedApply.applyId);
   const activationNotices = useMemo<WorkbenchNotice[]>(() => {
-    if (observedApply === null) return [];
+    if (observedApply === null || observedApplyShown === null) return [];
     const id = `activation.${observedApply.applyId}:${observedApply.applyGeneration}`;
     if (activationStatus?.state === 'failed' || activationStatus?.state === 'unknown_effect') {
       if (dismissedActivationNotice === id) return [];
       const notice = activationFailureNotice(
         id,
-        observedApply.applyId,
+        observedApplyShown,
         {
           state: activationStatus.state,
           failure: activationStatus.failure,
           failureAcknowledgement: activationStatus.failureAcknowledgement,
         },
-        savedScenarioPath,
         authoringAdmissionOpen,
         {
           busy: acknowledgingApply,
@@ -843,6 +844,8 @@ export default function App() {
           run: () => { void acknowledgeFailedApply(); },
           dismiss: () => setDismissedActivationNotice(id),
         },
+        // The authoring admission names the way out.
+        failedApplyHold(authoringAdmissionOpen),
       );
       return notice === null ? [] : [notice];
     }
@@ -853,7 +856,7 @@ export default function App() {
         severity: 'error',
         domain: 'activation',
         title: 'Activation status unavailable',
-        message: `Completion of ${observedApply.applyId} cannot currently be observed; it is neither confirmed nor failed.`,
+        message: `Completion of ${observedApplyShown} cannot currently be observed; it is neither confirmed nor failed.`,
       }];
     }
     const phase = activationStatus?.phase ?? maintenance?.phase ?? 'accepted';
@@ -862,12 +865,12 @@ export default function App() {
       severity: 'info',
       domain: 'activation',
       title: 'Activation in progress',
-      message: `Manager phase: ${String(phase).replaceAll('_', ' ')} (${observedApply.applyId}). Motion does not start automatically.`,
+      message: `Manager phase: ${String(phase).replaceAll('_', ' ')} (${observedApplyShown}). Motion does not start automatically.`,
       busy: true,
     }];
   }, [acknowledgeFailedApply, acknowledgingApply, activationStatus, activationUnobservable,
-    authoringAdmissionOpen, currentApplyAcknowledgementError, dismissedActivationNotice,
-    maintenance, observedApply, applyAcknowledgementOutcomeUnknown, savedScenarioPath]);
+    authoringAdmissionOpen,
+    currentApplyAcknowledgementError, dismissedActivationNotice, maintenance, observedApply, observedApplyShown, applyAcknowledgementOutcomeUnknown]);
   const activationCompleted = useBriefNotice(
     observedApply !== null && activationStatus?.state === 'succeeded'
       ? {
@@ -875,7 +878,7 @@ export default function App() {
           severity: 'info',
           domain: 'activation',
           title: 'Activation completed',
-          message: `Manager confirmed ${observedApply.applyId}.`,
+          message: `Manager confirmed ${observedApplyShown}.`,
         }
       : null,
   );
@@ -1168,11 +1171,12 @@ export default function App() {
   });
   // Unacknowledged warning alarms (yellow) with the server's exact acknowledgement.
   const alarmWarnings = useMemo(() => {
-    const alarms = headlessSnapshot?.alarms;
-    return alarms === undefined ? [] : alarmWarningNotices(
-      warningAlarms(alarms),
+    const snapshot = headlessSnapshot;
+    if (!snapshot) return [];
+    return alarmWarningNotices(
+      warningAlarms(snapshot.alarms),
       alarmAcknowledgement.busyActivation,
-      (alarm) => { void acknowledgeAlarm([alarm], alarms.ownerEpoch); },
+      (alarm) => { void acknowledgeAlarm([alarm], snapshot.applicationStartId); },
     );
   }, [acknowledgeAlarm, alarmAcknowledgement.busyActivation, headlessSnapshot]);
   const acknowledgeWarning = useCallback((id: string) => {
@@ -1372,7 +1376,7 @@ export default function App() {
               ? 'Connecting to Headless owner'
               : 'Headless owner disconnected';
   const connectionDetail = connectedProjection
-    ? `Receiver ${headlessSnapshot.receiverEpoch} · snapshot ${headlessSnapshot.snapshotSequence}`
+    ? `Application start ${headlessSnapshot.applicationStartId} · snapshot ${headlessSnapshot.snapshotSequence}`
     : headlessState.transportError
       ?? (headlessState.semanticStatus === 'current'
         ? null
@@ -1400,10 +1404,13 @@ export default function App() {
     <ScenarioDocumentCommands
       controller={programController}
       authoringAdmissionAllowed={authoringAdmissionOpen}
-      replacementAdmissionAllowed={replacementAdmissionAllowed(authoringAdmissionOpen, authoringCause)}
+      replacementAdmissionAllowed={replacementAdmissionAllowed(
+        authoringAdmissionOpen, authoringCause, authoringWorkspace.failedApplyHoldsCell)}
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
       localInvalidEdit={programInvalidEdit}
       motionActive={documentMotionActive}
+      newWaitReason={documentNewWaitReason}
+      componentActionActive={documentComponentActionActive}
       cellComponents={cellState.components?.map((component) => component.component_id) ?? null}
     />
   );
@@ -1428,7 +1435,7 @@ export default function App() {
           <span className="brand-mark" aria-hidden="true">MF</span>
           <strong>ManyForge</strong>
         </div>
-        <nav className="workspace-switcher" aria-label="Workbench sections">
+        <nav className="workspace-switcher" aria-label="ManyForge sections">
           <DocumentStateLetters states={programStates} owner="Program" side="left" />
           <button
             type="button"
@@ -1604,6 +1611,7 @@ export default function App() {
               <DraftInputResetProvider scope="deployment" resetKey={deploymentController.deploymentDraftInputResetEpoch}>
               <ComponentsWorkspace
                 enabled={headlessEnabled}
+                applicationStartId={headlessSnapshot?.applicationStartId ?? null}
                 controller={deploymentController}
                 cellState={cellState}
                 catalog={componentCatalog}

@@ -11,7 +11,6 @@
 #include <stop_token>
 #include "execution_host_scene_bridge.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
-#include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/ports/iio_signal_service.hpp>
@@ -76,7 +75,6 @@ struct ExecutionProduct {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
   std::shared_ptr<const deployment::ProgramBinding> program_binding;
-  std::optional<deployment::PreparedActivationProgramOutcomeDTO> selected_program_outcome{};
   std::shared_ptr<core::IIoSignalService> io_signal_service{};
   std::shared_ptr<const core::IoActivationRuleCatalogDTO> compiled_global_io_rules{};
   // Mutually exclusive with the actual service catalog. Same prepared product
@@ -198,8 +196,6 @@ struct Composition final : ExecutionProduct {
 #endif
   std::unique_ptr<core::AddressedPickPlacePlanningOwner>
       pick_place_planning_owner;
-  std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
-      active_publication_reader;
   std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
       artifact_source;
   std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
@@ -212,6 +208,13 @@ struct Composition final : ExecutionProduct {
   // the existing runtime publisher and is rechecked for every source view.
   std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane;
   std::shared_ptr<ControllerLaunchProcess> controller_process;
+  /// An I/O device's own process (simulated PLC, pose source, AI model):
+  /// after the driver-restart entry started it again, awaits it as its Apply
+  /// does and makes its exit the device drivers' fault again; a typed error
+  /// otherwise. Set by the Apply that builds the device.
+  std::function<core::Result<void>(const std::shared_ptr<ControllerLaunchProcess> &,
+                                   const IoProviderDriverGroup &, std::stop_token)>
+      restarted_process_ready;
   std::string controller_request_context;
   std::optional<ControllerLaunchSupervisor::Ensured> prepared_controller_launch;
   bool controller_launch_adopted{};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/types/application_identity.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 
 namespace manyforge::core {
@@ -16,10 +17,9 @@ class IAddressedOperationOwner {
   [[nodiscard]] virtual Result<OperationControlAcceptedDTO>
   acknowledge_completed(const OperationControlRequestDTO& request) = 0;
   [[nodiscard]] virtual Result<OperationStateDTO> get_operation_state(
-      const OperationId& operation_id) const = 0;
+      const OperationNumber& operation_id) const = 0;
   [[nodiscard]] virtual Result<void> reconcile_subordinate_state() = 0;
-  [[nodiscard]] virtual const RequestOwnerEpoch& request_owner_epoch()
-      const noexcept = 0;
+  [[nodiscard]] virtual ApplicationStartId application_start_id() const noexcept = 0;
 };
 
 }  // namespace manyforge::core

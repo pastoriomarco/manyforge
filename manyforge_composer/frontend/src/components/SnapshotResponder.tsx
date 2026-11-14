@@ -17,7 +17,7 @@ export interface SnapshotRequestView {
   width: number;
   height: number;
   mime: 'image/png' | 'image/jpeg';
-  requiredFrame: { ownerEpoch: string; generation: number };
+  requiredFrame: { applicationStartId: string; generation: number };
   timeoutMs: number;
 }
 
@@ -44,7 +44,7 @@ export function validateSnapshotRequest(request: SnapshotRequestView): string | 
   if (
     request.requiredFrame === undefined
     || (
-      !request.requiredFrame.ownerEpoch.trim()
+      !request.requiredFrame.applicationStartId.trim()
       || !Number.isSafeInteger(request.requiredFrame.generation)
       || request.requiredFrame.generation < 0
     )

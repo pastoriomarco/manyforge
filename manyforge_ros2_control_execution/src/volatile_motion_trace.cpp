@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <limits>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
 
 namespace manyforge::ros2_control_execution {
@@ -33,9 +34,7 @@ V key_value(const VolatileMotionTrace::Token &t) {
   return V(
       V::Object{{"action", V(t.action)},
                 {"binding_epoch", count(t.epoch.value())},
-                {"controller_goal_id", V(t.key.controller_goal_id.value())},
-                {"controller_goal_generation",
-                 count(t.key.controller_goal_generation.value())}});
+                {"controller_goal_id", core::ControllerGoalIdValue(t.key)}});
 }
 V replacement_policy(bool replacement,
                      const std::optional<core::ExecutionReplacementStartDTO> &start) {
@@ -120,15 +119,11 @@ std::shared_ptr<void> VolatileMotionTrace::Charge(std::size_t bytes) {
 }
 void VolatileMotionTrace::Preregister(
     const std::string &action, core::ExecutionBindingEpoch epoch,
-    const core::ExecutionGoalKey &key,
+    const core::ControllerGoalId &key,
     const core::PreparedOperationParticipantDTO &p) noexcept {
   try {
     const auto bounded = [](const std::string &s) { return s.size() <= 2048U; };
-    if (!bounded(action) || !bounded(key.controller_goal_id.value()) ||
-        !bounded(p.operation_id.value()) ||
-        !bounded(p.participant_id.value()) ||
-        !bounded(p.program_run_id.value()) ||
-        !bounded(p.program_binding_id.value()) ||
+    if (!bounded(action) || !bounded(p.program_binding_id.value()) ||
         !bounded(p.controllable_component_id.value())) {
       ++failures_;
       return;
@@ -139,9 +134,9 @@ void VolatileMotionTrace::Preregister(
       return;
     }
     Token token{action, epoch, key, {}};
-    Context context{p.operation_id.value(),
-                    p.participant_id.value(),
-                    p.program_run_id.value(),
+    Context context{p.operation_id,
+                    p.participant_id,
+                    p.program_run_id,
                     p.program_binding_id.value(),
                     p.controllable_component_id.value(),
                     p.operation_revision.value()};
@@ -169,11 +164,10 @@ void VolatileMotionTrace::Evict(Garbage &garbage) {
 }
 VolatileMotionTrace::TokenPtr VolatileMotionTrace::Begin(
     const std::string &action, core::ExecutionBindingEpoch epoch,
-    const core::ExecutionGoalKey &key, const TokenPtr &predecessor,
+    const core::ControllerGoalId &key, const TokenPtr &predecessor,
     core::TimePoint attempted_at, Garbage &garbage) noexcept {
   try {
-    if (action.size() > 2048U ||
-        key.controller_goal_id.value().size() > 2048U) {
+    if (action.size() > 2048U) {
       ++failures_;
       return {};
     }
@@ -191,10 +185,8 @@ VolatileMotionTrace::TokenPtr VolatileMotionTrace::Begin(
       }
     if (!token.context && predecessor && predecessor->epoch == epoch &&
         predecessor->action == action &&
-        predecessor->key.controller_goal_id == key.controller_goal_id &&
-        predecessor->key.controller_goal_generation.value() != UINT64_MAX &&
-        predecessor->key.controller_goal_generation.value() + 1U ==
-            key.controller_goal_generation.value())
+        predecessor->key.participant() == key.participant() &&
+        predecessor->key.generation + 1U == key.generation)
       token.context = predecessor->context;
     token.allocation_charge = Charge(64U * 1024U);
     if (!token.allocation_charge) {
@@ -391,7 +383,7 @@ void VolatileMotionTrace::PublishedScale(const std::string &action,
   }
 }
 core::Result<V>
-VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
+VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
                               std::size_t allowance) const {
   const auto error = [](const char *reason) {
     return core::Result<V>::Err(
@@ -419,13 +411,15 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
       dropped = dropped_samples_;
       evicted_scales = evicted_scales_;
     }
+    const auto start_text = core::FormatApplicationStartId(application_start_id);
     V::Array goal_values, sample_values, scale_values, omission_values;
     bool truncated = false;
     std::uint64_t association_missing = 0;
     auto make = [&](std::size_t exported) {
       return V(V::Object{
-          {"schema_version", V("manyforge.volatile_motion_trace.v1")},
-          {"request_owner_epoch", V(owner.value())},
+          {"schema_version", V("manyforge.volatile_motion_trace.v2")},
+          {"application_start_id",
+           V(std::string(start_text.data(), start_text.size()))},
           {"volatile", V(true)},
           {"retention", V(V::Object{{"goal_limit", count(kGoalLimit)},
                                     {"goal_byte_limit", count(kGoalBytes)},
@@ -468,16 +462,14 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
       if (!e.payload)
         continue;
       V::Object row{
-          {"controller_goal_id", V(e.token->key.controller_goal_id.value())},
-          {"controller_goal_generation",
-           count(e.token->key.controller_goal_generation.value())},
+          {"controller_goal_id", core::ControllerGoalIdValue(e.token->key)},
           {"binding_epoch", count(e.token->epoch.value())},
           {"action", V(e.token->action)},
           {"predecessor",
            e.predecessor ? key_value(*e.predecessor) : V(nullptr)},
           {"mechanism_goal_id", e.facts.mechanism_goal_id.empty()
                                     ? V(nullptr)
-                                    : V(e.facts.mechanism_goal_id.value())},
+                                    : V(core::MechanismGoalIdHex(e.facts.mechanism_goal_id))},
           {"send",
            V(V::Object{
                {"attempted_at_ns", ns(e.attempted_at)},
@@ -500,14 +492,20 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
                                                        : V(nullptr)}})
                : V(nullptr)},
           {"trajectory", goal_value(*e.payload)}};
+      row.emplace_back("operation_id",
+                       e.context ? count(e.context->operation_id.value())
+                                 : V(nullptr));
+      row.emplace_back("participant_id",
+                       e.context ? core::OperationParticipantIdValue(
+                                       e.context->participant_id)
+                                 : V(nullptr));
+      // Manual work has no run: the member is left out.
+      if (!e.context || e.context->program_run_id)
+        row.emplace_back("program_run_id",
+                         e.context ? count(e.context->program_run_id->value())
+                                   : V(nullptr));
       for (auto [name, value] :
-           {std::pair{"operation_id",
-                      e.context ? e.context->operation_id : std::string{}},
-            {"participant_id",
-             e.context ? e.context->participant_id : std::string{}},
-            {"program_run_id",
-             e.context ? e.context->program_run_id : std::string{}},
-            {"program_binding_id",
+           {std::pair{"program_binding_id",
              e.context ? e.context->program_binding_id : std::string{}},
             {"controllable_component_id",
              e.context ? e.context->component_id : std::string{}}})

@@ -1,7 +1,10 @@
 #include "scene_projection_worker.hpp"
 
+#include <manyforge_core/types/error_catalog.generated.hpp>
+
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -331,7 +334,13 @@ void SceneProjectionWorker::run(std::stop_token stop_token) noexcept {
       try {
         item = take_next_locked();
       } catch (...) {
-        std::terminate();
+        // Only a defect throws here. The worker reports it and ends through
+        // its ordinary exit, after which every submission is refused.
+        lock.unlock();
+        (void)std::fprintf(stderr, "manyforge_fault code=%.*s\n",
+                           static_cast<int>(core::error_codes::kSceneProjectionTakeFailed.size()),
+                           core::error_codes::kSceneProjectionTakeFailed.data());
+        break;
       }
       in_flight_ = true;
     }

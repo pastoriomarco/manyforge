@@ -6,12 +6,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
-import json
 import logging
 import math
 from threading import Event, Lock, Thread
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Final, Sequence
 
 import rfc8785
 from starlette.responses import JSONResponse
@@ -36,7 +35,6 @@ from .models import (
     ProgramReferenceValidationRequest,
     CallerAttributionRequest,
     ApplyOutcomeRequest,
-    HistorianReconcileRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
@@ -45,17 +43,15 @@ from .models import (
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
-    AuthoringOwnerReconciliationRequest,
     ProgramModelAttemptRequest,
     ProgramNodeCorrectionPreviewRequest,
     ProgramRunStartRequest,
-    ProgramRunStopRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
-    ProgramFullStopResetRequest,
-    ProgramFullStopResumeRequest,
+    ProgramHaltDiscardRequest,
+    ProgramHaltResumeRequest,
     ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
@@ -79,23 +75,25 @@ from .cell_admission import CellAdmissionError
 from .component_model import (
     ComponentModel,
     ComponentState,
+    CycleUnknown,
+    RunCycleFacts,
     SignalSample,
     DEFAULT_LIFECYCLE_TIMEOUT_S,
-    action_wait_s,
     group_action_order,
-    launch_settle_bound_s,
-    lifecycle_timeouts_s,
+    owner_stall,
     parse_component_model,
     manual_operation_resident,
     run_readiness,
     wait_for_action,
 )
 from .component_overview import ComponentOverviewFacts
+from .identity import RequestAdmission, parse_application_start_id
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
 from .activation_preparer import _program_catalog
 from .apply_follower import CommittedApplyFollower
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
-from .program_cycle import program_operation_failures
+from .program_cycle import MAXIMUM_ENDED_COMMAND_ROWS, program_operation_failures
+from .command_rows import CommandRowTable
 from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
@@ -104,20 +102,20 @@ from .program_binding_projection import (
 )
 
 
-RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
-MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
-PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v2"
+RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v3"
+MANAGER_SOURCE_VERSION = "manyforge.manager_source.v2"
+PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v3"
 PROGRAM_NODE_PREVIEW_INTENT_VERSION = (
-    "manyforge.program_node_correction_preview_intent.v2"
+    "manyforge.program_node_correction_preview_intent.v3"
 )
-PROGRAM_NODE_PREVIEW_VERSION = "manyforge.program_node_correction_preview.v2"
+PROGRAM_NODE_PREVIEW_VERSION = "manyforge.program_node_correction_preview.v3"
 # What the native motion preview evaluates: it plans a trajectory from the
 # current observed start state and collision-validates it against the named
 # scene revision. It is not IK-only, not a reservation, and execution always
 # plans and validates again.
 PROGRAM_NODE_PREVIEW_CHECK = "trajectory_planned_and_collision_validated"
 _PROGRAM_NODE_PREVIEW_IDENTITY_KEYS = (
-    "request_id",
+    "request_key",
     "program_run_id",
     "program_id",
     "program_revision",
@@ -136,16 +134,16 @@ VOLATILE_MOTION_TRACE_MARGIN_BYTES = 1024
 VOLATILE_MOTION_TRACE_MAX_BYTES = 3 * 1024 * 1024
 # Below this remaining budget no useful trace fits; skip the native read.
 VOLATILE_MOTION_TRACE_MIN_ALLOWANCE_BYTES = 4096
-PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v4"
-PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v2"
+PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v5"
+PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v3"
 SOURCE_MODEL_CONTEXT_VERSION = "manyforge.source_model_context.v1"
 ASSISTANT_MODE_CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _PROGRAM_RUN_STATES = frozenset(
     {
         "running",
         "intervention_required",
-        "full_stopping",
-        "full_stopped",
+        "halting",
+        "halted",
         "stopping",
         "finalizing",
         "stopped",
@@ -157,14 +155,14 @@ _ACTIVE_PROGRAM_RUN_STATES = frozenset(
     {
         "running",
         "intervention_required",
-        "full_stopping",
-        "full_stopped",
+        "halting",
+        "halted",
         "stopping",
         "finalizing",
     }
 )
 
-_HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v2"
+_HISTORY_SUMMARY_PAGE_VERSION = "manyforge.historian_summary_page.v3"
 
 
 def _rendered_response_bytes(content: dict[str, Any]) -> int:
@@ -213,7 +211,7 @@ _ADMITTED_SPEED_HISTORY_PAGES = 4
 
 
 def _prepared_motion_admitted_speeds(
-    stored: Any, program_run_id: str
+    stored: Any, program_run_id: int
 ) -> list[dict[str, Any]]:
     """Copy one ``operation_prepared`` record's Kernel speed diagnostics.
 
@@ -234,8 +232,14 @@ def _prepared_motion_admitted_speeds(
         or not isinstance(intent, dict)
     ):
         return []
+    def participant_key(value: Any) -> tuple[Any, Any] | None:
+        # A participant id is the object {operation_id, ordinal} (contract 1.5).
+        if not isinstance(value, dict):
+            return None
+        return (value.get("operation_id"), value.get("ordinal"))
+
     participants = {
-        participant.get("participant_id"): participant
+        participant_key(participant.get("participant_id")): participant
         for participant in state.get("participants") or ()
         if isinstance(participant, dict)
     }
@@ -243,7 +247,7 @@ def _prepared_motion_admitted_speeds(
     for diagnostic in intent.get("prepared_motion_diagnostics") or ():
         if not isinstance(diagnostic, dict):
             continue
-        participant = participants.get(diagnostic.get("participant_id"))
+        participant = participants.get(participant_key(diagnostic.get("participant_id")))
         admitted = diagnostic.get("admitted_tcp_linear_speed_mps")
         if (
             participant is None
@@ -280,6 +284,16 @@ def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
     )
 
 
+def _start_identity_text(value: object) -> bool:
+    """An ``application_start_id``: exactly 16 lowercase hex characters."""
+
+    try:
+        parse_application_start_id(value)  # type: ignore[arg-type]
+    except ValueError:
+        return False
+    return True
+
+
 _RUN_END_REASONS = frozenset({"completed", "failed", "stopped", "cell_fault"})
 _RUN_END_DETAIL_FIELDS = frozenset(
     {"node_instance_id", "error", "stopped_by", "rule_id", "component_id"}
@@ -311,6 +325,17 @@ def _valid_run_end(value: object) -> bool:
             details.get(name) is None or _bounded_text(details[name], maximum_bytes=512)
             for name in ("node_instance_id", "rule_id", "component_id")
         )
+    )
+
+
+def _valid_run_halt(value: object) -> bool:
+    """`{kind, source_label}` while the run is halting or halted, else null."""
+
+    return value is None or (
+        isinstance(value, dict)
+        and set(value) == {"kind", "source_label"}
+        and _bounded_text(value["kind"], maximum_bytes=256)
+        and (value["source_label"] is None or isinstance(value["source_label"], str))
     )
 
 
@@ -422,6 +447,11 @@ class TrustedAttribution:
     assurance: str = "unverified"
 
 
+# The end of an accepted empty Apply that a later one replaced before its
+# Scene clear began (OD-239).
+_EMPTY_APPLY_SUPERSEDED: Final = {"state": "superseded", "remaining": None, "reason": None}
+
+
 class HeadlessService:
     """Select fields from immutable owner snapshots; own no runtime state."""
 
@@ -433,7 +463,11 @@ class HeadlessService:
         program_runner: ProgramRunnerPort | None = None,
         cell_admission: Any | None = None,
         activation_preparer: Any | None = None,
+        *,
+        application_start_id: str,
     ) -> None:
+        # The one ``A`` check and the one Headless key minter (minter 5).
+        self.admission = RequestAdmission(application_start_id)
         self.core = core
         self.manager = manager
         self.execution = execution
@@ -449,12 +483,23 @@ class HeadlessService:
         self._apply_scene_stop = Event()
         self._apply_scene_completion_lock = Lock()
         self._empty_scene_execution_lock = Lock()
-        self._apply_scene_attempted: tuple[str, int, str] | None = None
-        self._empty_scene_applies: set[tuple[str, int]] = set()
-        self._direct_scene_clears: set[tuple[str, str]] = set()
+        self._apply_scene_attempted: tuple[int, int, str] | None = None
+        self._empty_scene_applies: set[tuple[int, int]] = set()
+        self._direct_scene_clears: set[str] = set()
         self._scene_clear: dict[str, Any] | None = None
         self._initial_scene_failure: dict[str, Any] | None = None
+        # Accepted Resets that reload the initial Scene, by request key, until
+        # their row ends (at most the runner's kept rows; OD-214).
+        self._scene_reloading_resets: dict[str, tuple[int, int, str]] = {}
         self.initial_scene_observer: Callable[[], None] | None = None
+        # Activation preparation (OD-214): answered at acceptance, its row
+        # published beside `scene_clear`; one at a time, the slot held by
+        # the preparing thread. The prepared activations of the kept
+        # succeeded rows, by captured input digest.
+        self.activation_preparations = CommandRowTable()
+        self._activation_preparation_slot = Lock()
+        self._prepared_activations: dict[str, dict[str, Any]] = {}
+        self._prepared_activations_lock = Lock()
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
         # One group action runs at a time; held by its thread.
@@ -507,10 +552,9 @@ class HeadlessService:
         intent = {
             "claim_kind": "authoring_mutation",
             "owner_role": "authoring_owner",
-            "owner_epoch": request.request_owner_epoch,
-            "owner_transaction_id": request.owner_transaction_id,
-            "request_id": request.request_id,
-            "request_payload_digest": request.request_payload_digest,
+            # An authoring transaction has no owner transaction number.
+            "owner_transaction_id": None,
+            "request_key": request.request_key,
             "expected_admission_generation": request.expected_admission_generation,
             "scope": {"resources": [], "configurations": []},
             "program_cycle_evidence": None,
@@ -519,7 +563,12 @@ class HeadlessService:
         try:
             return self._cell_admission().acquire(intent)
         except CellAdmissionError as error:
-            raise self._admission_error(error) from error
+            failure = self._admission_error(error)
+            if error.outcome_unknown:
+                # The Kernel's answer to this claim request was lost: the
+                # caller keeps its exact request and replays it.
+                failure.details["outcome_unknown"] = True
+            raise failure from error
 
     def settle_authoring_mutation(
         self, request: AuthoringMutationSettlementRequest
@@ -537,10 +586,9 @@ class HeadlessService:
             )
         release = {
             "owner_role": intent["owner_role"],
-            "owner_epoch": intent["owner_epoch"],
             "owner_transaction_id": intent["owner_transaction_id"],
-            "request_id": intent["request_id"],
-            "request_payload_digest": intent["request_payload_digest"],
+            # The key of the request that causes the release (1.15.2).
+            "request_key": request.request_key,
             "acquired_admission_generation": claim.get("acquired_admission_generation"),
             "claim_generation": claim.get("claim_generation"),
             "settlement": {
@@ -569,90 +617,6 @@ class HeadlessService:
             return self._cell_admission().recovery_receipt(
                 request.model_dump(mode="json")
             )
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
-
-    def reconcile_authoring_owner(
-        self, request: AuthoringOwnerReconciliationRequest
-    ) -> dict[str, Any]:
-        owners = request.current_owner_epochs
-        authoring = [
-            item for item in owners if item.get("owner_role") == "authoring_owner"
-        ]
-        if len(authoring) != 1:
-            raise HeadlessApiError(
-                "authoring_reconciliation_invalid",
-                "reconciliation must name exactly one authoring owner epoch",
-            )
-        try:
-            return self._cell_admission().reconcile(request.model_dump(mode="json"))
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
-
-    @staticmethod
-    def _request_digest(value: dict[str, Any]) -> str:
-        encoded = json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-    def _acquire_owner_claim(
-        self,
-        *,
-        claim_kind: str,
-        owner_role: str,
-        owner_epoch: str,
-        owner_transaction_id: str,
-        request_id: str,
-        expected_generation: int,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        intent = {
-            "claim_kind": claim_kind,
-            "owner_role": owner_role,
-            "owner_epoch": owner_epoch,
-            "owner_transaction_id": owner_transaction_id,
-            "request_id": request_id,
-            "request_payload_digest": self._request_digest(payload),
-            "expected_admission_generation": expected_generation,
-            "scope": {"resources": [], "configurations": []},
-            "program_cycle_evidence": None,
-            "intervention_evidence": None,
-        }
-        try:
-            return self._cell_admission().acquire(intent)
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
-
-    def _release_owner_claim(
-        self,
-        claim: dict[str, Any],
-        *,
-        committed: bool,
-        result: dict[str, Any],
-    ) -> None:
-        intent = claim["intent"]
-        release = {
-            "owner_role": intent["owner_role"],
-            "owner_epoch": intent["owner_epoch"],
-            "owner_transaction_id": intent["owner_transaction_id"],
-            "request_id": intent["request_id"],
-            "request_payload_digest": intent["request_payload_digest"],
-            "acquired_admission_generation": claim["acquired_admission_generation"],
-            "claim_generation": claim["claim_generation"],
-            "settlement": {
-                "settlement_kind": (
-                    "owner_commit" if committed else "proven_no_effect"
-                ),
-                "evidence_digest": self._request_digest(result),
-            },
-        }
-        try:
-            self._cell_admission().release(release)
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
@@ -737,7 +701,7 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_read(self, operation_id: str) -> dict[str, Any]:
+    def execution_read(self, operation_id: int) -> dict[str, Any]:
         return self._execution().read(operation_id)
 
     def execution_plan_pick(
@@ -757,6 +721,15 @@ class HeadlessService:
         return self._execution().plan_place(
             request, trusted_principal_id=attribution.principal_id
         )
+
+    def execution_read_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._execution().read_planning_job(job_id)
+
+    def execution_cancel_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._execution().cancel_planning_job(job_id)
+
+    def execution_release_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._execution().release_planning_job(job_id)
 
     def execution_reset(
         self,
@@ -785,27 +758,38 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_full_stop(
+    def execution_stop_all(
         self,
         request: FullStopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().full_stop(
+        return self._execution().stop_all(
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_recognized_malformed_stop(
+    def execution_halt(
         self,
-        *,
-        request_id: str,
-        recognized_route: str,
-        reason: str,
+        request: FullStopIntentRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        return self._execution().recognized_malformed_stop(
-            request_id=request_id,
+        return self._execution().halt(
+            request, trusted_principal_id=attribution.principal_id
+        )
+
+    def execution_recognized_stop(
+        self,
+        *,
+        request_key: str,
+        recognized_route: str,
+        reason: str,
+        source_label: str | None,
+        attribution: TrustedAttribution,
+    ) -> dict[str, Any]:
+        return self._execution().recognized_stop(
+            request_key=request_key,
             recognized_route=recognized_route,
             reason=reason,
+            source_label=source_label,
             trusted_principal_id=attribution.principal_id,
         )
 
@@ -830,14 +814,10 @@ class HeadlessService:
     def io_signals(self) -> list[SignalSample]:
         return self.component_model().signal_samples
 
-    def run_readiness(self) -> dict[str, Any]:
-        """The one owner of RunReadiness."""
+    def run_readiness(self, cycle: RunCycleFacts | CycleUnknown) -> dict[str, Any]:
+        """The one owner of RunReadiness, given the runner's cycle facts."""
 
         model = self.component_model()
-        try:
-            cycle: dict[str, Any] | None = self.program_cycle_status()
-        except HeadlessApiError:
-            cycle = None
         try:
             status: dict[str, Any] | None = self.program_applied_status()
         except HeadlessApiError:
@@ -924,16 +904,15 @@ class HeadlessService:
             component_id = sorted(missing)[0]
             raise HeadlessApiError("component_not_found", f"component {component_id} is not in the cell")
         selected = [component_id for component_id in order if component_id in by_id]
-        timeouts = lifecycle_timeouts_s(self.manager_graph()["cell_graph"])
         owner_of = {s["component_id"]: s.get("owner_id") for s in states}
-        stop_generation = self._stop_generation()
+        last_stop_event_id = self._last_stop_event_id()
         logger = logging.getLogger(__name__)
 
         def run() -> None:
             try:
                 recovered_owners: set[str] = set()
                 for component_id in selected:
-                    if self._stop_generation() != stop_generation:
+                    if self._last_stop_event_id() != last_stop_event_id:
                         return
                     target = by_id[component_id]
                     confirmed = target["recovery_preflight"]
@@ -978,14 +957,13 @@ class HeadlessService:
                     if previous is not None and previous.get("started_at_ns") == started:
                         logger.warning("component_recovery_outcome_unknown", extra={"component_id": component_id})
                         return
-                    owner = owner_of.get(component_id)
-                    member_timeout = timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S)
-                    owner_timeout = timeouts.get(owner, DEFAULT_LIFECYCLE_TIMEOUT_S) if owner else 0.0
-                    deadline = time.monotonic() + 2 * member_timeout + owner_timeout
+                    # No limit of its own: the adapters bound the composite;
+                    # it ends at its `last_action`, a Stop, the component
+                    # leaving, the owner-stall fault or a failed read.
                     while True:
                         state = next((s for s in self.component_model().component_states
                                       if s["component_id"] == component_id), None)
-                        if state is None or self._stop_generation() != stop_generation:
+                        if state is None or self._last_stop_event_id() != last_stop_event_id:
                             return
                         result = state.get("last_action")
                         if result and result.get("started_at_ns") == started and "action" not in state:
@@ -1005,8 +983,10 @@ class HeadlessService:
                                     and actual[0]["eligibility"] == "recover"):
                                 recovered_owners.add(owner_id)
                             break
-                        if time.monotonic() >= deadline:
-                            logger.warning("component_recovery_outcome_unknown", extra={"component_id": component_id})
+                        stalled = owner_stall(state)
+                        if stalled is not None:
+                            logger.warning("component_recovery_outcome_unknown", extra={
+                                "component_id": component_id, "error_code": stalled["code"]})
                             return
                         time.sleep(0.1)
             except HeadlessApiError as error:
@@ -1019,12 +999,12 @@ class HeadlessService:
         Thread(target=run, name="component-recover-enable-group", daemon=True).start()
         return {"action": "enable"}
 
-    def _stop_generation(self) -> Any:
-        """The cell's Stop generation; it changes with every new Stop."""
+    def _last_stop_event_id(self) -> Any:
+        """The cell's last Stop event id; it changes with every new Stop."""
 
         control = self.execution_control_state().get("control_state")
         stop = control.get("cell_stop_action") if isinstance(control, dict) else None
-        return stop.get("expected_stop_generation") if isinstance(stop, dict) else None
+        return stop.get("last_event_id") if isinstance(stop, dict) else None
 
     def component_actions(self, action: str, component_ids: list[str]) -> dict[str, Any]:
         """One action on the named components, one at a time.
@@ -1037,11 +1017,10 @@ class HeadlessService:
         e-stop (the explicit clear), and a machine's `recover` then prepares its members
         that aren't prepared, so Enable all after an e-stop or a failed Load
         brings every component up. Each action is
-        dispatched after the previous one finished, bounded as the host bounds
-        it (`action_wait_s`): the component's authored lifecycle timeout from
-        the active cell graph; a `prepare` of a component with no action since
-        its launch also waits up to the launch bound, the cell's lifecycle
-        timeouts summed (a result that doesn't come back is `unknown`). A
+        dispatched after the previous one finished (its `last_action`; the
+        component's adapter bounds it, the wait has no limit of its own); one
+        whose component reports the owner-stall fault ends `unknown` with
+        that code (`wait_for_action`). A
         refusal or failure of one doesn't stop the rest (each result is that
         component's `last_action`), except: a Stop ends the group, and the
         members of an owner whose `prepare` failed are skipped
@@ -1093,11 +1072,7 @@ class HeadlessService:
                     if owner_of.get(member) == component_id and unprepared(member)
                     and member not in selected
                 )
-        timeouts = lifecycle_timeouts_s(self.manager_graph()["cell_graph"])
-        launch_bound_s = launch_settle_bound_s(
-            timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S) for component_id in order
-        )
-        stop_generation = self._stop_generation()
+        last_stop_event_id = self._last_stop_event_id()
         logger = logging.getLogger(__name__)
 
         def read_states() -> list[ComponentState]:
@@ -1112,7 +1087,7 @@ class HeadlessService:
         def run_group() -> None:
             failed_owners: set[str] = set()
             for component_id, step_action in steps:
-                if self._stop_generation() != stop_generation:
+                if self._last_stop_event_id() != last_stop_event_id:
                     logger.warning(
                         "component_group_action_stopped",
                         extra={"component_id": component_id, "action": step_action,
@@ -1142,14 +1117,6 @@ class HeadlessService:
                         component_id,
                         step_action,  # type: ignore[arg-type]
                         previous[component_id],
-                        timeout_s=action_wait_s(
-                            step_action,
-                            timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S),
-                            launch_bound_s,
-                            # The host starts a launched component without a
-                            # `last_action`; its first Prepare awaits the launch.
-                            launch_settled=previous[component_id] is not None,
-                        ),
                     )
                 except HeadlessApiError as error:
                     logger.warning(
@@ -1304,13 +1271,11 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return {
             "projection_generation": runtime.get("projection_generation"),
-            "projection_owner_epoch": runtime.get("projection_owner_epoch"),
             "available": section.get("available"),
             "freshness": section.get("freshness"),
             "known_gaps": section.get("known_gaps"),
             "receiver_age_ns": section.get("receiver_age_ns"),
             "source_generation": section.get("source_generation"),
-            "source_owner_epoch": section.get("source_owner_epoch"),
             "source_owner_id": section.get("source_owner_id"),
             "source_content_digest": section.get("source_content_digest"),
         }
@@ -1332,7 +1297,7 @@ class HeadlessService:
                 "Manager source active.canonical_empty must be a boolean",
             )
         return {
-            "schema_version": "manyforge.manager_status_projection.v1",
+            "schema_version": "manyforge.manager_status_projection.v2",
             "source": self._source_metadata(runtime, section),
             "status": payload,
         }
@@ -1347,7 +1312,7 @@ class HeadlessService:
                 "Manager source has no active graph",
             )
         projection = {
-            "schema_version": "manyforge.manager_graph_projection.v1",
+            "schema_version": "manyforge.manager_graph_projection.v2",
             "source": status["source"],
             "graph_revision": active.get("graph_revision"),
             "retained_bundle_id": active.get("retained_bundle_id"),
@@ -1369,7 +1334,7 @@ class HeadlessService:
                 "Manager source has no runtime convergence projection",
             )
         return {
-            "schema_version": "manyforge.manager_diff_projection.v1",
+            "schema_version": "manyforge.manager_diff_projection.v2",
             "source": status["source"],
             "converged": runtime.get("converged"),
             "desired_units": runtime.get("desired_units"),
@@ -1380,7 +1345,7 @@ class HeadlessService:
         environment, skills = _build_skills()
         selected = self.core.node_environment_projection()
         if (
-            selected.get("schema_version") != "manyforge.node_environment_projection.v2"
+            selected.get("schema_version") != "manyforge.node_environment_projection.v3"
             or selected.get("environment_digest") != environment.environment_digest
         ):
             raise HeadlessApiError(
@@ -1424,7 +1389,7 @@ class HeadlessService:
         source = projection.get("source")
         if projection.get(
             "schema_version"
-        ) != "manyforge.node_environment_projection.v2" or not isinstance(source, dict):
+        ) != "manyforge.node_environment_projection.v3" or not isinstance(source, dict):
             raise HeadlessApiError(
                 "node_environment_projection_invalid",
                 "native core returned an unsupported node environment projection",
@@ -1474,7 +1439,7 @@ class HeadlessService:
             not isinstance(runner_projection, dict)
             or set(runner_projection) != {"availability", "schema_version", "source"}
             or runner_projection.get("schema_version")
-            != "manyforge.program_node_availability.v1"
+            != "manyforge.program_node_availability.v2"
             or not isinstance(runner_projection.get("source"), dict)
             or not isinstance(runner_projection.get("availability"), dict)
         ):
@@ -1520,7 +1485,6 @@ class HeadlessService:
                 "cycle_generation",
                 "graph_revision",
                 "node_environment_digest",
-                "owner_epoch",
                 "owner_id",
                 "program_binding_id",
                 "program_id",
@@ -1680,7 +1644,7 @@ class HeadlessService:
         source = projection.get("source")
         if projection.get(
             "schema_version"
-        ) != "manyforge.source_model_projection.v3" or not isinstance(source, dict):
+        ) != "manyforge.source_model_projection.v4" or not isinstance(source, dict):
             raise HeadlessApiError(
                 "source_model_projection_invalid",
                 "native core returned an unsupported source model projection",
@@ -1696,9 +1660,9 @@ class HeadlessService:
             or not isinstance(context.get("node_environment"), dict)
             or not isinstance(context.get("source_model"), dict)
             or context["node_environment"].get("schema_version")
-            != "manyforge.node_environment_projection.v2"
+            != "manyforge.node_environment_projection.v3"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v3"
+            != "manyforge.source_model_projection.v4"
         ):
             raise HeadlessApiError(
                 "source_model_context_invalid",
@@ -1726,9 +1690,9 @@ class HeadlessService:
             != ASSISTANT_MODE_PROJECTION_VERSION
             or context["assistant_mode"].get("mode") != mode_id
             or context["node_environment"].get("schema_version")
-            != "manyforge.node_environment_projection.v2"
+            != "manyforge.node_environment_projection.v3"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v3"
+            != "manyforge.source_model_projection.v4"
         ):
             raise HeadlessApiError(
                 "assistant_mode_context_invalid",
@@ -1840,9 +1804,13 @@ class HeadlessService:
     def notify_committed_apply(self) -> None:
         """Reconcile values and initialize Scene only for an explicit Apply purpose.
 
-        Repeated status reads do not repeat placement. A typed Runner
-        authoring-readiness refusal is retried briefly; other failures remain
-        terminal, and idle Reset with reload remains the explicit retry path.
+        Repeated status reads do not repeat placement. The preparation waits
+        for the authoring admission to open, and a typed Runner
+        authoring-readiness or busy refusal is tried again, with no time limit
+        (OD-214): the wait ends when it is sent, when another Apply supersedes
+        this one, at shutdown, or when a read fails (a lost runner or execution
+        host). Other failures remain terminal, and idle Reset with reload
+        remains the explicit retry path.
         The attempt latch is memory-only: a replacement Headless instance may
         attempt the current initializing Apply again on its next notification.
         """
@@ -1857,12 +1825,15 @@ class HeadlessService:
                 error,
             )
         identity = None
+        committed_key: tuple[int, int] | None = None
         dispatched = False
         def mark_dispatched() -> None:
             nonlocal dispatched
             dispatched = True
         try:
             committed = self.committed_scenario_activation()
+            committed_key = (committed["apply_id"], committed["apply_generation"])
+            self._end_unstarted_empty_applies(committed_key)
             if committed["scene_initialization"] != "initialize":
                 return
             identity = (committed["apply_id"], committed["apply_generation"],
@@ -1878,6 +1849,12 @@ class HeadlessService:
                 or applied["program_id"] is None
                 or applied["record_digest"] != committed["record_digest"]
             ):
+                # A committed empty Apply whose Applied Program does not
+                # match: its clear cannot begin (OD-239).
+                self._end_unstarted_empty_applies(committed_key, HeadlessApiError(
+                    "program_run_applied_selection_stale",
+                    "The Applied Program does not match the committed Apply",
+                ))
                 return
             with self._apply_scene_completion_lock:
                 current = self.committed_scenario_activation()
@@ -1889,15 +1866,7 @@ class HeadlessService:
                 if self._apply_scene_attempted == identity:
                     return
                 self._apply_scene_attempted = identity
-            deadline = time.monotonic() + 30.0
-            last_refusal = None
-            owner_epoch = None
             while not self._apply_scene_stop.is_set():
-                cycle = self.program_cycle_status()
-                current_owner = cycle["program_runner_owner_epoch"]
-                if owner_epoch is not None and current_owner != owner_epoch:
-                    raise HeadlessApiError("program_runner_unavailable", "Program runner changed during initial scene preparation")
-                owner_epoch = current_owner
                 admission = self.authoring_admission()
                 current = self.committed_scenario_activation()
                 if (current["apply_id"], current["apply_generation"],
@@ -1908,38 +1877,36 @@ class HeadlessService:
                         return
                 if self._apply_scene_stop.is_set():
                     return
+                if admission.get("authoring_allowed") is not True:
+                    # Not sent while the admission is closed: a refusal of it
+                    # would only add an ended row to the runner's commands.
+                    if self._apply_scene_stop.wait(0.25):
+                        return
+                    continue
+                # Each attempt is its own request with its own Headless key
+                # (BS 11.6): the admission generation is re-read each time.
                 request = ProgramScenePreparationRequest(
-                    request_id="apply-scene." + identity[2][7:],
-                    request_owner_epoch=owner_epoch,
+                    request_key=self.admission.mint_key(),
                     source_label="headless_apply_completion",
                     expected_applied_record_digest=identity[2],
                     expected_admission_generation=admission["admission_generation"],
                 )
-                # Readiness checks can be slow; no attempt may start after the bound.
-                if time.monotonic() >= deadline:
-                    if last_refusal is not None:
-                        raise last_refusal
-                    raise HeadlessApiError(
-                        "program_scene_preparation_failed",
-                        "Program scene preparation deadline expired before dispatch",
-                    )
                 try:
                     # Runner rechecks selection and admission before effects.
                     self.program_scene_prepare(request, on_dispatch=mark_dispatched)
                     return
                 except HeadlessApiError as error:
-                    # Only the typed Runner refusal is known to precede effects.
-                    if (error.code != "authoring_not_ready"
+                    # Only the typed Runner refusals are known to precede
+                    # effects: not ready, and busy with another command (OD-144).
+                    if (error.code not in {"authoring_not_ready", "execution_control_ingress_busy"}
                         or not isinstance(error.__cause__, ProgramRunnerClientError)):
                         raise
                     dispatched = False  # Runner explicitly refused before effects.
-                    last_refusal = error
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise
-                    if self._apply_scene_stop.wait(min(0.25, remaining)):
+                    if self._apply_scene_stop.wait(0.25):
                         return
         except (HeadlessApiError, ProgramRunnerClientError) as error:
+            # OD-239: an accepted empty Apply this failure leaves unstarted ends.
+            self._end_unstarted_empty_applies(committed_key, error)
             if identity is not None:
                 self._record_initial_scene_failure(identity, error, dispatched=dispatched)
             logging.getLogger(__name__).warning(
@@ -1955,11 +1922,11 @@ class HeadlessService:
             except Exception:
                 logging.getLogger(__name__).exception("Initial scene status wake failed")
 
-    def _current_apply_identity(self) -> tuple[str, int, str]:
+    def _current_apply_identity(self) -> tuple[int, int, str]:
         committed = self.committed_scenario_activation()
         return (committed["apply_id"], committed["apply_generation"], committed["record_digest"])
 
-    def _record_initial_scene_failure(self, identity: tuple[str, int, str], error: Exception, *, dispatched: bool) -> None:
+    def _record_initial_scene_failure(self, identity: tuple[int, int, str], error: Exception, *, dispatched: bool) -> None:
         # Unconfirmed or superseded identity must not modify the condition.
         try:
             with self._apply_scene_completion_lock:
@@ -1978,7 +1945,7 @@ class HeadlessService:
         except (HeadlessApiError, ProgramRunnerClientError):
             return
 
-    def _clear_initial_scene_failure(self, identity: tuple[str, int, str]) -> None:
+    def _clear_initial_scene_failure(self, identity: tuple[int, int, str]) -> None:
         try:
             with self._apply_scene_completion_lock:
                 if self._current_apply_identity() == identity and self._initial_scene_failure is not None and self._initial_scene_failure["identity"] == identity:
@@ -2002,23 +1969,62 @@ class HeadlessService:
             condition.update(apply_id=apply_id, apply_generation=generation, record_digest=digest)
         return {"initial_scene_failure": condition}
 
-    def _clear_empty_applied(self, identity: tuple[str, int, str]) -> None:
+    @staticmethod
+    def _empty_apply_failed(error: Exception) -> dict[str, Any]:
+        """A Scene clear that failed before any effect, in the clear's own shape."""
+
+        return {"state": "failed", "remaining": None,
+                "reason": {"code": "scene_clear_failed",
+                           "message": str(error) or type(error).__name__,
+                           "details": {"reason": getattr(error, "code", "scene_owner_unavailable")}}}
+
+    def _end_empty_apply(self, key: tuple[int, int], result: dict[str, Any]) -> None:
+        """Publish the end of an accepted empty Apply whose clear does not run
+        (OD-239) and forget it. The caller holds `_empty_scene_execution_lock`
+        (so no clear is pending) and `_apply_scene_completion_lock`. A status
+        naming a later Apply is kept: the Manager numbers Applies in
+        increasing order, and a waiter ends on a later Apply's status too."""
+
+        self._empty_scene_applies.discard(key)
+        current = self._scene_clear
+        later_id = None if current is None else current.get("apply_id")
+        if type(later_id) is int and later_id > key[0]:
+            return
+        self._scene_clear = {"apply_id": key[0], "apply_generation": key[1], **result}
+
+    def _end_unstarted_empty_applies(
+        self, committed: tuple[int, int] | None, error: Exception | None = None
+    ) -> None:
+        """OD-239: accepted empty Applies older than the committed one end
+        `superseded`; with ``error`` (the committed Apply or its Applied
+        Program could not be read, or does not match), those up to the
+        committed one (all, when it is unknown) end `failed`."""
+
+        def ends(key: tuple[int, int]) -> bool:
+            if error is not None:
+                return committed is None or key[0] <= committed[0]
+            return committed is not None and key[0] < committed[0]
+
+        with self._apply_scene_completion_lock:
+            if not any(ends(key) for key in self._empty_scene_applies):
+                return  # Nothing to end: never waits for a clear in progress.
+        with self._empty_scene_execution_lock, self._apply_scene_completion_lock:
+            for key in sorted(self._empty_scene_applies):
+                if ends(key):
+                    self._end_empty_apply(
+                        key,
+                        _EMPTY_APPLY_SUPERSEDED if error is None
+                        else self._empty_apply_failed(error),
+                    )
+
+    def _clear_empty_applied(self, identity: tuple[int, int, str]) -> None:
         with self._empty_scene_execution_lock:
             self._clear_empty_applied_once(identity)
 
-    def _clear_empty_applied_once(self, identity: tuple[str, int, str]) -> None:
+    def _clear_empty_applied_once(self, identity: tuple[int, int, str]) -> None:
         with self._apply_scene_completion_lock:
             if identity[:2] not in self._empty_scene_applies or self._apply_scene_attempted == identity:
                 return
-
-            def publish_unstarted(result: dict[str, Any]) -> None:
-                # A stale follower cannot replace another clear's evidence.
-                if (self._scene_clear is None
-                    or (self._scene_clear.get("apply_id"),
-                        self._scene_clear.get("apply_generation")) == identity[:2]):
-                    self._scene_clear = {"apply_id": identity[0], "apply_generation": identity[1],
-                                         **result}
-
             try:
                 current = self.committed_scenario_activation()
                 current_identity = (current["apply_id"], current["apply_generation"],
@@ -2027,10 +2033,11 @@ class HeadlessService:
                 logging.getLogger(__name__).warning(
                     "Cannot confirm committed Apply for Scene clear: %s", error
                 )
+                self._end_empty_apply(identity[:2], self._empty_apply_failed(error))
                 return
             self._empty_scene_applies.discard(identity[:2])
             if current_identity != identity:
-                publish_unstarted({"state": "superseded", "remaining": None, "reason": None})
+                self._end_empty_apply(identity[:2], _EMPTY_APPLY_SUPERSEDED)
                 return
             self._apply_scene_attempted = identity
             self._scene_clear = {"apply_id": identity[0], "apply_generation": identity[1],
@@ -2038,26 +2045,26 @@ class HeadlessService:
 
         sent = False
         try:
-            cycle = self._program_runner().cycle_status()
             admission = self.authoring_admission()
             current = self.committed_scenario_activation()
             if (current["apply_id"], current["apply_generation"], current["record_digest"]) != identity:
                 result = {"state": "superseded", "remaining": None, "reason": None}
             else:
                 request = ProgramScenePreparationRequest(
-                    request_id="apply-scene." + identity[2][7:],
-                    request_owner_epoch=cycle["program_runner_owner_epoch"],
+                    request_key=self.admission.mint_key(),
                     source_label="headless_apply_completion",
                     expected_applied_record_digest=identity[2],
                     expected_admission_generation=admission["admission_generation"],
                     clear_empty_scene=True,
                 )
+                runner = self._program_runner()  # no runner: nothing was sent
                 sent = True
-                response = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
+                response = runner.prepare_applied_scene(request.model_dump(mode="json"))
                 result = self._scene_clear_result(response, identity[2])
         except Exception as error:
             refused_before_effect = isinstance(error, ProgramRunnerClientError) and error.code in {
                 "authoring_not_ready", "program_run_applied_selection_stale",
+                "execution_control_ingress_busy",
             }
             unknown = sent and not refused_before_effect
             result = {"state": "unknown" if unknown else "failed", "remaining": None,
@@ -2111,13 +2118,13 @@ class HeadlessService:
                 "reason": reason}
 
     def _clear_current_empty_scene(self, request: ProgramScenePreparationRequest) -> dict[str, Any]:
-        key = (request.request_owner_epoch, request.request_id)
+        key = request.request_key
         with self._empty_scene_execution_lock:
             with self._apply_scene_completion_lock:
                 if key in self._direct_scene_clears:
                     raise HeadlessApiError("scene_clear_failed", "This Scene clear request was already attempted")
                 self._direct_scene_clears.add(key)
-                self._scene_clear = {"request_id": request.request_id, "state": "pending",
+                self._scene_clear = {"request_key": request.request_key, "state": "pending",
                                      "remaining": None, "reason": None}
             sent = False
             try:
@@ -2132,15 +2139,13 @@ class HeadlessService:
                     or active.get("canonical_empty") is not True
                     or publication.get("publication_generation") != request.expected_publication_generation):
                     raise HeadlessApiError("program_run_applied_selection_stale", "Canonical empty Scene changed before clearing")
-                cycle = self._program_runner().cycle_status()
-                if cycle.get("program_runner_owner_epoch") != request.request_owner_epoch:
-                    raise HeadlessApiError("program_runner_unavailable", "Program runner changed before clearing")
                 sent = True
                 response = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
                 result = self._scene_clear_result(response, None)
             except Exception as error:
                 refused_before_effect = isinstance(error, ProgramRunnerClientError) and error.code in {
                     "authoring_not_ready", "program_run_applied_selection_stale",
+                    "execution_control_ingress_busy",
                 }
                 unknown = sent and not refused_before_effect
                 result = {"state": "unknown" if unknown else "failed", "remaining": None,
@@ -2151,13 +2156,13 @@ class HeadlessService:
                 self._scene_clear.update(result)
                 return {"scene_clear": deepcopy(self._scene_clear)}
 
-    def follow_committed_apply(self, apply_id: str, apply_generation: int) -> None:
+    def follow_committed_apply(self, apply_id: int, apply_generation: int) -> None:
         """Wake the Program runner for an Apply observed committed through a
         status read, once Manager's published source names it.
 
         Manager answers Apply status from its journal and publishes its source
         just after, so a reader of the source can briefly still see the Apply
-        in progress. The follower waits that out (bounded) instead of waking
+        in progress. The follower waits that out instead of waking
         the runner into a refusal; a repeated identity is followed once.
         """
 
@@ -2197,18 +2202,18 @@ class HeadlessService:
     def _validate_program_run_snapshot(
         projection: dict[str, Any],
         *,
-        expected_program_run_id: str | None = None,
-        expected_owner_epoch: str | None = None,
+        expected_program_run_id: int | None = None,
     ) -> dict[str, Any]:
         expected_fields = {
             "active_operation_count",
             "capture",
             "details",
+            # The Halt that froze the run (null unless halting or halted).
+            "halt",
             "message",
             "node_status_revision",
             "node_statuses",
             "origin",
-            "owner_epoch",
             "owner_id",
             "reason_code",
             "run_revision",
@@ -2234,7 +2239,6 @@ class HeadlessService:
         }
         capture = projection.get("capture")
         owner_id = projection.get("owner_id")
-        owner_epoch = projection.get("owner_epoch")
         state = projection.get("state")
         active_count = projection.get("active_operation_count")
         reason = projection.get("reason_code")
@@ -2258,9 +2262,9 @@ class HeadlessService:
             # `run_end` (ProgramRunEnd) once the run has ended.
             set(projection) - {"run_end"} != expected_fields | {"operation_failures"}
             or not _valid_run_end(projection.get("run_end"))
+            or not _valid_run_halt(projection["halt"])
             or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
             or not _bounded_text(owner_id, maximum_bytes=512)
-            or not _bounded_text(owner_epoch, maximum_bytes=512)
             or type(projection.get("run_revision")) is not int
             or not 1 <= projection["run_revision"] <= 9_007_199_254_740_991
             or not isinstance(state, str)
@@ -2289,7 +2293,8 @@ class HeadlessService:
             or not isinstance(capture, dict)
             or set(capture) != capture_fields
             or capture.get("schema_version") != PROGRAM_RUN_CAPTURE_VERSION
-            or not _bounded_text(capture.get("program_run_id"), maximum_bytes=512)
+            or type(capture.get("program_run_id")) is not int
+            or not 1 <= capture["program_run_id"] <= 9_007_199_254_740_991
             or not _bounded_text(capture.get("scenario_id"), maximum_bytes=128)
             or not _bounded_text(capture.get("program_id"), maximum_bytes=512)
             or any(
@@ -2327,29 +2332,22 @@ class HeadlessService:
                 "program_runner_response_invalid",
                 "Program runner returned invalid run failure details or origin",
             ) from exc
+        # Each captured owner is ``{role, application_start_id}`` (contract
+        # 1.16.4 rule 3); nothing here compares the start identity.
         roles: list[str] = []
-        runner_identity: dict[str, Any] | None = None
         for identity in owner_identities:
             if (
                 not isinstance(identity, dict)
-                or set(identity) != {"owner_epoch", "owner_id", "owner_role"}
-                or not _bounded_text(identity.get("owner_role"), maximum_bytes=128)
-                or not _bounded_text(identity.get("owner_id"), maximum_bytes=512)
-                or not _bounded_text(identity.get("owner_epoch"), maximum_bytes=512)
+                or set(identity) != {"application_start_id", "role"}
+                or not _bounded_text(identity.get("role"), maximum_bytes=128)
+                or not _start_identity_text(identity.get("application_start_id"))
             ):
                 raise HeadlessApiError(
                     "program_runner_response_invalid",
                     "Program runner returned an invalid owner identity",
                 )
-            roles.append(identity["owner_role"])
-            if identity["owner_role"] == "program_runner":
-                runner_identity = identity
-        if (
-            roles != sorted(set(roles))
-            or runner_identity is None
-            or runner_identity["owner_id"] != owner_id
-            or runner_identity["owner_epoch"] != owner_epoch
-        ):
+            roles.append(identity["role"])
+        if roles != sorted(set(roles)) or "program_runner" not in roles:
             raise HeadlessApiError(
                 "program_runner_response_invalid",
                 "Program-run status and captured owner identities disagree",
@@ -2357,7 +2355,7 @@ class HeadlessService:
         if (
             expected_program_run_id is not None
             and capture["program_run_id"] != expected_program_run_id
-        ) or (expected_owner_epoch is not None and owner_epoch != expected_owner_epoch):
+        ):
             raise HeadlessApiError(
                 "program_runner_response_invalid",
                 "Program runner returned a divergent run identity",
@@ -2384,12 +2382,11 @@ class HeadlessService:
             raise self._runner_error(error) from error
         runs = projection.get("runs")
         owner_id = projection.get("owner_id")
-        owner_epoch = projection.get("owner_epoch")
         if (
             set(projection)
             != {
                 "active_only",
-                "owner_epoch",
+                "application_start_id",
                 "owner_id",
                 "runs",
                 "schema_version",
@@ -2398,7 +2395,7 @@ class HeadlessService:
             or projection.get("schema_version") != PROGRAM_RUN_INDEX_VERSION
             or projection.get("active_only") is not active_only
             or not _bounded_text(owner_id, maximum_bytes=512)
-            or not _bounded_text(owner_epoch, maximum_bytes=512)
+            or not _start_identity_text(projection.get("application_start_id"))
             or not isinstance(runs, list)
             or len(runs) > limit
             or type(projection.get("truncated")) is not bool
@@ -2407,21 +2404,14 @@ class HeadlessService:
                 "program_runner_response_invalid",
                 "Program runner returned an invalid run index",
             )
-        program_run_ids: list[str] = []
+        program_run_ids: list[int] = []
         for row in runs:
             if not isinstance(row, dict):
                 raise HeadlessApiError(
                     "program_runner_response_invalid",
                     "Program runner returned an invalid run index member",
                 )
-            self._validate_program_run_snapshot(
-                row,
-                expected_owner_epoch=(
-                    owner_epoch
-                    if row.get("state") in _ACTIVE_PROGRAM_RUN_STATES
-                    else None
-                ),
-            )
+            self._validate_program_run_snapshot(row)
             program_run_ids.append(row["capture"]["program_run_id"])
             if row["owner_id"] != owner_id or (
                 active_only and row["state"] not in _ACTIVE_PROGRAM_RUN_STATES
@@ -2462,42 +2452,13 @@ class HeadlessService:
         # Verify the exact Applied/Runner/environment join before the effect.
         # A transition may leave a well-formed older Runner offer briefly
         # visible; rejecting it here keeps retry entirely pre-admission.
-        current_environment = self.node_environment()
-        try:
-            projection = self._program_runner().start_run(
-                request.model_dump(mode="json")
-            )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        snapshot = self._validate_program_run_snapshot(projection)
-        capture = snapshot["capture"]
-        binding = applied.get("program_binding")
-        applied_node_policies = (
-            binding.get("node_policies") if isinstance(binding, dict) else None
+        self.node_environment()
+        # The runner answers at acceptance (OD-214): the run it starts is
+        # read from the cycle status (`run`, `program_run_id`), and the
+        # command's end from its row (`runner_commands`).
+        return self._runner_command(
+            lambda runner: runner.start_run(request.model_dump(mode="json"))
         )
-        if (
-            capture["applied_record_digest"] != source.get("record_digest")
-            or capture["node_policies"] != applied_node_policies
-            or capture["node_environment_digest"]
-            != current_environment.get("environment_digest")
-            or any(
-                capture[capture_field] != applied.get(applied_field)
-                for capture_field, applied_field in (
-                    ("scenario_id", "scenario_id"),
-                    ("source_document_digest", "source_document_digest"),
-                    ("program_id", "program_id"),
-                    ("program_revision", "program_revision"),
-                    ("program_binding_id", "program_binding_id"),
-                    ("retained_bundle_id", "retained_bundle_id"),
-                    ("graph_revision", "graph_revision"),
-                )
-            )
-        ):
-            raise HeadlessApiError(
-                "program_runner_response_invalid",
-                "Program runner started another Applied Program selection",
-            )
-        return snapshot
 
     def program_scene_prepare(
         self, request: ProgramScenePreparationRequest, *, on_dispatch: Callable[[], None] | None = None
@@ -2557,7 +2518,7 @@ class HeadlessService:
             self._clear_initial_scene_failure(preparation_identity)
         return result
 
-    def program_run_read(self, program_run_id: str) -> dict[str, Any]:
+    def program_run_read(self, program_run_id: int) -> dict[str, Any]:
         try:
             projection = self._program_runner().read_run(program_run_id)
         except ProgramRunnerClientError as error:
@@ -2567,162 +2528,69 @@ class HeadlessService:
             expected_program_run_id=program_run_id,
         )
 
-    def program_run_stop(
-        self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().stop_run(
-                program_run_id,
-                request.model_dump(mode="json"),
-            )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        if projection.get("schema_version") == ("manyforge.program_stop_acceptance.v1"):
-            if (
-                set(projection)
-                != {
-                    "schema_version",
-                    "program_run_id",
-                    "cycle_generation",
-                    "state",
-                    "execution_control_revision",
-                }
-                or projection.get("program_run_id") != program_run_id
-                or projection.get("state")
-                not in {"stopping", "resetting", "terminal_awaiting_reset"}
-                or type(projection.get("cycle_generation")) is not int
-                or type(projection.get("execution_control_revision")) is not int
-            ):
-                raise HeadlessApiError(
-                    "program_runner_response_invalid",
-                    "Program runner returned an invalid Stop acceptance",
-                )
-            return dict(projection)
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            # The Stop is applied: the reply is the run as received, even
-            # from another owner incarnation than the caller expected.
-            expected_owner_epoch=None,
-        )
-
     def program_run_motion_stop(
         self,
-        program_run_id: str,
         request: ProgramSelectionStopRequest,
+        attribution: TrustedAttribution,
     ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().stop_motion(
-                program_run_id,
-                request.model_dump(mode="json"),
-            )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            # The Stop is applied: the reply is the run as received, even
-            # from another owner incarnation than the caller expected.
-            expected_owner_epoch=None,
+        """Stop (level 1): the selection Stop goes straight to the Kernel.
+
+        Headless never calls the Program runner for a Stop (contract 1.8);
+        the runner learns the fence from the event stream.
+        """
+
+        return self._execution().stop_program_selection(
+            request, trusted_principal_id=attribution.principal_id
         )
 
     def program_run_motion_resume(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramSelectionResumeRequest,
     ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().resume_motion(
-                program_run_id,
-                request.model_dump(mode="json"),
+        return self._runner_command(
+            lambda runner: runner.resume_motion(
+                program_run_id, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
         )
 
     def program_run_motion_start(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramSelectionStartRequest,
     ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().start_motion(
-                program_run_id,
-                request.model_dump(mode="json"),
+        return self._runner_command(
+            lambda runner: runner.start_motion(
+                program_run_id, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
         )
 
     def program_run_manual_handover(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramManualHandoverRequest,
     ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().prepare_manual_handover(
+        return self._runner_command(
+            lambda runner: runner.prepare_manual_handover(
                 program_run_id, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
         )
 
-    def program_run_full_stop(
+    def program_run_resume_halt(
         self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
+        program_run_id: int,
+        request: ProgramHaltResumeRequest,
     ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().full_stop(
-                program_run_id,
-                request.model_dump(mode="json"),
+        return self._runner_command(
+            lambda runner: runner.resume_halt(
+                program_run_id, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            # The Stop is applied: the reply is the run as received, even
-            # from another owner incarnation than the caller expected.
-            expected_owner_epoch=None,
         )
 
-    def program_run_resume_full_stop(
+    def program_run_discard_halt(
         self,
-        program_run_id: str,
-        request: ProgramFullStopResumeRequest,
-    ) -> dict[str, Any]:
-        try:
-            projection = self._program_runner().resume_full_stop(
-                program_run_id,
-                request.model_dump(mode="json"),
-            )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
-        return self._validate_program_run_snapshot(
-            projection,
-            expected_program_run_id=program_run_id,
-            expected_owner_epoch=request.expected_owner_epoch,
-        )
-
-    def program_run_reset_full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramFullStopResetRequest,
+        program_run_id: int,
+        request: ProgramHaltDiscardRequest,
     ) -> dict[str, Any]:
         """Adapt the retained REST shape to one owner-managed Reset command."""
 
@@ -2733,14 +2601,9 @@ class HeadlessService:
             )
         reset = ProgramCycleResetRequest.model_validate(
             {
-                "request_id": request.request_id,
-                "request_owner_epoch": request.request_owner_epoch,
+                "request_key": request.request_key,
                 "source_label": request.source_label,
-                "correlation_id": request.correlation_id,
-                "session_id": request.session_id,
-                "client_sequence": request.client_sequence,
                 "program_run_id": program_run_id,
-                "expected_owner_epoch": request.expected_owner_epoch,
                 "expected_cycle_generation": request.expected_cycle_generation,
                 "expected_claim_generation": request.expected_claim_generation,
                 "terminal_reference": None,
@@ -2749,45 +2612,97 @@ class HeadlessService:
         )
         return self.program_cycle_reset(reset)
 
-    def program_cycle_status(self, *, include_scene_clear: bool = False) -> dict[str, Any]:
+    def program_cycle_status(
+        self, *, include_scene_clear: bool = False, before_command: bool = False
+    ) -> dict[str, Any]:
+        """The runner's cycle status; with ``include_scene_clear``, Headless's
+        own statuses beside it: `scene_clear` and `activation_preparation`
+        (OD-214), which a runner read failure carries in its details.
+        ``before_command``: the read before a command is forwarded waits for
+        the runner's answer (OD-214)."""
+
         try:
-            result = self._program_runner().cycle_status()
+            result = self._program_runner().cycle_status(
+                before_command=before_command
+            )
             if include_scene_clear:
                 with self._apply_scene_completion_lock:
                     result["scene_clear"] = deepcopy(self._scene_clear)
+                result["activation_preparation"] = self.activation_preparations.snapshot()
             return result
         except ProgramRunnerClientError as error:
             if include_scene_clear:
                 with self._apply_scene_completion_lock:
                     clear = deepcopy(self._scene_clear)
+                own = {"activation_preparation": self.activation_preparations.snapshot()}
                 if clear is not None:
-                    raise HeadlessApiError(error.code, str(error),
-                                           details={**error.details, "scene_clear": clear},
-                                           producer=error.producer) from error
+                    own["scene_clear"] = clear
+                raise HeadlessApiError(error.code, str(error),
+                                       details={**error.details, **own},
+                                       producer=error.producer) from error
             raise self._runner_error(error) from error
 
     def program_cycle_reset(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
-        """Forward one Reset; Program Runner owns every lifecycle phase."""
+        """Forward one Reset; Program Runner owns every lifecycle phase.
+
+        The runner answers at acceptance (OD-214). A Reset that reloads the
+        initial Scene clears the initial-scene failure of the Apply current
+        when it was sent once its row ends ``succeeded``: at once when the
+        reply already carries that end, else when the followed cycle status
+        shows it (:meth:`observe_runner_commands`).
+        """
+
+        identity = None
+        if request.reload_initial_scene:
+            try:
+                identity = self._current_apply_identity()
+            except (HeadlessApiError, ProgramRunnerClientError):
+                pass
+        reply = self._runner_command(
+            lambda runner: runner.reset_cycle(request.model_dump(mode="json"))
+        )
+        if identity is not None:
+            row = reply["command"]
+            if row["end"] is None:
+                with self._apply_scene_completion_lock:
+                    self._scene_reloading_resets[row["request_key"]] = identity
+                    while len(self._scene_reloading_resets) > MAXIMUM_ENDED_COMMAND_ROWS:
+                        del self._scene_reloading_resets[next(iter(self._scene_reloading_resets))]
+            elif row["end"]["outcome"] == "succeeded":
+                self._clear_initial_scene_failure(identity)
+        return reply
+
+    def observe_runner_commands(self, runner_commands: dict[str, Any]) -> None:
+        """Act on the runner command rows of one accepted cycle status.
+
+        Called by the one Program reader (control state) for every cycle it
+        accepts: a followed Reset that reloads the initial Scene and ended
+        ``succeeded`` clears that Apply's initial-scene failure.
+        """
+
+        with self._apply_scene_completion_lock:
+            if not self._scene_reloading_resets:
+                return
+            ended = []
+            for row in runner_commands["ended"]:
+                identity = self._scene_reloading_resets.pop(row["request_key"], None)
+                if identity is not None:
+                    ended.append((row["end"]["outcome"], identity))
+        for outcome, identity in ended:
+            if outcome == "succeeded":
+                self._clear_initial_scene_failure(identity)
+
+    def _runner_command(
+        self, send: Callable[[ProgramRunnerPort], dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Send one runner command; its ``program_command_reply.v1`` at acceptance."""
 
         try:
-            identity = None
-            if request.reload_initial_scene:
-                try:
-                    identity = self._current_apply_identity()
-                except (HeadlessApiError, ProgramRunnerClientError):
-                    pass
-            result = self._program_runner().reset_cycle(request.model_dump(mode="json"))
-            if (identity is not None
-                and result.get("schema_version") == "manyforge.program_cycle_reset_result.v1"
-                and result.get("program_run_id") == request.program_run_id
-                and result.get("reset_cycle_generation") == request.expected_cycle_generation
-                and result.get("idle_cycle_generation") == request.expected_cycle_generation + 1):
-                self._clear_initial_scene_failure(identity)
-            return result
+            return send(self._program_runner())
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+    def program_runtime_controls(self, program_run_id: int) -> dict[str, Any]:
         try:
             return self._program_runner().runtime_controls(program_run_id)
         except ProgramRunnerClientError as error:
@@ -2795,7 +2710,7 @@ class HeadlessService:
 
     def program_node_correction_preview(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramNodeCorrectionPreviewRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
@@ -2828,7 +2743,7 @@ class HeadlessService:
 
     def _preview_node_correction(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramNodeCorrectionPreviewRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
@@ -2841,7 +2756,6 @@ class HeadlessService:
         expected_keys = {
             "schema_version",
             *_PROGRAM_NODE_PREVIEW_IDENTITY_KEYS,
-            "program_runner_owner_epoch",
             "run_revision",
             "retained_bundle_id",
             "graph_revision",
@@ -2861,7 +2775,6 @@ class HeadlessService:
                 built.get(key) != getattr(request, key)
                 for key in _PROGRAM_NODE_PREVIEW_IDENTITY_KEYS
             )
-            or built.get("program_runner_owner_epoch") != request.expected_owner_epoch
             or built.get("proposed_paths")
             != [proposal.path for proposal in request.proposed_inputs]
             or (operation is None) == (unavailable is None)
@@ -2908,7 +2821,7 @@ class HeadlessService:
         if (
             participant is None
             or not isinstance(target, dict)
-            or intent.request_context.request_id != request.request_id
+            or intent.request_context.request_key != request.request_key
             or intent.program_run_id != program_run_id
             or intent.program_id != request.program_id
             or intent.program_revision != request.program_revision
@@ -2934,18 +2847,15 @@ class HeadlessService:
 
     def program_runtime_control_action(
         self,
-        program_run_id: str,
+        program_run_id: int,
         suffix: str,
         request: Any,
     ) -> dict[str, Any]:
-        try:
-            return self._program_runner().runtime_control_action(
-                program_run_id,
-                suffix,
-                request.model_dump(mode="json"),
+        return self._runner_command(
+            lambda runner: runner.runtime_control_action(
+                program_run_id, suffix, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
+        )
 
     def program_persistent_values(self) -> dict[str, Any]:
         try:
@@ -2956,22 +2866,18 @@ class HeadlessService:
     def program_persistent_value_action(
         self, action: str, request: Any
     ) -> dict[str, Any]:
-        try:
-            return self._program_runner().persistent_value_action(
+        return self._runner_command(
+            lambda runner: runner.persistent_value_action(
                 action, request.model_dump(mode="json")
             )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
+        )
 
     def cycle_recovery_action(
         self, request: CycleRecoveryActionRequest
     ) -> dict[str, Any]:
-        try:
-            return self._program_runner().apply_recovery_action(
-                request.model_dump(mode="json")
-            )
-        except ProgramRunnerClientError as error:
-            raise self._runner_error(error) from error
+        return self._runner_command(
+            lambda runner: runner.apply_recovery_action(request.model_dump(mode="json"))
+        )
 
     @staticmethod
     def _verified_viewer_asset(
@@ -3062,7 +2968,7 @@ class HeadlessService:
         runtime = self.runtime()
         sections = runtime["sections"]
         return {
-            "schema_version": "manyforge.scene_projection.v1",
+            "schema_version": "manyforge.scene_projection.v2",
             "projection_generation": runtime["projection_generation"],
             "logical_scene": sections["logical_scene"],
             "scene_runtime": sections["scene_runtime"],
@@ -3087,7 +2993,7 @@ class HeadlessService:
 
         The owner's `reconciled` reaches the Kernel only up to `P + D` later,
         and the Kernel admits by its held copy alone. The
-        `kernel_attention` member names that copy (owner epoch, generation,
+        `kernel_attention` member names that copy (generation,
         `reconciled`, `active_configuration`) as the Kernel last acknowledged
         it, or null when none is known to be current, so a client can wait
         for the Kernel's admission state instead of retrying refusals.
@@ -3111,10 +3017,8 @@ class HeadlessService:
             condition_id=condition_id,
             activation_id=request.activation_id,
             expected_record_revision=request.expected_record_revision,
-            request_id=request.request_id,
-            request_owner_epoch=request.request_owner_epoch,
+            request_key=request.request_key,
             source_label=request.source_label,
-            correlation_id=request.correlation_id,
             transport_kind="http",
             adapter_id="manyforge.headless.http.v1",
             assurance=attribution.assurance,
@@ -3134,10 +3038,8 @@ class HeadlessService:
                 for item in request.members
             ],
             expected_generation=request.expected_generation,
-            request_id=request.request_id,
-            request_owner_epoch=request.request_owner_epoch,
+            request_key=request.request_key,
             source_label=request.source_label,
-            correlation_id=request.correlation_id,
             transport_kind="http",
             adapter_id="manyforge.headless.http.v1",
             assurance=attribution.assurance,
@@ -3197,7 +3099,7 @@ class HeadlessService:
             },
         }
 
-    def program_run_admitted_speeds(self, program_run_id: str) -> dict[str, Any]:
+    def program_run_admitted_speeds(self, program_run_id: int) -> dict[str, Any]:
         """Return the owner-admitted TCP speed of each robot's latest prepared motion.
 
         Execution evidence only: each row copies, unchanged, the Kernel's
@@ -3213,7 +3115,7 @@ class HeadlessService:
         for _ in range(_ADMITTED_SPEED_HISTORY_PAGES):
             page = self.history_export(
                 HistorianQueryRequest(
-                    program_run_id=program_run_id,
+                    program_run_id=str(program_run_id),
                     event_types=["operation_prepared"],
                     before_sequence=before_sequence,
                 )
@@ -3226,7 +3128,7 @@ class HeadlessService:
                 break
             before_sequence = page["next_before_sequence"]
         return {
-            "schema_version": "manyforge.program_run_admitted_speeds.v1",
+            "schema_version": "manyforge.program_run_admitted_speeds.v2",
             "program_run_id": program_run_id,
             "targets": [rows[key] for key in sorted(rows)],
         }
@@ -3351,23 +3253,6 @@ class HeadlessService:
             body["apply_kind"], body["outcome"], body.get("error"), body["components"]
         ))
 
-    def historian_reconcile(
-        self,
-        request: HistorianReconcileRequest,
-        attribution: TrustedAttribution,
-    ) -> dict[str, Any]:
-        return self.core.reconcile_historian_health(
-            expected_generation=request.expected_health_generation,
-            request_id=request.request_id,
-            request_owner_epoch=request.request_owner_epoch,
-            source_label=request.source_label,
-            correlation_id=request.correlation_id,
-            transport_kind="http",
-            adapter_id="manyforge.headless.http.v1",
-            assurance=attribution.assurance,
-            trusted_principal_id=attribution.principal_id,
-        )
-
     def manager_deployment_candidate_preview(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]:
@@ -3413,20 +3298,75 @@ class HeadlessService:
                                    details={"bound_bytes": bound_bytes, "actual_bytes": actual_bytes})
         return result
 
-    def prepare_activation(self, request: ActivationPreparationRequest) -> dict[str, Any]:
+    def prepare_activation(
+        self,
+        request: ActivationPreparationRequest,
+        *,
+        refused: Callable[[str], bool],
+    ) -> dict[str, Any]:
+        """Accept one activation preparation; its row carries its end (OD-214).
+
+        One preparation at a time: a request waits for the slot (as it
+        waited for the preparer before), and is accepted when it takes it.
+        A request whose key names a kept row gets that row back and nothing
+        runs again. The preparation runs on in a thread of its own that
+        holds the slot until the row's end; the prepared activation is then
+        read by its captured input digest (:meth:`prepared_activation`).
+        ``refused`` tells the preparer's definite refusals (no effect) from
+        its failures.
+        """
+
         if self.activation_preparer is None:
             raise HeadlessApiError(
                 "activation_preparer_unavailable",
                 "Activation preparation is not configured",
             )
-        # The request's admission generation is evidence only: preparation
-        # follows the current admission facts. A momentarily closed admission
-        # (a Reset's Idle reaching the Kernel, the committed Apply's initial
-        # Scene placement, a readiness transition) is waited for, within the
-        # floor of every Apply's bound (momentarily busy never fails a Load).
-        self._await_idle_admission()
+        kept = self.activation_preparations.find(request.request_key)
+        if kept is not None:
+            return self._activation_preparation_reply(kept)
+        self._activation_preparation_slot.acquire()
+        kept = self.activation_preparations.find(request.request_key)
+        if kept is not None:
+            # The same key was accepted while this request waited.
+            self._activation_preparation_slot.release()
+            return self._activation_preparation_reply(kept)
+        row = self.activation_preparations.accept(
+            "activation_preparation",
+            request.request_key,
+            step="awaiting_admission",
+            captured_input_digest=request.captured_input_digest,
+        )
+        Thread(
+            target=self._run_activation_preparation,
+            args=(request, refused),
+            name="manyforge_activation_preparation",
+            daemon=True,
+        ).start()
+        return self._activation_preparation_reply(row)
+
+    @staticmethod
+    def _activation_preparation_reply(row: dict[str, Any]) -> dict[str, Any]:
         return {
-            "prepared_activation": self.activation_preparer.prepare(
+            "schema_version": "manyforge.activation_preparation_reply.v1",
+            "command": row,
+        }
+
+    def _run_activation_preparation(
+        self,
+        request: ActivationPreparationRequest,
+        refused: Callable[[str], bool],
+    ) -> None:
+        key = request.request_key
+        try:
+            # The request's admission generation is evidence only:
+            # preparation follows the current admission facts. A momentarily
+            # closed admission (a Reset's Idle reaching the Kernel, the
+            # committed Apply's initial Scene placement, a readiness
+            # transition) is waited for, within the floor of every Apply's
+            # bound (momentarily busy never fails a Load).
+            self._await_idle_admission()
+            self.activation_preparations.step(key, "preparing")
+            prepared = self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,
                 scenario_id=request.scenario_id,
                 project_path=request.project_path,
@@ -3435,7 +3375,44 @@ class HeadlessService:
                 model_source_closure=request.model_source_closure,
                 program=request.program,
             )
-        }
+        except HeadlessApiError as error:
+            self.activation_preparations.end(
+                key,
+                "refused" if refused(error.code) else "failed",
+                error.code,
+                error.details,
+            )
+        except Exception as error:
+            # An untyped failure: its effect is not established (OD-214).
+            logging.getLogger(__name__).exception("Activation preparation failed")
+            self.activation_preparations.end(
+                key,
+                "unknown",
+                "program_runtime_control_outcome_unknown",
+                {"command_kind": "activation_preparation", "cause_code": type(error).__name__},
+            )
+        else:
+            digest = request.captured_input_digest
+            with self._prepared_activations_lock:
+                self._prepared_activations.pop(digest, None)
+                self._prepared_activations[digest] = prepared
+                while len(self._prepared_activations) > MAXIMUM_ENDED_COMMAND_ROWS:
+                    del self._prepared_activations[next(iter(self._prepared_activations))]
+            self.activation_preparations.end(key, "succeeded")
+        finally:
+            self._activation_preparation_slot.release()
+
+    def prepared_activation(self, captured_input_digest: str) -> dict[str, Any]:
+        """The prepared activation of a preparation that ended ``succeeded``."""
+
+        with self._prepared_activations_lock:
+            prepared = self._prepared_activations.get(captured_input_digest)
+        if prepared is None:
+            raise HeadlessApiError(
+                "activation_preparation_result_not_found",
+                "No succeeded activation preparation of this input is kept",
+            )
+        return {"prepared_activation": deepcopy(prepared)}
 
     # The wait for idle admission: one default lifecycle timeout, the floor of
     # every Apply's bound, which fits inside the callers' Headless HTTP timeout.
@@ -3464,27 +3441,39 @@ class HeadlessService:
         apply_id = response.get("apply_id")
         apply_generation = response.get("apply_generation")
         if (
-            self.apply_follower is not None
-            and response.get("ok") is True
-            and isinstance(apply_id, str)
+            response.get("ok") is True
+            and type(apply_id) is int
             and type(apply_generation) is int
         ):
-            if (response.get("replay_status") == "accepted_new"
-                and request.scene_initialization == "initialize"
-                and request.prepared_activation.program_outcome["kind"] == "no_program"):
-                with self._apply_scene_completion_lock:
-                    self._empty_scene_applies.add((apply_id, apply_generation))
-            self.apply_follower.follow(apply_id, apply_generation)
+            empty = (response.get("replay_status") == "accepted_new"
+                     and request.scene_initialization == "initialize"
+                     and request.prepared_activation.program_outcome["kind"] == "no_program")
+            if self.apply_follower is None:
+                if empty:
+                    # OD-239: without a Program runner nothing clears the
+                    # Scene; the Apply's clear ends `failed` at once.
+                    try:
+                        self._program_runner()
+                    except HeadlessApiError as error:
+                        with self._empty_scene_execution_lock, self._apply_scene_completion_lock:
+                            self._end_empty_apply(
+                                (apply_id, apply_generation), self._empty_apply_failed(error)
+                            )
+            else:
+                if empty:
+                    with self._apply_scene_completion_lock:
+                        self._empty_scene_applies.add((apply_id, apply_generation))
+                self.apply_follower.follow(apply_id, apply_generation)
         return response
 
     def manager_apply_status(
-        self, apply_id: str, apply_generation: int
+        self, apply_id: int, apply_generation: int
     ) -> dict[str, Any]:
         return self.manager.observe_apply(apply_id, apply_generation)
 
     def manager_apply_acknowledge(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]:

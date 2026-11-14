@@ -8,6 +8,8 @@
 namespace manyforge::core {
 namespace {
 
+constexpr std::uint64_t kMaximumJsonInteger = 9'007'199'254'740'991ULL;
+
 [[nodiscard]] bool bounded_utf8(std::string_view value, std::size_t maximum) noexcept {
   if (value.empty() || value.size() > maximum || value.find('\0') != std::string_view::npos) {
     return false;
@@ -20,38 +22,13 @@ namespace {
 }
 
 [[nodiscard]] bool context_valid(const PublicRequestContextDTO& context) noexcept {
-  return !context.request_id.empty() &&
-         context.request_id.value().size() <= kMaximumStopIdentityBytes &&
-         context.request_id.value().find('\0') == std::string::npos &&
-         !context.request_owner_epoch.empty() &&
-         context.request_owner_epoch.value().size() <= kMaximumStopIdentityBytes &&
-         context.request_owner_epoch.value().find('\0') == std::string::npos &&
-         bounded_utf8(context.source_label, kMaximumStopRequestLabelBytes) &&
-         (!context.correlation_id.has_value() ||
-          bounded_utf8(*context.correlation_id, kMaximumStopRequestLabelBytes));
+  return bounded_utf8(context.source_label, kMaximumStopRequestLabelBytes);
 }
 
 [[nodiscard]] bool attribution_valid(const RequestAttributionDTO& attribution) noexcept {
   return attribution.locally_valid() &&
          (!attribution.principal_id.has_value() ||
           bounded_utf8(*attribution.principal_id, kMaximumStopRequestLabelBytes));
-}
-
-[[nodiscard]] bool portable_token(std::string_view value, std::size_t maximum) noexcept {
-  return !value.empty() && value.size() <= maximum &&
-         std::all_of(value.begin(), value.end(), [](const char character) {
-           return (character >= 'A' && character <= 'Z') ||
-                  (character >= 'a' && character <= 'z') ||
-                  (character >= '0' && character <= '9') || character == '_' || character == '.' ||
-                  character == ':' || character == '-';
-         });
-}
-
-// A Stop is keyed by its request id in the emergency reserve, which takes the
-// portable token only; any other id is a field error, so the Stop is promoted.
-[[nodiscard]] bool stop_context_valid(const PublicRequestContextDTO& context) noexcept {
-  return context_valid(context) &&
-         portable_token(context.request_id.value(), kMaximumStopIdentityBytes);
 }
 
 template <typename StrongId>
@@ -75,7 +52,7 @@ template <typename Targets, typename Key>
 }  // namespace
 
 std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& intent) noexcept {
-  if (!stop_context_valid(intent.request_context)) {
+  if (!context_valid(intent.request_context)) {
     return "stop_request_context_invalid";
   }
   if (!attribution_valid(intent.attribution)) {
@@ -93,7 +70,7 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
             return "stop_operation_targets_not_canonical";
           }
           if (std::any_of(targets.begin(), targets.end(), [](const auto& target) {
-                return !bounded_identity(target.operation_id) ||
+                return !target.operation_id.nonzero() ||
                        !target.expected_operation_revision.nonzero();
               })) {
             return "stop_operation_target_invalid";
@@ -112,7 +89,7 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
             return "stop_component_target_invalid";
           }
           return std::nullopt;
-        } else if constexpr (std::is_same_v<Targets, std::vector<StopResourceTargetDTO>>) {
+        } else {
           if (!canonical_targets(targets, [](const auto& target) { return target.resource_id; })) {
             return "stop_resource_targets_not_canonical";
           }
@@ -123,17 +100,6 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
             return "stop_resource_target_invalid";
           }
           return std::nullopt;
-        } else {
-          if (!canonical_targets(targets,
-                                 [](const auto& target) { return target.program_run_id; })) {
-            return "stop_program_run_targets_not_canonical";
-          }
-          if (std::any_of(targets.begin(), targets.end(), [](const auto& target) {
-                return !bounded_identity(target.program_run_id);
-              })) {
-            return "stop_program_run_target_invalid";
-          }
-          return std::nullopt;
         }
       },
       intent.selector);
@@ -141,7 +107,7 @@ std::optional<std::string_view> stop_intent_field_error(const StopIntentDTO& int
 
 std::optional<std::string_view> full_stop_intent_field_error(
     const FullStopIntentDTO& intent) noexcept {
-  if (!stop_context_valid(intent.request_context)) {
+  if (!context_valid(intent.request_context)) {
     return "full_stop_request_context_invalid";
   }
   if (!attribution_valid(intent.attribution)) {
@@ -150,24 +116,74 @@ std::optional<std::string_view> full_stop_intent_field_error(
   return std::nullopt;
 }
 
-std::optional<std::string_view> malformed_stop_ingress_field_error(
-    const MalformedStopIngressDTO& ingress) noexcept {
-  if (!portable_token(ingress.request_id.value(), kMaximumStopIdentityBytes) ||
-      !portable_token(ingress.receiver_owner_epoch.value(), kMaximumStopIdentityBytes)) {
-    return "malformed_stop_ingress_identity_invalid";
+std::optional<std::string_view> program_run_end_intent_field_error(
+    const ProgramRunEndIntentDTO& intent) noexcept {
+  if (!context_valid(intent.request_context)) {
+    return "program_run_end_request_context_invalid";
   }
+  if (!attribution_valid(intent.attribution)) {
+    return "program_run_end_request_attribution_invalid";
+  }
+  if (!intent.program_run_id.nonzero() || intent.program_run_id.value() > kMaximumJsonInteger) {
+    return "program_run_end_run_invalid";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string_view> stop_accepted_field_error(const StopAcceptedDTO& accepted) noexcept {
+  if (accepted.request_key == RequestKey{} || !IsAcceptedRequestReplayStatus(accepted.replay_status) ||
+      !accepted.event_id.nonzero() || accepted.event_id.value() > kMaximumJsonInteger) {
+    return "stop_accepted_identity_invalid";
+  }
+  // `applied` differs from `requested` only when the request was widened.
+  if (accepted.widen_reason == StopWidenReason::kNone && accepted.applied != accepted.requested) {
+    return "stop_accepted_widening_invalid";
+  }
+  if (accepted.program_run_id.has_value() &&
+      (!accepted.program_run_id->nonzero() ||
+       accepted.program_run_id->value() > kMaximumJsonInteger)) {
+    return "stop_accepted_run_invalid";
+  }
+  if (accepted.stale_diagnostics.size() > accepted.stale_total ||
+      std::any_of(accepted.stale_diagnostics.begin(), accepted.stale_diagnostics.end(),
+                  [](const auto& row) {
+                    return !row.operation_id.nonzero() ||
+                           row.expected_operation_revision == row.current_operation_revision;
+                  })) {
+    return "stop_accepted_stale_diagnostics_invalid";
+  }
+  if (std::any_of(accepted.covered.begin(), accepted.covered.end(),
+                  [](const auto& row) { return !row.operation_id.nonzero(); })) {
+    return "stop_accepted_covered_invalid";
+  }
+  if (accepted.hold_revision > kMaximumJsonInteger || accepted.accepted_at_ns < 0) {
+    return "stop_accepted_revision_or_time_invalid";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string_view> recognized_stop_ingress_field_error(
+    const RecognizedStopIngressDTO& ingress) noexcept {
   if (!attribution_valid(ingress.attribution)) {
-    return "malformed_stop_ingress_attribution_invalid";
+    return "recognized_stop_ingress_attribution_invalid";
   }
   if (!bounded_utf8(ingress.recognized_route, kMaximumStopRequestLabelBytes)) {
-    return "malformed_stop_ingress_route_invalid";
+    return "recognized_stop_ingress_route_invalid";
   }
   if (!bounded_utf8(ingress.reason, kMaximumStopMalformedReasonBytes) ||
       (ingress.reason != "recognized_stop_payload_invalid" &&
-       ingress.reason != "recognized_stop_body_oversized")) {
-    return "malformed_stop_ingress_reason_invalid";
+       ingress.reason != "recognized_stop_body_oversized" &&
+       ingress.reason != "recognized_stop_start_not_current")) {
+    return "recognized_stop_ingress_reason_invalid";
+  }
+  if (ingress.source_label.has_value() && !stop_source_label_valid(*ingress.source_label)) {
+    return "recognized_stop_ingress_label_invalid";
   }
   return std::nullopt;
+}
+
+bool stop_source_label_valid(const std::string_view label) noexcept {
+  return bounded_utf8(label, kMaximumStopRequestLabelBytes);
 }
 
 std::optional<std::string_view> operation_control_request_field_error(
@@ -175,7 +191,7 @@ std::optional<std::string_view> operation_control_request_field_error(
   if (!context_valid(request.request_context)) {
     return "operation_control_request_context_invalid";
   }
-  if (!bounded_identity(request.operation_id) || !request.expected_operation_revision.nonzero() ||
+  if (!request.operation_id.nonzero() || !request.expected_operation_revision.nonzero() ||
       request.expected_operation_revision.value() >
           static_cast<std::uint64_t>(kMaximumStopDurationNs)) {
     return "operation_control_target_invalid";

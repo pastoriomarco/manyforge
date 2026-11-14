@@ -6,7 +6,6 @@ import type {
   PersistentKeyValue,
   PersistentKeyValueEdit,
   PersistentKeyValues,
-  PersistentKeyValuesCleared,
   ExpressionCheckResult,
   ExpressionDiagnostic,
   ExpressionValueType,
@@ -31,7 +30,9 @@ import type {
 } from '../../types/api';
 import type { RuntimeScaleControlAccepted, RuntimeScaleControlStatus, ProgramRunAdmittedSpeeds } from '../../types/robotControl';
 import type { JsonObject } from './shared';
+import { isApplicationStartId, isRequestKey } from '../applicationIdentity';
 import { parseProgramRunEnd } from './components';
+import { parseRunnerCommands } from './commandRows';
 import {
   allowedKeysAt,
   arrayAt,
@@ -46,7 +47,6 @@ import {
   monotonicNanosecondsAt,
   nonEmptyStringAt,
   nullableNumberAt,
-  nullablePositiveUint64TextAt,
   nullableStringAt,
   numberAt,
   objectAt,
@@ -59,30 +59,26 @@ import {
 export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   const record = objectAt(value, 'programCycleStatus');
   allowedKeysAt(record, [
-    'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
+    'cycle_generation', 'state', 'program_run_id',
     'cycle_claim_generation', 'terminal_or_settlement_reference',
     'run_revision', 'node_status_revision',
     'runtime_control_revision', 'recovery_offer', 'run', 'runtime_controls',
-    'execution_control_revision', 'causal_correlation_id',
-    'causal_session_id', 'causal_client_sequence', 'current_command_kind',
+    'execution_control_revision',
+    'causal_request_key', 'current_command_kind', 'runner_commands',
     'failure', 'reset_phase', 'reset_options', 'reset_robot_position', 'allowed_commands',
-  ], ['run_end'], 'programCycleStatus');
+  ], ['run_end', 'causal_display'], 'programCycleStatus');
   const state = stringAt(record.state, 'programCycleStatus.state');
-  if (!['idle_after_reset', 'starting', 'running', 'stopping',
+  if (!['idle_after_reset', 'starting', 'running',
     'resetting', 'terminal_awaiting_reset', 'recovery_required'].includes(state)) {
     return fail('programCycleStatus.state', 'a supported Program cycle state');
   }
   const parsed: ProgramCycleStatus = {
-    programRunnerOwnerEpoch: stringAt(
-      record.program_runner_owner_epoch,
-      'programCycleStatus.program_runner_owner_epoch',
-    ),
     cycleGeneration: positiveIntegerAt(
       record.cycle_generation,
       'programCycleStatus.cycle_generation',
     ),
     state: state as ProgramCycleStatus['state'],
-    programRunId: nullableStringAt(
+    programRunId: nullablePositiveIntegerAt(
       record.program_run_id,
       'programCycleStatus.program_run_id',
     ),
@@ -118,22 +114,20 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       record.execution_control_revision,
       'programCycleStatus.execution_control_revision',
     ),
-    causalCorrelationId: nullableStringAt(
-      record.causal_correlation_id,
-      'programCycleStatus.causal_correlation_id',
-    ),
-    causalSessionId: nullableStringAt(
-      record.causal_session_id,
-      'programCycleStatus.causal_session_id',
-    ),
-    causalClientSequence: nullablePositiveUint64TextAt(
-      record.causal_client_sequence,
-      'programCycleStatus.causal_client_sequence',
+    causalRequestKey: record.causal_request_key === null
+      ? null
+      : requestKeyAt(record.causal_request_key, 'programCycleStatus.causal_request_key'),
+    // Headless's cycle-status route adds the display (1.16.2); the
+    // snapshot's cycle status carries the key only.
+    causalDisplay: record.causal_display === undefined ? null : nullableStringAt(
+      record.causal_display,
+      'programCycleStatus.causal_display',
     ),
     currentCommandKind: nullableStringAt(
       record.current_command_kind,
       'programCycleStatus.current_command_kind',
     ),
+    runnerCommands: parseRunnerCommands(record.runner_commands, 'programCycleStatus.runner_commands'),
     failure: record.failure === null
       ? null
       : jsonRecordAt(record.failure, 'programCycleStatus.failure'),
@@ -227,10 +221,6 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     }
   } else if (
     parsed.run.capture.programRunId !== parsed.programRunId
-    || (
-      !['terminal_awaiting_reset', 'resetting'].includes(parsed.state)
-      && parsed.run.ownerEpoch !== parsed.programRunnerOwnerEpoch
-    )
     || parsed.run.runRevision !== parsed.runRevision
     || parsed.run.nodeStatusRevision !== parsed.nodeStatusRevision
   ) {
@@ -246,7 +236,6 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   } else if (
     parsed.run === null
     || parsed.runtimeControls.programRunId !== parsed.programRunId
-    || parsed.runtimeControls.ownerEpoch !== parsed.programRunnerOwnerEpoch
     || parsed.runtimeControls.runRevision !== parsed.runRevision
     || parsed.runtimeControls.runtimeControls.runtimeControlRevision
       !== parsed.runtimeControlRevision
@@ -266,8 +255,8 @@ function runtimeScalePairIdentity(componentRoleId: string, targetRoleId: string)
 const PROGRAM_RUN_STATES = new Set<ProgramRunStateName>([
   'running',
   'intervention_required',
-  'full_stopping',
-  'full_stopped',
+  'halting',
+  'halted',
   'stopping',
   'finalizing',
   'stopped',
@@ -455,15 +444,12 @@ export function parseKnownProgramRunOutcome(payload: unknown, status: number): S
   const envelope = objectAt(payload, path);
   exactKeysAt(envelope, ['detail'], path);
   const dto = objectAt(envelope.detail, `${path}.detail`);
-  allowedKeysAt(dto, ['code', 'message', 'details'], ['request_id', 'producer'], `${path}.detail`);
+  allowedKeysAt(dto, ['code', 'message', 'details'], ['request_key', 'producer'], `${path}.detail`);
   const code = stringAt(dto.code, `${path}.code`);
-  const beforeStart = code === 'program_run_stopped_before_start';
-  const stopped = beforeStart || code === 'program_run_superseded_by_stop';
-  if ((!stopped && code !== 'program_run_started_then_failed')
-    || status !== (beforeStart ? 409 : 422)) {
+  if (code !== 'program_run_started_then_failed' || status !== 422) {
     return fail(path, 'a known Run outcome and its matching HTTP status');
   }
-  if (dto.request_id !== undefined) failureIdentityAt(dto.request_id, `${path}.request_id`);
+  if (dto.request_key !== undefined) requestKeyAt(dto.request_key, `${path}.request_key`);
   const details = objectAt(dto.details, `${path}.details`);
   const keys = Object.keys(details);
   if (keys.length > FAILURE_DETAIL_MAX_ENTRIES) {
@@ -482,26 +468,17 @@ export function parseKnownProgramRunOutcome(payload: unknown, status: number): S
     }
     parsed[key] = value as string | number | boolean | null;
   }
-  const runId = failureIdentityAt(details.program_run_id, `${path}.program_run_id`);
-  if (runId === null || details.needs_reset !== true) {
+  positiveIntegerAt(details.program_run_id, `${path}.program_run_id`);
+  if (details.needs_reset !== true) {
     return fail(path, 'the actual run identity and needs_reset:true');
   }
-  if (beforeStart) {
-    if (details.claim_generation !== null || details.no_effect !== true) {
-      return fail(path, 'no claim and proven no effect before start');
-    }
-  } else {
-    positiveIntegerAt(details.claim_generation, `${path}.claim_generation`);
-    if (details.no_effect !== undefined) return fail(path, 'no preclaim effect assertion');
-  }
-  if (stopped ? details.stopped_by_operator !== true : details.stopped_by_operator !== undefined) {
-    return fail(path, 'the Stop discriminant only on a stopped outcome');
+  positiveIntegerAt(details.claim_generation, `${path}.claim_generation`);
+  if (details.no_effect !== undefined) return fail(path, 'no preclaim effect assertion');
+  if (details.stopped_by_operator !== undefined) {
+    return fail(path, 'no Stop discriminant');
   }
   const cause = failureIdentityAt(details.cause_code, `${path}.cause_code`);
   if (cause === null) return fail(path, 'the named owner cause');
-  if (stopped && cause !== 'program_run_superseded_by_stop') {
-    return fail(path, 'the actual operator Stop cause');
-  }
   const causeMessage = failureMessageAt(details.cause_message, `${path}.cause_message`);
   if (causeMessage.length === 0) return fail(path, 'the owner cause message');
   const message = failureMessageAt(dto.message, `${path}.message`);
@@ -534,7 +511,7 @@ function programOperationFailuresAt(value: unknown, path: string): ProgramRunSta
     exactKeysAt(row, ['node_instance_id', 'node_attempt_id', 'operator_facing_run_revision',
       'operation', 'resource_ids', 'failure', 'recovery_class', 'terminal_facts'], key);
     const operation = objectAt(row.operation, `${key}.operation`);
-    exactKeysAt(operation, ['source_owner_epoch', 'operation_id', 'operation_revision'], `${key}.operation`);
+    exactKeysAt(operation, ['operation_id', 'operation_revision'], `${key}.operation`);
     const failure = objectAt(row.failure, `${key}.failure`);
     exactKeysAt(failure, ['code', 'message'], `${key}.failure`);
     const resourceIds = boundedArrayAt(row.resource_ids, `${key}.resource_ids`, 4096)
@@ -552,10 +529,9 @@ function programOperationFailuresAt(value: unknown, path: string): ProgramRunSta
       });
     return {
       nodeInstanceId: textAt(row.node_instance_id, `${key}.node_instance_id`, 128),
-      nodeAttemptId: textAt(row.node_attempt_id, `${key}.node_attempt_id`, 512),
+      nodeAttemptId: positiveIntegerAt(row.node_attempt_id, `${key}.node_attempt_id`),
       operatorFacingRunRevision: positiveIntegerAt(row.operator_facing_run_revision, `${key}.operator_facing_run_revision`),
-      operation: { sourceOwnerEpoch: textAt(operation.source_owner_epoch, `${key}.operation.source_owner_epoch`, 2048),
-        operationId: textAt(operation.operation_id, `${key}.operation.operation_id`, 2048),
+      operation: { operationId: positiveIntegerAt(operation.operation_id, `${key}.operation.operation_id`),
         operationRevision: positiveIntegerAt(operation.operation_revision, `${key}.operation.operation_revision`) },
       resourceIds,
       failure: { code: textAt(failure.code, `${key}.failure.code`, 256),
@@ -576,11 +552,11 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'operation_failures',
       'capture',
       'details',
+      'halt',
       'message',
       'node_status_revision',
       'node_statuses',
       'origin',
-      'owner_epoch',
       'owner_id',
       'reason_code',
       'run_revision',
@@ -593,8 +569,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_status.v4') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v4');
+  if (schemaVersion !== 'manyforge.program_run_status.v5') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v5');
   }
   const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
   if (!PROGRAM_RUN_STATES.has(state)) {
@@ -621,8 +597,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     ],
     `${path}.capture`,
   );
-  if (capture.schema_version !== 'manyforge.program_run_capture.v2') {
-    return fail(`${path}.capture.schema_version`, 'manyforge.program_run_capture.v2');
+  if (capture.schema_version !== 'manyforge.program_run_capture.v3') {
+    return fail(`${path}.capture.schema_version`, 'manyforge.program_run_capture.v3');
   }
   const ownerIdentities = boundedArrayAt(
     capture.owner_identities,
@@ -631,11 +607,13 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   ).map((value, index) => {
     const ownerPath = `${path}.capture.owner_identities[${index}]`;
     const owner = objectAt(value, ownerPath);
-    exactKeysAt(owner, ['owner_epoch', 'owner_id', 'owner_role'], ownerPath);
+    exactKeysAt(owner, ['application_start_id', 'role'], ownerPath);
     return {
-      ownerRole: stringAt(owner.owner_role, `${ownerPath}.owner_role`),
-      ownerId: stringAt(owner.owner_id, `${ownerPath}.owner_id`),
-      ownerEpoch: stringAt(owner.owner_epoch, `${ownerPath}.owner_epoch`),
+      role: stringAt(owner.role, `${ownerPath}.role`),
+      applicationStartId: stringAt(
+        owner.application_start_id,
+        `${ownerPath}.application_start_id`,
+      ),
     };
   });
   const nodePolicies = boundedArrayAt(
@@ -646,7 +624,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     value,
     `${path}.capture.node_policies[${index}]`,
   ));
-  const ownerRoles = ownerIdentities.map((owner) => owner.ownerRole);
+  const ownerRoles = ownerIdentities.map((owner) => owner.role);
   if (
     !ownerRoles.includes('program_runner')
     || ownerRoles.some((role, index) => index > 0 && role <= ownerRoles[index - 1])
@@ -681,19 +659,6 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     nodeStatuses[instanceId] = status as ProgramRunStatus['nodeStatuses'][string];
   }
   const ownerId = stringAt(record.owner_id, `${path}.owner_id`);
-  const ownerEpoch = stringAt(record.owner_epoch, `${path}.owner_epoch`);
-  const runnerIdentity = ownerIdentities.find(
-    (owner) => owner.ownerRole === 'program_runner',
-  );
-  if (
-    runnerIdentity?.ownerId !== ownerId
-    || runnerIdentity.ownerEpoch !== ownerEpoch
-  ) {
-    return fail(
-      `${path}.capture.owner_identities`,
-      'a program_runner identity matching the status owner',
-    );
-  }
   const activeOperationCount = record.active_operation_count === null
     ? null
     : integerAt(record.active_operation_count, `${path}.active_operation_count`);
@@ -709,14 +674,23 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   if (reasonCode === null && failureContext.origin !== null) {
     return fail(`${path}.origin`, 'null when the run names no reason');
   }
+  // The Stop that froze the run, exactly while it is halting or halted.
+  let halt: ProgramRunStatus['halt'] = null;
+  if (record.halt !== null) {
+    const haltRecord = objectAt(record.halt, `${path}.halt`);
+    exactKeysAt(haltRecord, ['kind', 'source_label'], `${path}.halt`);
+    halt = {
+      kind: nonEmptyStringAt(haltRecord.kind, `${path}.halt.kind`),
+      sourceLabel: nullableStringAt(haltRecord.source_label, `${path}.halt.source_label`),
+    };
+  }
   return {
     schemaVersion,
     ownerId,
-    ownerEpoch,
     runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
     state,
     capture: {
-      programRunId: stringAt(capture.program_run_id, `${path}.capture.program_run_id`),
+      programRunId: positiveIntegerAt(capture.program_run_id, `${path}.capture.program_run_id`),
       appliedRecordDigest: digestAt(
         capture.applied_record_digest,
         `${path}.capture.applied_record_digest`,
@@ -768,6 +742,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     message,
     runEnd: record.run_end === undefined || record.run_end === null
       ? null : parseProgramRunEnd(record.run_end, `${path}.run_end`),
+    halt,
   };
 }
 
@@ -783,6 +758,10 @@ const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
 
 function nullablePositiveIntegerAt(value: unknown, path: string): number | null {
   return value === null ? null : positiveIntegerAt(value, path);
+}
+
+function requestKeyAt(value: unknown, path: string): string {
+  return isRequestKey(value) ? value : fail(path, '32 lowercase hex characters');
 }
 
 /** The one event kind whose facts are parsed into typed fields. */
@@ -858,7 +837,7 @@ function parseTakeoverFallbackAuditFacts(
   if (planningCapMs < 0) return fail(`${path}.planning_cap_ms`, 'a non-negative number');
   return {
     nodeInstanceId: nonEmptyStringAt(record.node_instance_id, `${path}.node_instance_id`),
-    incumbentOperationId: nonEmptyStringAt(
+    incumbentOperationId: positiveIntegerAt(
       record.incumbent_operation_id,
       `${path}.incumbent_operation_id`,
     ),
@@ -917,10 +896,10 @@ export function parseProgramRuntimeControlsSnapshot(
     'recovery_fences', 'retry_counts', 'audit',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_controls.v3') {
-    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v3');
+  if (schemaVersion !== 'manyforge.program_runtime_controls.v4') {
+    return fail(`${path}.schema_version`, 'manyforge.program_runtime_controls.v4');
   }
-  const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
+  const programRunId = positiveIntegerAt(record.program_run_id, `${path}.program_run_id`);
   const fences = objectAt(record.recovery_fences, `${path}.recovery_fences`);
   exactKeysAt(fences, [
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
@@ -1020,15 +999,14 @@ function parseCycleRecoveryOffer(
     'program_binding_id', 'node_instance_id', 'node_attempt_id',
     'participants', 'graph_revision', 'retained_bundle_id', 'cycle_generation',
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
-    'pose_source_apply_generation', 'stop_id', 'stop_generation',
-    'stop_certificate_id', 'stop_certificate_revision', 'status',
+    'pose_source_apply_generation', 'status',
     'recovery_class', 'actions', 'reason_code', 'message',
     'details', 'origin', 'evidence_refs', 'manual_result', 'policy',
     'retries_used',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v5') {
-    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v5');
+  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v6') {
+    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v6');
   }
   const policy = objectAt(record.policy, `${path}.policy`);
   allowedKeysAt(policy, ['allow_intervention', 'max_retries'], ['intervention_stop_scope'], `${path}.policy`);
@@ -1091,18 +1069,18 @@ function parseCycleRecoveryOffer(
       record.control_command_epoch,
       `${path}.control_command_epoch`,
     ),
-    operationId: nullableStringAt(record.operation_id, `${path}.operation_id`),
+    operationId: nullablePositiveIntegerAt(record.operation_id, `${path}.operation_id`),
     operationRevision: nullablePositiveIntegerAt(
       record.operation_revision,
       `${path}.operation_revision`,
     ),
-    programRunId: stringAt(record.program_run_id, `${path}.program_run_id`),
+    programRunId: positiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
     programBindingId: digestAt(
       record.program_binding_id,
       `${path}.program_binding_id`,
     ),
     nodeInstanceId: stringAt(record.node_instance_id, `${path}.node_instance_id`),
-    nodeAttemptId: stringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    nodeAttemptId: positiveIntegerAt(record.node_attempt_id, `${path}.node_attempt_id`),
     participants: boundedArrayAt(record.participants, `${path}.participants`, 4096)
       .map((item, index) => jsonValueAt(item, `${path}.participants[${index}]`)),
     graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
@@ -1129,19 +1107,6 @@ function parseCycleRecoveryOffer(
     poseSourceApplyGeneration: integerAt(
       record.pose_source_apply_generation,
       `${path}.pose_source_apply_generation`,
-    ),
-    stopId: nullableStringAt(record.stop_id, `${path}.stop_id`),
-    stopGeneration: nullablePositiveIntegerAt(
-      record.stop_generation,
-      `${path}.stop_generation`,
-    ),
-    stopCertificateId: nullableStringAt(
-      record.stop_certificate_id,
-      `${path}.stop_certificate_id`,
-    ),
-    stopCertificateRevision: nullablePositiveIntegerAt(
-      record.stop_certificate_revision,
-      `${path}.stop_certificate_revision`,
     ),
     status: stringAt(record.status, `${path}.status`),
     recoveryClass: stringAt(record.recovery_class, `${path}.recovery_class`),
@@ -1170,9 +1135,9 @@ function parseCycleRecoveryOffer(
 
 function parseExecutionSelectionControls(value: unknown, path: string): ProgramExecutionSelectionControls {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['selection_revision', 'motion_held', 'groups'], path);
-  const selectionRevision = integerAt(record.selection_revision, `${path}.selection_revision`);
-  if (selectionRevision < 0) return fail(path, 'a nonnegative selection revision');
+  exactKeysAt(record, ['hold_revision', 'motion_held', 'groups'], path);
+  const holdRevision = integerAt(record.hold_revision, `${path}.hold_revision`);
+  if (holdRevision < 0) return fail(path, 'a nonnegative hold revision');
   const motionHeld = booleanAt(record.motion_held, `${path}.motion_held`);
   let previous = '';
   const groups = boundedArrayAt(record.groups, `${path}.groups`, 4097).map((raw, index) => {
@@ -1250,7 +1215,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       runtimeScaleSelector, runtimeScaleUnavailableReason, resourceIds };
   });
   if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
-  return { selectionRevision, motionHeld, groups };
+  return { holdRevision, motionHeld, groups };
 }
 
 function parseProgramRecoveryHold(value: unknown, path: string): ProgramRecoveryHold {
@@ -1278,18 +1243,18 @@ export function parseProgramRuntimeControlProjection(
   const path = 'programRuntimeControlProjection';
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'schema_version', 'owner_id', 'owner_epoch', 'program_run_id',
+    'schema_version', 'owner_id', 'program_run_id',
     'run_revision', 'runtime_controls', 'recovery_offer', 'recovery_offers',
     'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v9') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v10') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v9',
+      'manyforge.program_runtime_control_projection.v10',
     );
   }
-  const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
+  const programRunId = positiveIntegerAt(record.program_run_id, `${path}.program_run_id`);
   const runtimeControls = parseProgramRuntimeControlsSnapshot(
     record.runtime_controls,
     `${path}.runtime_controls`,
@@ -1315,7 +1280,6 @@ export function parseProgramRuntimeControlProjection(
   return {
     schemaVersion,
     ownerId: stringAt(record.owner_id, `${path}.owner_id`),
-    ownerEpoch: stringAt(record.owner_epoch, `${path}.owner_epoch`),
     programRunId,
     runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
     runtimeControls,
@@ -1357,8 +1321,8 @@ function persistentKeyValueAt(value: unknown, path: string): PersistentKeyValue 
 function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyValueEdit {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'action', 'detail', 'key', 'node_attempt_id', 'node_instance_id', 'program_run_id',
-    'project_path', 'reason', 'request_id', 'sequence', 'source_label',
+    'action', 'application_start_id', 'detail', 'key', 'node_attempt_id', 'node_instance_id',
+    'program_run_id', 'project_path', 'reason', 'request_key', 'sequence', 'source_label',
   ], path);
   const action = stringAt(record.action, `${path}.action`);
   if (
@@ -1375,26 +1339,17 @@ function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyVa
     sequence: positiveIntegerAt(record.sequence, `${path}.sequence`),
     key: nullableStringAt(record.key, `${path}.key`),
     action,
-    requestId: nullableStringAt(record.request_id, `${path}.request_id`),
+    applicationStartId: isApplicationStartId(record.application_start_id)
+      ? record.application_start_id
+      : fail(`${path}.application_start_id`, '16 lowercase hex characters'),
+    requestKey: record.request_key === null
+      ? null : requestKeyAt(record.request_key, `${path}.request_key`),
     sourceLabel: stringAt(record.source_label, `${path}.source_label`),
-    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
+    programRunId: nullablePositiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
     nodeInstanceId: nullableStringAt(record.node_instance_id, `${path}.node_instance_id`),
-    nodeAttemptId: nullableStringAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    nodeAttemptId: nullablePositiveIntegerAt(record.node_attempt_id, `${path}.node_attempt_id`),
     reason,
     detail: nullableStringAt(record.detail, `${path}.detail`),
-  };
-}
-
-function persistentKeyStorageFaultAt(
-  value: unknown,
-  path: string,
-): PersistentKeyValues['storageFault'] {
-  if (value === null) return null;
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['code', 'message'], path);
-  return {
-    code: stringAt(record.code, `${path}.code`),
-    message: stringAt(record.message, `${path}.message`),
   };
 }
 
@@ -1420,54 +1375,25 @@ export function parsePersistentKeyValues(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'apply_observation_fault', 'edits', 'keys', 'program_revision', 'program_run_id',
-    'project_path', 'scenario_id', 'schema_version', 'sequence', 'storage_fault',
+    'project_path', 'scenario_id', 'schema_version', 'sequence',
   ], path);
-  if (record.schema_version !== 'manyforge.persistent_key_values.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v1');
+  if (record.schema_version !== 'manyforge.persistent_key_values.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v2');
   }
   return {
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
     projectPath: projectPathAt(record.project_path, `${path}.project_path`),
     programRevision: digestAt(record.program_revision, `${path}.program_revision`),
-    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
+    programRunId: nullablePositiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
     sequence: integerAt(record.sequence, `${path}.sequence`),
     keys: arrayAt(record.keys, `${path}.keys`)
       .map((row, index) => persistentKeyValueAt(row, `${path}.keys[${index}]`)),
     edits: arrayAt(record.edits, `${path}.edits`)
       .map((row, index) => persistentKeyValueEditAt(row, `${path}.edits[${index}]`)),
-    storageFault: persistentKeyStorageFaultAt(record.storage_fault, `${path}.storage_fault`),
     applyObservationFault: persistentKeyApplyObservationFaultAt(
       record.apply_observation_fault,
       `${path}.apply_observation_fault`,
     ),
-  };
-}
-
-/** A set or Reset returns the Scenario's values as they are after the edit. */
-export function parsePersistentKeyEdit(value: unknown): PersistentKeyValues {
-  const path = 'persistentKeyEdit';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['action', 'key', 'request_id', 'schema_version', 'values'], path);
-  if (record.schema_version !== 'manyforge.persistent_key_edit.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.persistent_key_edit.v1');
-  }
-  if (record.action !== 'set' && record.action !== 'reset') {
-    return fail(`${path}.action`, 'set or reset');
-  }
-  return parsePersistentKeyValues(record.values, `${path}.values`);
-}
-
-export function parsePersistentKeyValuesCleared(value: unknown): PersistentKeyValuesCleared {
-  const path = 'persistentKeyValuesCleared';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['action', 'project_path', 'removed', 'request_id', 'schema_version'], path);
-  if (record.schema_version !== 'manyforge.persistent_key_edit.v1' || record.action !== 'clear') {
-    return fail(path, 'a manyforge.persistent_key_edit.v1 clear result');
-  }
-  return {
-    requestId: stringAt(record.request_id, `${path}.request_id`),
-    projectPath: projectPathAt(record.project_path, `${path}.project_path`),
-    removed: integerAt(record.removed, `${path}.removed`),
   };
 }
 
@@ -1965,7 +1891,7 @@ export function runtimeScaleControlStatusAt(
     scalingDomainId,
     activeControlConfigurationId,
     activeControlConfigurationGeneration,
-    activeOperationId: nullableStringAt(
+    activeOperationId: nullablePositiveIntegerAt(
       status.active_operation_id,
       `${path}.active_operation_id`,
     ),
@@ -2036,7 +1962,7 @@ export function parseRuntimeScaleControlAccepted(
     'active_operation_scale_generation',
     'control_generation',
     'replay_status',
-    'request_id',
+    'request_key',
     'requested_scale',
     'selector',
   ], 'runtimeScaleControlAcceptance.accepted');
@@ -2062,18 +1988,15 @@ export function parseRuntimeScaleControlAccepted(
     accepted.accepted_at_ns,
     'runtimeScaleControlAcceptance.accepted.accepted_at_ns',
   );
+  requestKeyAt(accepted.request_key, 'runtimeScaleControlAcceptance.accepted.request_key');
   return {
-    requestId: stringAt(
-      accepted.request_id,
-      'runtimeScaleControlAcceptance.accepted.request_id',
-    ),
     selector: runtimeScaleControlSelectorAt(
       accepted.selector,
       'runtimeScaleControlAcceptance.accepted.selector',
     ),
     requestedScale,
     controlGeneration,
-    activeOperationId: nullableStringAt(
+    activeOperationId: nullablePositiveIntegerAt(
       accepted.active_operation_id,
       'runtimeScaleControlAcceptance.accepted.active_operation_id',
     ),
@@ -2091,10 +2014,16 @@ export function parseRuntimeScaleControlAccepted(
 export function parseProgramRunAdmittedSpeeds(value: unknown): ProgramRunAdmittedSpeeds {
   const path = 'programRunAdmittedSpeeds';
   const root = objectAt(value, path);
-  exactKeysAt(root, ['schema_version', 'program_run_id', 'targets'], path);
-  if (root.schema_version !== 'manyforge.program_run_admitted_speeds.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_admitted_speeds.v1');
+  exactKeysAt(root, [
+    'schema_version', 'application_start_id', 'display', 'program_run_id', 'targets',
+  ], path);
+  if (root.schema_version !== 'manyforge.program_run_admitted_speeds.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_admitted_speeds.v2');
   }
+  if (!isApplicationStartId(root.application_start_id)) {
+    return fail(`${path}.application_start_id`, '16 lowercase hex characters');
+  }
+  nonEmptyStringAt(root.display, `${path}.display`);
   const targets = arrayAt(root.targets, `${path}.targets`).map((item, index) => {
     const at = `${path}.targets[${index}]`;
     const row = objectAt(item, at);
@@ -2108,7 +2037,7 @@ export function parseProgramRunAdmittedSpeeds(value: unknown): ProgramRunAdmitte
     return {
       controllableComponentId: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
       commandTargetId: stringAt(row.command_target_id, `${at}.command_target_id`),
-      operationId: stringAt(row.operation_id, `${at}.operation_id`),
+      operationId: positiveIntegerAt(row.operation_id, `${at}.operation_id`),
       occurredAtWall: stringAt(row.occurred_at_wall, `${at}.occurred_at_wall`),
       requestedTcpLinearSpeedMps: row.requested_tcp_linear_speed_mps === null
         ? null
@@ -2120,5 +2049,5 @@ export function parseProgramRunAdmittedSpeeds(value: unknown): ProgramRunAdmitte
       admittedTcpLinearSpeedMps: admitted,
     };
   });
-  return { programRunId: stringAt(root.program_run_id, `${path}.program_run_id`), targets };
+  return { programRunId: positiveIntegerAt(root.program_run_id, `${path}.program_run_id`), targets };
 }

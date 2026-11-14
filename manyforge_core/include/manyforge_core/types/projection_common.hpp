@@ -252,7 +252,7 @@ struct MaintenanceProjectionSetSourceDTO final {
   ProjectionRevisionDTO target_projection_revision;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
+    return apply_id.nonzero() && apply_generation.nonzero() &&
            target_projection_revision.valid();
   }
 

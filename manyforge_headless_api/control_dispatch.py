@@ -9,9 +9,10 @@ and every effect is decided by one of those semantic owners.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from collections.abc import Mapping
 from typing import Any
-from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -22,6 +23,14 @@ from .control_protocol import (
     ExecutionIngressStamp,
     is_stop_command,
 )
+from .identity import (
+    RequestAdmission,
+    RequestKeyInvalid,
+    RequestKeyRequired,
+    StartIdentityMismatch,
+    format_request_key,
+    websocket_request_key,
+)
 from .models import (
     CycleRecoveryActionRequest,
     FullStopIntentRequest,
@@ -30,10 +39,9 @@ from .models import (
     OperationResetRequest,
     OperationIntentRequest,
     ProgramCycleResetRequest,
-    ProgramFullStopResetRequest,
-    ProgramFullStopResumeRequest,
+    ProgramHaltDiscardRequest,
+    ProgramHaltResumeRequest,
     ProgramRunStartRequest,
-    ProgramRunStopRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
@@ -46,17 +54,21 @@ from .native import HeadlessApiError
 from .service import HeadlessService, TrustedAttribution
 
 
-_EXECUTION_HOST_COMMANDS = frozenset(
+# Session-less (HTTP) commands that name no value minted inside one start,
+# so they carry no ``A`` (contract 1.6; BS 1.3 route list).
+_KINDS_WITHOUT_START_VALUE = frozenset({"program_run", "stop_all", "halt"})
+# Kinds whose payload nests its request context (the Kernel DTO shape).
+_NESTED_CONTEXT_KINDS = frozenset(
     {
         "operation_start",
         "operation_stop",
         "operation_reset",
         "operation_acknowledge_completed",
-        "cell_full_stop",
+        "stop_all",
+        "halt",
         "runtime_scale",
     }
 )
-_EXPECTED_EXECUTION_OWNER_FIELD = "expected_execution_owner_epoch"
 _MANUAL_OPERATION_CONTROLS = frozenset(
     {
         "operation_reset",
@@ -65,17 +77,12 @@ _MANUAL_OPERATION_CONTROLS = frozenset(
 )
 
 
-def requires_execution_owner_fence(command_kind: str) -> bool:
-    """Return whether a command targets the independently owned execution host."""
-
-    return command_kind in _EXECUTION_HOST_COMMANDS
-
-
 class HeadlessExecutionControlDispatch:
     """Map all public control transports onto one strict owner call table."""
 
-    def __init__(self, service: HeadlessService) -> None:
+    def __init__(self, service: HeadlessService, admission: RequestAdmission) -> None:
         self._service = service
+        self._admission = admission
 
     def _manual_scope_conflict(
         self, request: ExecutionCommandRequestDTO, cycle: Mapping[str, Any]
@@ -95,15 +102,11 @@ class HeadlessExecutionControlDispatch:
         if kind not in _MANUAL_OPERATION_CONTROLS:
             return None
         projection = self._service.execution_control_state()
-        identity = projection.get("identity", {})
         state = projection.get("control_state", {})
         if (
-            not isinstance(identity, Mapping)
-            or identity.get("owner_epoch")
-            != request.payload.get(_EXPECTED_EXECUTION_OWNER_FIELD)
-            or not isinstance(state, Mapping)
+            not isinstance(state, Mapping)
             # One component-based version, no legacy fallback.
-            or state.get("schema_version") != "manyforge.execution_control_state.v7"
+            or state.get("schema_version") != "manyforge.execution_control_state.v8"
             or request.payload.get("execution_scope") is not None
         ):
             return "manual_operation_scope_stale"
@@ -126,54 +129,58 @@ class HeadlessExecutionControlDispatch:
             return None
         return "manual_operation_scope_stale"
 
-    def owner_projection(self) -> tuple[str, int]:
+    def control_revision(self) -> int:
         cycle = self._service.program_cycle_status()
-        owner = cycle.get("program_runner_owner_epoch")
         revision = cycle.get("execution_control_revision")
-        if (
-            not isinstance(owner, str)
-            or not owner
-            or type(revision) is not int
-            or revision < 1
-        ):
+        if type(revision) is not int or revision < 1:
             raise HeadlessApiError(
                 "execution_control_projection_invalid",
-                "Program owner omitted its execution-control identity",
+                "Program owner omitted its execution-control revision",
             )
-        return owner, revision
+        return revision
 
-    @staticmethod
     def _caller_context(
+        self,
         request: ExecutionCommandRequestDTO,
-        *,
-        include_session: bool,
     ) -> dict[str, Any]:
+        """Form the request context: the key is formed here, once.
+
+        A WebSocket command's key is class 0 from its session and client
+        sequence. A session-less (HTTP) command carries the client's 32-hex
+        key in its payload (top level, or in its nested request context); a
+        Stop without a valid one gets a fresh Headless key.
+        """
+
         envelope = request.command_envelope
-        payload_request_id = request.payload.get("request_id")
-        nested_context = request.payload.get("request_context")
-        if not isinstance(payload_request_id, str) and isinstance(
-            nested_context, Mapping
-        ):
-            payload_request_id = nested_context.get("request_id")
-        if not isinstance(payload_request_id, str):
-            payload_request_id = envelope.correlation_id
-        context = {
-            # Correlation groups related activity; it is not the command's
-            # replay/idempotency identity. Preserve the command-specific
-            # request ID already validated by its strict payload model.
-            "request_id": payload_request_id,
-            "request_owner_epoch": (
-                envelope.control_session_id or envelope.freshness.receiver_incarnation
-            ),
-            "source_label": envelope.source_label,
-            "correlation_id": envelope.correlation_id,
-        }
-        if include_session:
-            context.update(
-                session_id=envelope.control_session_id,
-                client_sequence=envelope.client_sequence,
+        if envelope.control_session_number is not None:
+            assert envelope.client_sequence is not None
+            key = format_request_key(
+                websocket_request_key(
+                    envelope.control_session_number, int(envelope.client_sequence)
+                )
             )
-        return context
+        else:
+            raw = request.payload.get("request_key")
+            nested = request.payload.get("request_context")
+            if raw is None and isinstance(nested, Mapping):
+                raw = nested.get("request_key")
+            stop = is_stop_command(envelope.command_kind)
+            try:
+                key = self._admission.http_key(raw, stop=stop)
+            except RequestKeyRequired as error:
+                raise HeadlessApiError(
+                    "request_key_required",
+                    "an effectful request must carry its request_key",
+                ) from error
+            except RequestKeyInvalid as error:
+                raise HeadlessApiError(
+                    "request_key_invalid",
+                    "request_key must be exactly 32 hex characters",
+                ) from error
+        return {
+            "request_key": key,
+            "source_label": envelope.source_label,
+        }
 
     @staticmethod
     def _owner_result(
@@ -182,9 +189,8 @@ class HeadlessExecutionControlDispatch:
         disposition: str,
         code: str,
     ) -> ExecutionIngressResult:
-        owner = cycle.get("program_runner_owner_epoch")
         revision = cycle.get("execution_control_revision")
-        if not isinstance(owner, str) or type(revision) is not int:
+        if type(revision) is not int:
             raise HeadlessApiError(
                 "execution_control_projection_invalid",
                 "Program owner returned an invalid current projection",
@@ -197,7 +203,6 @@ class HeadlessExecutionControlDispatch:
         return ExecutionIngressResult(
             disposition=disposition,  # type: ignore[arg-type]
             code=code,
-            semantic_owner_epoch=owner,
             execution_control_revision=revision,
             current_identity=current_identity,
         )
@@ -222,7 +227,6 @@ class HeadlessExecutionControlDispatch:
         return ExecutionIngressResult(
             disposition=disposition,  # type: ignore[arg-type]
             code=code,
-            semantic_owner_epoch=envelope.expected_semantic_owner_epoch,
             execution_control_revision=(envelope.expected_execution_control_revision),
             current_identity=None,
         )
@@ -262,7 +266,7 @@ class HeadlessExecutionControlDispatch:
         if kind == "program_reset" and state == "resetting":
             try:
                 model = ProgramCycleResetRequest.model_validate({
-                    **request.payload, **self._caller_context(request, include_session=True)
+                    **request.payload, **self._caller_context(request)
                 })
             except ValidationError as error:
                 raise HeadlessApiError(
@@ -279,8 +283,6 @@ class HeadlessExecutionControlDispatch:
                 disposition, code = "rejected", "program_run_request_conflict"
             else:
                 disposition, code = "joined", "program_reset_already_current"
-        elif is_stop_command(kind) and state == "stopping":
-            disposition, code = "joined", "program_stop_already_current"
         elif is_stop_command(kind) and state in {
             "idle_after_reset",
             "resetting",
@@ -301,11 +303,46 @@ class HeadlessExecutionControlDispatch:
         stamp: ExecutionIngressStamp,
     ) -> tuple[ExecutionIngressResult, Mapping[str, Any] | None]:
         envelope = request.command_envelope
+        stop = is_stop_command(envelope.command_kind)
+        attribution = TrustedAttribution(
+            principal_id=stamp.trusted_principal_id,
+            assurance=stamp.assurance or "unverified",
+        )
+        payload = dict(request.payload)
+        # Only a session-less (HTTP) command carries the client's key and
+        # ``A``; a WebSocket session belongs to one start (contract 1.6).
+        payload.pop("request_key", None)
+        start_identity = payload.pop("application_start_id", None)
+        if (
+            envelope.control_session_number is None
+            and envelope.command_kind not in _KINDS_WITHOUT_START_VALUE
+        ):
+            try:
+                self._admission.start_identity(start_identity)
+            except StartIdentityMismatch as mismatch:
+                if not stop:
+                    raise HeadlessApiError(
+                        mismatch.code,
+                        "the request names a value of another application start",
+                    ) from mismatch
+                # A Stop is never refused: a Stop of another or an unnamed
+                # start acts as Stop all (BS 1.3, B12; PD-1). It goes as a
+                # recognized Stop on the operation-Stop route, so the Kernel
+                # records why it was widened (`stale_start`).
+                context = self._caller_context(request)
+                result = self._service.execution_recognized_stop(
+                    request_key=context["request_key"],
+                    recognized_route="/api/execution/stops",
+                    reason="recognized_stop_start_not_current",
+                    source_label=context["source_label"],
+                    attribution=attribution,
+                )
+                return self._keyed_result(request, result, context["request_key"])
         # Recognized Stop must not wait for a Program projection read.  Its
         # semantic owner validates the exact target and current state, then
         # the state stream publishes the authoritative outcome.
-        if not is_stop_command(envelope.command_kind):
-            cycle_before = self._service.program_cycle_status()
+        if not stop:
+            cycle_before = self._service.program_cycle_status(before_command=True)
             allowed, reason = self._availability(cycle_before, envelope.command_kind)
             if not allowed:
                 return self._reduce_unavailable(request, cycle_before, reason)
@@ -313,72 +350,22 @@ class HeadlessExecutionControlDispatch:
             if conflict is not None:
                 return self._reduce_unavailable(request, cycle_before, conflict)
 
-        context = self._caller_context(
-            request,
-            include_session=(
-                envelope.command_kind.startswith("program_")
-                or envelope.command_kind == "execution_recovery"
-            ),
-        )
-        origin_epoch = context["request_owner_epoch"]
-        payload = dict(request.payload)
-        if requires_execution_owner_fence(envelope.command_kind) and is_stop_command(
-            envelope.command_kind
-        ):
-            # A Stop needs no owner fence: the Kernel resolves every Stop
-            # against its own current epoch. Without one it keeps the
-            # caller's epoch; a value given is the Stop's epoch and is
-            # validated with the rest of its payload.
-            if _EXPECTED_EXECUTION_OWNER_FIELD in payload:
-                context["request_owner_epoch"] = payload.pop(
-                    _EXPECTED_EXECUTION_OWNER_FIELD
-                )
-        elif requires_execution_owner_fence(envelope.command_kind):
-            execution_owner = payload.pop(_EXPECTED_EXECUTION_OWNER_FIELD, None)
-            if (
-                not isinstance(execution_owner, str)
-                or not execution_owner
-                or len(execution_owner.encode("utf-8")) > 256
-            ):
-                raise HeadlessApiError(
-                    "execution_control_payload_invalid",
-                    "native execution command omitted its current owner fence",
-                )
-            # This is a target-owner fence copied from the backend projection,
-            # not caller authority.  The control session remains the caller
-            # identity and the native owner rejects the command if this exact
-            # epoch has already been replaced.
-            context["request_owner_epoch"] = execution_owner
-        attribution = TrustedAttribution(
-            principal_id=stamp.trusted_principal_id,
-            assurance=stamp.assurance or "unverified",
-        )
+        context = self._caller_context(request)
+        formed_key = context["request_key"]
+        if envelope.command_kind in _NESTED_CONTEXT_KINDS:
+            payload.pop("request_context", None)
         try:
             kind = envelope.command_kind
             if kind == "program_run":
                 model = ProgramRunStartRequest.model_validate({**payload, **context})
                 result = self._service.program_run_start(model)
-            elif kind in {
-                "program_motion_stop",
-                "program_full_stop",
-                "program_stop",
-            }:
-                request_type = (
-                    ProgramSelectionStopRequest
-                    if kind == "program_motion_stop"
-                    else ProgramRunStopRequest
+            elif kind == "program_motion_stop":
+                # Kernel-first: the selection Stop goes to the host, never
+                # through the Program runner (contract 1.8).
+                model = ProgramSelectionStopRequest.model_validate(
+                    {**payload, **context}
                 )
-                model = request_type.model_validate({**payload, **context})
-                if kind == "program_motion_stop":
-                    result = self._service.program_run_motion_stop(
-                        model.program_run_id, model
-                    )
-                elif kind == "program_full_stop":
-                    result = self._service.program_run_full_stop(
-                        model.program_run_id, model
-                    )
-                else:
-                    result = self._service.program_run_stop(model.program_run_id, model)
+                result = self._service.program_run_motion_stop(model, attribution)
             elif kind in {"program_motion_start", "program_motion_resume"}:
                 model_type = (
                     ProgramSelectionStartRequest
@@ -404,18 +391,18 @@ class HeadlessExecutionControlDispatch:
                 result = self._service.program_cycle_reset(
                     ProgramCycleResetRequest.model_validate({**payload, **context})
                 )
-            elif kind == "program_resume_full_stop":
-                model = ProgramFullStopResumeRequest.model_validate(
+            elif kind == "program_resume_halt":
+                model = ProgramHaltResumeRequest.model_validate(
                     {**payload, **context}
                 )
-                result = self._service.program_run_resume_full_stop(
+                result = self._service.program_run_resume_halt(
                     model.program_run_id, model
                 )
-            elif kind == "program_discard_full_stop":
-                model = ProgramFullStopResetRequest.model_validate(
+            elif kind == "program_discard_halt":
+                model = ProgramHaltDiscardRequest.model_validate(
                     {**payload, **context}
                 )
-                result = self._service.program_run_reset_full_stop(
+                result = self._service.program_run_discard_halt(
                     model.program_run_id, model
                 )
             elif kind == "program_runtime_blackboard_write":
@@ -457,12 +444,14 @@ class HeadlessExecutionControlDispatch:
                     ),
                     attribution,
                 )
-            elif kind == "cell_full_stop":
-                result = self._service.execution_full_stop(
-                    FullStopIntentRequest.model_validate(
-                        {**payload, "request_context": context}
-                    ),
-                    attribution,
+            elif kind in {"stop_all", "halt"}:
+                model = FullStopIntentRequest.model_validate(
+                    {**payload, "request_context": context}
+                )
+                result = (
+                    self._service.execution_stop_all(model, attribution)
+                    if kind == "stop_all"
+                    else self._service.execution_halt(model, attribution)
                 )
             elif kind == "execution_recovery":
                 result = self._service.cycle_recovery_action(
@@ -490,32 +479,52 @@ class HeadlessExecutionControlDispatch:
                     "command payload does not match its declared command kind",
                     details={"validation": str(error)},
                 ) from error
-            # A recognized Stop whose payload is invalid is a Full Stop, as on
-            # the Stop HTTP routes; the adapter names it, as they do.
-            full = envelope.command_kind in {"cell_full_stop", "program_full_stop"}
-            result = self._service.execution_recognized_malformed_stop(
-                request_id="malformed-stop." + uuid4().hex[:16],
-                recognized_route=(
-                    "/api/execution/full-stop" if full else "/api/execution/stops"
-                ),
+            # A recognized Stop whose payload is invalid is widened by the
+            # Kernel from the route it names, as on the Stop HTTP routes
+            # (PD-1): Halt stays Halt, every other Stop becomes Stop all.
+            formed_key = self._admission.mint_key()
+            result = self._service.execution_recognized_stop(
+                request_key=formed_key,
+                recognized_route=_MALFORMED_STOP_ROUTES[envelope.command_kind],
                 reason="recognized_stop_payload_invalid",
+                # The envelope's label is validated with the envelope.
+                source_label=envelope.source_label,
                 attribution=attribution,
             )
 
-        def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
-            return self._addressed_result(
-                request,
-                disposition=disposition,
-                code=code,
-            )
+        return self._keyed_result(request, result, formed_key)
 
+    def _keyed_result(
+        self,
+        request: ExecutionCommandRequestDTO,
+        result: Any,
+        request_key: str,
+    ) -> tuple[ExecutionIngressResult, Mapping[str, Any] | None]:
+        """The dispatch result; the receipt names the key the command was
+        forwarded with, and a runner command's row (OD-214)."""
+
+        ingress, reply = self._dispatch_result(request, result)
+        command = None
+        if request.command_envelope.command_kind in _RUNNER_COMMAND_KINDS:
+            # The runner's `program_command_reply.v1`, validated by the
+            # runner client.
+            command = result["command"]
+        return replace(ingress, request_key=request_key, command=command), reply
+
+    def _dispatch_result(
+        self,
+        request: ExecutionCommandRequestDTO,
+        result: Any,
+    ) -> tuple[ExecutionIngressResult, Mapping[str, Any] | None]:
+        envelope = request.command_envelope
         if isinstance(result, Mapping) and result.get("ok") is False:
             error = result.get("error")
             code = error.get("code") if isinstance(error, Mapping) else None
             return (
-                owner_result(
-                    "rejected",
-                    (
+                self._addressed_result(
+                    request,
+                    disposition="rejected",
+                    code=(
                         code
                         if isinstance(code, str) and code
                         else "execution_command_rejected"
@@ -524,14 +533,31 @@ class HeadlessExecutionControlDispatch:
                 result,
             )
         return (
-            owner_result(
-                "received",
-                f"{envelope.command_kind}_received",
+            self._addressed_result(
+                request,
+                disposition="received",
+                code=f"{envelope.command_kind}_received",
             ),
             result,
         )
 
 
+# The command kinds Headless forwards to the Program runner: their reply is
+# the runner's `program_command_reply.v1`, answered at acceptance (OD-214).
+_RUNNER_COMMAND_KINDS = frozenset(
+    {
+        "program_run",
+        "program_motion_start",
+        "program_motion_resume",
+        "program_manual_handover",
+        "program_reset",
+        "program_resume_halt",
+        "program_discard_halt",
+        "program_runtime_blackboard_write",
+        "program_manual_result_stage",
+        "execution_recovery",
+    }
+)
 # The payload models of the Stop command kinds. Only their validation
 # failure promotes; any other model's failure keeps its refusal.
 _STOP_REQUEST_MODELS = frozenset(
@@ -539,13 +565,18 @@ _STOP_REQUEST_MODELS = frozenset(
     for model in (
         StopIntentRequest,
         FullStopIntentRequest,
-        ProgramRunStopRequest,
         ProgramSelectionStopRequest,
     )
 )
+# The Stop route each Stop kind names when its payload is invalid (PD-1).
+_MALFORMED_STOP_ROUTES = {
+    "program_motion_stop": "/api/execution/stops",
+    "operation_stop": "/api/execution/stops",
+    "stop_all": "/api/execution/stop-all",
+    "halt": "/api/execution/halt",
+}
 
 
 __all__ = [
     "HeadlessExecutionControlDispatch",
-    "requires_execution_owner_fence",
 ]

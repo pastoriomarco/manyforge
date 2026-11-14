@@ -73,25 +73,15 @@ private:
   core::ProgramCycleStatusDTO cycle_;
 };
 
-/// Caller has authenticated the ACK and validated its existing status digest.
 /// This check precedes ordinary current/reconciliation acceptance and effects.
 inline void CheckProgramRunnerPublicationHealth(
     const content_identity::CanonicalValue &value,
     const core::ProgramCycleStatusDTO &cycle,
-    const core::RuntimeEpoch &receiver_runtime_epoch, bool command_fenced,
-    const std::optional<std::string> &fault_reference) {
+    bool command_fenced) {
   if (auto fault = DecodeProgramRunnerPublisherFault(value)) {
-    // Reuse ProgramRuntime._digest's direct RFC8785 ErrorDTO digest. This
-    // existing status field remains inside the original fourteen-field hash.
-    if (!fault_reference ||
-        *fault_reference != content_identity::sha256_digest(
-                                content_identity::canonical_json(value)))
+    if (!command_fenced)
       throw std::invalid_argument(
-          "Program Runner publisher fault reference differs from its error");
-    if (!command_fenced || cycle.program_runner_owner_epoch.value() !=
-                               receiver_runtime_epoch.value())
-      throw std::invalid_argument("Program Runner publisher fault must name "
-                                  "its current owner and fence commands");
+          "Program Runner publisher fault must fence commands");
     throw ProgramRunnerPublisherFault(std::move(*fault), cycle);
   }
 }

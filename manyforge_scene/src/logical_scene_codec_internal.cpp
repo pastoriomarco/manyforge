@@ -620,40 +620,6 @@ DecodeProviderEvidence(const CanonicalValue &value) {
   };
 }
 
-// Observation fields that v9 stores kept in provider evidence.
-constexpr std::string_view kRetiredProviderEvidenceFields[] = {
-    "provider_source_sequence", "received_at_ns", "source_freshness_budget_ns",
-    "source_timestamp_ns"};
-
-CanonicalValue WithoutRetiredProviderEvidenceFields(
-    const CanonicalValue &value, bool &changed,
-    const bool provider_evidence = false) {
-  if (value.is_array()) {
-    CanonicalValue::Array result;
-    for (const auto &item : value.as_array()) {
-      result.push_back(WithoutRetiredProviderEvidenceFields(item, changed));
-    }
-    return CanonicalValue(std::move(result));
-  }
-  if (!value.is_object()) {
-    return value;
-  }
-  CanonicalValue::Object result;
-  for (const auto &[name, member] : value.as_object()) {
-    if (provider_evidence &&
-        std::find(std::begin(kRetiredProviderEvidenceFields),
-                  std::end(kRetiredProviderEvidenceFields),
-                  name) != std::end(kRetiredProviderEvidenceFields)) {
-      changed = true;
-      continue;
-    }
-    result.emplace_back(name, WithoutRetiredProviderEvidenceFields(
-                                  member, changed,
-                                  name == "provider_evidence"));
-  }
-  return CanonicalValue(std::move(result));
-}
-
 CanonicalValue Placement(const core::SceneObjectPlacementDTO &placement) {
   return std::visit(
       [](const auto &value) -> CanonicalValue {
@@ -931,32 +897,33 @@ core::ProjectionRevisionDTO DecodeProjection(const CanonicalValue &value) {
   return projection;
 }
 
+CanonicalValue RequestKeyValue(const core::RequestKey &key) {
+  return CanonicalValue(core::RequestKeyText(key));
+}
+
+// A request key (contract 1.4): exactly 32 lowercase hexadecimal characters.
+core::RequestKey DecodeRequestKey(const CanonicalValue &value,
+                                  const std::string_view label) {
+  const auto key = core::ParseRequestKey(String(value, label));
+  if (!key.has_value()) {
+    Fail(std::string(label) + " is not a request key");
+  }
+  return *key;
+}
+
 CanonicalValue RequestContext(const core::PublicRequestContextDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"correlation_id", value.correlation_id.has_value()
-                             ? CanonicalValue(*value.correlation_id)
-                             : CanonicalValue(nullptr)},
-      {"request_id", CanonicalValue(value.request_id.value())},
-      {"request_owner_epoch",
-       CanonicalValue(value.request_owner_epoch.value())},
+      {"request_key", RequestKeyValue(value.request_key)},
       {"source_label", CanonicalValue(value.source_label)},
   });
 }
 
 core::PublicRequestContextDTO
 DecodeRequestContext(const CanonicalValue &value) {
-  ExactObject(value, 4U, "request context");
-  std::optional<std::string> correlation_id;
-  const auto &correlation = Member(value, "correlation_id");
-  if (!std::holds_alternative<std::nullptr_t>(correlation.storage())) {
-    correlation_id = String(correlation, "correlation_id");
-  }
+  ExactObject(value, 2U, "request context");
   return {
-      core::RequestId(String(Member(value, "request_id"), "request_id")),
-      core::RequestOwnerEpoch(
-          String(Member(value, "request_owner_epoch"), "request_owner_epoch")),
+      DecodeRequestKey(Member(value, "request_key"), "request_key"),
       String(Member(value, "source_label"), "source_label"),
-      std::move(correlation_id),
   };
 }
 
@@ -1585,6 +1552,83 @@ CanonicalValue Snapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   });
 }
 
+// The Program runner's current cycle status carried by a Reset scene
+// authorization (OD-139); the Kernel validates it in memory.
+CanonicalValue ProgramCycleStatus(const core::ProgramCycleStatusDTO &status) {
+  const auto optional_unsigned = [](const auto &value, const std::string_view label) {
+    return value ? Unsigned(value->value(), label) : CanonicalValue(nullptr);
+  };
+  CanonicalValue accepted(nullptr);
+  if (status.accepted_reset) {
+    const auto &reset = *status.accepted_reset;
+    accepted = CanonicalValue(CanonicalValue::Object{
+        {"reload_initial_scene", CanonicalValue(reset.reload_initial_scene)},
+        {"request_key", RequestKeyValue(reset.request_key)},
+        {"request_payload_digest", CanonicalValue(reset.request_payload_digest.value())},
+        {"reset_claim_generation",
+         optional_unsigned(reset.reset_claim_generation, "reset_claim_generation")},
+        {"reset_robot_position", CanonicalValue(reset.reset_robot_position)}});
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_reset", std::move(accepted)},
+      {"cycle_claim_generation",
+       optional_unsigned(status.cycle_claim_generation, "cycle_claim_generation")},
+      {"cycle_generation", Unsigned(status.cycle_generation, "cycle_generation")},
+      {"program_run_id", optional_unsigned(status.program_run_id, "program_run_id")},
+      {"state", CanonicalValue(std::string(core::to_string(status.state)))},
+      {"terminal_or_settlement_reference",
+       status.terminal_or_settlement_reference
+           ? CanonicalValue(status.terminal_or_settlement_reference->value())
+           : CanonicalValue(nullptr)}});
+}
+
+core::ProgramCycleStatusDTO DecodeProgramCycleStatus(const CanonicalValue &value) {
+  ExactObject(value, 6U, "Program cycle status");
+  const auto optional_unsigned = [](const CanonicalValue &member, const std::string_view label) {
+    return member.is_null() ? std::optional<std::uint64_t>{}
+                            : std::optional{DecodeUnsigned(member, label)};
+  };
+  const auto &state_text = String(Member(value, "state"), "state");
+  std::optional<core::ProgramCycleStateDTO> state;
+  for (const auto candidate : {core::ProgramCycleStateDTO::kIdleAfterReset,
+                               core::ProgramCycleStateDTO::kStarting,
+                               core::ProgramCycleStateDTO::kRunning,
+                               core::ProgramCycleStateDTO::kStopping,
+                               core::ProgramCycleStateDTO::kTerminalAwaitingReset,
+                               core::ProgramCycleStateDTO::kInterventionOrRecovery,
+                               core::ProgramCycleStateDTO::kResetting,
+                               core::ProgramCycleStateDTO::kRecoveryRequired}) {
+    if (core::to_string(candidate) == state_text) state = candidate;
+  }
+  if (!state) Fail("Program cycle status has an unknown state");
+  core::ProgramCycleStatusDTO result;
+  result.cycle_generation = DecodeUnsigned(Member(value, "cycle_generation"), "cycle_generation");
+  result.state = *state;
+  if (const auto run = optional_unsigned(Member(value, "program_run_id"), "program_run_id"))
+    result.program_run_id = core::ProgramRunNumber(*run);
+  if (const auto claim = optional_unsigned(Member(value, "cycle_claim_generation"),
+                                           "cycle_claim_generation"))
+    result.cycle_claim_generation = core::CellAdmissionClaimGeneration(*claim);
+  if (const auto &reference = Member(value, "terminal_or_settlement_reference");
+      !reference.is_null())
+    result.terminal_or_settlement_reference =
+        core::ContentDigest(String(reference, "terminal_or_settlement_reference"));
+  if (const auto &reset = Member(value, "accepted_reset"); !reset.is_null()) {
+    ExactObject(reset, 5U, "accepted Program Reset");
+    core::AcceptedProgramResetDTO accepted{
+        DecodeRequestKey(Member(reset, "request_key"), "request_key"),
+        core::ContentDigest(String(Member(reset, "request_payload_digest"), "request_payload_digest")),
+        Boolean(Member(reset, "reload_initial_scene"), "reload_initial_scene"),
+        Boolean(Member(reset, "reset_robot_position"), "reset_robot_position"),
+        std::nullopt};
+    if (const auto claim = optional_unsigned(Member(reset, "reset_claim_generation"),
+                                             "reset_claim_generation"))
+      accepted.reset_claim_generation = core::CellAdmissionClaimGeneration(*claim);
+    result.accepted_reset = std::move(accepted);
+  }
+  return result;
+}
+
 CanonicalValue ProgramResetSceneAuthorization(
     const core::ProgramResetSceneAuthorizationDTO &authorization) {
   if (!core::ValidateProgramResetSceneAuthorization(authorization).ok()) {
@@ -1593,11 +1637,10 @@ CanonicalValue ProgramResetSceneAuthorization(
   if (authorization.reset_claim) {
     const auto& reset = *authorization.reset_claim;
     return CanonicalValue(CanonicalValue::Object{
-        {"program_runner_owner_epoch", CanonicalValue(authorization.program_runner_owner_epoch.value())},
         {"cycle_generation", Unsigned(reset.cycle_generation, "cycle_generation")},
+        {"program_cycle_status", ProgramCycleStatus(authorization.program_cycle_status)},
         {"reset_claim", CanonicalValue(CanonicalValue::Object{
-            {"request_owner_epoch", CanonicalValue(reset.request_owner_epoch.value())},
-            {"request_id", CanonicalValue(reset.request_id.value())},
+            {"request_key", RequestKeyValue(reset.request_key)},
             {"request_payload_digest", CanonicalValue(reset.request_payload_digest.value())},
             {"reset_claim_generation", Unsigned(reset.reset_claim_generation.value(), "reset_claim_generation")}})},
     });
@@ -1606,9 +1649,8 @@ CanonicalValue ProgramResetSceneAuthorization(
       {"cycle_claim_generation",
        Unsigned(authorization.cycle_claim_generation.value(),
                 "cycle_claim_generation")},
-      {"program_run_id", CanonicalValue(authorization.program_run_id.value())},
-      {"program_runner_owner_epoch",
-       CanonicalValue(authorization.program_runner_owner_epoch.value())},
+      {"program_cycle_status", ProgramCycleStatus(authorization.program_cycle_status)},
+      {"program_run_id", Unsigned(authorization.program_run_id.value(), "program_run_id")},
       {"terminal_or_settlement_reference",
        CanonicalValue(
            authorization.terminal_or_settlement_reference.value())},
@@ -1620,16 +1662,15 @@ core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
   if (value.is_object() && value.find_object_member("reset_claim") != nullptr) {
     ExactObject(value, 3U, "idle Program Reset scene authorization");
     const auto& reset = Member(value, "reset_claim");
-    ExactObject(reset, 4U, "idle Program Reset identity");
+    ExactObject(reset, 3U, "idle Program Reset identity");
     core::ProgramResetSceneAuthorizationDTO result{
-        core::RequestOwnerEpoch(String(Member(value, "program_runner_owner_epoch"), "program_runner_owner_epoch")),
-        core::ProgramRunId(""), core::CellAdmissionClaimGeneration(0U), core::ContentDigest(""),
+        core::ProgramRunNumber(0U), core::CellAdmissionClaimGeneration(0U), core::ContentDigest(""),
         core::ProgramResetClaimSceneAuthorizationDTO{
             DecodeUnsigned(Member(value, "cycle_generation"), "cycle_generation"),
-            core::RequestOwnerEpoch(String(Member(reset, "request_owner_epoch"), "request_owner_epoch")),
-            core::RequestId(String(Member(reset, "request_id"), "request_id")),
+            DecodeRequestKey(Member(reset, "request_key"), "request_key"),
             core::ContentDigest(String(Member(reset, "request_payload_digest"), "request_payload_digest")),
-            core::CellAdmissionClaimGeneration(DecodeUnsigned(Member(reset, "reset_claim_generation"), "reset_claim_generation"))}};
+            core::CellAdmissionClaimGeneration(DecodeUnsigned(Member(reset, "reset_claim_generation"), "reset_claim_generation"))},
+        DecodeProgramCycleStatus(Member(value, "program_cycle_status"))};
     if (!core::ValidateProgramResetSceneAuthorization(result).ok()) {
       Fail("idle Program Reset scene authorization is invalid");
     }
@@ -1637,16 +1678,15 @@ core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
   }
   ExactObject(value, 4U, "Program Reset scene authorization");
   core::ProgramResetSceneAuthorizationDTO result{
-      core::RequestOwnerEpoch(String(Member(value, "program_runner_owner_epoch"),
-                                     "program_runner_owner_epoch")),
-      core::ProgramRunId(
-          String(Member(value, "program_run_id"), "program_run_id")),
+      core::ProgramRunNumber(DecodeUnsigned(Member(value, "program_run_id"), "program_run_id")),
       core::CellAdmissionClaimGeneration(DecodeUnsigned(
           Member(value, "cycle_claim_generation"),
           "cycle_claim_generation")),
       core::ContentDigest(String(
           Member(value, "terminal_or_settlement_reference"),
           "terminal_or_settlement_reference")),
+      std::nullopt,
+      DecodeProgramCycleStatus(Member(value, "program_cycle_status")),
   };
   if (!core::ValidateProgramResetSceneAuthorization(result).ok()) {
     Fail("Program Reset scene authorization is invalid");
@@ -1657,29 +1697,26 @@ core::ProgramResetSceneAuthorizationDTO DecodeProgramResetSceneAuthorization(
 CanonicalValue
 ProgramNodeEvidence(const core::ProgramNodeAdmissionEvidenceDTO &evidence) {
   return CanonicalValue(CanonicalValue::Object{
-      {"program_runner_owner_epoch",
-       CanonicalValue(evidence.program_runner_owner_epoch.value())},
-      {"program_run_id", CanonicalValue(evidence.program_run_id.value())},
+      {"program_run_id", Unsigned(evidence.program_run_id.value(), "program_run_id")},
       {"parent_program_cycle_claim_generation",
        CanonicalValue(static_cast<double>(
            evidence.parent_program_cycle_claim_generation.value()))},
       {"node_instance_id", CanonicalValue(evidence.node_instance_id)},
-      {"node_attempt_id", CanonicalValue(evidence.node_attempt_id)},
+      {"node_attempt_id",
+       Unsigned(evidence.node_attempt_id.value(), "node_attempt_id")},
       {"owner_api", CanonicalValue(evidence.owner_api)}});
 }
 
 core::ProgramNodeAdmissionEvidenceDTO
 DecodeProgramNodeEvidence(const CanonicalValue &value) {
-  ExactObject(value, 6U, "Program node evidence");
-  return {core::RequestOwnerEpoch(String(
-              Member(value, "program_runner_owner_epoch"), "Runner owner")),
-          core::ProgramRunId(
-              String(Member(value, "program_run_id"), "Program run")),
+  ExactObject(value, 5U, "Program node evidence");
+  return {core::ProgramRunNumber(DecodeUnsigned(Member(value, "program_run_id"), "Program run")),
           core::CellAdmissionClaimGeneration(DecodeUnsigned(
               Member(value, "parent_program_cycle_claim_generation"),
               "parent claim")),
           String(Member(value, "node_instance_id"), "node instance"),
-          String(Member(value, "node_attempt_id"), "node attempt"),
+          core::NodeAttemptNumber(
+              DecodeUnsigned(Member(value, "node_attempt_id"), "node attempt")),
           String(Member(value, "owner_api"), "owner API")};
 }
 
@@ -1779,8 +1816,7 @@ std::string EncodeSnapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   return ci::canonical_json(Snapshot(snapshot));
 }
 
-core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes,
-                                             const bool verify_content_hash) {
+core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
   const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
   const auto &root = parsed.root();
   if (ci::canonical_json(root) != bytes) {
@@ -1815,9 +1851,8 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes,
         DecodeAttachment(attachment));
   }
   if (!snapshot.locally_valid() ||
-      (verify_content_hash &&
-       core::logical_scene_identity::ComputeLogicalSceneContentHash(
-           snapshot) != snapshot.revision.content_hash) ||
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          snapshot) != snapshot.revision.content_hash ||
       core::logical_scene_identity::ComputeCollisionPolicyContentDigest(
           snapshot.configured_collision_policy)
               .value() !=
@@ -1831,18 +1866,6 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes,
     }
   }
   return snapshot;
-}
-
-std::optional<std::string>
-StripRetiredProviderEvidenceFields(const std::string_view bytes) {
-  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
-  bool changed = false;
-  auto stripped =
-      WithoutRetiredProviderEvidenceFields(parsed.root(), changed);
-  if (!changed) {
-    return std::nullopt;
-  }
-  return ci::canonical_json(stripped);
 }
 
 std::string
@@ -1923,7 +1946,8 @@ std::string EncodeSceneTransaction(
       {"proposed_projection_revision",
        logical_scene_codec_internal::Projection(
            transaction.proposed_projection_revision)},
-      {"request_id", CanonicalValue(transaction.request_id.value())},
+      {"request_key",
+       logical_scene_codec_internal::RequestKeyValue(transaction.request_key)},
       {"resolution_evidence_digest", std::move(resolution)},
       {"resolved_operation",
        logical_scene_codec_internal::ResolvedOperation(
@@ -1953,9 +1977,9 @@ DecodeSceneTransaction(const std::string_view bytes) {
         encoded_resolution, "resolution_evidence_digest"));
   }
   core::SceneTransactionDTO transaction{
-      core::RequestId(logical_scene_codec_internal::String(
-          logical_scene_codec_internal::Member(root, "request_id"),
-          "request_id")),
+      logical_scene_codec_internal::DecodeRequestKey(
+          logical_scene_codec_internal::Member(root, "request_key"),
+          "request_key"),
       logical_scene_codec_internal::DecodeAttribution(
           logical_scene_codec_internal::Member(root, "attribution")),
       logical_scene_codec_internal::DecodeUnsigned(
@@ -1974,7 +1998,7 @@ DecodeSceneTransaction(const std::string_view bytes) {
       logical_scene_codec_internal::DecodeResolvedOperation(
           logical_scene_codec_internal::Member(root, "resolved_operation")),
       std::move(resolution)};
-  if (transaction.request_id.empty() || transaction.transaction_sequence == 0U ||
+  if (transaction.transaction_sequence == 0U ||
       !transaction.attribution.locally_valid() ||
       !transaction.prior_projection_revision.valid() ||
       !transaction.proposed_projection_revision.valid() ||

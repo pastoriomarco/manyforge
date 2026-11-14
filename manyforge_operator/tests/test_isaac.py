@@ -120,16 +120,19 @@ def test_isaac_start_without_host_or_path_refuses_with_typed_error(tmp_path, cap
     assert not (tmp_path / "state" / "workbench").exists()
 
 
-def test_remote_native_command_keeps_optional_source_identity_absent(tmp_path: Path):
+def test_start_without_container_configuration_refuses_before_any_remote_call(tmp_path, monkeypatch):
     launcher = IsaacLauncher(_config(tmp_path))
+    remote_calls = []
+    monkeypatch.setattr(launcher, "_ssh", lambda command, **kwargs: remote_calls.append(command))
 
-    command = launcher._remote_native_shell("start")
+    with pytest.raises(LauncherError) as raised:
+        launcher.start()
 
-    assert "--profile standard" in command
-    assert "--simulation-control-config" in command
-    assert "--expected-source-fingerprint" not in command
-    assert "--expected-head-commit" not in command
-    assert "--expected-head-tree" not in command
+    assert raised.value.code == "container_configuration_required"
+    assert raised.value.exit_code == 64
+    assert "compose-dev.sh start inside the owned container" in str(raised.value)
+    assert remote_calls == []
+    assert launcher.store.read() is None
 
 
 def test_explicit_arm_topic_remains_an_input_identity(tmp_path: Path):

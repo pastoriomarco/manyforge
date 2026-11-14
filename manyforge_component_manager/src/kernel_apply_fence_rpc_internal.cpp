@@ -17,11 +17,14 @@ namespace {
 
 namespace core = manyforge::core;
 
+// Version 3 (physical scopes) and 6 (provider scopes) carry the request
+// key in place of the request id and owner epoch, numeric Apply ids, and
+// no owner epoch in the execution-host epoch; 2 and 5 are refused.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'K',
-                                              'A', 'F', 'R', '2'};
+                                              'A', 'F', 'R', '3'};
 constexpr auto kProviderMagic = [] {
   auto value = kMagic;
-  value.back() = '5';
+  value.back() = '6';
   return value;
 }();
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
@@ -197,6 +200,23 @@ template <typename Generation>
   return Generation(reader.U64());
 }
 
+// A request key (contract 1.4) as its two big-endian halves.
+void WriteRequestKey(Writer &writer, const core::RequestKey &key) {
+  writer.U64(key.high());
+  writer.U64(key.low());
+}
+
+[[nodiscard]] core::RequestKey ReadRequestKey(Reader &reader) {
+  const auto high = reader.U64();
+  const auto low = reader.U64();
+  core::RequestKey key;
+  for (std::size_t index = 0U; index < 8U; ++index) {
+    key.bytes[index] = static_cast<std::uint8_t>(high >> (56U - 8U * index));
+    key.bytes[8U + index] = static_cast<std::uint8_t>(low >> (56U - 8U * index));
+  }
+  return key;
+}
+
 template <typename Value, typename Encode>
 void WriteOptional(Writer &writer, const std::optional<Value> &value,
                    Encode encode) {
@@ -300,20 +320,14 @@ ReadProjectionRevision(Reader &reader) {
 
 void WritePublicRequestContext(Writer &writer,
                                const core::PublicRequestContextDTO &context) {
-  WriteStrong(writer, context.request_id);
-  WriteStrong(writer, context.request_owner_epoch);
+  WriteRequestKey(writer, context.request_key);
   writer.String(context.source_label);
-  WriteOptional<std::string>(
-      writer, context.correlation_id,
-      [](Writer &output, const std::string &value) { output.String(value); });
 }
 
 [[nodiscard]] core::PublicRequestContextDTO
 ReadPublicRequestContext(Reader &reader) {
-  return {ReadStrong<core::RequestId>(reader),
-          ReadStrong<core::RequestOwnerEpoch>(reader), reader.String(),
-          ReadOptional<std::string>(
-              reader, [](Reader &input) { return input.String(); })};
+  auto key = ReadRequestKey(reader);
+  return {key, reader.String()};
 }
 
 [[nodiscard]] bool
@@ -479,13 +493,13 @@ void WriteFenceOwner(Writer &writer, const core::ApplyFenceOwnerDTO &owner) {
   if (!owner.valid()) {
     Fail("cannot encode an invalid Apply-fence owner");
   }
-  WriteStrong(writer, owner.apply_id);
+  WriteGeneration(writer, owner.apply_id);
   WriteGeneration(writer, owner.apply_generation);
 }
 
 [[nodiscard]] core::ApplyFenceOwnerDTO ReadFenceOwner(Reader &reader) {
   core::ApplyFenceOwnerDTO result{
-      ReadStrong<core::ApplyId>(reader),
+      ReadGeneration<core::ApplyId>(reader),
       ReadGeneration<core::ApplyGeneration>(reader)};
   if (!result.valid()) {
     Fail("decoded Apply-fence owner is invalid");
@@ -586,7 +600,6 @@ void WriteExecutionHostEpoch(Writer &writer,
   }
   WriteStrong(writer, epoch.runtime_unit_id);
   WriteStrong(writer, epoch.runtime_epoch);
-  WriteStrong(writer, epoch.request_owner_epoch);
   WriteStrong(writer, epoch.durable_stop_fence_ledger_digest);
   WriteGeneration(writer, epoch.publication_generation);
 }
@@ -596,7 +609,6 @@ ReadExecutionHostEpoch(Reader &reader) {
   core::ExecutionHostEpochDTO result{
       ReadStrong<core::RuntimeUnitId>(reader),
       ReadStrong<core::RuntimeEpoch>(reader),
-      ReadStrong<core::RequestOwnerEpoch>(reader),
       ReadStrong<core::ContentDigest>(reader),
       ReadGeneration<core::ActiveBundlePublicationGeneration>(reader)};
   if (!result.valid()) {
@@ -611,13 +623,11 @@ void WriteAdmissionQuery(
     Fail("cannot encode an invalid fence-admission query");
   }
   WriteScope(writer, query.affected_scope);
-  WriteStrong(writer, query.manager_runtime_epoch);
 }
 
 [[nodiscard]] core::ConfigurationFenceAdmissionQueryDTO
 ReadAdmissionQuery(Reader &reader) {
-  core::ConfigurationFenceAdmissionQueryDTO result{
-      ReadScope(reader), ReadStrong<core::RuntimeEpoch>(reader)};
+  core::ConfigurationFenceAdmissionQueryDTO result{ReadScope(reader)};
   if (!result.valid()) {
     Fail("decoded fence-admission query is invalid");
   }
@@ -724,13 +734,10 @@ void WriteRelease(Writer &writer,
     Fail("cannot encode an invalid fence release request");
   }
   WriteReconciliationEvidence(writer, request.reconciliation_evidence);
-  WriteStrong(writer, request.manager_runtime_epoch);
 }
 
 [[nodiscard]] core::ConfigurationFenceReleaseDTO ReadRelease(Reader &reader) {
-  core::ConfigurationFenceReleaseDTO result{
-      ReadReconciliationEvidence(reader),
-      ReadStrong<core::RuntimeEpoch>(reader)};
+  core::ConfigurationFenceReleaseDTO result{ReadReconciliationEvidence(reader)};
   if (!result.valid()) {
     Fail("decoded fence release request is invalid");
   }
@@ -767,7 +774,6 @@ void WriteReleasedWithSharedEvidence(
       released.execution_host_epoch != shared_evidence.execution_host_epoch) {
     Fail("fence release receipt differs from its shared status evidence");
   }
-  WriteStrong(writer, released.request.manager_runtime_epoch);
   writer.I64(released.released_at_ns);
   WriteReplayStatus(writer, released.replay_status);
   WriteStrong(writer, released.release_receipt_digest);
@@ -778,8 +784,7 @@ ReadReleasedWithSharedEvidence(
     Reader &reader,
     const core::ConfigurationFenceReconciliationEvidenceDTO &shared_evidence) {
   core::ConfigurationFenceReleasedDTO result{
-      core::ConfigurationFenceReleaseDTO{
-          shared_evidence, ReadStrong<core::RuntimeEpoch>(reader)},
+      core::ConfigurationFenceReleaseDTO{shared_evidence},
       shared_evidence.execution_host_epoch, reader.I64(),
       ReadReplayStatus(reader), ReadStrong<core::ContentDigest>(reader)};
   if (!result.valid()) {
@@ -797,7 +802,6 @@ void WriteStatusQuery(Writer &writer,
   WriteStrong(writer, query.configuration_fence_id);
   WriteGeneration(writer, query.configuration_fence_generation);
   WriteScope(writer, query.expected_scope);
-  WriteStrong(writer, query.manager_runtime_epoch);
 }
 
 [[nodiscard]] core::ConfigurationFenceStatusQueryDTO
@@ -805,7 +809,7 @@ ReadStatusQuery(Reader &reader) {
   core::ConfigurationFenceStatusQueryDTO result{
       ReadFenceOwner(reader), ReadStrong<core::ConfigurationFenceId>(reader),
       ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      ReadScope(reader), ReadStrong<core::RuntimeEpoch>(reader)};
+      ReadScope(reader)};
   if (!result.valid()) {
     Fail("decoded fence status query is invalid");
   }
@@ -866,14 +870,12 @@ void WriteAttemptQuery(Writer &writer,
   }
   WriteIntent(writer, query.persisted_intent);
   WriteStrong(writer, query.persisted_attempt_digest);
-  WriteStrong(writer, query.manager_runtime_epoch);
 }
 
 [[nodiscard]] core::ApplyFenceAcquireAttemptQueryDTO
 ReadAttemptQuery(Reader &reader) {
   core::ApplyFenceAcquireAttemptQueryDTO result{
-      ReadIntent(reader), ReadStrong<core::ContentDigest>(reader),
-      ReadStrong<core::RuntimeEpoch>(reader)};
+      ReadIntent(reader), ReadStrong<core::ContentDigest>(reader)};
   if (!result.valid()) {
     Fail("decoded fence-attempt query is invalid");
   }
@@ -926,119 +928,10 @@ ReadAttemptResult(Reader &reader) {
   return result;
 }
 
-void WriteRehydrate(Writer &writer,
-                    const core::ApplyFenceRehydrateDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode an invalid fence rehydration request");
-  }
-  WriteStrong(writer, request.apply_id);
-  WriteGeneration(writer, request.apply_generation);
-  WriteStrong(writer, request.request_id);
-  WriteStrong(writer, request.request_owner_epoch);
-  WriteStrong(writer, request.intent_digest);
-  WriteStrong(writer, request.expected_old_retained_bundle_id);
-  WriteStrong(writer, request.expected_old_graph_revision);
-  WriteStrong(writer, request.expected_new_retained_bundle_id);
-  WriteStrong(writer, request.expected_new_graph_revision);
-  WriteStrong(writer, request.persisted_configuration_fence_id);
-  WriteGeneration(writer, request.persisted_configuration_fence_generation);
-  WriteScope(writer, request.persisted_scope);
-  writer.String(request.last_durable_phase);
-  WriteStrong(writer, request.manager_runtime_epoch);
-}
-
-[[nodiscard]] core::ApplyFenceRehydrateDTO ReadRehydrate(Reader &reader) {
-  core::ApplyFenceRehydrateDTO result{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadStrong<core::RequestId>(reader),
-      ReadStrong<core::RequestOwnerEpoch>(reader),
-      ReadStrong<core::ContentDigest>(reader),
-      ReadStrong<core::RetainedBundleId>(reader),
-      ReadStrong<core::GraphRevision>(reader),
-      ReadStrong<core::RetainedBundleId>(reader),
-      ReadStrong<core::GraphRevision>(reader),
-      ReadStrong<core::ConfigurationFenceId>(reader),
-      ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      ReadScope(reader),
-      reader.String(),
-      ReadStrong<core::RuntimeEpoch>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence rehydration request is invalid");
-  }
-  return result;
-}
-
-void WriteReconcileEntry(Writer &writer,
-                         const core::ApplyFenceReconcileEntryDTO &entry) {
-  if (!entry.presence_valid()) {
-    Fail("cannot encode an invalid fence reconciliation entry");
-  }
-  WriteStrong(writer, entry.persisted_configuration_fence_id);
-  WriteGeneration(writer, entry.persisted_configuration_fence_generation);
-  writer.Byte(static_cast<std::uint8_t>(entry.state));
-  WriteOptional<core::ConfigurationFenceId>(
-      writer, entry.reconciled_configuration_fence_id,
-      [](Writer &output, const auto &value) { WriteStrong(output, value); });
-  WriteOptional<core::ConfigurationFenceGeneration>(
-      writer, entry.reconciled_configuration_fence_generation,
-      [](Writer &output, const auto value) { WriteGeneration(output, value); });
-}
-
-[[nodiscard]] core::ApplyFenceReconcileEntryDTO
-ReadReconcileEntry(Reader &reader) {
-  core::ApplyFenceReconcileEntryDTO result{
-      ReadStrong<core::ConfigurationFenceId>(reader),
-      ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      static_cast<core::ApplyFenceReconcileState>(reader.Byte()),
-      ReadOptional<core::ConfigurationFenceId>(
-          reader,
-          [](Reader &input) {
-            return ReadStrong<core::ConfigurationFenceId>(input);
-          }),
-      ReadOptional<core::ConfigurationFenceGeneration>(
-          reader, [](Reader &input) {
-            return ReadGeneration<core::ConfigurationFenceGeneration>(input);
-          })};
-  if (!result.presence_valid()) {
-    Fail("decoded fence reconciliation entry is invalid");
-  }
-  return result;
-}
-
-void WriteReconcileResult(Writer &writer,
-                          const core::ApplyFenceReconcileResultDTO &result) {
-  if (!result.presence_valid()) {
-    Fail("cannot encode an invalid fence rehydration result");
-  }
-  WriteExecutionHostEpoch(writer, result.execution_host_epoch);
-  WriteVector(writer, result.fence_results, WriteReconcileEntry);
-  writer.Boolean(result.admission_fenced);
-  writer.String(result.required_compensation_or_operator_direction);
-  WriteStrong(writer, result.result_digest);
-  WriteOptional<core::ErrorDTO>(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::ApplyFenceReconcileResultDTO
-ReadReconcileResult(Reader &reader) {
-  core::ApplyFenceReconcileResultDTO result{
-      ReadExecutionHostEpoch(reader),
-      ReadVector<core::ApplyFenceReconcileEntryDTO>(reader, ReadReconcileEntry),
-      reader.Boolean(),
-      reader.String(),
-      ReadStrong<core::ContentDigest>(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded fence rehydration result is invalid");
-  }
-  return result;
-}
-
 enum class RequestKind : std::uint8_t {
   kObserveAdmission = 1U,
   kAcquire = 2U,
   kReconcileAttempt = 3U,
-  kRehydrate = 4U,
   kQueryStatus = 5U,
   kRelease = 6U,
 };
@@ -1047,7 +940,6 @@ enum class ResponseKind : std::uint8_t {
   kAdmission = 1U,
   kAccepted = 2U,
   kAttemptReconciled = 3U,
-  kRehydrated = 4U,
   kStatus = 5U,
   kReleased = 6U,
   kFailure = 7U,
@@ -1066,8 +958,6 @@ enum class ResponseKind : std::uint8_t {
         else if constexpr (std::is_same_v<
                                T, core::ApplyFenceAcquireAttemptQueryDTO>)
           return UsesProviderDomains(value.persisted_intent.scope);
-        else if constexpr (std::is_same_v<T, core::ApplyFenceRehydrateDTO>)
-          return UsesProviderDomains(value.persisted_scope);
         else if constexpr (std::is_same_v<
                                T, core::ConfigurationFenceStatusQueryDTO>)
           return UsesProviderDomains(value.expected_scope);
@@ -1138,9 +1028,9 @@ bool IsKernelApplyFenceRpcPacket(const std::string_view bytes) noexcept {
                       kProviderMagic.size());
 }
 
-std::string
-EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
-  Writer writer(UsesProviderScope(request));
+namespace {
+
+void WriteRequestBody(Writer &writer, const KernelApplyFenceRpcRequest &request) {
   std::visit(
       [&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
@@ -1158,9 +1048,6 @@ EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
           writer.Byte(
               static_cast<std::uint8_t>(RequestKind::kReconcileAttempt));
           WriteAttemptQuery(writer, value);
-        } else if constexpr (std::is_same_v<T, core::ApplyFenceRehydrateDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kRehydrate));
-          WriteRehydrate(writer, value);
         } else if constexpr (std::is_same_v<
                                  T, core::ConfigurationFenceStatusQueryDTO>) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kQueryStatus));
@@ -1171,13 +1058,10 @@ EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
         }
       },
       request);
-  return std::move(writer).Finish();
 }
 
-KernelApplyFenceRpcRequest
-DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
-  Reader reader(bytes);
-  KernelApplyFenceRpcRequest result = [&]() -> KernelApplyFenceRpcRequest {
+[[nodiscard]] KernelApplyFenceRpcRequest ReadRequestBody(Reader &reader) {
+  return [&]() -> KernelApplyFenceRpcRequest {
     switch (static_cast<RequestKind>(reader.Byte())) {
     case RequestKind::kObserveAdmission:
       return ReadAdmissionQuery(reader);
@@ -1185,8 +1069,6 @@ DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
       return ReadIntent(reader);
     case RequestKind::kReconcileAttempt:
       return ReadAttemptQuery(reader);
-    case RequestKind::kRehydrate:
-      return ReadRehydrate(reader);
     case RequestKind::kQueryStatus:
       return ReadStatusQuery(reader);
     case RequestKind::kRelease:
@@ -1194,8 +1076,108 @@ DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
     }
     Fail("request kind is unknown");
   }();
+}
+
+// The candidate bundle and graph are the projection's own, so they are not
+// written twice.
+void WritePublicationReceipt(Writer &writer,
+                             const core::ActiveBundlePublicationReceiptDTO &receipt) {
+  if (!receipt.valid())
+    Fail("cannot encode an invalid active publication");
+  const auto &request = receipt.request;
+  if (const auto *apply = std::get_if<core::NamedApplyPublicationTransactionDTO>(
+          &request.transaction_ref)) {
+    writer.Byte(1U);
+    WriteGeneration(writer, apply->apply_id);
+    WriteGeneration(writer, apply->apply_generation);
+  } else {
+    const auto &bootstrap =
+        std::get<core::BootstrapPublicationTransactionDTO>(request.transaction_ref);
+    writer.Byte(2U);
+    WriteStrong(writer, bootstrap.bootstrap_id);
+    WriteGeneration(writer, bootstrap.bootstrap_generation);
+  }
+  WriteProjectionRevision(writer, request.candidate_projection_revision);
+  WriteOptional(writer, request.expected_previous_publication_generation,
+                [](Writer &out, const auto &generation) { WriteGeneration(out, generation); });
+  WriteStrong(writer, request.private_materialization_content_digest);
+  WriteGeneration(writer, receipt.publication_generation);
+  WriteStrong(writer, receipt.durable_public_pointer_content_digest);
+}
+
+[[nodiscard]] core::ActiveBundlePublicationReceiptDTO
+ReadPublicationReceipt(Reader &reader) {
+  auto transaction = [&]() -> core::ActiveBundlePublicationTransactionRefDTO {
+    switch (reader.Byte()) {
+    case 1U: {
+      const auto apply_id = ReadGeneration<core::ApplyId>(reader);
+      return core::NamedApplyPublicationTransactionDTO{
+          apply_id, ReadGeneration<core::ApplyGeneration>(reader)};
+    }
+    case 2U: {
+      auto bootstrap_id = ReadStrong<core::BootstrapId>(reader);
+      return core::BootstrapPublicationTransactionDTO{
+          std::move(bootstrap_id), ReadGeneration<core::BootstrapGeneration>(reader)};
+    }
+    default:
+      Fail("active publication transaction kind is unknown");
+    }
+  }();
+  const auto projection = ReadProjectionRevision(reader);
+  auto previous = ReadOptional<core::ActiveBundlePublicationGeneration>(
+      reader, [](Reader &in) { return ReadGeneration<core::ActiveBundlePublicationGeneration>(in); });
+  auto materialization = ReadStrong<core::ContentDigest>(reader);
+  const auto generation = ReadGeneration<core::ActiveBundlePublicationGeneration>(reader);
+  core::ActiveBundlePublicationReceiptDTO receipt{
+      {std::move(transaction), projection, projection.retained_bundle_id,
+       projection.graph_revision, previous, std::move(materialization)},
+      generation,
+      ReadStrong<core::ContentDigest>(reader)};
+  if (!receipt.valid())
+    Fail("decoded active publication is invalid");
+  return receipt;
+}
+
+} // namespace
+
+std::string
+EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
+  Writer writer(UsesProviderScope(request));
+  WriteRequestBody(writer, request);
+  return std::move(writer).Finish();
+}
+
+KernelApplyFenceRpcRequest
+DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
+  Reader reader(bytes);
+  auto result = ReadRequestBody(reader);
   reader.Finish(UsesProviderScope(result));
   return result;
+}
+
+std::string
+EncodeKernelApplyFenceRpcPacket(const KernelApplyFenceRpcPacket &packet) {
+  if (std::holds_alternative<core::ConfigurationFenceReleaseDTO>(packet.request) ==
+      packet.active_publication.has_value())
+    Fail("every request except Release carries the active publication");
+  Writer writer(UsesProviderScope(packet.request));
+  WriteRequestBody(writer, packet.request);
+  WriteOptional(writer, packet.active_publication, WritePublicationReceipt);
+  return std::move(writer).Finish();
+}
+
+KernelApplyFenceRpcPacket
+DecodeKernelApplyFenceRpcPacket(const std::string_view bytes) {
+  Reader reader(bytes);
+  KernelApplyFenceRpcPacket packet{
+      ReadRequestBody(reader),
+      ReadOptional<core::ActiveBundlePublicationReceiptDTO>(reader,
+                                                            ReadPublicationReceipt)};
+  if (std::holds_alternative<core::ConfigurationFenceReleaseDTO>(packet.request) ==
+      packet.active_publication.has_value())
+    Fail("every request except Release carries the active publication");
+  reader.Finish(UsesProviderScope(packet.request));
+  return packet;
 }
 
 std::string
@@ -1218,10 +1200,6 @@ EncodeKernelApplyFenceRpcResponse(const KernelApplyFenceRpcResponse &response) {
           writer.Byte(
               static_cast<std::uint8_t>(ResponseKind::kAttemptReconciled));
           WriteAttemptResult(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, core::ApplyFenceReconcileResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kRehydrated));
-          WriteReconcileResult(writer, value);
         } else if constexpr (std::is_same_v<
                                  T, core::ConfigurationFenceStatusDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kStatus));
@@ -1250,8 +1228,6 @@ DecodeKernelApplyFenceRpcResponse(const std::string_view bytes) {
       return ReadAccepted(reader);
     case ResponseKind::kAttemptReconciled:
       return ReadAttemptResult(reader);
-    case ResponseKind::kRehydrated:
-      return ReadReconcileResult(reader);
     case ResponseKind::kStatus:
       return ReadStatus(reader);
     case ResponseKind::kReleased:

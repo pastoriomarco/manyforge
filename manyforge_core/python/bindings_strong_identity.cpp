@@ -1,6 +1,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <string>
@@ -56,6 +57,76 @@ void bind_strong_counter(py::module_& module, const char* python_name) {
       });
 }
 
+// One operation participant (contract 1.5): (operation number, ordinal).
+void bind_operation_participant_id(py::module_& module) {
+  py::class_<OperationParticipantId>(module, "OperationParticipantId", py::is_final())
+      .def(py::init([](OperationNumber operation_id, std::uint32_t ordinal) {
+             return OperationParticipantId{operation_id, ordinal};
+           }),
+           py::arg("operation_id"), py::arg("ordinal"))
+      .def_readonly("operation_id", &OperationParticipantId::operation_id)
+      .def_readonly("ordinal", &OperationParticipantId::ordinal)
+      .def("__repr__",
+           [](const OperationParticipantId& value) {
+             return py::str("OperationParticipantId({}, {})")
+                 .format(value.operation_id.value(), value.ordinal);
+           })
+      .def(
+          "__eq__",
+          [](const OperationParticipantId& lhs, const OperationParticipantId& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const OperationParticipantId& lhs, const OperationParticipantId& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator())
+      .def("__hash__", [](const OperationParticipantId& value) {
+        return py::hash(
+            py::make_tuple("OperationParticipantId", value.operation_id.value(), value.ordinal));
+      });
+}
+
+// The 16-byte request key (contract 1.4): `bytes` of length 16 in Python,
+// 32 lowercase hex characters on every wire.
+void bind_request_key(py::module_& module) {
+  py::class_<RequestKey>(module, "RequestKey", py::is_final())
+      .def(py::init([](const py::bytes& value) {
+             const std::string raw = value;
+             if (raw.size() != 16U) throw py::value_error("a request key is exactly 16 bytes");
+             RequestKey key;
+             std::copy(raw.begin(), raw.end(), key.bytes.begin());
+             return key;
+           }),
+           py::arg("value"))
+      .def_static(
+          "from_hex",
+          [](const std::string& text) {
+            const auto key = ParseRequestKey(text);
+            if (!key.has_value()) throw py::value_error("a request key is 32 hex characters");
+            return *key;
+          },
+          py::arg("text"))
+      .def_property_readonly("value",
+                             [](const RequestKey& key) {
+                               return py::bytes(reinterpret_cast<const char*>(key.bytes.data()),
+                                                key.bytes.size());
+                             })
+      .def("hex", [](const RequestKey& key) { return RequestKeyText(key); })
+      .def("__repr__",
+           [](const RequestKey& key) { return "RequestKey.from_hex('" + RequestKeyText(key) + "')"; })
+      .def(
+          "__eq__", [](const RequestKey& lhs, const RequestKey& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__", [](const RequestKey& lhs, const RequestKey& rhs) { return lhs != rhs; },
+          py::is_operator())
+      .def("__hash__", [](const RequestKey& key) {
+        return py::hash(py::make_tuple("RequestKey", RequestKeyText(key)));
+      });
+}
 }  // namespace
 
 void register_strong_identity_bindings(py::module_& module) {
@@ -152,7 +223,6 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(SceneId);
   MANYFORGE_BIND_STRONG_STRING(ProjectionLeaseId);
   MANYFORGE_BIND_STRONG_STRING(BootstrapId);
-  MANYFORGE_BIND_STRONG_STRING(ApplyId);
 
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaId);
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaRevision);
@@ -161,20 +231,14 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ProgramId);
   MANYFORGE_BIND_STRONG_STRING(ProgramRevision);
   MANYFORGE_BIND_STRONG_STRING(ProgramBindingId);
-  MANYFORGE_BIND_STRONG_STRING(ProgramRunId);
   MANYFORGE_BIND_STRONG_STRING(MoveId);
 
-  MANYFORGE_BIND_STRONG_STRING(RequestOwnerEpoch);
-  MANYFORGE_BIND_STRONG_STRING(RequestId);
   MANYFORGE_BIND_STRONG_STRING(LifecycleTransactionId);
   MANYFORGE_BIND_STRONG_STRING(LifecycleFactId);
   MANYFORGE_BIND_STRONG_STRING(ConfigurationFenceId);
-  MANYFORGE_BIND_STRONG_STRING(OperationId);
-  MANYFORGE_BIND_STRONG_STRING(OperationParticipantId);
-  MANYFORGE_BIND_STRONG_STRING(StopId);
-  MANYFORGE_BIND_STRONG_STRING(StopCertificateId);
 
 #undef MANYFORGE_BIND_STRONG_STRING
+  bind_request_key(module);
 
   bind_strong_counter<ActiveControlConfigurationGeneration>(module,
                                                             "ActiveControlConfigurationGeneration");
@@ -182,6 +246,7 @@ void register_strong_identity_bindings(py::module_& module) {
   bind_strong_counter<ActiveBundlePublicationGeneration>(module,
                                                          "ActiveBundlePublicationGeneration");
   bind_strong_counter<BootstrapGeneration>(module, "BootstrapGeneration");
+  bind_strong_counter<ApplyId>(module, "ApplyId");
   bind_strong_counter<ApplyGeneration>(module, "ApplyGeneration");
   bind_strong_counter<LifecycleTransactionGeneration>(module, "LifecycleTransactionGeneration");
   bind_strong_counter<ComponentLifecycleGeneration>(module, "ComponentLifecycleGeneration");
@@ -189,8 +254,11 @@ void register_strong_identity_bindings(py::module_& module) {
   bind_strong_counter<AdmissionGeneration>(module, "AdmissionGeneration");
   bind_strong_counter<CellAdmissionClaimGeneration>(module, "CellAdmissionClaimGeneration");
   bind_strong_counter<ConfigurationFenceGeneration>(module, "ConfigurationFenceGeneration");
-  bind_strong_counter<StopGeneration>(module, "StopGeneration");
-  bind_strong_counter<StopCertificateRevision>(module, "StopCertificateRevision");
+  bind_strong_counter<StopEventId>(module, "StopEventId");
+  bind_strong_counter<OperationNumber>(module, "OperationNumber");
+  bind_strong_counter<ProgramRunNumber>(module, "ProgramRunNumber");
+  bind_strong_counter<NodeAttemptNumber>(module, "NodeAttemptNumber");
+  bind_operation_participant_id(module);
 }
 
 }  // namespace manyforge::core::python

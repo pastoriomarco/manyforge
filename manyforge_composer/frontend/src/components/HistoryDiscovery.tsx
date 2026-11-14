@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import type { HistorianDiscovery } from '../types/headless';
 
-/** One explicit, replaceable index page; no background discovery or growing list. */
-export function HistoryDiscovery({ onSelect }: {
+/**
+ * One explicit, replaceable index page; no background discovery or growing list.
+ * Program runs are listed for `applicationStartId` (the page's selected start).
+ */
+export function HistoryDiscovery({ onSelect, applicationStartId }: {
   onSelect: (kind: HistorianDiscovery['kind'], value: string) => void;
+  applicationStartId: ApplicationStartId | null;
 }) {
   const [kind, setKind] = useState<HistorianDiscovery['kind']>('program_run_id');
   const [page, setPage] = useState<HistorianDiscovery | null>(null);
@@ -20,7 +25,10 @@ export function HistoryDiscovery({ onSelect }: {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.history.discovery(kind, after, request.signal);
+      const next = await api.history.discovery(
+        kind, after, request.signal,
+        kind === 'program_run_id' ? applicationStartId ?? undefined : undefined,
+      );
       if (!request.signal.aborted) setPage(next);
     } catch (reason) {
       if (!request.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason));

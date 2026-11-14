@@ -3255,7 +3255,13 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         }
         runtime->lifecycle_condition.notify_all();
         ++runtime->revision;
-      } else if (runtime->cancel_pending || !runtime->executing) {
+      } else if (!runtime->executing && !runtime->cancel_pending) {
+        // The exact command already ended before this acceptance (e.g. its
+        // result deadline failed it). The late goal is only cancelled; the
+        // terminal state and its typed error stay.
+        handle_to_cancel = retained_goal;
+        action_client = ros->action_client;
+      } else if (runtime->cancel_pending) {
         lifecycle_handle = runtime->lifecycle_handle;
         runtime->lifecycle_handle.reset();
         ++runtime->lifecycle_schedule_generation;

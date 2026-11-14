@@ -773,7 +773,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
                              });
         return found != rows.end() &&
                found->runtime_unit_id == plan.runtime_unit_id &&
-               found->runtime_epoch.value() == process.process_incarnation() &&
                found->observed_product_identity == plan.product_identity &&
                found->observed_configuration_identity ==
                    plan.configuration_identity &&
@@ -823,13 +822,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
         Fail("retained component epoch is not currently present for " +
              plan.runtime_unit_id.value() +
              " [retained_epoch=" + retained->runtime_epoch.value() + "]");
-      }
-      if (process.process_incarnation() != retained->runtime_epoch.value()) {
-        Fail("current component epoch differs from retained Apply evidence "
-             "for " +
-             plan.runtime_unit_id.value() +
-             " [retained_epoch=" + retained->runtime_epoch.value() +
-             ", current_epoch=" + process.process_incarnation() + "]");
       }
       if (!prior_proves_candidate_preparation(plan, process)) {
         Fail("current component identity differs from retained Apply evidence "

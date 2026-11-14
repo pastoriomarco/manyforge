@@ -2,10 +2,11 @@ import { parseSceneRuntimePoseSource } from '../api/parsers/scene';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { VIEWER_POSE_RATE_HZ } from '../state/composerSettings';
 import { resolveStructuralAssetUrl } from '../api/client';
+import { isApplicationStartId, isRequestKey, newRequestKey } from '../api/applicationIdentity';
+import { parseApplyCommands, parseRunnerCommandRow } from '../api/parsers/commandRows';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { CommandRefusalError, receiptRefusal } from '../state/commandRefusal';
 import { operationStateIsTerminal } from '../state/robotControl';
-import { structuredErrorText } from '../state/structuredError';
 import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import { parseGlobalRuleStatus, type GlobalRuleStatus } from '../utils/globalRuleStatus';
@@ -16,9 +17,9 @@ import {
   parseSignalSamples,
 } from '../api/parsers/components';
 import type { CellState } from '../types/components';
+import type { CommandRow, RunnerCommandRowKind } from '../types/api';
 import {
   parseApiErrorDto,
-  parseKnownProgramRunOutcome,
   parseAuthoringWorkspaceContainment,
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
@@ -60,8 +61,8 @@ const CONTROL_STATE_INVALID =
 // execution-control settlement.
 export const HEADLESS_SHELL_PUBLICATION_MS = 50;
 
-const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v4';
-const EXECUTION_OBSERVATION_CREDIT_SCHEMA = 'manyforge.execution_observation_credit.v1';
+const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v5';
+const EXECUTION_OBSERVATION_CREDIT_SCHEMA = 'manyforge.execution_observation_credit.v2';
 const EXECUTION_OBSERVATION_RENEWAL_MS = 15_000;
 const observationTextEncoder = new TextEncoder();
 function isObservationText(value: unknown): value is string {
@@ -93,7 +94,7 @@ function sameExecutionObservationFrame(
   current: ExecutionObservationFrame,
   candidate: ExecutionObservationFrame,
 ): boolean {
-  return current.ownerEpoch === candidate.ownerEpoch
+  return current.applicationStartId === candidate.applicationStartId
     && current.sourceEpoch === candidate.sourceEpoch
     && current.sourceSequence === candidate.sourceSequence
     && current.cellId === candidate.cellId
@@ -113,12 +114,12 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     return value as Record<string, unknown>;
   };
   const record = object(raw, [
+    'application_start_id',
     'cell_id',
     'delivery_sequence',
     'outside_pose_sources',
     'graph_revision',
     'measured_targets',
-    'owner_epoch',
     'received_at_monotonic_us',
     'retained_bundle_id',
     'schema_version',
@@ -215,7 +216,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
     deliverySequence: integer('delivery_sequence'),
     outsidePoseSources,
-    ownerEpoch: text('owner_epoch'),
+    applicationStartId: text('application_start_id'),
     cellId: text('cell_id'),
     retainedBundleId: text('retained_bundle_id'),
     graphRevision: text('graph_revision'),
@@ -247,14 +248,20 @@ export interface HeadlessStateAdmission {
   reason: string | null;
 }
 
-const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v2';
-const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v1';
+const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v4';
+const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v2';
 // Starts, resumes and recovery actions are admitted by Composer, which checks
 // the shared Draft (an unapplied Draft refuses Execute/Run/Resume/Retry).
 const HTTP_ADMITTED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'program_run', 'program_motion_start', 'program_motion_resume',
-  'program_resume_full_stop', 'operation_start', 'execution_recovery',
+  'program_resume_halt', 'operation_start', 'execution_recovery',
 ]);
+/** A receipt's runner row (OD-214), or null for a command the runner does not own. */
+function receiptCommandRow(value: unknown): CommandRow<RunnerCommandRowKind> | null {
+  if (value === undefined) throw new Error('Execution command receipt omitted its command row.');
+  return value === null ? null : parseRunnerCommandRow(value, 'receipt.command');
+}
+
 const CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000;
 const CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000;
 const CONTROL_HEARTBEAT_STALE_NS = 1_000_000_000;
@@ -276,11 +283,9 @@ export type ExecutionControlCommandKind =
   | 'program_motion_start'
   | 'program_motion_stop'
   | 'program_motion_resume'
-  | 'program_full_stop'
-  | 'program_stop'
   | 'program_reset'
-  | 'program_resume_full_stop'
-  | 'program_discard_full_stop'
+  | 'program_resume_halt'
+  | 'program_discard_halt'
   | 'program_runtime_blackboard_write'
   | 'program_manual_result_stage'
   | 'program_manual_handover'
@@ -288,24 +293,15 @@ export type ExecutionControlCommandKind =
   | 'operation_stop'
   | 'operation_reset'
   | 'operation_acknowledge_completed'
-  | 'cell_full_stop'
+  | 'stop_all'
+  | 'halt'
   | 'execution_recovery'
   | 'runtime_scale';
 
 // Stop kinds are sent whenever the control socket is open: a late heartbeat,
 // a latched transport error or another pending command never holds one back.
 const STOP_COMMANDS = new Set<ExecutionControlCommandKind>([
-  'program_motion_stop', 'program_full_stop', 'program_stop',
-  'operation_stop', 'cell_full_stop',
-]);
-
-const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
-  'operation_start',
-  'operation_stop',
-  'operation_reset',
-  'operation_acknowledge_completed',
-  'cell_full_stop',
-  'runtime_scale',
+  'program_motion_stop', 'operation_stop', 'stop_all', 'halt',
 ]);
 
 /** Message kind and server sequence named by a control_projection_invalid record. */
@@ -317,36 +313,14 @@ function controlIncidentMessage(record: Record<string, unknown>): { kind: string
   return { kind: kind || 'unknown', sequence: sequence || 'none' };
 }
 
-export function executionCommandPayload(
-  commandKind: ExecutionControlCommandKind,
-  payload: Record<string, unknown>,
-  executionOwnerEpoch: string | null | undefined,
-): Record<string, unknown> {
-  if (!EXECUTION_OWNER_FENCED_COMMANDS.has(commandKind)) return payload;
-  if (typeof executionOwnerEpoch !== 'string' || executionOwnerEpoch === '') {
-    // A Stop is never refused locally: without the owner epoch it is sent
-    // unfenced and the owner treats it as an ordinary Stop.
-    if (STOP_COMMANDS.has(commandKind)) return payload;
-    throw new Error('Execution owner identity is unavailable.');
-  }
-  return {
-    ...payload,
-    expected_execution_owner_epoch: executionOwnerEpoch,
-  };
-}
-
 interface ControlFreshnessContext {
   context_id: string;
-  receiver_incarnation: string;
-  semantic_owner_epoch: string;
   execution_control_revision: number;
   issued_server_sequence: string;
   valid_for_ns: number;
 }
 
 interface CurrentExecutionControl {
-  receiver_incarnation: string;
-  semantic_owner_epoch: string;
   execution_control_revision: number;
   freshness: ControlFreshnessContext;
 }
@@ -387,24 +361,55 @@ interface ClientIncidentState {
  * never resend the command.
  */
 export class CommandDeliveryUnconfirmedError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  /** The WebSocket command whose receipt was lost; null for an HTTP command. */
+  readonly command: ExecutionCommandSessionIdentity | null;
+
+  constructor(
+    message: string,
+    options?: { cause?: unknown; command?: ExecutionCommandSessionIdentity | null },
+  ) {
     super(message, options);
     this.name = 'CommandDeliveryUnconfirmedError';
+    this.command = options?.command ?? null;
   }
 }
 
+/**
+ * A WebSocket command's identity: the control session number and the client
+ * sequence (the owner forms the command's request key from both). HTTP
+ * commands are named by their request key instead.
+ */
+export interface ExecutionCommandSessionIdentity {
+  controlSessionNumber: number;
+  clientSequence: string;
+}
+
 export interface ExecutionCommandReceipt {
-  correlationId: string;
-  disposition: 'received' | 'rejected' | 'joined' | 'already_current' | 'no_effect';
-  code: string;
+  /** Null for an HTTP-admitted command. */
+  controlSessionNumber: number | null;
+  /** Null for an HTTP-admitted command. */
+  clientSequence: string | null;
+  /**
+   * The receipt members below are null for Stop all or Halt sent over the
+   * HTTP Stop route: its reply is the dispatch result, with no receipt.
+   */
+  disposition: 'received' | 'rejected' | 'joined' | 'already_current' | 'no_effect' | null;
+  code: string | null;
   result: unknown;
-  receivedServerSequence: string;
-  receivedMonotonicNs: string;
-  emittedMonotonicNs: string;
+  receivedServerSequence: string | null;
+  receivedMonotonicNs: string | null;
+  emittedMonotonicNs: string | null;
+  /** The key the owner formed for the command; null for a Stop over HTTP. */
+  requestKey: string | null;
+  /**
+   * A runner command's row as it stood at acceptance (OD-214): its end is
+   * read from `runner_commands` in the cycle status. Null for other kinds.
+   */
+  command: CommandRow<RunnerCommandRowKind> | null;
 }
 
 export interface RuntimeFrameIdentity {
-  ownerEpoch: string;
+  applicationStartId: string;
   generation: number;
 }
 
@@ -425,7 +430,9 @@ export function admitHeadlessState(
   candidate: ComposerHeadlessState,
 ): HeadlessStateAdmission {
   if (current === null) return { accepted: true, reason: null };
-  if (candidate.receiverEpoch === current.receiverEpoch) {
+  // A different application start is accepted at once (the browser's resync
+  // on a new start); within one start snapshots are ordered by sequence.
+  if (candidate.applicationStartId === current.applicationStartId) {
     if (candidate.snapshotSequence < current.snapshotSequence) {
       return { accepted: false, reason: 'Headless snapshot sequence regressed.' };
     }
@@ -452,24 +459,6 @@ function websocketUrl(path: '/ws/control' | '/ws/scene/viewer'): string {
   return resolved.toString();
 }
 
-export function browserStableIdentity(storageKey: string, prefix: string): string {
-  const valid = (value: string | null): value is string =>
-    value !== null && new RegExp(`^${prefix}\\.[A-Za-z0-9_-]{8,256}$`).test(value);
-  try {
-    const stored = globalThis.localStorage?.getItem(storageKey);
-    if (valid(stored)) return stored;
-    const random = globalThis.crypto?.randomUUID?.()
-      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const value = `${prefix}.${random}`;
-    globalThis.localStorage?.setItem(storageKey, value);
-    return value;
-  } catch {
-    const random = globalThis.crypto?.randomUUID?.()
-      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    return `${prefix}.${random}`;
-  }
-}
-
 function sameStrings(current: string[], candidate: string[]): boolean {
   return current.length === candidate.length
     && current.every((value, index) => value === candidate[index]);
@@ -483,7 +472,6 @@ function sameSourceSection(
   return current.available === candidate.available
     && current.freshness === candidate.freshness
     && sameStrings(current.knownGaps, candidate.knownGaps)
-    && current.sourceOwnerEpoch === candidate.sourceOwnerEpoch
     && current.sourceOwnerId === candidate.sourceOwnerId
     && (!includeSourceGeneration
       || current.sourceGeneration === candidate.sourceGeneration);
@@ -715,15 +703,9 @@ export function sameViewerIdentity(
   candidate: ComposerHeadlessState | null,
 ): boolean {
   if (current === null || candidate === null) return current === candidate;
-  const sections = (state: ComposerHeadlessState) => state.runtime.sections;
-  return current.receiverEpoch === candidate.receiverEpoch
+  return current.applicationStartId === candidate.applicationStartId
     && viewerModelRefreshKey(current) === viewerModelRefreshKey(candidate)
-    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
-    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
-    && sections(current).logicalScene.sourceOwnerEpoch
-      === sections(candidate).logicalScene.sourceOwnerEpoch
-    && sections(current).sceneRuntime.sourceOwnerEpoch
-      === sections(candidate).sceneRuntime.sourceOwnerEpoch;
+    && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId;
 }
 
 export function sameViewerProjection(
@@ -731,12 +713,11 @@ export function sameViewerProjection(
   candidate: ComposerHeadlessState,
 ): boolean {
   if (current === null) return false;
-  return current.receiverEpoch === candidate.receiverEpoch
+  return current.applicationStartId === candidate.applicationStartId
     // Manager completion can arrive after the final Scene update. Publish
     // the same identity/readiness facts that wake the structural model reads,
     // without waking the viewer for source counters or observation ages.
     && viewerModelRefreshKey(current) === viewerModelRefreshKey(candidate)
-    && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
     && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
     && current.runtime.complete === candidate.runtime.complete
     && sameStrings(current.runtime.reasons, candidate.runtime.reasons)
@@ -809,8 +790,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private controlHeartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private controlStaleReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private controlSessionId: string | null = null;
-  private controlReceiverIncarnation: string | null = null;
+  private controlSessionNumber: number | null = null;
   private controlSnapshotBarrierPending = true;
   private controlServerSequence = 0n;
   private controlClientSequence = 0;
@@ -818,7 +798,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private lastControlEchoSequence = 0;
   private lastReceivedClientSequence = 0n;
   private controlHeartbeatFreshness: ControlFreshnessContext | null = null;
-  private commandDeliveryFaultSessionId: string | null = null;
+  private commandDeliveryFaultSessionNumber: number | null = null;
   private controlTransportStatus: ControlTransportStatus = 'disconnected';
   private controlTransportError: string | null = null;
   // Latches that keep the connection open. Each disables commands other than
@@ -833,16 +813,20 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   // An invalid control message: owner state is no longer applied.
   private controlStateInvalidCause: string | null = null;
   // The session on which control_projection_invalid was raised.
-  private controlProjectionInvalidSessionId: string | null | undefined = undefined;
+  private controlProjectionInvalidSessionNumber: number | null | undefined = undefined;
   private controlSemanticStatus: ControlSemanticStatus = 'synchronizing';
   private controlSemanticReason: string | null = 'control_projection_synchronizing';
   private executionControl: CurrentExecutionControl | null = null;
   private executionTargetsWire: unknown = null;
   private ordinaryControlPending: string | null = null;
+  // The HTTP command whose reply was lost: a resend of it keeps its key.
+  private unansweredHttpCommand: { fingerprint: string; requestKey: string } | null = null;
   private runtimeScaleControlPending: string | null = null;
+  // Pending WebSocket commands by client sequence.
   private readonly commandReceipts = new Map<string, {
     resolve: (receipt: ExecutionCommandReceipt) => void;
     reject: (reason: Error) => void;
+    command: ExecutionCommandSessionIdentity;
     clientSequence: bigint;
     deliveryTimer: ReturnType<typeof setTimeout> | null;
   }>();
@@ -951,7 +935,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     }
     this.appliedExecutionObservation = frame;
     recordViewerObservationApplied({
-      ownerEpoch: frame.ownerEpoch,
+      applicationStartId: frame.applicationStartId,
       sourceEpoch: frame.sourceEpoch,
       sourceSequence: frame.sourceSequence,
       receivedAtComposerMonotonicUs: frame.receivedAtMonotonicUs,
@@ -985,20 +969,62 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
     this.presentedFrame === null ? null : { ...this.presentedFrame };
 
+  /**
+   * Stop all or Halt over the Composer's HTTP Stop route, when the control
+   * session cannot carry it. The body names no run and no start: Headless
+   * gives the Stop its key. No time limit: the request runs until the reply
+   * arrives or the network fails.
+   */
+  private async sendCellStopOverHttp(
+    commandKind: 'stop_all' | 'halt',
+  ): Promise<ExecutionCommandReceipt> {
+    let response: Response;
+    try {
+      response = await fetch(
+        resolveStructuralAssetUrl(commandKind === 'stop_all' ? '/api/execution/stop-all' : '/api/execution/halt'),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ request_context: { source_label: 'operator_ui' } }),
+        },
+      );
+    } catch {
+      // The request did not reach the Composer, or its answer was lost.
+      throw new Error('The Composer did not answer, so the Stop is not confirmed.');
+    }
+    const body: unknown = await response.json();
+    if (!response.ok) {
+      const error = parseApiErrorDto(body);
+      if (error !== null) throw new CommandRefusalError(error);
+      throw new Error(`Execution command rejected (HTTP ${response.status}).`);
+    }
+    return {
+      controlSessionNumber: null,
+      clientSequence: null,
+      disposition: null,
+      code: null,
+      result: body,
+      receivedServerSequence: null,
+      receivedMonotonicNs: null,
+      emittedMonotonicNs: null,
+      requestKey: null,
+      command: null,
+    };
+  }
+
   readonly sendExecutionCommand = (
     commandKind: ExecutionControlCommandKind,
     payload: Record<string, unknown>,
-    correlationId: string,
   ): Promise<ExecutionCommandReceipt> => {
     const socket = this.socket;
-    const sessionId = this.controlSessionId;
+    const sessionNumber = this.controlSessionNumber;
     const control = this.executionControl;
     const stop = STOP_COMMANDS.has(commandKind);
     const runtimeScale = commandKind === 'runtime_scale';
     if (
       socket === null
       || socket.readyState !== WebSocket.OPEN
-      || sessionId === null
+      || sessionNumber === null
       || control === null
       || (!stop && (
         !this.controlHeartbeatConfirmed
@@ -1006,6 +1032,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.controlProjectionIsCurrent()
       ))
     ) {
+      // Stop all and Halt name nothing the page must know first: before the
+      // first snapshot, or with the control socket down, they go over the
+      // Composer's HTTP Stop route (the same Stop lane and record).
+      if (commandKind === 'stop_all' || commandKind === 'halt') {
+        return this.sendCellStopOverHttp(commandKind);
+      }
       return Promise.reject(new Error('Control connection is not synchronized.'));
     }
     if (!stop && (
@@ -1019,67 +1051,51 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           : 'Another ordinary control command is pending.',
       ));
     }
-    let fencedPayload: Record<string, unknown>;
-    try {
-      fencedPayload = executionCommandPayload(
-        commandKind,
-        payload,
-        this.latest?.executionControlStatus?.ownerEpoch,
-      );
-    } catch (error: unknown) {
-      return Promise.reject(error);
-    }
     if (HTTP_ADMITTED_COMMANDS.has(commandKind)) {
       // Composer checks the shared Draft and submits under its authoring
       // serialization lock. Stop and all observation remain on the WS lane.
-      this.ordinaryControlPending = correlationId;
+      // The request names start-minted values, so it carries `A`.
+      const applicationStartId = this.latest?.applicationStartId ?? null;
+      if (applicationStartId === null) {
+        return Promise.reject(new Error('Execution owner identity is unavailable.'));
+      }
+      // The command is answered at its acceptance (OD-214), so its reply has
+      // no time limit. A resend after a lost reply carries the same key: the
+      // owner answers with that command's row and runs nothing twice.
+      const fingerprint = JSON.stringify([commandKind, payload]);
+      const requestKey = this.unansweredHttpCommand?.fingerprint === fingerprint
+        ? this.unansweredHttpCommand.requestKey
+        : newRequestKey();
+      this.ordinaryControlPending = requestKey;
       return (async (): Promise<ExecutionCommandReceipt> => {
-        const abort = new AbortController();
-        const deadline = setTimeout(() => abort.abort(), 5_000);
         let acknowledged = false;
         let httpStatus: number | null = null;
         try {
           const response = await fetch(resolveStructuralAssetUrl('/api/control/commands'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            signal: abort.signal,
             body: JSON.stringify({
               command_envelope: {
                 schema_version: EXECUTION_COMMAND_SCHEMA,
                 command_kind: commandKind,
-                correlation_id: correlationId,
                 source_label: 'operator_ui',
-                control_session_id: null,
+                control_session_number: null,
                 client_sequence: null,
                 freshness: control.freshness,
-                expected_semantic_owner_epoch: control.semantic_owner_epoch,
                 expected_execution_control_revision: control.execution_control_revision,
               },
-              payload: fencedPayload,
+              // A session-less command carries its key and `A` in the
+              // payload; Headless takes both from there (contract 1.6).
+              payload: { ...payload, request_key: requestKey, application_start_id: applicationStartId },
             }),
           });
           httpStatus = response.status;
           const body: unknown = await response.json();
           if (!response.ok) {
-            // A non-5xx owner response is a known outcome, including an
-            // accepted Run that failed. Server errors remain uncertain.
+            // A non-5xx owner response is a refusal before acceptance (a
+            // failure after it is the row's end). Server errors remain uncertain.
             acknowledged = response.status >= 400 && response.status < 500;
             const error = parseApiErrorDto(body);
-            if (error !== null && ['program_run_started_then_failed',
-              'program_run_superseded_by_stop', 'program_run_stopped_before_start'].includes(error.code)) {
-              let outcome;
-              try {
-                outcome = parseKnownProgramRunOutcome(body, response.status);
-              } catch {
-                throw new Error('Run outcome could not be read; check the Program state before Reset.');
-              }
-              if (outcome.code === 'program_run_started_then_failed') {
-                throw new Error(`Run failed: ${structuredErrorText(outcome)}. Reset required.`);
-              }
-              const stopped = outcome.code === 'program_run_stopped_before_start'
-                ? 'Run stopped before start' : 'Run stopped';
-              throw new Error(`${stopped}. Reset required. ${structuredErrorText(outcome)}`);
-            }
             if (error !== null) throw new CommandRefusalError(error);
             throw new Error(`Execution command rejected (HTTP ${response.status}).`);
           }
@@ -1092,15 +1108,16 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             throw new Error('Execution command receipt is missing.');
           }
           const value = receipt as Record<string, unknown>;
-          if (value.schema_version !== 'manyforge.execution_command_receipt.v1'
-            || value.correlation_id !== correlationId
-            || value.control_session_id !== null
+          // An HTTP reply is matched by its request key. Headless sets the
+          // key's first byte (class and part), so bytes 1-15 are compared.
+          if (value.schema_version !== 'manyforge.execution_command_receipt.v3'
+            || typeof value.request_key !== 'string'
+            || value.request_key.length !== 32
+            || value.request_key.slice(2) !== requestKey.slice(2)
+            || value.control_session_number !== null
             || value.client_sequence !== null
-            || value.receiver_incarnation !== this.controlReceiverIncarnation
-            || (value.disposition !== 'rejected' && (
-              value.semantic_owner_epoch !== control.semantic_owner_epoch
-              || value.execution_control_revision !== control.execution_control_revision
-            ))
+            || (value.disposition !== 'rejected'
+              && value.execution_control_revision !== control.execution_control_revision)
             || !canonicalPositiveU64(value.received_server_sequence)
             || !canonicalPositiveU64(value.received_monotonic_ns)
             || !['received', 'rejected', 'joined', 'already_current', 'no_effect']
@@ -1108,7 +1125,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             || typeof value.code !== 'string') {
             throw new Error('Execution command receipt identity is invalid.');
           }
+          const command = receiptCommandRow(value.command);
           acknowledged = true;
+          this.unansweredHttpCommand = null;
           if (value.disposition === 'rejected') {
             const refusal = new CommandRefusalError(
               receiptRefusal(value.code as string, record.result), { withCode: true, executionResult: record.result },
@@ -1116,22 +1135,26 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             throw refusal;
           }
           return {
-            correlationId,
+            controlSessionNumber: null,
+            clientSequence: null,
             disposition: value.disposition as ExecutionCommandReceipt['disposition'],
             code: value.code as string,
             result: record.result,
             receivedServerSequence: value.received_server_sequence,
             receivedMonotonicNs: value.received_monotonic_ns,
             emittedMonotonicNs: value.received_monotonic_ns,
+            requestKey: value.request_key,
+            command,
           };
         } catch (error: unknown) {
           if (!acknowledged) {
-            // Keep the connection: the owner state shows the outcome. Until it
-            // moves past this point, commands other than Stop stay disabled.
-            const outcome = abort.signal.aborted ? 'timeout'
-              : httpStatus === null ? 'network' : `http_${httpStatus}`;
+            // The reply was lost: keep the connection; the owner state shows
+            // the outcome. Until it moves past this point, commands other than
+            // Stop stay disabled. A resend of this command keeps its key.
+            this.unansweredHttpCommand = { fingerprint, requestKey };
+            const outcome = httpStatus === null ? 'network' : `http_${httpStatus}`;
             this.latchCommandDelivery(
-              sessionId,
+              sessionNumber,
               `http_response_unconfirmed:${commandKind}:${outcome}`,
               5_000_000_000,
               null,
@@ -1142,51 +1165,56 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             );
             throw new CommandDeliveryUnconfirmedError(COMMAND_DELIVERY_UNCONFIRMED, { cause: error });
           }
+          this.unansweredHttpCommand = null;
           throw error;
         } finally {
-          clearTimeout(deadline);
-          if (this.ordinaryControlPending === correlationId) {
+          if (this.ordinaryControlPending === requestKey) {
             this.ordinaryControlPending = null;
           }
         }
       })();
     }
+    // A WebSocket command carries no request id, key or `A`: the session
+    // number and client sequence name it.
     this.controlClientSequence += 1;
     const clientSequence = String(this.controlClientSequence);
+    const identity: ExecutionCommandSessionIdentity = {
+      controlSessionNumber: sessionNumber,
+      clientSequence,
+    };
     const command = {
       schema_version: CONTROL_PROTOCOL_VERSION,
       message_kind: 'command',
-      control_session_id: sessionId,
+      control_session_number: sessionNumber,
       client_sequence: clientSequence,
       command: {
         command_envelope: {
           schema_version: EXECUTION_COMMAND_SCHEMA,
           command_kind: commandKind,
-          correlation_id: correlationId,
           source_label: 'operator_ui',
-          control_session_id: sessionId,
+          control_session_number: sessionNumber,
           client_sequence: clientSequence,
           freshness: control.freshness,
-          expected_semantic_owner_epoch: control.semantic_owner_epoch,
           expected_execution_control_revision: control.execution_control_revision,
         },
-        payload: fencedPayload,
+        payload,
       },
     };
     return new Promise<ExecutionCommandReceipt>((resolve, reject) => {
       const pending = {
         resolve,
         reject,
+        command: identity,
         clientSequence: BigInt(clientSequence),
         deliveryTimer: null as ReturnType<typeof setTimeout> | null,
       };
-      this.commandReceipts.set(correlationId, pending);
-      if (runtimeScale) this.runtimeScaleControlPending = correlationId;
-      else if (!stop) this.ordinaryControlPending = correlationId;
+      this.commandReceipts.set(clientSequence, pending);
+      if (runtimeScale) this.runtimeScaleControlPending = clientSequence;
+      else if (!stop) this.ordinaryControlPending = clientSequence;
       try {
         socket.send(JSON.stringify(command));
         pending.deliveryTimer = setTimeout(() => {
-          if (this.commandReceipts.get(correlationId) !== pending) return;
+          if (this.commandReceipts.get(clientSequence) !== pending) return;
           const delivered = this.lastReceivedClientSequence >= pending.clientSequence;
           if (delivered) {
             // The server watermark is the transport acknowledgement. Owner
@@ -1195,19 +1223,21 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             pending.deliveryTimer = null;
             return;
           }
-          this.commandReceipts.delete(correlationId);
-          if (this.ordinaryControlPending === correlationId) {
+          this.commandReceipts.delete(clientSequence);
+          if (this.ordinaryControlPending === clientSequence) {
             this.ordinaryControlPending = null;
           }
-          if (this.runtimeScaleControlPending === correlationId) {
+          if (this.runtimeScaleControlPending === clientSequence) {
             this.runtimeScaleControlPending = null;
           }
-          pending.reject(new CommandDeliveryUnconfirmedError(COMMAND_DELIVERY_UNCONFIRMED));
+          pending.reject(new CommandDeliveryUnconfirmedError(
+            COMMAND_DELIVERY_UNCONFIRMED, { command: identity },
+          ));
           // Keep the connection: an open socket delivers in order, so this
           // command is late, not lost. Commands other than Stop stay disabled
           // until the owner's watermark reaches it.
           this.latchCommandDelivery(
-            sessionId,
+            sessionNumber,
             `command_watermark_missing:${commandKind}:${clientSequence}`,
             CONTROL_COMMAND_DELIVERY_NS,
             pending.clientSequence,
@@ -1215,11 +1245,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           );
         }, CONTROL_COMMAND_DELIVERY_NS / 1_000_000);
       } catch (reason) {
-        this.commandReceipts.delete(correlationId);
-        if (this.ordinaryControlPending === correlationId) {
+        this.commandReceipts.delete(clientSequence);
+        if (this.ordinaryControlPending === clientSequence) {
           this.ordinaryControlPending = null;
         }
-        if (this.runtimeScaleControlPending === correlationId) {
+        if (this.runtimeScaleControlPending === clientSequence) {
           this.runtimeScaleControlPending = null;
         }
         reject(reason instanceof Error ? reason : new Error('Command delivery failed.'));
@@ -1275,7 +1305,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     }
     this.presentedViewer = snapshot;
     this.presentedFrame = {
-      ownerEpoch: snapshot.runtime.projectionOwnerEpoch,
+      applicationStartId: snapshot.applicationStartId,
       generation: snapshot.runtime.projectionGeneration,
     };
     this.advancePresentedFrame(this.latest);
@@ -1424,8 +1454,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.globalRules = null;
     this.cellState = EMPTY_CELL_STATE;
     for (const listener of this.operationProgressListeners) listener();
-    this.controlSessionId = null;
-    this.controlReceiverIncarnation = null;
+    this.controlSessionNumber = null;
     this.controlSnapshotBarrierPending = true;
     this.controlServerSequence = 0n;
     this.executionControl = null;
@@ -1443,7 +1472,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     this.runtimeScaleControlPending = null;
     for (const pending of this.commandReceipts.values()) {
       if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
-      pending.reject(new CommandDeliveryUnconfirmedError(`Command delivery unconfirmed; ${reason}.`));
+      pending.reject(new CommandDeliveryUnconfirmedError(
+        `Command delivery unconfirmed; ${reason}.`, { command: pending.command },
+      ));
     }
     this.commandReceipts.clear();
   }
@@ -1485,15 +1516,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.enabled
         || this.disposed
       ) return;
-      const clientIncarnation = browserStableIdentity(
-        'manyforge.composer.control_client_incarnation',
-        'control-client',
-      );
       socket.send(JSON.stringify({
         schema_version: CONTROL_PROTOCOL_VERSION,
         message_kind: 'client_hello',
         supported_versions: [CONTROL_PROTOCOL_VERSION],
-        client_incarnation: clientIncarnation,
         source_label: 'operator_ui',
       }));
     };
@@ -1513,9 +1539,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         const kind = record.message_kind;
         if (kind === 'server_hello') {
-          if (this.controlSessionId !== null
-            || typeof record.control_session_id !== 'string'
-            || typeof record.receiver_incarnation !== 'string'
+          if (this.controlSessionNumber !== null
+            || !Number.isSafeInteger(record.control_session_number)
+            || (record.control_session_number as number) < 1
+            || !isApplicationStartId(record.application_start_id)
             || record.heartbeat_period_ns !== CONTROL_HEARTBEAT_PERIOD_NS
             || record.heartbeat_delayed_ns !== CONTROL_HEARTBEAT_DELAYED_NS
             || record.heartbeat_stale_ns !== CONTROL_HEARTBEAT_STALE_NS
@@ -1524,8 +1551,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               !== CONTROL_MAXIMUM_MESSAGES_PER_SECOND) {
             throw new Error('Control server hello is invalid.');
           }
-          this.controlSessionId = record.control_session_id;
-          this.controlReceiverIncarnation = record.receiver_incarnation;
+          this.controlSessionNumber = record.control_session_number as number;
           this.controlSnapshotBarrierPending = true;
           this.controlServerSequence = 0n;
           this.controlClientSequence = 0;
@@ -1547,8 +1573,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           this.scheduleControlHeartbeatWatch(serial, socket);
           return;
         }
-        if (this.controlSessionId === null
-          || record.control_session_id !== this.controlSessionId
+        if (this.controlSessionNumber === null
+          || record.control_session_number !== this.controlSessionNumber
           || !canonicalPositiveU64(record.server_sequence)
           || BigInt(record.server_sequence) <= this.controlServerSequence) {
           throw new Error('Control server sequence or session is invalid.');
@@ -1579,8 +1605,6 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             freshness = record.freshness as unknown as ControlFreshnessContext;
             if (
               typeof freshness.context_id !== 'string'
-              || typeof freshness.receiver_incarnation !== 'string'
-              || typeof freshness.semantic_owner_epoch !== 'string'
               || !Number.isSafeInteger(freshness.execution_control_revision)
               || !canonicalPositiveU64(freshness.issued_server_sequence)
               || freshness.valid_for_ns !== 750_000_000
@@ -1610,7 +1634,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           socket.send(JSON.stringify({
             schema_version: CONTROL_PROTOCOL_VERSION,
             message_kind: 'heartbeat_echo',
-            control_session_id: this.controlSessionId,
+            control_session_number: this.controlSessionNumber,
             client_sequence: String(this.controlClientSequence),
             challenge_sequence: record.challenge_sequence,
           }));
@@ -1642,20 +1666,19 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             throw new Error('Control command receipt is invalid.');
           }
           const receipt = receiptValue as Record<string, unknown>;
-          const correlationId = receipt.correlation_id;
+          // A WebSocket receipt is matched by its client sequence.
+          const clientSequence = receipt.client_sequence;
           const disposition = receipt.disposition;
           const code = receipt.code;
-          if (typeof correlationId !== 'string' || typeof code !== 'string'
-            || receipt.schema_version !== 'manyforge.execution_command_receipt.v1'
-            || receipt.control_session_id !== this.controlSessionId
+          if (!canonicalPositiveU64(clientSequence) || typeof code !== 'string'
+            || receipt.schema_version !== 'manyforge.execution_command_receipt.v3'
+            || (receipt.request_key !== null && !isRequestKey(receipt.request_key))
+            || receipt.control_session_number !== this.controlSessionNumber
             || !canonicalPositiveU64(record.received_client_sequence)
-            || receipt.receiver_incarnation !== this.controlReceiverIncarnation
-            || !canonicalPositiveU64(receipt.client_sequence)
             || BigInt(record.received_client_sequence as string)
               < BigInt(receipt.client_sequence as string)
             || !canonicalPositiveU64(receipt.received_server_sequence)
             || !canonicalPositiveU64(receipt.received_monotonic_ns)
-            || typeof receipt.semantic_owner_epoch !== 'string'
             || !Number.isSafeInteger(receipt.execution_control_revision)
             || (receipt.execution_control_revision as number) < 1
             || !canonicalPositiveU64(record.emitted_monotonic_ns)
@@ -1665,29 +1688,29 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               .includes(String(disposition))) {
             throw new Error('Control command receipt is invalid.');
           }
-          const pending = this.commandReceipts.get(correlationId);
-          if (pending !== undefined
-              && pending.clientSequence !== BigInt(receipt.client_sequence as string)) {
-            throw new Error('Control receipt watermark or command identity is invalid.');
-          }
+          const command = receiptCommandRow(receipt.command);
+          const pending = this.commandReceipts.get(clientSequence);
           this.admitControlWatermark(record.received_client_sequence);
           if (pending !== undefined) {
-            this.commandReceipts.delete(correlationId);
+            this.commandReceipts.delete(clientSequence);
             if (pending.deliveryTimer !== null) clearTimeout(pending.deliveryTimer);
-            if (this.ordinaryControlPending === correlationId) {
+            if (this.ordinaryControlPending === clientSequence) {
               this.ordinaryControlPending = null;
             }
-            if (this.runtimeScaleControlPending === correlationId) {
+            if (this.runtimeScaleControlPending === clientSequence) {
               this.runtimeScaleControlPending = null;
             }
-            const parsed = {
-              correlationId,
+            const parsed: ExecutionCommandReceipt = {
+              controlSessionNumber: pending.command.controlSessionNumber,
+              clientSequence,
               disposition: disposition as ExecutionCommandReceipt['disposition'],
               code,
               result: record.result,
               receivedServerSequence: receipt.received_server_sequence,
               receivedMonotonicNs: receipt.received_monotonic_ns,
               emittedMonotonicNs: record.emitted_monotonic_ns,
+              requestKey: receipt.request_key as string | null,
+              command,
             };
             if (parsed.disposition === 'rejected') {
               const cause = record.result;
@@ -1695,7 +1718,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               const addressed = cause !== null && typeof cause === 'object'
                 && !Array.isArray(cause)
                 && (cause as Record<string, unknown>).code === code
-                && (cause as Record<string, unknown>).correlation_id === correlationId
+                && (cause as Record<string, unknown>).client_sequence === clientSequence
                 && typeof (cause as Record<string, unknown>).message === 'string';
               const refusal = new CommandRefusalError(
                 receiptRefusal(code, addressed ? cause : null), { withCode: true },
@@ -1705,11 +1728,6 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               pending.resolve(parsed);
             }
           }
-          return;
-        }
-        if (kind === 'resync_required') {
-          this.publishError('Control session requires a current resynchronization.');
-          socket.close(4002, 'invalid headless projection');
           return;
         }
         if (kind !== 'snapshot' && kind !== 'delta') {
@@ -1800,13 +1818,13 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private latchCommandDelivery(
-    sessionId: string,
+    sessionNumber: number,
     reasonCode: string,
     observedDelayNs: number,
     watermark: bigint | null,
     revision: NonNullable<HeadlessStateSource['deliveryRevisionLatch']> | null,
   ): void {
-    if (this.controlSessionId !== sessionId) return;
+    if (this.controlSessionNumber !== sessionNumber) return;
     if (watermark !== null && (this.deliveryWatermarkLatch === null
       || watermark > this.deliveryWatermarkLatch)) {
       this.deliveryWatermarkLatch = watermark;
@@ -1814,7 +1832,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     if (revision !== null && this.deliveryRevisionLatch === null) {
       this.deliveryRevisionLatch = revision;
     }
-    this.commandDeliveryFaultSessionId = sessionId;
+    this.commandDeliveryFaultSessionNumber = sessionNumber;
     this.reportClientIncident(
       'command_delivery_unconfirmed', true, reasonCode, observedDelayNs,
     );
@@ -1823,7 +1841,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private resolveCommandDeliveryLatch(): void {
     if (this.deliveryWatermarkLatch !== null || this.deliveryRevisionLatch !== null) return;
-    this.commandDeliveryFaultSessionId = null;
+    this.commandDeliveryFaultSessionNumber = null;
     this.reportClientIncident(
       'command_delivery_unconfirmed',
       false,
@@ -1842,10 +1860,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const snapshot = this.latest;
     if (snapshot === null) return false;
     const cycle = snapshot.programCycle;
-    if (['starting', 'running', 'stopping', 'resetting', 'recovery_required'].includes(cycle.state)) {
+    if (['starting', 'running', 'resetting', 'recovery_required'].includes(cycle.state)) {
       return true;
     }
-    if (['running', 'intervention_required', 'full_stopping', 'full_stopped', 'stopping',
+    if (['running', 'intervention_required', 'halting', 'halted', 'stopping',
       'finalizing'].includes(cycle.run?.state ?? '')) {
       return true;
     }
@@ -1870,7 +1888,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     if (serial !== this.serial || this.socket !== socket) return;
     const cause = reason instanceof Error ? reason.message : 'Invalid headless WebSocket projection.';
     // Resolved once a later control session applies valid state.
-    this.controlProjectionInvalidSessionId = this.controlSessionId;
+    this.controlProjectionInvalidSessionNumber = this.controlSessionNumber;
     this.reportClientIncident(
       'control_projection_invalid',
       true,
@@ -1905,9 +1923,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       }
       if (controlValue !== null) {
         const control = controlValue as unknown as CurrentExecutionControl;
-        if (typeof control.receiver_incarnation !== 'string'
-          || typeof control.semantic_owner_epoch !== 'string'
-          || !Number.isSafeInteger(control.execution_control_revision)
+        if (!Number.isSafeInteger(control.execution_control_revision)
           || control.execution_control_revision < 1
           || control.freshness === null || typeof control.freshness !== 'object') {
           throw new Error('Control projection identity is invalid.');
@@ -1952,7 +1968,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         const localIdentityFields = [
           'schema_version', 'authoring_workspace',
-          'authoring_workspace_containment', 'receiver_epoch',
+          'authoring_workspace_containment', 'application_start_id',
           'snapshot_sequence',
         ];
         const localIdentityCount = localIdentityFields.filter(
@@ -1965,17 +1981,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         const hasLocalIdentity = localIdentityCount === localIdentityFields.length;
         let authoringWorkspace = this.latest.authoringWorkspace;
         let authoringWorkspaceContainment = this.latest.authoringWorkspaceContainment;
-        let receiverEpoch = this.latest.receiverEpoch;
+        let applicationStartId = this.latest.applicationStartId;
         let snapshotSequence = this.latest.snapshotSequence;
         if (hasLocalIdentity) {
           const workspace = parseAuthoringWorkspaceIdentity(
             shellRecord.authoring_workspace,
             'controlDelta.authoring_workspace',
           );
-          if (typeof shellRecord.receiver_epoch !== 'string'
+          if (!isApplicationStartId(shellRecord.application_start_id)
             || !Number.isSafeInteger(shellRecord.snapshot_sequence)
             || shellRecord.schema_version
-              !== 'manyforge.composer_headless_state.v2') {
+              !== 'manyforge.composer_headless_state.v4') {
             throw new Error('Control delta shell identity is invalid.');
           }
           authoringWorkspace = workspace;
@@ -1983,15 +1999,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             shellRecord.authoring_workspace_containment,
             'controlDelta.authoring_workspace_containment',
           );
-          receiverEpoch = shellRecord.receiver_epoch;
+          applicationStartId = shellRecord.application_start_id;
           snapshotSequence = shellRecord.snapshot_sequence as number;
         }
         const permitted = new Set([
           'schema_version', 'complete', 'runtime', 'alarms',
           'component_overview', 'authoring_admission', 'held_run_draft_edit_allowed',
           'execution_targets',
-          'execution_control_state', 'program_cycle', 'authoring_workspace',
-          'authoring_workspace_containment', 'receiver_epoch', 'snapshot_sequence',
+          'execution_control_state', 'program_cycle', 'apply_commands', 'authoring_workspace',
+          'authoring_workspace_containment', 'application_start_id', 'snapshot_sequence',
         ]);
         if (Object.keys(shellRecord).some((name) => !permitted.has(name))) {
           throw new Error('Control delta shell shape is invalid.');
@@ -2061,12 +2077,20 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           ...('program_cycle' in shellRecord
             ? { programCycle: parseProgramCycleStatus(shellRecord.program_cycle) }
             : {}),
+          ...('apply_commands' in shellRecord
+            ? {
+                applyCommands: parseApplyCommands(
+                  shellRecord.apply_commands,
+                  'headlessState.apply_commands',
+                ),
+              }
+            : {}),
           authoringAdmission,
           heldRunDraftEditAllowed,
           executionControlStatus,
           authoringWorkspace,
           authoringWorkspaceContainment,
-          receiverEpoch,
+          applicationStartId,
           snapshotSequence,
         };
       }
@@ -2115,16 +2139,16 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         socket.send(JSON.stringify({
           schema_version: CONTROL_PROTOCOL_VERSION,
           message_kind: 'state_applied',
-          control_session_id: this.controlSessionId,
+          control_session_number: this.controlSessionNumber,
           state_sequence: record.state_sequence,
         }));
       }
       this.refreshControlCondition();
       this.advancePresentedFrame(candidate);
       this.resolveCommandDeliveryFaultAfterResynchronization();
-      if (this.controlProjectionInvalidSessionId !== undefined
-        && this.controlProjectionInvalidSessionId !== this.controlSessionId) {
-        this.controlProjectionInvalidSessionId = undefined;
+      if (this.controlProjectionInvalidSessionNumber !== undefined
+        && this.controlProjectionInvalidSessionNumber !== this.controlSessionNumber) {
+        this.controlProjectionInvalidSessionNumber = undefined;
         this.reportClientIncident(
           'control_projection_invalid', false, 'control_state_valid_after_reconnect',
         );
@@ -2177,14 +2201,14 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   private resolveCommandDeliveryFaultAfterResynchronization(): void {
     if (
-      this.commandDeliveryFaultSessionId === null
-      || this.controlSessionId === null
-      || this.controlSessionId === this.commandDeliveryFaultSessionId
+      this.commandDeliveryFaultSessionNumber === null
+      || this.controlSessionNumber === null
+      || this.controlSessionNumber === this.commandDeliveryFaultSessionNumber
       || !this.controlHeartbeatConfirmed
       || this.controlSnapshotBarrierPending
       || this.latest === null
     ) return;
-    this.commandDeliveryFaultSessionId = null;
+    this.commandDeliveryFaultSessionNumber = null;
     this.reportClientIncident(
       'command_delivery_unconfirmed',
       false,
@@ -2198,8 +2222,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     phase: 'activated' | 'resolved',
   ): boolean {
     const socket = this.socket;
-    const sessionId = this.controlSessionId;
-    if (socket === null || socket.readyState !== WebSocket.OPEN || sessionId === null) {
+    const sessionNumber = this.controlSessionNumber;
+    if (socket === null || socket.readyState !== WebSocket.OPEN || sessionNumber === null) {
       return false;
     }
     if (phase === 'resolved' && !incident.activationSent) return false;
@@ -2212,7 +2236,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       socket.send(JSON.stringify({
         schema_version: CONTROL_PROTOCOL_VERSION,
         message_kind: 'client_incident',
-        control_session_id: sessionId,
+        control_session_number: sessionNumber,
         client_sequence: String(this.controlClientSequence),
         incident_id: incident.id,
         incident_kind: incident.kind,
@@ -2317,7 +2341,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         lastDelivery = candidate;
         if (
           current !== null
-          && candidate.ownerEpoch === current.ownerEpoch
+          && candidate.applicationStartId === current.applicationStartId
           && candidate.sourceEpoch === current.sourceEpoch
           && candidate.sourceSequence < current.sourceSequence
         ) {
@@ -2327,7 +2351,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         if (
           current !== null
           && candidate.sourceSequence === current.sourceSequence
-          && candidate.ownerEpoch === current.ownerEpoch
+          && candidate.applicationStartId === current.applicationStartId
           && candidate.sourceEpoch === current.sourceEpoch
         ) {
           if (!sameExecutionObservationFrame(current, candidate)) {
@@ -2337,7 +2361,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         }
         recordViewerObservationReceived(
           {
-            ownerEpoch: candidate.ownerEpoch,
+            applicationStartId: candidate.applicationStartId,
             sourceEpoch: candidate.sourceEpoch,
             sourceSequence: candidate.sourceSequence,
             receivedAtComposerMonotonicUs: candidate.receivedAtMonotonicUs,
@@ -2428,7 +2452,6 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const creditFrame = this.observationReceivedOnSocket ? frame : null;
     socket.send(JSON.stringify({
       last_applied: creditFrame === null ? null : {
-        owner_epoch: creditFrame.ownerEpoch,
         source_epoch: creditFrame.sourceEpoch,
         source_sequence: creditFrame.sourceSequence,
         delivery_sequence: creditFrame.deliverySequence,
@@ -2468,7 +2491,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       || !sameViewerProjection(this.presentedViewer, candidate)
     ) return;
     this.presentedFrame = {
-      ownerEpoch: candidate.runtime.projectionOwnerEpoch,
+      applicationStartId: candidate.applicationStartId,
       generation: candidate.runtime.projectionGeneration,
     };
   }
@@ -2485,8 +2508,6 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   ): control is CurrentExecutionControl {
     return control !== null
       && freshness !== null
-      && freshness.receiver_incarnation === control.receiver_incarnation
-      && freshness.semantic_owner_epoch === control.semantic_owner_epoch
       && freshness.execution_control_revision
         === control.execution_control_revision;
   }

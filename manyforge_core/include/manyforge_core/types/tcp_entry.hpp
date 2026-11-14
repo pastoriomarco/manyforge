@@ -138,7 +138,8 @@ enum class ActiveTcpChangeSource : std::uint8_t { kProgram, kRobotControl, kRese
 
 /// Active TCP: one confirmed change of a robot's Active TCP,
 /// the `active_tcp_changed` event of the host's ordered events stream. The
-/// robot owner appends it under its own lock, so the stream order is the
+/// robot owner builds it under its own lock and posts it to the journal's
+/// queue after that lock, within its arm step, so one robot's rows keep the
 /// commit order. `entry` absent: no End-effector TCP.
 struct ActiveTcpChangeDTO final {
   ControllableComponentId component_id;
@@ -149,12 +150,11 @@ struct ActiveTcpChangeDTO final {
   /// adapter sent it); false on Mock/Isaac, with the checkbox off, and while
   /// the controller could not take it (the next Enable re-syncs).
   bool offset_sent{};
-  /// Order of Active TCP values (with the Kernel owner epoch of the stream
-  /// that carries them): the robot runtime owner's registration generation
-  /// (new and greater at every install or restart within one Kernel owner
-  /// epoch) and its sequence after this change (from 0 at install, +1 per
-  /// change). Results, reads and events carry `{owner_epoch,
-  /// registration_generation, sequence}`; a reader keeps the greatest.
+  /// Order of Active TCP values within one application start: the robot
+  /// runtime owner's registration generation (new and greater at every
+  /// install or restart) and its sequence after this change (from 0 at
+  /// install, +1 per change). Results, reads and events carry
+  /// `{registration_generation, sequence}`; a reader keeps the greatest.
   std::uint64_t registration_generation{};
   std::uint64_t sequence{};
   std::int64_t occurred_at_ns{};

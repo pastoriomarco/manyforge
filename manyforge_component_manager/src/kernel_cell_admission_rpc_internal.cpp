@@ -1,3 +1,5 @@
+#include <manyforge_core/types/application_identity.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 
 #include "manager_liveness_rpc_internal.hpp"
@@ -13,7 +15,7 @@
 namespace manyforge::component_manager::detail {
 namespace core = manyforge::core;
 namespace {
-constexpr std::string_view kMagic = "MFCA2";
+constexpr std::string_view kMagic = "MFCA3";
 constexpr std::size_t kMaxEntries = core::kMaximumCellAdmissionClaims;
 
 [[noreturn]] void Fail(const char *message) {
@@ -111,6 +113,28 @@ template <class T> T Enum(Reader &r, std::uint64_t count) {
   }
   return static_cast<T>(value);
 }
+// An application role (contract 1.2): 1-16; 0 is invalid.
+void Role(Writer &w, const core::ApplicationRole role) { Enum(w, role); }
+core::ApplicationRole Role(Reader &r) {
+  const auto role = Enum<core::ApplicationRole>(r, 17U);
+  if (static_cast<std::uint8_t>(role) == 0U) Fail("unknown application role");
+  return role;
+}
+// A request key (contract 1.4) as its two big-endian halves.
+void Key(Writer &w, const core::RequestKey &key) {
+  w.U64(key.high());
+  w.U64(key.low());
+}
+core::RequestKey Key(Reader &r) {
+  const auto high = r.U64();
+  const auto low = r.U64();
+  core::RequestKey key;
+  for (std::size_t index = 0U; index < 8U; ++index) {
+    key.bytes[index] = static_cast<std::uint8_t>(high >> (56U - 8U * index));
+    key.bytes[8U + index] = static_cast<std::uint8_t>(low >> (56U - 8U * index));
+  }
+  return key;
+}
 template <class T> void Opt(Writer &w, const std::optional<T> &v, auto fn) {
   w.Bool(v.has_value());
   if (v)
@@ -154,13 +178,25 @@ core::CellAdmissionScopeDTO Scope(Reader &r) {
                 G<core::ActiveControlConfigurationGeneration>(r)};
           })};
 }
+// An optional owner transaction number, typed by the owner role on decode.
+void TransactionId(Writer &w, const std::optional<core::CellAdmissionOwnerTransactionId> &v) {
+  Opt(w, v, [](Writer &w, const auto &id) {
+    w.U64(core::CellAdmissionOwnerTransactionNumber(id));
+  });
+}
+std::optional<core::CellAdmissionOwnerTransactionId> TransactionId(Reader &r,
+                                                                   core::ApplicationRole role) {
+  return Opt<core::CellAdmissionOwnerTransactionId>(r, [role](Reader &r) {
+    const auto id = core::CellAdmissionOwnerTransactionIdFor(role, r.U64());
+    if (!id) Fail("owner role carries no transaction id");
+    return *id;
+  });
+}
 void Intent(Writer &w, const core::CellAdmissionClaimIntentDTO &x) {
   Enum(w, x.claim_kind);
-  Enum(w, x.owner_role);
-  S(w, x.owner_epoch);
-  w.String(x.owner_transaction_id);
-  S(w, x.request_id);
-  S(w, x.request_payload_digest);
+  Role(w, x.owner_role);
+  TransactionId(w, x.owner_transaction_id);
+  Key(w, x.request_key);
   G(w, x.expected_admission_generation);
   Scope(w, x.scope);
   Opt(w, x.program_cycle_evidence, [](Writer &w, const auto &v) {
@@ -168,30 +204,30 @@ void Intent(Writer &w, const core::CellAdmissionClaimIntentDTO &x) {
     S(w, v.applied_program_revision);
   });
   Opt(w, x.intervention_evidence, [](Writer &w, const auto &v) {
-    Enum(w, v.offering_owner_role);
-    S(w, v.offering_owner_epoch);
-    w.String(v.offer_transaction_id);
+    Role(w, v.offering_owner_role);
+    TransactionId(w, v.offer_transaction_id);
     S(w, v.offer_digest);
     Opt(w, v.parent_program_cycle_claim_generation,
         [](Writer &w, const auto &g) { G(w, g); });
   });
   Opt(w, x.program_node_evidence, [](Writer& w, const auto& v) {
-    S(w, v.program_runner_owner_epoch);
-    S(w, v.program_run_id);
+    G(w, v.program_run_id);
     G(w, v.parent_program_cycle_claim_generation);
     w.String(v.node_instance_id);
-    w.String(v.node_attempt_id);
+    G(w, v.node_attempt_id);
     w.String(v.owner_api);
   });
 }
 core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
+  const auto kind = Enum<core::CellAdmissionClaimKindDTO>(r, 8U);
+  const auto role = Role(r);
+  auto transaction_id = TransactionId(r, role);
+  const auto key = Key(r);
   core::CellAdmissionClaimIntentDTO x{
-      Enum<core::CellAdmissionClaimKindDTO>(r, 8U),
-      Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-      S<core::RequestOwnerEpoch>(r),
-      r.String(),
-      S<core::RequestId>(r),
-      S<core::ContentDigest>(r),
+      kind,
+      role,
+      std::move(transaction_id),
+      key,
       G<core::AdmissionGeneration>(r),
       Scope(r),
       std::nullopt,
@@ -203,9 +239,10 @@ core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
       });
   x.intervention_evidence =
       Opt<core::CellAdmissionInterventionEvidenceDTO>(r, [](Reader &r) {
+        const auto offering_role = Role(r);
+        auto offer_transaction_id = TransactionId(r, offering_role);
         return core::CellAdmissionInterventionEvidenceDTO{
-            Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-            S<core::RequestOwnerEpoch>(r), r.String(),
+            offering_role, std::move(offer_transaction_id),
             S<core::ContentDigest>(r),
             Opt<core::CellAdmissionClaimGeneration>(r, [](Reader &r) {
               return G<core::CellAdmissionClaimGeneration>(r);
@@ -213,8 +250,8 @@ core::CellAdmissionClaimIntentDTO Intent(Reader &r) {
       });
   x.program_node_evidence = Opt<core::ProgramNodeAdmissionEvidenceDTO>(r, [](Reader& r) {
     return core::ProgramNodeAdmissionEvidenceDTO{
-        S<core::RequestOwnerEpoch>(r), S<core::ProgramRunId>(r),
-        G<core::CellAdmissionClaimGeneration>(r), r.String(), r.String(), r.String()};
+        G<core::ProgramRunNumber>(r), G<core::CellAdmissionClaimGeneration>(r), r.String(),
+        G<core::NodeAttemptNumber>(r), r.String()};
   });
   return x;
 }
@@ -229,38 +266,61 @@ core::CellAdmissionClaimDTO Claim(Reader &r) {
           G<core::AdmissionGeneration>(r), r.I64()};
 }
 void Release(Writer &w, const core::CellAdmissionClaimReleaseDTO &x) {
-  Enum(w, x.owner_role);
-  S(w, x.owner_epoch);
-  w.String(x.owner_transaction_id);
-  S(w, x.request_id);
-  S(w, x.request_payload_digest);
+  Role(w, x.owner_role);
+  TransactionId(w, x.owner_transaction_id);
+  Key(w, x.request_key);
   G(w, x.acquired_admission_generation);
   G(w, x.claim_generation);
   Enum(w, x.settlement.settlement_kind);
   S(w, x.settlement.evidence_digest);
 }
 core::CellAdmissionClaimReleaseDTO Release(Reader &r) {
-  return {Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-          S<core::RequestOwnerEpoch>(r),
-          r.String(),
-          S<core::RequestId>(r),
-          S<core::ContentDigest>(r),
-          G<core::AdmissionGeneration>(r),
-          G<core::CellAdmissionClaimGeneration>(r),
-          {Enum<core::CellAdmissionSettlementKindDTO>(r, 5U),
-           S<core::ContentDigest>(r)}};
+  const auto role = Role(r);
+  auto transaction_id = TransactionId(r, role);
+  const auto key = Key(r);
+  const auto acquired = G<core::AdmissionGeneration>(r);
+  const auto generation = G<core::CellAdmissionClaimGeneration>(r);
+  const auto kind = Enum<core::CellAdmissionSettlementKindDTO>(r, 4U);
+  return {role, std::move(transaction_id), key, acquired, generation,
+          {kind, S<core::ContentDigest>(r)}};
+}
+// The Manager-Apply facts beside an acquire or a release: a presence byte,
+// then the candidate bundle or the Apply's outcome.
+void AcquireFacts(Writer &w, const core::RetainedBundleId *candidate) {
+  w.Bool(candidate != nullptr);
+  if (candidate) S(w, *candidate);
+}
+std::optional<core::RetainedBundleId> AcquireFacts(Reader &r) {
+  auto candidate = Opt<core::RetainedBundleId>(
+      r, [](Reader &r) { return S<core::RetainedBundleId>(r); });
+  if (candidate && candidate->empty()) Fail("empty Manager-Apply candidate bundle");
+  return candidate;
+}
+void ReleaseFacts(Writer &w, const core::ManagerApplyReleaseOutcomeDTO *outcome) {
+  w.Bool(outcome != nullptr);
+  if (!outcome) return;
+  G(w, outcome->apply_id);
+  G(w, outcome->apply_generation);
+  w.Bool(outcome->succeeded);
+}
+std::optional<core::ManagerApplyReleaseOutcomeDTO> ReleaseFacts(Reader &r) {
+  auto outcome = Opt<core::ManagerApplyReleaseOutcomeDTO>(r, [](Reader &r) {
+    return core::ManagerApplyReleaseOutcomeDTO{
+        G<core::ApplyId>(r), G<core::ApplyGeneration>(r), r.Bool()};
+  });
+  if (outcome && (!outcome->apply_id.nonzero() || !outcome->apply_generation.nonzero()))
+    Fail("invalid Manager-Apply release outcome");
+  return outcome;
 }
 void ProgramCycle(Writer &w, const core::ProgramCycleStatusDTO &x) {
-  S(w, x.program_runner_owner_epoch);
   w.U64(x.cycle_generation);
   Enum(w, x.state);
-  Opt(w, x.program_run_id, [](Writer &w, const auto &v) { S(w, v); });
+  Opt(w, x.program_run_id, [](Writer &w, const auto &v) { G(w, v); });
   Opt(w, x.cycle_claim_generation, [](Writer &w, const auto &v) { G(w, v); });
   Opt(w, x.terminal_or_settlement_reference,
       [](Writer &w, const auto &v) { S(w, v); });
   Opt(w, x.accepted_reset, [](Writer &w, const auto &reset) {
-    S(w, reset.request_owner_epoch);
-    S(w, reset.request_id);
+    Key(w, reset.request_key);
     S(w, reset.request_payload_digest);
     w.Bool(reset.reload_initial_scene);
     w.Bool(reset.reset_robot_position);
@@ -271,11 +331,10 @@ void ProgramCycle(Writer &w, const core::ProgramCycleStatusDTO &x) {
 
 core::ProgramCycleStatusDTO ProgramCycle(Reader &r) {
   return core::ProgramCycleStatusDTO{
-      S<core::RequestOwnerEpoch>(r),
       r.U64(),
       Enum<core::ProgramCycleStateDTO>(r, 8U),
-      Opt<core::ProgramRunId>(
-          r, [](Reader &r) { return S<core::ProgramRunId>(r); }),
+      Opt<core::ProgramRunNumber>(
+          r, [](Reader &r) { return G<core::ProgramRunNumber>(r); }),
       Opt<core::CellAdmissionClaimGeneration>(
           r,
           [](Reader &r) { return G<core::CellAdmissionClaimGeneration>(r); }),
@@ -283,8 +342,7 @@ core::ProgramCycleStatusDTO ProgramCycle(Reader &r) {
           r, [](Reader &r) { return S<core::ContentDigest>(r); }),
       Opt<core::AcceptedProgramResetDTO>(r, [](Reader &r) {
         return core::AcceptedProgramResetDTO{
-            S<core::RequestOwnerEpoch>(r),
-            S<core::RequestId>(r),
+            Key(r),
             S<core::ContentDigest>(r),
             r.Bool(),
             r.Bool(),
@@ -311,8 +369,6 @@ void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
     if (!core::ValidateProgramRunnerContactLoss(loss).ok())
       Fail("invalid Program Runner contact loss");
     w.Bool(true);
-    S(w, loss.manager_owner_epoch);
-    S(w, loss.manager_runtime_epoch);
     ProgramCycle(w, loss.established_cycle);
     w.String(loss.failure_predicate);
     w.String(loss.message);
@@ -335,9 +391,7 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
   if (r.HasRemaining()) {
     if (!r.Bool())
       Fail("Program Runner loss extension must be present or omitted");
-    core::ProgramRunnerContactLossDTO loss{
-        S<core::RequestOwnerEpoch>(r), S<core::RuntimeEpoch>(r),
-        ProgramCycle(r), r.String(), r.String()};
+    core::ProgramRunnerContactLossDTO loss{ProgramCycle(r), r.String(), r.String()};
     if (!core::ValidateProgramRunnerContactLoss(loss).ok())
       Fail("invalid Program Runner contact loss");
     x.program_runner_loss = std::move(loss);
@@ -353,60 +407,6 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
   return x;
 }
 
-void Reconcile(Writer &w, const core::CellAdmissionReconcileDTO &x) {
-  S(w, x.kernel_owner_epoch);
-  Vec(w, x.retained_claims, [](Writer &w, const auto &v) { Claim(w, v); });
-  Vec(w, x.current_owner_epochs, [](Writer &w, const auto &v) {
-    Enum(w, v.owner_role);
-    S(w, v.owner_epoch);
-  });
-  S(w, x.reconciliation_evidence_digest);
-}
-
-core::CellAdmissionReconcileDTO Reconcile(Reader &r) {
-  auto result = core::CellAdmissionReconcileDTO{
-      S<core::RequestOwnerEpoch>(r),
-      Vec<core::CellAdmissionClaimDTO>(r, [](Reader &r) { return Claim(r); }),
-      Vec<core::CellAdmissionCurrentOwnerEpochDTO>(
-          r,
-          [](Reader &r) {
-            return core::CellAdmissionCurrentOwnerEpochDTO{
-                Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-                S<core::RequestOwnerEpoch>(r)};
-          }),
-      S<core::ContentDigest>(r)};
-  for (const auto &claim : result.retained_claims) {
-    if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
-        claim.claim_generation.value() == 0U ||
-        claim.acquired_admission_generation.value() == 0U) {
-      Fail("invalid retained claim");
-    }
-  }
-  return result;
-}
-
-void OwnerEpoch(Writer &w, const core::CellAdmissionCurrentOwnerEpochDTO &x) {
-  Enum(w, x.owner_role);
-  S(w, x.owner_epoch);
-}
-core::CellAdmissionCurrentOwnerEpochDTO OwnerEpoch(Reader &r) {
-  return {Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-          S<core::RequestOwnerEpoch>(r)};
-}
-void ReconcileSettlement(
-    Writer &w, const core::CellAdmissionReconcileSettlementDTO &x) {
-  Claim(w, x.predecessor_claim);
-  Enum(w, x.successor_owner_role);
-  S(w, x.successor_owner_epoch);
-  Enum(w, x.settlement_predicate);
-  S(w, x.reconciliation_evidence_digest);
-}
-core::CellAdmissionReconcileSettlementDTO ReconcileSettlement(Reader &r) {
-  return {Claim(r), Enum<core::CellAdmissionOwnerRoleDTO>(r, 7U),
-          S<core::RequestOwnerEpoch>(r),
-          Enum<core::CellAdmissionSettlementKindDTO>(r, 5U),
-          S<core::ContentDigest>(r)};
-}
 void RecoveryQuery(Writer &w,
                    const core::CellAdmissionRecoveryReceiptQueryDTO &x) {
   Intent(w, x.intent);
@@ -428,29 +428,30 @@ core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(Reader &r) {
 }
 void ProgramResetSceneAuthorization(
     Writer &w, const core::ProgramResetSceneAuthorizationDTO &x) {
-  S(w, x.program_runner_owner_epoch);
-  S(w, x.program_run_id);
+  G(w, x.program_run_id);
   G(w, x.cycle_claim_generation);
   S(w, x.terminal_or_settlement_reference);
   Opt(w, x.reset_claim, [](Writer& w, const auto& reset) {
     w.U64(reset.cycle_generation);
-    S(w, reset.request_owner_epoch);
-    S(w, reset.request_id);
+    Key(w, reset.request_key);
     S(w, reset.request_payload_digest);
     G(w, reset.reset_claim_generation);
   });
+  // The Program runner's current cycle status (OD-139), last.
+  ProgramCycle(w, x.program_cycle_status);
 }
 core::ProgramResetSceneAuthorizationDTO
 ProgramResetSceneAuthorization(Reader &r) {
   auto result = core::ProgramResetSceneAuthorizationDTO{
-      S<core::RequestOwnerEpoch>(r), S<core::ProgramRunId>(r),
+      G<core::ProgramRunNumber>(r),
       G<core::CellAdmissionClaimGeneration>(r),
       S<core::ContentDigest>(r),
       Opt<core::ProgramResetClaimSceneAuthorizationDTO>(r, [](Reader& r) {
         return core::ProgramResetClaimSceneAuthorizationDTO{
-            r.U64(), S<core::RequestOwnerEpoch>(r), S<core::RequestId>(r),
-            S<core::ContentDigest>(r), G<core::CellAdmissionClaimGeneration>(r)};
-      })};
+            r.U64(), Key(r), S<core::ContentDigest>(r),
+            G<core::CellAdmissionClaimGeneration>(r)};
+      }),
+      ProgramCycle(r)};
   if (!core::ValidateProgramResetSceneAuthorization(result).ok())
     Fail("invalid Program Reset scene authorization");
   return result;
@@ -460,34 +461,24 @@ void RecoveryReceipt(Writer &w,
   if (!core::ValidateCellAdmissionRecoveryReceipt(x).ok())
     Fail("invalid recovery receipt");
   Enum(w, x.status);
-  S(w, x.kernel_owner_epoch);
   G(w, x.admission_generation);
   Opt(w, x.matched_claim,
       [](Writer &w, const auto &v) { Claim(w, v); });
   Opt(w, x.matched_release,
       [](Writer &w, const auto &v) { Release(w, v); });
-  Opt(w, x.matched_reconcile_settlement,
-      [](Writer &w, const auto &v) { ReconcileSettlement(w, v); });
   Vec(w, x.held_claims,
       [](Writer &w, const auto &v) { Claim(w, v); });
-  Vec(w, x.current_owner_epochs,
-      [](Writer &w, const auto &v) { OwnerEpoch(w, v); });
 }
 core::CellAdmissionRecoveryReceiptDTO RecoveryReceipt(Reader &r) {
   auto result = core::CellAdmissionRecoveryReceiptDTO{
-      Enum<core::CellAdmissionRecoveryReceiptStatusDTO>(r, 5U),
-      S<core::RequestOwnerEpoch>(r),
+      Enum<core::CellAdmissionRecoveryReceiptStatusDTO>(r, 4U),
       G<core::AdmissionGeneration>(r),
       Opt<core::CellAdmissionClaimDTO>(
           r, [](Reader &r) { return Claim(r); }),
       Opt<core::CellAdmissionClaimReleaseDTO>(
           r, [](Reader &r) { return Release(r); }),
-      Opt<core::CellAdmissionReconcileSettlementDTO>(
-          r, [](Reader &r) { return ReconcileSettlement(r); }),
       Vec<core::CellAdmissionClaimDTO>(
-          r, [](Reader &r) { return Claim(r); }),
-      Vec<core::CellAdmissionCurrentOwnerEpochDTO>(
-          r, [](Reader &r) { return OwnerEpoch(r); })};
+          r, [](Reader &r) { return Claim(r); })};
   if (!core::ValidateCellAdmissionRecoveryReceipt(result).ok())
     Fail("invalid recovery receipt");
   return result;
@@ -523,15 +514,21 @@ DispatchKernelCellAdmissionRpc(core::IKernelCellAdmissionPort &kernel,
     return published.ok() ? KernelCellAdmissionRpcResponse{std::monostate{}}
                           : KernelCellAdmissionRpcResponse{published.error()};
   }
-  if (request.command == "cell_admission_acquire")
+  if (request.command == "cell_admission_acquire") {
+    if (const auto *reset = std::get_if<ProgramResetClaimAcquireRequest>(&request.request))
+      return adopt(kernel.AcquireProgramResetClaim(reset->intent, reset->program_cycle_status));
+    if (const auto *apply = std::get_if<ManagerApplyClaimAcquireRequest>(&request.request))
+      return adopt(kernel.AcquireManagerApplyClaim(apply->intent,
+                                                   apply->candidate_retained_bundle_id));
     return adopt(kernel.AcquireCellAdmissionClaim(
         std::get<core::CellAdmissionClaimIntentDTO>(request.request)));
-  if (request.command == "cell_admission_release")
+  }
+  if (request.command == "cell_admission_release") {
+    if (const auto *apply = std::get_if<ManagerApplyClaimReleaseRequest>(&request.request))
+      return adopt(kernel.ReleaseManagerApplyClaim(apply->release, apply->outcome));
     return adopt(kernel.ReleaseCellAdmissionClaim(
         std::get<core::CellAdmissionClaimReleaseDTO>(request.request)));
-  if (request.command == "cell_admission_reconcile")
-    return adopt(kernel.ReconcileCellAdmissionClaims(
-        std::get<core::CellAdmissionReconcileDTO>(request.request)));
+  }
   if (request.command == "cell_admission_recovery_receipt")
     return adopt(kernel.GetCellAdmissionRecoveryReceipt(
         std::get<core::CellAdmissionRecoveryReceiptQueryDTO>(
@@ -554,12 +551,11 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
   const bool liveness = x.command == "cell_admission_publish_liveness";
   const bool acquire = x.command == "cell_admission_acquire";
   const bool release = x.command == "cell_admission_release";
-  const bool reconcile = x.command == "cell_admission_reconcile";
   const bool recovery_receipt =
       x.command == "cell_admission_recovery_receipt";
   const bool program_reset_scene =
       x.command == "cell_admission_validate_program_reset_scene";
-  if (!get && !readiness && !liveness && !acquire && !release && !reconcile &&
+  if (!get && !readiness && !liveness && !acquire && !release &&
       !recovery_receipt && !program_reset_scene)
     Fail("unknown cell-admission command");
   if ((get && !std::holds_alternative<std::monostate>(x.request)) ||
@@ -570,12 +566,12 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
        !std::holds_alternative<core::ManagerLivenessObservationDTO>(
            x.request)) ||
       (acquire &&
-       !std::holds_alternative<core::CellAdmissionClaimIntentDTO>(x.request)) ||
+       !std::holds_alternative<core::CellAdmissionClaimIntentDTO>(x.request) &&
+       !std::holds_alternative<ManagerApplyClaimAcquireRequest>(x.request)) ||
       (release &&
        !std::holds_alternative<core::CellAdmissionClaimReleaseDTO>(
-           x.request)) ||
-      (reconcile &&
-       !std::holds_alternative<core::CellAdmissionReconcileDTO>(x.request)) ||
+           x.request) &&
+       !std::holds_alternative<ManagerApplyClaimReleaseRequest>(x.request)) ||
       (recovery_receipt &&
        !std::holds_alternative<
            core::CellAdmissionRecoveryReceiptQueryDTO>(x.request)) ||
@@ -597,20 +593,27 @@ EncodeKernelCellAdmissionRpcRequest(const KernelCellAdmissionRpcPacket &x) {
               std::is_same_v<T, core::ManagerLivenessObservationDTO>)
             w.String(EncodeManagerLivenessRpcResponse(v));
           else if constexpr (std::is_same_v<T,
-                                            core::CellAdmissionClaimIntentDTO>)
+                                            core::CellAdmissionClaimIntentDTO>) {
             Intent(w, v);
-          else if constexpr (std::is_same_v<T,
-                                            core::CellAdmissionClaimReleaseDTO>)
+            AcquireFacts(w, nullptr);
+          } else if constexpr (std::is_same_v<T, ManagerApplyClaimAcquireRequest>) {
+            Intent(w, v.intent);
+            AcquireFacts(w, &v.candidate_retained_bundle_id);
+          } else if constexpr (std::is_same_v<T,
+                                              core::CellAdmissionClaimReleaseDTO>) {
             Release(w, v);
-          else if constexpr (std::is_same_v<
-                                 T, core::CellAdmissionReconcileDTO>)
-            Reconcile(w, v);
-          else if constexpr (std::is_same_v<
+            ReleaseFacts(w, nullptr);
+          } else if constexpr (std::is_same_v<T, ManagerApplyClaimReleaseRequest>) {
+            Release(w, v.release);
+            ReleaseFacts(w, &v.outcome);
+          } else if constexpr (std::is_same_v<
                                  T, core::ProgramResetSceneAuthorizationDTO>)
             ProgramResetSceneAuthorization(w, v);
           else if constexpr (std::is_same_v<
                                  T, core::OperatorAlarmAttentionSnapshotDTO>)
             Fail("operator-alarm attention is not a Manager-channel command");
+          else if constexpr (std::is_same_v<T, ProgramResetClaimAcquireRequest>)
+            Fail("Program Reset claim acquisition is not a Manager-channel command");
           else
             RecoveryQuery(w, v);
         }
@@ -633,15 +636,22 @@ DecodeKernelCellAdmissionRpcRequest(std::string_view b) {
     auto v = Intent(r);
     if (!core::ValidateCellAdmissionClaimIntent(v).ok())
       Fail("invalid claim intent");
-    x = std::move(v);
+    if (auto candidate = AcquireFacts(r)) {
+      if (v.claim_kind != core::CellAdmissionClaimKindDTO::kManagerApply)
+        Fail("only a Manager-Apply claim carries a candidate bundle");
+      x = ManagerApplyClaimAcquireRequest{std::move(v), std::move(*candidate)};
+    } else {
+      x = std::move(v);
+    }
   } else if (command == "cell_admission_release") {
     auto v = Release(r);
     if (!core::ValidateCellAdmissionClaimRelease(v).ok())
       Fail("invalid claim release");
-    x = std::move(v);
-  } else if (command == "cell_admission_reconcile")
-    x = Reconcile(r);
-  else if (command == "cell_admission_recovery_receipt")
+    if (auto outcome = ReleaseFacts(r))
+      x = ManagerApplyClaimReleaseRequest{std::move(v), *outcome};
+    else
+      x = std::move(v);
+  } else if (command == "cell_admission_recovery_receipt")
     x = RecoveryQuery(r);
   else if (command == "cell_admission_validate_program_reset_scene")
     x = ProgramResetSceneAuthorization(r);
@@ -658,7 +668,6 @@ EncodeKernelCellAdmissionRpcResponse(std::string_view command,
       command != "cell_admission_publish_liveness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
-      command != "cell_admission_reconcile" &&
       command != "cell_admission_recovery_receipt" &&
       command != "cell_admission_validate_program_reset_scene")
     Fail("unknown response command");
@@ -732,7 +741,6 @@ DecodeKernelCellAdmissionRpcResponse(std::string_view b) {
       command != "cell_admission_publish_liveness" &&
       command != "cell_admission_acquire" &&
       command != "cell_admission_release" &&
-      command != "cell_admission_reconcile" &&
       command != "cell_admission_recovery_receipt" &&
       command != "cell_admission_validate_program_reset_scene")
     Fail("unknown response command");

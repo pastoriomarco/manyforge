@@ -33,11 +33,11 @@ inline constexpr std::string_view kHeadlessApiMutationResponseSchemaVersion =
 inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
-    "manyforge.applied_program_selection.v4";
+    "manyforge.applied_program_selection.v5";
 inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
     "manyforge.applied_program_status.v2";
 inline constexpr std::string_view kCommittedScenarioActivationSchemaVersion =
-    "manyforge.committed_scenario_activation.v4";
+    "manyforge.committed_scenario_activation.v5";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -47,6 +47,9 @@ inline constexpr std::size_t kMaximumViewerModelResourceUriBytes = 4096U;
 /// runtime-fault snapshot. Per-field owner contracts remain independently checked.
 inline constexpr std::size_t kMaximumRuntimeFaultSnapshotBytes =
     manyforge::core::kMaximumCellAdmissionJsonResponseBytes;
+/// The event stream's frame bound (`execution_event_stream.v4`) also bounds
+/// the operations table it carries.
+inline constexpr std::size_t kMaximumOperationTableBytes = 4U * 1024U * 1024U;
 inline constexpr std::string_view kAlarmSourceRefreshSchemaVersion =
     "manyforge.alarm_source_refresh.v1";
 /// Alarm-source currency. Source health, the scene adapter and
@@ -159,16 +162,19 @@ private:
 };
 
 struct HeadlessApiCoreConfig final {
-  std::filesystem::path projection_root;
   std::filesystem::path install_root;
   std::filesystem::path artifact_root;
   std::filesystem::path node_catalog_path;
   std::filesystem::path node_environment_manifest_path;
   std::filesystem::path alarm_catalog_path;
-  std::filesystem::path historian_database_path;
+  /// Directory holding the History store (``history.v<N>.sqlite3``).
+  std::filesystem::path historian_directory;
   std::string cell_id;
+  /// Headless's role text (``headless``); the base of its sub-role ids
+  /// until P-1 maps each of them to a role.
   std::string owner_id;
-  std::string owner_epoch;
+  /// ``A``: 16 lowercase hex characters, handed over at launch.
+  std::string application_start_id;
   RuntimeSnapshotFreshnessPolicy freshness_policy;
   std::size_t historian_queue_capacity{kDefaultHistorianQueueCapacity};
   std::size_t historian_record_retention{kDefaultHistorianRecordRetention};
@@ -234,7 +240,7 @@ public:
       AlarmSnapshotOrdering ordering = AlarmSnapshotOrdering::kDefault);
   [[nodiscard]] manyforge::content_identity::CanonicalValue AlarmMetrics();
   /// The generation-fenced motion-attention projection the native Kernel
-  /// evaluates at admission (`manyforge.operator_alarm_motion_attention.v3`).
+  /// evaluates at admission (`manyforge.operator_alarm_motion_attention.v4`).
   /// Reads the alarm owner's published projection without the core
   /// coordination lock and without refreshing sources; its currency is
   /// bounded by `kAlarmSourceCurrencyBoundNs` instead.
@@ -246,6 +252,19 @@ public:
   /// lock. Reports whether it refreshed and the current refresh time.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RefreshAlarmSources();
+  /// OD-216: applies one frame of the Manager's status stream to the one
+  /// mirror (the stream's follower thread only; no core lock). Returns
+  /// `{control_changed, tick_advanced, viewer_changed}`; throws `ManagerStatusStreamError` for an
+  /// `error` or invalid frame.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ApplyManagerStatusFrame(std::string_view frame);
+  /// The status subscription ended: the Manager is not answering at once.
+  /// Returns true when it was connected.
+  bool MarkManagerStatusDisconnected();
+  /// The viewer's scene-runtime payload and pose sessions while the Manager
+  /// answers (no core lock).
+  [[nodiscard]] std::optional<std::pair<std::string, std::string>>
+  ViewerPoseSources() const;
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AcknowledgeAlarm(std::string condition_id, std::string activation_id,
                    std::uint64_t expected_record_revision,
@@ -262,7 +281,8 @@ public:
   HistoryQueryPage(const HistorianQuery &query, bool full_records = false);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryDiscovery(const std::string &kind, const std::string &after,
-                   std::size_t limit);
+                   std::size_t limit,
+                   const std::optional<std::string> &application_start_id = std::nullopt);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryCapturePage(std::optional<std::uint64_t> before_capture_id,
                      std::size_t limit);
@@ -270,7 +290,8 @@ public:
   HistoryDetail(std::uint64_t sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordClientIncident(std::string incident_id, std::string incident_kind,
-                       std::string phase, std::string control_session_id,
+                       std::string phase,
+                       std::optional<std::uint64_t> control_session_number,
                        std::string client_incarnation, std::string source_label,
                        std::string reason_code, std::uint64_t occurrence_count,
                        std::optional<std::uint64_t> maximum_delay_ns,
@@ -286,9 +307,6 @@ public:
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ObserveWorkbenchPreviousSessionReport(manyforge::content_identity::CanonicalValue report);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  ReconcileHistorianHealth(std::uint64_t expected_health_generation,
-                           AlarmCallerAttribution caller);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
@@ -299,25 +317,51 @@ public:
   RecordActivity(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   IngestOperationEvent(
-      std::string source_owner_epoch, std::uint64_t source_sequence,
-      std::string record_kind, std::optional<std::string> request_id,
-      std::optional<std::string> operation_id,
+      std::uint64_t source_sequence,
+      std::string record_kind, std::optional<std::string> request_key,
+      std::optional<std::uint64_t> operation_id,
       std::optional<std::uint64_t> operation_revision,
       std::int64_t occurred_at_ns, std::string occurred_at_wall,
-      bool effect_pending,
       manyforge::content_identity::CanonicalValue journal_payload,
       std::string payload_digest);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  CompleteOperationEventSnapshot(
-      std::string source_owner_epoch, std::uint64_t through_source_sequence);
+  CompleteOperationEventSnapshot(std::uint64_t through_source_sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  MarkOperationEventSourceUnknown(std::string source_owner_epoch);
-  /// Observe two bounded current native-owner fault facts. First occurrences
-  /// remain active for this Workbench lifetime, including across reconnects.
+  MarkOperationEventSourceUnknown();
+  /// OD-205 (b): the operation alarms (motion fault, runtime collision,
+  /// lost measured state) are raised and cleared from the event stream's
+  /// `operations` table, read from Kernel memory (level reading). Returns
+  /// `{changed}`. A table that lists fewer entries than it counts, or an
+  /// entry without its alarm facts, keeps the present alarms and marks the
+  /// operation source not fully read (quality unknown).
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveOperationTable(manyforge::content_identity::CanonicalValue operations);
+  /// Observe the bounded current native-owner fault facts. A Runner loss
+  /// clears when its fact ends; the others remain active for this Workbench
+  /// lifetime, including across reconnects.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ObserveRuntimeFaultConditions(
-      std::string source_owner_epoch,
       manyforge::content_identity::CanonicalValue current_runtime_faults);
+  /// OD-247/OD-248: the operator alarm for component faults. `faults` is
+  /// the list of the components whose published state shows a fault (the
+  /// simulators left out), each `{component_id, fault}`. One alarm per
+  /// component, raised on its fault and returned to normal when the fault
+  /// ends; a changed code while the fault lasts returns the earlier
+  /// occurrence and raises a new one. Submits on edges only; returns
+  /// `{changed}`.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveComponentFaults(manyforge::content_identity::CanonicalValue faults);
+  /// OD-215, for the disk check's own thread: History's "queue full" level
+  /// and whether its loss episode's cause is a full disk
+  /// (`{queue_full, storage_full}`). Deliberately outside the core lock: it
+  /// takes only History's writer lock, which is never held across a write.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue HistoryDiskSignals();
+  /// OD-215: raise (`active`, with the details fixed at entry) or clear the
+  /// cell's `manyforge.runtime.disk_cannot_keep_records` alarm. Memory work
+  /// under the core lock; an unchanged condition is not resubmitted.
+  /// Returns `{changed}`.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  ObserveDiskRecordsCondition(manyforge::content_identity::CanonicalValue condition);
   /// Internal accepted Program source; absence/owner replacement never clears an occurrence.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ObserveProgramFailureCondition(manyforge::content_identity::CanonicalValue condition);
@@ -363,30 +407,21 @@ private:
   void
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
-  void RegisterOperationEpochLocked(std::string source_owner_epoch);
+  void RegisterOperationSourceLocked();
   /// Call-local facts parsed once from one immutable committed capture.
   struct ParsedOperationFacts final {
     bool captured_origin{};
     bool terminal_facts_present{};
     bool preemption_present{};
-    bool captured_failure_effects_known{};
   };
   [[nodiscard]] static ParsedOperationFacts
   ParseOperationFacts(const manyforge::content_identity::CanonicalValue &state,
                       const manyforge::content_identity::CanonicalValue *intent,
                       bool captured_origin_allowed, bool terminal_facts_allowed,
                       bool preemption_allowed);
-  void ReconcileRuntimeCollisionStopLocked(
-      const manyforge::content_identity::CanonicalValue &journal_payload,
-      std::uint64_t native_sequence,
-      std::string_view payload_digest, std::int64_t occurred_at_ns,
-      std::string_view occurred_at_wall, std::string_view raw_event_id);
-  void ReconcileOperationFaultLocked(
-      const manyforge::content_identity::CanonicalValue &journal_payload,
-      const ParsedOperationFacts &facts, std::string_view record_kind,
-      std::string_view request_id, std::uint64_t native_sequence,
-      std::string_view payload_digest, std::int64_t occurred_at_ns,
-      std::string_view occurred_at_wall, std::string_view raw_event_id);
+  /// One listed entry of the operations table: the three alarms by level.
+  void ReconcileOperationTableEntryLocked(
+      const manyforge::content_identity::CanonicalValue &entry);
   /// Which adapter-local record an admitted operation condition updates.
   enum class OperationConditionKind {
     kExecutionFault,
@@ -417,6 +452,13 @@ private:
                                              const AlarmConditionUpdate &update);
   void ForgetRefusedOperationConditionLocked(std::string_view definition_id,
                                              std::string_view tracking_id);
+  /// One operation condition update from the operations table, at the
+  /// observation time; a clear returns the adapter-local record.
+  void SubmitOperationTableConditionLocked(
+      std::string definition_id, AlarmSubject subject, bool active,
+      manyforge::content_identity::CanonicalValue details,
+      manyforge::content_identity::CanonicalValue correlations,
+      OperationConditionKind kind, const std::string &operation_id);
   void ReconsiderRefusedOperationConditionsLocked();
   /// Hold the cell-scoped alarm-scope condition active exactly while at least
   /// one refused operation condition is retained, naming each of them. Called
@@ -431,7 +473,10 @@ private:
       manyforge::content_identity::CanonicalValue correlations);
   [[nodiscard]] std::vector<std::string>
   DeliverFactsLocked(const std::vector<AlarmLifecycleFact> &facts);
-  void SynchronizeHistorianHealthLocked();
+  /// Hold the cell-scoped "History is missing records" alarm active exactly
+  /// while History is in a loss episode. It gates nothing and needs no
+  /// acknowledgement; unchanged state is not resubmitted.
+  void SynchronizeHistoryLossAlarmLocked();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MutationResponse(const AlarmMutation &mutation,
                    const std::vector<std::string> &audit_event_ids);
@@ -465,6 +510,7 @@ private:
       assistant_mode_projection_cache_;
   std::shared_ptr<SqliteEventHistoryStore> history_store_;
   AsyncEventHistorian historian_;
+  ManagerStatusMirror manager_status_;
   RuntimeSnapshotAggregator runtime_aggregator_;
   AlarmLifecycleOwner alarm_owner_;
   /// (retained bundle, graph revision) whose resources the alarm owner
@@ -474,6 +520,10 @@ private:
   AdapterCursor runtime_health_adapter_;
   AdapterCursor runtime_fault_adapter_;
   std::set<std::string> active_runtime_fault_kinds_;
+  /// Component-fault alarm source, registered at the first fault.
+  AdapterCursor component_fault_adapter_;
+  /// The fault code currently alarmed, per component id.
+  std::map<std::string, std::string> active_component_faults_;
   bool runtime_health_baseline_observed_{};
   AdapterCursor scene_adapter_;
   /// Scene-domain alarm source: `scene.carried_object_lost` events.
@@ -484,21 +534,27 @@ private:
   AdapterCursor program_failure_adapter_;
   std::uint64_t program_failure_control_revision_{};
   std::uint64_t program_failure_run_revision_{};
-  std::string program_failure_run_id_;
+  std::uint64_t program_failure_run_id_{}; // 0: none
   AdapterCursor alarm_scope_adapter_;
   AdapterCursor workbench_session_adapter_;
+  AdapterCursor history_loss_adapter_;
+  /// OD-215: "the disk cannot keep ManyForge's records", raised and cleared
+  /// by the Headless disk check.
+  AdapterCursor disk_records_adapter_;
   std::optional<std::string> workbench_previous_session_id_;
   std::uint64_t operation_native_sequence_{};
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;
-  std::set<std::string> observed_operation_faults_;
+  /// The last observed operations-table entry per listed operation (its
+  /// canonical JSON): an unchanged entry is not re-evaluated. At most the
+  /// table's listed entries.
+  std::map<std::string, std::string> observed_operation_table_entries_;
   /// A runtime-monitor Stop alarm: a collision, or lost measured robot state.
   struct RuntimeMonitorStopCondition final {
     std::string definition_id;
     AlarmSubject subject;
   };
   std::map<std::string, RuntimeMonitorStopCondition> active_runtime_collisions_;
-  std::set<std::string> observed_runtime_collisions_;
   mutable std::mutex mutex_;
   std::uint64_t node_environment_generation_{};
   std::string previous_node_environment_digest_;
@@ -511,7 +567,6 @@ private:
 };
 
 [[nodiscard]] HeadlessApiCoreClocks ProductionHeadlessApiClocks();
-[[nodiscard]] std::string MintHeadlessOwnerEpoch(std::string_view prefix);
 /// The Applied Program selection's `assistant_projection.ai_models`: every AI
 /// model component row of `graph` (`controllable_component_id`, `base_url`,
 /// `model`, `api_key_env` or null) in retained (id) order; empty when none.

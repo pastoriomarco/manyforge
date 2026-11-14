@@ -160,10 +160,6 @@ public:
       const core::ProjectionRevisionDTO &expected,
       const core::ProjectionExecutionHostBindingDTO &binding) const;
 
-  [[nodiscard]] bool
-  AllRequiredProjectionsHealthy(const deployment::RetainedBundle &bundle,
-                                const core::ProjectionRevisionDTO &expected) const;
-
   void InstallActiveFrameResolverSet(
       const deployment::RetainedBundle &bundle,
       const core::ProjectionRevisionDTO &expected,

@@ -32,7 +32,6 @@ from pathlib import Path
 import sys
 import tempfile
 from types import ModuleType
-import uuid
 from typing import Any, Callable, Iterator
 
 import pytest
@@ -62,7 +61,8 @@ def _test_module(relative: str, name: str) -> ModuleType:
 
 # --- Stable placeholders ---------------------------------------------------
 
-_MONOTONIC_KEYS = frozenset({"generated_at_ns"})
+# Per-run times; the command rows' wall-clock times (OD-214) alike.
+_MONOTONIC_KEYS = frozenset({"generated_at_ns", "accepted_at_ns", "finished_at_ns"})
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -101,8 +101,8 @@ def _stabilize(value: Any) -> Any:
 
 # --- Program cycle with held failures ---------------------------------------
 
-_RUNNER_EPOCH = "program-runner.epoch.1"
-_RUN_ID = "program-cycle.1"
+# The run number: the cycle generation of the first Run (contract 1.5).
+_RUN_ID = 1
 
 
 def _held_owner(behavior: ModuleType):
@@ -170,23 +170,14 @@ def _started_runner() -> Iterator[tuple[Any, ModuleType]]:
             lambda *_args, **_kwargs: runner._PreparedRunAdmission(),
         )
         runner._bypass_scene_preparation(patch)
-        # Node attempt ids are random per attempt; number them instead.
-        attempts = iter(range(1, 1_000))
-        patch.setattr(
-            "manyforge_behavior.program_runtime.uuid4",
-            lambda: uuid.UUID(int=next(attempts)),
-        )
+        # Node attempt ids are a per-run counter from 1 (contract 1.15.3).
         runtime, _journal, _admission = runner._reconcile_runtime(
             Path(raw),
-            journal_owner_epoch=_RUNNER_EPOCH,
-            runtime_owner_epoch=_RUNNER_EPOCH,
             inventory={},
         )
         fake_owner = runner._Owner()
         runtime._owner = fake_owner
-        runtime._host = runner._Host(
-            fake_owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch
-        )
+        runtime._host = runner._Host(fake_owner, owner_id=runtime.owner_id)
         runtime.start()
         try:
             yield runtime, runner

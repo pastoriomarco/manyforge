@@ -37,6 +37,7 @@ from manyforge_behavior.nodes.control_flow import (
 from manyforge_behavior.nodes.v2_owner import (
     OwnerInvocationAdapter,
     OwnerTaskAdapter,
+    PickPlacePlanningAdapter,
     GripperCommandAdapter,
     GripperStatusWaitAdapter,
     IoInputWaitAdapter,
@@ -68,6 +69,7 @@ from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
 from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS, MOTION_NODE_IDS, active_tcp_key
 from manyforge_behavior.program_clock import ProgramClock
+from manyforge_behavior.run_sender import RunSender
 
 class ExecutableNodeResolverError(ValueError):
     """The closed resolver and retained environment do not agree."""
@@ -106,8 +108,10 @@ class NodeAdapterBuildContext:
     motion_attention: Callable[[str, str], None] | None = None
     # Receives each automatic retry's audit fact (the run's own audit list).
     audit_sink: Callable[[dict[str, Any]], None] | None = None
-    # The Runner's execution transport timeout (s); owner task nodes need it.
-    transport_timeout_s: float | None = None
+    # The run's ordered sender (OD-213): the nodes whose slow request
+    # leaves the tick (Scene nodes, the output writes, Set TCP, pick/place
+    # planning) use it.
+    run_sender: RunSender | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -265,12 +269,6 @@ def _required_program_clock(context: NodeAdapterBuildContext) -> ProgramClock:
     return context.program_clock
 
 
-def _required_transport_timeout(context: NodeAdapterBuildContext) -> float:
-    if context.transport_timeout_s is None:
-        raise ValueError("an owner task node requires the Runner's transport timeout")
-    return context.transport_timeout_s
-
-
 def _required_input_resolver(
     context: NodeAdapterBuildContext,
 ) -> NodeAttemptInputResolver:
@@ -330,10 +328,12 @@ def _owner_task_builder(
         gripper_command = node_id == "gripper.command_position"
         interrupt_motion = node_id in INTERRUPT_MOTION_NODE_IDS
         motion = node_id in MOTION_NODE_IDS or interrupt_motion
+        planning = node_id in {"planning.plan_pick_sequence", "planning.plan_place_sequence"}
         adapter = (
             GripperCommandAdapter if gripper_command
             else InterruptMotionTaskAdapter if interrupt_motion
             else MotionTaskAdapter if motion
+            else PickPlacePlanningAdapter if planning
             else OwnerTaskAdapter
         )
         timing = ({
@@ -346,6 +346,10 @@ def _owner_task_builder(
         if gripper_command:
             timing["io_watches"] = getattr(context.ports, "io_watches", None)
             timing["io_signals"] = getattr(context.ports, "io_signals", None)
+            timing["valve_sender"] = context.run_sender
+        if node_id == "motion.set_tcp" or planning:
+            # Set TCP and the pick/place planning jobs (OD-213) leave the tick.
+            timing["run_sender"] = context.run_sender
         if interrupt_motion:
             timing["mock_simulation"] = getattr(context.ports, "mock_simulation", None)
         return adapter(
@@ -359,7 +363,6 @@ def _owner_task_builder(
             input_resolver=_required_input_resolver(context),
             port=port,  # type: ignore[arg-type]
             owner_port_name=port_name,
-            transport_timeout_s=_required_transport_timeout(context),
             intervention_port=context.ports.program_interventions,
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
@@ -458,6 +461,12 @@ def _owner_invocation_builder(
         if node_id != "gripper.wait_for_status":
             return OwnerInvocationAdapter(
                 operator_stop_state=context.operator_stop_state,
+                # The Scene nodes and the output write leave the tick (OD-213).
+                run_sender=(
+                    context.run_sender
+                    if port_name == "scene_transactions" or node_id == "io.set_output"
+                    else None
+                ),
                 **common,  # type: ignore[arg-type]
             )
         # Only a waiter some hold policy can stop ticking sees the Stop
@@ -569,7 +578,7 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "kernel.operation": "kernel_operations",
         "kernel.reset": "kernel_controls",
         "kernel.stop": "kernel_controls",
-        "kernel.full_stop": "kernel_controls",
+        "kernel.cell_stop": "kernel_controls",
         "kernel.recovery": "kernel_controls",
         "planning.pick_sequence": "kernel_operations",
         "planning.place_sequence": "kernel_operations",

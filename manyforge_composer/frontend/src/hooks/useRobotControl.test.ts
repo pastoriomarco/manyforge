@@ -27,12 +27,15 @@ import {
   robotControlReducer,
 } from '../state/robotControl';
 
+const TEST_START = '3f9a000000000001';
+const TEST_KEY = 'c0112233445566778899aabbccddeeff';
+
 it('manual availability follows owner and hold changes, not observed poses or node ticks', () => {
   const snapshot = {
-    executionControlStatus: statusFixture(), authoringAdmission: { admissionGeneration: 1 },
-    programCycle: { programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1, state: 'running',
+    applicationStartId: TEST_START, executionControlStatus: statusFixture(), authoringAdmission: { admissionGeneration: 1 },
+    programCycle: { cycleGeneration: 1, state: 'running',
       executionControlRevision: 1, nodeStatusRevision: 1,
-      runtimeControls: { executionSelections: { selectionRevision: 1,
+      runtimeControls: { executionSelections: { holdRevision: 1,
         groups: [{ groupId: 'all', state: 'stopping' }] } },
     },
   } as unknown as ComposerHeadlessState;
@@ -46,7 +49,7 @@ it('manual availability follows owner and hold changes, not observed poses or no
   snapshot.programCycle.runtimeControls!.executionSelections.groups[0].state = 'held';
   expect(manualAvailabilityScopeFence(snapshot, 'joint')).not.toBe(initial);
   const held = manualAvailabilityScopeFence(snapshot, 'joint');
-  snapshot.executionControlStatus!.ownerEpoch = 'replacement';
+  snapshot.executionControlStatus!.applicationStartId = 'replacement';
   expect(manualAvailabilityScopeFence(snapshot, 'joint')).not.toBe(held);
 });
 
@@ -161,9 +164,9 @@ it('refuses query-only preset guessing and preserves position/motion observation
 });
 
 it('fences pneumatic availability on the current descriptor and addressed target', () => {
-  const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
-    programCycle: { programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1, state: 'running',
-      executionControlRevision: 1, runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+  const snapshot = { applicationStartId: TEST_START, executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
+    programCycle: { cycleGeneration: 1, state: 'running',
+      executionControlRevision: 1, runtimeControls: { executionSelections: { holdRevision: 1, groups: [] } } },
   } as unknown as ComposerHeadlessState;
   const before = manualAvailabilityScopeFence(snapshot, 'gripper');
   snapshot.executionControlStatus!.directControlGripper!.targetDescriptor.openStateRef = 'changed-ref';
@@ -336,57 +339,45 @@ describe('persistent runtime-scale transport cadence', () => {
 
   it('uses an exact owner acceptance to fence the next scale update', () => {
     const accepted = acceptedRuntimeScaleStatus(status, {
-      requestId: 'scale-request-1',
       selector: status.selector,
       requestedScale: 0.25,
       controlGeneration: 4,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
       activeOperationRevision: 8,
       activeOperationScaleGeneration: 2,
-    }, 'scale-request-1', 0.25);
+    }, 0.25);
     expect(accepted).toMatchObject({
       controlGeneration: 4,
       requestedScale: 0.25,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
     });
     expect(() => acceptedRuntimeScaleStatus(status, {
-      requestId: 'scale-request-2',
-      selector: status.selector,
-      requestedScale: 0.25,
-      controlGeneration: 4,
-      activeOperationId: null,
-      activeOperationRevision: null,
-      activeOperationScaleGeneration: null,
-    }, 'scale-request-1', 0.25)).toThrow(/does not match/);
-    expect(() => acceptedRuntimeScaleStatus(status, {
-      requestId: 'scale-request-1',
       selector: status.selector,
       requestedScale: 0.4,
       controlGeneration: 4,
       activeOperationId: null,
       activeOperationRevision: null,
       activeOperationScaleGeneration: null,
-    }, 'scale-request-1', 0.25)).toThrow(/does not match/);
+    }, 0.25)).toThrow(/does not match/);
   });
 
   it('keeps the projected active operation when the acceptance carries none', () => {
     const projected = {
       ...status,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
       activeOperationRevision: 8,
       activeOperationScaleGeneration: 2,
     };
     expect(acceptedRuntimeScaleStatus(projected, {
-      requestId: 'scale-request-1',
       selector: status.selector,
       requestedScale: 0.25,
       controlGeneration: projected.controlGeneration + 1,
       activeOperationId: null,
       activeOperationRevision: null,
       activeOperationScaleGeneration: null,
-    }, 'scale-request-1', 0.25)).toMatchObject({
+    }, 0.25)).toMatchObject({
       requestedScale: 0.25,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
       activeOperationRevision: 8,
       activeOperationScaleGeneration: 2,
     });
@@ -419,7 +410,7 @@ describe('pneumatic manual availability observation', () => {
   let root: import('react-dom/client').Root;
   let latest: ReturnType<typeof useRobotControl>;
   const pending: Array<{ intent: Parameters<typeof api.execution.manualAvailability>[0];
-    signal: AbortSignal | undefined; resolve: (value: Awaited<ReturnType<typeof api.execution.manualAvailability>>) => void }> = [];
+    applicationStartId: string; signal: AbortSignal | undefined; resolve: (value: Awaited<ReturnType<typeof api.execution.manualAvailability>>) => void }> = [];
   function Harness({ snapshot }: { snapshot: ComposerHeadlessState }) {
     const result = useRobotControl(true, true, true, snapshot);
     useEffect(() => { latest = result; }, [result]);
@@ -448,8 +439,8 @@ describe('pneumatic manual availability observation', () => {
     const { createRoot } = await import('react-dom/client');
     root = createRoot(makeNode('div') as unknown as Element);
     pending.length = 0;
-    vi.spyOn(api.execution, 'manualAvailability').mockImplementation((intent, signal) => (
-      new Promise((resolve) => pending.push({ intent, signal, resolve }))
+    vi.spyOn(api.execution, 'manualAvailability').mockImplementation((intent, applicationStartId, signal) => (
+      new Promise((resolve) => pending.push({ intent, applicationStartId, signal, resolve }))
     ));
     vi.spyOn(api.execution, 'previewCapabilityCommand');
     vi.spyOn(api.execution, 'previewMotion');
@@ -461,7 +452,7 @@ describe('pneumatic manual availability observation', () => {
   });
   it('drops an in-flight preview after hiding and refuses hidden approval', async () => {
     const status = statusFixture();
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
     let release!: (receipt: ReturnType<typeof receiptFixture>) => void;
     const pendingPreview = new Promise<ReturnType<typeof receiptFixture>>((resolve) => { release = resolve; });
     const preview = vi.mocked(api.execution.previewMotion).mockReturnValue(pendingPreview);
@@ -488,9 +479,9 @@ describe('pneumatic manual availability observation', () => {
   });
   it('retains the Move To label only for the operation id in the accepted receipt', async () => {
     const status = statusFixture();
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
-    const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => ({
-      result: { ok: true, command: 'submit', accepted: { request_id: requestId, operation_id: 'move-to.1' } },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
+    const send = vi.fn(async (_kind: string, _payload: unknown) => ({
+      result: { ok: true, command: 'submit', accepted: { request_key: TEST_KEY, operation_id: 41 } },
     }));
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
     function MoveToHarness({ current }: { current: ComposerHeadlessState }) {
@@ -501,7 +492,7 @@ describe('pneumatic manual availability observation', () => {
     vi.spyOn(window, 'setTimeout')
       .mockImplementation(((callback: () => void) => globalThis.setTimeout(callback, 0)) as never);
     vi.mocked(api.execution.previewMotion).mockImplementation(async (intent) => (
-      receiptFixture(status, intent.request_context.request_id, [0.2, 0.3])
+      receiptFixture(status, intent.request_context.request_key, [0.2, 0.3])
     ));
     await act(async () => root.render(createElement(MoveToHarness, { current: snapshot })));
     await act(async () => {
@@ -513,15 +504,15 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.state.phase).toBe('ready');
     await act(async () => latest.approve());
     expect(latest.state.acceptedOperationMode).toMatchObject({
-      ownerEpoch: status.ownerEpoch, operationId: 'move-to.1', mode: 'move_to',
+      applicationStartId: status.applicationStartId, operationId: 41, mode: 'move_to',
     });
 
     const movingStatus = structuredClone(status);
     const target = movingStatus.directControl!;
     movingStatus.manualOperations = [{
-      programRunId: target.programRunId,
-      operationId: 'move-to.1', operationRevision: 1, resident: true, state: 'executing',
-      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null,
+      payloadKind: 'motion',
+      operationId: 41, operationRevision: 1, resident: true, state: 'executing',
+      progress: 0, stopEventId: null, terminalError: null,
       controllableComponentId: target.controllableComponentId, commandTargetId: target.commandTargetId,
     }];
     const movingSnapshot = { ...snapshot, executionControlStatus: movingStatus } as ComposerHeadlessState;
@@ -529,7 +520,7 @@ describe('pneumatic manual availability observation', () => {
     expect(robotControlAcceptedOperationMode(latest.state)).toBe('move_to');
     expect(robotControlAcceptedOperationMode({
       ...latest.state,
-      operation: { ...latest.state.operation!, operationId: 'external-operation' },
+      operation: { ...latest.state.operation!, operationId: 99 },
     })).toBeNull();
   });
   it('does not submit Set TCP during an active manual operation', async () => {
@@ -538,12 +529,12 @@ describe('pneumatic manual availability observation', () => {
     const flange = { ...row, entry: { ...row.entry, frameRoleId: 'flange' },
       frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
     status.directControl!.targetDescriptor.tcps.push(flange);
-    status.manualOperations = [{ programRunId: status.directControl!.programRunId,
+    status.manualOperations = [{ payloadKind: 'motion',
       controllableComponentId: status.directControl!.controllableComponentId,
       commandTargetId: status.directControl!.commandTargetId,
-      operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing',
-      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null }];
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      operationId: 1, operationRevision: 1, resident: true, state: 'executing',
+      progress: 0, stopEventId: null, terminalError: null }];
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     const send = vi.fn();
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
@@ -561,12 +552,12 @@ describe('pneumatic manual availability observation', () => {
 
   it('sends another operation Stop on a repeated press while the first is pending', async () => {
     const status = statusFixture();
-    status.manualOperations = [{ programRunId: status.directControl!.programRunId,
+    status.manualOperations = [{ payloadKind: 'motion',
       controllableComponentId: status.directControl!.controllableComponentId,
       commandTargetId: status.directControl!.commandTargetId,
-      operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing',
-      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null }];
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      operationId: 1, operationRevision: 1, resident: true, state: 'executing',
+      progress: 0, stopEventId: null, terminalError: null }];
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     // No receipt arrives: the first Stop stays pending.
     const send = vi.fn(() => new Promise<never>(() => undefined));
@@ -582,6 +573,12 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.controlPending).toBe('stop');
     await act(async () => { void latest.stop(); });
     expect(send.mock.calls.map((call) => (call as unknown[])[0])).toEqual(['operation_stop', 'operation_stop']);
+    // A WebSocket Stop carries no request id, key or application-start id:
+    // the session and its client sequence name it.
+    expect(send.mock.calls[0]).toEqual(['operation_stop', {
+      operations: [{ operation_id: 1, expected_operation_revision: 1 }],
+      reason: 'operator Robot Control Stop',
+    }]);
   });
 
   it('submits Set TCP once and keeps the owner value until the result', async () => {
@@ -591,17 +588,17 @@ describe('pneumatic manual availability observation', () => {
       frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
     status.directControl!.targetDescriptor.tcps.push(flange);
     status.observedMotion!.tcpPoses[tcpEntryIdentityKey(flange.entry)] = status.observedMotion!.currentTcpPose!;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     let finish!: () => void;
     const sent = new Promise<void>((resolve) => { finish = resolve; });
-    const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => {
+    const send = vi.fn(async (_kind: string, _payload: unknown) => {
       await sent;
-      return { result: { ok: true, command: 'submit', accepted: { request_id: requestId, operation_id: 'operation.1' },
+      return { result: { ok: true, command: 'submit', accepted: { request_key: TEST_KEY, operation_id: 1 },
         active_tcp: [{ component_id: 'robot-a', entry: {
           target: { component_id: 'robot-a', command_target_id: 'arm' },
           frame: { component_id: 'robot-a', frame_id: 'flange' },
-        }, owner_epoch: status.ownerEpoch, registration_generation: 1, sequence: 1 }] } };
+        }, registration_generation: 1, sequence: 1 }] } };
     });
     let transportStatus = 'connected';
     let transportError: string | null = null;
@@ -630,7 +627,8 @@ describe('pneumatic manual availability observation', () => {
         target: { component_id: 'robot-a', command_target_id: 'arm' },
         frame: { component_id: 'robot-a', frame_id: 'flange' },
       } } })],
-    }), expect.any(String));
+    }));
+    expect(send.mock.calls[0]).toHaveLength(2);
     await act(async () => latest.selectTcp(tcpEntryIdentityKey(flange.entry)));
     expect(send).toHaveBeenCalledTimes(1);
     await act(async () => finish());
@@ -654,14 +652,14 @@ describe('pneumatic manual availability observation', () => {
     expect(api.execution.previewMotion).not.toHaveBeenCalled();
     const stale = structuredClone(snapshot);
     stale.executionControlStatus!.directControl!.activeTcp = {
-      entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
+      entry: flange.entry, display: flange.qualifiedName, applicationStartId: status.applicationStartId,
       registrationGeneration: 1, sequence: 0,
     };
     await renderTcp(stale);
     expect(latest.tcpApplying).toBe(true);
     const updated = structuredClone(snapshot);
     updated.executionControlStatus!.directControl!.activeTcp = {
-      entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
+      entry: flange.entry, display: flange.qualifiedName, applicationStartId: status.applicationStartId,
       registrationGeneration: 1, sequence: 1,
     };
     await renderTcp(updated);
@@ -676,7 +674,7 @@ describe('pneumatic manual availability observation', () => {
       const flange = { ...row, entry: { ...row.entry, frameRoleId: 'flange' },
         frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
       status.directControl!.targetDescriptor.tcps.push(flange);
-      const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
         programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
       const raw = { ok: false, error: { code: 'tcp_failed', message: 'TCP failed',
         details: { immediate_step: 'admitted' } }, active_tcp: [] };
@@ -699,7 +697,7 @@ describe('pneumatic manual availability observation', () => {
       expect(latest.tcpApplying).toBe(true);
       const newer = structuredClone(snapshot);
       newer.executionControlStatus!.directControl!.activeTcp = {
-        entry: null, display: null, ownerEpoch: status.ownerEpoch, registrationGeneration: 1, sequence: 1,
+        entry: null, display: null, applicationStartId: status.applicationStartId, registrationGeneration: 1, sequence: 1,
       };
       await act(async () => root.render(createElement(SetTcpHarness, { current: newer })));
       expect(latest.tcpApplying).toBe(false);
@@ -713,7 +711,7 @@ describe('pneumatic manual availability observation', () => {
     const flange = { ...row, entry: { ...row.entry, frameRoleId: 'flange' },
       frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
     status.directControl!.targetDescriptor.tcps.push(flange);
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     const raw = { ok: false, error: { code: 'tcp_failed', message: 'TCP failed',
       details: { immediate_step: 'admitted' } }, active_tcp: [{ component_id: 'robot-a',
@@ -721,7 +719,7 @@ describe('pneumatic manual availability observation', () => {
         target: { component_id: 'robot-a', command_target_id: 'arm' },
         frame: { component_id: 'robot-a', frame_id: 'flange' },
       },
-      owner_epoch: status.ownerEpoch, registration_generation: 1, sequence: 1 }] };
+      registration_generation: 1, sequence: 1 }] };
     const send = vi.fn(async () => { throw new CommandRefusalError(
       { code: 'tcp_failed', message: 'TCP failed', details: { immediate_step: 'admitted' }, origin: null },
       { executionResult: raw }); });
@@ -737,7 +735,7 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.selectedStatus!.directControl!.activeTcp!.entry).toEqual(flange.entry);
     const caughtUp = structuredClone(snapshot);
     caughtUp.executionControlStatus!.directControl!.activeTcp = {
-      entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
+      entry: flange.entry, display: flange.qualifiedName, applicationStartId: status.applicationStartId,
       registrationGeneration: 1, sequence: 1,
     };
     await act(async () => root.render(createElement(SetTcpHarness, { current: caughtUp })));
@@ -750,7 +748,7 @@ describe('pneumatic manual availability observation', () => {
     const flange = { ...row, entry: { ...row.entry, frameRoleId: 'flange' },
       frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false };
     status.directControl!.targetDescriptor.tcps.push(flange);
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     let currentShell: ComposerHeadlessState | null = snapshot;
     let transportStatus = 'connected';
@@ -787,7 +785,7 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.tcpResumeStatus!.directControlTargets[0].activeTcp).toBeNull();
     const observed = structuredClone(snapshot);
     observed.executionControlStatus!.directControl!.activeTcp = {
-      entry: flange.entry, display: flange.qualifiedName, ownerEpoch: status.ownerEpoch,
+      entry: flange.entry, display: flange.qualifiedName, applicationStartId: status.applicationStartId,
       registrationGeneration: 1, sequence: 1,
     };
     await renderTcp(observed);
@@ -799,7 +797,7 @@ describe('pneumatic manual availability observation', () => {
     const status = statusFixture();
     status.directControl!.activeTcp = null;
     const row = status.directControl!.targetDescriptor.tcps[0];
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     const send = vi.fn();
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
@@ -819,7 +817,7 @@ describe('pneumatic manual availability observation', () => {
     const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameComponentId: 'other-tool', frameRoleId: 'tcp' },
       mountedHere: false, mountedElsewhere: true };
     status.directControl!.targetDescriptor.tcps.push(other);
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     const send = vi.fn().mockRejectedValue(new Error('Tool not mounted on this robot.'));
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
@@ -841,20 +839,20 @@ describe('pneumatic manual availability observation', () => {
       completionPolicy: 'no_output', pneumaticOutputs: [{ controllableComponentId: 'valve_io',
         signalName: 'valve', openValue: false, closeValue: true }],
     });
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunId: 1, cycleGeneration: 1,
         state: 'running', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+        runtimeControls: { executionSelections: { holdRevision: 1, groups: [] } } },
     } as unknown as ComposerHeadlessState;
     await render(snapshot);
     await act(async () => { latest.selectMode('gripper'); latest.setManualPanelVisible(true); });
     expect(latest.manualControlUnavailableReason ?? '').not.toContain('idle after Reset');
   });
   it('refuses a missing current observation when a pneumatic target becomes Position', async () => {
-    const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunId: 1, cycleGeneration: 1,
         state: 'running', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+        runtimeControls: { executionSelections: { holdRevision: 1, groups: [] } } },
     } as unknown as ComposerHeadlessState;
     await render(snapshot);
     await act(async () => { latest.selectMode('gripper'); latest.setManualPanelVisible(true); });
@@ -870,8 +868,7 @@ describe('pneumatic manual availability observation', () => {
     expect(pending).toHaveLength(1);
     expect(latest.manualControlAllowed).toBe(false);
     expect(latest.manualControlUnavailableReason).toBe('Gripper observation is unavailable.');
-    await act(async () => pending[0].resolve({ requestId: pending[0].intent.request_context.request_id,
-      requestOwnerEpoch: pending[0].intent.request_context.request_owner_epoch,
+    await act(async () => pending[0].resolve({ requestKey: pending[0].intent.request_context.request_key,
       intentDigest: 'sha256:obsolete-query', available: true, unavailableReason: null,
       cleanupRequired: false, manualHandover: null }));
     expect(latest.manualControlAllowed).toBe(false);
@@ -879,10 +876,10 @@ describe('pneumatic manual availability observation', () => {
   });
   it.each(['commanded', 'none'] as const)(
     'ignores a late %s query across a source/target change during Stop without drafting or previewing', async (mode) => {
-      const snapshot = { executionControlStatus: pneumaticStatus(mode), authoringAdmission: { admissionGeneration: 1 },
-        programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+      const snapshot = { applicationStartId: TEST_START, executionControlStatus: pneumaticStatus(mode), authoringAdmission: { admissionGeneration: 1 },
+        programCycle: { programRunId: 1, cycleGeneration: 1,
           state: 'running', executionControlRevision: 1,
-          runtimeControls: { executionSelections: { selectionRevision: 1,
+          runtimeControls: { executionSelections: { holdRevision: 1,
             groups: [{ groupId: 'cell', state: 'stopping' }] } } },
       } as unknown as ComposerHeadlessState;
       await render(snapshot);
@@ -891,13 +888,14 @@ describe('pneumatic manual availability observation', () => {
         latest.setManualPanelVisible(true);
       });
       expect(pending).toHaveLength(1);
-      expect(pending[0].intent.request_context.request_owner_epoch).toBe(snapshot.executionControlStatus!.ownerEpoch);
+      expect(pending[0].intent.request_context.request_key).toMatch(/^[0-9a-f]{32}$/);
+      expect(pending[0].intent).not.toHaveProperty('application_start_id');
       expect(pending[0].intent.program_binding_id).toBe(snapshot.executionControlStatus!.directControlGripper!.programBindingId);
       expect(pending[0].intent.participants[0].payload).toMatchObject({ command_value: {
         position: { kind: 'linear_m', value_m: 0.037 },
       } });
       const successor = structuredClone(snapshot);
-      successor.executionControlStatus!.ownerEpoch = 'owner.successor';
+      successor.executionControlStatus!.applicationStartId = 'owner.successor';
       successor.executionControlStatus!.directControlGripper!.programBindingId = 'binding.successor';
       const successorPreset = successor.executionControlStatus!.directControlGripper!.targetDescriptor.namedPresets[0];
       successorPreset.masterPosition = 0.033;
@@ -912,15 +910,13 @@ describe('pneumatic manual availability observation', () => {
       const currentQuery = liveQueries[0];
       expect(currentQuery).toBe(successorQueries.at(-1));
       for (const query of successorQueries) {
-        expect(query.intent.request_context.request_owner_epoch).toBe('owner.successor');
         expect(query.intent.program_binding_id).toBe('binding.successor');
         expect(query.intent.participants[0].payload).toMatchObject({ command_value: {
           position: { kind: 'linear_m', value_m: 0.033 },
         } });
       }
       const answer = (query: typeof currentQuery, available: boolean) => ({
-        requestId: query.intent.request_context.request_id,
-        requestOwnerEpoch: query.intent.request_context.request_owner_epoch,
+        requestKey: query.intent.request_context.request_key,
         intentDigest: 'sha256:availability-only', available,
         unavailableReason: available ? null : 'component_not_ready', cleanupRequired: false, manualHandover: null });
       for (const obsolete of pending.filter((query) => query !== currentQuery)) {
@@ -940,10 +936,10 @@ describe('pneumatic manual availability observation', () => {
   );
 
   it('sends a held-program cleanup to the Runner even when its offered owner differs', async () => {
-    const snapshot = { executionControlStatus: statusFixture(), authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.current', programRunId: 'program.1', cycleGeneration: 1,
+    const snapshot = { applicationStartId: TEST_START, executionControlStatus: statusFixture(), authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunId: 1, cycleGeneration: 1,
         state: 'running', runRevision: 3, executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [{ groupId: 'all', state: 'held' }] } } },
+        runtimeControls: { executionSelections: { holdRevision: 1, groups: [{ groupId: 'all', state: 'held' }] } } },
     } as unknown as ComposerHeadlessState;
     const send = vi.fn(() => new Promise(() => {}));
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
@@ -957,21 +953,23 @@ describe('pneumatic manual availability observation', () => {
     await act(async () => root.render(createElement(HandoverHarness)));
     await act(async () => latest.setManualPanelVisible(true));
     expect(pending).toHaveLength(1);
-    await act(async () => pending[0].resolve({ requestId: pending[0].intent.request_context.request_id,
-      requestOwnerEpoch: pending[0].intent.request_context.request_owner_epoch, intentDigest: 'sha256:availability',
+    await act(async () => pending[0].resolve({ requestKey: pending[0].intent.request_context.request_key,
+      intentDigest: 'sha256:availability',
       available: true, unavailableReason: null, cleanupRequired: true,
-      manualHandover: { program_run_id: 'program.1', program_runner_owner_epoch: 'runner.offered',
-        claim_generation: 2, selection_revision: 1 } }));
+      manualHandover: { program_run_id: 1, claim_generation: 2, hold_revision: 1 } }));
     expect(latest.manualControlAllowed).toBe(true);
     await act(async () => { latest.setManualPanelVisible(true); latest.editJoint(0, 0.2); });
     await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
     expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith('program_manual_handover', expect.objectContaining({
-      program_run_id: 'program.1', expected_owner_epoch: 'runner.offered', expected_run_revision: 3,
-    }), expect.any(String));
+    expect(send).toHaveBeenCalledWith('program_manual_handover', {
+      program_run_id: 1, expected_run_revision: 3, operation: expect.objectContaining({
+        manual_handover: { program_run_id: 1, claim_generation: 2, hold_revision: 1 },
+      }),
+    });
+    expect(pending[0].applicationStartId).toBe(TEST_START);
   });
 
-  it.each(['runner', 'execution', 'panel-hidden'] as const)(
+  it.each(['execution', 'panel-hidden'] as const)(
     'continues the confirmed pneumatic sequence after %s', async (owner) => {
       const status = pneumaticStatus('none');
       const descriptor = status.directControlGripper!.targetDescriptor;
@@ -988,15 +986,15 @@ describe('pneumatic manual availability observation', () => {
         signals: [{ componentId: row.controllableComponentId, signalName: row.signalName,
           valueType: 'bool', direction: 'output', transitionCapability: 'sampled_only', signalDescriptorDigest: 'digest' }],
       }));
-      const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-        programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
+      const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+        programCycle: { programRunId: null, cycleGeneration: 1,
           state: 'idle_after_reset', executionControlRevision: 1 } } as unknown as ComposerHeadlessState;
       let firstStarted!: () => void;
       let releaseFirst!: () => void;
       const started = new Promise<void>((resolve) => { firstStarted = resolve; });
       const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-      const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => (
-        { result: { accepted: { request_id: requestId, operation_id: 'gripper-op' } } }));
+      const send = vi.fn(async (_kind: string, _payload: unknown) => (
+        { result: { accepted: { request_key: TEST_KEY, operation_id: 51 } } }));
       let writes = 0;
       // The one output write path; the first valve write waits.
       vi.spyOn(api.io, 'setOutput').mockImplementation(async () => {
@@ -1012,7 +1010,7 @@ describe('pneumatic manual availability observation', () => {
       vi.spyOn(window, 'setTimeout')
         .mockImplementation(((resolve: () => void) => globalThis.setTimeout(resolve, 0)) as never);
       vi.mocked(api.execution.previewCapabilityCommand).mockImplementation(async (intent) => (
-        gripperReceiptFixture(status, intent.request_context.request_id, 0.037)
+        gripperReceiptFixture(status, intent.request_context.request_key, 0.037)
       ));
       await act(async () => root.render(createElement(SequenceHarness, { current: snapshot })));
       await act(async () => { latest.setManualPanelVisible(true); latest.selectMode('gripper'); latest.editGripper(0.037); });
@@ -1022,8 +1020,7 @@ describe('pneumatic manual availability observation', () => {
       await act(async () => { approval = latest.approve(); });
       await started;
       const successor = structuredClone(snapshot);
-      if (owner === 'runner') successor.programCycle.programRunnerOwnerEpoch = 'runner.2';
-      else if (owner === 'execution') successor.executionControlStatus!.ownerEpoch = 'execution.2';
+      if (owner === 'execution') successor.executionControlStatus!.applicationStartId = 'execution.2';
       if (owner === 'panel-hidden') await act(async () => latest.setManualPanelVisible(false));
       else await act(async () => root.render(createElement(SequenceHarness, { current: successor })));
       releaseFirst();

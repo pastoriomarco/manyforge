@@ -29,6 +29,7 @@ import type {
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
 import { tcpEntryIdentityKey } from '../types/robotControl';
+import { displayId } from '../api/applicationIdentity';
 import type { LogicalSceneObject, LogicalSceneProjection, ProgramTreeNode, SourceModelProjection } from '../types/api';
 import { previewBodyIdentity } from '../state/runtimeScenePresentation';
 import {
@@ -370,7 +371,7 @@ export function RobotControlPanelView({
   const [playingPreview, setPlayingPreview] = useState(false);
   const [previewReplay, setPreviewReplay] = useState(0);
   const previewPath = controller.state.diagnosticPreview ?? (controller.state.preview?.schemaVersion
-    === 'manyforge.direct_control_motion_preview.v4' ? controller.state.preview.pathPreview : undefined);
+    === 'manyforge.direct_control_motion_preview.v5' ? controller.state.preview.pathPreview : undefined);
   const previewIndex = controller.state.previewSampleIndex;
   useEffect(() => { setPlayingPreview(false); }, [previewPath]);
   useEffect(() => {
@@ -433,7 +434,7 @@ export function RobotControlPanelView({
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
-  const inputResetKey = [status?.ownerEpoch, motion?.programBindingId,
+  const inputResetKey = [status?.applicationStartId, motion?.programBindingId,
     motion?.tcpFrameRoleId, motion?.selectedTcpEntryKey,
     gripper?.programBindingId,
     status?.retainedBundleId, status?.graphRevision, programActive,
@@ -448,7 +449,7 @@ export function RobotControlPanelView({
     || (state.mode === 'move_to' && state.moveToKind === 'pose'));
   const active = operationActive || !controller.manualControlAllowed || tcpBlocksCartesian;
   const authoringBlocked = active || state.operation?.resident === true;
-  const previewNoticeKey = [status?.ownerEpoch, state.generation, state.error, state.previewIssue].join('\u0000');
+  const previewNoticeKey = [status?.applicationStartId, state.generation, state.error, state.previewIssue].join('\u0000');
   const expectedTargetRejection = state.previewIssue != null;
   const previewRejectionLabel = expectedTargetRejection ? 'Target not executable' : 'Preview unavailable';
   const tcpActionUnavailable = state.mode !== 'joint' && state.mode !== 'gripper'
@@ -1504,7 +1505,7 @@ export function RobotControlPanelView({
                 <span>{previewPath.samples[previewIndex].timeFromStartS.toFixed(2)} s · {previewPath.samples[previewIndex].status}</span>
                 <p title="Blue: checked, no contact. Yellow: contact your settings allow. Orange: closer than clearance. Red: contact not allowed, or still touching at the end. Grey: unknown.">Blue: clear · Yellow: allowed · Orange: too close · Red: collision · Grey: unknown</p>
                 {robotControlPreviewApprovable(state) && <p>Ready to approve</p>}
-                {state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+                {state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v5'
                   && runtimeScene?.snapshot?.revision != null
                   && (state.preview.sceneRevision.scene_id !== runtimeScene.snapshot.revision.scene_id
                     || state.preview.sceneRevision.revision_id !== runtimeScene.snapshot.revision.revision_id
@@ -1561,7 +1562,7 @@ export function RobotControlPanelView({
 
               {state.operation !== null && (
                 <div className="robot-control-operation">
-                  <OperationProgress operation={state.operation} ownerEpoch={status?.ownerEpoch} source={controller.controlSource} />
+                  <OperationProgress operation={state.operation} source={controller.controlSource} />
                   {state.operation.resident && !recoveryRequired && <div className="robot-control-operation-actions">
                     {resetOperationControl}
                   </div>}
@@ -1637,11 +1638,13 @@ export function RobotControlPanelView({
               </dl>
               <p>Scene revision {state.ghost.sceneRevision.revision_id} · collision revision {state.ghost.collisionWorldRevision.revision_id}</p>
             </>}
-            {state.operation !== null && <p>Operation <code>{state.operation.operationId}</code> · revision {state.operation.operationRevision} · {state.operation.resident ? 'retained by owner' : 'settled by owner'}</p>}
+            {state.operation !== null && <p>Operation <code>{controller.applicationStartId == null
+              ? `op${state.operation.operationId}`
+              : displayId(controller.applicationStartId, 'op', state.operation.operationId)}</code> · revision {state.operation.operationRevision} · {state.operation.resident ? 'retained by owner' : 'settled by owner'}</p>}
             <details>
               <summary>Target and owner contract</summary>
               <pre>{JSON.stringify({
-                ownerEpoch: status.ownerEpoch,
+                applicationStartId: status.applicationStartId,
                 bindingId: state.mode === 'gripper' && gripper !== null ? gripper.programBindingId : motion?.programBindingId,
                 target: state.mode === 'gripper' && gripper !== null ? gripper.targetDescriptor : motion?.targetDescriptor,
               }, null, 2)}</pre>

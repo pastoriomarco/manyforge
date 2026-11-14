@@ -47,7 +47,7 @@ def _waiter(clock=None, program_clock=None, timeout_while_held="pause", **adapte
         node_id="gripper.wait_for_status",
         node_instance_id="wait",
         attempt_source=SimpleNamespace(
-            begin=lambda _: NodeAttemptIdentity("run.1", "wait", "attempt.1")
+            begin=lambda _: NodeAttemptIdentity(1, "wait", 1)
         ),
         parameters=parameters,
         value_sources={},

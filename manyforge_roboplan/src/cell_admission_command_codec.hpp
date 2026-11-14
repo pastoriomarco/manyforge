@@ -10,24 +10,17 @@
 namespace manyforge::roboplan_backend::detail {
 
 inline constexpr std::string_view kCellAdmissionCommandApiVersion =
-    "manyforge.execution_command.v3";
+    "manyforge.execution_command.v4";
 inline constexpr std::string_view kCellAdmissionResponseApiVersion =
-    "manyforge.execution_command_response.v4";
+    "manyforge.execution_command_response.v5";
 
-/// Strict decoders shared by descriptor-bound, read-only owner-journal
-/// settlement readers. They accept only the canonical private DTO spelling.
+/// Strict decoder of a claim as the response JSON spells it.
 [[nodiscard]] manyforge::core::CellAdmissionClaimDTO
 DecodeCellAdmissionClaim(std::string_view bytes);
 
-[[nodiscard]] manyforge::core::CellAdmissionClaimIntentDTO
-DecodeCellAdmissionClaimIntent(std::string_view bytes);
-
-[[nodiscard]] manyforge::core::CellAdmissionClaimReleaseDTO
-DecodeCellAdmissionClaimRelease(std::string_view bytes);
-
 [[nodiscard]] manyforge::content_identity::CanonicalValue ProgramRunnerLossValue(
     const manyforge::core::ProgramRunnerContactLossDTO &loss,
-    const manyforge::core::RequestOwnerEpoch &kernel_owner_epoch);
+    manyforge::core::ApplicationStartId application_start_id);
 
 /// Returns nullopt only when a well-formed command names another command.
 /// Recognized cell-admission commands are decoded as closed, canonical DTOs.

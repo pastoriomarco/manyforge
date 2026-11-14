@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import asyncio
 import json
 import threading
@@ -11,10 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from manyforge_headless_api.models import (
-    ProgramFullStopResumeRequest,
-    ProgramFullStopResetRequest,
+    ProgramHaltResumeRequest,
     ProgramRunStartRequest,
-    ProgramRunStopRequest,
     ProgramScenePreparationRequest,
 )
 from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
@@ -31,6 +31,18 @@ from manyforge_program_runner.models import (
 from manyforge_program_runner.runtime import ProgramRunnerError
 
 
+def _kb(*parts) -> bytes:
+    """A deterministic 16-byte request key named by text, for readable tests."""
+
+    return hashlib.md5("/".join(map(str, parts)).encode()).digest()
+
+
+def _key(*parts) -> str:
+    """The wire form (32 lowercase hex) of ``_kb``."""
+
+    return _kb(*parts).hex()
+
+
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
@@ -38,14 +50,13 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 def _snapshot(*, state: str = "running") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_run_status.v4",
+        "schema_version": "manyforge.program_run_status.v5",
         "owner_id": "program-runner.cell-a",
-        "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v2",
-            "program_run_id": "program-run.1",
+            "schema_version": "manyforge.program_run_capture.v3",
+            "program_run_id": 1,
             "applied_record_digest": _DIGEST_C,
             "scenario_id": "cell-pick",
             "source_document_digest": _DIGEST_A,
@@ -59,9 +70,8 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
             "node_policies": [],
             "owner_identities": [
                 {
-                    "owner_role": "program_runner",
-                    "owner_id": "program-runner.cell-a",
-                    "owner_epoch": "program-runner.epoch.1",
+                    "role": "program_runner",
+                    "application_start_id": "3f9a00000000002a",
                 }
             ],
         },
@@ -106,9 +116,9 @@ class FakeRuntime:
 
     def health(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runner_health.v1",
+            "schema_version": "manyforge.program_runner_health.v2",
             "owner_id": "program-runner.cell-a",
-            "owner_epoch": "program-runner.epoch.1",
+            "application_start_id": "3f9a00000000002a",
             "started": self.started,
             "closed": self.closed,
             "assistant_model_transport_available": False,
@@ -121,7 +131,7 @@ class FakeRuntime:
     ) -> dict[str, Any]:
         self.calls.append(("node_availability", request))
         return {
-            "schema_version": "manyforge.program_node_availability.v1",
+            "schema_version": "manyforge.program_node_availability.v2",
             "source": {},
             "availability": {},
         }
@@ -143,9 +153,9 @@ class FakeRuntime:
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
         return {
-            "schema_version": "manyforge.program_run_index.v2",
+            "schema_version": "manyforge.program_run_index.v3",
             "owner_id": "program-runner.cell-a",
-            "owner_epoch": "program-runner.epoch.1",
+            "application_start_id": "3f9a00000000002a",
             "active_only": active_only,
             "truncated": False,
             "runs": [_snapshot()],
@@ -174,47 +184,15 @@ class FakeRuntime:
 
     def preview_node_correction(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("node_preview", (program_run_id, request)))
-        return {"schema_version": "manyforge.program_node_correction_preview_intent.v1"}
+        return {"schema_version": "manyforge.program_node_correction_preview_intent.v3"}
 
-    def stop_run(
+    def resume_halt(
         self,
         program_run_id: str,
-        request: ProgramRunStopRequest,
+        request: ProgramHaltResumeRequest,
     ) -> dict[str, Any]:
-        self.calls.append(("stop", (program_run_id, request)))
-        return _snapshot(state="stopping")
-
-    def stop_motion(
-        self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        self.calls.append(("motion_stop", (program_run_id, request)))
+        self.calls.append(("resume_halt", (program_run_id, request)))
         return _snapshot(state="running")
-
-    def full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        self.calls.append(("full_stop", (program_run_id, request)))
-        return _snapshot(state="full_stopping")
-
-    def resume_full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramFullStopResumeRequest,
-    ) -> dict[str, Any]:
-        self.calls.append(("resume_full_stop", (program_run_id, request)))
-        return _snapshot(state="running")
-
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramFullStopResetRequest,
-    ) -> dict[str, Any]:
-        self.calls.append(("discard_full_stop", (program_run_id, request)))
-        return _snapshot(state="stopped")
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         self.calls.append(("reset", request))
@@ -229,17 +207,15 @@ class FakeRuntime:
 
     def cycle_status(self) -> dict[str, Any]:
         return {
-            "program_runner_owner_epoch": "program-runner.epoch.1",
             "cycle_generation": 1,
             "state": "idle_after_reset",
             "program_run_id": None,
             "cycle_claim_generation": None,
             "terminal_or_settlement_reference": None,
             "execution_control_revision": self.control_revision,
-            "causal_correlation_id": None,
-            "causal_session_id": None,
-            "causal_client_sequence": None,
+            "causal_request_key": None,
             "current_command_kind": None,
+            "runner_commands": {"in_progress": None, "ended": []},
             "failure": None,
             "reset_phase": None,
         "reset_options": None,
@@ -289,13 +265,36 @@ class FakeRuntime:
         self.calls.append(("reconcile_persistent_values", None))
         return {"outcome": "duplicate"}
 
+    def run_command(self, request_key, command) -> dict[str, Any]:
+        # The runtime answers at acceptance (OD-214); this fake runs the
+        # command to its end and answers with its accepted row.
+        command()
+        return _reply(_KIND_OF_CALL.get(self.calls[-1][0], self.calls[-1][0]),
+                      request_key)
+
+
+_KIND_OF_CALL = {
+    "set_persistent_value": "persistent_value_set",
+    "reset_persistent_value": "persistent_value_reset",
+    "clear_persistent_values": "persistent_values_clear",
+    "write_runtime_blackboard": "runtime_blackboard_write",
+    "stage_manual_result": "manual_result_stage",
+    "apply_recovery_action": "recovery_action",
+}
+
+
+def _reply(kind: str, request_key: str | None = None) -> dict[str, Any]:
+    return {
+        "schema_version": "manyforge.program_command_reply.v1",
+        "command": {"kind": kind, "request_key": request_key or _key("request.1"),
+                    "step": "admitting", "accepted_at_ns": "1", "end": None},
+    }
+
 
 def _caller() -> dict[str, Any]:
     return {
-        "request_id": "request.1",
-        "request_owner_epoch": "composer.epoch.1",
+        "request_key": _key("request.1"),
         "source_label": "operator_ui",
-        "correlation_id": None,
     }
 
 
@@ -309,7 +308,7 @@ def test_node_availability_is_a_read_only_runner_projection() -> None:
 
     assert response.status_code == 200
     assert response.json()["schema_version"] == (
-        "manyforge.program_node_availability.v1"
+        "manyforge.program_node_availability.v2"
     )
     assert runtime.calls[0][0] == "node_availability"
     assert runtime.calls[0][1].model_dump() == body
@@ -320,8 +319,7 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
     client = TestClient(create_app(runtime))
     body = {
         **_caller(),
-        "program_run_id": "program-run.1",
-        "expected_owner_epoch": "program-runner.epoch.1",
+        "program_run_id": 1,
         "expected_cycle_generation": 4,
         "expected_claim_generation": 7,
         "terminal_reference": _DIGEST_A,
@@ -330,7 +328,8 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
     with client:
         response = client.post("/api/program/cycle/reset", json=body)
     assert response.status_code == 200
-    assert response.json()["idle_cycle_generation"] == 5
+    # Answered at acceptance (OD-214): the reply is the command's row.
+    assert response.json() == _reply("reset")
     assert runtime.calls[0][0] == "reset"
     assert (
         client.post(
@@ -347,17 +346,15 @@ def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
         response = client.get("/api/cycle/status")
     assert response.status_code == 200
     assert set(response.json()) == {
-        "program_runner_owner_epoch",
         "cycle_generation",
         "state",
         "program_run_id",
         "cycle_claim_generation",
         "terminal_or_settlement_reference",
         "execution_control_revision",
-        "causal_correlation_id",
-        "causal_session_id",
-        "causal_client_sequence",
+        "causal_request_key",
         "current_command_kind",
+        "runner_commands",
         "failure",
         "reset_phase",
         "reset_options",
@@ -394,7 +391,7 @@ def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
         assert runtime.control_state_observers == set()
         with client.websocket_connect("/ws/program/control-state") as websocket:
             first = websocket.receive_json()
-            assert first["schema_version"] == "manyforge.program_control_state.v2"
+            assert first["schema_version"] == "manyforge.program_control_state.v4"
             assert first["event_class"] == "critical"
             assert first["server_sequence"] == "1"
             assert first["program_cycle"]["execution_control_revision"] == 1
@@ -485,186 +482,63 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
             "/api/program/scene-preparations",
             json={
                 **_caller(),
-                "request_id": "request.prepare.1",
+                "request_key": _key("request.prepare.1"),
                 "expected_applied_record_digest": _DIGEST_B,
                 "expected_admission_generation": 7,
             },
         )
-        read = client.get("/api/program/runs/program-run.1")
-        motion_stopped = client.post(
-            "/api/program/runs/program-run.1/motion-stop",
-            json={
-                **_caller(),
-                "request_id": "request.motion-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
-                "reason": "ordinary operator motion Stop",
-            },
-        )
+        read = client.get("/api/program/runs/1")
         motion_started = client.post(
-            "/api/program/runs/program-run.1/motion-start",
+            "/api/program/runs/1/motion-start",
             json={
                 **_caller(),
-                "request_id": "request.motion-start.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
-                "expected_selection_revision": 0,
+                "request_key": _key("request.motion-start.1"),
+                "program_run_id": 1,
+                "expected_hold_revision": 0,
                 "group_ids": ["robot_group"],
                 "reason": "initial operator motion Run",
             },
         )
-        full_stopped = client.post(
-            "/api/program/runs/program-run.1/full-stop",
-            json={
-                **_caller(),
-                "request_id": "request.full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
-                "reason": "ordinary operator Full Stop",
-            },
-        )
         resumed = client.post(
-            "/api/program/runs/program-run.1/resume-full-stop",
+            "/api/program/runs/1/resume-halt",
             json={
                 **_caller(),
-                "request_id": "request.resume-full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
+                "request_key": _key("request.resume-halt.1"),
+                "program_run_id": 1,
                 "expected_run_revision": 1,
-                "reason": "operator Run after Full Stop",
+                "reason": "operator Execute after Halt",
             },
         )
-        discarded = client.post(
-            "/api/program/runs/program-run.1/discard-full-stop",
-            json={
-                **_caller(),
-                "request_id": "request.discard-full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
-                "expected_run_revision": 1,
-                "expected_cycle_generation": 4,
-                "expected_claim_generation": 7,
-                "reason": "operator Reset discarded Full Stop",
-            },
-        )
-        stopped = client.post(
-            "/api/program/runs/program-run.1/stop",
-            json={
-                **_caller(),
-                "request_id": "request.2",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
-                "reason": "operator stop",
-            },
-        )
+        # Kernel-first: the runner has no Stop route; every client Stop goes
+        # Headless -> Kernel.
+        removed_stop_routes = [
+            client.post(f"/api/program/runs/1/{route}", json={})
+            for route in (
+                "stop", "motion-stop", "full-stop", "discard-full-stop",
+                "resume-full-stop",
+            )
+        ]
 
     assert health.status_code == 200
     assert prepared.status_code == 200
     assert prepared.json()["status"] == "prepared"
     assert health.json()["started"] is True
-    assert index.json()["runs"][0]["capture"]["program_run_id"] == "program-run.1"
+    assert index.json()["runs"][0]["capture"]["program_run_id"] == 1
     assert started.status_code == 200
     assert read.status_code == 200
-    assert motion_stopped.json()["state"] == "running"
-    assert motion_started.json()["state"] == "running"
-    assert full_stopped.json()["state"] == "full_stopping"
-    assert resumed.json()["state"] == "running"
-    assert discarded.json()["state"] == "stopped"
-    assert stopped.json()["state"] == "stopping"
+    assert started.json() == _reply("start")
+    assert motion_started.json() == _reply("start_motion", _key("request.motion-start.1"))
+    assert resumed.json() == _reply("resume_halt", _key("request.resume-halt.1"))
+    assert [response.status_code for response in removed_stop_routes] == [404] * 5
     assert runtime.calls[0] == ("runs", (True, 7))
     assert runtime.calls[1][0] == "start"
     assert runtime.calls[2][0] == "prepare_scene"
-    assert runtime.calls[3] == ("read", "program-run.1")
-    assert runtime.calls[4][0] == "motion_stop"
-    assert runtime.calls[5][0] == "start_motion"
-    assert runtime.calls[6][0] == "full_stop"
-    assert runtime.calls[7][0] == "resume_full_stop"
-    assert runtime.calls[8][0] == "discard_full_stop"
-    assert runtime.calls[9][0] == "stop"
-    assert runtime.closed is True
-
-
-def test_stop_route_progresses_while_both_ordinary_workers_are_occupied() -> None:
-    class PressuredRuntime(FakeRuntime):
-        def __init__(self) -> None:
-            super().__init__()
-            self._lock = threading.Lock()
-            self._ordinary_started_count = 0
-            self.ordinary_workers_started = threading.Event()
-            self.release_ordinary = threading.Event()
-            self.stop_called = threading.Event()
-
-        def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
-            with self._lock:
-                self._ordinary_started_count += 1
-                if self._ordinary_started_count == 2:
-                    self.ordinary_workers_started.set()
-            self.release_ordinary.wait(timeout=2.0)
-            return super().start_run(request)
-
-        def stop_motion(
-            self,
-            program_run_id: str,
-            request: ProgramRunStopRequest,
-        ) -> dict[str, Any]:
-            self.stop_called.set()
-            return super().stop_motion(program_run_id, request)
-
-    runtime = PressuredRuntime()
-    app = create_app(runtime)
-    start_endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None) == "/api/program/runs"
-        and "POST" in (getattr(route, "methods", set()) or set())
-    )
-    stop_endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None)
-        == "/api/program/runs/{program_run_id}/motion-stop"
-    )
-    start_request = ProgramRunStartRequest.model_validate(
-        {
-            **_caller(),
-            "scenario_id": "cell-pick",
-            "source_document_digest": _DIGEST_A,
-            "expected_applied_record_digest": _DIGEST_B,
-            "draft_program_revision": _DIGEST_B,
-        }
-    )
-    stop_request = ProgramRunStopRequest.model_validate(
-        {
-            **_caller(),
-            "request_id": "request.stop.pressure",
-            "program_run_id": "program-run.1",
-            "expected_owner_epoch": "program-runner.epoch.1",
-            "reason": "priority qualification",
-        }
-    )
-
-    async def exercise() -> None:
-        async with app.router.lifespan_context(app):
-            ordinary = [
-                asyncio.create_task(start_endpoint(start_request)) for _ in range(2)
-            ]
-            try:
-                assert await asyncio.to_thread(
-                    runtime.ordinary_workers_started.wait,
-                    1.0,
-                )
-                stopped = await asyncio.wait_for(
-                    stop_endpoint("program-run.1", stop_request),
-                    timeout=0.5,
-                )
-                assert json.loads(stopped.body)["state"] == "running"
-                assert runtime.stop_called.is_set()
-                assert not runtime.release_ordinary.is_set()
-            finally:
-                runtime.release_ordinary.set()
-                await asyncio.gather(*ordinary)
-
-    asyncio.run(exercise())
+    assert runtime.calls[3] == ("read", 1)
+    assert runtime.calls[4][0] == "start_motion"
+    assert runtime.calls[5][0] == "resume_halt"
+    assert runtime.calls[5][1][0] == 1
+    assert isinstance(runtime.calls[5][1][1], ProgramHaltResumeRequest)
+    assert len(runtime.calls) == 6
     assert runtime.closed is True
 
 
@@ -673,15 +547,19 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
     client = TestClient(create_app(runtime))
     body = {
         **_caller(),
-        "program_run_id": "program-run.2",
-        "expected_owner_epoch": "program-runner.epoch.1",
+        "program_run_id": 2,
+        "expected_hold_revision": 0,
+        "group_ids": ["robot_group"],
         "reason": None,
     }
     with client:
         mismatch = client.post(
-            "/api/program/runs/program-run.1/stop",
+            "/api/program/runs/1/motion-start",
             json=body,
         )
+        # Run numbers are decimal integers >= 1 (1.15.3).
+        textual = client.get("/api/program/runs/program-run.1")
+        zero = client.get("/api/program/runs/0")
         unknown = client.post(
             "/api/program/runs",
             json={
@@ -696,13 +574,15 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
 
     assert mismatch.status_code == 400
     assert mismatch.json()["detail"]["code"] == "program_run_path_invalid"
+    assert textual.status_code == 422
+    assert zero.status_code == 422
     assert unknown.status_code == 422
     assert runtime.calls == []
 
 
 def test_private_surface_preserves_stable_owner_error_codes() -> None:
     class FailingRuntime(FakeRuntime):
-        def read_run(self, program_run_id: str) -> dict[str, Any]:
+        def read_run(self, program_run_id: int) -> dict[str, Any]:
             raise ProgramRunnerError(
                 "program_run_not_found",
                 f"unknown Program run {program_run_id}",
@@ -711,14 +591,14 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
 
     client = TestClient(create_app(FailingRuntime()))
     with client:
-        response = client.get("/api/program/runs/missing")
+        response = client.get("/api/program/runs/7")
 
     assert response.status_code == 404
     assert response.json() == {
         "detail": {
             "code": "program_run_not_found",
             "details": {},
-            "message": "unknown Program run missing",
+            "message": "unknown Program run 7",
             "producer": "kernel",
         }
     }
@@ -767,15 +647,17 @@ def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
     }
     with TestClient(create_app(runtime)) as client:
         assert client.get(base).json() == {"project_path": project}
-        assert client.post(base, json={**edit, "value": 3}).json() == {
-            "action": "set"
-        }
-        assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
+        assert client.post(base, json={**edit, "value": 3}).json() == _reply(
+            "persistent_value_set"
+        )
+        assert client.post(f"{base}/reset", json=edit).json() == _reply(
+            "persistent_value_reset"
+        )
         cleared = client.post(
             f"{base}/clear",
             json={**_caller(), "project_path": project},
         )
-        assert cleared.json() == {"action": "clear"}
+        assert cleared.json() == _reply("persistent_values_clear")
         # The project folder is absolute and lexically normalized.
         for path in (
             "projects/cell-pick.scenario",
@@ -799,15 +681,15 @@ def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
         # A live run is named with its revision; the register sequence is no
         # longer a fence (without a run the last admitted edit wins).
         assert client.post(
-            f"{base}/reset", json={**edit, "program_run_id": "run.1"}
+            f"{base}/reset", json={**edit, "program_run_id": 1}
         ).status_code == 422
         assert client.post(
             f"{base}/reset", json={**edit, "expected_sequence": 4}
         ).status_code == 422
         assert client.post(
             f"{base}/reset",
-            json={**edit, "program_run_id": "run.1", "expected_run_revision": 2},
-        ).json() == {"action": "reset"}
+            json={**edit, "program_run_id": 1, "expected_run_revision": 2},
+        ).json() == _reply("persistent_value_reset")
         assert client.post(
             f"{base}/clear",
             json={**_caller(), "project_path": project, "expected_sequence": 4},
@@ -840,24 +722,23 @@ def test_runtime_override_routes_are_removed_and_key_writes_remain() -> None:
 def test_node_correction_preview_is_a_plain_runner_query() -> None:
     runtime = FakeRuntime()
     body = {
-        "schema_version": "manyforge.program_node_correction_preview_request.v1",
-        "request_id": "node-preview.1",
-        "program_run_id": "program-run.1",
-        "expected_owner_epoch": "program-runner.epoch.1",
+        "schema_version": "manyforge.program_node_correction_preview_request.v2",
+        "request_key": _key("node-preview.1"),
+        "program_run_id": 1,
         "program_id": "lite6_program",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "a" * 64,
         "node_instance_id": "move",
-        "node_attempt_id": "attempt:1",
+        "node_attempt_id": 1,
         "proposed_inputs": [{"path": "goal", "value": []}],
     }
 
     with TestClient(create_app(runtime)) as client:
         response = client.post(
-            "/api/program/runs/program-run.1/node-correction-previews", json=body
+            "/api/program/runs/1/node-correction-previews", json=body
         )
         foreign = client.post(
-            "/api/program/runs/program-run.1/node-correction-previews",
+            "/api/program/runs/1/node-correction-previews",
             json={**body, "target_role_id": "other"},
         )
 
@@ -885,8 +766,6 @@ def test_run_contract_removes_client_generation_and_rejects_old_wire_field():
 
 @pytest.mark.parametrize("code,status", [
     ("program_run_started_then_failed", 422),
-    ("program_run_superseded_by_stop", 422),
-    ("program_run_stopped_before_start", 409),
     ("authoring_not_ready", 409),
     ("program_cycle_reconciliation_required", 503),
     ("program_runner_internal_error", 500),
@@ -894,14 +773,14 @@ def test_run_contract_removes_client_generation_and_rejects_old_wire_field():
 def test_started_then_failed_response_preserves_actual_identity_and_native_details(
     code: str, status: int,
 ) -> None:
-    details = {"program_run_id": "program-cycle.2", "claim_generation": 9, "needs_reset": True,
+    details = {"program_run_id": 2, "claim_generation": 9, "needs_reset": True,
         "cause_code": "component_lifecycle_facts_stale", "admission_changed": "true",
         "admission_generation_before": "36", "admission_generation_after": "37"}
     class FailedStart(FakeRuntime):
         def start_run(self, _request):
             raise ProgramRunnerError(code, "Owner outcome", details=details)
     with TestClient(create_app(FailedStart())) as client:
-        response = client.post("/api/program/runs", json={**_caller(), "request_id": "run.failed.1",
+        response = client.post("/api/program/runs", json={**_caller(), "request_key": _key("run.failed.1"),
             "scenario_id": "cell-pick", "source_document_digest": _DIGEST_A,
             "expected_applied_record_digest": _DIGEST_B, "draft_program_revision": _DIGEST_A})
     assert response.status_code == status
@@ -915,3 +794,42 @@ def test_run_refusals_are_409_not_5xx() -> None:
     for code in RUN_REFUSAL_CODES:
         assert _status(code) == 409, code
     assert _status("program_runner_unavailable") == 503
+
+
+def test_a_forwarded_request_without_its_key_is_a_bad_request() -> None:
+    """1.15.1: the runner refuses a request Headless forwarded without its key
+    with ``request_key_required``, an internal contract violation (400)."""
+
+    class KeylessRuntime(FakeRuntime):
+        def start_run(self, request):
+            raise ProgramRunnerError(
+                "request_key_required", "the forwarded request carries no request key"
+            )
+
+    client = TestClient(create_app(KeylessRuntime()))
+    with client:
+        response = client.post(
+            "/api/program/runs",
+            json={
+                "source_label": "operator_ui",
+                "scenario_id": "cell-pick",
+                "source_document_digest": _DIGEST_A,
+                "expected_applied_record_digest": _DIGEST_B,
+                "draft_program_revision": _DIGEST_B,
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "request_key_required"
+
+
+def test_startup_collects_once_after_start_and_before_serving(monkeypatch) -> None:
+    runtime = FakeRuntime()
+    settles: list[tuple[str, bool, int]] = []
+    monkeypatch.setattr(
+        "manyforge_program_runner.app.settle_heap",
+        lambda point: settles.append((point, runtime.started, len(runtime.calls))),
+    )
+    with TestClient(create_app(runtime)) as client:
+        assert settles == [("start", True, 0)]
+        assert client.get("/api/program/health").status_code == 200
+    assert settles == [("start", True, 0)]

@@ -26,6 +26,7 @@ import {
 } from '../state/newScenario';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
 import { errorMessage } from '../state/structuralResource';
+import { COMPONENT_ACTION_REASON, DOCUMENT_MOTION_REASON } from '../state/heldRunAuthoring';
 import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 
 type ScenarioAction = 'new' | 'save_as' | 'load';
@@ -43,6 +44,14 @@ interface ScenarioDocumentCommandsProps {
   localInvalidEdit?: boolean;
   /** Robots are moving (Program motion not held, or a manual operation). */
   motionActive?: boolean;
+  /**
+   * Why New waits for the robots (`newMotionReason`), or null; defaults to
+   * the motion reason while `motionActive`, else the component-action
+   * reason while `componentActionActive`.
+   */
+  newWaitReason?: string | null;
+  /** A component action is running (`componentActionRunning`): Load waits (OD-194). */
+  componentActionActive?: boolean;
   /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
   authoringAdmissionAllowed?: boolean | null;
   /** Admission for New and Load; defaults to `authoringAdmissionAllowed`. */
@@ -105,13 +114,21 @@ export function ScenarioDocumentCommands({
   deploymentDirty = false,
   localInvalidEdit = false,
   motionActive = false,
+  componentActionActive = false,
+  // New waits while motion executes or a Stop is in progress, and names that
+  // before any admission step (maintainer, 2026-11-13).
+  newWaitReason: newMotionReason = motionActive ? DOCUMENT_MOTION_REASON
+    : componentActionActive ? COMPONENT_ACTION_REASON : null,
   authoringAdmissionAllowed = null,
   replacementAdmissionAllowed = authoringAdmissionAllowed,
   cellComponents = [],
 }: ScenarioDocumentCommandsProps) {
   const authoringAdmissionTooltip = useAuthoringAdmissionTooltip();
   // Document actions wait while robots move (maintainer, 2026-10-16).
-  const motionReason = motionActive ? 'Not available while robots are moving. Stop motion first.' : null;
+  const motionReason = motionActive ? DOCUMENT_MOTION_REASON : null;
+  // Load starts with New: it waits while a component action runs (OD-194).
+  const loadWaitReason = motionReason
+    ?? (componentActionActive ? COMPONENT_ACTION_REASON : null);
   const {
     state,
     busyOperation: operation,
@@ -185,6 +202,7 @@ export function ScenarioDocumentCommands({
       : workspace === null ? 'Program workspace is not loaded.'
         // A finished or stopped run is the server's to decide.
         : scenarioReplacementUnavailableReason ?? null);
+  const newEntryReason = newMotionReason ?? replacementEntryReason;
   const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
   const draftDiscarded = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
@@ -339,7 +357,8 @@ export function ScenarioDocumentCommands({
   const completeReplacement = async (kind: 'new' | 'load', acknowledged = false) => {
     if (replacementInFlight.current) return;
     const path = kind === 'load' ? selectedScenarioPath : null;
-    if (replacementEntryReason !== null || (kind === 'load' && path === null)) return;
+    if ((kind === 'new' ? newEntryReason : replacementEntryReason) !== null
+      || (kind === 'load' && path === null)) return;
     // Stopping the cell's components or discarding Draft changes is the
     // operator's choice: one confirmation, the same for New and Load.
     if (replaceNeedsConfirmation && !acknowledged) {
@@ -372,7 +391,7 @@ export function ScenarioDocumentCommands({
   // New has no form: it asks only when Draft changes would be discarded.
   useEffect(() => {
     if (action === 'new' && confirmation === null && !replacementPending && newError === null
-      && replacementEntryReason === null) void completeReplacement('new');
+      && newEntryReason === null) void completeReplacement('new');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [action]);
   // Same look as the Reset/Execute confirmations: a short lead, the
@@ -398,15 +417,17 @@ export function ScenarioDocumentCommands({
       <p>Robots and physically held parts may remain; account for them before using the next cell.</p>
     </>;
   const confirmationTitle = confirmation?.kind === 'new' ? 'New Scenario?' : 'Load Scenario?';
+  const confirmationBlock = (confirmation?.kind === 'new' ? newMotionReason : null)
+    ?? replacementAdmissionBlock;
 
   return (
     <>
       <div className="scenario-commands" role="group" aria-label="Scenario">
         <ScenarioIconButton
           label="New"
-          reason={motionReason ?? replacementEntryReason}
-          disabled={motionReason !== null || replacementEntryReason !== null}
-          disabledTooltip={replacementAdmissionBlock ?? undefined}
+          reason={newEntryReason}
+          disabled={newEntryReason !== null}
+          disabledTooltip={newMotionReason === null ? replacementAdmissionBlock ?? undefined : undefined}
           operation={operation}
           commands="new"
           onClick={(event) => beginAction('new', event)}
@@ -448,8 +469,8 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label="Load Scenario"
-          reason={motionReason ?? replacementEntryReason}
-          disabled={motionReason !== null || replacementEntryReason !== null}
+          reason={loadWaitReason ?? replacementEntryReason}
+          disabled={loadWaitReason !== null || replacementEntryReason !== null}
           disabledTooltip={replacementAdmissionBlock ?? undefined}
           operation={operation}
           commands="load"
@@ -696,8 +717,8 @@ export function ScenarioDocumentCommands({
               {loadFailed && (
                 <button
                   type="button"
-                  disabled={busy || replacementEntryReason !== null}
-                  title={replacementEntryReason ?? 'Empty the cell and open the empty Untitled Scenario.'}
+                  disabled={busy || newEntryReason !== null}
+                  title={newEntryReason ?? 'Empty the cell and open the empty Untitled Scenario.'}
                   onClick={() => void completeReplacement('new')}
                 >
                   Load empty scenario
@@ -730,8 +751,8 @@ export function ScenarioDocumentCommands({
           <div className="dialog-actions">
             <button type="button" onClick={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>Cancel</button>
             <button type="button" className="danger-button"
-              disabled={replacementAdmissionBlock !== null}
-              title={replacementAdmissionBlock ?? undefined}
+              disabled={confirmationBlock !== null}
+              title={confirmationBlock ?? undefined}
               onClick={() => {
               if (confirmation !== null) void completeReplacement(confirmation.kind, true);
             }}>{confirmation?.kind === 'new' ? 'Empty the cell and continue' : 'Load Scenario'}</button>

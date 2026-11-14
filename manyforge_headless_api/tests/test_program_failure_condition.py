@@ -18,10 +18,10 @@ from manyforge_headless_api.native import HeadlessApiError
 
 
 def _failure_row(
-    operation_id: str = "operation.1",
+    operation_id: int = 1,
     *,
     node: str = "move",
-    attempt: str = "move.attempt.1",
+    attempt: int = 1,
     resources: list[str] | None = None,
     recovery_class: str = "failed_validation",
     facts: list[dict[str, str]] | None = None,
@@ -31,7 +31,6 @@ def _failure_row(
         "node_attempt_id": attempt,
         "operator_facing_run_revision": 2,
         "operation": {
-            "source_owner_epoch": "kernel.1",
             "operation_id": operation_id,
             "operation_revision": 1,
         },
@@ -52,13 +51,11 @@ def _cycle(
     run_state: str | None,
     run_revision: int = 2,
     rows: list[dict[str, Any]] | None = None,
-    epoch: str = "runner.1",
     logic_only: bool = False,
-    run_id: str = "run.1",
+    run_id: int = 1,
     omit_failures: bool = False,
 ) -> dict[str, Any]:
     cycle: dict[str, Any] = {
-        "program_runner_owner_epoch": epoch,
         "execution_control_revision": control,
         "cycle_generation": 2,
         "state": "idle_after_reset",
@@ -75,10 +72,9 @@ def _cycle(
         "reset_options": None,
         "reset_robot_position": {"available": False, "reason": "unsupported"},
         "current_command_kind": None,
+        "runner_commands": {"in_progress": None, "ended": []},
         "allowed_commands": [],
-        "causal_correlation_id": None,
-        "causal_session_id": None,
-        "causal_client_sequence": None,
+        "causal_request_key": None,
         "failure": None,
     }
     if run_state is None:
@@ -98,30 +94,26 @@ def _cycle(
     }
     capture.update(
         {
-            "schema_version": "manyforge.program_run_capture.v2",
+            "schema_version": "manyforge.program_run_capture.v3",
             "program_run_id": run_id,
             "scenario_id": "pick",
             "program_id": "program.pick",
             "node_policies": [],
             "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
             "owner_identities": [
-                {
-                    "owner_role": "program_runner",
-                    "owner_id": "runner",
-                    "owner_epoch": epoch,
-                }
+                {"role": "program_runner", "application_start_id": "3f9a0000000000a1"}
             ],
         }
     )
     failed = run_state != "running"
     run = {
-        "schema_version": "manyforge.program_run_status.v4",
+        "schema_version": "manyforge.program_run_status.v5",
         "owner_id": "runner",
-        "owner_epoch": epoch,
         "run_revision": run_revision,
         "capture": capture,
         "state": run_state,
         "tree_status": "failure" if run_state == "failed" else "running",
+        "halt": None,
         "node_status_revision": run_revision,
         "node_statuses": {"move": "held" if failed else "running"},
         "active_operation_count": 0,
@@ -194,11 +186,10 @@ class _Observer:
 
 def _ingress() -> ExecutionControlIngress:
     return ExecutionControlIngress(
-        projection=lambda: ("runner.1", 4),
+        projection=lambda: 4,
         dispatch=lambda _request, _stamp: None,
-        authority=ControlFreshnessAuthority(
-            receiver_incarnation="receiver.1", secret=b"x" * 32
-        ),
+        application_start_id="3f9a0000000000a1",
+        authority=ControlFreshnessAuthority(secret=b"x" * 32),
     )
 
 
@@ -231,7 +222,7 @@ def test_zero_client_demand_keeps_the_one_program_reader_running() -> None:
         observer.called = asyncio.Event()
         source = HeadlessControlStateSource(
             SimpleNamespace(
-                program_cycle_status=lambda: held,
+                program_cycle_status=lambda **_kwargs: held,
                 component_overview_facts=lambda *, program_cycle, cancelled=None: (
                     ComponentOverviewFacts(
                         runtime={},
@@ -259,7 +250,7 @@ def test_zero_client_demand_keeps_the_one_program_reader_running() -> None:
             assert source.active_clients == 0
             assert reader is not None and not reader.done()
             assert source._cold_task is None  # noqa: SLF001
-            assert observer.states() == [("active", "operation.1", 5)]
+            assert observer.states() == [("active", 1, 5)]
             # A browser shares the same reader; leaving keeps it running.
             subscription = await source.subscribe()
             assert source._runner_task is reader  # noqa: SLF001
@@ -293,20 +284,18 @@ def test_held_operation_failure_is_active_once(source_and_observer) -> None:
     )
     assert observer.calls == [
         {
-            "schema_version": "manyforge.program_failure_condition.v1",
-            "program_runner_owner_epoch": "runner.1",
+            "schema_version": "manyforge.program_failure_condition.v2",
             "execution_control_revision": 5,
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "run_revision": 2,
             "state": "active",
             "occurrence": {
                 "node_instance_id": "move",
-                "node_attempt_id": "move.attempt.1",
+                "node_attempt_id": 1,
                 "operator_facing_run_revision": 2,
             },
             "operation": {
-                "source_owner_epoch": "kernel.1",
-                "operation_id": "operation.1",
+                "operation_id": 1,
                 "operation_revision": 1,
             },
             "resource_ids": ["robot.arm"],
@@ -357,13 +346,13 @@ def test_accepted_retry_leaving_the_hold_clears_with_original_provenance(
     _accept(source, _cycle(control=5, run_state="intervention_required", rows=[_failure_row()]))
     # Running again without a later accepted control revision is no release.
     _accept(source, _cycle(control=5, run_state="running", run_revision=3))
-    assert observer.states() == [("active", "operation.1", 5)]
+    assert observer.states() == [("active", 1, 5)]
     # The Runner's accepted Retry advances the control revision exactly once
     # (ProgramRuntime.apply_recovery_action); the cycle stays running.
     _accept(source, _cycle(control=6, run_state="running", run_revision=4))
     assert observer.states() == [
-        ("active", "operation.1", 5),
-        ("clear", "operation.1", 6),
+        ("active", 1, 5),
+        ("clear", 1, 6),
     ]
     cleared = observer.calls[-1]
     assert cleared["run_revision"] == 4
@@ -387,21 +376,21 @@ def test_failed_run_stays_active_until_reset_completes(source_and_observer) -> N
         source,
         _cycle(control=7, run_state="failed", run_revision=4, rows=[_failure_row()]),
     )
-    assert observer.states() == [("active", "operation.1", 5)]
+    assert observer.states() == [("active", 1, 5)]
     _accept(source, _cycle(control=8, run_state=None))
     assert observer.states() == [
-        ("active", "operation.1", 5),
-        ("clear", "operation.1", 8),
+        ("active", 1, 5),
+        ("clear", 1, 8),
     ]
     # Completed Reset retires the run; its last Run revision is retained.
-    assert observer.calls[-1]["program_run_id"] == "run.1"
+    assert observer.calls[-1]["program_run_id"] == 1
     assert observer.calls[-1]["run_revision"] == 4
 
 
 def test_stopped_run_with_unresolved_failure_is_active(source_and_observer) -> None:
     source, observer = source_and_observer
     _accept(source, _cycle(control=5, run_state="stopped", rows=[_failure_row()]))
-    assert observer.states() == [("active", "operation.1", 5)]
+    assert observer.states() == [("active", 1, 5)]
 
 
 def test_source_invalidation_reports_unknown_and_recovery_restates(
@@ -413,21 +402,13 @@ def test_source_invalidation_reports_unknown_and_recovery_restates(
     source._invalidate_source("program")  # noqa: SLF001
     source._invalidate_source("program")  # noqa: SLF001
     assert observer.states() == [
-        ("active", "operation.1", 5),
-        ("unknown", "operation.1", 5),
+        ("active", 1, 5),
+        ("unknown", 1, 5),
     ]
     # Recovery with the same current cycle restates the condition as good.
     _accept(source, held)
-    assert observer.states()[-1] == ("active", "operation.1", 5)
+    assert observer.states()[-1] == ("active", 1, 5)
     assert len(observer.calls) == 3
-
-
-def test_owner_replacement_never_clears(source_and_observer) -> None:
-    source, observer = source_and_observer
-    _accept(source, _cycle(control=5, run_state="failed", rows=[_failure_row()]))
-    _accept(source, _cycle(control=1, run_state=None, epoch="runner.2"))
-    _accept(source, _cycle(control=9, run_state="running", epoch="runner.2"))
-    assert observer.states() == [("active", "operation.1", 5)]
 
 
 def test_multiple_origins_are_observed_once_each_with_own_resources(
@@ -435,11 +416,11 @@ def test_multiple_origins_are_observed_once_each_with_own_resources(
 ) -> None:
     source, observer = source_and_observer
     rows = [
-        _failure_row("operation.1", resources=["robot.arm"]),
+        _failure_row(1, resources=["robot.arm"]),
         _failure_row(
-            "operation.2",
+            2,
             node="grip",
-            attempt="grip.attempt.1",
+            attempt=2,
             resources=["gripper.a", "gripper.b"],
         ),
     ]
@@ -449,23 +430,23 @@ def test_multiple_origins_are_observed_once_each_with_own_resources(
         (call["operation"]["operation_id"], call["resource_ids"])
         for call in observer.calls
     ] == [
-        ("operation.1", ["robot.arm"]),
-        ("operation.2", ["gripper.a", "gripper.b"]),
+        (1, ["robot.arm"]),
+        (2, ["gripper.a", "gripper.b"]),
     ]
     # Both holds were released before this projection was read: the Runner
     # advanced the control revision once per accepted release.
     _accept(source, _cycle(control=7, run_state="running", run_revision=3))
     assert sorted(observer.states()[2:]) == [
-        ("clear", "operation.1", 7),
-        ("clear", "operation.2", 7),
+        ("clear", 1, 7),
+        ("clear", 2, 7),
     ]
 
 
 def _two_holds() -> list[dict[str, Any]]:
     return [
-        _failure_row("operation.1"),
+        _failure_row(1),
         _failure_row(
-            "operation.2", node="grip", attempt="grip.attempt.1", resources=["gripper.a"]
+            2, node="grip", attempt=2, resources=["gripper.a"]
         ),
     ]
 
@@ -480,16 +461,16 @@ def test_retry_of_one_hold_clears_only_its_alarm(source_and_observer) -> None:
     # The Runner advanced the control revision once for that release.
     _accept(source, _cycle(control=6, run_state="running", run_revision=3, rows=[second]))
     assert observer.states() == [
-        ("active", "operation.1", 5),
-        ("active", "operation.2", 5),
-        ("clear", "operation.1", 6),
+        ("active", 1, 5),
+        ("active", 2, 5),
+        ("clear", 1, 6),
     ]
     # A later revision that releases nothing (e.g. another control) keeps it.
     _accept(source, _cycle(control=7, run_state="running", run_revision=4, rows=[second]))
     assert len(observer.calls) == 3
     # The second hold's release is its own single Runner advance.
     _accept(source, _cycle(control=8, run_state="running", run_revision=5))
-    assert observer.states()[-1] == ("clear", "operation.2", 8)
+    assert observer.states()[-1] == ("clear", 2, 8)
 
 
 def test_continue_of_one_hold_clears_its_alarm(source_and_observer) -> None:
@@ -504,7 +485,7 @@ def test_continue_of_one_hold_clears_its_alarm(source_and_observer) -> None:
         source,
         _cycle(control=6, run_state="intervention_required", run_revision=3, rows=[first]),
     )
-    assert observer.states()[2:] == [("clear", "operation.2", 6)]
+    assert observer.states()[2:] == [("clear", 2, 6)]
 
 
 def test_a_dropped_row_clears_only_under_a_later_control_revision(
@@ -524,7 +505,7 @@ def test_a_dropped_row_clears_only_under_a_later_control_revision(
         source,
         _cycle(control=6, run_state="intervention_required", run_revision=4, rows=[first]),
     )
-    assert observer.states()[2:] == [("clear", "operation.2", 6)]
+    assert observer.states()[2:] == [("clear", 2, 6)]
 
 
 def test_observer_failure_never_stops_the_reader_and_is_restated(
@@ -544,7 +525,7 @@ def test_observer_failure_never_stops_the_reader_and_is_restated(
             rows=[_failure_row()],
         ),
     )
-    assert observer.states() == [("active", "operation.1", 5)]
+    assert observer.states() == [("active", 1, 5)]
 
 
 @pytest.mark.parametrize(
@@ -553,7 +534,7 @@ def test_observer_failure_never_stops_the_reader_and_is_restated(
         {**_failure_row(), "resource_ids": ["b", "a"]},
         {**_failure_row(), "resource_ids": []},
         {**_failure_row(), "unexpected": 1},
-        {**_failure_row(), "operation": {"operation_id": "operation.1"}},
+        {**_failure_row(), "operation": {"operation_id": 1}},
         {**_failure_row(), "operator_facing_run_revision": 0},
     ],
 )
@@ -588,7 +569,7 @@ def test_raw_co_participant_facts_never_suppress_the_selected_failure(
     # that succeeded or ended differently does not hide the selected cause.
     source, observer = source_and_observer
     _accept(source, _cycle(control=5, run_state="failed", rows=[_failure_row(facts=facts)]))
-    assert observer.states() == [("active", "operation.1", 5)]
+    assert observer.states() == [("active", 1, 5)]
 
 
 def test_a_run_without_its_operation_failures_key_is_unknown_never_no_failure(
@@ -601,7 +582,7 @@ def test_a_run_without_its_operation_failures_key_is_unknown_never_no_failure(
             source,
             _cycle(control=6, run_state="running", run_revision=3, omit_failures=True),
         )
-    assert observer.states() == [("active", "operation.1", 5)]  # Never cleared.
+    assert observer.states() == [("active", 1, 5)]  # Never cleared.
 
 
 def test_a_new_run_of_the_same_owner_clears_the_previous_runs_failures(
@@ -610,9 +591,9 @@ def test_a_new_run_of_the_same_owner_clears_the_previous_runs_failures(
     source, observer = source_and_observer
     _accept(source, _cycle(control=5, run_state="failed", rows=[_failure_row()]))
     # No idle_after_reset was observed in between; the earlier Run is gone.
-    _accept(source, _cycle(control=7, run_state="running", run_id="run.2"))
+    _accept(source, _cycle(control=7, run_state="running", run_id=2))
     assert observer.states() == [
-        ("active", "operation.1", 5),
-        ("clear", "operation.1", 7),
+        ("active", 1, 5),
+        ("clear", 1, 7),
     ]
-    assert observer.calls[-1]["program_run_id"] == "run.1"
+    assert observer.calls[-1]["program_run_id"] == 1

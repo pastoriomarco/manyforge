@@ -33,8 +33,8 @@ from .private_transport import (
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v2"
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
 MAX_MANAGER_PACKET_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -44,7 +44,6 @@ _SCENE_REPLAY_STATUSES = {
     "request_result_expired",
     "request_id_conflict",
     "request_ledger_full",
-    "stale_request_owner_epoch",
 }
 _SCENE_PROJECTION_STATUSES = {
     "not_attempted",
@@ -65,12 +64,12 @@ class ManagerPort(Protocol):
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]: ...
 
     def observe_apply(
-        self, apply_id: str, apply_generation: int
+        self, apply_id: int, apply_generation: int
     ) -> dict[str, Any]: ...
 
     def acknowledge_apply(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]: ...
@@ -256,10 +255,8 @@ class ManagerCommandClient:
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner refusal is invalid")
         if (response.get("ok") is not True or set(response) != {
                 "api_version", "ok", "cell_id", "initialization_generation",
-                "initialization_state", "runtime_identity", "scene_runtime_owner_epoch"}
+                "initialization_state", "runtime_identity"}
                 or not isinstance(response.get("cell_id"), str)
-                or not isinstance(response.get("scene_runtime_owner_epoch"), str)
-                or not response["scene_runtime_owner_epoch"]
                 or not isinstance(response.get("runtime_identity"), dict)):
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner response is invalid")
         return response
@@ -280,7 +277,6 @@ class ManagerCommandClient:
                     request.expected_admission_generation
                 ),
                 "expected_current": request.expected_current.model_dump(),
-                "request_owner_epoch": request.request_owner_epoch,
             }
         )
         return response
@@ -292,15 +288,13 @@ class ManagerCommandClient:
                 "command": "apply",
                 "accepted_impact_digest": request.accepted_impact_digest,
                 "candidate_receipt": request.candidate_receipt.model_dump(),
-                "correlation_id": request.correlation_id,
                 "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,
                 "expected_current": request.expected_current.model_dump(),
                 "reject_if_affected_busy": request.reject_if_affected_busy,
                 "prepared_activation": request.prepared_activation.model_dump(),
                 "scene_initialization": request.scene_initialization,
-                "request_id": request.request_id,
-                "request_owner_epoch": request.request_owner_epoch,
+                "request_key": request.request_key,
                 "source_label": request.source_label,
                 "admission_context": (
                     {
@@ -331,14 +325,14 @@ class ManagerCommandClient:
         self,
         command_name: str,
         label: str,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext | None = None,
     ) -> dict[str, Any]:
+        # ``apply_id`` is the Manager's Apply number (contract 1.16.1).
         if (
-            not isinstance(apply_id, str)
-            or not apply_id
-            or len(apply_id.encode("utf-8")) > 256
+            type(apply_id) is not int
+            or not 1 <= apply_id <= _MAXIMUM_SAFE_INTEGER
             or type(apply_generation) is not int
             or not 1 <= apply_generation <= _MAXIMUM_SAFE_INTEGER
         ):
@@ -387,7 +381,7 @@ class ManagerCommandClient:
         return response
 
     def observe_apply(
-        self, apply_id: str, apply_generation: int
+        self, apply_id: int, apply_generation: int
     ) -> dict[str, Any]:
         return self._apply_status_command(
             "apply_status", "Manager Apply status", apply_id, apply_generation
@@ -395,7 +389,7 @@ class ManagerCommandClient:
 
     def acknowledge_apply(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]:
@@ -442,7 +436,7 @@ class ManagerCommandClient:
             and (
                 not isinstance(released, dict)
                 or set(released) != {"apply_id", "apply_generation"}
-                or not isinstance(released["apply_id"], str)
+                or type(released["apply_id"]) is not int
                 or type(released["apply_generation"]) is not int
             )
         ):
@@ -461,8 +455,7 @@ class ManagerCommandClient:
             "ok",
             "projection_status",
             "replay_status",
-            "request_id",
-            "request_owner_epoch",
+            "request_key",
             "transaction_sequence",
             "update_status",
         }

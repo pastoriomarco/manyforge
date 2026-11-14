@@ -120,17 +120,20 @@ ControllerLaunchSupervisor::Ensured StartSimulatedPlcCandidate(
   if (!borrowed_drivers)
     for (const auto &driver : drivers)
       if (driver)
-        driver->SetSupervisedProcessFaultSource(
-            [source = ControllerLaunchSupervisor::fault_source(process)]()
-                -> std::optional<core::ErrorDTO> {
-              auto reason = source();
-              if (!reason)
-                return std::nullopt;
-              return core::ErrorDTO{"simulated_plc_exited", std::move(*reason),
-                                    {}};
-            });
+        driver->SetSupervisedProcessFaultSource(SimulatedPlcFaultSource(process));
   unowned.ensured = nullptr;
   return ensured;
+}
+
+std::function<std::optional<core::ErrorDTO>()>
+SimulatedPlcFaultSource(std::shared_ptr<ControllerLaunchProcess> process) {
+  return [source = ControllerLaunchSupervisor::fault_source(std::move(process))]()
+             -> std::optional<core::ErrorDTO> {
+    auto reason = source();
+    if (!reason)
+      return std::nullopt;
+    return core::ErrorDTO{"simulated_plc_exited", std::move(*reason), {}};
+  };
 }
 
 } // namespace manyforge::roboplan_backend::host_detail

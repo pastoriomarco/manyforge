@@ -22,7 +22,7 @@ from manyforge_composer.backend.state import ComposerState
 
 
 def _node_environment() -> VerifiedActiveNodeEnvironment:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     return VerifiedActiveNodeEnvironment(
         payload={
             "retained_bundle_id": "bundle.1",
@@ -31,7 +31,6 @@ def _node_environment() -> VerifiedActiveNodeEnvironment:
                 "selection_projection_generation": 7,
                 "selection_source_content_digest": "sha256:" + "a" * 64,
                 "selection_source_generation": 3,
-                "selection_source_owner_epoch": "manager.epoch.1",
                 "selection_source_owner_id": "component-manager.cell-a",
             },
         },
@@ -46,16 +45,13 @@ def _source() -> dict:
         "freshness": "fresh",
         "known_gaps": [],
         "projection_generation": 1,
-        "projection_owner_epoch": "headless.epoch.1",
         "receiver_age_ns": 10,
         "selection_projection_generation": 7,
         "selection_source_content_digest": "sha256:" + "a" * 64,
         "selection_source_generation": 3,
-        "selection_source_owner_epoch": "manager.epoch.1",
         "selection_source_owner_id": "component-manager.cell-a",
         "source_content_digest": "sha256:" + "b" * 64,
         "source_generation": 1,
-        "source_owner_epoch": "headless.epoch.1",
         "source_owner_id": "headless-api.source-model",
         "source_owner_kind": "source_model_projection",
     }
@@ -68,7 +64,7 @@ def _seal(payload: dict) -> dict:
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v3",
+                b"manyforge.source_model_projection.v4",
                 canonical_json_bytes(semantic),
             )
         )
@@ -78,7 +74,7 @@ def _seal(payload: dict) -> dict:
 
 def _projection() -> dict:
     return _seal({
-        "schema_version": "manyforge.source_model_projection.v3",
+        "schema_version": "manyforge.source_model_projection.v4",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -250,7 +246,7 @@ def test_empty_projection_carries_no_model_map_identity() -> None:
 
 
 def _context() -> tuple[ComposerState, dict]:
-    return ComposerState(), {
+    return ComposerState(application_start_id=0x3F9A0000000000A1), {
         "schema_version": "manyforge.source_model_context.v1",
         "node_environment": _node_environment().payload,
         "source_model": _projection(),
@@ -305,7 +301,7 @@ def _duplicate_end_effector_identity(payload: dict) -> None:
             lambda payload: payload["source"].update(
                 {"selection_source_generation": 4}
             ),
-            "selection epochs disagree",
+            "selections disagree",
         ),
         (
             lambda payload: payload.update({"retained_bundle_id": "bundle.2"}),
@@ -319,25 +315,19 @@ def _duplicate_end_effector_identity(payload: dict) -> None:
             lambda payload: payload["source"].update(
                 {"selection_projection_generation": 8}
             ),
-            "selection epochs disagree",
+            "selections disagree",
         ),
         (
             lambda payload: payload["source"].update(
                 {"selection_source_content_digest": "sha256:" + "c" * 64}
             ),
-            "selection epochs disagree",
-        ),
-        (
-            lambda payload: payload["source"].update(
-                {"selection_source_owner_epoch": "manager.epoch.2"}
-            ),
-            "selection epochs disagree",
+            "selections disagree",
         ),
         (
             lambda payload: payload["source"].update(
                 {"selection_source_owner_id": "component-manager.cell-b"}
             ),
-            "selection epochs disagree",
+            "selections disagree",
         ),
         (
             lambda payload: payload["targets"][0]["model_groups"][0].update(

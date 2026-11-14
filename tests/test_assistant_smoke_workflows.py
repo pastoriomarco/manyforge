@@ -67,7 +67,7 @@ class _ProviderHttp:
         if method == "GET" and path == "/api/assistant/modes":
             return _JsonResponse(
                 {
-                    "schema_version": "manyforge.assistant_mode_index.v2",
+                    "schema_version": "manyforge.assistant_mode_index.v3",
                     "modes": [{"mode": PROVIDER.ASSISTANT_MODE}],
                     "ai_model_component_id": "mock_chat_model",
                     "assistant_component_id": "assistant",
@@ -76,7 +76,7 @@ class _ProviderHttp:
         if method == "GET" and path == "/api/assistant/modes/composer-assistant":
             return _JsonResponse(
                 {
-                    "schema_version": "manyforge.assistant_mode_projection.v2",
+                    "schema_version": "manyforge.assistant_mode_projection.v3",
                     "mode": PROVIDER.ASSISTANT_MODE,
                     "model_endpoint": {
                         "model_endpoint_alias": "assistant_model",

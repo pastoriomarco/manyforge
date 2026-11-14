@@ -51,8 +51,7 @@ template <typename T>
          left.program_run_id == right.program_run_id &&
          left.expected_graph_revision == right.expected_graph_revision &&
          left.expected_retained_bundle_id == right.expected_retained_bundle_id &&
-         left.expected_scene_revision == right.expected_scene_revision &&
-         left.request_context.request_owner_epoch == right.request_context.request_owner_epoch;
+         left.expected_scene_revision == right.expected_scene_revision;
 }
 
 [[nodiscard]] bool same_motion_target(const OperationIntentDTO& left,
@@ -88,10 +87,10 @@ template <typename T>
                                 "pick/place planning intent is incomplete, stale, or crosses its "
                                 "Program, arm, scene, or deployment context");
   }
-  std::set<RequestId> request_ids{
-      approach.request_context.request_id, descend.request_context.request_id,
-      tool.request_context.request_id, retreat.request_context.request_id};
-  if (request_ids.size() != 4U) {
+  std::set<RequestKey> request_keys{
+      approach.request_context.request_key, descend.request_context.request_key,
+      tool.request_context.request_key, retreat.request_context.request_key};
+  if (request_keys.size() != 4U) {
     return planning_error<void>("pick_place_request_id_duplicate",
                                 "pick/place phase request identities must be distinct");
   }
@@ -344,12 +343,12 @@ struct ResolvedPickOffsetBases final {
 [[nodiscard]] SceneTransactionRequestDTO attach_request(
     const PickSequencePlanningIntentDTO& intent, const ProjectionRevisionDTO& projection_revision,
     const RuntimeParticipantBindingDTO& carrier_binding, std::vector<CollisionBodyRoleId> roles,
-    std::vector<ComponentAttachmentRevision> structural_revisions,
-    const RequestOwnerEpoch& scene_owner_epoch) {
+    std::vector<ComponentAttachmentRevision> structural_revisions) {
+  // The attach is a further action of the sequence's approach request (part
+  // 1, contract 1.4 fan-out), so a resent sequence derives the same key.
   return SceneTransactionRequestDTO{
-      PublicRequestContextDTO{RequestId(intent.sequence_id + ".scene.attach"), scene_owner_epoch,
-                              "pick_place_planning_owner",
-                              intent.approach_operation.request_context.correlation_id},
+      PublicRequestContextDTO{intent.approach_operation.request_context.request_key.WithPart(1U),
+                              "pick_place_planning_owner"},
       intent.approach_operation.attribution, projection_revision,
       AttachCarriedObjectRequestDTO{
           CarriedObjectAttachmentId("carried:" + intent.sequence_id), intent.selected_object_id,
@@ -360,11 +359,11 @@ struct ResolvedPickOffsetBases final {
 
 [[nodiscard]] SceneTransactionRequestDTO detach_request(
     const PlaceSequencePlanningIntentDTO& intent, const ProjectionRevisionDTO& projection_revision,
-    const CarriedObjectAttachmentDTO& attachment, const RequestOwnerEpoch& scene_owner_epoch) {
+    const CarriedObjectAttachmentDTO& attachment) {
+  // The detach is a further action of the place approach request (part 1).
   return SceneTransactionRequestDTO{
-      PublicRequestContextDTO{RequestId(intent.sequence_id + ".scene.detach"), scene_owner_epoch,
-                              "pick_place_planning_owner",
-                              intent.approach_operation.request_context.correlation_id},
+      PublicRequestContextDTO{intent.approach_operation.request_context.request_key.WithPart(1U),
+                              "pick_place_planning_owner"},
       intent.approach_operation.attribution, projection_revision,
       DetachCarriedObjectRequestDTO{attachment.carried_object_attachment_id,
                                     attachment.carried_object_attachment_revision, Pose3DTO{},
@@ -611,7 +610,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   }
   auto attach = attach_request(
       intent, planning_projection, carrier.value(), std::move(roles.value()),
-      carrier_frame.value().component_attachment_revisions, scene_.CurrentRequestOwnerEpoch());
+      carrier_frame.value().component_attachment_revisions);
   AddressedPickCandidatePlanner planner(*session.value(), scene_candidates_, projection_);
   auto outcome = planner.Search(
       PickCandidatePlanningRequestDTO{
@@ -735,7 +734,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
                                                        carrier.value().command_target_id,
                                                        intent.carrier_frame.frame_id};
   auto detach =
-      detach_request(intent, planning_projection, *attachment, scene_.CurrentRequestOwnerEpoch());
+      detach_request(intent, planning_projection, *attachment);
   AddressedPlacePlanner planner(*session.value(), scene_candidates_, projection_);
   auto outcome = planner.Plan(
       PlacePlanningRequestDTO{

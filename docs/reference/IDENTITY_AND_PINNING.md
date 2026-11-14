@@ -30,11 +30,13 @@ Digests are SHA-256 over RFC 8785 canonical JSON, from one codec in
 | Applied composition: retained bundle, graph revision, Program Binding, Program revision, node-environment digest, applied record digest | Execute (`program_node_availability_stale`) and Runner binding | The robot runs exactly what was Applied |
 | Retained bundle against this build's closed-schema registry | Bundle verification | Bundle and build agree on every schema |
 | Stop contract roles of each provider | Activation | Every arm and gripper provider can be stopped as configured |
-| Cell admission request ids and owner epochs, against the current admission facts | Run, Apply, Reset, manual operations (Stop bypasses them) | No two effects race on the robot |
-| Manager Apply journal and Program cycle journal records (digests, schema versions) | Manager and runner restart | An interrupted Apply or run is reported from intact records |
+| Application start identity (`application_start_id`, 16 hexadecimal characters, one per start) | Every HTTP request that names an operation, Stop, run, node attempt or Apply number | A number from another start never addresses this start's work |
+| Request keys (16 bytes) and request payload digests, against the current admission generation | Run, Apply, Reset, manual operations (Stop bypasses them) | No two effects race on the robot |
+| Journal schema versions of the previous run | The next start, when it writes its report on the previous run | The previous run's unfinished work is reported, never resumed |
 
-Nothing is journaled for component lifecycle: after a restart every component
-starts `not_prepared` or `offline` and is prepared again.
+Nothing is journaled for component lifecycle, and every start begins with an
+empty cell: every component starts `not_prepared` or `offline` and is
+prepared again.
 
 ## Committed pins and generated files
 

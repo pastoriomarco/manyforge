@@ -61,22 +61,22 @@ public:
   void release_ros_entities() noexcept;
 
   core::ExecutionPortCommandResultDTO
-  Submit(const core::ExecutionGoalKey &key,
+  Submit(const core::ControllerGoalId &key,
          const core::TrajectoryDTO &trajectory,
          std::shared_ptr<core::ExecutionDispatchToken> token = {}) override;
   core::ExecutionPortCommandResultDTO
-  Replace(const core::ExecutionGoalKey &active_key,
-          const core::ExecutionGoalKey &next_key,
+  Replace(const core::ControllerGoalId &active_key,
+          const core::ControllerGoalId &next_key,
           const core::TrajectoryDTO &trajectory,
           std::shared_ptr<core::ExecutionDispatchToken> token = {}) override;
   core::ExecutionPortCommandResultDTO
-  ReplaceScheduled(const core::ExecutionGoalKey &active_key,
-                   const core::ExecutionGoalKey &next_key,
+  ReplaceScheduled(const core::ControllerGoalId &active_key,
+                   const core::ControllerGoalId &next_key,
                    const core::TrajectoryDTO &trajectory,
                    const core::ExecutionReplacementStartDTO &start,
                    std::shared_ptr<core::ExecutionDispatchToken> token = {}) override;
   core::ExecutionPortCommandResultDTO
-  Cancel(const core::ExecutionGoalKey &key,
+  Cancel(const core::ControllerGoalId &key,
          std::chrono::steady_clock::time_point deadline =
              std::chrono::steady_clock::time_point::max()) override;
   core::ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override;
@@ -88,7 +88,7 @@ public:
     return SetScale(value, ReserveScaleSequence());
   }
   std::optional<core::ExecutionGoalObservationDTO>
-  ReadGoal(const core::ExecutionGoalKey &key) const override;
+  ReadGoal(const core::ControllerGoalId &key) const override;
   std::optional<core::ExecutionControllerSampleDTO> ReadSample() const override;
   core::ExecutionReadinessDTO ReadReadiness() const override;
   /// The controller's own goal state, for the component's activity:
@@ -110,7 +110,7 @@ public:
   enum class LateCancelUnresolvedReason { kNotIssued, kUnknown };
   struct UnresolvedLateCancel final {
     core::ExecutionBindingEpoch binding_epoch;
-    core::ExecutionGoalKey key;
+    core::ControllerGoalId key;
     std::optional<std::uint64_t> execution_id;
     LateCancelUnresolvedReason reason;
   };
@@ -137,15 +137,15 @@ private:
   struct LateCancelItem;
   void ObserveReadinessImpl(core::ExecutionReadinessDTO readiness);
   bool ActionServerIsReadyImpl() const;
-  core::ExecutionPortCommandResultDTO SubmitImpl(const core::ExecutionGoalKey &, const core::TrajectoryDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
-  core::ExecutionPortCommandResultDTO ReplaceImpl(const core::ExecutionGoalKey &, const core::ExecutionGoalKey &, const core::TrajectoryDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
-  core::ExecutionPortCommandResultDTO ReplaceScheduledImpl(const core::ExecutionGoalKey &, const core::ExecutionGoalKey &, const core::TrajectoryDTO &, const core::ExecutionReplacementStartDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
+  core::ExecutionPortCommandResultDTO SubmitImpl(const core::ControllerGoalId &, const core::TrajectoryDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
+  core::ExecutionPortCommandResultDTO ReplaceImpl(const core::ControllerGoalId &, const core::ControllerGoalId &, const core::TrajectoryDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
+  core::ExecutionPortCommandResultDTO ReplaceScheduledImpl(const core::ControllerGoalId &, const core::ControllerGoalId &, const core::TrajectoryDTO &, const core::ExecutionReplacementStartDTO &, std::shared_ptr<core::ExecutionDispatchToken>);
   core::ExecutionPortCommandResultDTO CancelImpl(
-      const core::ExecutionGoalKey &, std::chrono::steady_clock::time_point);
+      const core::ControllerGoalId &, std::chrono::steady_clock::time_point);
   core::ExecutionPortCommandResultDTO SetScaleImpl(double, std::uint64_t);
   core::ExecutionPortCommandResultDTO SendGoal(
-      const core::ExecutionGoalKey &key, const core::TrajectoryDTO &trajectory,
-      std::optional<core::ExecutionGoalKey> active_key,
+      const core::ControllerGoalId &key, const core::TrajectoryDTO &trajectory,
+      std::optional<core::ControllerGoalId> active_key,
       VolatileMotionTrace::Garbage &trace_garbage,
       std::optional<core::ExecutionReplacementStartDTO> start = std::nullopt,
       std::shared_ptr<core::ExecutionDispatchToken> token = {});
@@ -157,36 +157,36 @@ private:
       const std::shared_ptr<std::atomic<bool>> &gate,
       const control_msgs::msg::JointTrajectoryControllerState &message);
   static void ReceiveResponse(const std::shared_ptr<State> &state,
-                              const core::ExecutionGoalKey &key,
+                              const core::ControllerGoalId &key,
                               const GoalHandle::SharedPtr &handle,
                               const std::shared_ptr<CancelAttempt> &attempt);
   static void DrainLossCancels(const std::shared_ptr<State> &state) noexcept;
   static void
   SendAutomaticCancel(const std::shared_ptr<State> &state,
-                      const core::ExecutionGoalKey &key,
+                      const core::ControllerGoalId &key,
                       const GoalHandle::SharedPtr &handle,
                       const std::shared_ptr<CancelAttempt> &attempt,
                       const rclcpp_action::Client<Action>::SharedPtr &client) noexcept;
   static void
   QueueAutomaticCancel(const std::shared_ptr<State> &state,
-                       const core::ExecutionGoalKey &key,
+                       const core::ControllerGoalId &key,
                        const GoalHandle::SharedPtr &handle,
                        const std::shared_ptr<CancelAttempt> &attempt) noexcept;
   static core::ExecutionPortCommandResultDTO
   SendCancel(const std::shared_ptr<State> &state,
-             const core::ExecutionGoalKey &key,
+             const core::ControllerGoalId &key,
              const GoalHandle::SharedPtr &handle,
              std::chrono::steady_clock::time_point deadline);
   static void ReceiveCancelResponse(
-      const std::shared_ptr<State> &state, const core::ExecutionGoalKey &key,
+      const std::shared_ptr<State> &state, const core::ControllerGoalId &key,
       std::uint64_t cancel_sequence,
       const action_msgs::srv::CancelGoal::Response::SharedPtr &response);
   static void ReceiveFeedback(const std::shared_ptr<State> &state,
-                              const core::ExecutionGoalKey &key,
+                              const core::ControllerGoalId &key,
                               const GoalHandle::SharedPtr &handle,
                               const Action::Feedback &feedback);
   static void ReceiveResult(const std::shared_ptr<State> &state,
-                            const core::ExecutionGoalKey &key,
+                            const core::ControllerGoalId &key,
                             const GoalHandle::WrappedResult &result);
 
   std::shared_ptr<State> state_;

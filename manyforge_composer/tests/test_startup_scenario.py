@@ -209,7 +209,6 @@ class _Headless:
                 "available": True,
                 "freshness": "fresh",
                 "known_gaps": [],
-                "source_owner_epoch": "manager-owner-1",
             },
             "status": {
                 "manager_ready": True,
@@ -246,10 +245,9 @@ class _Headless:
         return {
             "ok": True,
             "state": "succeeded",
-            "apply_id": "apply-1",
+            "apply_id": 1,
             "apply_generation": 1,
-            "request_id": body["request_id"],
-            "request_owner_epoch": body["request_owner_epoch"],
+            "request_key": body["request_key"],
             "candidate_projection_revision": {
                 "retained_bundle_id": receipt["candidate_retained_bundle_id"],
                 "graph_revision": receipt["candidate_graph_revision"],
@@ -262,7 +260,7 @@ class _Headless:
         return {
             "ok": True,
             "candidate_receipt": {
-                "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+                "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
                 "deployment_artifact_id": body["deployment_artifact_id"],
                 "deployment_revision": body["deployment_revision"],
                 "source_document_digest": self.selection[
@@ -276,7 +274,7 @@ class _Headless:
                 "expected_admission_generation": body[
                     "expected_admission_generation"
                 ],
-                "manager_owner_epoch": body["request_owner_epoch"],
+                "application_start_id": body["application_start_id"],
                 "impact_digest": "sha256:" + "c" * 64,
                 "destructive_impact": False,
                 "receipt_digest": "sha256:" + "8" * 64,
@@ -285,14 +283,17 @@ class _Headless:
 
 
 class _Coordinator:
-    owner_epoch = "composer-owner-1"
+    application_start_id = 0x3F9A0000000000A1
     mutation_ready = True
 
     def __init__(self) -> None:
         self.executions: list[dict[str, Any]] = []
 
-    def recover(self) -> None:
-        self.mutation_ready = True
+    def settle_before_preparation(self) -> None:
+        """No local claim is pending in these route-unit tests."""
+
+    def manager_submission_sent(self, _claim: Any) -> None:
+        """The parent claim's hand-over is the real coordinator's concern."""
 
     def execute(self, envelope: Any, **arguments: Any) -> Any:
         prepared = arguments["prepare_effect"]()
@@ -320,6 +321,7 @@ def _state(
     program: Program | None,
 ) -> ComposerState:
     state = object.__new__(ComposerState)
+    state.application_start_id = 0x3F9A0000000000A1
     state.node_environment = build_node_environment()
     state.allowed_fs_roots = [str(_ROOT / "examples")]
     state.allowed_program_write_roots = [str(_ROOT / "examples")]
@@ -359,11 +361,10 @@ def test_candidate_apply_returns_acceptance_without_polling(
     headless.manager_target = True
     state = _state(headless, _Coordinator(), program=None)
     acceptance = {
-        "api_version": "manyforge.manager_command_response.v2",
-        "apply_id": "apply-1",
+        "api_version": "manyforge.manager_command_response.v3",
+        "apply_id": 1,
         "apply_generation": 1,
-        "request_id": "request-1",
-        "request_owner_epoch": "manager-owner-1",
+        "request_key": "1" * 32,
         "replay_status": replay_status,
         "ok": True,
         "error": None,

@@ -92,8 +92,6 @@ void RequireCoherent(const ManagerLivenessTransportRequestDTO& request) {
   const bool heartbeat_matches =
       beat.cell_id == set.cell_id &&
       beat.manager_runtime_unit_id == set.manager_runtime_unit_id &&
-      beat.manager_runtime_epoch == set.manager_runtime_epoch &&
-      beat.manager_owner_epoch == set.manager_owner_epoch &&
       beat.runtime_policy_id == policy.runtime_policy_id &&
       beat.runtime_policy_revision == policy.runtime_policy_revision;
   bool reconciliation_matches = true;
@@ -102,8 +100,6 @@ void RequireCoherent(const ManagerLivenessTransportRequestDTO& request) {
     reconciliation_matches =
         ack.cell_id == set.cell_id &&
         ack.manager_runtime_unit_id == set.manager_runtime_unit_id &&
-        ack.manager_runtime_epoch == set.manager_runtime_epoch &&
-        ack.manager_owner_epoch == set.manager_owner_epoch &&
         ack.active_bundle_id == set.active_bundle_id &&
         ack.required_runtime_set_digest == set.required_runtime_set_digest &&
         manyforge::content_identity::is_sha256_digest(
@@ -129,33 +125,51 @@ std::string EncodeManagerLivenessRpcRequest(
       !ValidateManagerLivenessPolicy(request.policy).ok() ||
       !ValidateManagerHeartbeat(request.heartbeat).ok() ||
       request.receiver_runtime_unit_id.empty() ||
-      !request.active_publication_generation.nonzero() ||
-      request.active_graph_revision.empty() ||
+      !request.active_publication.valid() ||
       !manyforge::content_identity::is_sha256_digest(
-          request.active_public_pointer_digest.value())) {
+          request.active_publication.durable_public_pointer_content_digest.value())) {
     Fail("request is invalid");
   }
   RequireCoherent(request);
   const auto& set = request.required_set;
   const auto& policy = request.policy;
   const auto& beat = request.heartbeat;
+  const auto& publication = request.active_publication;
+  const auto& projection = publication.request.candidate_projection_revision;
   std::ostringstream out;
   out << kManagerLivenessRequestTag << ' '
-      << request.active_publication_generation.value() << ' '
-      << request.active_graph_revision.value() << ' '
-      << request.active_public_pointer_digest.value() << ' '
+      << publication.publication_generation.value() << ' '
+      << publication.durable_public_pointer_content_digest.value() << ' ';
+  if (const auto* apply = std::get_if<NamedApplyPublicationTransactionDTO>(
+          &publication.request.transaction_ref)) {
+    out << "apply " << apply->apply_id.value() << ' '
+        << apply->apply_generation.value() << ' ';
+  } else {
+    const auto& bootstrap =
+        std::get<BootstrapPublicationTransactionDTO>(publication.request.transaction_ref);
+    out << "bootstrap " << bootstrap.bootstrap_id.value() << ' '
+        << bootstrap.bootstrap_generation.value() << ' ';
+  }
+  // The candidate bundle and graph are the projection's own.
+  out << projection.retained_bundle_id.value() << ' '
+      << projection.graph_revision.value() << ' '
+      << projection.scene_revision.scene_id.value() << ' '
+      << projection.scene_revision.revision_id << ' '
+      << projection.scene_revision.content_hash.value() << ' ';
+  if (publication.request.expected_previous_publication_generation) {
+    out << publication.request.expected_previous_publication_generation->value();
+  } else {
+    out << '-';
+  }
+  out << ' ' << publication.request.private_materialization_content_digest.value() << ' '
       << set.cell_id.value() << ' '
       << set.active_bundle_id.value() << ' '
       << set.required_runtime_set_digest.value() << ' '
       << set.manager_runtime_unit_id.value() << ' '
-      << set.manager_runtime_epoch.value() << ' '
-      << set.manager_owner_epoch.value() << ' '
       << request.receiver_runtime_unit_id.value() << ' '
       << policy.runtime_policy_id.value() << ' '
       << policy.runtime_policy_revision.value() << ' '
       << policy.heartbeat_period_ns << ' '
-      << policy.local_safe_state_contract_id.value() << ' '
-      << policy.local_safe_state_contract_revision.value() << ' '
       << beat.heartbeat_sequence << ' ';
   if (request.reconciliation.has_value()) {
     out << request.reconciliation->reconciliation_evidence_digest.value();
@@ -178,53 +192,75 @@ std::string EncodeManagerLivenessRpcRequest(
 
 ManagerLivenessTransportRequestDTO DecodeManagerLivenessRpcRequest(
     std::string_view bytes) {
+  // Twelve publication tokens precede the required set (offset 13).
   const auto f = Fields(bytes);
-  if (f.size() < 23U || f[0] != kManagerLivenessRequestTag) {
+  if (f.size() < 28U || f[0] != kManagerLivenessRequestTag) {
     Fail("wrong closed request shape");
   }
   for (std::size_t i = 1; i < f.size(); ++i) {
     CheckToken(f[i]);
   }
-  const auto receiver_count = Unsigned<std::size_t>(f[18]);
+  const auto receiver_count = Unsigned<std::size_t>(f[23]);
   if (receiver_count == 0U ||
       receiver_count > kMaximumManagerLivenessReceivers ||
-      f.size() != 19U + receiver_count * 4U) {
+      f.size() != 24U + receiver_count * 4U) {
     Fail("wrong required receiver count");
   }
   std::vector<RequiredManagerLivenessReceiverDTO> receivers;
   receivers.reserve(receiver_count);
   for (std::size_t index = 0; index < receiver_count; ++index) {
-    const auto offset = 19U + index * 4U;
+    const auto offset = 24U + index * 4U;
     receivers.push_back(
         {RuntimeUnitId(f[offset]), RuntimeEpoch(f[offset + 1U]),
          RuntimePolicyId(f[offset + 2U]),
          RuntimePolicyRevision(f[offset + 3U])});
   }
+  auto transaction = [&]() -> ActiveBundlePublicationTransactionRefDTO {
+    if (f[3] == "apply") {
+      return NamedApplyPublicationTransactionDTO{
+          ApplyId(Unsigned<std::uint64_t>(f[4])),
+          ApplyGeneration(Unsigned<std::uint64_t>(f[5]))};
+    }
+    if (f[3] == "bootstrap") {
+      return BootstrapPublicationTransactionDTO{
+          BootstrapId(f[4]), BootstrapGeneration(Unsigned<std::uint64_t>(f[5]))};
+    }
+    Fail("unknown publication transaction kind");
+  }();
+  const ProjectionRevisionDTO projection{
+      RetainedBundleId(f[6]), GraphRevision(f[7]),
+      {SceneId(f[8]), Unsigned<std::uint64_t>(f[9]), ContentDigest(f[10])}};
+  ActiveBundlePublicationReceiptDTO publication{
+      {std::move(transaction), projection, projection.retained_bundle_id,
+       projection.graph_revision,
+       f[11] == "-" ? std::nullopt
+                    : std::optional(ActiveBundlePublicationGeneration(
+                          Unsigned<std::uint64_t>(f[11]))),
+       ContentDigest(f[12])},
+      ActiveBundlePublicationGeneration(Unsigned<std::uint64_t>(f[1])),
+      ContentDigest(f[2])};
   ManagerLivenessRequiredSetDTO set{
-      CellId(f[4]), RetainedBundleId(f[5]), ContentDigest(f[6]),
-      RuntimeUnitId(f[7]), RuntimeEpoch(f[8]), RequestOwnerEpoch(f[9]),
-      std::move(receivers)};
+      CellId(f[13]), RetainedBundleId(f[14]), ContentDigest(f[15]),
+      RuntimeUnitId(f[16]), std::move(receivers)};
   ManagerLivenessPolicyDTO policy{
-      RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12]), Signed(f[13]),
-      ProductContractId(f[14]), ProductContractRevision(f[15])};
+      RuntimePolicyId(f[18]), RuntimePolicyRevision(f[19]), Signed(f[20])};
   ManagerHeartbeatDTO heartbeat{
-      CellId(f[4]), RuntimeUnitId(f[7]), RuntimeEpoch(f[8]),
-      RequestOwnerEpoch(f[9]), Unsigned<std::uint64_t>(f[16]),
-      RuntimePolicyId(f[11]), RuntimePolicyRevision(f[12])};
+      CellId(f[13]), RuntimeUnitId(f[16]),
+      Unsigned<std::uint64_t>(f[21]), RuntimePolicyId(f[18]),
+      RuntimePolicyRevision(f[19])};
   ManagerLivenessTransportRequestDTO result{
-      RuntimeUnitId(f[10]),
-      ActiveBundlePublicationGeneration(
-          Unsigned<std::uint64_t>(f[1])),
-      GraphRevision(f[2]),
-      ContentDigest(f[3]),
+      RuntimeUnitId(f[17]), std::move(publication),
       set, policy, heartbeat, std::nullopt};
-  if (f[17] != "-") {
+  if (f[22] != "-") {
     result.reconciliation = ManagerLivenessReconciliationAck{
-        set.cell_id, set.manager_runtime_unit_id, set.manager_runtime_epoch,
-        set.manager_owner_epoch, set.active_bundle_id,
-        set.required_runtime_set_digest, ContentDigest(f[17])};
+        set.cell_id, set.manager_runtime_unit_id,
+        set.active_bundle_id, set.required_runtime_set_digest,
+        ContentDigest(f[22])};
   }
-  if (!ValidateManagerLivenessRequiredSet(set).ok() ||
+  if (!result.active_publication.valid() ||
+      !manyforge::content_identity::is_sha256_digest(
+          result.active_publication.durable_public_pointer_content_digest.value()) ||
+      !ValidateManagerLivenessRequiredSet(set).ok() ||
       !ValidateManagerLivenessPolicy(policy).ok() ||
       !ValidateManagerHeartbeat(heartbeat).ok()) {
     Fail("decoded request is invalid");
@@ -244,19 +280,16 @@ std::string EncodeManagerLivenessRpcResponse(
       << s.receiver_runtime_unit_id.value() << ' '
       << s.receiver_runtime_epoch.value() << ' '
       << s.manager_runtime_unit_id.value() << ' '
-      << s.manager_runtime_epoch.value() << ' '
-      << s.manager_owner_epoch.value() << ' '
       << s.runtime_policy_id.value() << ' '
       << s.runtime_policy_revision.value() << ' '
       << s.last_accepted_heartbeat_sequence << ' '
-      << s.receiver_status_sequence << ' ' << s.local_receipt_age_ns << ' '
+      << s.receiver_status_sequence << ' '
       << static_cast<unsigned>(s.state) << ' ' << (s.command_fenced ? 1 : 0)
       << ' ' << (s.fault_or_effect_reference.has_value()
                      ? s.fault_or_effect_reference->value()
                      : "-")
       << ' ' << value.active_bundle_id.value() << ' '
-      << value.required_runtime_set_digest.value() << ' '
-      << value.receiver_status_digest.value();
+      << value.required_runtime_set_digest.value();
   return out.str();
 }
 
@@ -266,26 +299,25 @@ ManagerLivenessObservationDTO DecodeManagerLivenessRpcResponse(
   if (f.size() == 2U && f[0] == kManagerLivenessRejectionTag) {
     throw ManagerLivenessRpcRejection(f[1]);
   }
-  if (f.size() != 18U || f[0] != kManagerLivenessResponseTag) {
+  if (f.size() != 14U || f[0] != kManagerLivenessResponseTag) {
     Fail("wrong closed response shape");
   }
-  const auto state = Unsigned<unsigned>(f[12]);
-  const auto fenced = Unsigned<unsigned>(f[13]);
+  const auto state = Unsigned<unsigned>(f[9]);
+  const auto fenced = Unsigned<unsigned>(f[10]);
   if (state > static_cast<unsigned>(ManagerLivenessStateDTO::kUnreconciled) ||
       fenced > 1U) {
     Fail("response enum is invalid");
   }
   ManagerLivenessStatusDTO status{
       CellId(f[1]), RuntimeUnitId(f[2]), RuntimeEpoch(f[3]),
-      RuntimeUnitId(f[4]), RuntimeEpoch(f[5]), RequestOwnerEpoch(f[6]),
-      RuntimePolicyId(f[7]), RuntimePolicyRevision(f[8]),
-      Unsigned<std::uint64_t>(f[9]), Unsigned<std::uint64_t>(f[10]),
-      Signed(f[11]), static_cast<ManagerLivenessStateDTO>(state), fenced == 1U,
-      f[14] == "-" ? std::nullopt
-                   : std::optional<ContentDigest>(ContentDigest(f[14]))};
+      RuntimeUnitId(f[4]),
+      RuntimePolicyId(f[5]), RuntimePolicyRevision(f[6]),
+      Unsigned<std::uint64_t>(f[7]), Unsigned<std::uint64_t>(f[8]),
+      static_cast<ManagerLivenessStateDTO>(state), fenced == 1U,
+      f[11] == "-" ? std::nullopt
+                   : std::optional<ContentDigest>(ContentDigest(f[11]))};
   ManagerLivenessObservationDTO result{
-      status, RetainedBundleId(f[15]), ContentDigest(f[16]),
-      ContentDigest(f[17])};
+      status, RetainedBundleId(f[12]), ContentDigest(f[13])};
   if (!ValidateManagerLivenessObservation(result).ok()) {
     Fail("decoded response is invalid");
   }
@@ -306,10 +338,6 @@ std::string_view NativeShutdownPhaseName(const NativeShutdownPhase phase) {
     return "group-retirement";
   case NativeShutdownPhase::kExecutionDrain:
     return "execution-drain";
-  case NativeShutdownPhase::kCurrentBuilderDrain:
-    return "current-builder-drain";
-  case NativeShutdownPhase::kManagedBuilderDrain:
-    return "managed-builder-drain";
   case NativeShutdownPhase::kProjectionDrain:
     return "projection-drain";
   case NativeShutdownPhase::kKernelDestruction:
@@ -332,6 +360,8 @@ std::string_view NativeShutdownPhaseName(const NativeShutdownPhase phase) {
     return "fence-owner-destruction";
   case NativeShutdownPhase::kServicingLaneDrain:
     return "servicing-lane-drain";
+  case NativeShutdownPhase::kPlannedHalt:
+    return "planned-halt";
   }
   Fail("unknown shutdown phase");
 }
@@ -378,7 +408,7 @@ NativeShutdownProgress DecodeNativeShutdownRpcResponse(std::string_view bytes) {
   if (f.size() != 12U || f[0] != kNativeShutdownResponseTag)
     Fail("wrong shutdown response shape");
   const auto phase = Unsigned<unsigned>(f[2]);
-  if (phase > static_cast<unsigned>(NativeShutdownPhase::kServicingLaneDrain))
+  if (phase > static_cast<unsigned>(NativeShutdownPhase::kPlannedHalt))
     Fail("unknown shutdown phase");
   const auto pid = Signed(f[11]);
   if (pid < -1 || pid > std::numeric_limits<int>::max())

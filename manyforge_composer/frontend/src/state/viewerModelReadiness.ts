@@ -75,7 +75,7 @@ function verifiedAppliedCellGraph(
   const payload = manager.payload;
   if (!manager.available || manager.freshness !== 'fresh' || manager.knownGaps.length !== 0
       || !Number.isSafeInteger(manager.sourceGeneration) || (manager.sourceGeneration ?? 0) <= 0
-      || !manager.sourceOwnerId || !manager.sourceOwnerEpoch || payload === null
+      || !manager.sourceOwnerId || payload === null
       || payload.manager_ready !== true || pendingManagerApply(payload) !== false) return null;
   const active = recordValue(payload.active);
   const graph = recordValue(active?.cell_graph);
@@ -193,7 +193,6 @@ export function viewerModelPresentation(
     };
   }
   if (manager.knownGaps.length > 0 || manager.sourceGeneration === null
-      || manager.sourceOwnerEpoch === null || manager.sourceOwnerEpoch.length === 0
       || manager.sourceOwnerId === null || manager.sourceOwnerId.length === 0) {
     return {
       status: 'unavailable',

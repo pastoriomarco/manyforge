@@ -2,7 +2,6 @@ import { errorCatalogRow } from '../state/commandRefusal';
 import { errorMessage } from '../state/structuralResource';
 import {
   parseApplyPreview,
-  parseApplyResult,
   parseCellLatch,
   parseComponentStates,
   parseEffectiveValues,
@@ -12,9 +11,11 @@ import {
   parseSignalSamples,
 } from './parsers/components';
 import { objectAt, stringAt } from './parsers/shared';
+import { newRequestKey as executionRequestKey, type ApplicationStartId } from './applicationIdentity';
+import { sameClientRequestKey } from './parsers/execution';
+import { parseApplyCommandReply, parseProgramCommandReply } from './parsers/commandRows';
 import type {
   ApplyPreview,
-  ApplyResult,
   CellLatch,
   ComponentAction,
   ComponentState,
@@ -36,10 +37,8 @@ import {
   parseAppliedProgramSelection,
   parseAppliedProgramStatus,
   parseApiErrorDto,
-  parsePersistentKeyEdit,
   parseExpressionCheckResult,
   parsePersistentKeyValues,
-  parsePersistentKeyValuesCleared,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
   parseDeploymentWorkspaceResponse,
@@ -59,7 +58,6 @@ import {
   parseNodeEnvironmentResponse,
   parseObjectResponse,
   parseProgramWorkspaceResponse,
-  parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseRuntimeScaleControlStatus,
   parseScenarioDocumentIndexResponse,
@@ -98,7 +96,9 @@ import type {
   AppliedProgramSelection,
   AppliedProgramStatus,
   PersistentKeyValues,
-  PersistentKeyValuesCleared,
+  ApplyCommandRow,
+  CommandRow,
+  RunnerCommandRowKind,
   ExpressionCheckRequest,
   ExpressionCheckResult,
   AuthoringWorkspaceSnapshot,
@@ -118,7 +118,6 @@ import type {
   ManagerGraphProjection,
   ManagerStatusProjection,
   ProgramWorkspaceResponse,
-  ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
@@ -173,8 +172,10 @@ export interface HistorianListQuery {
   recentSeconds?: number;
   clockOwner?: string;
   severities?: string[];
-  programRunId?: string;
-  operationId?: string;
+  programRunId?: number;
+  operationId?: number;
+  /** Sent only with a run or operation filter (contract 1.6). */
+  applicationStartId?: ApplicationStartId;
   actionSpanId?: string;
   nodeInstanceId?: string;
   interventionSessionId?: string;
@@ -227,6 +228,9 @@ export function historianListPath(query: HistorianListQuery = {}): string {
     ['alarm_phase', query.alarmPhase], ['search', query.search],
   ] as const) {
     if (value !== undefined) parameters.set(key, String(value));
+  }
+  if (query.applicationStartId !== undefined) {
+    parameters.set('application_start_id', query.applicationStartId);
   }
   if (query.captureId !== undefined) {
     if (!Number.isSafeInteger(query.captureId) || query.captureId < 1) {
@@ -492,13 +496,12 @@ export function savedNotAdoptedMessage(error: unknown): string | null {
   return code !== null && SAVED_NOT_ADOPTED_CODES.has(code) ? (error as ApiError).message : null;
 }
 
+/** One authoring request: the start it was built against and its own key. */
 export type AuthoringRequestIdentity = {
-  requestOwnerEpoch: string;
-  requestId: string;
+  applicationStartId: ApplicationStartId;
+  requestKey: string;
   expectedAdmissionGeneration: number;
   path?: string;
-  /** The shared reference an Apply after Reset was sent with. */
-  correlationId?: string;
 };
 
 const failedAuthoringRequests = new WeakMap<object, AuthoringRequestIdentity>();
@@ -509,8 +512,7 @@ export function failedAuthoringRequest(error: unknown): AuthoringRequestIdentity
 }
 
 export interface PersistentKeyRequestIdentity {
-  request_id: string;
-  request_owner_epoch: string;
+  application_start_id: ApplicationStartId;
   source_label: string;
 }
 
@@ -520,7 +522,7 @@ export interface PersistentKeyRequestIdentity {
  * request is still refused by its identity.
  */
 export type PersistentKeyValuesFence =
-  | { program_run_id: string; expected_run_revision: number }
+  | { program_run_id: number; expected_run_revision: number }
   | { program_run_id?: never; expected_run_revision?: never };
 
 export type PersistentKeyValueEditBody = PersistentKeyRequestIdentity & PersistentKeyValuesFence & {
@@ -566,6 +568,32 @@ function parseAssistantProfiles(value: unknown): AssistantProfiles {
   }));
 }
 
+// The last command whose reply was lost (the connection dropped): a resend of
+// the same request carries its key, so the owner answers with that command's
+// row and runs nothing twice (OD-214). Any reply ends it.
+let unansweredCommand: { fingerprint: string; requestKey: string } | null = null;
+
+/** A command answered at acceptance; its body carries a `request_key`. */
+async function sendKeyedCommand<T>(
+  path: string,
+  body: object,
+  parser: (value: unknown) => T,
+): Promise<T> {
+  const fingerprint = JSON.stringify([path, body]);
+  const requestKey = unansweredCommand?.fingerprint === fingerprint
+    ? unansweredCommand.requestKey : executionRequestKey();
+  try {
+    const reply = await requestJson(path, parser, undefined, {
+      method: 'POST', body: JSON.stringify({ ...body, request_key: requestKey }),
+    });
+    unansweredCommand = null;
+    return reply;
+  } catch (error) {
+    unansweredCommand = connectionLost(error) ? { fingerprint, requestKey } : null;
+    throw error;
+  }
+}
+
 async function requestJson<T>(
   path: string,
   parser: (value: unknown) => T,
@@ -579,13 +607,12 @@ async function requestJson<T>(
     // The exact sent envelope is only readback evidence, never a replay request.
     if (error !== null && typeof error === 'object' && typeof init.body === 'string') {
       const body = JSON.parse(init.body) as Partial<AuthoringRequestIdentity>;
-      if (typeof body.requestOwnerEpoch === 'string' && typeof body.requestId === 'string'
+      if (typeof body.applicationStartId === 'string' && typeof body.requestKey === 'string'
         && Number.isSafeInteger(body.expectedAdmissionGeneration) && body.expectedAdmissionGeneration! > 0) {
         failedAuthoringRequests.set(error, {
-          requestOwnerEpoch: body.requestOwnerEpoch, requestId: body.requestId,
+          applicationStartId: body.applicationStartId, requestKey: body.requestKey,
           expectedAdmissionGeneration: body.expectedAdmissionGeneration!,
           path,
-          ...(typeof body.correlationId === 'string' ? { correlationId: body.correlationId } : {}),
         });
       }
     }
@@ -725,15 +752,23 @@ export const api = {
       requestJson(`/api/components/${encodeURIComponent(componentId)}/recover-enable/preflight`,
         parseRecoveryPreflight, signal),
     /** 202: Recover (if confirmed) then Enable; phases arrive in `last_action`. */
-    recoverEnable: (componentId: string, confirmation: RecoveryConfirmation): Promise<{ action: ComponentAction }> =>
+    recoverEnable: (
+      componentId: string,
+      confirmation: RecoveryConfirmation,
+      applicationStartId: ApplicationStartId,
+    ): Promise<{ action: ComponentAction }> =>
       requestJson(`/api/components/${encodeURIComponent(componentId)}/recover-enable`, parseAcceptedAction,
-        undefined, { method: 'POST', body: JSON.stringify(confirmation) }),
+        undefined, {
+          method: 'POST',
+          body: JSON.stringify({ ...confirmation, application_start_id: applicationStartId }),
+        }),
     /** The same, for several components one at a time in cell order; stops at the first change. */
     recoverEnableGroup: (
       targets: readonly { component_id: string; recovery_preflight: RecoveryConfirmation }[],
+      applicationStartId: ApplicationStartId,
     ): Promise<{ action: ComponentAction }> =>
       requestJson('/api/components/recover-enable', parseAcceptedAction, undefined,
-        { method: 'POST', body: JSON.stringify({ targets }) }),
+        { method: 'POST', body: JSON.stringify({ targets, application_start_id: applicationStartId }) }),
   },
   cell: {
     latch: (signal?: AbortSignal): Promise<CellLatch> =>
@@ -754,26 +789,25 @@ export const api = {
   cellApply: {
     preview: (): Promise<ApplyPreview> =>
       requestJson('/api/deployment/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
-    /** Applies exactly what `scope` previewed; a changed Draft is refused. */
-    apply: (scope: ApplyPreview['scope']): Promise<ApplyResult> =>
-      requestJson('/api/deployment/apply', parseApplyResult, undefined,
-        { method: 'POST', body: JSON.stringify({ scope }) }),
+    /**
+     * Applies exactly what `scope` previewed; a changed Draft is refused.
+     * Answered at acceptance: the row's end is read from `apply_commands`.
+     */
+    apply: (scope: ApplyPreview['scope']): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/deployment/apply', { scope }, parseApplyCommandReply),
     /** The impact of reverting to the Saved Scenario; effect-free. */
     revertPreview: (): Promise<ApplyPreview> =>
       requestJson('/api/deployment/revert/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
     /** Apply of the Saved Scenario the Revert preview showed; both Drafts return to Saved. */
-    revert: (scope: ApplyPreview['scope']): Promise<ApplyResult> =>
-      requestJson('/api/deployment/revert', parseApplyResult, undefined,
-        { method: 'POST', body: JSON.stringify({ scope }) }),
+    revert: (scope: ApplyPreview['scope']): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/deployment/revert', { scope }, parseApplyCommandReply),
     effective: (signal?: AbortSignal): Promise<EffectiveValues> =>
       requestJson('/api/deployment/effective', parseEffectiveValues, signal),
     /** The GUI asks before discarding unsaved Drafts, then confirms here. */
-    load: (path: string): Promise<ApplyResult> =>
-      requestJson('/api/scenario/load', parseApplyResult, undefined,
-        { method: 'POST', body: JSON.stringify({ path, discard_unsaved: true }) }),
-    newScenario: (): Promise<ApplyResult> =>
-      requestJson('/api/scenario/new', parseApplyResult, undefined,
-        { method: 'POST', body: JSON.stringify({ discard_unsaved: true }) }),
+    load: (path: string): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/scenario/load', { path, discard_unsaved: true }, parseApplyCommandReply),
+    newScenario: (): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/scenario/new', { discard_unsaved: true }, parseApplyCommandReply),
   },
   authoringWorkspace: {
     /** Log one confirmed Apply-after-Reset before its Reset; grants no authority. */
@@ -793,8 +827,8 @@ export const api = {
     ),
     submissionOutcome: (request: AuthoringRequestIdentity) => requestJson(
       `/api/authoring/submission-outcome?${new URLSearchParams({
-        request_owner_epoch: request.requestOwnerEpoch,
-        request_id: request.requestId,
+        application_start_id: request.applicationStartId,
+        request_key: request.requestKey,
         expected_admission_generation: String(request.expectedAdmissionGeneration),
       })}`,
       (value) => parseAuthoringSubmissionOutcome(value, request),
@@ -888,19 +922,11 @@ export const api = {
     apply: (
       fence: DraftFenceRequest,
       signal?: AbortSignal,
-      /** An Apply after Reset keeps its shared reference in the Manager record. */
-      correlationId?: string,
-    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
+    ): Promise<ApplyCommandRow> => requestJson(
       '/api/program/apply',
-      parseProgramWorkspaceTransitionResponse,
+      parseApplyCommandReply,
       signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          ...(correlationId === undefined ? {} : { correlationId }),
-        }),
-      },
+      { method: 'POST', body: JSON.stringify(fence) },
     ),
     discard: (
       fence: LocalWorkspaceFenceRequest,
@@ -927,9 +953,9 @@ export const api = {
     revert: (
       fence: DraftFenceRequest,
       signal?: AbortSignal,
-    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
+    ): Promise<ApplyCommandRow> => requestJson(
       '/api/program/revert',
-      parseProgramWorkspaceTransitionResponse,
+      parseApplyCommandReply,
       signal,
       {
         method: 'POST',
@@ -1117,7 +1143,7 @@ export const api = {
       request: ProgramNodeCorrectionPreviewRequest,
       signal?: AbortSignal,
     ): Promise<ProgramNodeCorrectionPreview> => requestJson(
-      `/api/program/runs/${encodeURIComponent(request.program_run_id)}/node-correction-previews`,
+      `/api/program/runs/${request.program_run_id}/node-correction-previews`,
       (value) => parseProgramNodeCorrectionPreview(value, request),
       signal,
       { method: 'POST', body: JSON.stringify(request) },
@@ -1129,22 +1155,23 @@ export const api = {
       parsePersistentKeyValues,
       signal,
     ),
-    /** Set one stored value, or Reset it to `initial:` (value omitted). */
+    /**
+     * Set one stored value, or Reset it to `initial:` (value omitted).
+     * Answered at acceptance: the runner's row; the values are read after its end.
+     */
     editPersistentValue: (
       body: PersistentKeyValueEditBody,
-    ): Promise<PersistentKeyValues> => requestJson(
+    ): Promise<CommandRow<RunnerCommandRowKind>> => sendKeyedCommand(
       persistentValuesPath('value' in body ? '' : '/reset'),
-      parsePersistentKeyEdit,
-      undefined,
-      { method: 'POST', body: JSON.stringify(body) },
+      body,
+      parseProgramCommandReply,
     ),
     clearPersistentValues: (
       body: PersistentKeyRequestIdentity & { project_path: string },
-    ): Promise<PersistentKeyValuesCleared> => requestJson(
+    ): Promise<CommandRow<RunnerCommandRowKind>> => sendKeyedCommand(
       persistentValuesPath('/clear'),
-      parsePersistentKeyValuesCleared,
-      undefined,
-      { method: 'POST', body: JSON.stringify(body) },
+      body,
+      parseProgramCommandReply,
     ),
   },
   manager: {
@@ -1164,13 +1191,15 @@ export const api = {
       signal,
     ),
     applyStatus: (
-      applyId: string,
+      applyId: number,
       applyGeneration: number,
+      applicationStartId: ApplicationStartId,
       signal?: AbortSignal,
     ): Promise<ManagerApplyStatus> => {
       const params = new URLSearchParams({
-        apply_id: applyId,
+        apply_id: String(applyId),
         apply_generation: String(applyGeneration),
+        application_start_id: applicationStartId,
       });
       return requestJson(
         `/api/manager/apply/status?${params.toString()}`,
@@ -1190,13 +1219,14 @@ export const api = {
       );
     },
     acknowledgeApply: (
-      applyId: string,
+      applyId: number,
       applyGeneration: number,
+      applicationStartId: ApplicationStartId,
       requestContext: ManagerApplyAcknowledgementContext,
       signal?: AbortSignal,
     ): Promise<ManagerApplyStatus> => {
       const params = new URLSearchParams({
-        apply_id: applyId,
+        apply_id: String(applyId),
         apply_generation: String(applyGeneration),
       });
       return requestJson(
@@ -1216,7 +1246,10 @@ export const api = {
         signal,
         {
           method: 'POST',
-          body: JSON.stringify({ request_context: requestContext }),
+          body: JSON.stringify({
+            application_start_id: applicationStartId,
+            request_context: requestContext,
+          }),
         },
       );
     },
@@ -1351,9 +1384,15 @@ export const api = {
       { method: 'POST', body: JSON.stringify(mockIoInputBody(selector, expectedSourceEpoch, value)) },
     ),
     /** Each robot's latest owner-admitted TCP speed in one Program run (history evidence). */
-    admittedSpeeds: (programRunId: string, signal?: AbortSignal): Promise<ProgramRunAdmittedSpeeds> =>
+    admittedSpeeds: (
+      programRunId: number,
+      applicationStartId: ApplicationStartId,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunAdmittedSpeeds> =>
       requestJson(
-        `/api/execution/program-runs/${encodeURIComponent(programRunId)}/admitted-speeds`,
+        `/api/execution/program-runs/${programRunId}/admitted-speeds?${new URLSearchParams({
+          application_start_id: applicationStartId,
+        })}`,
         parseProgramRunAdmittedSpeeds,
         signal,
       ),
@@ -1390,22 +1429,23 @@ export const api = {
     },
     manualAvailability: (
       intent: DirectControlOperationIntent | import('../types/robotControl').DirectControlSetTcpIntent,
+      applicationStartId: ApplicationStartId,
       signal?: AbortSignal,
     ): Promise<ManualControlAvailability> => requestJson(
       '/api/execution/manual-handover',
       (value) => {
         const result = parseManualControlAvailability(value);
-        if (result.requestId !== intent.request_context.request_id
-          || result.requestOwnerEpoch !== intent.request_context.request_owner_epoch) {
+        if (!sameClientRequestKey(result.requestKey, intent.request_context.request_key)) {
           throw new Error('Manual availability does not match the requested owner and target query.');
         }
         return result;
       },
       signal,
-      { method: 'POST', body: JSON.stringify(intent) },
+      { method: 'POST', body: JSON.stringify({ ...intent, application_start_id: applicationStartId }) },
     ),
     previewMotion: (
       intent: DirectControlOperationIntent,
+      applicationStartId: ApplicationStartId,
       signal?: AbortSignal,
     ): Promise<MotionPreviewReceipt> => requestJson(
       '/api/execution/motion-previews',
@@ -1423,13 +1463,10 @@ export const api = {
           throw new Error('joint flange fallback is only valid for a joint-goal preview');
         }
         if (
-          receipt.requestId !== intent.request_context.request_id
-          || receipt.requestOwnerEpoch
-            !== intent.request_context.request_owner_epoch
+          !sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
           || receipt.programId !== intent.program_id
           || receipt.programRevision !== intent.program_revision
           || receipt.programBindingId !== intent.program_binding_id
-          || receipt.programRunId !== intent.program_run_id
           || receipt.graphRevision !== intent.expected_graph_revision
           || receipt.retainedBundleId !== intent.expected_retained_bundle_id
           || receipt.target.componentId !== participant.target.component_id
@@ -1448,10 +1485,11 @@ export const api = {
         return receipt;
       },
       signal,
-      { method: 'POST', body: JSON.stringify(intent) },
+      { method: 'POST', body: JSON.stringify({ ...intent, application_start_id: applicationStartId }) },
     ),
     previewCapabilityCommand: (
       intent: DirectControlOperationIntent,
+      applicationStartId: ApplicationStartId,
       signal?: AbortSignal,
     ): Promise<CapabilityCommandPreviewReceipt> => requestJson(
       '/api/execution/capability-command-previews',
@@ -1464,13 +1502,10 @@ export const api = {
           );
         }
         if (
-          receipt.requestId !== intent.request_context.request_id
-          || receipt.requestOwnerEpoch
-            !== intent.request_context.request_owner_epoch
+          !sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
           || receipt.programId !== intent.program_id
           || receipt.programRevision !== intent.program_revision
           || receipt.programBindingId !== intent.program_binding_id
-          || receipt.programRunId !== intent.program_run_id
           || receipt.graphRevision !== intent.expected_graph_revision
           || receipt.retainedBundleId !== intent.expected_retained_bundle_id
           || receipt.target.componentId !== participant.target.component_id
@@ -1496,14 +1531,13 @@ export const api = {
         return receipt;
       },
       signal,
-      { method: 'POST', body: JSON.stringify(intent) },
+      { method: 'POST', body: JSON.stringify({ ...intent, application_start_id: applicationStartId }) },
     ),
   },
   alarms: {
     acknowledge: (
       alarm: AlarmMembership,
-      ownerEpoch: string,
-      requestId: string,
+      applicationStartId: ApplicationStartId,
       signal?: AbortSignal,
     ): Promise<Record<string, unknown>> => requestJson(
       `/api/execution/alarms/${encodeURIComponent(alarm.conditionId)}/acknowledge`,
@@ -1512,10 +1546,9 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({
-          request_id: requestId,
-          request_owner_epoch: ownerEpoch,
+          request_key: executionRequestKey(),
+          application_start_id: applicationStartId,
           source_label: 'composer_ui',
-          correlation_id: null,
           activation_id: alarm.activationId,
           expected_record_revision: alarm.recordRevision,
           reason: null,
@@ -1524,10 +1557,9 @@ export const api = {
       },
     ),
     acknowledgeAll: (
-      ownerEpoch: string,
+      applicationStartId: ApplicationStartId,
       generation: number,
       members: AlarmMembership[],
-      requestId: string,
       signal?: AbortSignal,
     ): Promise<Record<string, unknown>> => requestJson(
       '/api/execution/alarms/acknowledge-all',
@@ -1536,10 +1568,9 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({
-          request_id: requestId,
-          request_owner_epoch: ownerEpoch,
+          request_key: executionRequestKey(),
+          application_start_id: applicationStartId,
           source_label: 'composer_ui',
-          correlation_id: null,
           members: members.map((member) => ({
             condition_id: member.conditionId,
             activation_id: member.activationId,
@@ -1553,8 +1584,17 @@ export const api = {
     ),
   },
   history: {
-    discovery: (kind: HistorianDiscovery['kind'], after = '', signal?: AbortSignal): Promise<HistorianDiscovery> =>
-      requestJson(`/api/execution/history/discovery?${new URLSearchParams({ kind, after, limit: '32' })}`, (value) => {
+    /** Program runs are listed for `applicationStartId` (default: the current start). */
+    discovery: (
+      kind: HistorianDiscovery['kind'],
+      after = '',
+      signal?: AbortSignal,
+      applicationStartId?: ApplicationStartId,
+    ): Promise<HistorianDiscovery> =>
+      requestJson(`/api/execution/history/discovery?${new URLSearchParams({
+        kind, after, limit: '32',
+        ...(applicationStartId === undefined ? {} : { application_start_id: applicationStartId }),
+      })}`, (value) => {
         const page = parseHistorianDiscovery(value);
         if (page.kind !== kind) throw new Error('History discovery response has a different kind');
         return page;

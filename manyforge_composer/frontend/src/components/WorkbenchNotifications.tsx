@@ -197,7 +197,7 @@ export function WorkbenchNotificationStack({
 }) {
   if (errorRow === null && warnings.length === 0 && activity.length === 0) return null;
   return (
-    <div className="workbench-notification-stack" aria-label="Workbench notifications">
+    <div className="workbench-notification-stack" aria-label="ManyForge notifications">
       {errorRow}
       <NoticeRow severity="warning" notices={warnings} />
       <NoticeRow severity="info" notices={activity} />

@@ -85,9 +85,9 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         )
         program_port.bind(_program_context())
         identity = NodeAttemptIdentity(
-            program_run_id="run.simulation.transport",
+            program_run_id=1,
             node_instance_id="move_soup_can",
-            node_attempt_id="run.simulation.transport/move_soup_can/1",
+            node_attempt_id=1,
         )
         started = program_port.start(
             "simulation.set_entity_pose",
@@ -145,7 +145,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
 
 def _program_context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
-        program_run_id="run.simulation.transport",
+        program_run_id=1,
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="isaac-cell",
         source_document_digest=_DIGEST_A,

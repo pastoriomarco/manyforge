@@ -121,7 +121,7 @@ export function FolderPicker({
     projectRoots.length > 0
       ? projectRoots.map(({ hostPath, containerPath }) => `${hostPath} → ${containerPath}`).join('\n')
       : 'See project_folders in the site settings file for the folders on your machine.',
-    'After changing project_folders, Stop and Start the workbench.',
+    'After changing project_folders, stop and start ManyForge.',
     'Pasting a host path is not supported. Use the matching /projects/... path or a path relative to the current folder.',
   ].join('\n');
 

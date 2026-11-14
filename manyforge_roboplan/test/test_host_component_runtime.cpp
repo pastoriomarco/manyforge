@@ -32,7 +32,7 @@ class InstantAdapter final : public core::IComponentAdapter {
     state.lifecycle = lifecycle_;
     state.activity = activity_;
     if (lifecycle_ == ComponentLifecycle::kFault)
-      state.fault = core::Fault{core::FaultCode::kEstop, "E-stop", true,
+      state.fault = core::Fault{core::FaultCode::kProtectiveStop, "Protective stop", true,
                                 core::FaultOperatorAction::kEnable, std::nullopt,
                                 std::nullopt, {}, 0};
     state.observed_at_ns = now_ns;
@@ -225,7 +225,7 @@ TEST(HostComponentRuntime, SharedTransportRecoveryUsesTheRecordedMemberAction) {
   auto hooks = HooksFor(recorder);
   hooks.shared_transport_fault = [&](const std::string &id) -> std::optional<core::Fault> {
     if (id != "io" || !faulted.load()) return std::nullopt;
-    return core::Fault{core::FaultCode::kProcessExited,
+    return core::Fault{core::FaultCode::kRosTransportFailed,
                        "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
                        true, core::FaultOperatorAction::kRecover, std::nullopt,
                        std::nullopt, {}, 0};
@@ -285,7 +285,7 @@ TEST(HostComponentRuntime, SharedTransportFaultIsPublishedWithUnknownActivity) {
   auto hooks = HooksFor(recorder);
   hooks.shared_transport_fault = [](const std::string &id) -> std::optional<core::Fault> {
     if (id != "io") return std::nullopt;
-    return core::Fault{core::FaultCode::kProcessExited,
+    return core::Fault{core::FaultCode::kRosTransportFailed,
                        "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
                        true, core::FaultOperatorAction::kRecover, std::nullopt,
                        std::nullopt, {}, 0};
@@ -299,7 +299,7 @@ TEST(HostComponentRuntime, SharedTransportFaultIsPublishedWithUnknownActivity) {
   EXPECT_EQ(states[0].lifecycle, ComponentLifecycle::kFault);
   EXPECT_EQ(states[0].activity, ComponentActivity::kUnknown);
   ASSERT_TRUE(states[0].fault);
-  EXPECT_EQ(states[0].fault->code, core::FaultCode::kProcessExited);
+  EXPECT_EQ(states[0].fault->code, core::FaultCode::kRosTransportFailed);
   EXPECT_NE(states[0].fault->message.find("/manyforge_generic_io"), std::string::npos);
 }
 

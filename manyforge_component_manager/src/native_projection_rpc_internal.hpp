@@ -46,7 +46,7 @@ struct NativeProjectionTransactionRequest final {
   manyforge::core::SceneTransactionDTO transaction;
 
   [[nodiscard]] bool valid() const noexcept {
-    return execution_host_binding.valid() && !transaction.request_id.empty() &&
+    return execution_host_binding.valid() &&
            transaction.transaction_sequence != 0U &&
            transaction.attribution.locally_valid() &&
            transaction.prior_projection_revision.valid() &&

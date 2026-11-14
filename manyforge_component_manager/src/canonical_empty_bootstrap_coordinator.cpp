@@ -396,19 +396,11 @@ ManagerBootstrapAcceptedTargetDTO AcceptedTarget(
 
 ManagerBootstrapAcceptedTargetDTO AcceptedTarget(
     const ProjectionBootstrapStatusDTO& status,
-    const ManagerBootstrapIntentDTO& intent,
-    const bool allow_exact_later_state = false) {
-  const bool accepted_or_allowed_later =
-      status.state == ProjectionBootstrapStatusState::kAccepted ||
-      (allow_exact_later_state &&
-       (status.state == ProjectionBootstrapStatusState::kRebuilding ||
-        status.state == ProjectionBootstrapStatusState::kReadyToPublish ||
-        status.state == ProjectionBootstrapStatusState::kPublished ||
-        status.state == ProjectionBootstrapStatusState::kFinalized));
+    const ManagerBootstrapIntentDTO& intent) {
   if (!status.presence_valid() ||
       status.bootstrap_id != intent.bootstrap_id ||
       status.bootstrap_generation != intent.bootstrap_generation ||
-      !accepted_or_allowed_later ||
+      status.state != ProjectionBootstrapStatusState::kAccepted ||
       !status.canonical_empty_target.has_value()) {
     Fail(
         "scene owner did not report one exact non-uncertain bootstrap "
@@ -609,10 +601,7 @@ CanonicalEmptyBootstrapCoordinator::BeginOrRecover(
     const deployment::CanonicalEmptyRetainedBundleAdmission& admission) {
   VerifyAdmission(stores_.matches_admission(admission), admission);
 
-  // Both stores must remain structurally valid and cell-bound. An exact
-  // generation-1 publication is tolerated only after this journal already
-  // contains the durable accepted target; it is crash-recovery evidence, not
-  // proof that Begin itself completed.
+  // Both stores must remain structurally valid and cell-bound.
   const auto inventory = stores_.StartupInventory();
   if (inventory.bootstrap_journal.cell_id != admission.cell_id() ||
       inventory.active_bundle_publication.cell_id != admission.cell_id()) {
@@ -626,9 +615,7 @@ CanonicalEmptyBootstrapCoordinator::BeginOrRecover(
   const bool publication_is_empty =
       inventory.active_bundle_publication.receipt_count == 0 &&
       inventory.active_bundle_publication.current_generation.value() == 0U;
-  if (snapshot.phase !=
-          ManagerBootstrapJournalPhase::kAcceptedTargetPersisted &&
-      !publication_is_empty) {
+  if (!publication_is_empty) {
     Fail(
         "canonical-empty Begin requires an empty publication head before "
         "the accepted target is durable");
@@ -653,80 +640,18 @@ CanonicalEmptyBootstrapCoordinator::BeginOrRecover(
     // This first observation must precede identity minting and persistence.
     RequireReadyPrerequisites(scene_owner_, query);
     intent = ManagerIntent(admission, MintBootstrapId());
-    try {
-      const auto write =
-          stores_.bootstrap_journal().EnsureIntent(intent);
-      if (!write.inserted || write.record.intent != intent) {
-        Fail(
-            "bootstrap journal did not durably insert the first exact "
-            "intent");
-      }
-      snapshot = stores_.bootstrap_journal().ReadSnapshot();
-    } catch (const ManagerBootstrapJournalConflictError&) {
-      // Another coordinator can win after both observed an empty journal.
-      // Reuse only that exact durable winner; never retry with our losing ID.
-      snapshot = stores_.bootstrap_journal().ReadSnapshot();
-      if (!snapshot.valid() || !snapshot.intent.has_value() ||
-          !IntentExactlyMatchesAdmission(
-              snapshot.intent->intent, admission)) {
-        Fail(
-            "concurrent bootstrap intent winner does not exactly match the "
-            "admitted canonical-empty package");
-      }
-      intent = snapshot.intent->intent;
+    const auto write =
+        stores_.bootstrap_journal().EnsureIntent(intent);
+    if (!write.inserted || write.record.intent != intent) {
+      Fail(
+          "bootstrap journal did not durably insert the first exact "
+          "intent");
     }
   } else {
-    if (!snapshot.intent.has_value() ||
-        !IntentExactlyMatchesAdmission(
-            snapshot.intent->intent, admission)) {
-      Fail(
-          "persisted bootstrap intent does not exactly match the admitted "
-          "canonical-empty package");
-    }
-    intent = snapshot.intent->intent;
-    const auto replay =
-        stores_.bootstrap_journal().EnsureIntent(intent);
-    if (replay.inserted || replay.record != *snapshot.intent) {
-      Fail("bootstrap journal did not exactly replay its durable intent");
-    }
-  }
-
-  if (snapshot.phase ==
-      ManagerBootstrapJournalPhase::kAcceptedTargetPersisted) {
-    if (!snapshot.accepted_target.has_value() ||
-        !TargetExactlyMatches(
-            snapshot.accepted_target->accepted_target, intent)) {
-      Fail("persisted bootstrap accepted target mismatches its exact intent");
-    }
-    const auto expected_request = PublicationRequest(
-        admission, intent, snapshot.accepted_target->accepted_target);
-    const auto observation = ObserveExactBootstrapPhase(
-        scene_owner_,
-        stores_,
-        intent,
-        snapshot.accepted_target->accepted_target,
-        expected_request);
-    const auto observed_target =
-        AcceptedTarget(observation.status, intent, true);
-    if (observed_target !=
-        snapshot.accepted_target->accepted_target) {
-      Fail(
-          "scene-owner accepted status mismatches the durable accepted "
-          "target");
-    }
-    return PersistAcceptedTarget(stores_, intent, observed_target);
-  }
-
-  if (snapshot.phase != ManagerBootstrapJournalPhase::kEmpty &&
-      snapshot.phase != ManagerBootstrapJournalPhase::kIntentPersisted) {
     Fail("bootstrap journal is in an unsupported phase");
   }
 
   auto status = ReadStatus(scene_owner_, intent);
-  if (status.state == ProjectionBootstrapStatusState::kAccepted) {
-    return PersistAcceptedTarget(
-        stores_, intent, AcceptedTarget(status, intent));
-  }
   if (status.state != ProjectionBootstrapStatusState::kAbsent) {
     Fail(
         "bootstrap Begin recovery found a later or uncertain scene-owner "

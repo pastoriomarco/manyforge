@@ -46,12 +46,12 @@ def test_a_count_is_fixed_or_resolved_per_attempt_never_defaulted(decorator):
         decorator("loop", CountingLeaf("leaf"))
 
 
-def test_attempt_ids_retain_no_counts_or_completed_identity_history():
-    source = ProgramRunAttemptSource("run.indefinite")
+def test_attempt_numbers_count_from_one_per_run_without_identity_history():
+    source = ProgramRunAttemptSource(1)
     before = vars(source).copy()
-    identifiers = {source.begin("root/leaf").node_attempt_id for _ in range(20_000)}
-    assert len(identifiers) == 20_000
-    assert vars(source) == before
+    identifiers = [source.begin("root/leaf").node_attempt_id for _ in range(20_000)]
+    assert identifiers == list(range(1, 20_001))
+    assert vars(source).keys() == before.keys()
 
 
 def test_loop_schema_and_json_schema_reject_zero_but_accept_indefinite():

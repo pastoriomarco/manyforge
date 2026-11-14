@@ -321,7 +321,7 @@ export function TripPresetEditor({
         <p className="program-form-hint">{STOP_STAGE_NOTE}</p>
       )}
       <p className="program-form-hint">
-        To stop the whole cell, use a global rule with scope everything: a Full Stop the operator recovers.
+        To stop the whole cell, use a global rule with scope everything: a Stop of all motion that the operator recovers.
         {' '}
         <button
           type="button"

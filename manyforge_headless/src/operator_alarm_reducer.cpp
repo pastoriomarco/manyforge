@@ -139,9 +139,7 @@ CanonicalValue CallerValue(const AlarmCallerAttribution &caller) {
   return CanonicalValue(CanonicalValue::Object{
       {"adapter_id", CanonicalValue(caller.adapter_id)},
       {"assurance", CanonicalValue(caller.assurance)},
-      {"correlation_id", OptionalString(caller.correlation_id)},
-      {"request_id", CanonicalValue(caller.request_id)},
-      {"request_owner_epoch", CanonicalValue(caller.request_owner_epoch)},
+      {"request_key", CanonicalValue(caller.request_key)},
       {"source_label", CanonicalValue(caller.source_label)},
       {"transport_kind", CanonicalValue(caller.transport_kind)},
       {"trusted_principal_id", OptionalString(caller.trusted_principal_id)},
@@ -719,7 +717,6 @@ CanonicalValue AlarmLifecycleFactValue(const AlarmLifecycleFact &fact) {
       {"event_type", CanonicalValue(fact.event_type)},
       {"occurred_at_ns", Number(fact.occurred_at_ns, "occurred_at_ns")},
       {"occurred_at_wall", CanonicalValue(fact.occurred_at_wall)},
-      {"owner_epoch", CanonicalValue(fact.owner_epoch)},
       {"owner_generation", Number(fact.owner_generation, "owner_generation")},
       {"previous_state", StateValue(fact.previous_state)},
       {"reason", OptionalString(fact.reason)},

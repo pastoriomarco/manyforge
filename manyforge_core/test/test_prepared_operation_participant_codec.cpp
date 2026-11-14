@@ -255,13 +255,13 @@ struct SealedInputs final {
   std::vector<ResourceId> resources;
   for (const auto& row : binding.resources) resources.push_back(row.resource_id);
   std::sort(resources.begin(), resources.end());
-  PreparedParticipantStopPlanContextDTO stop_context{OperationId("operation.1"),
+  PreparedParticipantStopPlanContextDTO stop_context{OperationNumber(1U),
                                                      OperationRevision(1U),
-                                                     OperationParticipantId("participant.1"),
+                                                     OperationParticipantId{OperationNumber(1U), 1U},
                                                      binding.program_id,
                                                      binding.program_revision,
                                                      binding.program_binding_id,
-                                                     ProgramRunId("run.1"),
+                                                     ProgramRunNumber(1U),
                                                      std::nullopt,
                                                      ParticipantStopProfilePurposeDTO::kOrdinary,
                                                      std::nullopt,
@@ -274,13 +274,13 @@ struct SealedInputs final {
   const auto& interface_binding = domain.expected_bindings.front();
   PreparedParticipantSelectedRouteDTO route{domain.expected_endpoints};
   return {ContentDigest("pending"),
-          OperationId("operation.1"),
+          OperationNumber(1U),
           OperationRevision(1U),
-          OperationParticipantId("participant.1"),
+          OperationParticipantId{OperationNumber(1U), 1U},
           binding.program_id,
           binding.program_revision,
           binding.program_binding_id,
-          ProgramRunId("run.1"),
+          ProgramRunNumber(1U),
           binding.retained_bundle_id,
           binding.graph_revision,
           binding.controllable_component_id,
@@ -363,12 +363,12 @@ struct SealedInputs final {
       binding.retained_bundle_id, binding.graph_revision,
       SceneRevision{SceneId(Digest('d')), 1U, ContentDigest(Digest('e'))}};
   PlanRequestDTO request{
-      OperationId("operation.1"),
-      OperationParticipantId("participant.1"),
+      OperationNumber(1U),
+      OperationParticipantId{OperationNumber(1U), 1U},
       binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
-      ProgramRunId("run.1"),
+      ProgramRunNumber(1U),
       MoveId("move.1"),
       binding.controllable_component_id,
       binding.component_type_id,
@@ -463,7 +463,7 @@ struct SealedInputs final {
   prefix.waypoints.pop_back();
   prefix.runtime_scale_bounds.reset();
   payload.plan_request.moving_replacement =
-      MovingReplacementInputDTO{{ControllerGoalId("old.goal"), ControllerGoalGeneration(2U)},
+      MovingReplacementInputDTO{ControllerGoalId{OperationNumber(901U), 1U, 2U},
                                 ExecutionBindingEpoch(3U),
                                 2.0,
                                 std::move(prefix),
@@ -741,7 +741,7 @@ TEST(PreparedOperationParticipantCodecTest,
   EXPECT_EQ(scope.stop_plan, stop.value());
   EXPECT_EQ(scope.activation_mode, MotionInterruptActivationMode::kFreshEdgeAfterArm);
   auto crossed_context = context;
-  crossed_context.operation_id = OperationId("other.operation");
+  crossed_context.operation_id = OperationNumber(1001U);
   const auto crossed_stop = MakePreparedParticipantStopPlan(
       inputs.readiness.value().resolved_stop_base_plan, crossed_context,
       inputs.binding.value().resources, DefaultLimits());
@@ -808,7 +808,7 @@ TEST(PreparedOperationParticipantCodecTest,
   crossed = candidate;
   std::get<PreparedMotionExecutionDTO>(crossed.payload)
       .interrupt_scopes.front()
-      .stop_plan.operation_id = OperationId("other.operation");
+      .stop_plan.operation_id = OperationNumber(1001U);
   EXPECT_FALSE(MakePreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
                                                 DefaultLimits(),
                                                 MotionInterruptNodeCategory::kGeneric)

@@ -10,7 +10,7 @@ using Kind = IoConditionValueKind;
 const InterruptSourceId kBlackboard("program.bb");
 
 IoProgramBlackboardSourceBindingDTO bb_binding() {
-  return {{RequestOwnerEpoch("host"), RequestOwnerEpoch("runner"), 1U, std::nullopt, std::nullopt,
+  return {{1U, std::nullopt, std::nullopt,
            ProgramBindingId("binding"), ActiveBundlePublicationGeneration(1U)},
           kBlackboard,
           IoSourceIncarnation("bb.1"),
@@ -18,7 +18,7 @@ IoProgramBlackboardSourceBindingDTO bb_binding() {
           8192U};
 }
 std::unique_ptr<IoSignalSubsystem> bb_service(FakeClock& clock, std::size_t maximum_keys = 3U) {
-  auto result = IoSignalSubsystem::Create({RequestOwnerEpoch("host"), 1U, {}},
+  auto result = IoSignalSubsystem::Create({1U, {}},
                                           {1U, maximum_keys, 8U, 8U, 128U, 1024U}, clock);
   if (!result.ok()) return {};
   return std::move(result.value());
@@ -132,7 +132,7 @@ TEST(IoProgramBlackboardTest, WholeTypedFramePreventsHalfUpdateTripAndRetainsAct
   EXPECT_EQ(final.trip->blackboard->values[0], matched_value);
   EXPECT_EQ(final.trip->blackboard->message_sequence, 3U);
   EXPECT_EQ(std::get<bool>(*matched_value->value), true);
-  const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 8U);
+  const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 8U);
   ASSERT_TRUE(records.ok());
   ASSERT_EQ(records.value().records.size(), 5U);
   ASSERT_TRUE(records.value().records[3].blackboard_snapshot);
@@ -413,7 +413,7 @@ TEST(IoProgramBlackboardTest, MixedTypedKeysUseExactComparisonAndProjectOnlyChec
   EXPECT_EQ(evidence.trip->blackboard->values[0]->name, "count");
   EXPECT_EQ(evidence.trip->blackboard->values[1]->name, "ratio");
   EXPECT_EQ(evidence.trip->blackboard->values[2]->name, "text");
-  const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 8U);
+  const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 8U);
   ASSERT_TRUE(records.ok());
   ASSERT_TRUE(records.value().records.back().blackboard_snapshot);
   EXPECT_EQ(records.value().records.back().blackboard_snapshot->values.size(), 5U);
@@ -440,9 +440,6 @@ TEST(IoProgramBlackboardTest,
   EXPECT_TRUE(service->WasProgramBlackboardScopeRetired(old.scope).value());
   auto invented = old.scope;
   invented.program_binding_id = ProgramBindingId("never.installed");
-  EXPECT_FALSE(service->WasProgramBlackboardScopeRetired(invented).value());
-  invented = old.scope;
-  invented.program_runner_owner_epoch = RequestOwnerEpoch("unknown.runner");
   EXPECT_FALSE(service->WasProgramBlackboardScopeRetired(invented).value());
   EXPECT_FALSE(service->WasProgramBlackboardScopeRetired(replacement.scope).value());
 }
@@ -471,7 +468,7 @@ TEST(IoProgramBlackboardTest, EvictedRetirementCannotAuthorizeSupersededReply) {
                         replacement, sequence, {{"a", Kind::kBoolean, IoConditionValueDTO{false}}}))
                     .ok());
   EXPECT_FALSE(service->WasProgramBlackboardScopeRetired(old.scope).value());
-  const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 64U);
+  const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 64U);
   ASSERT_TRUE(records.ok());
   EXPECT_TRUE(records.value().retention_gap);
   EXPECT_EQ(records.value().records.size(), 64U);
@@ -494,7 +491,7 @@ TEST(IoProgramBlackboardTest, CompactEvidenceAliasesOnlyUsedKeysAndOwnsNoFabrica
   ASSERT_TRUE(acquired.trip);
   ASSERT_TRUE(acquired.trip->blackboard);
   ASSERT_EQ(acquired.trip->blackboard->values.size(), 1U);
-  const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 8U);
+  const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 8U);
   ASSERT_TRUE(records.ok());
   const auto& full = records.value().records.back().blackboard_snapshot;
   ASSERT_TRUE(full);
@@ -537,7 +534,7 @@ TEST(IoProgramBlackboardTest, QualifiedResetAndRunBaselinesKeepGlobalTokenAndEva
       {{"a", Kind::kBoolean, IoConditionValueDTO{true}}})).ok());
   EXPECT_FALSE(service->ReadRuleEvidence(guard.value()).value().trip);
   auto run = reset;
-  run.scope.program_run_id = ProgramRunId("run.new");
+  run.scope.program_run_id = ProgramRunNumber(122U);
   run.scope.claim_generation = CellAdmissionClaimGeneration(7U);
   run.incarnation = IoSourceIncarnation("bb.run.new");
   ASSERT_TRUE(service->PublishProgramBlackboardBaseline(run, reset.incarnation,
@@ -551,7 +548,7 @@ TEST(IoProgramBlackboardTest, QualifiedResetAndRunBaselinesKeepGlobalTokenAndEva
   EXPECT_EQ(matched.trip->blackboard->incarnation, run.incarnation);
   ASSERT_TRUE(matched.trip->triggering_acquisition);
   EXPECT_EQ(matched.trip->triggering_acquisition->incarnation, run.incarnation);
-  const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 8U);
+  const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 8U);
   ASSERT_TRUE(records.ok());
   ASSERT_EQ(records.value().records.size(), 3U);
   for (const auto& record : records.value().records) EXPECT_FALSE(record.loss);
@@ -594,7 +591,7 @@ TEST(IoProgramBlackboardTest, FreshBaselineRestoresSourceWithoutErasingEarlierGa
     EXPECT_NE(fresh.value().registration_id, guard.value().registration_id);
     EXPECT_EQ(service->ReadRuleConditionSnapshot(fresh.value()).value().value, std::optional(false));
     EXPECT_TRUE(service->ReadRuleEvidence(fresh.value()).value().source_losses.empty());
-    const auto records = service->ReadRecords({RequestOwnerEpoch("host"), 1U, kBlackboard, 0U}, 8U);
+    const auto records = service->ReadRecords({1U, kBlackboard, 0U}, 8U);
     ASSERT_TRUE(records.ok());
     ASSERT_EQ(records.value().records.size(), 3U);
     EXPECT_TRUE(records.value().records[1].loss);
@@ -628,9 +625,8 @@ TEST(IoProgramBlackboardTest, BaselineHandoffRejectsDifferentAuthorityAndPreserv
   auto reset = initial;
   reset.scope.cycle_generation = 2U;
   reset.incarnation = IoSourceIncarnation("bb.reset.2");
-  for (int wrong = 0; wrong < 4; ++wrong) {
+  for (int wrong = 1; wrong < 4; ++wrong) {
     auto foreign = reset;
-    if (wrong == 0) foreign.scope.program_runner_owner_epoch = RequestOwnerEpoch("other.runner");
     if (wrong == 1) foreign.scope.program_binding_id = ProgramBindingId("other.binding");
     if (wrong == 2) foreign.scope.active_publication_generation = ActiveBundlePublicationGeneration(2U);
     const auto expected = wrong == 3 ? std::optional(IoSourceIncarnation("foreign.epoch"))

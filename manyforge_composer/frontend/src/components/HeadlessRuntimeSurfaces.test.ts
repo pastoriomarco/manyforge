@@ -26,7 +26,6 @@ function source() {
     knownGaps: [],
     payload: {},
     sourceGeneration: 1,
-    sourceOwnerEpoch: 'source-epoch',
     sourceOwnerId: 'source-owner',
     receiverAgeNs: 10,
   };
@@ -65,6 +64,32 @@ describe('headless Composer presentation adapters', () => {
     );
     expect(represented.get('recovery.cell')?.map((alarm) => alarm.subject.subjectId)).toEqual(['lite6_robot']);
     expect(standalone.map((alarm) => alarm.subject.subjectId)).toEqual(['gripper']);
+  });
+
+  it('shows a component-fault alarm inside the latch item only for the latched component', () => {
+    const fault = (subjectId: string): OperatorAlarmRecord => ({
+      conditionId: `condition-${subjectId}`, activationId: `activation-${subjectId}`,
+      recordRevision: 1, activatedAtNs: 100,
+      definitionId: 'manyforge.runtime.component_fault',
+      lifecycleState: 'active_unacknowledged', active: true, acknowledged: false,
+      priority: 'high', alarmClass: 'runtime_health', title: 'Component fault',
+      message: `Fault on component ${subjectId}`, consequence: '', operatorResponse: '',
+      occurrenceCount: 1, acknowledgementRequired: true, requiresMotionAttention: false,
+      subject: { subjectKind: 'component', subjectId, resourceIds: [] },
+      details: { failure: { code: 'fault_drive', message: 'Joint 2 drive fault' } },
+    });
+    const latch = {
+      id: 'cell.latch', severity: 'error' as const, domain: 'recovery' as const,
+      title: '1 error requires attention', message: 'lite6: Joint 2 drive fault.',
+      alarmSubjects: [{ definitionId: 'manyforge.runtime.component_fault', subjectId: 'lite6' }],
+    };
+    const { standalone, represented } = partitionRepresentedAlarms(
+      [fault('lite6'), fault('io_box')], [latch],
+    );
+    expect(represented.get('cell.latch')?.map((alarm) => alarm.subject.subjectId)).toEqual(['lite6']);
+    expect(standalone.map((alarm) => alarm.subject.subjectId)).toEqual(['io_box']);
+    // Once the latch clears, the alarm stands alone until acknowledged.
+    expect(partitionRepresentedAlarms([fault('lite6')], []).standalone).toHaveLength(1);
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {
@@ -167,8 +192,9 @@ describe('headless Composer presentation adapters', () => {
   it('uses exact historian event types for lifecycle filtering', () => {
     const stored: HistorianStoredEvent = {
       sequence: 11,
+      applicationStartId: '3f9a0000000000a1',
       event: {
-        schemaVersion: 'manyforge.historian_event_summary.v2',
+        schemaVersion: 'manyforge.historian_event_summary.v3',
         conditionSeverity: 'ERROR',
         clockOwner: 'headless:test-epoch',
         wallClockRegressed: false,
@@ -181,18 +207,26 @@ describe('headless Composer presentation adapters', () => {
         occurredAtWall: '2026-08-05T12:00:00Z',
         message: 'operator alarm acknowledged',
         conditionId: 'condition-1',
-        programRunId: 'program-run-1',
-        operationId: 'operation-1',
+        programRunId: 1,
+        operationId: 1,
       },
     };
 
     const view = historianEventView(stored);
 
     expect(view.alarmPhase).toBe('acknowledgement');
+    expect(view.applicationStartId).toBe('3f9a0000000000a1');
     expect(view.severity).toBe('ERROR');
     expect(view.message).toContain('condition-1');
-    expect(view.programRunId).toBe('program-run-1');
-    expect(view.operationId).toBe('operation-1');
+    // Run and operation ids are integers of their start (contract 1.5).
+    expect(view.programRunId).toBe(1);
+    expect(view.operationId).toBe(1);
+    // "Acknowledge all" writes one row with its own event type.
+    const all = historianEventView({
+      ...stored,
+      event: { ...stored.event, eventType: 'operator_alarms_acknowledged' },
+    });
+    expect(all.alarmPhase).toBe('acknowledgement');
   });
 
   it('presents owner status, attention and standing alarms, history access, and reconnect together', () => {
@@ -232,11 +266,12 @@ describe('headless Composer presentation adapters', () => {
       requiresMotionAttention: false,
     };
     const snapshot: ComposerHeadlessState = {
-      schemaVersion: 'manyforge.composer_headless_state.v2',
+      schemaVersion: 'manyforge.composer_headless_state.v4',
+      applyCommands: { inProgress: null, ended: [] },
       complete: true,
       executionControlStatus: null,
       componentOverview: {
-        schemaVersion: 'manyforge.component_overview.v2',
+        schemaVersion: 'manyforge.component_overview.v3',
         overviewRevision: `sha256:${'a'.repeat(64)}`,
         readiness: 'ready',
         summaryLabel: 'Application surfaces ready',
@@ -247,29 +282,20 @@ describe('headless Composer presentation adapters', () => {
         components: [],
         maintenanceOperation: null,
         basis: {
-          runtimeProjectionOwnerEpoch: null,
           runtimeProjectionGeneration: null,
-          managerSourceOwnerEpoch: null,
-          logicalSceneSourceOwnerEpoch: null,
           logicalSceneSourceGeneration: null,
-          sceneRuntimeSourceOwnerEpoch: null,
           sceneRuntimeSourceGeneration: null,
-          alarmOwnerEpoch: null,
           alarmGeneration: null,
           alarmStateRevision: null,
           admissionGeneration: null,
-          programRunnerOwnerEpoch: null,
           programCycleGeneration: null,
-          appliedProgramOwnerEpoch: null,
           appliedProgramGeneration: null,
-          executionOwnerEpoch: null,
           executionPublicationGeneration: null,
         },
       },
       authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
       heldRunDraftEditAllowed: false,
       programCycle: {
-        programRunnerOwnerEpoch: 'runner.epoch.1',
         cycleGeneration: 1,
         state: 'idle_after_reset',
         programRunId: null,
@@ -279,10 +305,9 @@ describe('headless Composer presentation adapters', () => {
         nodeStatusRevision: null,
         runtimeControlRevision: null,
         executionControlRevision: 1,
-        causalCorrelationId: null,
-        causalSessionId: null,
-        causalClientSequence: null,
-        currentCommandKind: null,
+        causalRequestKey: null,
+        causalDisplay: null,
+        currentCommandKind: null, runnerCommands: { inProgress: null, ended: [] },
         failure: null,
         resetPhase: null, resetOptions: null,
         resetRobotPosition: { available: false, reason: 'unsupported' },
@@ -299,14 +324,13 @@ describe('headless Composer presentation adapters', () => {
         deploymentDraftRevision: 1,
       },
       authoringWorkspaceContainment: null,
-      receiverEpoch: 'receiver.epoch.1',
+      applicationStartId: '3f9a0000000000a1',
       snapshotSequence: 1,
       runtime: {
-        schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+        schemaVersion: 'manyforge.headless_runtime_snapshot.v3',
         activeConfiguration: null,
         complete: true,
         projectionGeneration: 7,
-        projectionOwnerEpoch: 'projection-epoch',
         projectionOwnerId: 'headless-api',
         reasons: [],
         unavailableSections: [],
@@ -317,9 +341,8 @@ describe('headless Composer presentation adapters', () => {
         },
       },
       alarms: {
-        schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
+        schemaVersion: 'manyforge.operator_alarm_snapshot.v3',
         ownerId: 'alarm-owner',
-        ownerEpoch: 'alarm-epoch',
         generation: 9,
         stateRevision: 11,
         reconciled: true,

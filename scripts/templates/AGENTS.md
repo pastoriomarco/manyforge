@@ -16,9 +16,14 @@ It is disabled unless Composer starts with `--mcp-http`.
   authorized command with `{"action":"command","body":<current REST DTO>}`.
   Use the exact current owner identities, freshness envelope and caller
   attribution required by that DTO. Never fabricate or bypass them.
-- Submit once. Observe backend state to learn the outcome. A timeout or lost
-  tool result is not proof of rejection; do not repeat a motion command.
-  A receipt is not proof of physical rest. Stop/Full Stop still use the
+- Submit once. A command answers when it is accepted; its outcome is the
+  `end` of its row, found by its `request_key`: `runner_commands` of
+  `manyforge_cycle_control` `{"action":"status"}` for Program commands,
+  `apply_commands` of `manyforge_deployment` `{"action":"workspace"}` for
+  Apply, Revert, Load and New. A lost tool result is not proof of rejection;
+  resending the same `request_key` returns the same row and runs nothing again.
+  Do not repeat a motion command with a new key.
+  A receipt is not proof of physical rest. Stop, Stop all and Halt still use the
   backend's reserved path, not a tree flag or browser state machine.
 - Reset owns its stop-and-restore transaction. Do not invent Idle, Running,
   Stopped or successful recovery from a disconnected or incomplete response.

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Callable, NoReturn
@@ -24,6 +23,13 @@ from manyforge_behavior.model_source_capture import (
 from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field
 
+from .application_identity import (
+    ApplicationStartIdText,
+    RequestKeyText,
+    format_application_start_id,
+    new_request_key,
+    parse_application_start_id,
+)
 from .authoring_admission import (
     AuthoringMutationEnvelope,
     OperationEffects,
@@ -31,6 +37,7 @@ from .authoring_admission import (
     headless_client_http_exception,
     raise_operation_failure,
     raise_save_failure,
+    refused_before_effect,
     scenario_artifact_http_exception,
 )
 from .authoring_forest import (
@@ -53,10 +60,17 @@ from .authoring_workspace_fence import (
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
-from .apply_orchestration import Preview, candidate_preview, recorded_apply
+from .apply_orchestration import (
+    ApplyRefused,
+    Preview,
+    apply_accepted,
+    apply_command,
+    apply_steps_hidden,
+    candidate_preview,
+    require_no_motion,
+)
 from .deployment_defaults import with_defaults
 from .routes_deployment_draft import (
-    SERVER_REQUEST_OWNER_EPOCH,
     HeadlessApplyPorts,
     _workspace as deployment_workspace,
     apply_slot,
@@ -108,16 +122,14 @@ class _ScenarioFence(BaseModel):
     expected_admission_generation: int = Field(
         alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
     )
-    request_owner_epoch: str = Field(
-        alias="requestOwnerEpoch", min_length=1, max_length=256
-    )
-    request_id: str = Field(alias="requestId", min_length=1, max_length=256)
+    application_start_id: ApplicationStartIdText = Field(alias="applicationStartId")
+    request_key: RequestKeyText = Field(alias="requestKey")
 
     def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
-            request_owner_epoch=self.request_owner_epoch,
-            request_id=self.request_id,
+            application_start_id=parse_application_start_id(self.application_start_id),
+            request_key=bytes.fromhex(self.request_key),
         )
 
     def require_workspace_fence(
@@ -157,6 +169,8 @@ class ScenarioLoadRequest(BaseModel):
 
     path: str = Field(min_length=1, max_length=4096)
     discard_unsaved: bool = False
+    # The command's identity (OD-214): the same key again returns its row.
+    request_key: RequestKeyText
 
 
 class ScenarioEmptyRequest(BaseModel):
@@ -166,6 +180,8 @@ class ScenarioEmptyRequest(BaseModel):
     model_config = _DTO
 
     discard_unsaved: bool = False
+    # The command's identity (OD-214): the same key again returns its row.
+    request_key: RequestKeyText
 
 
 def _server_load_request(
@@ -183,8 +199,9 @@ def _server_load_request(
         expected_workspace_epoch=identity.workspace_epoch,
         expected_workspace_revision=identity.workspace_revision,
         expected_admission_generation=server_admission_generation(state),
-        request_owner_epoch=SERVER_REQUEST_OWNER_EPOCH,
-        request_id=f"composer-server.{uuid.uuid4()}",
+        # A server-originated request: Composer's own `A` and a fresh key.
+        application_start_id=format_application_start_id(state.application_start_id),
+        request_key=new_request_key().hex(),
     )
 
 
@@ -587,8 +604,11 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         }
 
     @router.post("/api/scenario/load", response_model=None)
-    def load_document(body: ScenarioLoadRequest) -> dict[str, Any] | JSONResponse:
-        """New, then Apply of the file; returns ApplyResult.
+    def load_document(body: ScenarioLoadRequest) -> dict[str, Any]:
+        """New, then Apply of the file. Answers at acceptance with its row
+        (``manyforge.apply_command_reply.v1``): once the document is read
+        and checked and the New's own checks passed; the row's end carries
+        the ApplyResult's outcome.
 
         The document is read and its basic structure checked before New; a
         failure at that stage leaves the cell as it is. New (an Apply of the
@@ -598,9 +618,23 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         empty. A failed New is the Load's result. A Manager Apply that fails
         before any effect restores the Drafts its commit replaced.
 
-        A Load whose workspace install failed contains the workspace: the
-        status stays 503 and the body is the failed ApplyResult.
+        A Load whose workspace install failed contains the workspace: its
+        row ends ``failed`` with ``composer_workspace_failed_closed``.
         """
+        def empty_first() -> dict[str, Any]:
+            # Load's New step waits exactly as New does, before it releases or
+            # disables anything. Its row shows ``emptying`` from its
+            # acceptance until the New ends.
+            refuse_new_during_motion()
+            command = apply_command()
+            if command is not None:
+                command.accept_step = "emptying"
+            with apply_steps_hidden():
+                return activate_document(
+                    str(UNTITLED_SCENARIO_PATH),
+                    discard_unsaved=body.discard_unsaved,
+                )
+
         def run() -> dict[str, Any] | JSONResponse:
             try:
                 with apply_slot():
@@ -609,10 +643,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         # The New removes every component; the Apply of the file
                         # then adds and prepares each one fresh.
                         discard_unsaved=True,
-                        empty_first=lambda: activate_document(
-                            str(UNTITLED_SCENARIO_PATH),
-                            discard_unsaved=body.discard_unsaved,
-                        ),
+                        empty_first=empty_first,
                     )
             except (AuthoringWorkspaceError, HTTPException) as error:
                 detail = getattr(error, "detail", None)
@@ -628,20 +659,43 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "error": {"code": code, "message": message},
                 })
 
-        return recorded_apply(state.headless_client, "scenario_load", run)
+        return state.apply_commands.run(
+            state.headless_client, "scenario_load", body.request_key, run
+        )
 
     @router.post("/api/scenario/new")
     def new_document(body: ScenarioEmptyRequest) -> dict[str, Any]:
         """Apply of the empty cell (the built-in Untitled Scenario); the
-        Scene is initialized. New always works."""
+        Scene is initialized. New always works. Answers at acceptance with
+        its row (``manyforge.apply_command_reply.v1``)."""
 
         def run() -> dict[str, Any]:
             with apply_slot():
+                refuse_new_during_motion()
                 return activate_document(
                     str(UNTITLED_SCENARIO_PATH), discard_unsaved=body.discard_unsaved
                 )
 
-        return recorded_apply(state.headless_client, "scenario_new", run)
+        return state.apply_commands.run(
+            state.headless_client, "scenario_new", body.request_key, run
+        )
+
+    def refuse_new_during_motion() -> None:
+        """New, and Load's New step, wait while motion executes, a Stop is in
+        progress or a component action runs: refused before anything is
+        released or changed (:func:`require_no_motion`)."""
+
+        if state.headless_client is None:
+            return
+        try:
+            require_no_motion(HeadlessApplyPorts(state))
+        except ApplyRefused as refusal:
+            detail: dict[str, Any] = {"code": refusal.code, "message": str(refusal)}
+            if refusal.details:
+                detail["details"] = refusal.details
+            raise refused_before_effect(409, detail) from refusal
+        except Exception as error:  # noqa: BLE001 - a read failure, before any effect
+            raise_operation_failure(error, OperationEffects(), _raise)
 
     def activate_document(
         path: str,
@@ -745,7 +799,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             client = state.headless_client
 
             def activation_intent(generation: int) -> dict[str, Any]:
-                bundle, graph, _epoch = state._manager_current(
+                bundle, graph = state._manager_current(
                     client.manager_status(), phase="scenario_load.preview"
                 )
                 return {
@@ -763,11 +817,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "graph_revision": graph,
                     },
                     "expected_admission_generation": generation,
-                    "manager_request_id": "scenario-document-activation-"
-                    + hashlib.sha256(
-                        f"{body.request_owner_epoch}:{body.request_id}".encode()
-                    ).hexdigest()[:32],
-                    "correlation_id": body.request_id,
+                    "application_start_id": body.application_start_id,
+                    "request_key": new_request_key().hex(),
                     "confirmation_token": None,
                     "draft_id": body.draft_id,
                     "draft_revision": body.expected_draft_revision,
@@ -857,7 +908,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 # after acquisition is invalid: the claim deliberately closes
                 # idle admission. Manager rechecks the exact preview receipt
                 # and current publication when it accepts the operation.
-                current_bundle, current_graph, _ = state._manager_current(
+                current_bundle, current_graph = state._manager_current(
                     state.headless_client.manager_status(), phase="scenario_load.claim"
                 )
                 if current["intent"]["expected_manager_current"] != {
@@ -967,8 +1018,10 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         activation = coordinator.execute_external_submission(
                             AuthoringMutationEnvelope(
                                 expected_admission_generation=generation,
-                                request_owner_epoch=body.request_owner_epoch,
-                                request_id=body.request_id,
+                                application_start_id=parse_application_start_id(
+                                    body.application_start_id
+                                ),
+                                request_key=bytes.fromhex(body.request_key),
                             ),
                             operation_kind="load_scenario_document",
                             draft_id=body.draft_id,
@@ -1003,13 +1056,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
             # Unsaved Drafts are refused before any component is touched.
             require_discard_confirmed()
+            # Every check that refuses before any effect has passed (OD-214).
+            apply_accepted()
             if path == str(UNTITLED_SCENARIO_PATH):
                 # New always works: a failed Apply that still holds
                 # the cell, whatever it changed, is released; this New then
                 # stops and removes everything the host has.
                 try:
                     release = client.manager_apply_release_for_new({
-                        "request_id": f"composer-new.{uuid.uuid4()}",
+                        "request_key": new_request_key().hex(),
                         "source_label": "manyforge_composer",
                     })
                 except HeadlessClientError as error:
@@ -1018,7 +1073,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     raise
                 if release.get("released") is not None:
                     effects.submitted()
-            result = orchestrated_apply(_LoadPorts(state, deployment))
+            result = orchestrated_apply(_LoadPorts(state))
             return {
                 **result,
                 "diagnostics": diagnostics,
@@ -1176,7 +1231,8 @@ def require_empty_cell(state: ComposerState) -> None:
 
 
 def load_exact_scenario_document(state: ComposerState, path: str) -> dict[str, Any]:
-    """Use the one Scenario-document Open/activate implementation at startup.
+    """Use the one Scenario-document Open/activate implementation at startup;
+    returns the Load's ended row (OD-214).
 
     Startup is intentionally not a second loader. Constructing the bounded
     router only binds its handlers; invoking this exact handler performs the
@@ -1195,7 +1251,11 @@ def load_exact_scenario_document(state: ComposerState, path: str) -> dict[str, A
         if isinstance(route, APIRoute)
         and route.path == "/api/scenario/load"
     )
-    return route.endpoint(ScenarioLoadRequest(path=path))
+    request_key = new_request_key().hex()
+    route.endpoint(ScenarioLoadRequest(path=path, request_key=request_key))
+    row = state.apply_commands.ended_row(request_key)
+    assert row is not None and row["end"] is not None
+    return row
 
 
 __all__ = [

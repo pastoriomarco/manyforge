@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Callable, Literal, Protocol
 import hashlib
 import json
 import re
@@ -27,11 +27,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .component_model import RUN_REFUSAL_CODES
+from .component_model import RUN_REFUSAL_CODES, RunReadinessRequest
 from .execution import ExecutionCommandClient, ExecutionEventPump
-from .control_dispatch import (
-    HeadlessExecutionControlDispatch,
-    requires_execution_owner_fence,
+from .manager_status_stream import ManagerStatusChanges, ManagerStatusFollower
+from .control_dispatch import HeadlessExecutionControlDispatch
+from .identity import (
+    RequestKeyInvalid,
+    RequestKeyRequired,
+    StartIdentityMismatch,
+    causal_display,
+    identified,
 )
 from .control_protocol import (
     ControlProtocolError,
@@ -70,7 +75,7 @@ from .models import (
     ProgramReferenceValidationRequest,
     ComponentFrameLookupRequest,
     FullStopIntentRequest,
-    HistorianReconcileRequest,
+    RequestContext,
     IoSignalReadRequest,
     ManagerApplyRequest,
     ManagerApplyAcknowledgementRequest,
@@ -79,19 +84,17 @@ from .models import (
     AuthoringMutationContext,
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
-    AuthoringOwnerReconciliationRequest,
     ProgramModelAttemptRequest,
     ProgramDiagnosticRequest,
     SkillExpansionRequest,
     ProgramRunStartRequest,
-    ProgramRunStopRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
     ProgramNodeCorrectionPreviewRequest,
-    ProgramFullStopResetRequest,
-    ProgramFullStopResumeRequest,
+    ProgramHaltDiscardRequest,
+    ProgramHaltResumeRequest,
     ProgramScenePreparationRequest,
     ProgramCycleResetRequest,
     CycleRecoveryActionRequest,
@@ -130,24 +133,35 @@ from .alarm_attention import (
     OperatorAlarmAttentionPublisher,
 )
 from .activation_preparer import ActivationPreparer
+from .disk_check import (
+    EVENT_HISTORY,
+    HALT_SOURCE_LABEL as DISK_HALT_SOURCE_LABEL,
+    OPERATION_JOURNAL,
+    DiskRecordsCheck,
+    RecordFolder,
+)
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
-# A Program Stop whose body is invalid is a Full Stop too, recognized on the
-# execution Stop route of its kind.
+# The execution Stop routes: an invalid body on any of them is still a Stop,
+# widened by the Kernel from its route (PD-1: Halt stays Halt, the others
+# become Stop all).
+_EXECUTION_STOP_ROUTES = frozenset(
+    {"/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt"}
+)
+# A Program group Stop whose body is invalid is recognized on the execution
+# Stop route of its kind.
 _PROGRAM_STOP_ROUTES = {
-    "/api/program/runs/{program_run_id}/stop": "/api/execution/stops",
     "/api/program/runs/{program_run_id}/motion-stop": "/api/execution/stops",
-    "/api/program/runs/{program_run_id}/full-stop": "/api/execution/full-stop",
 }
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
-_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
+_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v2"
 SOURCE_MODEL_REFERENCE_NOTE = (
     "The applied cell's source-local model facts, schema "
-    "`manyforge.source_model_projection.v3`: `occurrences` (each model "
+    "`manyforge.source_model_projection.v4`: `occurrences` (each model "
     "occurrence with its owning `component_id`, coordinates, links and SRDF "
     "facts), `targets` (each component command target with its frames, model "
     "groups and collision bodies) and `components`, one row per component of "
@@ -179,10 +193,10 @@ def _execution_observation_cursor(message: str) -> dict[str, Any] | None:
         return None
     if (
         not isinstance(cursor, dict)
-        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
-        or not isinstance(cursor.get("owner_epoch"), str)
-        or not cursor["owner_epoch"]
-        or len(cursor["owner_epoch"].encode("utf-8")) > 2_048
+        or set(cursor) != {"application_start_id", "source_epoch", "source_sequence"}
+        or not isinstance(cursor.get("application_start_id"), str)
+        or not cursor["application_start_id"]
+        or len(cursor["application_start_id"].encode("utf-8")) > 2_048
         or not isinstance(cursor.get("source_epoch"), str)
         or not cursor["source_epoch"]
         or len(cursor["source_epoch"].encode("utf-8")) > 2_048
@@ -337,7 +351,7 @@ def _error_status(code: str) -> int:
         return 400
     if code in {"component_frame_lookup_stale", "component_reference_missing", "frame_missing"}:
         return 409
-    if code in {"program_run_started_then_failed", "program_run_superseded_by_stop"}:
+    if code == "program_run_started_then_failed":
         return 422
     if code == "full_stack_restart_required":
         return 409
@@ -361,6 +375,7 @@ def _error_status(code: str) -> int:
     if code.endswith("_not_found") or code in {
         "missing_reference",
         "operator_alarm_not_found",
+        "planning_job_unknown",
     }:
         return 404
     if (
@@ -374,11 +389,8 @@ def _error_status(code: str) -> int:
             "command_not_allowed",
             "manual_handover_required",
             "object_already_exists",
-            "scene_projection_transition_in_progress",
             "program_run_admission_failed",
             "program_run_already_active",
-            "program_required_component_not_active",
-            "route_selection_component_not_ready",
             "program_applied_non_executable",
             "program_not_selected",
             # Preparation runs before any claim or effect; it refuses the input.
@@ -386,9 +398,7 @@ def _error_status(code: str) -> int:
             "program_reference_validation_failed",
             "prepared_activation_unverified",
             "authoring_not_ready",
-            "program_run_stopped_before_start",
             "program_run_draft_applied_mismatch",
-            "deployment_candidate_compiler_busy",
             "activation_preparer_busy",
             "model_sources_unknown",
             "program_node_preview_busy",
@@ -397,9 +407,6 @@ def _error_status(code: str) -> int:
             # An operator-alarm condition interlock refuses motion before any effect.
             "operator_alarm_interlock_active",
             "request_result_expired",
-            # Typed refusals before any effect: Close needs settled work.
-            "cell_close_operation_nonterminal",
-            "cell_close_containment_uncertain",
             # Component model v2: refusals before dispatch.
             "component_action_in_progress",
             "component_action_unsupported",
@@ -409,6 +416,9 @@ def _error_status(code: str) -> int:
             "simulation_not_playing",
             # An assistant mode read while the Deployment has no assistant.
             "assistant_component_absent",
+            # Pick/place planning jobs: a held name, a release before the end.
+            "planning_job_exists",
+            "planning_job_unfinished",
         }
         # RunReadiness reasons and run refusals.
         or code in RUN_REFUSAL_CODES
@@ -427,8 +437,10 @@ def _error_status(code: str) -> int:
         "program_cycle_reconciliation_required",
         "request_ledger_full",
         "scene_projection_commit_uncertain",
-        "persistent_key_storage_uncertain",
         "execution_control_ingress_busy",
+        "execution_planning_jobs_busy",
+        # A runtime unit launching or preparing (contract 1.3).
+        "runtime_unit_launch_in_progress",
     }:
         return 503
     if (
@@ -439,6 +451,8 @@ def _error_status(code: str) -> int:
         return 400
     if code in {
         "confirmation_required",
+        "request_key_required",
+        "start_identity_required",
         "operator_alarm_acknowledgement_confirmation_required",
         "operator_alarm_acknowledgement_reason_required",
         "operator_alarm_acknowledge_all_confirmation_required",
@@ -514,7 +528,11 @@ def create_app(
         raise ValueError("provide exactly one of config or service")
     owns_core = service is None
     event_pump: ExecutionEventPump | None = None
+    manager_status_follower: ManagerStatusFollower | None = None
+    manager_status_changes = ManagerStatusChanges()
+    viewer_pose_sources: Callable[[], tuple[str, str] | None] | None = None
     alarm_attention: OperatorAlarmAttentionPublisher | None = None
+    disk_check: DiskRecordsCheck | None = None
     program_runner_client: ProgramRunnerHttpClient | None = None
     if service is None:
         assert config is not None
@@ -555,14 +573,27 @@ def create_app(
                 timeout_seconds=config.execution_timeout_seconds,
             ),
             activation_preparer=activation_preparer,
+            application_start_id=config.application_start_id,
         )
         event_execution = ExecutionCommandClient(
             config.execution_run_root,
             timeout_seconds=min(config.execution_timeout_seconds, 1.0),
         )
+        # OD-216: the Manager's state from its status stream, followed for the
+        # application's lifetime; each change or liveness change wakes the
+        # control state and the viewer pose streams.
+        manager_status_follower = ManagerStatusFollower(
+            core,
+            config.manager_run_root,
+            silence_seconds=config.freshness_milliseconds / 1_000.0,
+            on_control_change=lambda: control_state_source.notify_cold(),
+            on_viewer_change=manager_status_changes.notify,
+        )
+        viewer_pose_sources = core.viewer_pose_sources
         event_pump = ExecutionEventPump(
             core,
             event_execution,
+            application_start_id=config.application_start_id,
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
         )
         # Its own thread, reading the owner's published projection without the
@@ -577,14 +608,49 @@ def create_app(
                 ),
             ),
         )
+        if config.disk_free_floor_bytes is not None:
+            assert config.disk_free_margin_bytes is not None
+            # OD-215: its own thread. The Halt goes on the Kernel's Stop
+            # socket with the internal transport, as the Manager's Halt for a
+            # late execution host; the journal's level comes from the pump.
+            disk_halt = ExecutionCommandClient(
+                config.execution_run_root,
+                timeout_seconds=min(config.execution_timeout_seconds, 1.0),
+                attribution_transport="internal",
+            )
+            pump = event_pump
+            disk_admission = service.admission
+            disk_check = DiskRecordsCheck(
+                folders=(
+                    RecordFolder(OPERATION_JOURNAL, config.execution_run_root.parent),
+                    RecordFolder(EVENT_HISTORY, config.historian_directory),
+                ),
+                floor_bytes=config.disk_free_floor_bytes,
+                margin_bytes=config.disk_free_margin_bytes,
+                history_signals=core.history_disk_signals,
+                journal_signals=lambda: pump.journal_disk_signals,
+                halt=lambda: disk_halt.halt(
+                    FullStopIntentRequest(
+                        request_context=RequestContext(
+                            request_key=disk_admission.mint_key(),
+                            source_label=DISK_HALT_SOURCE_LABEL,
+                        )
+                    ),
+                    trusted_principal_id=None,
+                ),
+                observe_condition=core.observe_disk_records_condition,
+            )
     assert service is not None
+    # One ``A`` check and one Headless key minter, shared with the service.
+    admission = service.admission
     execution_controls = ExecutionControlClient(
         thread_name_prefix="manyforge_headless_control",
     )
-    control_dispatch = HeadlessExecutionControlDispatch(service)
+    control_dispatch = HeadlessExecutionControlDispatch(service, admission)
     control_ingress = ExecutionControlIngress(
-        projection=control_dispatch.owner_projection,
+        projection=control_dispatch.control_revision,
         dispatch=control_dispatch,
+        application_start_id=admission.application_start_id,
         lanes=execution_controls,
     )
     runner_control_url = getattr(
@@ -594,30 +660,21 @@ def create_app(
     )
     if not isinstance(runner_control_url, str):
         runner_control_url = None
-    cold_freshness_paths = (
-        ()
-        if config is None
-        else (
-            config.projection_root / "manager-source.json",
-            config.projection_root / "logical-scene-source.json",
-            config.projection_root / "scene-runtime-source.json",
-        )
-    )
-    cold_watch_paths = cold_freshness_paths
     control_state_source = HeadlessControlStateSource(
         service,
         control_ingress,
         program_runner_websocket_url=runner_control_url,
-        cold_watch_paths=cold_watch_paths,
-        cold_freshness_paths=cold_freshness_paths,
-        cold_freshness_budget_ns=(
-            None if config is None else config.freshness_milliseconds * 1_000_000
-        ),
         incident_recorder=getattr(service, "record_client_incident", None),
         # The owned native core raises the ordinary Program-failure alarm from
         # the accepted Run; an injected service keeps the demand-only reader.
         program_failure_observer=(
             service.core.observe_program_failure_condition if owns_core else None
+        ),
+        # A Reset's end (its row) clears the initial-scene failure (OD-214).
+        runner_command_observer=(
+            service.observe_runner_commands
+            if isinstance(service, HeadlessService)
+            else None
         ),
     )
     if isinstance(service, HeadlessService):
@@ -655,6 +712,125 @@ def create_app(
             stop=stop,
         )
 
+    def start_identity(value: str | None) -> None:
+        """The one ``A`` check of a request naming a start-minted value."""
+
+        try:
+            admission.start_identity(value)
+        except StartIdentityMismatch as mismatch:
+            raise HeadlessApiError(
+                mismatch.code,
+                "the request names a value of another application start",
+            ) from mismatch
+
+    def read_start_identity(value: str | None, unknown: Exception) -> None:
+        """A read naming a value of another start answers as an unknown id."""
+
+        if value is None:
+            start_identity(value)
+        if value != admission.application_start_id:
+            raise unknown
+
+    def history_start_identity(query: Any) -> None:
+        """A History query naming no start means the current one for its
+        numbers, so a display form's 4-hex prefix must be the current start's;
+        an earlier start is named by ``application_start_id`` or a full form.
+        """
+
+        full, prefixes = query.start_identities()
+        current = admission.application_start_id
+        if not full and any(prefix != current[:4] for prefix in prefixes):
+            raise HeadlessApiError(
+                "historian_query_invalid",
+                "a display form names another application start; name that start "
+                "with application_start_id or use the full form",
+            )
+
+    def shown(reply: dict[str, Any]) -> dict[str, Any]:
+        """A reply naming an id carries ``A`` and its display (1.5)."""
+
+        return identified(reply, admission.application_start_id)
+
+    def http_key(raw: str | None) -> str:
+        try:
+            return admission.http_key(raw, stop=False)
+        except RequestKeyRequired as error:
+            raise HeadlessApiError(
+                "request_key_required",
+                "an effectful request must carry its request_key",
+            ) from error
+        except RequestKeyInvalid as error:
+            raise HeadlessApiError(
+                "request_key_invalid",
+                "request_key must be exactly 32 hex characters",
+            ) from error
+
+    def admitted(body: Any, *, start_value: bool = True) -> Any:
+        """Check ``A`` and form the key of one effectful HTTP request.
+
+        The returned copy carries the formed key; ``A`` is never
+        serialized downstream: nothing there compares it (contract 1.6).
+        """
+
+        if start_value:
+            start_identity(body.application_start_id)
+        context = getattr(body, "request_context", None)
+        if context is not None:
+            return body.model_copy(
+                update={
+                    "request_context": context.model_copy(
+                        update={"request_key": http_key(context.request_key)}
+                    ),
+                }
+            )
+        return body.model_copy(
+            update={
+                "request_key": http_key(body.request_key),
+            }
+        )
+
+    def command_payload(body: Any) -> dict[str, Any]:
+        """The command payload of a REST route, with the ``A`` it carries.
+
+        ``application_start_id`` is never serialized by the models; the
+        dispatch checks it once and drops it.
+        """
+
+        return {
+            **body.model_dump(mode="json"),
+            "application_start_id": body.application_start_id,
+        }
+
+    def preview_admitted(body: Any) -> Any:
+        """Check ``A`` of an effect-free request; a client key is used when
+        given, otherwise Headless gives the request its own key."""
+
+        start_identity(body.application_start_id)
+        raw = body.request_context.request_key
+        key = admission.mint_key() if raw is None else http_key(raw)
+        return body.model_copy(
+            update={
+                "request_context": body.request_context.model_copy(
+                    update={"request_key": key}
+                ),
+            }
+        )
+
+    def plan_admitted(body: Any) -> Any:
+        """Each phase of a pick/place plan is checked and keyed as its own request."""
+
+        return body.model_copy(
+            update={
+                name: admitted(getattr(body, name))
+                for name in (
+                    "approach_operation",
+                    "descend_operation",
+                    "tool_operation",
+                    "retreat_operation",
+                )
+            }
+        )
+
     async def rest_execution_command(
         *,
         command_kind: str,
@@ -671,39 +847,30 @@ def create_app(
 
         if is_stop_command(command_kind):
             # Stop must reach its reserved lane without first waiting on an
-            # owner projection. The semantic owner resolves stale exact scope
-            # conservatively; these envelope fields grant no authority.
-            owner_epoch = request_context.request_owner_epoch
+            # owner projection. Its freshness is never validated; these
+            # envelope fields grant no authority.
             control_revision = 1
         else:
             # This synchronous Program Runner read can itself make a REST
             # request. Keep it off the ASGI event loop and within the existing
             # bounded ordinary-control lane. Recognized Stop retains its
             # projection-free reserved path above.
-            owner_epoch, control_revision = await control_call(
-                control_dispatch.owner_projection
-            )
-        freshness = control_ingress.freshness_for(owner_epoch, control_revision)
-        correlation_id = request_context.correlation_id or request_context.request_id
-        command_payload = dict(payload)
-        if requires_execution_owner_fence(command_kind):
-            command_payload["expected_execution_owner_epoch"] = (
-                request_context.request_owner_epoch
-            )
+            control_revision = await control_call(control_dispatch.control_revision)
+        freshness = control_ingress.freshness_for(control_revision)
+        # The payload keeps the client's key and ``A``: the dispatch checks
+        # ``A`` and forms the key once, for every session-less command.
         command = ExecutionCommandRequestDTO.model_validate(
             {
                 "command_envelope": {
-                    "schema_version": "manyforge.execution_command.v1",
+                    "schema_version": "manyforge.execution_command.v2",
                     "command_kind": command_kind,
-                    "correlation_id": correlation_id,
                     "source_label": request_context.source_label,
-                    "control_session_id": None,
+                    "control_session_number": None,
                     "client_sequence": None,
                     "freshness": freshness.model_dump(mode="json"),
-                    "expected_semantic_owner_epoch": owner_epoch,
                     "expected_execution_control_revision": control_revision,
                 },
-                "payload": command_payload,
+                "payload": dict(payload),
             }
         )
         attribution = _trusted_attribution(transport_request, trusted_principal_adapter)
@@ -727,14 +894,18 @@ def create_app(
                 submission.receipt.code,
                 "execution command was rejected by its current owner",
             )
-        return {} if submission.result is None else dict(submission.result)
+        return {} if submission.result is None else shown(dict(submission.result))
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if manager_status_follower is not None:
+            manager_status_follower.start()
         if event_pump is not None:
             event_pump.start()
         if alarm_attention is not None:
             alarm_attention.start()
+        if disk_check is not None:
+            disk_check.start()
         try:
             if owns_core:
                 # Application-lifetime demand on the one Program reader, so the
@@ -749,11 +920,17 @@ def create_app(
                 if owns_core:
                     try:
                         try:
+                            if disk_check is not None:
+                                disk_check.shutdown()
                             if alarm_attention is not None:
                                 alarm_attention.shutdown()
                         finally:
-                            if event_pump is not None:
-                                event_pump.shutdown()
+                            try:
+                                if event_pump is not None:
+                                    event_pump.shutdown()
+                            finally:
+                                if manager_status_follower is not None:
+                                    manager_status_follower.shutdown()
                     finally:
                         try:
                             if program_runner_client is not None:
@@ -787,9 +964,7 @@ def create_app(
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
             "/api/program/diagnostics": 64 * 1024,
         },
-        recognized_stop_paths=frozenset(
-            {"/api/execution/stops", "/api/execution/full-stop"}
-        ),
+        recognized_stop_paths=_EXECUTION_STOP_ROUTES,
     )
 
     @app.middleware("http")
@@ -860,17 +1035,19 @@ def create_app(
     async def recognized_malformed_stop(
         request: Request,
         recognized_route: str,
+        source_label: str | None = None,
     ) -> Response:
-        """An invalid Stop request is a Full Stop, recognized on its route."""
+        """An invalid Stop request is still a Stop, recognized on its route.
+
+        ``source_label`` is the caller's label where the body was validated.
+        """
 
         reason = getattr(
             request.state,
             "recognized_stop_malformed_reason",
             "recognized_stop_payload_invalid",
         )
-        adapter_request_id = "malformed-stop." + getattr(
-            request.state, "request_id", uuid.uuid4().hex[:16]
-        )
+        request_key = admission.mint_key()
         attribution = _trusted_attribution(
             request,
             trusted_principal_adapter,
@@ -878,10 +1055,11 @@ def create_app(
         try:
             response = execution_response(
                 await control_call(
-                    lambda: service.execution_recognized_malformed_stop(
-                        request_id=adapter_request_id,
+                    lambda: service.execution_recognized_stop(
+                        request_key=request_key,
                         recognized_route=recognized_route,
                         reason=reason,
+                        source_label=source_label,
                         attribution=attribution,
                     ),
                     stop=True,
@@ -904,7 +1082,7 @@ def create_app(
         route = getattr(request.scope.get("route"), "path", None)
         recognized_route = (
             request.url.path
-            if request.url.path in {"/api/execution/stops", "/api/execution/full-stop"}
+            if request.url.path in _EXECUTION_STOP_ROUTES
             else _PROGRAM_STOP_ROUTES.get(route)
         )
         if request.method == "POST" and recognized_route is not None:
@@ -956,10 +1134,15 @@ def create_app(
     def component_recover_enable(
         component_id: Annotated[str, Path(min_length=1, max_length=256)], body: RecoveryPreflightConfirmation,
     ) -> dict[str, Any]:
-        return service.component_recover_enable(component_id, body.model_dump(mode="json"))
+        start_identity(body.application_start_id)
+        return service.component_recover_enable(
+            component_id,
+            body.model_dump(mode="json"),
+        )
 
     @app.post("/api/components/recover-enable", status_code=202)
     def component_recover_enable_group(body: RecoveryGroupRequest) -> dict[str, Any]:
+        start_identity(body.application_start_id)
         return service.component_recover_enable_group(body.model_dump(mode="json")["targets"])
 
     @app.get("/api/cell/latch")
@@ -982,7 +1165,12 @@ def create_app(
     @app.get("/api/program/readiness")
     def program_readiness() -> dict[str, Any]:
         """RunReadiness: can_execute, can_resume, blocked_reasons."""
-        return service.run_readiness()
+        return service.run_readiness(control_state_source.held_cycle_facts())
+
+    @app.post("/api/program/readiness")
+    def program_runner_readiness(body: RunReadinessRequest) -> dict[str, Any]:
+        """RunReadiness for the Program runner, from its own cycle facts."""
+        return service.run_readiness(body.program_cycle.model_dump())
 
     @app.get("/api/cell/authoring-admission")
     def authoring_admission() -> dict[str, Any]:
@@ -992,7 +1180,7 @@ def create_app(
     def acquire_authoring_transaction(
         body: AuthoringMutationContext,
     ) -> dict[str, Any]:
-        claim = service.acquire_authoring_mutation(body)
+        claim = service.acquire_authoring_mutation(admitted(body))
         control_state_source.notify_cold()
         return {"claim": claim}
 
@@ -1000,7 +1188,7 @@ def create_app(
     def settle_authoring_transaction(
         body: AuthoringMutationSettlementRequest,
     ) -> dict[str, Any]:
-        admission = service.settle_authoring_mutation(body)
+        admission = service.settle_authoring_mutation(admitted(body))
         control_state_source.notify_cold()
         return {"admission": admission}
 
@@ -1008,17 +1196,12 @@ def create_app(
     def recover_authoring_transaction(
         body: AuthoringMutationRecoveryRequest,
     ) -> dict[str, Any]:
-        receipt = service.recover_authoring_mutation(body)
+        start_identity(body.application_start_id)
+        receipt = service.recover_authoring_mutation(
+            body
+        )
         control_state_source.notify_cold()
         return {"recovery_receipt": receipt}
-
-    @app.post("/api/program/authoring-transactions/reconcile-owner")
-    def reconcile_authoring_owner(
-        body: AuthoringOwnerReconciliationRequest,
-    ) -> dict[str, Any]:
-        admission = service.reconcile_authoring_owner(body)
-        control_state_source.notify_cold()
-        return {"admission": admission}
 
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -1078,10 +1261,12 @@ def create_app(
     def program_model_attempt(
         request: ProgramModelAttemptRequest,
     ) -> dict[str, Any]:
+        start_identity(request.application_start_id)
         return service.program_model_attempt(request)
 
     @app.post("/api/program/diagnostics")
     def program_diagnostic(request: ProgramDiagnosticRequest) -> dict[str, Any]:
+        start_identity(request.application_start_id)
         return service.core.record_program_diagnostic(request.model_dump(mode="json"))
 
     @app.get("/api/program/diagnostics/health")
@@ -1102,7 +1287,7 @@ def create_app(
     ) -> dict[str, Any]:
         return await rest_execution_command(
             command_kind="program_run",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
@@ -1111,53 +1296,45 @@ def create_app(
     async def program_scene_prepare(
         request: ProgramScenePreparationRequest,
     ) -> dict[str, Any]:
+        # The client's key is required (Q8) but each forwarded attempt gets
+        # its own Headless key (BS 11.6), so the formed key is not passed on.
+        request = admitted(request)
         return await json_control_call(lambda: service.program_scene_prepare(request))
 
     @app.get("/api/program/runs/{program_run_id}")
     def program_run_read(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
     ) -> dict[str, Any]:
-        return service.program_run_read(program_run_id)
-
-    @app.post("/api/program/runs/{program_run_id}/stop")
-    async def program_run_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        if body.program_run_id != program_run_id:
-            # Path and body name different runs: an invalid Stop, so a Full Stop.
-            return await recognized_malformed_stop(  # type: ignore[return-value]
-                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/stop"]
-            )
-        return await rest_execution_command(
-            command_kind="program_stop",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
+        read_start_identity(
+            application_start_id,
+            HeadlessApiError("program_run_not_found", "Program run is not known"),
         )
+        return shown(service.program_run_read(program_run_id))
 
     @app.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramSelectionStopRequest,
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
-            # Path and body name different runs: an invalid Stop, so a Full Stop.
+            # Path and body name different runs: an invalid Stop, so Stop all.
             return await recognized_malformed_stop(  # type: ignore[return-value]
-                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/motion-stop"]
+                request,
+                _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/motion-stop"],
+                body.source_label,
             )
         return await rest_execution_command(
             command_kind="program_motion_stop",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/resume-motion")
     async def program_run_motion_resume(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramSelectionResumeRequest,
         request: Request,
     ) -> dict[str, Any]:
@@ -1168,14 +1345,14 @@ def create_app(
             )
         return await rest_execution_command(
             command_kind="program_motion_resume",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/motion-start")
     async def program_run_motion_start(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramSelectionStartRequest,
         request: Request,
     ) -> dict[str, Any]:
@@ -1186,14 +1363,14 @@ def create_app(
             )
         return await rest_execution_command(
             command_kind="program_motion_start",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-handover")
     async def program_run_manual_handover(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramManualHandoverRequest,
         request: Request,
     ) -> dict[str, Any]:
@@ -1205,33 +1382,15 @@ def create_app(
             )
         return await rest_execution_command(
             command_kind="program_manual_handover",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
-    @app.post("/api/program/runs/{program_run_id}/full-stop")
-    async def program_run_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        if body.program_run_id != program_run_id:
-            # Path and body name different runs: an invalid Stop, so a Full Stop.
-            return await recognized_malformed_stop(  # type: ignore[return-value]
-                request, _PROGRAM_STOP_ROUTES["/api/program/runs/{program_run_id}/full-stop"]
-            )
-        return await rest_execution_command(
-            command_kind="program_full_stop",
-            payload=body.model_dump(mode="json"),
-            request_context=body,
-            transport_request=request,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
-    async def program_run_resume_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramFullStopResumeRequest,
+    @app.post("/api/program/runs/{program_run_id}/resume-halt")
+    async def program_run_resume_halt(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        body: ProgramHaltResumeRequest,
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
@@ -1240,16 +1399,16 @@ def create_app(
                 "Program-run identity in path and body must match",
             )
         return await rest_execution_command(
-            command_kind="program_resume_full_stop",
-            payload=body.model_dump(mode="json"),
+            command_kind="program_resume_halt",
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.post("/api/program/runs/{program_run_id}/reset")
-    async def program_run_reset_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramFullStopResetRequest,
+    async def program_run_discard_halt(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        body: ProgramHaltDiscardRequest,
         request: Request,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
@@ -1258,15 +1417,22 @@ def create_app(
                 "Program-run identity in path and body must match",
             )
         return await rest_execution_command(
-            command_kind="program_discard_full_stop",
-            payload=body.model_dump(mode="json"),
+            command_kind="program_discard_halt",
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
-        return service.program_cycle_status(include_scene_clear=True)
+        status = service.program_cycle_status(include_scene_clear=True)
+        # Headless adds the display of the causal key (1.16.2).
+        return {
+            **status,
+            "causal_display": causal_display(
+                admission.application_start_id, status.get("causal_request_key")
+            ),
+        }
 
     @app.get("/api/control/state")
     def execution_control_projection() -> dict[str, Any]:
@@ -1312,20 +1478,25 @@ def create_app(
     ) -> dict[str, Any]:
         return await rest_execution_command(
             command_kind="program_reset",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def program_runtime_controls(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
     ) -> dict[str, Any]:
-        return service.program_runtime_controls(program_run_id)
+        read_start_identity(
+            application_start_id,
+            HeadlessApiError("program_run_not_found", "Program run is not known"),
+        )
+        return shown(service.program_runtime_controls(program_run_id))
 
     @app.post("/api/program/runs/{program_run_id}/node-correction-previews")
     def program_node_correction_preview(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramNodeCorrectionPreviewRequest,
         request: Request,
     ) -> dict[str, Any]:
@@ -1335,13 +1506,19 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return service.program_node_correction_preview(
-            program_run_id,
-            body,
-            _trusted_attribution(request, trusted_principal_adapter),
+        start_identity(body.application_start_id)
+        # A preview has no effect: a client key is used when given, else
+        # Headless gives the preview its own key.
+        key = admission.mint_key() if body.request_key is None else http_key(body.request_key)
+        return shown(
+            service.program_node_correction_preview(
+                program_run_id,
+                body.model_copy(update={"request_key": key}),
+                _trusted_attribution(request, trusted_principal_adapter),
+            )
         )
 
-    def require_control_path(program_run_id: str, request: Any) -> None:
+    def require_control_path(program_run_id: int, request: Any) -> None:
         if request.program_run_id != program_run_id:
             raise HeadlessApiError(
                 "program_run_path_invalid",
@@ -1350,14 +1527,14 @@ def create_app(
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: RuntimeBlackboardWriteRequest,
         request: Request,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
         return await rest_execution_command(
             command_kind="program_runtime_blackboard_write",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
@@ -1373,30 +1550,36 @@ def create_app(
     def set_program_persistent_value(
         body: PersistentKeyValueSetRequest,
     ) -> dict[str, Any]:
-        return service.program_persistent_value_action("set", body)
+        return service.program_persistent_value_action(
+            "set", admitted(body, start_value=body.program_run_id is not None)
+        )
 
     @app.post("/api/program/persistent-values/reset")
     def reset_program_persistent_value(
         body: PersistentKeyValueResetRequest,
     ) -> dict[str, Any]:
-        return service.program_persistent_value_action("reset", body)
+        return service.program_persistent_value_action(
+            "reset", admitted(body, start_value=body.program_run_id is not None)
+        )
 
     @app.post("/api/program/persistent-values/clear")
     def clear_program_persistent_values(
         body: PersistentKeyValuesClearRequest,
     ) -> dict[str, Any]:
-        return service.program_persistent_value_action("clear", body)
+        return service.program_persistent_value_action(
+            "clear", admitted(body, start_value=False)
+        )
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ManualResultStageRequest,
         request: Request,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
         return await rest_execution_command(
             command_kind="program_manual_result_stage",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
@@ -1408,7 +1591,7 @@ def create_app(
     ) -> dict[str, Any]:
         return await rest_execution_command(
             command_kind="execution_recovery",
-            payload=body.model_dump(mode="json"),
+            payload=command_payload(body),
             request_context=body,
             transport_request=request,
         )
@@ -1503,7 +1686,10 @@ def create_app(
     def manager_deployment_candidate_preview(
         request: ManagerDeploymentCandidatePreviewRequest,
     ) -> JSONResponse:
-        response = service.manager_deployment_candidate_preview(request)
+        start_identity(request.application_start_id)
+        response = service.manager_deployment_candidate_preview(
+            request
+        )
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
@@ -1530,11 +1716,27 @@ def create_app(
 
     @app.post("/api/activation-preparations")
     def prepare_activation(request: ActivationPreparationRequest) -> dict[str, Any]:
-        return service.prepare_activation(request)
+        """Answered at acceptance (OD-214); the preparation's row is published
+        in `GET /api/cycle/status` (`activation_preparation`)."""
+
+        return service.prepare_activation(
+            admitted(request),
+            # The preparer's definite refusals (no effect) end the row
+            # `refused`, as their HTTP status said before.
+            refused=lambda code: 400 <= _error_status(code) < 500,
+        )
+
+    @app.get("/api/activation-preparations/{captured_input_digest}")
+    def prepared_activation(
+        captured_input_digest: Annotated[str, Path(pattern=r"^sha256:[0-9a-f]{64}$")],
+    ) -> dict[str, Any]:
+        """The prepared activation once its preparation ended ``succeeded``."""
+
+        return service.prepared_activation(captured_input_digest)
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:
-        response = service.manager_apply(request)
+        response = service.manager_apply(admitted(request))
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
@@ -1548,10 +1750,15 @@ def create_app(
 
     @app.get("/api/manager/apply/status")
     def manager_apply_status(
-        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_id: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
         apply_generation: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
         background: BackgroundTasks,
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
     ) -> JSONResponse:
+        read_start_identity(
+            application_start_id,
+            HeadlessApiError("apply_status_not_found", "Apply status is not known"),
+        )
         response = service.manager_apply_status(apply_id, apply_generation)
         if response.get("ok") is True:
             if response.get("state") == "succeeded":
@@ -1575,12 +1782,12 @@ def create_app(
 
     @app.post("/api/manager/apply/acknowledge")
     def manager_apply_acknowledge(
-        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_id: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
         apply_generation: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
         request: ManagerApplyAcknowledgementRequest,
     ) -> JSONResponse:
         response = service.manager_apply_acknowledge(
-            apply_id, apply_generation, request.request_context
+            apply_id, apply_generation, admitted(request).request_context
         )
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
@@ -1600,7 +1807,9 @@ def create_app(
         """New: release the fence and claim a failed Apply still holds,
         whatever it changed; New's Apply then empties the cell."""
 
-        response = service.manager_apply_release_for_new(request.request_context)
+        response = service.manager_apply_release_for_new(
+            admitted(request, start_value=False).request_context
+        )
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
@@ -1613,6 +1822,7 @@ def create_app(
         return JSONResponse(status_code=_error_status(code), content=response)
 
     def execution_response(response: dict[str, Any]) -> JSONResponse:
+        response = shown(response)
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
@@ -1654,11 +1864,11 @@ def create_app(
     async def viewer_pose_stream(websocket: WebSocket) -> None:
         from .viewer_pose_stream import serve_viewer_pose_stream
 
-        path = (None if config is None else
-                (config.projection_root / "scene-runtime-source.json").absolute())
         await serve_viewer_pose_stream(
-            websocket, path, None if config is None else config.cell_id,
-            0 if config is None else config.freshness_milliseconds * 1_000_000,
+            websocket,
+            viewer_pose_sources,
+            None if viewer_pose_sources is None else manager_status_changes,
+            None if config is None else config.cell_id,
             None if config is None else service.manager.scene_runtime_owner,
         )
 
@@ -1757,7 +1967,7 @@ def create_app(
         return execution_response(
             await rest_execution_command(
                 command_kind="operation_start",
-                payload=body.model_dump(mode="json"),
+                payload=command_payload(body),
                 request_context=body.request_context,
                 transport_request=request,
             )
@@ -1771,7 +1981,7 @@ def create_app(
         """Read compact target eligibility/context; no cleanup or motion admission."""
         return execution_response(
             service.execution_read_manual_handover(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+                preview_admitted(body), _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
@@ -1782,7 +1992,7 @@ def create_app(
     ) -> JSONResponse:
         return execution_response(
             service.execution_preview_motion(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+                preview_admitted(body), _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
@@ -1793,14 +2003,28 @@ def create_app(
     ) -> JSONResponse:
         return execution_response(
             service.execution_preview_capability_command(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+                preview_admitted(body), _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
     @app.get("/api/execution/operations/{operation_id}")
     def execution_read(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
     ) -> JSONResponse:
+        if application_start_id is None:
+            start_identity(application_start_id)
+        if application_start_id != admission.application_start_id:
+            # The reply of an unknown operation (contract 1.6).
+            return execution_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "operation_not_resident",
+                        "message": "operation is not resident or retained",
+                    },
+                }
+            )
         return execution_response(service.execution_read(operation_id))
 
     @app.post("/api/execution/pick-place/plans/pick")
@@ -1810,7 +2034,7 @@ def create_app(
     ) -> JSONResponse:
         return execution_response(
             service.execution_plan_pick(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+                plan_admitted(body), _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
@@ -1821,13 +2045,34 @@ def create_app(
     ) -> JSONResponse:
         return execution_response(
             service.execution_plan_place(
-                body, _trusted_attribution(request, trusted_principal_adapter)
+                plan_admitted(body), _trusted_attribution(request, trusted_principal_adapter)
             )
         )
 
+    # A pick/place plan is answered at acceptance with its job (OD-213 (1));
+    # its state, and its result once done, are read here. Memory only on the
+    # execution host: no wait and no time limit in any of these.
+    @app.get("/api/execution/pick-place/plans/{job_id}")
+    def execution_read_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> JSONResponse:
+        return execution_response(service.execution_read_planning_job(job_id))
+
+    @app.post("/api/execution/pick-place/plans/{job_id}/cancel")
+    def execution_cancel_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> JSONResponse:
+        return execution_response(service.execution_cancel_planning_job(job_id))
+
+    @app.post("/api/execution/pick-place/plans/{job_id}/release")
+    def execution_release_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> JSONResponse:
+        return execution_response(service.execution_release_planning_job(job_id))
+
     def require_matching_operation(
-        path_operation_id: str,
-        body_operation_id: str,
+        path_operation_id: int,
+        body_operation_id: int,
     ) -> None:
         if path_operation_id != body_operation_id:
             raise HeadlessApiError(
@@ -1837,7 +2082,7 @@ def create_app(
 
     @app.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: OperationResetRequest,
         request: Request,
     ) -> JSONResponse:
@@ -1845,7 +2090,7 @@ def create_app(
         return execution_response(
             await rest_execution_command(
                 command_kind="operation_reset",
-                payload=body.model_dump(mode="json"),
+                payload=command_payload(body),
                 request_context=body.request_context,
                 transport_request=request,
             )
@@ -1853,7 +2098,7 @@ def create_app(
 
     @app.post("/api/execution/operations/{operation_id}/acknowledge-completed")
     async def execution_acknowledge_completed(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: OperationControlRequest,
         request: Request,
     ) -> JSONResponse:
@@ -1861,7 +2106,7 @@ def create_app(
         return execution_response(
             await rest_execution_command(
                 command_kind="operation_acknowledge_completed",
-                payload=body.model_dump(mode="json"),
+                payload=command_payload(body),
                 request_context=body.request_context,
                 transport_request=request,
             )
@@ -1875,20 +2120,36 @@ def create_app(
         return execution_response(
             await rest_execution_command(
                 command_kind="operation_stop",
+                payload=command_payload(body),
+                request_context=body.request_context,
+                transport_request=request,
+            )
+        )
+
+    @app.post("/api/execution/stop-all")
+    async def execution_stop_all(
+        body: FullStopIntentRequest,
+        request: Request,
+    ) -> JSONResponse:
+        """Stop all: every operation in the cell; every group held."""
+        return execution_response(
+            await rest_execution_command(
+                command_kind="stop_all",
                 payload=body.model_dump(mode="json"),
                 request_context=body.request_context,
                 transport_request=request,
             )
         )
 
-    @app.post("/api/execution/full-stop")
-    async def execution_full_stop(
+    @app.post("/api/execution/halt")
+    async def execution_halt(
         body: FullStopIntentRequest,
         request: Request,
     ) -> JSONResponse:
+        """Halt: Stop all and the Program frozen; works with no Program."""
         return execution_response(
             await rest_execution_command(
-                command_kind="cell_full_stop",
+                command_kind="halt",
                 payload=body.model_dump(mode="json"),
                 request_context=body.request_context,
                 transport_request=request,
@@ -1903,7 +2164,7 @@ def create_app(
         return execution_response(
             await rest_execution_command(
                 command_kind="runtime_scale",
-                payload=body.model_dump(mode="json"),
+                payload=command_payload(body),
                 request_context=body.request_context,
                 transport_request=request,
             )
@@ -1973,7 +2234,7 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         response = service.scene_commit(
-            body, _trusted_attribution(request, trusted_principal_adapter)
+            admitted(body), _trusted_attribution(request, trusted_principal_adapter)
         )
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
@@ -1988,7 +2249,7 @@ def create_app(
 
     @app.post("/api/scene/transactions/status")
     def scene_transaction_status(body: SceneTransactionRequest) -> dict[str, Any]:
-        return service.scene_transaction_status(body)
+        return service.scene_transaction_status(admitted(body))
 
     @app.get("/api/execution/alarms")
     def alarms(
@@ -2014,7 +2275,7 @@ def create_app(
     ) -> dict[str, Any]:
         result = service.acknowledge_alarm(
             condition_id,
-            body,
+            admitted(body),
             _trusted_attribution(request, trusted_principal_adapter),
         )
         control_state_source.notify_cold()
@@ -2026,7 +2287,7 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         result = service.acknowledge_all(
-            body,
+            admitted(body),
             _trusted_attribution(request, trusted_principal_adapter),
         )
         control_state_source.notify_cold()
@@ -2036,6 +2297,7 @@ def create_app(
     def history(
         query: Annotated[HistorianQueryRequest, Query()],
     ) -> JSONResponse:
+        history_start_identity(query)
         # Encode this potentially large bounded page in the synchronous route
         # worker instead of blocking the shared ASGI event loop.
         return JSONResponse(content=service.history(query))
@@ -2044,6 +2306,7 @@ def create_app(
     def history_export(
         query: Annotated[HistorianQueryRequest, Query()]
     ) -> JSONResponse:
+        history_start_identity(query)
         return JSONResponse(
             content=service.history_export(query),
             headers={
@@ -2067,6 +2330,7 @@ def create_app(
 
     @app.get("/api/debug/export")
     def debug_export(query: Annotated[HistorianDebugRequest, Query()]) -> JSONResponse:
+        history_start_identity(query.history_query())
         return JSONResponse(
             content=service.debug_export(query.history_query()),
             headers={
@@ -2078,6 +2342,7 @@ def create_app(
     def normalized_trace_export(
         query: Annotated[HistorianDebugRequest, Query()]
     ) -> JSONResponse:
+        history_start_identity(query.history_query())
         return JSONResponse(
             content=service.debug_export(
                 query.history_query(), include_volatile_motion_trace=False
@@ -2089,10 +2354,15 @@ def create_app(
 
     @app.get("/api/execution/program-runs/{program_run_id}/admitted-speeds")
     def program_run_admitted_speeds(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=1024)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
     ) -> JSONResponse:
+        read_start_identity(
+            application_start_id,
+            HeadlessApiError("program_run_not_found", "Program run is not known"),
+        )
         return JSONResponse(
-            content=service.program_run_admitted_speeds(program_run_id)
+            content=shown(service.program_run_admitted_speeds(program_run_id))
         )
 
     @app.get("/api/execution/history/health")
@@ -2110,16 +2380,6 @@ def create_app(
         """One Scenario Load/New, Deployment or Program Apply/Revert terminal
         (outcome, typed error, component rows), recorded as `apply_finished`."""
         return service.record_apply_outcome(body)
-
-    @app.post("/api/execution/history/reconcile")
-    def historian_reconcile(
-        body: HistorianReconcileRequest,
-        request: Request,
-    ) -> dict[str, Any]:
-        return service.historian_reconcile(
-            body,
-            _trusted_attribution(request, trusted_principal_adapter),
-        )
 
     return app
 

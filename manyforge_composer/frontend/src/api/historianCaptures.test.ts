@@ -19,7 +19,7 @@ function retention() {
     last_recorded_utc_ns: null,
   });
   return {
-    schema_version: 'manyforge.historian_retention.v2',
+    schema_version: 'manyforge.historian_retention.v3',
     partitions: [partition('routine'), partition('important')],
     captures: {
       live_count: '1',
@@ -38,6 +38,7 @@ function retention() {
     database_page_byte_limit: '536870912',
     duration_guaranteed: false,
     prior_pruning_known: true,
+    older_history_files: [] as Array<{ file_name: string; format: string | null }>,
   };
 }
 
@@ -131,15 +132,34 @@ describe('failure capture contracts', () => {
     expect(parseHistorianCapturePage({ ...wire, next_before_capture_id: '3' }).nextBeforeCaptureId).toBe('3');
   });
 
-  it('accepts the v2 retention profile on history pages', () => {
+  it('accepts the v3 retention profile on history pages', () => {
     expect(parseHistorianPage({
-      schema_version: 'manyforge.historian_summary_page.v2',
+      schema_version: 'manyforge.historian_summary_page.v3',
       events: [],
       next_before_sequence: null,
       truncated: false,
       time_window: { start_utc_ns: null, end_utc_ns: null },
       retention: retention(),
     }).retention?.captures.liveCount).toBe('1');
+  });
+
+  it('reads the earlier History files named by the retention document', () => {
+    const page = (files: unknown) => parseHistorianPage({
+      schema_version: 'manyforge.historian_summary_page.v3',
+      events: [],
+      next_before_sequence: null,
+      truncated: false,
+      time_window: { start_utc_ns: null, end_utc_ns: null },
+      retention: { ...retention(), older_history_files: files },
+    });
+    expect(page([
+      { file_name: 'history.sqlite3', format: null },
+      { file_name: 'history.v5.sqlite3', format: '5' },
+    ]).retention?.olderHistoryFiles).toEqual([
+      { fileName: 'history.sqlite3', format: null },
+      { fileName: 'history.v5.sqlite3', format: '5' },
+    ]);
+    expect(() => page([{ file_name: 'history.v5.sqlite3' }])).toThrow();
   });
 
   it('restricts a history query to one positive capture id', () => {

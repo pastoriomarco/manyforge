@@ -140,6 +140,17 @@ build_manyforge_content_identity() {
     cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
 }
 
+build_manyforge_private_stream() {
+    local build="$1"
+    local build_testing="$2"
+    mkdir -p "$build"
+    cd "$build"
+    cmake "$WORKSPACE/manyforge_private_stream" -G "$BUILD_GENERATOR" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_PRIVATE_STREAM_BUILD_TESTING="$build_testing" 2>&1 | tail -3
+    cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" 2>&1 | tail -5
+}
+
 build_manyforge_persistence() {
     local build="$1"
     local build_testing="$2"
@@ -251,6 +262,18 @@ run_cpp_tests() {
     build_manyforge_content_identity "$identity_build" ON
     cd "$identity_build"
     if ! require_ctest_tests "manyforge_content_identity"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+
+    section "C++ manyforge_private_stream tests"
+    local private_stream_build="$BUILD_DIR/private-stream"
+    build_manyforge_private_stream "$private_stream_build" ON
+    cd "$private_stream_build"
+    if ! require_ctest_tests "manyforge_private_stream"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -514,9 +537,9 @@ run_headless_cpp_tests() {
     build_manyforge_headless "$build" "$ros_execution_host"
     cd "$build"
     if ! require_ctest_tests "manyforge_headless" \
-        "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" \
-        "ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement" \
-        "ManagerDaemonProcess.PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement"; then
+        "ManagerDaemonProcess.ALateExecutionHostIsFaultedStoppedOnceAndKeptUntilItExits" \
+        "ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndAPreviousRunIsRefused" \
+        "ManagerDaemonProcess.AnExecutionHostExitEndsTheApplication"; then
         FAIL=$((FAIL + 1))
     elif ! require_headless_runtime_packages "$build"; then
         FAIL=$((FAIL + 1))
@@ -557,6 +580,8 @@ run_headless_python_tests() {
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
         MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
+        MANYFORGE_ASSISTANT_STOPPABLE_MOTION_PACKAGE_ROOT="$build/assistant-native-stoppable-motion-test-fixture/retained-package" \
+        MANYFORGE_ASSISTANT_STOPPABLE_MOTION_METADATA="$build/assistant-native-stoppable-motion-test-fixture/metadata.json" \
         MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT="$build/robotiq-position-manager-test-fixture/retained-package" \
         MANYFORGE_ROBOTIQ_POSITION_METADATA="$build/robotiq-position-manager-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \

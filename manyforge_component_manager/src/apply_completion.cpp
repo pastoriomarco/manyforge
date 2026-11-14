@@ -34,7 +34,7 @@ bool ManagerApplyFailureEvidenceDTO::valid() const noexcept {
 }
 
 bool ManagerApplyTerminalOutcomeDTO::valid() const noexcept {
-  if (apply_id.empty() || !apply_generation.nonzero()) {
+  if (!apply_id.nonzero() || !apply_generation.nonzero()) {
     return false;
   }
   // "No success evidence" means every success-only optional is absent, not

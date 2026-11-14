@@ -42,7 +42,7 @@ def test_free_text_nested_or_oversized_details_are_never_logged() -> None:
 
 
 def test_unhandled_exception_keeps_a_typed_500_without_exposing_exception() -> None:
-    app = create_app(ComposerState())
+    app = create_app(ComposerState(application_start_id=0x3F9A0000000000A1))
 
     def failing_route() -> None:
         raise RuntimeError("private internal details")

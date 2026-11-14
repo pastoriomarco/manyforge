@@ -22,6 +22,7 @@ LOGGER = logging.getLogger("manyforge_composer.reset_apply")
 _Identity = Annotated[str, Field(min_length=1, max_length=256)]
 _Revision = Annotated[str, Field(min_length=1, max_length=256)]
 _Count = Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+_RunNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class ResetApplyContextRequest(BaseModel):
@@ -31,13 +32,12 @@ class ResetApplyContextRequest(BaseModel):
         populate_by_name=True, extra="forbid", allow_inf_nan=False, strict=True
     )
 
-    schema_version: Literal["manyforge.composer_reset_apply_context.v1"] = Field(
+    schema_version: Literal["manyforge.composer_reset_apply_context.v2"] = Field(
         alias="schemaVersion"
     )
     correlation_id: _Identity = Field(alias="correlationId")
     document: Literal["program", "deployment"]
-    program_run_id: _Identity = Field(alias="programRunId")
-    program_runner_owner_epoch: _Identity = Field(alias="programRunnerOwnerEpoch")
+    program_run_id: _RunNumber = Field(alias="programRunId")
     cycle_generation: _Count = Field(alias="cycleGeneration")
     draft_id: _Identity = Field(alias="draftId")
     draft_revision: _Count = Field(alias="draftRevision")
@@ -54,7 +54,6 @@ def record_reset_apply_context(body: ResetApplyContextRequest) -> dict[str, Any]
             "reset_apply_correlation_id": body.correlation_id,
             "document": body.document,
             "program_run_id": body.program_run_id,
-            "program_runner_owner_epoch": body.program_runner_owner_epoch,
             "cycle_generation": body.cycle_generation,
             "draft_id": body.draft_id,
             "draft_revision": body.draft_revision,
@@ -69,7 +68,7 @@ def log_reset_apply_link(
     phase: Literal["program_apply", "deployment_apply"],
     *,
     correlation_id: str,
-    request_id: str,
+    request_key: str,
     outcome: str,
     **identities: Any,
 ) -> None:
@@ -80,7 +79,7 @@ def log_reset_apply_link(
         extra={
             "reset_apply_correlation_id": correlation_id,
             "reset_apply_phase": phase,
-            "request_id": request_id,
+            "request_key": request_key,
             "outcome": outcome,
             **{key: value for key, value in identities.items() if value is not None},
         },

@@ -1,7 +1,9 @@
+#include <manyforge_core/types/application_identity.hpp>
 #include "../src/program_runner_publisher_fault_internal.hpp"
 #include "../src/manager_reference_diagnostics_internal.hpp"
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -26,6 +28,7 @@
 #include <manyforge_component_manager/execution_host_unit_admission.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
@@ -41,11 +44,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "manyforge_headless/cell_admission_readiness_reducer.hpp"
-#include "manyforge_headless/source_snapshot.hpp"
 
 namespace manyforge::headless {
 namespace {
@@ -57,7 +60,7 @@ namespace deployment = manyforge::deployment;
 
 TEST(ManagerReferenceDiagnostics, RetainsTypedRowsAndBoundsTheResponse) {
   using V = content_identity::CanonicalValue;
-  const V response(V::Object{{"api_version", V("manyforge.manager_command_response.v2")},
+  const V response(V::Object{{"api_version", V("manyforge.manager_command_response.v3")},
       {"ok", V(false)}, {"error", V(V::Object{{"code", V("program_reference_validation_failed")},
           {"message", V("invalid reference")}, {"details", V(V::Object{})}, {"producer", V("manager")}})}});
   const deployment::ProgramReferenceDiagnostic row{
@@ -85,9 +88,9 @@ TEST(ManagerReferenceDiagnostics, RetainsTypedRowsAndBoundsTheResponse) {
 }
 
 core::ProgramCycleStatusDTO IdleCycleStatus() {
-  return {core::RequestOwnerEpoch("runner-owner"),
-          4U,
+  return {4U,
           core::ProgramCycleStateDTO::kIdleAfterReset,
+          std::nullopt,
           std::nullopt,
           std::nullopt,
           std::nullopt};
@@ -115,7 +118,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
      PreservesRunningStaleFaultedAndUnsettledClosureFacts) {
   auto running = IdleCycleStatus();
   running.state = core::ProgramCycleStateDTO::kRunning;
-  running.program_run_id = core::ProgramRunId("run");
+  running.program_run_id = core::ProgramRunNumber(107U);
   running.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
   const auto reduced = ReduceManagerCellAdmissionReadiness(
       {false, running, false, 3U, 2U, false, false, 1U, 1U, 1U});
@@ -135,41 +138,17 @@ TEST(ManagerCellAdmissionReadinessReducer,
 }
 
 TEST(ManagerCellAdmissionReadinessReducer,
-     AcceptsOnlyTheCurrentProgramRunnerOwner) {
-  const auto before = IdleCycleStatus();
-  auto after = before;
-  after.program_runner_owner_epoch =
-      core::RequestOwnerEpoch("runner-successor");
-  EXPECT_TRUE(IsCurrentProgramRunnerOwner(
-      after, core::RuntimeEpoch("runner-successor")));
-
-  // Cycle progression is owned by the Runner and may happen between Manager's
-  // probe and renewal exchange.
-  after.cycle_generation += 1U;
-  EXPECT_TRUE(IsCurrentProgramRunnerOwner(
-      after, core::RuntimeEpoch("runner-successor")));
-  after = before;
-  after.program_runner_owner_epoch =
-      core::RequestOwnerEpoch("foreign-successor");
-  EXPECT_FALSE(IsCurrentProgramRunnerOwner(
-      after, core::RuntimeEpoch("runner-successor")));
-}
-
-TEST(ManagerCellAdmissionReadinessReducer,
      RunnerContactLossRequiresPreviouslyQualifiedActiveRun) {
-  const core::RequestOwnerEpoch manager("manager.owner");
-  const core::RuntimeEpoch manager_runtime("manager.runtime");
   const auto loss = [&](const std::optional<core::ProgramCycleStatusDTO> &cycle,
                         std::string_view predicate =
                             "program_runner_liveness_probe",
                         std::string_view message = "contact failed") {
-    return MakeProgramRunnerContactLoss(cycle, manager, manager_runtime,
-                                        predicate, message);
+    return MakeProgramRunnerContactLoss(cycle, predicate, message);
   };
   EXPECT_FALSE(loss(std::nullopt));
   EXPECT_FALSE(loss(IdleCycleStatus()));
   auto cycle = IdleCycleStatus();
-  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.program_run_id = core::ProgramRunNumber(107U);
   cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
   for (const auto state : {core::ProgramCycleStateDTO::kStarting,
                            core::ProgramCycleStateDTO::kRunning,
@@ -259,7 +238,7 @@ TEST(ManagerProgramRunnerPublicationFault,
      CurrentFencedPublisherIsTypedWithoutInventingRunnerDeath) {
   auto cycle = IdleCycleStatus();
   cycle.state = core::ProgramCycleStateDTO::kRunning;
-  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.program_run_id = core::ProgramRunNumber(107U);
   cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
   const auto fault =
       content_identity::CanonicalValue(content_identity::CanonicalValue::Object{
@@ -268,43 +247,20 @@ TEST(ManagerProgramRunnerPublicationFault,
           {"message", content_identity::CanonicalValue("key ACK missing")},
           {"details", content_identity::CanonicalValue(
                           content_identity::CanonicalValue::Object{})}});
-  const core::RuntimeEpoch receiver("runner-owner");
-  // Golden vector produced by the existing Python RFC8785 helper, not a
-  // locally invented framing or an assumed Manager process-death reference.
-  const std::optional<std::string> reference =
-      "sha256:dcf9f1d846eb19d655b0da3da50f978ca68913d08f206476e20787d68f13686b";
-  EXPECT_EQ(
-      content_identity::sha256_digest(content_identity::canonical_json(fault)),
-      *reference);
   EXPECT_NO_THROW(detail::CheckProgramRunnerPublicationHealth(
-      content_identity::CanonicalValue(nullptr), cycle, receiver, false,
-      std::nullopt));
+      content_identity::CanonicalValue(nullptr), cycle, false));
   EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
-                   fault, cycle, receiver, false, reference),
-               std::invalid_argument);
-  EXPECT_THROW(
-      detail::CheckProgramRunnerPublicationHealth(
-          fault, cycle, core::RuntimeEpoch("foreign-runner"), true, reference),
-      std::invalid_argument);
-  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
-                   fault, cycle, receiver, true, std::nullopt),
-               std::invalid_argument);
-  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
-                   fault, cycle, receiver, true,
-                   std::string("sha256:") + std::string(64U, 'a')),
+                   fault, cycle, false),
                std::invalid_argument);
   try {
-    detail::CheckProgramRunnerPublicationHealth(fault, cycle, receiver, true,
-                                                reference);
+    detail::CheckProgramRunnerPublicationHealth(fault, cycle, true);
     FAIL() << "publisher failure did not stop normal renewal progression";
   } catch (const detail::ProgramRunnerPublisherFault &error) {
     EXPECT_EQ(error.cycle(), cycle);
     EXPECT_EQ(std::string(error.what()),
               "program_bbkey_publication_failed: key ACK missing");
     const auto loss = MakeProgramRunnerContactLoss(
-        cycle, core::RequestOwnerEpoch("manager"),
-        core::RuntimeEpoch("manager.runtime"),
-        "program_runner_publication_fault", error.what());
+        cycle, "program_runner_publication_fault", error.what());
     ASSERT_TRUE(loss);
     EXPECT_EQ(loss->established_cycle, cycle);
     EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
@@ -323,20 +279,16 @@ TEST(ManagerProgramRunnerPublicationFault,
   EXPECT_TRUE(retained.starts_with("program_bbkey_publication_failed: "));
   auto cycle = IdleCycleStatus();
   cycle.state = core::ProgramCycleStateDTO::kRunning;
-  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.program_run_id = core::ProgramRunNumber(107U);
   cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
   const auto loss = MakeProgramRunnerContactLoss(
-      cycle, core::RequestOwnerEpoch("manager"),
-      core::RuntimeEpoch("manager.runtime"), "program_runner_publication_fault",
-      retained);
+      cycle, "program_runner_publication_fault", retained);
   ASSERT_TRUE(loss);
   EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
   EXPECT_EQ(loss->message, retained);
   EXPECT_EQ(loss->established_cycle, cycle);
   EXPECT_FALSE(MakeProgramRunnerContactLoss(
-      IdleCycleStatus(), core::RequestOwnerEpoch("manager"),
-      core::RuntimeEpoch("manager.runtime"), "program_runner_publication_fault",
-      retained));
+      IdleCycleStatus(), "program_runner_publication_fault", retained));
 }
 
 TEST(ManagerCellAdmissionReadinessReducer,
@@ -346,7 +298,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
   auto after = before;
   auto &cycle = *after.program_cycle_status;
   cycle.state = core::ProgramCycleStateDTO::kStarting;
-  cycle.program_run_id = core::ProgramRunId("run");
+  cycle.program_run_id = core::ProgramRunNumber(107U);
   EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
   cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
   EXPECT_TRUE(IsSameProgramAdmissionProgress(before, after));
@@ -362,10 +314,6 @@ TEST(ManagerCellAdmissionReadinessReducer,
     EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
   }
   auto changed = after;
-  changed.program_cycle_status->program_runner_owner_epoch =
-      core::RequestOwnerEpoch("foreign");
-  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
-  changed = after;
   ++changed.program_cycle_status->cycle_generation;
   EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
   changed = after;
@@ -380,7 +328,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
      StartingToRunningDoesNotInventAnAdmissionOutage) {
   auto starting = IdleCycleStatus();
   starting.state = core::ProgramCycleStateDTO::kStarting;
-  starting.program_run_id = core::ProgramRunId("run");
+  starting.program_run_id = core::ProgramRunNumber(107U);
   auto before = ReduceManagerCellAdmissionReadiness(
       {true, starting, true, 3U, 3U, true, true, 0U, 0U, 0U});
   auto after = before;
@@ -407,11 +355,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
     EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
   }
   auto changed = after;
-  changed.program_cycle_status->program_runner_owner_epoch =
-      core::RequestOwnerEpoch("other");
-  EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
-  changed = after;
-  changed.program_cycle_status->program_run_id = core::ProgramRunId("other");
+  changed.program_cycle_status->program_run_id = core::ProgramRunNumber(108U);
   EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
   changed = after;
   ++changed.program_cycle_status->cycle_generation;
@@ -428,6 +372,19 @@ TEST(ManagerCellAdmissionReadinessReducer,
 
 constexpr std::string_view kDeploymentRevision =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A readable request name as its wire request key (32 hex): a Manager-minted
+/// internal key whose sequence hashes the name, so equal names give equal
+/// keys and distinct names distinct keys.
+std::string TestRequestKeyText(const std::string_view name) {
+  std::uint64_t sequence = 0xcbf29ce484222325ULL;
+  for (const char character : name)
+    sequence = (sequence ^ static_cast<unsigned char>(character)) *
+               0x100000001b3ULL;
+  return core::RequestKeyText(core::RequestKey::Make(
+      core::RequestKeyClass::kInternal, 0U,
+      static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), sequence));
+}
 
 const content_identity::CanonicalValue &
 RequiredMember(const content_identity::CanonicalValue &value,
@@ -575,8 +532,10 @@ public:
     std::filesystem::create_directory(manager_run_root());
     std::filesystem::create_directory(execution_state_root());
     std::filesystem::create_directory(execution_run_root());
-    std::filesystem::create_directory(publication_root());
     std::filesystem::create_directory(activation_root());
+    // The launcher's process list; these tests start no listed process.
+    std::ofstream(application_processes())
+        << R"({"api_version":"manyforge.application_processes.v1","processes":[]})";
   }
 
   ~DaemonDirectory() {
@@ -603,9 +562,6 @@ public:
   [[nodiscard]] std::filesystem::path manager_run_root() const {
     return root_ / "manager-run";
   }
-  [[nodiscard]] std::filesystem::path publication_root() const {
-    return root_ / "publications";
-  }
   [[nodiscard]] std::filesystem::path scene_database() const {
     return root_ / "logical-scene.sqlite3";
   }
@@ -614,6 +570,13 @@ public:
   }
   [[nodiscard]] std::filesystem::path socket_path() const {
     return manager_run_root() / "manager-command.sock";
+  }
+  /// The Manager's status stream (OD-216).
+  [[nodiscard]] std::filesystem::path status_socket_path() const {
+    return manager_run_root() / "manager-status.sock";
+  }
+  [[nodiscard]] std::filesystem::path application_processes() const {
+    return root_ / "application-processes.json";
   }
   [[nodiscard]] std::filesystem::path startup_stderr() const {
     return root_ / "manager-startup.stderr";
@@ -647,6 +610,211 @@ private:
   const int initial_uncaught_exceptions_{std::uncaught_exceptions()};
 };
 
+// The Manager's status stream (OD-216), read as its clients do: one
+// SEQPACKET connection to `manager-status.sock`, no request; the Manager
+// sends a `snapshot` frame, then one `section` frame per section with a
+// value, then a `section` frame per change and `keepalive` frames per tick.
+constexpr std::string_view kStatusStreamApiVersion =
+    "manyforge.manager_status_stream.v1";
+/// One byte above the stream's frame bound (409,600 bytes): a larger packet
+/// is reported by MSG_TRUNC and refused.
+constexpr std::size_t kStatusFrameBufferBytes = 409'601U;
+
+/// One client connection to the status stream; closed on destruction.
+class StatusConnection final {
+public:
+  explicit StatusConnection(const DaemonDirectory &directory)
+      : fd_(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)) {
+    if (fd_ < 0) {
+      throw std::runtime_error("Manager status client socket failed");
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const auto spelling = directory.status_socket_path().string();
+    if (spelling.size() >= sizeof(address.sun_path)) {
+      static_cast<void>(::close(fd_));
+      throw std::runtime_error("Manager status socket path is too long");
+    }
+    std::copy(spelling.begin(), spelling.end(), address.sun_path);
+    if (::connect(fd_, reinterpret_cast<sockaddr *>(&address),
+                  sizeof(address)) != 0) {
+      static_cast<void>(::close(fd_));
+      fd_ = -1;
+    }
+  }
+
+  ~StatusConnection() {
+    if (fd_ >= 0) {
+      static_cast<void>(::close(fd_));
+    }
+  }
+
+  StatusConnection(const StatusConnection &) = delete;
+  StatusConnection &operator=(const StatusConnection &) = delete;
+
+  /// False when no Manager listens on the status socket.
+  [[nodiscard]] bool connected() const noexcept { return fd_ >= 0; }
+
+  /// The next frame, or nullopt when none arrives by `deadline`. Throws when
+  /// the Manager closed the connection or sent an invalid frame.
+  [[nodiscard]] std::optional<content_identity::CanonicalValue>
+  Receive(const std::chrono::steady_clock::time_point deadline) const {
+    for (;;) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now());
+      pollfd inbound{fd_, POLLIN, 0};
+      const int ready = ::poll(
+          &inbound, 1,
+          static_cast<int>(std::max<std::int64_t>(0, remaining.count())));
+      if (ready < 0 && errno == EINTR) {
+        continue;
+      }
+      if (ready < 0) {
+        throw std::runtime_error("Manager status stream poll failed");
+      }
+      if (ready == 0) {
+        return std::nullopt;
+      }
+      break;
+    }
+    std::string buffer(kStatusFrameBufferBytes, '\0');
+    ssize_t received = -1;
+    do {
+      received = ::recv(fd_, buffer.data(), buffer.size(), MSG_TRUNC);
+    } while (received < 0 && errno == EINTR);
+    if (received == 0) {
+      throw std::runtime_error("Manager status stream closed");
+    }
+    if (received < 0 || static_cast<std::size_t>(received) >= buffer.size()) {
+      throw std::runtime_error("Manager status frame is invalid or too large");
+    }
+    buffer.resize(static_cast<std::size_t>(received));
+    return content_identity::parse_canonical_json(
+        buffer, content_identity::CanonicalJsonParseLimits{
+                    content_identity::kMaximumCanonicalJsonBytes,
+                    content_identity::kMaximumCanonicalJsonDepth,
+                    content_identity::kMaximumCanonicalJsonNodes});
+  }
+
+private:
+  int fd_;
+};
+
+const std::string &StatusFrameType(const content_identity::CanonicalValue &frame) {
+  return RequiredMember(frame, "type").as_string();
+}
+
+std::uint64_t StatusFrameTick(const content_identity::CanonicalValue &frame) {
+  return static_cast<std::uint64_t>(RequiredMember(frame, "tick").as_number());
+}
+
+/// One status section's newest value, named like the old status-file record
+/// fields: `generation` rises only when the payload bytes change, and
+/// `observed_at_ns` is the producer's time of that value.
+struct StatusSection final {
+  std::uint64_t source_generation{};
+  std::int64_t observed_at_ns{};
+  content_identity::CanonicalValue payload;
+};
+
+StatusSection
+ReadStatusSectionFrame(const content_identity::CanonicalValue &frame) {
+  const auto &section = RequiredMember(frame, "section");
+  if (RequiredMember(section, "oversized").as_bool()) {
+    throw std::runtime_error("Manager status section is oversized: " +
+                             RequiredMember(frame, "name").as_string());
+  }
+  return {static_cast<std::uint64_t>(
+              RequiredMember(section, "generation").as_number()),
+          content_identity::parse_nonnegative_int64(
+              RequiredMember(section, "observed_at_ns")),
+          RequiredMember(section, "payload")};
+}
+
+/// The current value of the status section `name`: connects, reads the
+/// snapshot and then section frames until every section it lists with a
+/// value has arrived at or above its listed generation, and closes (one
+/// connection per call, as a reader of the old status files read them).
+/// nullopt when no Manager listens or the section has no value yet
+/// (generation 0). A refused subscription (the Manager serves at most four;
+/// a closed reader's slot is freed at its writer's next send, within one
+/// 500 ms status tick) is retried until the deadline.
+std::optional<StatusSection> ReadStatusSection(const DaemonDirectory &directory,
+                                               const std::string_view name) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    const StatusConnection connection(directory);
+    if (!connection.connected()) {
+      return std::nullopt;
+    }
+    const auto snapshot = connection.Receive(deadline);
+    if (!snapshot.has_value()) {
+      throw std::runtime_error("Manager status stream sent no snapshot");
+    }
+    if (StatusFrameType(*snapshot) == "error" &&
+        std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+    if (StatusFrameType(*snapshot) != "snapshot") {
+      throw std::runtime_error("Manager status stream did not start with a "
+                               "snapshot: " +
+                               content_identity::canonical_json(*snapshot));
+    }
+    std::vector<std::pair<std::string, std::uint64_t>> pending;
+    for (const auto &[section, generation] :
+         RequiredMember(*snapshot, "generations").as_object()) {
+      if (generation.as_number() >= 1.0) {
+        pending.emplace_back(
+            section, static_cast<std::uint64_t>(generation.as_number()));
+      }
+    }
+    std::optional<StatusSection> value;
+    while (!pending.empty()) {
+      const auto frame = connection.Receive(deadline);
+      if (!frame.has_value()) {
+        throw std::runtime_error(
+            "Manager status stream did not send its current sections");
+      }
+      if (StatusFrameType(*frame) == "keepalive") {
+        continue;
+      }
+      if (StatusFrameType(*frame) != "section") {
+        throw std::runtime_error("Manager status stream sent " +
+                                 content_identity::canonical_json(*frame));
+      }
+      const auto &frame_name = RequiredMember(*frame, "name").as_string();
+      auto section = ReadStatusSectionFrame(*frame);
+      std::erase_if(pending, [&](const auto &entry) {
+        return entry.first == frame_name &&
+               section.source_generation >= entry.second;
+      });
+      if (frame_name == name) {
+        value = std::move(section);
+      }
+    }
+    return value;
+  }
+}
+
+/// One named status section, read like the old status-file channel: every
+/// Read is one `ReadStatusSection`.
+class StatusSectionReader final {
+public:
+  StatusSectionReader(const DaemonDirectory &directory, std::string name)
+      : directory_(directory), name_(std::move(name)) {}
+
+  [[nodiscard]] std::optional<StatusSection> Read() const {
+    return ReadStatusSection(directory_, name_);
+  }
+
+private:
+  const DaemonDirectory &directory_;
+  std::string name_;
+};
+
 std::string SendCommand(const std::filesystem::path &path,
                         const std::string &request);
 void SendCommandAndDisconnect(const std::filesystem::path &path,
@@ -661,19 +829,42 @@ public:
       std::string admission_filename = "canonical-empty-admission.json",
       std::string executable = MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON,
       std::string program_runner_liveness_socket = {},
-      std::string projection_root = {}) {
-    const auto manager_root = directory.manager_root().string();
-    const auto manager_run_root = directory.manager_run_root().string();
-    const auto execution_state_root = directory.execution_state_root().string();
-    const auto execution_run_root = directory.execution_run_root().string();
-    const auto scene_database = directory.scene_database().string();
-    const auto program_cycle_journal =
-        directory.program_cycle_journal().string();
-    const auto publication_root = projection_root.empty()
-                                      ? directory.publication_root().string()
-                                      : projection_root;
+      std::vector<std::string> extra_arguments = {}) {
+    // The whole command line is built before fork: the child only execs.
+    std::vector<std::string> arguments{
+        executable,
+        "--install-root",
+        package_root,
+        "--activation-root",
+        directory.activation_root().string(),
+        "--canonical-empty-admission-filename",
+        admission_filename,
+        "--manager-state-root",
+        directory.manager_root().string(),
+        "--manager-run-root",
+        directory.manager_run_root().string(),
+        "--execution-state-root",
+        directory.execution_state_root().string(),
+        "--execution-run-root",
+        directory.execution_run_root().string(),
+        "--logical-scene-database",
+        directory.scene_database().string()};
+    if (!program_runner_liveness_socket.empty()) {
+      arguments.emplace_back("--program-runner-liveness-socket");
+      arguments.push_back(program_runner_liveness_socket);
+    }
+    arguments.emplace_back("--application-processes");
+    arguments.push_back(directory.application_processes().string());
+    arguments.emplace_back("--reconciliation-period-ms");
+    arguments.emplace_back("10");
+    arguments.insert(arguments.end(), extra_arguments.begin(),
+                     extra_arguments.end());
+    std::vector<char *> argv;
+    for (auto &argument : arguments) {
+      argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
     const auto startup_stderr = directory.startup_stderr().string();
-    const auto activation_root = directory.activation_root().string();
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("Manager daemon test fork failed");
@@ -686,35 +877,7 @@ public:
         ::_exit(127);
       }
       static_cast<void>(::close(stderr_fd));
-      if (program_runner_liveness_socket.empty()) {
-        ::execl(executable.c_str(), executable.c_str(), "--install-root",
-                package_root.c_str(), "--activation-root",
-                activation_root.c_str(), "--canonical-empty-admission-filename",
-                admission_filename.c_str(), "--manager-state-root",
-                manager_root.c_str(), "--manager-run-root",
-                manager_run_root.c_str(), "--execution-state-root",
-                execution_state_root.c_str(), "--execution-run-root",
-                execution_run_root.c_str(), "--logical-scene-database",
-                scene_database.c_str(), "--program-cycle-journal",
-                program_cycle_journal.c_str(), "--projection-root",
-                publication_root.c_str(), "--reconciliation-period-ms", "10",
-                static_cast<char *>(nullptr));
-      } else {
-        ::execl(
-            executable.c_str(), executable.c_str(), "--install-root",
-            package_root.c_str(), "--activation-root", activation_root.c_str(),
-            "--canonical-empty-admission-filename",
-            admission_filename.c_str(), "--manager-state-root",
-            manager_root.c_str(), "--manager-run-root",
-            manager_run_root.c_str(), "--execution-state-root",
-            execution_state_root.c_str(), "--execution-run-root",
-            execution_run_root.c_str(), "--logical-scene-database",
-            scene_database.c_str(), "--program-cycle-journal",
-            program_cycle_journal.c_str(), "--projection-root",
-            publication_root.c_str(), "--program-runner-liveness-socket",
-            program_runner_liveness_socket.c_str(),
-            "--reconciliation-period-ms", "10", static_cast<char *>(nullptr));
-      }
+      ::execv(executable.c_str(), argv.data());
       ::_exit(127);
     }
   }
@@ -745,16 +908,15 @@ public:
             "Manager daemon exited before readiness" +
             (detail.empty() ? std::string{} : ": " + detail));
       }
+      // The status socket is bound after the start-up publication of every
+      // status section (OD-216), so its presence means they are readable.
       if (std::filesystem::is_socket(directory.socket_path()) &&
-          std::filesystem::is_regular_file(directory.publication_root() /
-                                           "manager-source.json") &&
-          std::filesystem::is_regular_file(directory.publication_root() /
-                                           "logical-scene-source.json")) {
+          std::filesystem::is_socket(directory.status_socket_path())) {
         try {
           const auto response =
               SendCommand(directory.socket_path(),
-                          "{\"api_version\":\"manyforge.manager_command.v1\","
-                          "\"command\":\"reconcile\"}");
+                          "{\"api_version\":\"manyforge.manager_command.v2\","
+                          "\"command\":\"scene_owner_read\"}");
           if (response.find("\"ok\":true") != std::string::npos) {
             return;
           }
@@ -843,7 +1005,7 @@ public:
           "--headless-url", "http://127.0.0.1:1", "--execution-run-root",
           execution_run_root.c_str(), "--cycle-journal-path", journal.c_str(),
           "--manager-liveness-socket", socket.c_str(), "--cell-id",
-          cell_id.c_str(), "--owner-id", "program-runner.manager-process-test",
+          cell_id.c_str(), "--application-start-id", "3f9a00000000002a",
           "--headless-timeout-s", "0.25", static_cast<char *>(nullptr));
       ::_exit(127);
     }
@@ -986,63 +1148,12 @@ std::filesystem::path PrepareManagerApplyInstalledTargets(
       "manyforge_ros2_control_execution_host");
 }
 
-struct NativePackageIdentity final {
-  std::shared_ptr<const deployment::RetainedBundle> bundle;
-  deployment::VerifiedRetainedRuntimeUnitProduct product;
-  core::RuntimeContractOfferDTO offer;
-  std::string executable_digest;
-};
-
-NativePackageIdentity
-ReadNativePackageIdentity(const std::filesystem::path &package_root,
-                          const std::string_view retained_bundle_id,
-                          const std::filesystem::path &installed_host) {
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  deployment::FilesystemVerifiedRetainedProductArtifactSource artifact_source(
-      package_root);
-  const auto bundle = bundle_source.get_verified(
-      core::RetainedBundleId(std::string(retained_bundle_id)));
-  if (bundle == nullptr ||
-      bundle->value().cell_graph.runtime_units.size() != 1U) {
-    throw std::runtime_error("native package identity lacks one runtime");
-  }
-  const auto runtime_id =
-      bundle->value().cell_graph.runtime_units.front().runtime_unit_id;
-  const auto product = deployment::verify_runtime_unit_product(
-      *bundle, runtime_id, artifact_source);
-  if (!product.has_value() ||
-      product->product_contract_id().value() !=
-          deployment::ros2_control_execution_runtime_contract::kProductContractId) {
-    throw std::runtime_error("package identity lacks the selected ROS product");
-  }
-  const auto *qualified =
-      deployment::runtime_contract_declaration_registry().find(
-          bundle->value().cell_graph.runtime_units.front().runtime_profile_id,
-          bundle->value()
-              .cell_graph.runtime_units.front()
-              .runtime_profile_revision,
-          product->product_contract_id(), product->product_contract_revision());
-  if (qualified == nullptr) {
-    throw std::runtime_error(
-        "native package identity lacks its declared runtime offer");
-  }
-  std::ifstream stream(installed_host, std::ios::binary);
-  const std::string bytes{std::istreambuf_iterator<char>(stream),
-                          std::istreambuf_iterator<char>()};
-  if (!stream && !stream.eof()) {
-    throw std::runtime_error("native package identity target is unreadable");
-  }
-  return {bundle, *product, qualified->offer(),
-          content_identity::sha256_digest(bytes)};
-}
-
 #endif
 
 #if defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
 struct ExecutionReadyObservation final {
   std::string response;
-  std::string owner_epoch;
+  std::string application_start_id;
   bool observed_closed{};
 };
 
@@ -1056,7 +1167,7 @@ ExecutionReadyObservation WaitForExecutionReady(
     try {
       observation.response = SendCommand(
           directory.execution_socket_path(),
-          R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
+          R"({"api_version":"manyforge.execution_command.v4","command":"status"})");
       if (observation.response.find("\"code\":\"execution_owner_not_ready\"") !=
           std::string::npos) {
         observation.observed_closed = true;
@@ -1064,19 +1175,20 @@ ExecutionReadyObservation WaitForExecutionReady(
       if (observation.response.find("\"ok\":true") != std::string::npos &&
           observation.response.find(expected_retained_bundle_id) !=
               std::string::npos) {
-        constexpr std::string_view kOwnerEpochPrefix = "\"owner_epoch\":\"";
-        const auto owner_begin = observation.response.find(kOwnerEpochPrefix);
-        if (owner_begin == std::string::npos) {
+        // The Kernel's owner identity is the application start A (1.1).
+        constexpr std::string_view kStartIdPrefix = "\"application_start_id\":\"";
+        const auto start_begin = observation.response.find(kStartIdPrefix);
+        if (start_begin == std::string::npos) {
           throw std::runtime_error(
-              "ready execution response has no owner epoch");
+              "ready execution response has no application start identity");
         }
-        const auto value_begin = owner_begin + kOwnerEpochPrefix.size();
+        const auto value_begin = start_begin + kStartIdPrefix.size();
         const auto value_end = observation.response.find('"', value_begin);
         if (value_end == std::string::npos || value_end == value_begin) {
           throw std::runtime_error(
-              "ready execution response has an invalid owner epoch");
+              "ready execution response has an invalid application start identity");
         }
-        observation.owner_epoch =
+        observation.application_start_id =
             observation.response.substr(value_begin, value_end - value_begin);
         return observation;
       }
@@ -1106,8 +1218,8 @@ ExecutionReadyObservation WaitForExecutionReady(
 
 #if defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
 RuntimeOfferProjection WaitForRuntimeOfferProjection(
-    const AtomicSourceSnapshotChannel &manager_source,
-    const std::string_view expected_execution_owner_epoch,
+    const StatusSectionReader &manager_source,
+    const std::string_view expected_application_start_id,
     const std::chrono::seconds timeout = std::chrono::seconds(20)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -1117,8 +1229,8 @@ RuntimeOfferProjection WaitForRuntimeOfferProjection(
         const auto projection = ReadRuntimeOfferProjection(snapshot->payload);
         if (!projection.selected.empty() && !projection.observed.empty() &&
             projection.selected == projection.observed &&
-            expected_execution_owner_epoch ==
-                "kernel-owner-" + projection.observed_epoch) {
+            // The Kernel owner epoch is exactly A (contract 1.1).
+            expected_application_start_id == projection.observed_epoch) {
           return projection;
         }
       }
@@ -1242,7 +1354,7 @@ AuthoringAdmissionProjection
 ReadAuthoringAdmissionProjection(const DaemonDirectory &directory) {
   const auto response = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v3","command":"cell_admission_get"})");
+      R"({"api_version":"manyforge.execution_command.v4","command":"cell_admission_get"})");
   const auto root = deployment::parse_strict_json_model_yaml(response).root();
   const auto *ok = std::get_if<bool>(&RequiredMember(root, "ok").storage());
   const auto &admission = RequiredMember(root, "authoring_admission");
@@ -1441,14 +1553,13 @@ std::string PublishTestCloseWithoutProgram(
 
 std::string ApplyRequest(
     const DaemonDirectory &directory,
-    const std::string_view manager_owner_epoch,
     const std::uint64_t expected_admission_generation,
     const std::string_view deployment_artifact_id = "candidate",
     const std::string_view deployment_revision = kDeploymentRevision,
     const std::string_view expected_graph_revision = "current-graph",
     const std::string_view expected_retained_bundle_id = "current-bundle",
-    const std::string_view request_id = "request-1",
-    const std::string_view preview_owner_epoch = {},
+    // A readable request name, sent as its request key.
+    const std::string_view request_name = "request-1",
     const bool preview_only = false,
     // "receipt" echoes the previewed impact digest (explicit acceptance), an
     // empty value accepts nothing, anything else is sent verbatim.
@@ -1459,8 +1570,7 @@ std::string ApplyRequest(
   std::string resolved_retained_bundle_id(expected_retained_bundle_id);
   if (expected_graph_revision == "current-graph" ||
       expected_retained_bundle_id == "current-bundle") {
-    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                               "manager-source.json");
+    StatusSectionReader manager_source(directory, "manager");
     const auto current = manager_source.Read();
     if (!current.has_value()) {
       throw std::runtime_error(
@@ -1474,8 +1584,6 @@ std::string ApplyRequest(
       resolved_retained_bundle_id = RequiredText(active, "retained_bundle_id");
     }
   }
-  const auto owner =
-      preview_owner_epoch.empty() ? manager_owner_epoch : preview_owner_epoch;
   const auto expected = CanonicalValue(CanonicalValue::Object{
       {"graph_revision", CanonicalValue(resolved_graph_revision)},
       {"retained_bundle_id", CanonicalValue(resolved_retained_bundle_id)},
@@ -1549,7 +1657,7 @@ std::string ApplyRequest(
   }
   const auto preview_request =
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+          {"api_version", CanonicalValue("manyforge.manager_command.v2")},
           {"command", CanonicalValue("deployment_candidate_preview")},
           {"candidate_graph_revision", CanonicalValue(candidate_graph)},
           {"candidate_retained_bundle_id", CanonicalValue(candidate_bundle)},
@@ -1561,7 +1669,6 @@ std::string ApplyRequest(
            CanonicalValue(static_cast<double>(expected_admission_generation))},
           {"expected_current", expected},
           {"prepared_activation_id", CanonicalValue(prepared_activation_id)},
-          {"request_owner_epoch", CanonicalValue(std::string(owner))},
       }));
   const auto preview_response =
       SendCommand(directory.socket_path(), preview_request);
@@ -1589,10 +1696,9 @@ std::string ApplyRequest(
        : accepted_impact.empty()
            ? CanonicalValue(nullptr)
            : CanonicalValue(std::string(accepted_impact))},
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"candidate_receipt", RequiredMember(preview, "candidate_receipt")},
       {"command", CanonicalValue("apply")},
-      {"correlation_id", CanonicalValue("correlation-1")},
       {"deployment_artifact_id",
        CanonicalValue(std::string(deployment_artifact_id))},
       {"deployment_revision", CanonicalValue(std::string(deployment_revision))},
@@ -1600,8 +1706,7 @@ std::string ApplyRequest(
       {"prepared_activation", prepared_summary},
       {"reject_if_affected_busy", CanonicalValue(true)},
       {"scene_initialization", CanonicalValue("preserve")},
-      {"request_id", CanonicalValue(std::string(request_id))},
-      {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
+      {"request_key", CanonicalValue(TestRequestKeyText(request_name))},
       {"source_label", CanonicalValue("manager-process-test")},
   }));
 }
@@ -1612,10 +1717,12 @@ ApplyStatusRequest(const std::string_view submission_response) {
   const auto response =
       deployment::parse_strict_json_model_yaml(submission_response).root();
   const auto *apply_id =
-      std::get_if<std::string>(&RequiredMember(response, "apply_id").storage());
+      std::get_if<double>(&RequiredMember(response, "apply_id").storage());
   const auto generation =
       RequiredMember(response, "apply_generation").as_number();
-  if (apply_id == nullptr || apply_id->empty() || generation < 1.0 ||
+  if (apply_id == nullptr || *apply_id < 1.0 || *apply_id > 9007199254740991.0 ||
+      static_cast<double>(static_cast<std::uint64_t>(*apply_id)) != *apply_id ||
+      generation < 1.0 ||
       generation > 9007199254740991.0 ||
       static_cast<double>(static_cast<std::uint64_t>(generation)) !=
           generation) {
@@ -1623,7 +1730,7 @@ ApplyStatusRequest(const std::string_view submission_response) {
   }
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"api_version",
-       CanonicalValue(std::string("manyforge.manager_command.v1"))},
+       CanonicalValue(std::string("manyforge.manager_command.v2"))},
       {"apply_generation", CanonicalValue(generation)},
       {"apply_id", CanonicalValue(*apply_id)},
       {"command", CanonicalValue(std::string("apply_status"))},
@@ -1631,7 +1738,7 @@ ApplyStatusRequest(const std::string_view submission_response) {
 }
 
 std::string SceneAddRequest(
-    const SourceSnapshot &scene_source, const std::string_view request_id,
+    const StatusSection &scene_source, const std::string_view request_name,
     const std::uint64_t expected_admission_generation, const double box_x = 0.1,
     const std::string_view scene_resource_id = "scene-process-box") {
   using content_identity::CanonicalValue;
@@ -1640,7 +1747,7 @@ std::string SceneAddRequest(
   const auto &cell_id = RequiredMember(
       RequiredMember(scene_source.payload, "snapshot"), "cell_id");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_commit")},
       {"transaction",
        CanonicalValue(CanonicalValue::Object{
@@ -1689,23 +1796,21 @@ std::string SceneAddRequest(
            {"program_reset_scene_authorization", CanonicalValue(nullptr)},
            {"request_context",
             CanonicalValue(CanonicalValue::Object{
-                {"correlation_id", CanonicalValue(nullptr)},
-                {"request_id", CanonicalValue(std::string(request_id))},
-                {"request_owner_epoch",
-                 CanonicalValue(scene_source.source_owner_epoch)},
+                {"request_key",
+                 CanonicalValue(TestRequestKeyText(request_name))},
                 {"source_label", CanonicalValue("manager-process-test")},
             })},
        })},
   }));
 }
 
-std::string ScenePoseRequest(const SourceSnapshot &scene_source,
+std::string ScenePoseRequest(const StatusSection &scene_source,
                              const std::string_view scene_resource_id) {
   using content_identity::CanonicalValue;
   const auto &projection = RequiredMember(
       RequiredMember(scene_source.payload, "access"), "active_projection");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_pose_query")},
       {"expected_projection_revision", projection},
       {"scene_resource_ids", CanonicalValue(CanonicalValue::Array{
@@ -1716,14 +1821,14 @@ std::string ScenePoseRequest(const SourceSnapshot &scene_source,
 
 // The active projection with its Scene revision advanced by one: a request
 // naming a revision the owner has not reached.
-std::string ScenePoseRequestAheadOfOwner(const SourceSnapshot &scene_source,
+std::string ScenePoseRequestAheadOfOwner(const StatusSection &scene_source,
                                          const std::string_view scene_resource_id) {
   using content_identity::CanonicalValue;
   const auto &projection = RequiredMember(
       RequiredMember(scene_source.payload, "access"), "active_projection");
   const auto &scene = RequiredMember(projection, "scene_revision");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_pose_query")},
       {"expected_projection_revision",
        CanonicalValue(CanonicalValue::Object{
@@ -1746,16 +1851,16 @@ std::string ScenePoseRequestAheadOfOwner(const SourceSnapshot &scene_source,
 }
 
 std::string
-ScenePreviewRequest(const SourceSnapshot &scene_source,
-                    const std::string_view request_id,
+ScenePreviewRequest(const StatusSection &scene_source,
+                    const std::string_view request_name,
                     const std::uint64_t expected_admission_generation) {
   using content_identity::CanonicalValue;
   const auto transaction = deployment::parse_strict_json_model_yaml(
-                               SceneAddRequest(scene_source, request_id,
+                               SceneAddRequest(scene_source, request_name,
                                                expected_admission_generation))
                                .root();
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"candidate_request",
        CanonicalValue(CanonicalValue::Object{
            {"frame_resolution", CanonicalValue(nullptr)},
@@ -1766,13 +1871,13 @@ ScenePreviewRequest(const SourceSnapshot &scene_source,
 }
 
 const content_identity::CanonicalValue &
-SceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
+SceneRuntimeIdentityValue(const StatusSection &scene_runtime_source) {
   return RequiredMember(RequiredMember(scene_runtime_source.payload, "state"),
                         "runtime_identity");
 }
 
 content_identity::CanonicalValue
-DifferentSceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
+DifferentSceneRuntimeIdentityValue(const StatusSection &scene_runtime_source) {
   using content_identity::CanonicalValue;
   const auto &identity = SceneRuntimeIdentityValue(scene_runtime_source);
   return CanonicalValue(CanonicalValue::Object{
@@ -1788,7 +1893,7 @@ DifferentSceneRuntimeIdentityValue(const SourceSnapshot &scene_runtime_source) {
 }
 
 std::string SceneRuntimeObserverOpenRequest(
-    const SourceSnapshot &scene_runtime_source,
+    const StatusSection &scene_runtime_source,
     const std::string_view source_epoch,
     const std::string_view source_id = "isaac.observer",
     const std::string_view object_id = "robot",
@@ -1796,7 +1901,7 @@ std::string SceneRuntimeObserverOpenRequest(
     const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"bindings",
        CanonicalValue(CanonicalValue::Array{
            CanonicalValue(CanonicalValue::Object{
@@ -1814,7 +1919,7 @@ std::string SceneRuntimeObserverOpenRequest(
 }
 
 std::string SceneRuntimeObserveRequest(
-    const SourceSnapshot &scene_runtime_source,
+    const StatusSection &scene_runtime_source,
     const std::string_view source_epoch, const std::uint64_t source_sequence,
     const std::uint64_t lifetime_ns = 1000000000ULL,
     const double position = 0.25,
@@ -1825,7 +1930,7 @@ std::string SceneRuntimeObserveRequest(
     const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_runtime_observe")},
       {"eligible", CanonicalValue(eligible)},
       {"expected_runtime_identity",
@@ -1851,7 +1956,7 @@ std::string SceneRuntimeObserveRequest(
 }
 
 std::string SceneRuntimePoseObserveRequest(
-    const SourceSnapshot &scene_runtime_source,
+    const StatusSection &scene_runtime_source,
     const std::string_view source_epoch, const std::uint64_t source_sequence,
     const std::uint64_t lifetime_ns = 1000000000ULL,
     const double position = 0.25,
@@ -1859,7 +1964,7 @@ std::string SceneRuntimePoseObserveRequest(
     const std::string_view object_id = "scene-process-box") {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_runtime_observe")},
       {"eligible", CanonicalValue(true)},
       {"expected_runtime_identity",
@@ -1895,15 +2000,34 @@ std::string SceneRuntimePoseObserveRequest(
 }
 
 std::string SceneRuntimeBeforePlanningLatchRequest(
-    const SourceSnapshot &scene_runtime_source,
-    const SourceSnapshot &) {
+    const StatusSection &scene_runtime_source,
+    const StatusSection &) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"command", CanonicalValue("scene_runtime_latch_before_planning")},
       {"expected_runtime_identity",
        SceneRuntimeIdentityValue(scene_runtime_source)},
   }));
+}
+
+// Every application start begins from an empty current/ directory
+// (OD-122 (2), (8)): a Manager given a previous run's state is refused at
+// start with a typed start-up error, before any listed process is started
+// (OD-242); nothing is recreated or resumed.
+void ExpectPreviousRunRefused(ManagerProcess &manager,
+                              const DaemonDirectory &directory) {
+  const auto status = manager.Wait();
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 70);
+  const auto startup_error = ReadStartupStderr(directory);
+  EXPECT_NE(
+      startup_error.find("\"code\":\"manager_run_folder_holds_previous_run\""),
+      std::string::npos)
+      << startup_error;
+  // The supervisor writes `started <role> pid=<pid>` for each process it
+  // starts.
+  EXPECT_EQ(startup_error.find(" pid="), std::string::npos) << startup_error;
 }
 
 TEST(ManagerDaemonProcess,
@@ -1933,8 +2057,7 @@ TEST(ManagerDaemonProcess,
       std::string::npos);
   EXPECT_FALSE(std::filesystem::exists(legacy.socket_path()));
   EXPECT_FALSE(std::filesystem::exists(legacy.execution_socket_path()));
-  EXPECT_FALSE(std::filesystem::exists(legacy.publication_root() /
-                                       "manager-source.json"));
+  EXPECT_FALSE(std::filesystem::exists(legacy.status_socket_path()));
   EXPECT_TRUE(std::filesystem::exists(legacy_journal));
   EXPECT_FALSE(std::filesystem::exists(
       legacy.manager_root() /
@@ -1948,157 +2071,313 @@ TEST(ManagerDaemonProcess,
       std::string(component_manager::kManagerStateMarkerFilename)));
 }
 
-TEST(ManagerDaemonProcess,
-     RejectsDisposableRunRootNestedInsideDurableProjectionRoot) {
+// The Manager writes every store file through one writer and drains it at
+// shutdown before the stores close: no write-ahead log stays behind and the
+// files hold the start's records.
+TEST(ManagerDaemonProcess, OneStoreWriterDrainsBeforeTheStoresClose) {
   DaemonDirectory directory;
-  ManagerProcess manager(
-      directory, MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  std::size_t threads = 0U;
+  for ([[maybe_unused]] const auto &task : std::filesystem::directory_iterator(
+           "/proc/" + std::to_string(manager.pid()) + "/task")) {
+    ++threads;
+  }
+  // The main thread, the Apply lane, the one store writer and the status
+  // stream's acceptor (OD-216; no status reader is connected and no liveness
+  // socket is configured here).
+  EXPECT_EQ(threads, 4U);
+  const auto stopped = manager.Stop(SIGTERM);
+  ASSERT_TRUE(WIFEXITED(stopped));
+  EXPECT_EQ(WEXITSTATUS(stopped), 0);
+
+  const auto bootstrap_path =
+      directory.manager_root() /
+      std::string(component_manager::kManagerBootstrapJournalFilename);
+  const auto publication_path =
+      directory.manager_root() /
+      std::string(component_manager::kActiveBundlePublicationStoreFilename);
+  const auto apply_path =
+      directory.manager_root() /
+      std::string(component_manager::kManagerApplyJournalFilename);
+  for (const auto &database :
+       {bootstrap_path, publication_path, apply_path,
+        directory.scene_database()}) {
+    ASSERT_TRUE(std::filesystem::exists(database)) << database;
+    const std::filesystem::path wal(database.string() + "-wal");
+    std::error_code error;
+    EXPECT_TRUE(!std::filesystem::exists(wal) ||
+                std::filesystem::file_size(wal, error) == 0U)
+        << wal;
+  }
+  const auto admission =
+      deployment::FilesystemCanonicalEmptyRetainedBundleSource(
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT)
+          .load_verified();
+  component_manager::SqliteManagerBootstrapJournal bootstrap(
+      bootstrap_path, admission.cell_id());
+  EXPECT_EQ(bootstrap.ReadSnapshot().phase,
+            component_manager::ManagerBootstrapJournalPhase::
+                kAcceptedTargetPersisted);
+  component_manager::SqliteActiveBundlePublicationStore publication(
+      publication_path, admission.cell_id());
+  EXPECT_EQ(publication.VerifyIntegrity().current_generation.value(), 1U);
+}
+
+// OD-187: the Manager's stop has no time limit. A listed process that ignores
+// SIGTERM is waited for; a second stop request (here a second SIGTERM, as the
+// launchers pass it on) kills it with one typed line naming the process,
+// logs the forced step, and the Manager still finishes its own records and
+// exits with the "stop incomplete" status.
+TEST(ManagerDaemonProcess, ASecondStopRequestForcesTheStopAndTheStatusSaysSo) {
+  DaemonDirectory directory;
+  const auto termed = directory.application_processes().parent_path() / "headless.termed";
+  const auto ready = directory.application_processes().parent_path() / "headless.ready";
+  std::ofstream(directory.application_processes(), std::ios::trunc)
+      << R"({"api_version":"manyforge.application_processes.v1","processes":[)"
+      << R"({"role":"headless","argv":["/bin/sh","-c","trap ': > )"
+      << termed.string() << R"(' TERM; : > )" << ready.string()
+      << R"(; while :; do sleep 0.05; done"],"environment":{},"start":"immediate"}]})";
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  const auto wait_for = [](const std::filesystem::path &path) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!std::filesystem::exists(path) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return std::filesystem::exists(path);
+  };
+  ASSERT_TRUE(wait_for(ready));
+  ASSERT_EQ(::kill(manager.pid(), SIGTERM), 0);
+  // The process got its SIGTERM and stays: the Manager waits for its exit.
+  ASSERT_TRUE(wait_for(termed));
+  const auto status = manager.Stop(SIGTERM);
+  ASSERT_TRUE(WIFEXITED(status));
+  // kApplicationStopIncompleteExitStatus (application_process_supervisor.hpp).
+  EXPECT_EQ(WEXITSTATUS(status), 74);
+  std::ifstream input(directory.startup_stderr(), std::ios::binary);
+  const std::string text{std::istreambuf_iterator<char>(input),
+                         std::istreambuf_iterator<char>()};
+  const auto waiting = text.find("application stop: waiting at headless: pid=");
+  const auto forced = text.find(
+      R"({"code":"application_stop_forced","step":"application_processes"})");
+  const auto killed = text.find(
+      R"({"code":"application_process_killed","role":"headless","pid":)");
+  const auto records = text.find("application stop: manager_records written");
+  ASSERT_NE(waiting, std::string::npos) << text;
+  ASSERT_NE(forced, std::string::npos) << text;
+  ASSERT_NE(killed, std::string::npos) << text;
+  ASSERT_NE(records, std::string::npos) << text;
+  EXPECT_LT(waiting, forced) << text;
+  EXPECT_LT(forced, killed) << text;
+  EXPECT_LT(killed, records) << text;
+  // No execution host runs here: nothing to halt, so no Halt line counts.
+  EXPECT_EQ(text.find("application_process_killed\",\"role\":\"execution_host"),
+            std::string::npos)
+      << text;
+}
+
+// The Manager's status sections at one connection: the snapshot's
+// generations and the section frames that follow it, in arrival order.
+struct StatusStreamState final {
+  std::string application_start_id;
+  std::vector<std::pair<std::string, std::uint64_t>> generations;
+  std::vector<std::pair<std::string, std::uint64_t>> sections;
+  std::uint64_t tick{};
+};
+
+StatusStreamState ReadStatusStreamState(const StatusConnection &connection) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  const auto snapshot = connection.Receive(deadline);
+  if (!snapshot.has_value() || StatusFrameType(*snapshot) != "snapshot" ||
+      RequiredMember(*snapshot, "api_version").as_string() !=
+          kStatusStreamApiVersion) {
+    throw std::runtime_error("Manager status stream sent no snapshot");
+  }
+  StatusStreamState state{
+      RequiredMember(*snapshot, "application_start_id").as_string(),
+      {},
+      {},
+      StatusFrameTick(*snapshot)};
+  std::size_t listed = 0U;
+  for (const auto &[name, generation] :
+       RequiredMember(*snapshot, "generations").as_object()) {
+    state.generations.emplace_back(
+        name, static_cast<std::uint64_t>(generation.as_number()));
+    listed += generation.as_number() >= 1.0 ? 1U : 0U;
+  }
+  while (state.sections.size() < listed) {
+    const auto frame = connection.Receive(deadline);
+    if (!frame.has_value()) {
+      throw std::runtime_error(
+          "Manager status stream did not send its current sections");
+    }
+    if (StatusFrameType(*frame) == "section") {
+      state.sections.emplace_back(
+          RequiredMember(*frame, "name").as_string(),
+          ReadStatusSectionFrame(*frame).source_generation);
+    }
+  }
+  return state;
+}
+
+// OD-216: the Manager serves its state from memory on its status stream. A
+// reader receives the whole current state at connect, in the fixed section
+// order; a reader that connects later receives the same current state.
+TEST(ManagerDaemonProcess,
+     StatusStreamSendsFullStateAtConnectAndLateReaderGetsCurrentState) {
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  StatusStreamState first;
+  {
+    const StatusConnection connection(directory);
+    ASSERT_TRUE(connection.connected());
+    first = ReadStatusStreamState(connection);
+  }
+  EXPECT_FALSE(first.application_start_id.empty());
+  // Every section has a value from the start-up publication, the viewer pose
+  // sessions included (published when the scene runtime opens).
+  ASSERT_EQ(first.generations.size(), 4U);
+  for (const auto &[name, generation] : first.generations) {
+    EXPECT_GE(generation, 1U) << name;
+  }
+  const std::vector<std::string> order{"manager", "logical_scene",
+                                       "scene_runtime", "viewer_pose_sessions"};
+  ASSERT_EQ(first.sections.size(), order.size());
+  for (std::size_t index = 0U; index < order.size(); ++index) {
+    EXPECT_EQ(first.sections[index].first, order[index]);
+    const auto listed = std::find_if(
+        first.generations.begin(), first.generations.end(),
+        [&](const auto &entry) { return entry.first == order[index]; });
+    ASSERT_NE(listed, first.generations.end());
+    EXPECT_GE(first.sections[index].second, listed->second) << order[index];
+  }
+
+  // Later than one status tick: the late reader is served the current state,
+  // unchanged while the cell is idle.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  const StatusConnection late(directory);
+  ASSERT_TRUE(late.connected());
+  const auto second = ReadStatusStreamState(late);
+  EXPECT_EQ(second.application_start_id, first.application_start_id);
+  EXPECT_EQ(second.generations, first.generations);
+  EXPECT_EQ(second.sections, first.sections);
+  EXPECT_GT(second.tick, first.tick);
+}
+
+// The Manager's status tick reaches a kept connection as keepalives while no
+// section changes: each frame's higher tick proves the main loop ran since.
+TEST(ManagerDaemonProcess, StatusStreamTickAdvancesWithoutChanges) {
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  const StatusConnection connection(directory);
+  ASSERT_TRUE(connection.connected());
+  const auto state = ReadStatusStreamState(connection);
+  std::vector<std::uint64_t> ticks{state.tick};
+  const auto window =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (const auto frame = connection.Receive(window)) {
+    EXPECT_EQ(StatusFrameType(*frame), "keepalive")
+        << content_identity::canonical_json(*frame);
+    ticks.push_back(StatusFrameTick(*frame));
+  }
+  ASSERT_GE(ticks.size(), 3U);
+  for (std::size_t index = 1U; index < ticks.size(); ++index) {
+    EXPECT_GT(ticks[index], ticks[index - 1U]);
+  }
+}
+
+// OD-216: the Manager writes no status files and no longer takes the option
+// that named their directory.
+TEST(ManagerDaemonProcess, NoStatusFilesAreWritten) {
+  DaemonDirectory directory;
+  const auto root = directory.manager_root().parent_path();
+  {
+    ManagerProcess manager(directory);
+    manager.WaitReady(directory);
+    const auto published = ReadStatusSection(directory, "manager");
+    ASSERT_TRUE(published.has_value());
+    EXPECT_GE(published->source_generation, 1U);
+    const auto stopped = manager.Stop(SIGTERM);
+    ASSERT_TRUE(WIFEXITED(stopped));
+    EXPECT_EQ(WEXITSTATUS(stopped), 0);
+  }
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(root)) {
+    const auto name = entry.path().filename().string();
+    EXPECT_TRUE(name != "manager-source.json" &&
+                name != "logical-scene-source.json" &&
+                name != "scene-runtime-source.json" &&
+                name != "viewer-pose-sessions.json")
+        << entry.path();
+  }
+
+  DaemonDirectory refused_directory;
+  ManagerProcess refused(
+      refused_directory, MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT,
       "canonical-empty-admission.json", MANYFORGE_HEADLESS_TEST_MANAGER_DAEMON,
-      {}, directory.publication_root().parent_path().string());
-  const auto status = manager.Wait();
+      {},
+      {"--projection-root",
+       (refused_directory.manager_root().parent_path() / "publications")
+           .string()});
+  const auto status = refused.Wait();
   ASSERT_TRUE(WIFEXITED(status));
   EXPECT_NE(WEXITSTATUS(status), 0);
-  EXPECT_NE(ReadStartupStderr(directory).find(
-                "must be disjoint from disposable run storage"),
-            std::string::npos);
-  EXPECT_FALSE(std::filesystem::exists(directory.socket_path()));
-  EXPECT_FALSE(std::filesystem::exists(directory.execution_socket_path()));
+  EXPECT_NE(ReadStartupStderr(refused_directory)
+                .find("unknown or duplicate option --projection-root"),
+            std::string::npos)
+      << ReadStartupStderr(refused_directory);
+  EXPECT_FALSE(std::filesystem::exists(refused_directory.socket_path()));
+  EXPECT_FALSE(std::filesystem::exists(refused_directory.status_socket_path()));
 }
 
-TEST(ManagerDaemonProcess, StartupReplacesTornStatusFiles) {
-  // The status files are written without fsync; a power loss can leave one
-  // empty, truncated or garbage. Start-up replaces each and starts.
-  DaemonDirectory directory;
-  const auto root = directory.publication_root();
-  { std::ofstream empty(root / "manager-source.json"); }
-  {
-    AtomicSourceSnapshotChannel previous(root, "logical-scene-source.json");
-    static_cast<void>(previous.Publish(
-        "logical_scene", "logical-scene.previous", "epoch-previous", 1,
-        content_identity::CanonicalValue(
-            content_identity::CanonicalValue::Object{})));
-    const auto path = root / "logical-scene-source.json";
-    std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2U);
-  }
-  for (const auto *name :
-       {"scene-runtime-source.json", "viewer-pose-sessions.json"}) {
-    std::ofstream garbage(root / name, std::ios::binary);
-    garbage << "{\"api_version\":\"manyforge.source_snapshot.v1\",\"pay";
-  }
-
-  ManagerProcess manager(directory);
-  manager.WaitReady(directory);
-  const std::pair<const char *, const char *> rebuilt[]{
-      {"manager-source.json", "component_manager"},
-      {"logical-scene-source.json", "logical_scene"},
-      {"scene-runtime-source.json", "scene_runtime"}};
-  for (const auto &[name, owner_kind] : rebuilt) {
-    const auto snapshot = AtomicSourceSnapshotChannel(root, name).Read();
-    ASSERT_TRUE(snapshot.has_value()) << name;
-    EXPECT_EQ(snapshot->source_owner_kind, owner_kind);
-  }
-  EXPECT_NO_THROW(static_cast<void>(
-      AtomicSourceSnapshotChannel(root, "viewer-pose-sessions.json").Read()));
-}
-
-TEST(ManagerDaemonProcess, ProcessStopDecoderPreservesActualMultilineLaunchIdentity) {
-  using content_identity::CanonicalValue;
+// A status reader that never reads holds only its own writer: commands are
+// answered in their usual time and another reader keeps receiving ticks.
+// (Without section changes its socket buffer does not fill in this window,
+// so the Manager's drop of a full reader is not observed here.)
+TEST(ManagerDaemonProcess,
+     ASilentStatusReaderDelaysNeitherCommandsNorOtherReaders) {
   DaemonDirectory directory;
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(), "manager-source.json");
-  const auto before = manager_source.Read();
-  ASSERT_TRUE(before);
-  const std::string launches[]{
-      "mock\nlite6_robot\nlite6_lite_gripper\n/manyforge/lite6_robot\nlite6_traj_controller\nlite_gripper_controller\n\nsha256:948e121935a4e7d66ca927d1945438e48332cce2bd820f60488fc049bb18d4b1\nsha256:61f01507a85d3a8d6539b8488d9a525dbaf115dca33338dc0d1702168d3b34a4\n",
-      "mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n"};
-  EXPECT_EQ(launches[0].size(), 250U);
-  EXPECT_EQ(launches[1].size(), 257U);
-  const auto base = deployment::parse_strict_json_model_yaml(
-      R"({"request_context":{"request_id":"close.stop.1","request_owner_epoch":"caller.1","source_label":"composer"},"predecessor_projection_revision":{"retained_bundle_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","graph_revision":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","scene_revision":{"scene_id":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","revision_id":1,"content_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},"expected_predecessor_publication_generation":1,"expected_predecessor_public_pointer_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","runtime_unit_id":"host.1","runtime_epoch":"host.epoch.1","manager_runtime_epoch":"foreign.manager.epoch","controllable_component_id":"placeholder","launch_identity":"placeholder","leader_pid":42})").root();
-  const auto exchange = [&](const std::string &command, const std::string &launch,
-                            const std::string &component, const std::string &runtime_unit) {
-    auto fields = base.as_object();
-    for (auto &[key, value] : fields) {
-      if (key == "launch_identity") value = CanonicalValue(launch);
-      if (key == "controllable_component_id") value = CanonicalValue(component);
-      if (key == "runtime_unit_id") value = CanonicalValue(runtime_unit);
-    }
-    const auto packet = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.manager_command.v1")},
-        {"command", CanonicalValue(command)}, {"request", CanonicalValue(std::move(fields))}}));
-    return deployment::parse_strict_json_model_yaml(SendCommand(directory.socket_path(), packet)).root();
-  };
-  for (std::size_t i = 0U; i < 2U; ++i) {
-    const std::string component = i == 0U ? "lite6_robot" : "ur5e_robot";
-    for (const auto *command : {"stop_component_process", "component_process_stop_result"}) {
-      const auto response = exchange(command, launches[i], component, "host.1");
-      EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(false));
-      const auto &error = RequiredMember(response, "error");
-      EXPECT_EQ(RequiredText(error, "code"), "manager_command_rejected");
-      // A refusal after decoding names its producer.
-      EXPECT_EQ(RequiredText(error, "producer"), "component_manager");
-      // Reaching the original Manager occurrence guard proves complete decoding;
-      // the foreign Manager epoch prevents forwarding or any Stop effect.
-      EXPECT_EQ(RequiredText(error, "message"),
-                "Manager daemon: component process Stop names another Manager occurrence");
+  const StatusConnection silent(directory);
+  ASSERT_TRUE(silent.connected());
+  const StatusConnection reader(directory);
+  ASSERT_TRUE(reader.connected());
+  const auto first_tick = ReadStatusStreamState(reader).tick;
+  auto last_tick = first_tick;
+  auto slowest = std::chrono::steady_clock::duration::zero();
+  const std::string commands[]{
+      R"({"api_version":"manyforge.manager_command.v2","command":"scene_runtime_owner_read"})",
+      R"({"api_version":"manyforge.manager_command.v2","command":"scene_owner_read"})"};
+  std::size_t sent = 0U;
+  const auto window_end =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < window_end) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto response =
+        SendCommand(directory.socket_path(), commands[sent++ % 2U]);
+    slowest = std::max(slowest, std::chrono::steady_clock::now() - started);
+    EXPECT_NE(response.find("\"ok\":true"), std::string::npos) << response;
+    const auto drain_until =
+        std::min(std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(100),
+                 window_end);
+    while (const auto frame = reader.Receive(drain_until)) {
+      last_tick = std::max(last_tick, StatusFrameTick(*frame));
     }
   }
-  for (const auto &launch : {std::string(), launches[1]}) {
-    const auto response = exchange("stop_component_process", launch, "ur5e_robot",
-                                   launch.empty() ? "host.1" : std::string(257U, 'x'));
-    EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(false));
-    const auto message = RequiredText(RequiredMember(response, "error"), "message");
-    EXPECT_NE(message.find(launch.empty() ? "command field launch_identity" : "command field runtime_unit_id"),
-              std::string::npos);
-  }
-  const auto component_rejected = exchange("stop_component_process", launches[1], std::string(129U, 'x'), "host.1");
-  EXPECT_NE(RequiredText(RequiredMember(component_rejected, "error"), "message").find(
-      "component process Stop request is invalid"), std::string::npos);
-  const auto after = manager_source.Read();
-  ASSERT_TRUE(after);
-  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
-  EXPECT_EQ(RequiredMember(after->payload, "active"), RequiredMember(before->payload, "active"));
-}
-
-TEST(ManagerDaemonProcess, ProcessStopOfferReturnsKnownEmptyInventoryAndIsPassive) {
-  using content_identity::CanonicalValue;
-  DaemonDirectory directory;
-  ManagerProcess manager(directory);
-  manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(), "manager-source.json");
-  const auto before = manager_source.Read();
-  ASSERT_TRUE(before);
-  const auto bytes = SendCommand(directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":"component.1"})");
-  const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
-  ASSERT_EQ(response.as_object().size(), 4U);
-  EXPECT_EQ(RequiredMember(response, "api_version"), CanonicalValue("manyforge.manager_command_response.v2"));
-  EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(true)) << bytes;
-  EXPECT_EQ(RequiredMember(response, "error"), CanonicalValue(nullptr));
-  const auto &offer = RequiredMember(response, "result");
-  ASSERT_EQ(offer.as_object().size(), 2U);
-  EXPECT_EQ(RequiredMember(offer, "controllable_component_id"), CanonicalValue("component.1"));
-  EXPECT_TRUE(RequiredMember(offer, "process_inventories").as_array().empty());
-  for (const auto* request : {
-      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer"})",
-      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":false})",
-      R"({"api_version":"manyforge.manager_command.v1","command":"component_process_stop_offer","controllable_component_id":"component.1","extra":true})"}) {
-    const auto rejected_bytes = SendCommand(directory.socket_path(), request);
-    const auto rejected = deployment::parse_strict_json_model_yaml(rejected_bytes).root();
-    EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false)) << rejected_bytes;
-    // A command that does not decode is one request-validation refusal.
-    const auto &error = RequiredMember(rejected, "error");
-    EXPECT_EQ(RequiredMember(error, "code"), CanonicalValue("invalid_request")) << rejected_bytes;
-    EXPECT_EQ(RequiredMember(RequiredMember(error, "details"), "command"),
-              CanonicalValue("invalid")) << rejected_bytes;
-    EXPECT_EQ(RequiredMember(error, "producer"), CanonicalValue("component_manager"))
-        << rejected_bytes;
-  }
-  const auto after = manager_source.Read();
-  ASSERT_TRUE(after);
-  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
-  EXPECT_EQ(RequiredMember(after->payload, "active"), RequiredMember(before->payload, "active"));
+  EXPECT_GE(sent, 10U);
+  // Commands answer in milliseconds; a second would mean they waited.
+  EXPECT_LT(slowest, std::chrono::seconds(1));
+  // Three seconds at one tick per 500 ms.
+  EXPECT_GE(last_tick, first_tick + 4U);
+  // A further reader is still served the current state.
+  EXPECT_TRUE(ReadStatusSection(directory, "manager").has_value());
 }
 
 TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
@@ -2107,16 +2386,16 @@ TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
   const auto valid = SendCommand(directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","request_context":{"request_id":"ack.1","source_label":"composer"}})");
+      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})");
   const auto accepted_shape = deployment::parse_strict_json_model_yaml(valid).root();
   EXPECT_EQ(RequiredMember(RequiredMember(accepted_shape, "error"), "code"),
             CanonicalValue("apply_status_not_found")) << valid;
   EXPECT_EQ(RequiredMember(RequiredMember(RequiredMember(accepted_shape, "error"), "details"), "effect"),
             CanonicalValue("none")) << valid;
   for (const auto *request : {
-      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge"})",
-      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","extra":true,"request_context":{"request_id":"ack.1","source_label":"composer"}})",
-      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","request_context":{"extra":true,"request_id":"ack.1","source_label":"composer"}})"}) {
+      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge"})",
+      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","extra":true,"request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})",
+      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"extra":true,"request_key":"40000000000000010000000000000a01","source_label":"composer"}})"}) {
     const auto bytes = SendCommand(directory.socket_path(), request);
     const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
@@ -2134,13 +2413,13 @@ TEST(ManagerDaemonProcess, ApplyReleaseForNewReleasesNothingOnAFreshCell) {
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
   const auto valid = SendCommand(directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"apply_release_for_new","request_context":{"request_id":"new.1","source_label":"composer"}})");
+      R"({"api_version":"manyforge.manager_command.v2","command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})");
   const auto released = deployment::parse_strict_json_model_yaml(valid).root();
   EXPECT_EQ(RequiredMember(released, "ok"), CanonicalValue(true)) << valid;
   EXPECT_EQ(RequiredMember(released, "released"), CanonicalValue(nullptr)) << valid;
   for (const auto *request : {
-      R"({"api_version":"manyforge.manager_command.v1","command":"apply_release_for_new"})",
-      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_release_for_new","request_context":{"request_id":"new.1","source_label":"composer"}})"}) {
+      R"({"api_version":"manyforge.manager_command.v2","command":"apply_release_for_new"})",
+      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})"}) {
     const auto bytes = SendCommand(directory.socket_path(), request);
     const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
@@ -2149,52 +2428,36 @@ TEST(ManagerDaemonProcess, ApplyReleaseForNewReleasesNothingOnAFreshCell) {
 }
 
 TEST(ManagerDaemonProcess,
-     PublishesWithoutComposerAndSurvivesManagerReplacement) {
+     PublishesWithoutComposerAndRefusesAPreviousRunsState) {
   DaemonDirectory directory;
-  std::string first_manager_epoch;
   std::uint64_t first_manager_generation = 0U;
-  std::string first_scene_epoch;
-  std::string first_scene_digest;
-  std::uint64_t first_scene_generation = 0U;
-  std::string first_scene_runtime_epoch;
   std::uint64_t first_scene_runtime_generation = 0U;
   std::string unavailable_response;
   {
     ManagerProcess manager(directory);
     manager.WaitReady(directory);
-    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                               "manager-source.json");
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
-    AtomicSourceSnapshotChannel scene_runtime_source(
-        directory.publication_root(), "scene-runtime-source.json");
+    StatusSectionReader manager_source(directory, "manager");
+    StatusSectionReader scene_source(directory, "logical_scene");
+    StatusSectionReader scene_runtime_source(directory, "scene_runtime");
     const auto manager_snapshot = manager_source.Read();
     const auto scene_snapshot = scene_source.Read();
     const auto scene_runtime_snapshot = scene_runtime_source.Read();
     ASSERT_TRUE(manager_snapshot.has_value());
     ASSERT_TRUE(scene_snapshot.has_value());
     ASSERT_TRUE(scene_runtime_snapshot.has_value());
-    EXPECT_EQ(manager_snapshot->source_owner_kind, "component_manager");
-    EXPECT_EQ(scene_snapshot->source_owner_kind, "logical_scene");
-    EXPECT_EQ(scene_runtime_snapshot->source_owner_kind, "scene_runtime");
     const auto manager_payload_bytes =
         content_identity::canonical_json(manager_snapshot->payload);
     EXPECT_EQ(manager_payload_bytes.find("node_environment"),
               std::string::npos);
-    first_manager_epoch = manager_snapshot->source_owner_epoch;
     first_manager_generation = manager_snapshot->source_generation;
-    first_scene_epoch = scene_snapshot->source_owner_epoch;
-    first_scene_digest = scene_snapshot->semantic_content_digest;
-    first_scene_generation = scene_snapshot->source_generation;
-    first_scene_runtime_epoch = scene_runtime_snapshot->source_owner_epoch;
     first_scene_runtime_generation = scene_runtime_snapshot->source_generation;
 
     unavailable_response = ApplyRequest(
-        directory, first_manager_epoch, 1U, "candidate", kDeploymentRevision,
-        "current-graph", "current-bundle", "request-1", {}, true);
-    EXPECT_EQ(ApplyRequest(directory, first_manager_epoch, 1U, "candidate",
+        directory, 1U, "candidate", kDeploymentRevision,
+        "current-graph", "current-bundle", "request-1", true);
+    EXPECT_EQ(ApplyRequest(directory, 1U, "candidate",
                            kDeploymentRevision, "current-graph",
-                           "current-bundle", "request-1", {}, true),
+                           "current-bundle", "request-1", true),
               unavailable_response);
     EXPECT_NE(unavailable_response.find("\"deployment_candidate_rejected\""),
               std::string::npos);
@@ -2203,31 +2466,34 @@ TEST(ManagerDaemonProcess,
 
     SendCommandAndDisconnect(
         directory.socket_path(),
-        "{\"api_version\":\"manyforge.manager_command.v1\","
-        "\"command\":\"reconcile\"}");
+        "{\"api_version\":\"manyforge.manager_command.v2\","
+        "\"command\":\"scene_owner_read\"}");
     const auto post_disconnect_response =
         SendCommand(directory.socket_path(),
-                    "{\"api_version\":\"manyforge.manager_command.v1\","
-                    "\"command\":\"reconcile\"}");
+                    "{\"api_version\":\"manyforge.manager_command.v2\","
+                    "\"command\":\"scene_owner_read\"}");
     EXPECT_NE(post_disconnect_response.find("\"ok\":true"), std::string::npos);
     EXPECT_EQ(::kill(manager.pid(), 0), 0);
 
-    component_manager::SqliteManagerApplyJournal apply_journal(
-        directory.manager_root() /
-            std::string(component_manager::kManagerApplyJournalFilename),
-        core::CellId("c1_build_authority_cell"));
-    EXPECT_TRUE(apply_journal.ReadStatusInventory().empty());
+    // The Manager's own Apply list; its journal file is written afterwards.
+    const auto apply_snapshot = manager_source.Read();
+    ASSERT_TRUE(apply_snapshot.has_value());
+    EXPECT_TRUE(RequiredMember(RequiredMember(apply_snapshot->payload, "apply"),
+                               "records")
+                    .as_array()
+                    .empty());
 
+    // Concurrent status readers, as many as the Manager serves at once, each
+    // reading a few times (a closed reader's slot frees within one tick).
     std::atomic<bool> read_failed{false};
     std::vector<std::thread> readers;
     for (int index = 0; index < 4; ++index) {
       readers.emplace_back([&] {
         try {
-          AtomicSourceSnapshotChannel reader(directory.publication_root(),
-                                             "manager-source.json");
-          for (int read = 0; read < 100; ++read) {
+          StatusSectionReader reader(directory, "manager");
+          for (int read = 0; read < 3; ++read) {
             const auto snapshot = reader.Read();
-            if (!snapshot.has_value() || !snapshot->valid()) {
+            if (!snapshot.has_value()) {
               read_failed.store(true);
               return;
             }
@@ -2240,8 +2506,8 @@ TEST(ManagerDaemonProcess,
     for (int reconcile = 0; reconcile < 20; ++reconcile) {
       const auto response =
           SendCommand(directory.socket_path(),
-                      "{\"api_version\":\"manyforge.manager_command.v1\","
-                      "\"command\":\"reconcile\"}");
+                      "{\"api_version\":\"manyforge.manager_command.v2\","
+                      "\"command\":\"scene_owner_read\"}");
       EXPECT_NE(response.find("\"ok\":true"), std::string::npos);
     }
     for (auto &reader : readers) {
@@ -2262,57 +2528,18 @@ TEST(ManagerDaemonProcess,
     EXPECT_EQ(WTERMSIG(status), SIGKILL);
   }
 
+  // Every application start begins from an empty current/ directory
+  // (OD-122 (2), (8)): a Manager given a previous run's state is refused at
+  // start; nothing is recreated or resumed. The refused start lists one
+  // process, and it is not started (OD-242).
   {
+    std::ofstream(directory.application_processes(), std::ios::trunc)
+        << R"({"api_version":"manyforge.application_processes.v1","processes":[)"
+        << R"({"role":"headless","argv":["/bin/sh","-c",":"],"environment":{},"start":"immediate"}]})";
     ManagerProcess replacement(directory);
-    replacement.WaitReady(directory);
-    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                               "manager-source.json");
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
-    AtomicSourceSnapshotChannel scene_runtime_source(
-        directory.publication_root(), "scene-runtime-source.json");
-    const auto manager_snapshot = manager_source.Read();
-    const auto scene_snapshot = scene_source.Read();
-    const auto scene_runtime_snapshot = scene_runtime_source.Read();
-    ASSERT_TRUE(manager_snapshot.has_value());
-    ASSERT_TRUE(scene_snapshot.has_value());
-    ASSERT_TRUE(scene_runtime_snapshot.has_value());
-    EXPECT_NE(manager_snapshot->source_owner_epoch, first_manager_epoch);
-    EXPECT_EQ(manager_snapshot->source_generation, 1U);
-    EXPECT_EQ(scene_snapshot->source_owner_epoch, first_scene_epoch);
-    EXPECT_EQ(scene_snapshot->semantic_content_digest, first_scene_digest);
-    EXPECT_EQ(scene_snapshot->source_generation, first_scene_generation);
-    EXPECT_NE(scene_runtime_snapshot->source_owner_epoch,
-              first_scene_runtime_epoch);
-    EXPECT_EQ(scene_runtime_snapshot->source_generation, 1U);
-    EXPECT_NE(content_identity::canonical_json(scene_runtime_snapshot->payload)
-                  .find("\"state\":\"open\""),
+    ExpectPreviousRunRefused(replacement, directory);
+    EXPECT_EQ(ReadStartupStderr(directory).find("started headless"),
               std::string::npos);
-    const auto stale_apply = ApplyRequest(
-        directory, first_manager_epoch, 1U, "candidate", kDeploymentRevision,
-        "current-graph", "current-bundle", "request-1", {}, true);
-    EXPECT_NE(stale_apply.find("\"stale_request_owner_epoch\""),
-              std::string::npos);
-    const auto stale_generation = SendCommand(
-        directory.socket_path(),
-        SceneAddRequest(*scene_snapshot, "replacement-stale-generation.1", 2U));
-    EXPECT_NE(stale_generation.find("\"authoring_not_ready\""),
-              std::string::npos);
-    const auto replacement_unavailable =
-        ApplyRequest(directory, manager_snapshot->source_owner_epoch, 1U,
-                     "candidate", kDeploymentRevision, "current-graph",
-                     "current-bundle", "request-1", {}, true);
-    EXPECT_NE(replacement_unavailable.find("\"deployment_candidate_rejected\""),
-              std::string::npos);
-
-    const auto shutdown =
-        SendCommand(directory.socket_path(),
-                    "{\"api_version\":\"manyforge.manager_command.v1\","
-                    "\"command\":\"shutdown_runtime\"}");
-    EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos);
-    const auto status = replacement.Wait();
-    EXPECT_TRUE(WIFEXITED(status));
-    EXPECT_EQ(WEXITSTATUS(status), 0);
   }
 }
 
@@ -2321,10 +2548,11 @@ TEST(ManagerDaemonProcess,
   DaemonDirectory directory;
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  const auto before = scene_source.ReadObserved();
-  ASSERT_TRUE(before.has_value());
+  // The main loop's status tick (OD-216) proves it ran: an unchanged value is
+  // no longer republished, so the tick replaces the old file's write time.
+  const StatusConnection status(directory);
+  ASSERT_TRUE(status.connected());
+  const auto before_tick = ReadStatusStreamState(status).tick;
 
   std::atomic<bool> stop{false};
   std::atomic<bool> failed{false};
@@ -2335,7 +2563,7 @@ TEST(ManagerDaemonProcess,
         while (!stop.load()) {
           const auto response =
               SendCommand(directory.socket_path(),
-                          "{\"api_version\":\"manyforge.manager_command.v1\","
+                          "{\"api_version\":\"manyforge.manager_command.v2\","
                           "\"command\":\"scene_owner_read\"}");
           if (response.find("\"ok\":true") == std::string::npos) {
             failed.store(true);
@@ -2347,47 +2575,51 @@ TEST(ManagerDaemonProcess,
       }
     });
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // Two further ticks (500 ms each) while the traffic runs.
+  auto after_tick = before_tick;
+  const auto tick_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (after_tick < before_tick + 2U) {
+    const auto frame = status.Receive(tick_deadline);
+    if (!frame.has_value()) {
+      break;
+    }
+    after_tick = std::max(after_tick, StatusFrameTick(*frame));
+  }
   stop.store(true);
   for (auto &sender : senders) {
     sender.join();
   }
 
-  const auto after = scene_source.ReadObserved();
-  ASSERT_TRUE(after.has_value());
   EXPECT_FALSE(failed.load());
-  EXPECT_GT(after->file_modified_at_unix_ns, before->file_modified_at_unix_ns);
+  EXPECT_GE(after_tick, before_tick + 2U);
 }
 
 TEST(ManagerDaemonProcess,
-     SceneRuntimeObservationIngressFencesIdentityReplacementAndFreshness) {
+     SceneRuntimeObservationIngressFencesIdentityAndFreshness) {
   DaemonDirectory directory;
   {
     ManagerProcess manager(directory);
     manager.WaitReady(directory);
-    AtomicSourceSnapshotChannel scene_runtime_source(
-        directory.publication_root(), "scene-runtime-source.json");
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
-    AtomicSourceSnapshotChannel viewer_sessions(
-        directory.publication_root(), "viewer-pose-sessions.json");
+    StatusSectionReader scene_runtime_source(directory, "scene_runtime");
+    StatusSectionReader scene_source(directory, "logical_scene");
+    StatusSectionReader viewer_sessions(directory, "viewer_pose_sessions");
     const auto initial = scene_runtime_source.Read();
     const auto initial_scene = scene_source.Read();
     ASSERT_TRUE(initial.has_value());
     ASSERT_TRUE(initial_scene.has_value());
     const auto initial_sessions = viewer_sessions.Read();
     ASSERT_TRUE(initial_sessions.has_value());
-    EXPECT_EQ(initial_sessions->source_owner_id, initial->source_owner_id);
-    EXPECT_EQ(initial_sessions->source_owner_epoch, initial->source_owner_epoch);
     EXPECT_EQ(RequiredMember(initial_sessions->payload, "runtime_identity"),
               SceneRuntimeIdentityValue(*initial));
     EXPECT_TRUE(RequiredMember(initial_sessions->payload, "sessions").as_array().empty());
 
     const auto owner_read = SendCommand(
         directory.socket_path(),
-        R"({"api_version":"manyforge.manager_command.v1","command":"scene_runtime_owner_read"})");
+        R"({"api_version":"manyforge.manager_command.v2","command":"scene_runtime_owner_read"})");
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
-    EXPECT_NE(owner_read.find("\"scene_runtime_owner_epoch\":"),
+    // The reply names no owner epoch (contract 1.4).
+    EXPECT_EQ(owner_read.find("\"scene_runtime_owner_epoch\":"),
               std::string::npos);
     EXPECT_NE(owner_read.find("\"initialization_state\":\"open\""),
               std::string::npos);
@@ -2439,15 +2671,9 @@ TEST(ManagerDaemonProcess,
               std::string::npos)
         << crossed_latch;
 
-    const auto viewer_path = directory.publication_root() / "viewer-pose-sessions.json";
-    const auto saved_viewer_path = directory.publication_root() / "viewer-pose-sessions.saved";
-    std::filesystem::rename(viewer_path, saved_viewer_path);
-    std::filesystem::create_directory(viewer_path);
     const auto opened_first = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
-    std::filesystem::remove(viewer_path);
-    std::filesystem::rename(saved_viewer_path, viewer_path);
     EXPECT_NE(opened_first.find("\"source_epoch_order\":1"), std::string::npos)
         << opened_first;
     const auto retry_open = SendCommand(
@@ -2700,34 +2926,7 @@ TEST(ManagerDaemonProcess,
   }
 
   ManagerProcess replacement(directory);
-  replacement.WaitReady(directory);
-  AtomicSourceSnapshotChannel scene_runtime_source(directory.publication_root(),
-                                                   "scene-runtime-source.json");
-  const auto replacement_snapshot = scene_runtime_source.Read();
-  ASSERT_TRUE(replacement_snapshot.has_value());
-  EXPECT_EQ(content_identity::canonical_json(replacement_snapshot->payload)
-                .find("\"source_id\":\"isaac.observer\""),
-            std::string::npos);
-  AtomicSourceSnapshotChannel viewer_sessions(directory.publication_root(),
-                                             "viewer-pose-sessions.json");
-  const auto restarted_sessions = viewer_sessions.Read();
-  ASSERT_TRUE(restarted_sessions.has_value());
-  EXPECT_EQ(restarted_sessions->source_owner_epoch,
-            replacement_snapshot->source_owner_epoch);
-  EXPECT_TRUE(RequiredMember(restarted_sessions->payload, "sessions").as_array().empty());
-  const auto stale_after_owner_loss =
-      SendCommand(directory.socket_path(),
-                  SceneRuntimeObserveRequest(*replacement_snapshot,
-                                             "observer-epoch-2", 2U));
-  EXPECT_NE(stale_after_owner_loss.find("scene_runtime_observer_session_stale"),
-            std::string::npos)
-      << stale_after_owner_loss;
-  const auto reopened = SendCommand(
-      directory.socket_path(), SceneRuntimeObserverOpenRequest(
-                                   *replacement_snapshot, "observer-epoch-3"));
-  EXPECT_NE(reopened.find("\"source_epoch_order\":1"), std::string::npos)
-      << reopened;
-  EXPECT_TRUE(WIFEXITED(replacement.Stop(SIGTERM)));
+  ExpectPreviousRunRefused(replacement, directory);
 }
 
 TEST(ManagerDaemonProcess,
@@ -2740,46 +2939,38 @@ TEST(ManagerDaemonProcess,
   const auto displaced_root = selected_root.string() + ".displaced";
   ManagerProcess manager(directory, selected_root.string());
   manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
+  StatusSectionReader manager_source(directory, "manager");
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
   const auto children_before_replacement = ReadDirectChildren(manager.pid());
   std::filesystem::rename(selected_root, displaced_root);
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
 
-  const auto reconcile = SendCommand(
-      directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
-  EXPECT_EQ(ReadDirectChildren(manager.pid()), children_before_replacement);
-  EXPECT_NE(reconcile.find("\"code\":\"full_stack_restart_required\""),
-            std::string::npos)
-      << reconcile;
-  EXPECT_NE(reconcile.find("\"reason\":\"snapshot_integrity_lost\""),
-            std::string::npos)
-      << reconcile;
-  EXPECT_NE(reconcile.find("\"retryable\":\"false\""), std::string::npos)
-      << reconcile;
-  EXPECT_NE(reconcile.find("\"required_action\":\"complete_stack_stop_start\""),
-            std::string::npos)
-      << reconcile;
-
   const auto apply =
-      ApplyRequest(directory, before->source_owner_epoch, 1U, "candidate",
+      ApplyRequest(directory, 1U, "candidate",
                    kDeploymentRevision, "current-graph", "current-bundle",
-                   "request-1", {}, true);
+                   "request-1", true);
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), children_before_replacement);
   EXPECT_NE(apply.find("\"code\":\"full_stack_restart_required\""),
+            std::string::npos)
+      << apply;
+  EXPECT_NE(apply.find("\"reason\":\"snapshot_integrity_lost\""),
+            std::string::npos)
+      << apply;
+  EXPECT_NE(apply.find("\"retryable\":\"false\""), std::string::npos)
+      << apply;
+  EXPECT_NE(apply.find("\"required_action\":\"complete_stack_stop_start\""),
             std::string::npos)
       << apply;
 
   const auto owner_read = SendCommand(
       directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"scene_owner_read"})");
+      R"({"api_version":"manyforge.manager_command.v2","command":"scene_owner_read"})");
   EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos) << owner_read;
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  std::optional<SourceSnapshot> blocked;
+  std::optional<StatusSection> blocked;
   while (std::chrono::steady_clock::now() < deadline) {
     blocked = manager_source.Read();
     if (blocked.has_value() &&
@@ -2799,7 +2990,7 @@ TEST(ManagerDaemonProcess,
 
   const auto shutdown = SendCommand(
       directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"shutdown_runtime"})");
+      R"({"api_version":"manyforge.manager_command.v2","command":"shutdown_runtime"})");
   EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos) << shutdown;
   const auto status = manager.Wait();
   EXPECT_TRUE(WIFEXITED(status));
@@ -2821,24 +3012,20 @@ TEST(ManagerDaemonProcess, EnforcesOneProcessOwnerPerManagerStateRoot) {
 }
 
 TEST(ManagerDaemonProcess,
-     SceneCommandsFailClosedWithoutKernelAndReadsSurviveReplacement) {
+     SceneCommandsFailClosedWithoutKernelAndAPreviousRunIsRefused) {
   DaemonDirectory directory;
   std::string request;
-  std::string committed_digest;
-  std::uint64_t committed_generation = 0U;
   {
     ManagerProcess manager(directory);
     manager.WaitReady(directory);
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
+    StatusSectionReader scene_source(directory, "logical_scene");
     const auto initial = scene_source.Read();
     ASSERT_TRUE(initial.has_value());
     const auto owner_read =
         SendCommand(directory.socket_path(),
-                    "{\"api_version\":\"manyforge.manager_command.v1\","
+                    "{\"api_version\":\"manyforge.manager_command.v2\","
                     "\"command\":\"scene_owner_read\"}");
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
-    EXPECT_NE(owner_read.find(initial->source_owner_epoch), std::string::npos);
     const auto preview = SendCommand(
         directory.socket_path(),
         ScenePreviewRequest(*initial, "scene-process-preview.1", 1U));
@@ -2849,8 +3036,7 @@ TEST(ManagerDaemonProcess,
         << preview;
     const auto after_preview = scene_source.Read();
     ASSERT_TRUE(after_preview.has_value());
-    EXPECT_EQ(after_preview->semantic_content_digest,
-              initial->semantic_content_digest);
+    EXPECT_EQ(after_preview->payload, initial->payload);
     EXPECT_EQ(after_preview->source_generation, initial->source_generation);
     request = SceneAddRequest(*initial, "scene-process-request.1", 1U);
     const auto committed = SendCommand(directory.socket_path(), request);
@@ -2893,8 +3079,6 @@ TEST(ManagerDaemonProcess,
                   "\"details\":{\"scene_resource_id\":\"absent-object\"}"),
               std::string::npos)
         << absent_pose;
-    committed_digest = published->semantic_content_digest;
-    committed_generation = published->source_generation;
 
     const auto conflict = SendCommand(
         directory.socket_path(),
@@ -2911,20 +3095,7 @@ TEST(ManagerDaemonProcess,
   }
 
   ManagerProcess replacement(directory);
-  replacement.WaitReady(directory);
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  const auto recovered = scene_source.Read();
-  ASSERT_TRUE(recovered.has_value());
-  EXPECT_EQ(recovered->semantic_content_digest, committed_digest);
-  EXPECT_EQ(recovered->source_generation, committed_generation);
-  const auto replayed = SendCommand(directory.socket_path(), request);
-  EXPECT_NE(replayed.find("\"ok\":false"), std::string::npos);
-  EXPECT_NE(replayed.find("\"authoring_not_ready\""), std::string::npos);
-  EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
-            std::string::npos);
-  const auto stopped = replacement.Stop(SIGTERM);
-  EXPECT_TRUE(WIFEXITED(stopped));
+  ExpectPreviousRunRefused(replacement, directory);
 }
 
 #if defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
@@ -3076,6 +3247,171 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
+     ALateExecutionHostIsFaultedStoppedOnceAndKeptUntilItExits) {
+  // OD-120 (4), OD-121 (4), (16): a host that answers late is not stopped.
+  // The timed-out exchange stays the channel's one pending exchange; the
+  // Manager faults the host unit (readiness closed) and requests one
+  // cell-wide Stop on the Kernel's control socket; the late reply is
+  // discarded when it comes. Only the management status reply is late: the
+  // test-boundary build of the real host holds that one reply until the test
+  // releases it, and every other host lane keeps serving.
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(
+      directory, MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST);
+  const auto socket = directory.program_runner_liveness_socket_path();
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         fixture.admission_filename,
+                         installed_manager.string(), socket.string());
+  manager.WaitReady(directory);
+  ProgramRunnerProcess runner(directory, fixture.cell_id);
+  ASSERT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
+  const auto host = WaitForSoleManagedChild(manager.pid(), "before the late host");
+  const auto count = [&](const std::string_view text) {
+    const auto log = ReadStartupStderr(directory);
+    std::size_t found = 0U;
+    for (auto at = log.find(text); at != std::string::npos;
+         at = log.find(text, at + text.size()))
+      ++found;
+    return found;
+  };
+  // The one stderr line that carries `text` (empty when absent).
+  const auto line_of = [&](const std::string_view text) {
+    const auto log = ReadStartupStderr(directory);
+    const auto at = log.find(text);
+    if (at == std::string::npos) return std::string{};
+    const auto begin = log.rfind('\n', at);
+    const auto first = begin == std::string::npos ? 0U : begin + 1U;
+    return log.substr(first, log.find('\n', at) - first);
+  };
+  // Polls a fact the Manager or the host publishes; the deadline only ends a
+  // failed wait.
+  const auto wait_until = [](const auto &fact) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!fact() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return fact();
+  };
+  const auto authoring_allowed = [&]() -> std::optional<bool> {
+    try {
+      return ReadAuthoringAdmissionProjection(directory).authoring_allowed;
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+  using content_identity::CanonicalValue;
+  const auto read_events = [&] {
+    return SendCommand(
+        directory.execution_socket_path(),
+        content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+            {"after_sequence", CanonicalValue(0.0)},
+            {"command", CanonicalValue("events")},
+            {"limit", CanonicalValue(1.0)}})));
+  };
+  constexpr std::string_view event = "\"code\":\"execution_host_late_reply\"";
+  constexpr std::string_view settled = "execution host late reply settled";
+  constexpr std::string_view shutdown_requested =
+      "execution host child shutdown requested";
+  const auto run_root = directory.execution_run_root();
+  const auto entered = run_root / "reply-late.entered";
+
+  // No Stop before the late host: the Halt it causes is this start's first.
+  const auto before = read_events();
+  EXPECT_NE(before.find("\"last_stop_event_id\":null"), std::string::npos)
+      << before;
+
+  // Select the hold; the host's next periodic status reply is held, the
+  // Manager's bounded status exchange times out and the host is late.
+  {
+    const auto staged = run_root / "reply-late.mode.staged";
+    std::ofstream(staged, std::ios::binary | std::ios::trunc) << "status";
+    std::filesystem::rename(staged, run_root / "reply-late.mode");
+  }
+  ASSERT_TRUE(wait_until([&] { return std::filesystem::exists(entered); }))
+      << ReadStartupStderr(directory);
+  ASSERT_TRUE(wait_until([&] { return count(event) != 0U; }))
+      << ReadStartupStderr(directory);
+  // One event naming the status exchange, and its one Halt, which the
+  // Kernel's control socket accepted.
+  EXPECT_EQ(count(event), 1U) << ReadStartupStderr(directory);
+  const auto late_line = line_of(event);
+  EXPECT_NE(late_line.find("\"exchange\":\"status\""), std::string::npos)
+      << late_line;
+  EXPECT_NE(late_line.find("\"halt\":\"accepted\""), std::string::npos)
+      << late_line;
+  // Late, not lost: the host is kept.
+  EXPECT_EQ(::kill(host, 0), 0);
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), std::vector<pid_t>{host});
+  // While the reply is outstanding the host unit counts as faulted: the
+  // still-serving host reports authoring closed.
+  ASSERT_TRUE(wait_until([&] { return authoring_allowed() == false; }))
+      << ReadStartupStderr(directory);
+  // The Halt the late host caused is the Kernel's newest Stop event.
+  const auto after_halt = read_events();
+  EXPECT_NE(after_halt.find("\"last_stop_event_id\":1"), std::string::npos)
+      << after_halt;
+  // A Stop never uses the management channel: while the status reply is
+  // still held, the Kernel's control socket accepts a Halt.
+  const auto stop = SendCommand(
+      run_root / "execution-control.sock",
+      content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+          {"attribution",
+           CanonicalValue(CanonicalValue::Object{
+               {"assurance", CanonicalValue("unverified")},
+               {"principal_id", CanonicalValue(nullptr)},
+               {"transport", CanonicalValue("internal")}})},
+          {"command", CanonicalValue("halt")},
+          {"request",
+           CanonicalValue(CanonicalValue::Object{
+               {"request_context",
+                CanonicalValue(CanonicalValue::Object{
+                    {"request_key",
+                     CanonicalValue(TestRequestKeyText("late-host-stop"))},
+                    {"source_label",
+                     CanonicalValue("manager-process-test")}})}})}})));
+  EXPECT_NE(stop.find("\"event_id\""), std::string::npos) << stop;
+  EXPECT_EQ(count(settled), 0U) << ReadStartupStderr(directory);
+
+  // Release the held reply: it arrives late, is recognised and discarded,
+  // and the channel is usable again. The host was never stopped or replaced.
+  std::ofstream(run_root / "reply-late.release") << "release\n";
+  ASSERT_TRUE(wait_until([&] { return count(settled) != 0U; }))
+      << ReadStartupStderr(directory);
+  EXPECT_NE(line_of(settled).find("exchange=status"), std::string::npos)
+      << line_of(settled);
+  EXPECT_EQ(::kill(host, 0), 0);
+  EXPECT_EQ(ReadDirectChildren(manager.pid()), std::vector<pid_t>{host});
+  EXPECT_EQ(count(shutdown_requested), 0U) << ReadStartupStderr(directory);
+  EXPECT_EQ(count("stopping execution host child"), 0U)
+      << ReadStartupStderr(directory);
+  // Exactly one event, so exactly one cell-wide Stop request, per episode.
+  EXPECT_EQ(count(event), 1U) << ReadStartupStderr(directory);
+
+  // The host unit counted as faulted only while its reply was outstanding:
+  // once the reply arrived the fault stops counting by itself, with no Reset
+  // and no latch (maintainer 2026-11-13), so authoring opens again.
+  ASSERT_TRUE(wait_until([&] { return authoring_allowed() == true; }))
+      << ReadStartupStderr(directory);
+
+  // The host is kept until the application ends: the orderly stop is the
+  // first and only time the Manager asks it to shut down.
+  const auto shutdown = SendCommand(
+      directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v2","command":"shutdown_runtime"})");
+  EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos) << shutdown;
+  const auto status = manager.Wait();
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+  EXPECT_EQ(count(shutdown_requested), 1U) << ReadStartupStderr(directory);
+}
+
+TEST(ManagerDaemonProcess,
      RobotiqPositionHostApplyPublishesAControllableCellWithoutMotion) {
   const auto fixture = ReadManagerApplyFixtureMetadata(
       MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA);
@@ -3097,18 +3433,17 @@ TEST(ManagerDaemonProcess,
                          program_runner.socket_path().string());
   manager.WaitReady(directory);
 
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
+  StatusSectionReader manager_source(directory, "manager");
   const auto initial = manager_source.Read();
   ASSERT_TRUE(initial.has_value());
   const auto request = ApplyRequest(
-      directory, initial->source_owner_epoch,
+      directory,
       WaitForAuthoringAdmission(directory).admission_generation,
       fixture.physical_deployment_artifact_id,
       fixture.physical_deployment_revision,
       fixture.predecessor_graph_revision,
       fixture.predecessor_retained_bundle_id,
-      "manager-robotiq-position-apply.1", {}, false, "receipt",
+      "manager-robotiq-position-apply.1", false, "receipt",
       fixture.prepared_activation_id);
   const auto submitted = SendCommand(directory.socket_path(), request);
   ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos)
@@ -3131,10 +3466,10 @@ TEST(ManagerDaemonProcess,
             std::string::npos);
   const auto ready = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
-  EXPECT_FALSE(ready.owner_epoch.empty());
+  EXPECT_FALSE(ready.application_start_id.empty());
   const auto status = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
+      R"({"api_version":"manyforge.execution_command.v4","command":"status"})");
   ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
   EXPECT_NE(status.find("tool.gripper.command"), std::string::npos)
       << status;
@@ -3214,17 +3549,16 @@ TEST(
                          program_runner.socket_path().string());
   manager.WaitReady(directory);
 
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
+  StatusSectionReader manager_source(directory, "manager");
   const auto initial = manager_source.Read();
   ASSERT_TRUE(initial.has_value());
   const auto request = ApplyRequest(
-      directory, initial->source_owner_epoch,
+      directory,
       WaitForAuthoringAdmission(directory).admission_generation,
       fixture.physical_deployment_artifact_id,
       fixture.physical_deployment_revision, fixture.predecessor_graph_revision,
       fixture.predecessor_retained_bundle_id,
-      "manager-pneumatic-commanded-feedback-apply.1", {}, false, "receipt",
+      "manager-pneumatic-commanded-feedback-apply.1", false, "receipt",
       fixture.prepared_activation_id);
   const auto submitted = SendCommand(directory.socket_path(), request);
   ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
@@ -3242,7 +3576,7 @@ TEST(
       << ReadStartupStderr(directory);
   const auto ready = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
-  EXPECT_FALSE(ready.owner_epoch.empty());
+  EXPECT_FALSE(ready.application_start_id.empty());
   // The Manager's own source refreshes on its next observation cycle, which
   // may follow the Apply's terminal record and the host's readiness.
   auto current = manager_source.Read();
@@ -3262,185 +3596,11 @@ TEST(
             fixture.physical_candidate_retained_bundle_id);
   const auto status = SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
+      R"({"api_version":"manyforge.execution_command.v4","command":"status"})");
   ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
   EXPECT_NE(status.find("tool.gripper.command"), std::string::npos) << status;
   EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
       << status;
-}
-
-TEST(ManagerDaemonProcess,
-     CompatibleNativeReplacementUsesFreshEpochAfterCleanStop) {
-  const auto fixture_a = ReadManagerApplyFixtureMetadata();
-  const auto fixture_b = ReadManagerApplyFixtureMetadata(
-      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA);
-  ASSERT_EQ(fixture_a.close_retained_bundle_id,
-            fixture_b.close_retained_bundle_id);
-
-  const std::filesystem::path package_a =
-      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT;
-  const std::filesystem::path package_b =
-      MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT;
-  ASSERT_NE(package_a, package_b);
-
-  DaemonDirectory directory_a;
-  std::filesystem::copy(package_a, directory_a.apply_package_root(),
-                        std::filesystem::copy_options::recursive);
-  const auto installed_manager_a = PrepareManagerApplyInstalledTargets(
-      directory_a, MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST);
-  const auto identity_a = ReadNativePackageIdentity(
-      package_a, fixture_a.physical_candidate_retained_bundle_id,
-      directory_a.installed_root() / "manyforge_ros2_control_execution_host");
-  ASSERT_TRUE(component_manager::VerifyExecutionHostUnitForHost(
-                  *identity_a.bundle,
-                  identity_a.bundle->value()
-                      .cell_graph.runtime_units.front()
-                      .runtime_unit_id,
-                  deployment::FilesystemVerifiedRetainedProductArtifactSource(
-                      package_a),
-                  "linux",
-                  deployment::ros2_control_execution_runtime_contract::
-                      kLaunchEnvironmentContract)
-                  .has_value());
-
-  ProgramRunnerProcess program_runner_a(directory_a, fixture_a.cell_id);
-  std::string manager_epoch_a;
-  std::string runtime_epoch_a;
-  {
-    ManagerProcess manager(
-        directory_a, package_a.string(), fixture_a.admission_filename,
-        installed_manager_a.string(), program_runner_a.socket_path().string());
-    manager.WaitReady(directory_a);
-    AtomicSourceSnapshotChannel manager_source(directory_a.publication_root(),
-                                               "manager-source.json");
-    const auto initial = manager_source.Read();
-    ASSERT_TRUE(initial.has_value());
-    manager_epoch_a = initial->source_owner_epoch;
-    const auto admission = WaitForAuthoringAdmission(directory_a);
-    const auto request = ApplyRequest(directory_a, manager_epoch_a,
-                                      admission.admission_generation,
-                                      fixture_a.physical_deployment_artifact_id,
-                                      fixture_a.physical_deployment_revision,
-                                      fixture_a.predecessor_graph_revision,
-                                      fixture_a.predecessor_retained_bundle_id,
-                                      "manager-replacement-a.1");
-    const auto submitted = SendCommand(directory_a.socket_path(), request);
-    ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
-    const auto status_request = ApplyStatusRequest(submitted);
-    auto applied = submitted;
-    const auto apply_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
-           std::chrono::steady_clock::now() < apply_deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory_a.socket_path(), status_request);
-    }
-    ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
-        << applied;
-    const auto status = deployment::parse_strict_json_model_yaml(applied).root();
-    const auto &prepared = RequiredMember(status, "prepared_activation");
-    ASSERT_TRUE(prepared.is_object());
-    EXPECT_EQ(prepared.as_object().size(), 5U);
-    const auto requested = deployment::parse_strict_json_model_yaml(request).root();
-    EXPECT_EQ(RequiredText(prepared, "prepared_activation_id"),
-              RequiredText(RequiredMember(requested, "prepared_activation"),
-                           "prepared_activation_id"));
-    ASSERT_NE(applied.find(fixture_a.physical_candidate_retained_bundle_id),
-              std::string::npos)
-        << applied;
-    const auto ready = WaitForExecutionReady(
-        directory_a, fixture_a.physical_candidate_retained_bundle_id);
-    ASSERT_FALSE(ready.owner_epoch.empty());
-    runtime_epoch_a = ready.owner_epoch;
-    ASSERT_FALSE(runtime_epoch_a.empty());
-    const auto stopped = manager.Stop(SIGTERM);
-    ASSERT_TRUE(WIFEXITED(stopped));
-    EXPECT_EQ(WEXITSTATUS(stopped), 0);
-    EXPECT_FALSE(std::filesystem::exists(directory_a.socket_path()));
-    EXPECT_FALSE(std::filesystem::exists(directory_a.execution_socket_path()));
-  }
-
-  DaemonDirectory directory_b;
-  std::filesystem::copy(package_b, directory_b.apply_package_root(),
-                        std::filesystem::copy_options::recursive);
-  const auto installed_manager_b = PrepareManagerApplyInstalledTargets(
-      directory_b, MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST);
-  const auto identity_b = ReadNativePackageIdentity(
-      package_b, fixture_b.physical_candidate_retained_bundle_id,
-      directory_b.installed_root() / "manyforge_ros2_control_execution_host");
-  ASSERT_TRUE(component_manager::VerifyExecutionHostUnitForHost(
-                  *identity_b.bundle,
-                  identity_b.bundle->value()
-                      .cell_graph.runtime_units.front()
-                      .runtime_unit_id,
-                  deployment::FilesystemVerifiedRetainedProductArtifactSource(
-                      package_b),
-                  "linux",
-                  deployment::ros2_control_execution_runtime_contract::
-                      kLaunchEnvironmentContract)
-                  .has_value());
-  EXPECT_NE(identity_a.executable_digest, identity_b.executable_digest);
-  // Different compatible executables consume the same semantic package. Their
-  // release identity is diagnostic and no longer package admission authority.
-  EXPECT_EQ(identity_a.product.product_identity(),
-            identity_b.product.product_identity());
-  EXPECT_EQ(identity_a.product.configuration_identity(),
-            identity_b.product.configuration_identity());
-  EXPECT_EQ(identity_a.bundle->retained_bundle_id(),
-            identity_b.bundle->retained_bundle_id());
-  EXPECT_EQ(identity_a.offer, identity_b.offer);
-  EXPECT_EQ(identity_a.offer.offer_digest, identity_b.offer.offer_digest);
-
-  ProgramRunnerProcess program_runner_b(directory_b, fixture_b.cell_id);
-  std::string manager_epoch_b;
-  std::string runtime_epoch_b;
-  {
-    ManagerProcess manager(
-        directory_b, package_b.string(), fixture_b.admission_filename,
-        installed_manager_b.string(), program_runner_b.socket_path().string());
-    manager.WaitReady(directory_b);
-    AtomicSourceSnapshotChannel manager_source(directory_b.publication_root(),
-                                               "manager-source.json");
-    const auto initial = manager_source.Read();
-    ASSERT_TRUE(initial.has_value());
-    manager_epoch_b = initial->source_owner_epoch;
-    const auto admission = WaitForAuthoringAdmission(directory_b);
-    const auto request = ApplyRequest(directory_b, manager_epoch_b,
-                                      admission.admission_generation,
-                                      fixture_b.physical_deployment_artifact_id,
-                                      fixture_b.physical_deployment_revision,
-                                      fixture_b.predecessor_graph_revision,
-                                      fixture_b.predecessor_retained_bundle_id,
-                                      "manager-replacement-b.1");
-    const auto submitted = SendCommand(directory_b.socket_path(), request);
-    ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
-    const auto status_request = ApplyStatusRequest(submitted);
-    auto applied = submitted;
-    const auto apply_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    while (applied.find("\"state\":\"succeeded\"") == std::string::npos &&
-           std::chrono::steady_clock::now() < apply_deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      applied = SendCommand(directory_b.socket_path(), status_request);
-    }
-    ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
-        << applied;
-    ASSERT_NE(applied.find(fixture_b.physical_candidate_retained_bundle_id),
-              std::string::npos)
-        << applied;
-    const auto ready = WaitForExecutionReady(
-        directory_b, fixture_b.physical_candidate_retained_bundle_id);
-    ASSERT_FALSE(ready.owner_epoch.empty());
-    runtime_epoch_b = ready.owner_epoch;
-    ASSERT_FALSE(runtime_epoch_b.empty());
-    EXPECT_NE(manager_epoch_a, manager_epoch_b);
-    EXPECT_NE(runtime_epoch_a, runtime_epoch_b);
-    const auto stopped = manager.Stop(SIGTERM);
-    ASSERT_TRUE(WIFEXITED(stopped));
-    EXPECT_EQ(WEXITSTATUS(stopped), 0);
-    EXPECT_FALSE(std::filesystem::exists(directory_b.socket_path()));
-    EXPECT_FALSE(std::filesystem::exists(directory_b.execution_socket_path()));
-  }
 }
 
 TEST(ManagerDaemonProcess,
@@ -3457,14 +3617,13 @@ TEST(ManagerDaemonProcess,
                          installed_manager.string(),
                          program_runner.socket_path().string());
   manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
+  StatusSectionReader manager_source(directory, "manager");
   const auto before = manager_source.Read();
   ASSERT_TRUE(before.has_value());
   // First Apply the physical fixture cell with its Program.
   const auto physical_submitted = SendCommand(
       directory.socket_path(),
-      ApplyRequest(directory, before->source_owner_epoch,
+      ApplyRequest(directory,
                    WaitForAuthoringAdmission(directory).admission_generation,
                    fixture.physical_deployment_artifact_id,
                    fixture.physical_deployment_revision,
@@ -3498,15 +3657,15 @@ TEST(ManagerDaemonProcess,
   const auto admission =
       WaitForAuthoringAdmission(directory).admission_generation;
   std::string last_request;
-  const auto submit = [&](const std::string_view request_id,
+  const auto submit = [&](const std::string_view request_name,
                           const std::string_view accepted) {
     last_request =
-        ApplyRequest(directory, before->source_owner_epoch, admission,
+        ApplyRequest(directory, admission,
                      fixture.close_deployment_artifact_id,
                      fixture.close_deployment_revision,
                      physical_graph_revision,
-                     fixture.physical_candidate_retained_bundle_id, request_id,
-                     {}, false, accepted, close_prepared_activation_id);
+                     fixture.physical_candidate_retained_bundle_id, request_name,
+                     false, accepted, close_prepared_activation_id);
     const auto response = SendCommand(directory.socket_path(), last_request);
     return response;
   };
@@ -3532,8 +3691,10 @@ TEST(ManagerDaemonProcess,
   ASSERT_TRUE(unchanged.has_value());
   const auto unchanged_payload =
       content_identity::canonical_json(unchanged->payload);
-  EXPECT_EQ(unchanged_payload.find("impact-unaccepted"), std::string::npos);
-  EXPECT_EQ(unchanged_payload.find("impact-wrong"), std::string::npos);
+  EXPECT_EQ(unchanged_payload.find(TestRequestKeyText("impact-unaccepted")),
+            std::string::npos);
+  EXPECT_EQ(unchanged_payload.find(TestRequestKeyText("impact-wrong")),
+            std::string::npos);
 
   const auto accepted = submit("impact-accepted", "receipt");
   EXPECT_EQ(accepted.find("\"code\":\"confirmation_required\""),
@@ -3566,7 +3727,7 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
-     NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
+     NamedApplyUsesTheRealManagedFenceAndAPreviousRunIsRefused) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory(true);
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -3583,7 +3744,7 @@ TEST(ManagerDaemonProcess,
       try {
         status = SendCommand(
             directory.execution_socket_path(),
-            R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
+            R"({"api_version":"manyforge.execution_command.v4","command":"status"})");
         if (status.find("\"ok\":true") != std::string::npos ||
             status.find("\"code\":\"execution_owner_not_ready\"") !=
                 std::string::npos) {
@@ -3597,19 +3758,15 @@ TEST(ManagerDaemonProcess,
     return status;
   };
   std::string preserved_scene_snapshot;
-  std::string first_manager_epoch;
   std::string request;
   {
     ManagerProcess manager(directory, package_root, fixture.admission_filename,
                            installed_manager.string(),
                            program_runner.socket_path().string());
     manager.WaitReady(directory);
-    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                               "manager-source.json");
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
-    AtomicSourceSnapshotChannel scene_runtime_source(
-        directory.publication_root(), "scene-runtime-source.json");
+    StatusSectionReader manager_source(directory, "manager");
+    StatusSectionReader scene_source(directory, "logical_scene");
+    StatusSectionReader scene_runtime_source(directory, "scene_runtime");
     const auto before = manager_source.Read();
     const auto scene_before = scene_source.Read();
     const auto scene_runtime_before = scene_runtime_source.Read();
@@ -3621,7 +3778,6 @@ TEST(ManagerDaemonProcess,
     ASSERT_TRUE(predecessor_snapshot->is_object());
     preserved_scene_snapshot = content_identity::canonical_json(*predecessor_snapshot);
     ASSERT_TRUE(scene_runtime_before.has_value());
-    first_manager_epoch = before->source_owner_epoch;
     EXPECT_NE(content_identity::canonical_json(before->payload)
                   .find("\"apply\":{\"mutation_available\":true"),
               std::string::npos);
@@ -3629,7 +3785,7 @@ TEST(ManagerDaemonProcess,
                   .find(fixture.predecessor_retained_bundle_id),
               std::string::npos);
     request = ApplyRequest(
-        directory, first_manager_epoch,
+        directory,
         WaitForAuthoringAdmission(directory).admission_generation,
         fixture.physical_deployment_artifact_id,
         fixture.physical_deployment_revision,
@@ -3657,7 +3813,8 @@ TEST(ManagerDaemonProcess,
             !ManagerSourceHistoryIsOneGeneration(observed->payload)) {
           split_generation = applied;
         }
-        if (applied.find(R"("request_id":"manager-program-apply.1")") !=
+        if (applied.find("\"" + TestRequestKeyText("manager-program-apply.1") +
+                         "\"") !=
                 std::string::npos &&
             applied.find(R"("terminal_state":"succeeded")") !=
                 std::string::npos) {
@@ -3716,24 +3873,30 @@ TEST(ManagerDaemonProcess,
               std::string::npos)
         << replayed;
 
-    component_manager::SqliteManagerApplyJournal journal(
-        directory.manager_root() /
-            std::string(component_manager::kManagerApplyJournalFilename),
-        core::CellId(fixture.cell_id));
-    const auto inventory = journal.ReadStatusInventory();
-    ASSERT_EQ(inventory.size(), 1U);
-    ASSERT_TRUE(inventory.front().terminal_outcome.has_value());
-    ASSERT_TRUE(inventory.front()
-                    .terminal_outcome->terminal_outcome
-                    .candidate_projection_revision.has_value());
-    EXPECT_EQ(inventory.front()
-                  .terminal_outcome->terminal_outcome
-                  .candidate_projection_revision->retained_bundle_id.value(),
-              fixture.physical_candidate_retained_bundle_id);
+    // The Manager's own Apply list; its journal file is written afterwards.
+    {
+      const auto listed = manager_source.Read();
+      ASSERT_TRUE(listed.has_value());
+      const auto &records =
+          RequiredMember(RequiredMember(listed->payload, "apply"), "records")
+              .as_array();
+      ASSERT_EQ(records.size(), 1U);
+      EXPECT_EQ(RequiredText(records.front(), "terminal_state"), "succeeded");
+      EXPECT_EQ(RequiredText(records.front(), "candidate_retained_bundle_id"),
+                fixture.physical_candidate_retained_bundle_id);
+    }
 
     // Optional export is reached only after this test's real Manager Apply
     // and its durable journal report the same successful candidate.
     if (const char* export_path = std::getenv("MANYFORGE_REAL_APPLY_FIXTURE_EXPORT")) {
+      // Export mode only: reads the live file, which may lag the Manager.
+      component_manager::SqliteManagerApplyJournal journal(
+          directory.manager_root() /
+              std::string(component_manager::kManagerApplyJournalFilename),
+          core::CellId(fixture.cell_id));
+      const auto inventory = journal.ReadStatusInventory();
+      ASSERT_EQ(inventory.size(), 1U);
+      ASSERT_TRUE(inventory.front().terminal_outcome.has_value());
       const auto& intent = inventory.front().intent;
       ASSERT_TRUE(inventory.front().terminal_outcome->terminal_outcome.succeeded());
       ASSERT_NE(applied.find(R"("terminal_state":"succeeded")"), std::string::npos);
@@ -3825,61 +3988,11 @@ TEST(ManagerDaemonProcess,
   ManagerProcess replacement(
       directory, package_root, fixture.admission_filename,
       installed_manager.string(), program_runner.socket_path().string());
-  replacement.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  AtomicSourceSnapshotChannel scene_runtime_source(directory.publication_root(),
-                                                   "scene-runtime-source.json");
-  const auto recovered = manager_source.Read();
-  const auto recovered_scene = scene_source.Read();
-  const auto scene_runtime_recovered = scene_runtime_source.Read();
-  ASSERT_TRUE(recovered.has_value());
-  ASSERT_TRUE(recovered_scene.has_value());
-  ASSERT_TRUE(scene_runtime_recovered.has_value());
-  const auto recovered_manager_bytes =
-      content_identity::canonical_json(recovered->payload);
-  EXPECT_NE(recovered->source_owner_epoch, first_manager_epoch);
-  EXPECT_NE(recovered_manager_bytes.find(
-                fixture.physical_candidate_retained_bundle_id),
-            std::string::npos);
-  EXPECT_NE(recovered_manager_bytes.find(
-                R"("request_id":"manager-program-apply.1")"),
-            std::string::npos);
-  EXPECT_NE(
-      recovered_manager_bytes.find(R"("incomplete":false,"intent_digest":)"),
-      std::string::npos);
-  EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
-                .find(fixture.physical_candidate_retained_bundle_id),
-            std::string::npos);
-  const auto *const recovered_snapshot = recovered_scene->payload.find_object_member("snapshot");
-  ASSERT_NE(recovered_snapshot, nullptr);
-  EXPECT_EQ(content_identity::canonical_json(*recovered_snapshot), preserved_scene_snapshot);
-  EXPECT_EQ(content_identity::canonical_json(recovered_scene->payload).find("apply_fixture_marker"),
-            std::string::npos);
-  const auto recovered_execution_status = wait_execution_response();
-  // Reopening the Manager may read completed Apply evidence, but it must not
-  // silently restart a physical execution owner after process loss.
-  EXPECT_NE(recovered_execution_status.find("\"ok\":false"),
-            std::string::npos)
-      << recovered_execution_status;
-  EXPECT_NE(recovered_execution_status.find(
-                "\"code\":\"execution_owner_not_ready\""),
-            std::string::npos)
-      << recovered_execution_status;
-  const auto replay = SendCommand(directory.socket_path(), request);
-  EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
-      << replay;
-  EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
-            std::string::npos)
-      << replay;
-  const auto stopped = replacement.Stop(SIGTERM);
-  EXPECT_TRUE(WIFEXITED(stopped));
+  ExpectPreviousRunRefused(replacement, directory);
 }
 
 TEST(ManagerDaemonProcess,
-     PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement) {
+     AnExecutionHostExitEndsTheApplication) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -3888,25 +4001,20 @@ TEST(ManagerDaemonProcess,
   const auto package_root = directory.apply_package_root().string();
   const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
   ProgramRunnerProcess program_runner(directory, fixture.cell_id);
-  std::string first_manager_epoch;
   std::string apply_request;
-  std::string applied_owner_epoch;
+  std::string applied_application_start_id;
   RuntimeOfferProjection initial_offer;
-  std::uint64_t advanced_scene_generation = 0U;
   {
     ManagerProcess manager(directory, package_root, fixture.admission_filename,
                            installed_manager.string(),
                            program_runner.socket_path().string());
     manager.WaitReady(directory);
-    AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                               "manager-source.json");
-    AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                             "logical-scene-source.json");
+    StatusSectionReader manager_source(directory, "manager");
+    StatusSectionReader scene_source(directory, "logical_scene");
     const auto before = manager_source.Read();
     ASSERT_TRUE(before.has_value());
-    first_manager_epoch = before->source_owner_epoch;
     apply_request =
-        ApplyRequest(directory, first_manager_epoch,
+        ApplyRequest(directory,
                      WaitForAuthoringAdmission(directory).admission_generation,
                      fixture.physical_deployment_artifact_id,
                      fixture.physical_deployment_revision,
@@ -3932,13 +4040,13 @@ TEST(ManagerDaemonProcess,
 
     const auto initial = WaitForExecutionReady(
         directory, fixture.physical_candidate_retained_bundle_id);
-    ASSERT_FALSE(initial.owner_epoch.empty());
-    applied_owner_epoch = initial.owner_epoch;
+    ASSERT_FALSE(initial.application_start_id.empty());
+    applied_application_start_id = initial.application_start_id;
     initial_offer =
-        WaitForRuntimeOfferProjection(manager_source, initial.owner_epoch);
+        WaitForRuntimeOfferProjection(manager_source, initial.application_start_id);
     EXPECT_EQ(initial_offer.selected, initial_offer.observed);
-    EXPECT_EQ(initial.owner_epoch,
-              "kernel-owner-" + initial_offer.observed_epoch);
+    EXPECT_EQ(initial.application_start_id,
+              initial_offer.observed_epoch);
 
     const auto advanced_scene_projection = scene_source.Read();
     ASSERT_TRUE(advanced_scene_projection.has_value());
@@ -3951,7 +4059,7 @@ TEST(ManagerDaemonProcess,
         << advanced_scene;
     const auto scene_advance_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    std::optional<SourceSnapshot> after_scene_advance;
+    std::optional<StatusSection> after_scene_advance;
     while (std::chrono::steady_clock::now() < scene_advance_deadline &&
            (!after_scene_advance.has_value() ||
             after_scene_advance->source_generation <=
@@ -3967,92 +4075,30 @@ TEST(ManagerDaemonProcess,
     ASSERT_TRUE(after_scene_advance.has_value());
     EXPECT_GT(after_scene_advance->source_generation,
               advanced_scene_projection->source_generation);
-    advanced_scene_generation = after_scene_advance->source_generation;
+    static_cast<void>(after_scene_advance->source_generation);
 
     const auto first_child =
         WaitForSoleManagedChild(manager.pid(), "before deliberate SIGKILL");
     ASSERT_EQ(::kill(first_child, SIGKILL), 0);
 
-    // Unexpected loss of a required owner is contained fault evidence, not an
-    // implicit replacement request. Steady-state observation and the public
-    // reconcile command must never start the lost managed unit again; only the
-    // Manager's own bootstrap may reinitialize it.
-    const auto reap_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < reap_deadline &&
-           !ReadDirectChildren(manager.pid()).empty()) {
-      static_cast<void>(SendCommand(
-          directory.socket_path(),
-          R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})"));
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    ASSERT_TRUE(ReadDirectChildren(manager.pid()).empty())
-        << "the exited managed child was not observed and reaped";
-    for (int attempt = 0; attempt < 5; ++attempt) {
-      const auto reconciled = SendCommand(
-          directory.socket_path(),
-          R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
-      EXPECT_NE(reconciled.find("\"ok\":true"), std::string::npos)
-          << reconciled;
-      EXPECT_TRUE(ReadDirectChildren(manager.pid()).empty())
-          << "steady-state observation restarted a lost managed child";
-    }
-    const auto manager_loss = manager_source.Read();
-    ASSERT_TRUE(manager_loss.has_value());
-    EXPECT_NE(content_identity::canonical_json(manager_loss->payload)
-                  .find("\"manager_ready\":false"),
+    // Any application process exit ends the application (OD-122 (1)): the
+    // Manager observes the host's exit, prints it, runs the one stop
+    // sequence and exits with its fixed status. Nothing relaunches the host.
+    const auto status = manager.Wait();
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 72);
+    std::ifstream input(directory.startup_stderr(), std::ios::binary);
+    const std::string stderr_text{std::istreambuf_iterator<char>(input),
+                                  std::istreambuf_iterator<char>()};
+    EXPECT_NE(stderr_text.find("execution_host exited with signal 9"),
               std::string::npos)
-        << "lost required owner must keep readiness closed";
-    const auto status = manager.Stop(SIGKILL);
-    ASSERT_TRUE(WIFSIGNALED(status));
+        << stderr_text;
   }
 
   ManagerProcess replacement(
       directory, package_root, fixture.admission_filename,
       installed_manager.string(), program_runner.socket_path().string());
-  replacement.WaitReady(directory);
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  const auto recovered_scene = scene_source.Read();
-  ASSERT_TRUE(recovered_scene.has_value());
-  EXPECT_GE(recovered_scene->source_generation, advanced_scene_generation);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
-  const auto manager_recovered = manager_source.Read();
-  ASSERT_TRUE(manager_recovered.has_value());
-  const auto manager_recovered_offer =
-      ReadRuntimeOfferProjection(manager_recovered->payload);
-  EXPECT_EQ(manager_recovered_offer.selected, manager_recovered_offer.observed);
-  EXPECT_EQ(manager_recovered_offer.selected, initial_offer.selected);
-  EXPECT_NE(manager_recovered_offer.observed_epoch,
-            initial_offer.observed_epoch);
-  EXPECT_NE("kernel-owner-" + manager_recovered_offer.observed_epoch,
-            applied_owner_epoch);
-  EXPECT_NE(manager_recovered->source_owner_epoch, first_manager_epoch);
-  EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
-                .find(fixture.physical_candidate_retained_bundle_id),
-            std::string::npos);
-  // An unexpected required-child loss is not a new Apply request. A Manager
-  // restart may restore observation of the durable selection, but cannot
-  // silently rebuild the old physical product or reopen control admission.
-  const auto execution_status = SendCommand(
-      directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
-  EXPECT_NE(execution_status.find("\"code\":\"execution_owner_not_ready\""),
-            std::string::npos)
-      << execution_status;
-  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed)
-      << SendCommand(directory.execution_socket_path(),
-                     R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
-  const auto replay = SendCommand(directory.socket_path(), apply_request);
-  EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
-      << replay;
-  EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
-            std::string::npos)
-      << replay;
-  const auto stopped = replacement.Stop(SIGTERM);
-  EXPECT_TRUE(WIFEXITED(stopped));
-  EXPECT_EQ(WEXITSTATUS(stopped), 0);
+  ExpectPreviousRunRefused(replacement, directory);
 }
 #endif
 
@@ -4163,12 +4209,9 @@ TEST(ManagerDaemonProcess,
                          installed_manager.string(),
                          program_runner.socket_path().string());
   manager.WaitReady(directory);
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  AtomicSourceSnapshotChannel runtime_source(directory.publication_root(),
-                                             "scene-runtime-source.json");
+  StatusSectionReader manager_source(directory, "manager");
+  StatusSectionReader scene_source(directory, "logical_scene");
+  StatusSectionReader runtime_source(directory, "scene_runtime");
   const auto before = manager_source.Read();
   const auto scene_before = scene_source.Read();
   const auto runtime_before = runtime_source.Read();
@@ -4179,12 +4222,12 @@ TEST(ManagerDaemonProcess,
                          "retained_bundle_id"),
             predecessor_id);
   // The component model and component actions are served
-  // on the execution host's Stop control socket.
+  // on the execution host's component socket.
   const auto control_command = [&](CanonicalValue::Object request) {
     request.emplace_back("api_version",
-                         CanonicalValue("manyforge.execution_command.v3"));
+                         CanonicalValue("manyforge.execution_command.v4"));
     const auto bytes = SendCommand(
-        directory.execution_run_root() / "execution-control.sock",
+        directory.execution_run_root() / "execution-component.sock",
         content_identity::canonical_json(CanonicalValue(std::move(request))));
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
@@ -4195,46 +4238,40 @@ TEST(ManagerDaemonProcess,
   // Events use the stable owner/journal even before a physical product exists.
   const auto idle_identity = deployment::parse_strict_json_model_yaml(SendCommand(
       directory.execution_socket_path(),
-      R"({"api_version":"manyforge.execution_command.v3","command":"identity"})")).root();
+      R"({"api_version":"manyforge.execution_command.v4","command":"identity"})")).root();
   ASSERT_EQ(RequiredMember(idle_identity, "ok"), CanonicalValue(false));
-  const auto event_owner_epoch = RequiredText(
-      RequiredMember(RequiredMember(idle_identity, "error"), "details"), "owner_epoch");
-  const auto read_event_metadata = [&](const bool expected_ready, const bool stale_cursor = false) {
+  // The event cursor is the sequence alone; the journal belongs to this
+  // application start, so no owner epoch is named (contract 1.1).
+  const auto read_event_metadata = [&](const bool expected_ready) {
     const auto response = deployment::parse_strict_json_model_yaml(SendCommand(
         directory.execution_socket_path(), content_identity::canonical_json(
             CanonicalValue(CanonicalValue::Object{
-                {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+                {"api_version", CanonicalValue("manyforge.execution_command.v4")},
                 {"command", CanonicalValue("events")},
-                {"owner_epoch", CanonicalValue(stale_cursor ? "unregistered-event-owner" : event_owner_epoch)},
                 {"after_sequence", CanonicalValue(0.0)}, {"limit", CanonicalValue(1.0)}})))).root();
-    EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(!stale_cursor))
+    EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(true))
         << content_identity::canonical_json(response);
-    EXPECT_EQ(RequiredText(response, "owner_epoch"), event_owner_epoch);
     EXPECT_EQ(RequiredMember(response, "execution_owner_ready"), CanonicalValue(expected_ready));
     const auto& faults = RequiredMember(response, "runtime_faults");
     EXPECT_EQ(faults.as_object().size(), 3U);
     EXPECT_EQ(RequiredMember(faults, "operation_journal_write_fault"), CanonicalValue(nullptr));
     EXPECT_EQ(RequiredMember(faults, "program_runner_loss"), CanonicalValue(nullptr));
     EXPECT_EQ(RequiredMember(faults, "kernel_internal_fault"), CanonicalValue(nullptr));
-    if (stale_cursor) {
-      EXPECT_EQ(RequiredText(RequiredMember(response, "error"), "code"),
-                "operation_journal_owner_epoch_stale");
-    } else {
-      EXPECT_EQ(RequiredText(RequiredMember(response, "event_page"), "owner_epoch"), event_owner_epoch);
-    }
+    EXPECT_EQ(RequiredText(RequiredMember(response, "event_page"), "schema_version"),
+              "manyforge.execution_event_page.v3");
   };
   read_event_metadata(false);
-  read_event_metadata(false, true);  // Page error keeps actual-owner metadata.
   const auto request =
-      ApplyRequest(directory, before->source_owner_epoch,
+      ApplyRequest(directory,
                    WaitForAuthoringAdmission(directory).admission_generation,
                    RequiredText(metadata, "deployment_artifact_id"),
                    RequiredText(metadata, "deployment_revision"),
                    RequiredText(metadata, "predecessor_graph_revision"),
-                   predecessor_id, "empty-ros-one-mock.1", {}, false, "receipt",
+                   predecessor_id, "empty-ros-one-mock.1", false, "receipt",
                    RequiredText(metadata, "prepared_activation_id"));
   // Decode genuine Apply envelopes with an intentionally unowned parent claim.
-  // The stale outer owner prevents every valid-shape control from applying.
+  // The parent names an admission generation other than the previewed
+  // receipt's, so every valid-shape control is refused before any effect.
   {
     const auto replace = [](CanonicalValue value, const std::string &name,
                             CanonicalValue member) {
@@ -4250,12 +4287,18 @@ TEST(ManagerDaemonProcess,
     const CanonicalValue intent(CanonicalValue::Object{
         {"claim_kind", CanonicalValue("authoring_mutation")},
         {"owner_role", CanonicalValue("authoring_owner")},
-        {"owner_epoch", CanonicalValue(std::string(60U, 'o'))},
-        {"owner_transaction_id", CanonicalValue("parent.decoder.transaction")},
-        {"request_id", CanonicalValue("parent.decoder.request")},
-        {"request_payload_digest",
-         CanonicalValue("sha256:" + std::string(64U, 'a'))},
-        {"expected_admission_generation", CanonicalValue(1.0)},
+        {"owner_transaction_id", CanonicalValue(nullptr)},
+        {"request_key",
+         CanonicalValue(TestRequestKeyText("parent.decoder.request"))},
+        {"expected_admission_generation",
+         CanonicalValue(
+             RequiredMember(RequiredMember(deployment::parse_strict_json_model_yaml(
+                                               request)
+                                               .root(),
+                                           "admission_context"),
+                            "expected_admission_generation")
+                 .as_number() +
+             1.0)},
         {"scope",
          CanonicalValue(CanonicalValue::Object{
              {"resources", CanonicalValue(CanonicalValue::Array{})},
@@ -4269,8 +4312,6 @@ TEST(ManagerDaemonProcess,
         {"accepted_at_ns", CanonicalValue(7.0)}});
     const auto submit_parent = [&](CanonicalValue parent) {
       auto command = deployment::parse_strict_json_model_yaml(request).root();
-      command = replace(std::move(command), "request_owner_epoch",
-                        CanonicalValue("manager.parent-decoder.stale"));
       command = replace(std::move(command), "admission_context",
                         CanonicalValue(CanonicalValue::Object{
                             {"kind", CanonicalValue("parent_authoring_claim")},
@@ -4290,6 +4331,28 @@ TEST(ManagerDaemonProcess,
                 "Manager daemon: parent " + std::string(field) +
                     " must be one positive safe integer");
     }
+    // An authoring claim intent carries no transaction id and no payload digest.
+    const auto with_intent = [&](CanonicalValue parent_intent) {
+      return replace(claim, "intent", std::move(parent_intent));
+    };
+    const auto numbered = submit_parent(with_intent(
+        replace(intent, "owner_transaction_id", CanonicalValue(1.0))));
+    EXPECT_EQ(RequiredText(RequiredMember(numbered, "error"), "code"),
+              "invalid_request");
+    EXPECT_EQ(RequiredText(RequiredMember(numbered, "error"), "message"),
+              "Manager daemon: parent authoring claim carries an owner "
+              "transaction id");
+    auto digest_fields = intent.as_object();
+    digest_fields.emplace_back(
+        "request_payload_digest",
+        CanonicalValue("sha256:" + std::string(64U, 'a')));
+    const auto digested =
+        submit_parent(with_intent(CanonicalValue(std::move(digest_fields))));
+    EXPECT_EQ(RequiredText(RequiredMember(digested, "error"), "code"),
+              "invalid_request");
+    EXPECT_EQ(RequiredText(RequiredMember(digested, "error"), "message"),
+              "Manager daemon: parent authoring claim intent has an unknown "
+              "or missing field");
     const auto bad_timestamp = submit_parent(
         replace(claim, "accepted_at_ns", CanonicalValue("not-a-timestamp")));
     EXPECT_EQ(RequiredText(RequiredMember(bad_timestamp, "error"), "code"),
@@ -4308,10 +4371,14 @@ TEST(ManagerDaemonProcess,
       const auto valid =
           submit_parent(replace(claim, "accepted_at_ns", timestamp));
       EXPECT_EQ(RequiredText(RequiredMember(valid, "error"), "code"),
-                "stale_request_owner_epoch")
+                "deployment_candidate_receipt_mismatch")
           << content_identity::canonical_json(valid);
-      EXPECT_EQ(RequiredText(valid, "request_owner_epoch"),
-                "manager.parent-decoder.stale");
+      EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(valid, "error"),
+                                            "details"),
+                             "effect"),
+                "none");
+      EXPECT_EQ(RequiredText(valid, "request_key"),
+                TestRequestKeyText("empty-ros-one-mock.1"));
     }
   }
   const auto submitted = SendCommand(directory.socket_path(), request);
@@ -4331,7 +4398,8 @@ TEST(ManagerDaemonProcess,
     if (status.has_value()) {
       last = content_identity::canonical_json(status->payload);
       EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(status->payload)) << last;
-      if (last.find("\"request_id\":\"empty-ros-one-mock.1\"") !=
+      if (last.find("\"" + TestRequestKeyText("empty-ros-one-mock.1") +
+                    "\"") !=
               std::string::npos &&
           last.find("\"terminal_state\":\"succeeded\"") != std::string::npos) {
         succeeded = true;
@@ -4341,17 +4409,20 @@ TEST(ManagerDaemonProcess,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   ASSERT_TRUE(succeeded) << last;
-  read_event_metadata(true);  // Same stable owner and envelope after composition.
-  read_event_metadata(true, true);
-  component_manager::SqliteManagerApplyJournal journal(
-      directory.manager_root() /
-          std::string(component_manager::kManagerApplyJournalFilename),
-      core::CellId(cell));
-  const auto inventory = journal.ReadStatusInventory();
-  ASSERT_EQ(inventory.size(), 1U);
-  const auto &status = inventory.front();
-  ASSERT_TRUE(status.fence_released.has_value());
-  ASSERT_TRUE(status.publication_receipt.has_value());
+  read_event_metadata(true);  // Same stable journal and envelope after composition.
+  // The Manager's own Apply list; its journal file is written afterwards.
+  {
+    const auto listed = manager_source.Read();
+    ASSERT_TRUE(listed.has_value());
+    const auto &records =
+        RequiredMember(RequiredMember(listed->payload, "apply"), "records")
+            .as_array();
+    ASSERT_EQ(records.size(), 1U);
+    EXPECT_EQ(RequiredText(RequiredMember(records.front(), "fence"), "state"),
+              "released");
+    EXPECT_EQ(RequiredMember(records.front(), "committed"),
+              CanonicalValue(true));
+  }
 
   const auto read_component = [&](const std::string &component_id) {
     const auto model = control_command(
@@ -4427,7 +4498,7 @@ TEST(ManagerDaemonProcess,
   const auto read_command_gate = [&] {
     const auto bytes = SendCommand(
         directory.execution_socket_path(),
-        R"({"api_version":"manyforge.execution_command.v3","command":"targets"})");
+        R"({"api_version":"manyforge.execution_command.v4","command":"targets"})");
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
@@ -4458,7 +4529,7 @@ TEST(ManagerDaemonProcess,
                                                  false) {
     const auto bytes = SendCommand(
         directory.execution_socket_path(),
-        R"({"api_version":"manyforge.execution_command.v3","command":"status"})");
+        R"({"api_version":"manyforge.execution_command.v4","command":"status"})");
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
@@ -4535,14 +4606,12 @@ TEST(ManagerDaemonProcess,
     CanonicalValue operation(CanonicalValue::Object{
         {"request_context",
          CanonicalValue(CanonicalValue::Object{
-             {"request_id", CanonicalValue(request_id)},
-             {"request_owner_epoch", RequiredMember(identity, "owner_epoch")},
-             {"source_label", CanonicalValue("manager_ros_apply_fixture")},
-             {"correlation_id", CanonicalValue(nullptr)}})},
+             {"request_key", CanonicalValue(TestRequestKeyText(request_id))},
+             {"source_label", CanonicalValue("manager_ros_apply_fixture")}})},
         {"program_id", RequiredMember(manual, "program_id")},
         {"program_revision", RequiredMember(manual, "program_revision")},
         {"program_binding_id", RequiredMember(manual, "program_binding_id")},
-        {"program_run_id", RequiredMember(manual, "program_run_id")},
+        {"program_run_id", CanonicalValue(nullptr)},
         {"expected_graph_revision", RequiredMember(identity, "graph_revision")},
         {"expected_retained_bundle_id",
          RequiredMember(identity, "retained_bundle_id")},
@@ -4553,7 +4622,7 @@ TEST(ManagerDaemonProcess,
     const auto submitted_motion = SendCommand(
         directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+            {"api_version", CanonicalValue("manyforge.execution_command.v4")},
             {"command", CanonicalValue("submit")},
             {"operation", std::move(operation)},
             {"attribution", CanonicalValue(CanonicalValue::Object{
@@ -4627,35 +4696,46 @@ TEST(ManagerDaemonProcess,
     return deployment::parse_strict_json_model_yaml(bytes).root();
   };
   const CanonicalValue::Object capability_request{
-      {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+      {"api_version", CanonicalValue("manyforge.execution_command.v4")},
       {"command", CanonicalValue("reset_robot_position_capability")}};
   const auto capability = execution_command(capability_request);
   ASSERT_EQ(capability.as_object().size(), 5U);
   ASSERT_EQ(RequiredMember(capability, "ok"), CanonicalValue(true));
-  EXPECT_EQ(RequiredText(capability, "api_version"), "manyforge.execution_command_response.v4");
+  EXPECT_EQ(RequiredText(capability, "api_version"), "manyforge.execution_command_response.v6");
   EXPECT_EQ(RequiredText(capability, "command"), "reset_robot_position_capability");
   const auto &position_capability = RequiredMember(capability, "reset_robot_position");
   ASSERT_EQ(position_capability.as_object().size(), 2U);
   EXPECT_EQ(RequiredMember(position_capability, "available"), CanonicalValue(true));
   EXPECT_EQ(RequiredMember(position_capability, "reason"), CanonicalValue(nullptr));
   const auto &position_identity = RequiredMember(capability, "identity");
-  EXPECT_EQ(RequiredText(position_identity, "schema_version"), "manyforge.execution_identity.v2");
+  EXPECT_EQ(RequiredText(position_identity, "schema_version"), "manyforge.execution_identity.v3");
   const CanonicalValue::Object reset_authorization{
-      {"program_runner_owner_epoch", CanonicalValue("absent.runner")},
       {"cycle_generation", CanonicalValue(1.0)},
-      {"request_owner_epoch", CanonicalValue("absent.request-owner")},
-      {"request_id", CanonicalValue("absent.reset")},
+      {"request_key", CanonicalValue(TestRequestKeyText("absent.reset"))},
       {"request_payload_digest", CanonicalValue("sha256:" + std::string(64U, '1'))},
       {"program_run_id", CanonicalValue(nullptr)},
       {"cycle_claim_generation", CanonicalValue(nullptr)},
       {"terminal_or_settlement_reference", CanonicalValue(nullptr)},
-      {"reset_claim_generation", CanonicalValue(1.0)}};
+      {"reset_claim_generation", CanonicalValue(1.0)},
+      // The runner's current cycle status (OD-139).
+      {"program_cycle_status", CanonicalValue(CanonicalValue::Object{
+           {"cycle_generation", CanonicalValue(1.0)},
+           {"state", CanonicalValue("resetting")},
+           {"program_run_id", CanonicalValue(nullptr)},
+           {"cycle_claim_generation", CanonicalValue(nullptr)},
+           {"terminal_or_settlement_reference", CanonicalValue(nullptr)},
+           {"accepted_reset", CanonicalValue(CanonicalValue::Object{
+                {"request_key", CanonicalValue(TestRequestKeyText("absent.reset"))},
+                {"request_payload_digest", CanonicalValue("sha256:" + std::string(64U, '1'))},
+                {"reload_initial_scene", CanonicalValue(false)},
+                {"reset_robot_position", CanonicalValue(true)},
+                {"reset_claim_generation", CanonicalValue(1.0)}})}})}};
   CanonicalValue::Object expected_deployment;
-  for (const auto *key : {"owner_epoch", "active_publication_generation", "retained_bundle_id", "graph_revision"})
+  for (const auto *key : {"application_start_id", "active_publication_generation", "retained_bundle_id", "graph_revision"})
     expected_deployment.emplace_back(key, RequiredMember(position_identity, key));
   const auto reset_command = [](CanonicalValue::Object authorization, CanonicalValue::Object expected) {
     return CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+        {"api_version", CanonicalValue("manyforge.execution_command.v4")},
         {"command", CanonicalValue("reset_robot_position")},
         {"authorization", CanonicalValue(std::move(authorization))},
         {"expected_deployment_identity", CanonicalValue(std::move(expected))}};
@@ -4738,16 +4818,19 @@ TEST(ManagerDaemonProcess,
       submit_current_joint_hold("empty-ros-one-mock.active-motion");
   ASSERT_EQ(RequiredMember(accepted_motion, "ok"), CanonicalValue(true))
       << content_identity::canonical_json(accepted_motion);
+  // The operation number (an integer on the wire).
   const auto operation_id =
-      RequiredText(RequiredMember(accepted_motion, "accepted"), "operation_id");
+      RequiredMember(RequiredMember(accepted_motion, "accepted"), "operation_id");
+  ASSERT_TRUE(operation_id.is_number())
+      << content_identity::canonical_json(accepted_motion);
   const auto motion_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(20);
   CanonicalValue actual_motion(nullptr);
   while (std::chrono::steady_clock::now() < motion_deadline) {
     const auto bytes = SendCommand(directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue("manyforge.execution_command.v3")},
-            {"command", CanonicalValue("read")}, {"operation_id", CanonicalValue(operation_id)}})));
+            {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+            {"command", CanonicalValue("read")}, {"operation_id", operation_id}})));
     const auto actual = deployment::parse_strict_json_model_yaml(bytes).root();
     ASSERT_EQ(RequiredMember(actual, "ok"), CanonicalValue(true)) << bytes;
     actual_motion = RequiredMember(actual, "operation");
@@ -4797,7 +4880,7 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v3")},
+                            CanonicalValue("manyforge.execution_command.v4")},
                            {"command", CanonicalValue(name)},
                            {"attribution", io_attribution},
                            {field, std::move(payload)}}))))
@@ -4808,11 +4891,11 @@ TEST(ManagerDaemonProcess,
   CanonicalValue::Object reset_request{
       {"request_context",
        CanonicalValue(CanonicalValue::Object{
-           {"request_id", CanonicalValue("reset.output-ack.decoder")},
-           {"request_owner_epoch", CanonicalValue(event_owner_epoch)},
-           {"source_label", CanonicalValue("native-output-ack-test")},
-           {"correlation_id", CanonicalValue(nullptr)}})},
-      {"operation_id", CanonicalValue("operation.absent-output")},
+           {"request_key",
+            CanonicalValue(TestRequestKeyText("reset.output-ack.decoder"))},
+           {"source_label", CanonicalValue("native-output-ack-test")}})},
+      // An absent operation number.
+      {"operation_id", CanonicalValue(999999.0)},
       {"expected_operation_revision", CanonicalValue(1.0)},
       {"reason", CanonicalValue(nullptr)}};
   const auto decoded =
@@ -4822,17 +4905,15 @@ TEST(ManagerDaemonProcess,
             "execution_command_invalid");
 
   CanonicalValue::Object io_token{
-      {"owner_epoch", CanonicalValue(event_owner_epoch)},
       {"catalog_generation", CanonicalValue("18446744073709551615")},
       {"registration_id", CanonicalValue("18446744073709551615")},
       {"scope",
        CanonicalValue(CanonicalValue::Object{
-           {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
-           {"program_run_id", CanonicalValue("run.io-wire")},
+           {"program_run_id", CanonicalValue(155.0)},
            {"node",
             CanonicalValue(CanonicalValue::Object{
                 {"node_instance_id", CanonicalValue("io_wait")},
-                {"node_attempt_id", CanonicalValue("attempt.io-wire")}})}})}};
+                {"node_attempt_id", CanonicalValue(1.0)}})}})}};
   for (const auto &command : {"read_io_watch", "release_io_watch"}) {
     const auto refused =
         io_command(command, "registration", CanonicalValue(io_token));
@@ -4856,14 +4937,12 @@ TEST(ManagerDaemonProcess,
     }
   }
   CanonicalValue::Object io_request{
-      {"schema_version", CanonicalValue("manyforge.io_watch_request.v2")},
-      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"schema_version", CanonicalValue("manyforge.io_watch_request.v3")},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
-      {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
       {"claim_generation", CanonicalValue(1.0)},
-      {"program_run_id", CanonicalValue("run.io-wire")},
+      {"program_run_id", CanonicalValue(155.0)},
       {"node_instance_id", CanonicalValue("io_wait")},
-      {"node_attempt_id", CanonicalValue("attempt.io-wire")},
+      {"node_attempt_id", CanonicalValue(1.0)},
       {"signal", CanonicalValue(CanonicalValue::Object{
           {"component_id", CanonicalValue("io_target")},
           {"signal_name", CanonicalValue("ready_input")}})},
@@ -4877,14 +4956,12 @@ TEST(ManagerDaemonProcess,
                          "reason"),
             "io_watch_scope_stale");
   CanonicalValue::Object io_scope_release{
-      {"schema_version", CanonicalValue("manyforge.io_watch_scope_release.v1")},
-      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"schema_version", CanonicalValue("manyforge.io_watch_scope_release.v2")},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
-      {"program_runner_owner_epoch", CanonicalValue("runner.io-wire")},
       {"claim_generation", CanonicalValue(1.0)},
-      {"program_run_id", CanonicalValue("run.io-wire")},
+      {"program_run_id", CanonicalValue(155.0)},
       {"node_instance_id", CanonicalValue("io_wait")},
-      {"node_attempt_id", CanonicalValue("attempt.io-wire")}};
+      {"node_attempt_id", CanonicalValue(1.0)}};
   const auto stale_scope_release = io_command(
       "release_io_watch", "scope_request", CanonicalValue(io_scope_release));
   EXPECT_EQ(
@@ -4921,14 +4998,13 @@ TEST(ManagerDaemonProcess,
         CanonicalValue(CanonicalValue::Object{
             {"request_context",
              CanonicalValue(CanonicalValue::Object{
-                 {"request_id", CanonicalValue("io-write-wire")},
-                 {"request_owner_epoch", CanonicalValue("owner.output.stale")},
-                 {"source_label", CanonicalValue("io-write-wire")},
-                 {"correlation_id", CanonicalValue(nullptr)}})},
+                 {"request_key",
+                  CanonicalValue(TestRequestKeyText("io-write-wire"))},
+                 {"source_label", CanonicalValue("io-write-wire")}})},
             {"program_id", CanonicalValue("program.io-write-wire")},
             {"program_revision", CanonicalValue("revision.io-write-wire")},
             {"program_binding_id", CanonicalValue("binding.io-write-wire")},
-            {"program_run_id", CanonicalValue("run.io-write-wire")},
+            {"program_run_id", CanonicalValue(156.0)},
             {"expected_graph_revision", CanonicalValue("graph.io-write-wire")},
             {"expected_retained_bundle_id",
              CanonicalValue("bundle.io-write-wire")},
@@ -5015,8 +5091,7 @@ TEST(ManagerDaemonProcess,
             "execution_command_invalid");
 
   CanonicalValue::Object io_query{
-      {"schema_version", CanonicalValue("manyforge.target_observation_query.v2")},
-      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"schema_version", CanonicalValue("manyforge.target_observation_query.v3")},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
       {"kind", CanonicalValue("io_signal")},
       {"signal", CanonicalValue(CanonicalValue::Object{
@@ -5029,7 +5104,7 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v3")},
+                            CanonicalValue("manyforge.execution_command.v4")},
                            {"command", CanonicalValue("query_target")},
                            {"query", std::move(query)}}))))
         .root();
@@ -5040,8 +5115,7 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(RequiredText(RequiredMember(missing_service, "error"), "code"),
             "io_signal_unbound");
   CanonicalValue::Object mock_set{
-      {"schema_version", CanonicalValue("manyforge.mock_io_input_request.v2")},
-      {"owner_epoch", CanonicalValue(event_owner_epoch)},
+      {"schema_version", CanonicalValue("manyforge.mock_io_input_request.v3")},
       {"program_binding_id", CanonicalValue("binding.io-wire")},
       {"signal", CanonicalValue(CanonicalValue::Object{
           {"component_id", CanonicalValue("io_target")},
@@ -5071,9 +5145,9 @@ TEST(ManagerDaemonProcess,
   CanonicalValue retired_motion(nullptr);
   do {
     retired_motion = execution_command(CanonicalValue::Object{
-        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+        {"api_version", CanonicalValue("manyforge.execution_command.v4")},
         {"command", CanonicalValue("read")},
-        {"operation_id", CanonicalValue(operation_id)}});
+        {"operation_id", operation_id}});
     ASSERT_EQ(RequiredMember(retired_motion, "ok"), CanonicalValue(true));
     if (RequiredMember(retired_motion, "resident") == CanonicalValue(false))
       break;
@@ -5089,10 +5163,10 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v3")},
+                            CanonicalValue("manyforge.execution_command.v4")},
                            {"command",
                             CanonicalValue("get_operation_recovery")},
-                           {"operation_id", CanonicalValue(operation_id)}}))))
+                           {"operation_id", operation_id}}))))
         .root();
   };
   const auto recovery = read_recovery();
@@ -5106,7 +5180,7 @@ TEST(ManagerDaemonProcess,
   // authorize an effect. Live-owner replay/fence behavior has focused Core
   // tests.
   CanonicalValue::Object recovery_request{
-      {"request_id", CanonicalValue("managed-recovery-wire")},
+      {"request_key", CanonicalValue(TestRequestKeyText("managed-recovery-wire"))},
       {"action", CanonicalValue("reset_cycle")},
       {"principal_id", CanonicalValue("operator.recovery-wire-test")},
       {"expected_assessment_revision", CanonicalValue(1.0)},
@@ -5123,11 +5197,11 @@ TEST(ManagerDaemonProcess,
                    content_identity::canonical_json(
                        CanonicalValue(CanonicalValue::Object{
                            {"api_version",
-                            CanonicalValue("manyforge.execution_command.v3")},
+                            CanonicalValue("manyforge.execution_command.v4")},
                            {"command",
                             CanonicalValue("apply_operation_recovery")},
                            {"expected_operation_revision", operation_revision},
-                           {"operation_id", CanonicalValue(operation_id)},
+                           {"operation_id", operation_id},
                            {"request", std::move(request_value)}}))))
         .root();
   };
@@ -5195,7 +5269,7 @@ TEST(ManagerDaemonProcess,
   }
   EXPECT_EQ(read_recovery(), recovery);
   const auto execution = WaitForExecutionReady(directory, candidate_id);
-  EXPECT_FALSE(execution.owner_epoch.empty());
+  EXPECT_FALSE(execution.application_start_id.empty());
   const auto scene_after = scene_source.Read();
   const auto runtime_after = runtime_source.Read();
   ASSERT_TRUE(scene_after.has_value());
@@ -5235,8 +5309,16 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(SendCommand(directory.socket_path(), request)
                 .find("\"replay_status\":\"replayed_exact\""),
             std::string::npos);
-  const auto replay_inventory = journal.ReadStatusInventory();
-  ASSERT_EQ(replay_inventory.size(), 1U);
+  {
+    // The Manager's own Apply list; its journal file is written afterwards.
+    const auto listed = manager_source.Read();
+    ASSERT_TRUE(listed.has_value());
+    EXPECT_EQ(RequiredMember(RequiredMember(listed->payload, "apply"),
+                             "records")
+                  .as_array()
+                  .size(),
+              1U);
+  }
 
   // Let the actual Manager child owner settle normal runtime shutdown before
   // the successful fixture removes the controller launch artifact directory.

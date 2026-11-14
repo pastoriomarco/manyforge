@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <optional>
+
+#include <manyforge_core/types/strong_id.hpp>
 #include <string>
 #include <string_view>
 
@@ -52,7 +54,7 @@ inline std::optional<ActionSource> action_source_from_string(
 struct ActionSpanDTO {
   ActionSource action_source = ActionSource::kSystem;
   std::string action_span_id;
-  std::string program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
   std::string node_instance_id;
   std::string node_attempt_id;
   std::string parent_node_attempt_id;

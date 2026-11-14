@@ -44,14 +44,10 @@ public:
   [[nodiscard]] const manyforge::core::RuntimeContractManifestSetDTO &
   manifest_set() const noexcept;
 
-  void RequireCurrent(
-      const manyforge::core::RuntimeContractManifestSetDTO &observed);
+  void RequireCurrent();
 
 private:
-  [[noreturn]] void LatchAndThrow(
-      std::string reason,
-      std::optional<manyforge::core::RuntimeContractManifestSetDigest>
-          observed_digest = std::nullopt);
+  [[noreturn]] void LatchAndThrow(std::string reason);
 
   std::filesystem::path package_root_;
   manyforge::core::RuntimeContractManifestSetDTO manifest_set_;

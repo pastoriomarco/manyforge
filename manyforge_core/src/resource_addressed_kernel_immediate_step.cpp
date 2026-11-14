@@ -19,11 +19,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
     if (const auto valid = validate_operation_intent(intent); !valid.ok()) {
       return Result<OperationAcceptedDTO>::Err(valid.error());
     }
-    if (intent.request_context.request_owner_epoch != config_.request_owner_epoch) {
-      return Result<OperationAcceptedDTO>::Err(
-          error("stale_request_owner_epoch", "operation request names a stale Kernel owner epoch",
-                "stale_request_owner_epoch"));
-    }
     if (intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
       return reject<OperationAcceptedDTO>("an immediate step names exactly one component",
@@ -36,6 +31,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
     if (!made.ok()) return Result<OperationAcceptedDTO>::Err(made.error());
     step.emplace(std::move(made.value()));
     const bool manual = registration.intrinsic_direct_control;
+    // Manual work has no run; Program work names the run the Kernel holds.
+    if (manual == intent.program_run_id.has_value()) {
+      return reject<OperationAcceptedDTO>(manual ? "manual work cannot name a Program run"
+                                                 : "Program work requires its Program run",
+                                          "direct_control_product_mismatch");
+    }
     if (manual ? intent.participants.front().execution_scope.has_value()
                : intent.manual_handover.has_value()) {
       return reject<OperationAcceptedDTO>(
@@ -51,10 +52,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
                                             "manual_handover_scope_stale");
       }
       const auto& capture = held.value()->capture;
-      const ManualProgramHandoverContextDTO current{capture.program_runner_owner_epoch,
-                                                    capture.program_run_id,
+      const ManualProgramHandoverContextDTO current{capture.program_run_id,
                                                     capture.claim_generation,
-                                                    held.value()->selection_revision};
+                                                    held.value()->hold_revision};
       if (current != *intent.manual_handover) {
         return reject<OperationAcceptedDTO>("manual handover differs from its current hold",
                                             "manual_handover_scope_stale");
@@ -114,15 +114,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
       immediate_step_engines_.insert(engine);
       holding = true;
     }
-    const auto operation_id = OperationId("operation." + config_.request_owner_epoch.value() +
-                                          "." + std::to_string(next_operation_id_++));
+    const auto operation_id = OperationNumber(next_operation_id_++);
     accepted.emplace(OperationAcceptedDTO{
-        intent.request_context.request_id,
+        intent.request_context.request_key,
         RequestReplayStatusDTO::kAcceptedNew,
         operation_id,
         OperationRevision(1U),
         {OperationParticipantAssignmentDTO{
-            0U, OperationParticipantId(operation_id.value() + ".participant.1")}},
+            0U, OperationParticipantId{operation_id, 1U}}},
         clock_.now()});
   }
   auto* engine = resolved->value().engine;
@@ -138,8 +137,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
     // step's own reason stays; nothing is resident or replayed.
     auto failed = ran.error();
     failed.details.insert_or_assign("immediate_step", "admitted");
-    failed.details.insert_or_assign("request_id", intent.request_context.request_id.value());
-    failed.details.insert_or_assign("operation_id", accepted->operation_id.value());
+    failed.details.insert_or_assign("request_key", RequestKeyText(intent.request_context.request_key));
+    failed.details.insert_or_assign("operation_id", std::to_string(accepted->operation_id.value()));
     return Result<OperationAcceptedDTO>::Err(std::move(failed));
   }
   return Result<OperationAcceptedDTO>::Ok(std::move(*accepted));

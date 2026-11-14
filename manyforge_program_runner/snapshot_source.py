@@ -6,7 +6,6 @@ import base64
 from collections.abc import Mapping
 from hashlib import sha256
 import math
-import re
 from threading import Event, RLock
 from typing import Final
 from urllib.parse import urlsplit
@@ -18,12 +17,12 @@ from manyforge_behavior.assistant_program_port import (
     ProgramSnapshotSourceError,
     validate_program_snapshot_attachment,
 )
+from manyforge_headless_api.internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 
 
 _MAX_IMAGE_BYTES: Final = 2 * 1024 * 1024
 _MAX_CAPTURE_TIMEOUT_S: Final = 2.0
 _STREAM_CHUNK_BYTES: Final = 64 * 1024
-_OWNER_EPOCH: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
 class ComposerProgramSnapshotSource:
@@ -57,7 +56,7 @@ class ComposerProgramSnapshotSource:
                 "/api/scene/snapshot/render endpoint"
             )
         self._render_url = render_url
-        self._client = client or httpx.Client()
+        self._client = client or httpx.Client(limits=INTERNAL_HTTP_CLIENT_LIMITS)
         self._owns_client = client is None
         self._lock = RLock()
         self._closed = False
@@ -151,9 +150,6 @@ class ComposerProgramSnapshotSource:
                     media_type = response.headers.get("content-type", "").split(
                         ";", 1
                     )[0].strip().lower()
-                    owner_epoch = response.headers.get(
-                        "x-manyforge-viewer-owner-epoch"
-                    )
                     raw_generation = response.headers.get(
                         "x-manyforge-viewer-generation"
                     )
@@ -164,8 +160,6 @@ class ComposerProgramSnapshotSource:
                         generation = -1
                     if (
                         media_type != expected_media_type
-                        or owner_epoch is None
-                        or _OWNER_EPOCH.fullmatch(owner_epoch) is None
                         or generation < 0
                         or "no-store" not in {
                             token.strip().lower()
@@ -233,9 +227,8 @@ class ComposerProgramSnapshotSource:
             "source": {
                 "height": height,
                 "image_sha256": "sha256:" + sha256(image_bytes).hexdigest(),
-                "schema_version": "manyforge.program_snapshot_source.v1",
+                "schema_version": "manyforge.program_snapshot_source.v2",
                 "viewer_generation": generation,
-                "viewer_owner_epoch": owner_epoch,
                 "width": width,
             },
             "transport": "inline_data_url",

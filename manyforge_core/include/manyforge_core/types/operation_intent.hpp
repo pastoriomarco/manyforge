@@ -127,10 +127,10 @@ struct OperationParticipantIntentDTO final {
 /// Exact held Program selected before manual cleanup/approval. This is a
 /// precondition, never permission: the Kernel rechecks producers and settlement.
 struct ManualProgramHandoverContextDTO final {
-  RequestOwnerEpoch program_runner_owner_epoch;
-  ProgramRunId program_run_id;
+  ProgramRunNumber program_run_id;
   CellAdmissionClaimGeneration claim_generation;
-  std::uint64_t selection_revision{};
+  /// The Kernel's hold revision the handover was prepared against.
+  std::uint64_t hold_revision{};
   friend bool operator==(const ManualProgramHandoverContextDTO&,
                          const ManualProgramHandoverContextDTO&) = default;
 };
@@ -140,7 +140,10 @@ struct OperationIntentDTO final {
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  /// Present for Program work and equal to the run the Kernel holds; absent
+  /// for manual work, including a manual handover (its parent is in
+  /// `manual_handover`).
+  std::optional<ProgramRunNumber> program_run_id;
   GraphRevision expected_graph_revision;
   RetainedBundleId expected_retained_bundle_id;
   std::optional<SceneRevision> expected_scene_revision;
@@ -160,9 +163,9 @@ struct OperationParticipantAssignmentDTO final {
 };
 
 struct OperationAcceptedDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestReplayStatusDTO replay_status;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   std::vector<OperationParticipantAssignmentDTO> participant_assignments;
   std::int64_t accepted_at_ns{};

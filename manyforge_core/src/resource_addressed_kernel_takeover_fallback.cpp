@@ -25,84 +25,82 @@ namespace {
 }  // namespace
 
 Result<void> ResourceAddressedExecutionKernel::begin_motion_takeover_fallback(
-    const OperationId& incumbent_id, const OperationId& candidate_id, ErrorDTO cause) {
-  StopWorkHandoff handoff;
-  const ScopeExit publish([&] { publish_stop_work(handoff); });
-  std::lock_guard lock(state_mutex_);
-  auto* source = find_active_operation_locked(incumbent_id);
-  if (!source || source->pending_motion_takeover.empty() ||
-      source->pending_motion_takeover.key() != candidate_id)
-    return reject<void>("Takeover fallback lost its accepted candidate",
-                        "motion_takeover_candidate_stale");
-  auto& candidate = *source->pending_motion_takeover.mapped();
-  if (candidate.motion_takeover_spring_fallback) return Result<void>::Ok();
-  if (source->participants.size() != 1U || source->state.active_stop_id ||
-      source->stop_effect_in_flight)
-    return reject<void>("Another Stop already owns the takeover source",
-                        "motion_takeover_stop_selection_stale");
-  const auto& participant = source->participants.front();
-  // Genuine faults retain their ordinary containment route; no successor may
-  // activate while admission is closed. The same Stop owner still stops the
-  // logically preempted incumbent.
-  const bool spring = !motion_admission_closed_locked() &&
-                      !cell_latched_locked() &&
-                      sealed_spring_return_allowed(participant);
-  const MotionTakeoverStopSelection selection{incumbent_id, candidate_id, spring};
-  const auto material = config_.request_owner_epoch.value() + "\nmotion-takeover-fallback\n" +
-                        incumbent_id.value() + "\n" + candidate_id.value();
-  StopIntentDTO intent{PublicRequestContextDTO{RequestId(content_identity::sha256_digest(material)),
-                                               config_.request_owner_epoch,
-                                               "kernel.motion_takeover", candidate_id.value()},
-                       std::vector<StopOperationTargetDTO>{
-                           {incumbent_id, source->state.operation_revision,
-                            source->state.active_stop_generation.value_or(StopGeneration(0U))}},
-                       std::string("motion_takeover_fallback"),
-                       RequestAttributionDTO{RequestTransportDTO::kInternal,
-                                             RequestAssuranceDTO::kUnverified, std::nullopt}};
-  const auto decided_at_ns = clock_.now();
-  const auto previous_capture_order = candidate.state.journal_capture_order;
-  auto previous_decision = std::move(candidate.state.motion_takeover);
-  candidate.state.motion_takeover = MotionTakeoverDecisionDTO{
-      incumbent_id,
-      spring ? MotionTakeoverPathDTO::kSpringBackHold
-             : MotionTakeoverPathDTO::kOrdinaryContainment,
-      cause,
-      decided_at_ns,
-      std::max<std::int64_t>(0, decided_at_ns - candidate.accepted.accepted_at_ns),
-      candidate.participants.front().takeover_preparation_budget_ns.value_or(0),
-      std::nullopt,
-      candidate.participants.front().takeover_planning_budget_ns.value_or(0)};
-  stamp_operation_capture_locked(candidate, candidate.state);
-  bool fallback_accepted = false;
-  const ScopeExit restore_unaccepted_decision([&] {
-    if (!fallback_accepted) {
-      candidate.state.motion_takeover = std::move(previous_decision);
-      candidate.state.journal_capture_order = previous_capture_order;
-    }
-  });
-  const auto stopped =
-      accept_stop_locked(EmergencyStopProjectedIntentDTO{std::move(intent)}, handoff, decided_at_ns,
-                         nullptr, nullptr, &selection);
-  if (!stopped.ok()) return Result<void>::Err(stopped.error());
-  fallback_accepted = true;
-  candidate.motion_takeover_spring_fallback.emplace(
-      MotionTakeoverSpringFallbackDTO{stopped.value().stop_id,
-                                      stopped.value().stop_generation,
-                                      {},
-                                      {},
-                                      std::move(cause),
-                                      candidate.participants.front().preparation_id});
-  return Result<void>::Ok();
+    const OperationNumber& incumbent_id, const OperationNumber& candidate_id, ErrorDTO cause) {
+  // Obtained before the Kernel lock: the thread's first Stop reserves it.
+  StopHandoff& handoff = thread_stop_handoff();
+  Result<void> rules_removed = Result<void>::Ok();
+  {
+    std::lock_guard lock(state_mutex_);
+    auto* source = find_active_operation_locked(incumbent_id);
+    if (!source || source->pending_motion_takeover.empty() ||
+        source->pending_motion_takeover.key() != candidate_id)
+      return reject<void>("Takeover fallback lost its accepted candidate",
+                          "motion_takeover_candidate_stale");
+    auto& candidate = *source->pending_motion_takeover.mapped();
+    if (candidate.motion_takeover_spring_fallback) return Result<void>::Ok();
+    if (source->participants.size() != 1U || source->state.stop_event_id ||
+        source->stop_effect_in_flight)
+      return reject<void>("Another Stop already owns the takeover source",
+                          "motion_takeover_stop_selection_stale");
+    // The candidate's rule, registered at its send, ends with this hand-over
+    // attempt (OD-223); a successor started from rest registers its own at
+    // the ordinary dispatch barrier.
+    if (auto& row = candidate.participants.front(); !row.io_rule_registrations.empty())
+      rules_removed = retire_participant_io_rules_locked(row);
+    const auto& participant = source->participants.front();
+    // Genuine faults retain their ordinary containment route; no successor may
+    // activate while admission is closed. The same Stop owner still stops the
+    // logically preempted incumbent.
+    const bool spring = !motion_admission_closed_locked() &&
+                        !cell_latched_locked() &&
+                        sealed_spring_return_allowed(participant);
+    const auto decided_at_ns = clock_.now();
+    candidate.state.motion_takeover = MotionTakeoverDecisionDTO{
+        incumbent_id,
+        spring ? MotionTakeoverPathDTO::kSpringBackHold
+               : MotionTakeoverPathDTO::kOrdinaryContainment,
+        cause,
+        decided_at_ns,
+        std::max<std::int64_t>(0, decided_at_ns - candidate.accepted.accepted_at_ns),
+        candidate.participants.front().takeover_preparation_budget_ns.value_or(0),
+        std::nullopt,
+        candidate.participants.front().takeover_planning_budget_ns.value_or(0)};
+    stamp_operation_capture_locked(candidate, candidate.state);
+    // S12: the takeover's own forced Stop of the incumbent. Never refused; its
+    // own Stop does not cancel this incumbent's candidates (E13 exemption).
+    const StopParticipantRef incumbent_participant{incumbent_id, 0U};
+    StopRequest request{};
+    request.request_key = mint_kernel_request_key();
+    request.kind = StopKind::kTakeover;
+    request.selector = StopSelectorKind::kParticipants;
+    request.participants = std::span<const StopParticipantRef>(&incumbent_participant, 1U);
+    request.source_label = "kernel.motion_takeover";
+    request.reason = "motion_takeover_fallback";
+    request.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+    if (spring) request.mode = StopMode::kSpringReturn;
+    request.own_takeover_stop = true;
+    const auto record = request_stop_locked(request, handoff);
+    candidate.motion_takeover_spring_fallback.emplace(
+        MotionTakeoverSpringFallbackDTO{stop_events_.records[record].event_id,
+                                        {},
+                                        {},
+                                        std::move(cause),
+                                        candidate.participants.front().preparation_id});
+  }
+  complete_stop_handoff(handoff);
+  return rules_removed;
 }
 
 Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
-    const OperationId& incumbent_id, const OperationId& candidate_id) {
+    const OperationNumber& incumbent_id, const OperationNumber& candidate_id) {
   IResolvedPreparedParticipantExecutionEngine* engine{};
   std::uint64_t preparation_id{};
   bool retire_previous{};
   bool attach_to_sent{};
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> prepare;
-  std::optional<StopCertificateDTO> certificate;
+  // The incumbent's outcome of the attempt the fallback's own Stop started,
+  // once that attempt ended and the takeover was not cancelled (K11).
+  std::optional<ParticipantStopOutcomeDTO> settled;
   std::optional<ErrorDTO> refusal;
   {
     std::lock_guard lock(state_mutex_);
@@ -115,8 +113,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
       return reject<void>("Takeover fallback lost its immutable context",
                           "motion_takeover_fallback_context_missing");
     const auto& fallback = *candidate.motion_takeover_spring_fallback;
-    if (source->state.active_stop_id != fallback.stop_id ||
-        source->state.active_stop_generation != fallback.stop_generation)
+    if (source->takeover_cancelled)
       return reject<void>("A newer Stop superseded takeover fallback",
                           "motion_takeover_stop_selection_stale");
     auto& participant = candidate.participants.front();
@@ -124,14 +121,11 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
     preparation_id = participant.preparation_id;
     retire_previous = preparation_id != 0U && preparation_id == fallback.abandoned_preparation_id;
     attach_to_sent = retire_previous && participant.prepared_dispatch_released;
-    if (source->settled_stop && source->settled_stop->stop_id == fallback.stop_id &&
-        source->settled_stop->generation == fallback.stop_generation &&
-        source->settled_stop->certificate) {
-      if (fallback.certificate && fallback.certificate->stop_certificate_id ==
-                                      source->settled_stop->certificate->stop_certificate_id)
-        certificate = *fallback.certificate;
-    }
-    if (certificate && (!fallback.stage || !fallback.return_point ||
+    if (source->participants.size() == 1U &&
+        source->participants.front().stop.started_by == fallback.stop_event_id &&
+        source->terminal_stop_result().has_value())
+      settled = participant_stop_outcome(source->participants.front());
+    if (settled && (!fallback.stage || !fallback.return_point ||
                         motion_admission_closed_locked() || cell_latched_locked()))
       refusal = fallback.smooth_failure;
     if (engine == nullptr || !participant.takeover_preparation ||
@@ -175,7 +169,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
                                       "motion_takeover_fallback_preparation_failed")));
         return failed.ok() ? Result<void>::Ok() : Result<void>::Err(failed.error());
       }
-      if (!certificate || cold.state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared)
+      if (!settled || cold.state != ResolvedPreparedMotionExecutionStateDTO::kColdPrepared)
         return Result<void>::Ok();
       {
         std::lock_guard lock(state_mutex_);
@@ -184,9 +178,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
             source->pending_motion_takeover.key() != candidate_id)
           return Result<void>::Ok();
         auto& candidate = *source->pending_motion_takeover.mapped();
-        const auto& fallback = *candidate.motion_takeover_spring_fallback;
-        if (source->state.active_stop_id != fallback.stop_id ||
-            source->state.active_stop_generation != fallback.stop_generation)
+        if (source->takeover_cancelled)
           return reject<void>("A newer Stop superseded cold retirement",
                               "motion_takeover_stop_selection_stale");
         auto& participant = candidate.participants.front();
@@ -216,9 +208,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
           participant.subordinate_id = cold.reserved_execution_id;
           participant.prepared_participant.reset();
           participant.prepared_dispatch_released = false;
-          const auto& fallback = *candidate.motion_takeover_spring_fallback;
-          superseded = source->state.active_stop_id != fallback.stop_id ||
-                       source->state.active_stop_generation != fallback.stop_generation;
+          superseded = source->takeover_cancelled;
         }
       }
       if (!retired.ok()) return Result<void>::Err(retired.error());
@@ -243,8 +233,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
       const auto& fallback = *candidate.motion_takeover_spring_fallback;
       if (!fallback.stage || !fallback.return_point || participant.prepare_in_flight)
         return Result<void>::Ok();
-      if (source->state.active_stop_id != fallback.stop_id ||
-          source->state.active_stop_generation != fallback.stop_generation)
+      if (source->takeover_cancelled)
         return reject<void>("A newer Stop superseded cold admission",
                             "motion_takeover_stop_selection_stale");
       prepare = *participant.takeover_preparation;
@@ -285,6 +274,9 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
   if (prepare) {
     auto prepared = [&]() -> Result<std::uint64_t> {
       try {
+        if (const auto verified = verify_retained_preparation_stop_plans(*prepare);
+            !verified.ok())
+          return Result<std::uint64_t>::Err(verified.error());
         return engine->PrepareMotion(std::move(*prepare));
       } catch (...) {
         return reject<std::uint64_t>("Spring successor preparation raised before dispatch",
@@ -328,15 +320,15 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
     const auto failed = fail_pending_motion_takeover(incumbent_id, candidate_id, failure);
     return failed.ok() ? Result<void>::Ok() : Result<void>::Err(failed.error());
   }
-  if (!certificate) return Result<void>::Ok();
+  if (!settled) return Result<void>::Ok();
   if (observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kColdPrepared) {
-    const auto activated = engine->PrepareColdMotionAfterStop(preparation_id, *certificate);
+    const auto activated = engine->PrepareColdMotionAfterStop(preparation_id, *settled);
     if (activated.ok()) return Result<void>::Ok();
     const auto failed = fail_pending_motion_takeover(incumbent_id, candidate_id, activated.error());
     return failed.ok() ? Result<void>::Ok() : Result<void>::Err(failed.error());
   }
   if (observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
-    const auto adopted = commit_settled_motion_takeover(incumbent_id, candidate_id, *certificate);
+    const auto adopted = commit_settled_motion_takeover(incumbent_id, candidate_id, *settled);
     return adopted.ok() ? Result<void>::Ok() : Result<void>::Err(adopted.error());
   }
   return Result<void>::Ok();

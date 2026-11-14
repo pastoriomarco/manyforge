@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 
 #include "native_stop_qualification_fixture.hpp"
 
@@ -61,7 +62,7 @@ void RemoveJournalFiles(const std::filesystem::path &path) {
 core::ResourceAddressedExecutionKernelConfig EmptyKernelConfig() {
   const auto graph = core::GraphRevision("graph.empty-cell");
   core::ResourceAddressedExecutionKernelConfig config{
-      core::RequestOwnerEpoch("owner.empty-cell"),
+      core::kTestApplicationStartId,
       core::CellId("cell.empty-cell"),
       32U,
       {},
@@ -178,7 +179,7 @@ public:
     return unused<core::ResolvedRuntimeScaleAcceptedDTO>();
   }
   [[nodiscard]] core::Result<core::ResolvedRuntimeScaleStatusDTO>
-  runtime_scale_status(const core::OperationId &,
+  runtime_scale_status(const core::OperationNumber &,
                        const core::ControlBindingId &) const override {
     return unused<core::ResolvedRuntimeScaleStatusDTO>();
   }
@@ -317,8 +318,8 @@ TEST(RetainedCellRuntimeTest,
         followed.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
     const auto output = testing::internal::GetCapturedStderr();
     ASSERT_TRUE(lane_continued);
-    // The cell Kernel contained it: the idle cell accepted the internal Full
-    // Stop, and the typed cause holds motion admission closed.
+    // The cell Kernel contained it: the idle cell recorded the internal-fault
+    // Halt, and the typed cause holds motion admission closed.
     EXPECT_NE(output.find("manyforge_fault code=scheduler_stop_control_callback_exception "
                           "state=contained\n"),
               std::string::npos)
@@ -326,7 +327,9 @@ TEST(RetainedCellRuntimeTest,
     const auto fault = cell.addressed_kernel().get_internal_fault();
     ASSERT_TRUE(fault.has_value());
     EXPECT_EQ(fault->reason_code, "scheduler_stop_control_callback_exception");
-    EXPECT_TRUE(fault->stop_accepted);
+    EXPECT_TRUE(cell.addressed_kernel()
+                    .get_stop_stream_facts()
+                    .last_stop_event_id.has_value());
     EXPECT_EQ(fault->later_count, 0U);
   }
   RemoveJournalFiles(journal_path);
@@ -523,7 +526,8 @@ TEST(RetainedCellRuntimeTest,
     RetainedCellRuntime cell(std::move(input));
     std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
     core::RuntimeParticipantAdmissionResolver resolver =
-        [](const core::OperationIntentDTO &, const std::size_t) {
+        [](const core::OperationIntentDTO &, const std::size_t,
+           const core::ProgramRunResolutionContext &) {
           return core::Result<
               core::RuntimeParticipantExecutionRegistration>::Err(
               {"test_resolver", "test resolver is not invoked", {}});
@@ -618,24 +622,24 @@ TEST(RetainedCellRuntimeTest,
   CellTestExecutionEngine engine;
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
-      {core::RequestId("request.contact-policy"),
-       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      {core::TestRequestKey("request.contact-policy"), "test"},
       program_binding.value().value().program_id,
       program_binding.value().value().program_revision,
       program_binding.value().value().program_binding_id,
-      core::ProgramRunId("run.resolver"),
+      core::ProgramRunNumber(111U),
       physical_binding.value().value().graph_revision,
       physical_binding.value().value().retained_bundle_id,
       std::nullopt,
       {}};
   const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
     auto resolver = make_retained_cell_kernel_participant_resolver(
-        [selected](const core::OperationIntentDTO &, std::size_t) {
+        [selected](const core::OperationIntentDTO &, std::size_t,
+                   const core::ProgramRunResolutionContext &) {
           return core::Result<RetainedResolvedParticipant>::Ok(
               {selected, false});
         },
         {physical});
-    return resolver(intent, 0U);
+    return resolver(intent, 0U, {});
   };
   // The ordinary first node carries the Program's policy catalog even when
   // that node does not select a contact policy. It must keep the same owner.
@@ -680,24 +684,24 @@ TEST(RetainedCellRuntimeTest,
   CellTestExecutionEngine engine;
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
-      {core::RequestId("request.arm-only"),
-       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      {core::TestRequestKey("request.arm-only"), "test"},
       program_binding.value().value().program_id,
       program_binding.value().value().program_revision,
       program_binding.value().value().program_binding_id,
-      core::ProgramRunId("run.arm-only"),
+      core::ProgramRunNumber(130U),
       physical_binding.value().value().graph_revision,
       physical_binding.value().value().retained_bundle_id,
       std::nullopt,
       {}};
   const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
     auto resolver = make_retained_cell_kernel_participant_resolver(
-        [selected](const core::OperationIntentDTO &, std::size_t) {
+        [selected](const core::OperationIntentDTO &, std::size_t,
+                   const core::ProgramRunResolutionContext &) {
           return core::Result<RetainedResolvedParticipant>::Ok(
               {selected, false});
         },
         {physical});
-    return resolver(intent, 0U);
+    return resolver(intent, 0U, {});
   };
   const auto resolved = resolve(program_binding.value());
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
@@ -738,24 +742,24 @@ TEST(RetainedCellRuntimeTest,
   CellTestExecutionEngine engine;
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
-      {core::RequestId("request.fewer-frames"),
-       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      {core::TestRequestKey("request.fewer-frames"), "test"},
       program_value.program_id,
       program_value.program_revision,
       program_value.program_binding_id,
-      core::ProgramRunId("run.fewer-frames"),
+      core::ProgramRunNumber(127U),
       program_value.graph_revision,
       program_value.retained_bundle_id,
       std::nullopt,
       {}};
   const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
     auto resolver = make_retained_cell_kernel_participant_resolver(
-        [selected](const core::OperationIntentDTO &, std::size_t) {
+        [selected](const core::OperationIntentDTO &, std::size_t,
+                   const core::ProgramRunResolutionContext &) {
           return core::Result<RetainedResolvedParticipant>::Ok(
               {selected, false});
         },
         {physical});
-    return resolver(intent, 0U);
+    return resolver(intent, 0U, {});
   };
   const auto resolved = resolve(program_binding.value());
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
@@ -977,23 +981,23 @@ TEST(RetainedCellRuntimeTest,
     physical.motion_takeover_planning_budget_s =
         budget ? std::optional<double>(1.25) : std::nullopt;
     auto resolver = make_retained_cell_kernel_participant_resolver(
-        [binding](const core::OperationIntentDTO &, std::size_t) {
+        [binding](const core::OperationIntentDTO &, std::size_t,
+                  const core::ProgramRunResolutionContext &) {
           return core::Result<RetainedResolvedParticipant>::Ok(
               {binding, false});
         },
         {physical});
     const core::OperationIntentDTO intent{
-        {core::RequestId("request.resolver"), core::RequestOwnerEpoch("owner.resolver"),
-         "test", std::nullopt},
+        {core::TestRequestKey("request.resolver"), "test"},
         binding.value().program_id,
         binding.value().program_revision,
         binding.value().program_binding_id,
-        core::ProgramRunId("run.resolver"),
+        core::ProgramRunNumber(111U),
         binding.value().graph_revision,
         binding.value().retained_bundle_id,
         std::nullopt,
         {}};
-    const auto resolved = resolver(intent, 0U);
+    const auto resolved = resolver(intent, 0U, {});
     ASSERT_TRUE(resolved.ok()) << resolved.error().message;
     EXPECT_EQ(resolved.value().motion_takeover_preparation_budget_s, budget);
     EXPECT_EQ(resolved.value().motion_takeover_planning_budget_s,

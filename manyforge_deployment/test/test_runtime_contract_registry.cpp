@@ -35,7 +35,7 @@ TEST(RuntimeContractRegistry, OldSealedRosProfileRefusesWithRecompileGuidance) {
 
 TEST(RuntimeContractRegistry, PackageAndEmbeddedOffersAreOneExactValue) {
   const auto &registry = runtime_contract_declaration_registry();
-  ASSERT_EQ(registry.contracts().size(), 2U);
+  ASSERT_EQ(registry.contracts().size(), 1U);
   ASSERT_EQ(registry.package_manifest_set().offers.size(),
             registry.contracts().size());
   ASSERT_TRUE(

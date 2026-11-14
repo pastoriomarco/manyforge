@@ -164,13 +164,13 @@ describe('viewer presentation and performance', () => {
     qualification.reset();
     qualification.resetObservationFlow();
     recordViewerObservationReceived({
-      ownerEpoch: 'owner.1',
+      applicationStartId: '3f9a0000000000a1',
       sourceEpoch: 'source.1',
       sourceSequence: 7,
       receivedAtComposerMonotonicUs: 123,
     }, false);
     recordViewerObservationApplied({
-      ownerEpoch: 'owner.1',
+      applicationStartId: '3f9a0000000000a1',
       sourceEpoch: 'source.1',
       sourceSequence: 7,
       receivedAtComposerMonotonicUs: 123,

@@ -36,22 +36,26 @@ resolve_verified_stop_base_plan(
 
 /// Verify one resolved plan and seal the readiness value consumed by Kernel
 /// Prepare. The in-memory plan is used as resolved; it is not persisted.
+/// `hard_stop_completion_timeout_ns` is the lane's hard-stop completion
+/// timeout, which the Kernel's hard-stage watchdog uses (stop state model F4).
 [[nodiscard]] core::Result<core::RuntimeParticipantStopReadiness>
 seal_runtime_participant_stop_readiness(
     const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
-    const core::RuntimeParticipantBinding &participant_binding);
+    const core::RuntimeParticipantBinding &participant_binding,
+    core::Duration hard_stop_completion_timeout_ns);
 
 [[nodiscard]] inline core::Result<core::RuntimeParticipantStopReadiness>
 seal_runtime_participant_stop_readiness(
     const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const VerifiedControllerLifecycleExpectedDomain &expected_domain,
-    const core::RuntimeParticipantBinding &participant_binding) {
+    const core::RuntimeParticipantBinding &participant_binding,
+    const core::Duration hard_stop_completion_timeout_ns) {
   return seal_runtime_participant_stop_readiness(
       retained_bundle, std::move(plan), component_lifecycle_generation,
-      expected_domain.sealed(), participant_binding);
+      expected_domain.sealed(), participant_binding, hard_stop_completion_timeout_ns);
 }
 
 } // namespace manyforge::deployment

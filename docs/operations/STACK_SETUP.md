@@ -170,10 +170,6 @@ move:
   unconfirmed update can fault the robot. Enable and each new motion goal also
   check the host's current projection; see
   [TCPs](../authoring/TCPS.md#attach-to-the-active-tcp).
-  After a Manager restart, a previously published physical Scene may have no
-  initialized projection in the new host. Enable and physical motion remain
-  unavailable until the projection is established; restart does not itself
-  reconstruct it.
 
 An ordinary move, or one with the robot's current Active TCP, sends no TCP
 offset and reads no offset report. A replacement that takes over a moving robot sends

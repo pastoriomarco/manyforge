@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_core/manager_liveness_receiver.hpp>
+#include <manyforge_core/types/active_bundle_publication.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,10 +34,8 @@ public:
 /// Manager state and can reject a changed bundle/set/policy before renewal.
 struct ManagerLivenessTransportRequestDTO final {
   manyforge::core::RuntimeUnitId receiver_runtime_unit_id;
-  manyforge::core::ActiveBundlePublicationGeneration
-      active_publication_generation;
-  manyforge::core::GraphRevision active_graph_revision;
-  manyforge::core::ContentDigest active_public_pointer_digest;
+  /// The Manager's current publication; the receiver keeps it in memory.
+  manyforge::core::ActiveBundlePublicationReceiptDTO active_publication;
   manyforge::core::ManagerLivenessRequiredSetDTO required_set;
   manyforge::core::ManagerLivenessPolicyDTO policy;
   manyforge::core::ManagerHeartbeatDTO heartbeat;

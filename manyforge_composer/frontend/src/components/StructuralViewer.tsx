@@ -145,7 +145,7 @@ interface StructuralViewerProps {
     sceneResourceId: string,
     pose: LogicalScenePose,
     scale: [number, number, number],
-    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+    expectedDraftIdentity: { draftId: string; generation: number },
   ) => Promise<boolean>;
   onDuplicateSceneResource?: (sceneResourceId: string) => Promise<boolean>;
   onRemoveSceneResource?: (sceneResourceId: string) => Promise<boolean>;
@@ -174,15 +174,15 @@ interface StructuralViewerProps {
   measuredStateGhostObjects?: readonly LogicalSceneObject[];
   executionObservationPresentation?: MeasuredRobotPresentationReader;
   sceneOwnerIdentity?: {
-    ownerEpoch: string;
+    applicationStartId: string;
     generation: number;
   };
   viewerFrameIdentity?: {
-    ownerEpoch: string;
+    applicationStartId: string;
     generation: number;
   };
   readViewerFrameIdentity?: () => {
-    ownerEpoch: string;
+    applicationStartId: string;
     generation: number;
   } | null;
   pointCloudCellId?: string;
@@ -404,7 +404,7 @@ function authoritativeStreamIdentity(
   ...parts: Array<string | number>
 ): string {
   return JSON.stringify([
-    ownerIdentity?.ownerEpoch ?? 'unbound-owner',
+    ownerIdentity?.applicationStartId ?? 'unbound-owner',
     ownerIdentity?.generation ?? -1,
     ...parts,
   ]);
@@ -1893,7 +1893,7 @@ function SceneObjectPrimitive({
   );
 }
 
-type SceneTransformIdentity = { ownerEpoch: string; generation: number };
+type SceneTransformIdentity = { draftId: string; generation: number };
 type SceneTransformCommit = (
   sceneResourceId: string,
   pose: LogicalScenePose,
@@ -1963,7 +1963,7 @@ function EditableLogicalSceneObject({
     if (
       expectedTransformIdentity === undefined
       || latestTransformIdentity.current === undefined
-      || latestTransformIdentity.current.ownerEpoch !== expectedTransformIdentity.ownerEpoch
+      || latestTransformIdentity.current.draftId !== expectedTransformIdentity.draftId
       || latestTransformIdentity.current.generation !== expectedTransformIdentity.generation
     ) {
       dragging.current = false;
@@ -2276,13 +2276,13 @@ function BoundSnapshotResponder({
     current.current = frameIdentity;
   }, [frameIdentity]);
   const ensureFrame = useCallback(async (
-    required: { ownerEpoch: string; generation: number },
+    required: { applicationStartId: string; generation: number },
     timeoutMs: number,
-  ): Promise<{ ownerEpoch: string; generation: number } | null> => {
+  ): Promise<{ applicationStartId: string; generation: number } | null> => {
     const deadline = performance.now() + timeoutMs;
     while (performance.now() <= deadline) {
       const observed = readFrameIdentity() ?? current.current;
-      if (observed.ownerEpoch !== required.ownerEpoch) return null;
+      if (observed.applicationStartId !== required.applicationStartId) return null;
       if (observed.generation >= required.generation) return observed;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -3386,7 +3386,7 @@ function StructuralViewerContent({
     programDraftEditIdentity === undefined
       ? undefined
       : {
-          ownerEpoch: programDraftEditIdentity.draftId,
+          draftId: programDraftEditIdentity.draftId,
           generation: programDraftEditIdentity.draftRevision,
         }
   ), [programDraftEditIdentity]);

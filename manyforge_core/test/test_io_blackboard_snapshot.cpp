@@ -11,8 +11,8 @@ using PublicationKind = IoBlackboardPublicationKind;
 using Snapshot = IoProgramBlackboardSnapshotDTO;
 
 IoProgramBlackboardSourceBindingDTO binding() {
-  return {{RequestOwnerEpoch("host.1"), RequestOwnerEpoch("runner.1"), 7U,
-           CellAdmissionClaimGeneration(8U), ProgramRunId("run.1"), ProgramBindingId("binding.1"),
+  return {{7U,
+           CellAdmissionClaimGeneration(8U), ProgramRunNumber(1U), ProgramBindingId("binding.1"),
            ActiveBundlePublicationGeneration(9U)},
           InterruptSourceId("program.bb"),
           IoSourceIncarnation("source.1"),
@@ -178,14 +178,12 @@ TEST(ProgramBlackboardSnapshot, EveryScopeFieldAndPreviousSourceAreFenced) {
   const auto source = binding();
   const auto previous = start(source);
   ASSERT_NE(previous, nullptr);
-  std::vector<IoProgramBlackboardScopeDTO> scopes(7U, source.scope);
-  scopes[0].request_owner_epoch = RequestOwnerEpoch("other");
-  scopes[1].program_runner_owner_epoch = RequestOwnerEpoch("other");
-  scopes[2].cycle_generation += 1;
-  scopes[3].claim_generation = CellAdmissionClaimGeneration(9);
-  scopes[4].program_run_id = ProgramRunId("other");
-  scopes[5].program_binding_id = ProgramBindingId("other");
-  scopes[6].active_publication_generation = ActiveBundlePublicationGeneration(10U);
+  std::vector<IoProgramBlackboardScopeDTO> scopes(5U, source.scope);
+  scopes[0].cycle_generation += 1;
+  scopes[1].claim_generation = CellAdmissionClaimGeneration(9);
+  scopes[2].program_run_id = ProgramRunNumber(108U);
+  scopes[3].program_binding_id = ProgramBindingId("other");
+  scopes[4].active_publication_generation = ActiveBundlePublicationGeneration(10U);
   for (const auto& scope : scopes) {
     auto frame = update(source, {{"flag", Kind::kBoolean, IoConditionValueDTO{true}}});
     frame.scope = scope;
@@ -220,7 +218,7 @@ TEST(ProgramBlackboardSnapshot, BetweenRunsIsActualNullableScopeNotFabricatedRun
       source, previous, update(source, {{"count", Kind::kInt64, std::nullopt}}));
   ASSERT_TRUE(result.ok());
   EXPECT_FALSE(key(*result.value(), "count").value);
-  source.scope.program_run_id = ProgramRunId("invented");
+  source.scope.program_run_id = ProgramRunNumber(135U);
   expect_reason(ValidateAndBuildProgramBlackboardSnapshot(source, {}, baseline(source)),
                 "program_bb_binding_invalid");
 }

@@ -14,7 +14,6 @@
 #include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 
 #include "execution_host_unit_internal.hpp"
-#include "reference_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -92,13 +91,6 @@ template <std::size_t... N>
 void validate_row(const RuntimeContractDeclaration& row) {
   const auto exact_product = [&]() {
     if (row.runtime_profile_id().value() ==
-        detail::kReferenceRuntimeProfileId) {
-      return row.runtime_product_id().value() ==
-                 detail::kReferenceRuntimeProductContractId &&
-             row.runtime_product_revision() ==
-                 detail::reference_runtime_product_contract_revision();
-    }
-    if (row.runtime_profile_id().value() ==
         detail::kRos2ControlExecutionRuntimeProfileId) {
       return row.runtime_product_id().value() ==
                  detail::kRos2ControlExecutionRuntimeProductContractId &&
@@ -112,13 +104,6 @@ void validate_row(const RuntimeContractDeclaration& row) {
         "runtime contract row has no exact qualified runtime product");
   }
   const auto exact_profile = [&]() {
-    if (row.runtime_profile_id().value() ==
-        detail::kReferenceRuntimeProfileId) {
-      return row.runtime_profile_revision().value() ==
-                 detail::reference_runtime_profile_revision() &&
-             row.offer().runtime_implementation_id.value() ==
-                 detail::kReferenceRuntimeImplementationId;
-    }
     if (row.runtime_profile_id().value() ==
         detail::kRos2ControlExecutionRuntimeProfileId) {
       return row.runtime_profile_revision().value() ==
@@ -179,26 +164,16 @@ void validate_row(const RuntimeContractDeclaration& row) {
     throw std::logic_error(
         "runtime contract API offer differs from its complete role mapping");
   }
-  if (endpoint_roles.find(
-          row.runtime_profile_id().value() ==
-                  detail::kReferenceRuntimeProfileId
-              ? std::string(detail::kReferenceRuntimeStatusEndpointRoleId)
-              : std::string(
-                          detail::
-                              kRos2ControlExecutionRuntimeStatusEndpointRoleId)) ==
+  if (endpoint_roles.find(std::string(
+          detail::kRos2ControlExecutionRuntimeStatusEndpointRoleId)) ==
       endpoint_roles.end()) {
     throw std::logic_error(
         "runtime contract row omits its mandatory supervision/status mapping");
   }
   std::set<std::string, std::less<>> expected_runtime_roles;
   std::set<std::string, std::less<>> expected_endpoint_roles;
-  if (row.runtime_profile_id().value() == detail::kReferenceRuntimeProfileId) {
-    expected_runtime_roles.insert(
-        std::string(detail::kReferenceRuntimeRoleId));
-    expected_endpoint_roles.insert(
-        std::string(detail::kReferenceRuntimeStatusEndpointRoleId));
-  } else if (row.runtime_profile_id().value() ==
-             detail::kRos2ControlExecutionRuntimeProfileId) {
+  if (row.runtime_profile_id().value() ==
+      detail::kRos2ControlExecutionRuntimeProfileId) {
     expected_runtime_roles.insert(
         std::string(detail::kRos2ControlExecutionRuntimeRoleId));
     expected_endpoint_roles = {
@@ -235,32 +210,9 @@ void validate_row(const RuntimeContractDeclaration& row) {
 
 std::vector<RuntimeContractDeclaration>
 RuntimeContractDeclarationRegistry::make_rows() {
-  const std::string reference_product_revision =
-      detail::reference_runtime_product_contract_revision().value();
   const std::string ros_product_revision =
       detail::ros2_control_execution_runtime_product_contract_revision().value();
   std::vector<RuntimeContractDeclaration> rows;
-  rows.push_back(RuntimeContractDeclaration(
-      core::RuntimeProfileId(std::string(detail::kReferenceRuntimeProfileId)),
-      core::RuntimeProfileRevision(
-          detail::reference_runtime_profile_revision()),
-      core::ProductContractId(
-          std::string(detail::kReferenceRuntimeProductContractId)),
-      core::ProductContractRevision(reference_product_revision),
-      make_offer(
-          detail::kReferenceRuntimeImplementationId,
-          {core::ApiContractId(
-               std::string(detail::kReferenceRuntimeRoleApiContractId)),
-           core::ApiContractId(
-               std::string(detail::kReferenceRuntimeStatusApiContractId))},
-          {}),
-      {role_mapping(detail::kReferenceRuntimeRoleId,
-                    detail::kReferenceRuntimeRoleApiContractId,
-                    "reference-runtime"),
-       },
-      {endpoint_mapping(detail::kReferenceRuntimeStatusEndpointRoleId,
-                        detail::kReferenceRuntimeStatusApiContractId,
-                        "reference-runtime")}));
   rows.push_back(RuntimeContractDeclaration(
       core::RuntimeProfileId(
           std::string(detail::kRos2ControlExecutionRuntimeProfileId)),
@@ -451,14 +403,6 @@ const RuntimeContractDeclaration& require_runtime_contract(
 
 const RuntimeContractDeclaration& require_runtime_contract_for_unit(
     const core::RuntimeUnitDTO& runtime_unit) {
-  if (runtime_unit.runtime_profile_id.value() ==
-      detail::kReferenceRuntimeProfileId) {
-    return require_runtime_contract(
-        runtime_unit.runtime_profile_id, runtime_unit.runtime_profile_revision,
-        core::ProductContractId(
-            std::string(detail::kReferenceRuntimeProductContractId)),
-        detail::reference_runtime_product_contract_revision());
-  }
   if (runtime_unit.runtime_profile_id.value() ==
       detail::kRos2ControlExecutionRuntimeProfileId) {
     return require_runtime_contract(

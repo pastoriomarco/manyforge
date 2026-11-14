@@ -762,9 +762,10 @@ make_kernel_participant_resolver(
   return [binding_resolver = std::move(binding_resolver),
           physical_registrations = std::move(physical_registrations)](
              const core::OperationIntentDTO &operation,
-             const std::size_t participant_index)
+             const std::size_t participant_index,
+             const core::ProgramRunResolutionContext &held_run)
              -> core::Result<core::RuntimeParticipantExecutionRegistration> {
-    auto binding = binding_resolver(operation, participant_index);
+    auto binding = binding_resolver(operation, participant_index, held_run);
     if (!binding.ok()) {
       return core::Result<core::RuntimeParticipantExecutionRegistration>::Err(
           binding.error());
@@ -1262,6 +1263,8 @@ create_retained_execution_host_participants(
 
   runtime->clock = shared_clock != nullptr ? std::move(shared_clock)
                                            : std::make_shared<WallClock>();
+  // OD-217: the cell profile the robot's own check thread copies.
+  const auto cell_scheduler_config = config.scheduler;
   runtime->scheduler =
       shared_scheduler != nullptr
           ? std::move(shared_scheduler)
@@ -1430,7 +1433,11 @@ create_retained_execution_host_participants(
                                    runtime->kinematic_model,
                                    runtime->kinematic_model,
                                    nullptr,
-                                   runtime->planning_scene_synchronizer};
+                                   runtime->planning_scene_synchronizer,
+                                   make_runtime_collision_check_scheduler(
+                                       cell_scheduler_config, runtime->scheduler)};
+  config.kernel.log_label =
+      runtime->motion_binding.value().controllable_component_id.value();
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
       runtime->planner, ports, runtime->execution, runtime->clock,
       *runtime->scheduler, runtime->cache, std::move(config.kernel));
@@ -2201,8 +2208,6 @@ void RetainedExecutionHost::BindCellRuntimeOwner(
   auto* const stable_operation_journal = &cell.operation_journal();
   runtime.cell_addressed_kernel = stable_kernel_owner;
   runtime.cell_operation_journal = stable_operation_journal;
-  runtime.addressed_request_owner_epoch =
-      stable_kernel_owner->request_owner_epoch();
   runtime.addressed_cell_id = core::CellId(cell_id);
   const auto seed_current_policy = [&](RetainedExecutionHost &component) {
     for (auto &row : component.participant_registrations) {
@@ -2218,8 +2223,6 @@ void RetainedExecutionHost::BindCellRuntimeOwner(
   for (const auto &peer : runtime.participant_peers) {
     peer->cell_addressed_kernel = stable_kernel_owner;
     peer->cell_operation_journal = stable_operation_journal;
-    peer->addressed_request_owner_epoch =
-        runtime.addressed_request_owner_epoch;
     peer->addressed_cell_id = runtime.addressed_cell_id;
     seed_current_policy(*peer);
   }

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -716,6 +717,10 @@ class PoseSourceSnapshotPublisher(Node):
         )
 
 
+# Ends the process without interpreter finalization; tests replace it.
+_exit_now = os._exit
+
+
 def _required_path_parameter(node: Node, name: str) -> Path:
     value = str(node.get_parameter(name).value).strip()
     if not value:
@@ -780,6 +785,15 @@ def main(args: list[str] | None = None) -> int:
             executor.shutdown(timeout_sec=2.0)
         if context.ok() and node_stopped:
             rclpy.shutdown(context=context)
+    if not node_stopped:
+        # OD-236: stop() logged isaac_pose_observer_shutdown_incomplete and a
+        # worker is still inside its client, so node, executor and context
+        # stay live. End at once with the failure's status, as the execution
+        # host does with _Exit, instead of finalizing the interpreter under
+        # them (rclpy can crash there and hide the real failure).
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _exit_now(result)
     return result
 
 

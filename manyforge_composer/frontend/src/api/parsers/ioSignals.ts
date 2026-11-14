@@ -16,7 +16,6 @@ export type IoSignalQuality = 'missing' | 'fresh' | 'stale' | 'invalid' | 'unava
 
 /** The exact current-binding selector of one bound boolean signal. */
 export interface IoSignalSelector {
-  ownerEpoch: string;
   programBindingId: string;
   componentId: string;
   signalName: string;
@@ -73,7 +72,6 @@ export function parseIoSignalResponse(
 
 /** The existing source cursor of one published Mock record (decimal-string counters). */
 export interface IoSourceCursor {
-  ownerEpoch: string;
   catalogGeneration: string;
   sourceId: string;
   recordSequence: string;
@@ -111,16 +109,14 @@ export function parseMockIoInputReceipt(
   if (envelope.published_cursor !== null) {
     const at = `${path}.published_cursor`;
     const cursor = objectAt(envelope.published_cursor, at);
-    exactKeysAt(cursor, ['owner_epoch', 'catalog_generation', 'source_id', 'record_sequence'], at);
+    exactKeysAt(cursor, ['catalog_generation', 'source_id', 'record_sequence'], at);
     publishedCursor = {
-      ownerEpoch: stringAt(cursor.owner_epoch, `${at}.owner_epoch`),
       catalogGeneration: nullablePositiveUint64TextAt(stringAt(cursor.catalog_generation, `${at}.catalog_generation`),
         `${at}.catalog_generation`)!,
       sourceId: stringAt(cursor.source_id, `${at}.source_id`),
       recordSequence: nullablePositiveUint64TextAt(stringAt(cursor.record_sequence, `${at}.record_sequence`),
         `${at}.record_sequence`)!,
     };
-    if (publishedCursor.ownerEpoch !== selector.ownerEpoch) return fail(`${at}.owner_epoch`, 'the request owner epoch');
     if (reading.sourceId !== null && publishedCursor.sourceId !== reading.sourceId) {
       return fail(`${at}.source_id`, 'the observed source');
     }
@@ -144,12 +140,12 @@ function observationAt(
   selector: IoSignalSelector,
   path: string,
 ): IoSignalReading {
-  if (envelope.api_version !== 'manyforge.execution_command_response.v4'
+  if (envelope.api_version !== 'manyforge.execution_command_response.v6'
     || envelope.command !== command || envelope.ok !== true) {
     return fail(path, `a successful ${command} response`);
   }
   const observation = objectAt(envelope.target_observation, `${path}.target_observation`);
-  exactKeysAt(observation, ['schema_version', 'owner_epoch', 'program_binding_id', 'signal',
+  exactKeysAt(observation, ['schema_version', 'program_binding_id', 'signal',
     'kind', 'evaluated_at_ns', 'value'], `${path}.target_observation`);
   const signal = objectAt(observation.signal, `${path}.target_observation.signal`);
   exactKeysAt(signal, ['component_id', 'signal_name'], `${path}.target_observation.signal`);
@@ -157,9 +153,8 @@ function observationAt(
   if (receiptAgeAt(observation.evaluated_at_ns, `${path}.target_observation.evaluated_at_ns`) === null) {
     fail(`${path}.target_observation.evaluated_at_ns`, 'a nonnegative int64');
   }
-  if (observation.schema_version !== 'manyforge.target_observation.v2'
+  if (observation.schema_version !== 'manyforge.target_observation.v3'
     || observation.kind !== 'io_signal'
-    || observation.owner_epoch !== selector.ownerEpoch
     || observation.program_binding_id !== selector.programBindingId
     || signal.component_id !== selector.componentId
     || signal.signal_name !== selector.signalName) {
@@ -228,8 +223,7 @@ function livenessAt(value: unknown, path: string): IoSignalLiveness | null {
 
 export function ioSignalReadBody(selector: IoSignalSelector) {
   return {
-    schema_version: 'manyforge.target_observation_query.v2',
-    owner_epoch: selector.ownerEpoch,
+    schema_version: 'manyforge.target_observation_query.v3',
     program_binding_id: selector.programBindingId,
     kind: 'io_signal',
     signal: { component_id: selector.componentId, signal_name: selector.signalName },
@@ -238,8 +232,7 @@ export function ioSignalReadBody(selector: IoSignalSelector) {
 
 export function mockIoInputBody(selector: IoSignalSelector, expectedSourceEpoch: string, value: boolean) {
   return {
-    schema_version: 'manyforge.mock_io_input_request.v2',
-    owner_epoch: selector.ownerEpoch,
+    schema_version: 'manyforge.mock_io_input_request.v3',
     program_binding_id: selector.programBindingId,
     signal: { component_id: selector.componentId, signal_name: selector.signalName },
     expected_source_epoch: expectedSourceEpoch,

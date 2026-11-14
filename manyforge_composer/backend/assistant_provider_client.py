@@ -10,6 +10,8 @@ import unicodedata
 
 import httpx
 
+from manyforge_headless_api.internal_http import INTERNAL_HTTP_CLIENT_LIMITS
+
 
 _MAXIMUM_RESPONSE_BYTES = 8 * 1024 * 1024
 _STATUS_VERSION = "manyforge.assistant.provider_status.v1"
@@ -72,7 +74,9 @@ class AssistantProviderHttpClient:
     ) -> None:
         if not 0 < timeout_seconds <= 60:
             raise ValueError("assistant bridge timeout must be in (0, 60]")
-        self._client = client or httpx.Client(timeout=timeout_seconds)
+        self._client = client or httpx.Client(
+            timeout=timeout_seconds, limits=INTERNAL_HTTP_CLIENT_LIMITS
+        )
         self._owns_client = client is None
 
     def submit(self, endpoint_url: str, body: Mapping[str, Any]) -> dict[str, Any]:

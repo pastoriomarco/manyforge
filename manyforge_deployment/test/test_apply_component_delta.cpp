@@ -581,7 +581,7 @@ TEST(ApplyComponentDelta, OwnMeasuredJointsOverrideEditReachesThatArmsInMotionBu
         encode_component_stream_overrides({core::StreamParameterOverrideDTO{
             component,
             std::string(ros2_control_execution_runtime_contract::kMeasuredJointsStreamId),
-            budget_ns, std::nullopt, std::nullopt}}));
+            budget_ns}}));
     return Resealed(std::move(root));
   };
   const auto before = with_override(RosTwoArms(), FirstArm(), 300'000'000);

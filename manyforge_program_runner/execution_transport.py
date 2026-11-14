@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import math
 from pathlib import Path
 import re
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Final, Literal, TypeVar
 import unicodedata
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -26,6 +26,7 @@ from manyforge_headless_api.models import (
     OperationRecoveryActionRequest,
     PickSequencePlanningRequest,
     PlaceSequencePlanningRequest,
+    ProgramResetCycleStatusRequest,
     ProgramRunStopIntentRequest,
     ProgramOperationQuery,
     FullStopIntentRequest,
@@ -43,18 +44,23 @@ _Request = TypeVar("_Request", bound=BaseModel)
 _Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 _Digest = Annotated[str, Field(pattern=SHA256_PATTERN)]
 _Identity = Annotated[str, Field(min_length=1, max_length=256)]
+# A run number (1.5): the runner's cycle generation, a JSON integer.
+_RunNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+# A node attempt number (1.15.3): a per-run counter from 1.
+_AttemptNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+_RequestKeyText = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 
 class _ResetPositionAuthorization(StrictRequest):
-    program_runner_owner_epoch: _Identity
     cycle_generation: _Revision
-    request_owner_epoch: _Identity
-    request_id: _Identity
+    request_key: _RequestKeyText
     request_payload_digest: _Digest
-    program_run_id: _Identity | None
+    program_run_id: _RunNumber | None
     cycle_claim_generation: _Revision | None
     terminal_or_settlement_reference: _Digest | None
     reset_claim_generation: _Revision | None
+    # The runner's current cycle status; the Kernel validates it (OD-139).
+    program_cycle_status: ProgramResetCycleStatusRequest
 
     @model_validator(mode="after")
     def exact_claim_shape(self):
@@ -70,7 +76,7 @@ class _ResetPositionAuthorization(StrictRequest):
 
 
 class _ResetPositionDeploymentIdentity(StrictRequest):
-    owner_epoch: _Identity
+    application_start_id: Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
     active_publication_generation: _Revision
     retained_bundle_id: _Digest
     graph_revision: _Digest
@@ -82,7 +88,7 @@ class _ResetPositionRequest(StrictRequest):
 
 
 class _ResetPositionExecutionIdentity(_ResetPositionDeploymentIdentity):
-    schema_version: Literal["manyforge.execution_identity.v2"]
+    schema_version: Literal["manyforge.execution_identity.v3"]
     cell_id: _Identity
     control_management_mode: Literal["component_lifecycle", "pending"]
 
@@ -112,7 +118,6 @@ class _ResetPositionResponse(_ResetPositionSuccessResponse):
 class _ActiveTcpReading(StrictRequest):
     component_id: _Identity
     entry: TcpEntryRequest | None
-    owner_epoch: _Identity
     registration_generation: _Revision
     sequence: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
@@ -128,13 +133,12 @@ class _ProgramNodeExecutionScope(StrictRequest):
     """Private Runner attribution, never accepted from a public operation DTO."""
 
     node_instance_id: str
-    node_attempt_id: str
+    node_attempt_id: _AttemptNumber
 
-    @field_validator("node_instance_id", "node_attempt_id")
+    @field_validator("node_instance_id")
     @classmethod
-    def validate_scope_identity(cls, value: str, info) -> str:
-        limit = 128 if info.field_name == "node_instance_id" else 512
-        if not value or "\0" in value or len(value.encode("utf-8")) > limit:
+    def validate_scope_identity(cls, value: str) -> str:
+        if not value or "\0" in value or len(value.encode("utf-8")) > 128:
             raise ValueError("Program execution scope identity exceeds its bounds")
         return value
 
@@ -191,49 +195,43 @@ class _IoWatchCondition(StrictRequest):
 
 
 class _IoWatchRequest(StrictRequest):
-    """`manyforge.io_watch_request.v2`: one node attempt's level watch."""
+    """`manyforge.io_watch_request.v3`: one node attempt's level watch."""
 
-    schema_version: Literal["manyforge.io_watch_request.v2"]
-    owner_epoch: _Identity
+    schema_version: Literal["manyforge.io_watch_request.v3"]
     program_binding_id: _Digest
-    program_runner_owner_epoch: _Identity
     claim_generation: _Revision
-    program_run_id: _Identity
+    program_run_id: _RunNumber
     node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
-    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    node_attempt_id: _AttemptNumber
     signal: _SignalReference
     condition: _IoWatchCondition
 
 
 class _IoWatchNode(StrictRequest):
     node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
-    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    node_attempt_id: _AttemptNumber
 
 
 class _IoWatchScope(StrictRequest):
-    program_runner_owner_epoch: _Identity
-    program_run_id: _Identity
+    program_run_id: _RunNumber
     node: _IoWatchNode
 
 
 class _IoWatchScopeRelease(StrictRequest):
-    """`manyforge.io_watch_scope_release.v1`: release (and fence) one exact
+    """`manyforge.io_watch_scope_release.v2`: release (and fence) one exact
     node attempt's watch when its registration reply was never known."""
 
-    schema_version: Literal["manyforge.io_watch_scope_release.v1"]
-    owner_epoch: _Identity
+    schema_version: Literal["manyforge.io_watch_scope_release.v2"]
     program_binding_id: _Digest
-    program_runner_owner_epoch: _Identity
     claim_generation: _Revision
-    program_run_id: _Identity
+    program_run_id: _RunNumber
     node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
-    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    node_attempt_id: _AttemptNumber
 
 
 class _IoWatchRegistration(StrictRequest):
     """The exact Core registration token; read/release send it unchanged."""
 
-    owner_epoch: _Identity
     catalog_generation: _Identity
     registration_id: _Identity
     scope: _IoWatchScope
@@ -271,13 +269,11 @@ def _selectors(rows) -> list[tuple[str, str]]:
 
 
 class _MockSimulationOccurrence(StrictRequest):
-    owner_epoch: _Identity
     program_binding_id: _Digest
-    program_runner_owner_epoch: _Identity
     claim_generation: _Revision
-    program_run_id: _Identity
+    program_run_id: _RunNumber
     node_instance_id: Annotated[str, Field(min_length=1, max_length=128)]
-    node_attempt_id: Annotated[str, Field(min_length=1, max_length=512)]
+    node_attempt_id: _AttemptNumber
     # Positive full-width uint64, canonical decimal text (no 53-bit limit).
     node_start_index: _PositiveDecimal
 
@@ -290,10 +286,10 @@ class _MockSimulationOccurrence(StrictRequest):
 
 
 class _MockSimulationEnd(_MockSimulationOccurrence):
-    """`manyforge.mock_io_node_end.v1`: the start's exact
+    """`manyforge.mock_io_node_end.v2`: the start's exact
     occurrence; its still-pending change is cancelled."""
 
-    schema_version: Literal["manyforge.mock_io_node_end.v1"]
+    schema_version: Literal["manyforge.mock_io_node_end.v2"]
 
 
 class _MockSimulationEndAck(_MockSimulationOccurrence):
@@ -303,11 +299,9 @@ class _MockSimulationEndAck(_MockSimulationOccurrence):
 
 
 class _MockRunPauseOccurrence(StrictRequest):
-    owner_epoch: _Identity
     program_binding_id: _Digest
-    program_runner_owner_epoch: _Identity
     claim_generation: _Revision
-    program_run_id: _Identity
+    program_run_id: _RunNumber
     # The Runner's existing run_revision: positive full uint64 decimal text.
     run_revision: _PositiveDecimal
     paused: bool
@@ -331,10 +325,10 @@ class _MockRunPauseOccurrence(StrictRequest):
 
 
 class _MockRunPause(_MockRunPauseOccurrence):
-    """`manyforge.mock_io_run_pause.v1`: the Run's
+    """`manyforge.mock_io_run_pause.v2`: the Run's
     Halt state and held-node mask under one run_revision."""
 
-    schema_version: Literal["manyforge.mock_io_run_pause.v1"]
+    schema_version: Literal["manyforge.mock_io_run_pause.v2"]
 
 
 class _MockRunPauseAck(_MockRunPauseOccurrence):
@@ -344,9 +338,9 @@ class _MockRunPauseAck(_MockRunPauseOccurrence):
 
 
 class _MockSimulationRequest(_MockSimulationOccurrence):
-    """`manyforge.mock_io_node_start.v2`: one node start's literal rows."""
+    """`manyforge.mock_io_node_start.v3`: one node start's literal rows."""
 
-    schema_version: Literal["manyforge.mock_io_node_start.v2"]
+    schema_version: Literal["manyforge.mock_io_node_start.v3"]
     signals: Annotated[list[_MockSimulationRow], Field(min_length=1)]
 
     @model_validator(mode="after")
@@ -358,7 +352,7 @@ class _MockSimulationRequest(_MockSimulationOccurrence):
 
 
 class _MockSimulationAck(_MockSimulationOccurrence):
-    """The exact flat 14-field success reply; no wrapper."""
+    """The exact flat 12-field success reply; no wrapper."""
 
     api_version: Literal[EXECUTION_RESPONSE_VERSION]
     command: Literal["start_mock_io_node_simulation"]
@@ -404,14 +398,12 @@ class _ProgramBlackboardValue(StrictRequest):
 
 
 class _ProgramBlackboardPublication(StrictRequest):
-    """`manyforge.program_bbkey_publication.v1`: one ordered BB key frame."""
+    """`manyforge.program_bbkey_publication.v2`: one ordered BB key frame."""
 
-    schema_version: Literal["manyforge.program_bbkey_publication.v1"]
-    owner_epoch: _Identity
-    program_runner_owner_epoch: _Identity
+    schema_version: Literal["manyforge.program_bbkey_publication.v2"]
     # Both null for the cell-level source between Runs.
     claim_generation: _Revision | None
-    program_run_id: _Identity | None
+    program_run_id: _RunNumber | None
     program_binding_id: _Digest
     # The host's existing Applied publication counter.
     active_publication_generation: _Revision
@@ -450,12 +442,11 @@ class _ProgramBlackboardPublicationAck(StrictRequest):
     command: Literal["publish_program_bbkeys"]
     ok: Literal[True]
     status: Literal["accepted", "superseded"]
-    owner_epoch: _Identity
     program_binding_id: _Digest
     active_publication_generation: _Revision
     cycle_generation: _Revision
     # Null between Runs.
-    program_run_id: _Identity | None
+    program_run_id: _RunNumber | None
     source_epoch: _Identity
     accepted_sequence: _UnsignedDecimal | None
 
@@ -464,6 +455,24 @@ class _ProgramBlackboardPublicationAck(StrictRequest):
         if (self.status == "accepted") != (self.accepted_sequence is not None):
             raise ValueError("BB publication reply sequence does not match its status")
         return self
+
+
+# The commands this runner sends only from threads off the Program tick
+# (OD-214): the run's sender (output and valve writes, the pick/place planning
+# send) and its command threads (Execute's capture, the handover's read, the
+# Reset's position reset). They wait for the host's answer, with only the
+# connection limited. Every other command is also, or only, sent from a tick
+# and keeps the receive limit until OD-213 moves it off the tick.
+_SENT_OFF_THE_TICK: Final = frozenset(
+    {
+        "set_io_output",
+        "plan_pick",
+        "plan_place",
+        "register_program_run_capture",
+        "read_manual_handover",
+        "reset_robot_position",
+    }
+)
 
 
 class ProgramRunnerExecutionTransport(ExecutionCommandClient):
@@ -475,6 +484,11 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             timeout_seconds=timeout_seconds,
             attribution_transport="internal",
         )
+
+    def _receive_timeout(self, command: dict[str, Any]) -> float | None:
+        if command.get("command") in _SENT_OFF_THE_TICK:
+            return None
+        return self._timeout_seconds
 
     def resolve_attach_active_tcp(
         self, binding_id: str, target: Mapping[str, str]
@@ -572,8 +586,11 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             if command.get("command") in {
                 "start_program_selection",
                 "release_program_selection",
+                "release_halt",
                 "check_program_node_motion_attention",
             } and error.details.get("reason") in {
+                "program_halt_release_stale",
+                "program_selection_manual_operation_active",
                 "program_selection_stale",
                 "program_selection_unknown",
                 "program_node_unknown",
@@ -809,13 +826,10 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             ) from error
         return ack.model_dump(mode="json")
 
-    def read_interrupt_rule_state_events(
-        self, owner_epoch: str, after_sequence: int
-    ) -> dict[str, Any]:
+    def read_interrupt_rule_state_events(self, after_sequence: int) -> dict[str, Any]:
         """One page of the existing ``events`` command, returned whole for the
-        global-rule state mirror: its outer
-        ``interrupt_rule_state_baseline`` and its sparse
-        ``interrupt_rule_state_changed`` rows, read strictly by the mirror."""
+        global-rule state mirror, which reads its outer
+        ``interrupt_rule_catalog`` and ``interrupt_rule_state_baseline``."""
 
         if type(after_sequence) is not int or not 0 <= after_sequence <= 9_007_199_254_740_991:
             raise ValueError("operation event query exceeds its fixed bounds")
@@ -825,14 +839,13 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "after_sequence": after_sequence,
                 "command": "events",
                 "limit": 16,
-                "owner_epoch": owner_epoch,
             }
         )
         if response.get("ok") is not True:
             self._raise_error_response(response)
         return response
 
-    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
+    def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]:
         return self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
@@ -857,7 +870,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         )
 
     def release_program_selection(
-        self, body: Mapping[str, Any], expected_selection_revision: int
+        self, body: Mapping[str, Any], expected_hold_revision: int
     ) -> dict[str, Any]:
         return self._exchange(
             {
@@ -865,12 +878,12 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "command": "release_program_selection",
                 "attribution": self._request_attribution(None),
                 "request": dict(body),
-                "expected_selection_revision": expected_selection_revision,
+                "expected_hold_revision": expected_hold_revision,
             }
         )
 
     def start_program_selection(
-        self, body: Mapping[str, Any], expected_selection_revision: int
+        self, body: Mapping[str, Any], expected_hold_revision: int
     ) -> dict[str, Any]:
         return self._exchange(
             {
@@ -878,7 +891,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "command": "start_program_selection",
                 "attribution": self._request_attribution(None),
                 "request": dict(body),
-                "expected_selection_revision": expected_selection_revision,
+                "expected_hold_revision": expected_hold_revision,
             }
         )
 
@@ -897,9 +910,9 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return super().query_operation(self._request(ProgramOperationQuery, body))
 
-    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return super().full_stop(
-            self._request(FullStopIntentRequest, body), trusted_principal_id=None
+    def cell_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return super().cell_stop(
+            self._request(FullStopIntentRequest, body)
         )
 
     def apply_operation_recovery(

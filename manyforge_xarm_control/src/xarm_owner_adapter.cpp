@@ -218,7 +218,8 @@ core::ComponentState XArmOwnerAdapter::State(const std::int64_t now_ns) const {
   }
 
   std::optional<core::Fault> fault;
-  if (lane.fault && lane.fault->code == core::FaultCode::kProcessExited) {
+  if (lane.fault && (lane.fault->code == core::FaultCode::kProcessExited ||
+                     lane.fault->code == core::FaultCode::kRosTransportFailed)) {
     fault = lane.fault;
     fault->concerns = Concerns(XArmFaultScope::kMachine);
   } else if (!fresh) {

@@ -70,15 +70,6 @@ control_domain_control_product_artifact_roles() noexcept;
 control_domain_control_product_contract_descriptor();
 
 [[nodiscard]] std::string_view
-reference_runtime_product_contract_id() noexcept;
-[[nodiscard]] const core::ProductContractRevision&
-reference_runtime_product_contract_revision();
-[[nodiscard]] std::span<const QualifiedRetainedProductArtifactRole>
-reference_runtime_product_artifact_roles() noexcept;
-[[nodiscard]] const CanonicalValue&
-reference_runtime_product_contract_descriptor();
-
-[[nodiscard]] std::string_view
 ros2_control_execution_runtime_product_contract_id() noexcept;
 [[nodiscard]] const core::ProductContractRevision &
 ros2_control_execution_runtime_product_contract_revision();

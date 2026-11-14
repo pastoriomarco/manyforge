@@ -144,7 +144,7 @@ protected:
     publisher_ = make_publisher(kEndpoint);
     engine = std::make_shared<Engine>();
     auto subsystem = core::IoSignalSubsystem::Create(
-        {core::RequestOwnerEpoch("host"), 1, {descriptor(age)}, {}},
+        {1, {descriptor(age)}, {}},
         {1, 1, depth, 4, 128, 1024}, *clock);
     ASSERT_TRUE(subsystem.ok()) << subsystem.error().message;
     signals = std::shared_ptr<core::IoSignalSubsystem>(
@@ -238,7 +238,7 @@ protected:
       std::shared_ptr<core::IoSignalSubsystem> &next_signals,
       std::shared_ptr<core::IoSignalIngress> &next_ingress) {
     auto created = core::IoSignalSubsystem::Create(
-        {core::RequestOwnerEpoch("host"), 2, {descriptor()}, {}},
+        {2, {descriptor()}, {}},
         {1, 1, 8, 4, 128, 1024}, *clock);
     ASSERT_TRUE(created.ok()) << created.error().message;
     next_signals = std::shared_ptr<core::IoSignalSubsystem>(

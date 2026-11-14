@@ -105,6 +105,7 @@ core::Result<void> ValidateSealedProgramCaptureRequest(
   if (capture.table != nullptr || capture.binding != nullptr ||
       capture.blackboard_key_declarations != nullptr ||
       capture.io_conditions != nullptr ||
+      capture.resolution_context != nullptr ||
       capture.retained_bundle_id != bundle.retained_bundle_id() ||
       capture.graph_revision != bundle.value().cell_graph.graph_revision)
     return core::Result<void>::Err(CaptureError(
@@ -164,6 +165,8 @@ core::Result<core::ProgramRunExecutionCaptureDTO> ResolveSealedProgramCapture(
     capture.blackboard_key_declarations = std::shared_ptr<
         const std::vector<core::ProgramBlackboardKeyDeclarationDTO>>(
         program, &program->blackboard_key_declarations());
+    capture.resolution_context = std::make_shared<const SealedProgramRunSources>(
+        SealedProgramRunSources{program, binding});
     return Reply::Ok(std::move(capture));
   } catch (const std::exception &exception) {
     return Reply::Err(CaptureError(

@@ -17,14 +17,14 @@ class RecordingReader:
 
     def invoke(self, operation: str, arguments=None) -> dict[str, Any]:
         self.calls.append((operation, arguments))
-        return {"schema_version": "manyforge.headless_runtime_snapshot.v1"}
+        return {"schema_version": "manyforge.headless_runtime_snapshot.v3"}
 
 
 def test_assistant_reads_owner_facts_without_callback_or_mutation() -> None:
     reader = RecordingReader()
     client = AssistantHeadlessReadClient(reader)
 
-    assert client.observe("runtime")["schema_version"].endswith("snapshot.v1")
+    assert client.observe("runtime")["schema_version"].endswith("snapshot.v3")
     assert reader.calls == [("runtime", None)]
     assert "node_environment" in ASSISTANT_READ_OPERATIONS
     assert "source_model" in ASSISTANT_READ_OPERATIONS

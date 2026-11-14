@@ -140,14 +140,14 @@ component_manager::RuntimeUnitConvergencePlanRowDTO RuntimeRow() {
       "manyforge.runtime-publication.status",
       "status-revision-1",
       "private-controller",
-      "manyforge.posix_sh.retained_script",
+      "manyforge.installed_execution_target",
       "adapter-revision-1",
       "retained-raw-artifact",
       "retrieval-revision-1",
       core::ContentDigest(std::string(kDigestTwo)),
       1U,
       "linux",
-      "posix.1-2017",
+      "manyforge.ros2_control_execution_host.abi.v1",
       requirement.value(),
       core::RuntimeContractOfferDigest(std::string(kDigestOne)),
   };
@@ -215,12 +215,12 @@ component_manager::ManagerApplyIntentDTO ApplyIntent(
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
   return {
       core::PublicRequestContextDTO{
-          core::RequestId("request-1"),
-          core::RequestOwnerEpoch("manager-client-epoch-1"),
+          core::RequestKey::Make(
+              core::RequestKeyClass::kInternal, 0U,
+              static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), 1U),
           "owner-publication-test",
-          std::nullopt,
       },
-      core::ApplyId("apply-1"),
+      core::ApplyId(1U),
       core::ApplyGeneration(1U),
       admission.cell_id(),
       ProjectionRevision(admission),
@@ -311,7 +311,7 @@ TEST(ManagerSourcePublication,
       admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
   const auto bytes = content_identity::canonical_json(payload);
-  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.manager_source.v1\""),
+  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.manager_source.v2\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"cell_graph\":"), std::string::npos);
   const auto *const active = payload.find_object_member("active");
@@ -340,7 +340,7 @@ TEST(ManagerSourcePublication, NamedClosePublicationIsCanonicalEmptyByAdmissionI
       directory.path() / "apply.sqlite3", admission.cell_id());
   auto runtime = Runtime(admission);
   runtime.plan.active_publication.request.transaction_ref =
-      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.close"), core::ApplyGeneration(1U)};
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(2U), core::ApplyGeneration(1U)};
   runtime.plan.active_publication.request.expected_previous_publication_generation =
       core::ActiveBundlePublicationGeneration(1U);
   runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
@@ -354,7 +354,7 @@ TEST(ManagerSourcePublication, NamedClosePublicationIsCanonicalEmptyByAdmissionI
   ASSERT_NE(canonical_empty, nullptr);
   ASSERT_TRUE(canonical_empty->is_bool());
   EXPECT_TRUE(canonical_empty->as_bool());
-  EXPECT_NE(content_identity::canonical_json(*active).find("\"apply_id\":\"apply.close\""), std::string::npos);
+  EXPECT_NE(content_identity::canonical_json(*active).find("\"apply_id\":2,\"kind\":\"named_apply\""), std::string::npos);
 }
 
 TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
@@ -381,7 +381,7 @@ TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
   runtime.plan.active_publication.request.candidate_retained_bundle_id = projection.retained_bundle_id;
   runtime.plan.active_publication.request.candidate_graph_revision = projection.graph_revision;
   runtime.plan.active_publication.request.transaction_ref =
-      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.nonempty"), core::ApplyGeneration(1U)};
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(3U), core::ApplyGeneration(1U)};
   runtime.plan.active_publication.request.expected_previous_publication_generation =
       core::ActiveBundlePublicationGeneration(1U);
   runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
@@ -436,7 +436,7 @@ TEST(ManagerSourcePublication,
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
       admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
-  EXPECT_NE(bytes.find("\"apply_id\":\"apply-1\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"apply_id\":1,"), std::string::npos);
   EXPECT_NE(bytes.find("\"phase\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"state\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"incomplete\":true"), std::string::npos);

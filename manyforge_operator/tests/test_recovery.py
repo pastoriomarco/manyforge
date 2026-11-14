@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +10,7 @@ from manyforge_operator import (
     LaunchProfile,
     ResourceKind,
 )
+from manyforge_operator.application_processes import ApplicationProcess
 from manyforge_operator.orchestrator import (
     LauncherError,
     NativeLauncher,
@@ -47,16 +47,17 @@ def _config(tmp_path: Path) -> NativeLauncherConfig:
 
 
 def _mechanical_process() -> dict[str, object]:
+    # The launcher records only the Manager it started (spec 3.3, S3).
     return {
-        "resource_id": "headless",
-        "component_id": "headless",
+        "resource_id": "manager",
+        "component_id": "manager",
         "kind": ResourceKind.PROCESS.value,
         "host_id": "runtime",
         "pid": 999999,
         "start_ticks": 1,
         "boot_id": "22222222-2222-2222-2222-222222222222",
         "process_group_id": 999999,
-        "log_reference": "headless.log",
+        "log_reference": "manager.log",
         "argv": [],
     }
 
@@ -74,7 +75,7 @@ def test_status_reconciles_a_dead_recorded_child_to_degraded(
     _write_record(
         launcher,
         status,
-        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"manager": _mechanical_process()}},
     )
 
     observed = launcher.status()
@@ -110,7 +111,7 @@ def test_status_rejects_a_present_process_over_a_stopped_record(
     _write_record(
         launcher,
         status,
-        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"manager": _mechanical_process()}},
     )
     monkeypatch.setattr(
         "manyforge_operator.orchestrator._process_is_authenticated",
@@ -135,7 +136,7 @@ def test_start_conflicts_with_a_present_process_over_stopped_record(
     _write_record(
         launcher,
         status,
-        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"manager": _mechanical_process()}},
     )
     monkeypatch.setattr(
         "manyforge_operator.orchestrator._configuration",
@@ -178,45 +179,7 @@ def test_failed_cleanup_after_start_failure_is_degraded(
     assert raised.value.status.last_failure.reason_code == "cleanup_deadline_exceeded"
 
 
-def test_readiness_timeout_preserves_terminal_failure_without_recleaning(
-    tmp_path: Path, configuration_factory, status_factory, monkeypatch
-):
-    launcher = NativeLauncher(
-        replace(_config(tmp_path), readiness_timeout_seconds=0.01)
-    )
-    configuration = configuration_factory()
-    stopped = status_factory(
-        configuration, state=LaunchInstanceState.STOPPED, with_resources=False
-    )
-    calls: list[FailureRecord] = []
-    monkeypatch.setattr(
-        "manyforge_operator.orchestrator._configuration",
-        lambda _config: configuration,
-    )
-    monkeypatch.setattr(launcher, "_port_available", lambda: None)
-    monkeypatch.setattr(
-        "manyforge_operator.orchestrator.native_commands", lambda _config: ()
-    )
-    monkeypatch.setattr(
-        launcher, "_readiness", lambda: (False, [], "owner did not become ready")
-    )
-    monkeypatch.setattr("manyforge_operator.orchestrator.time.sleep", lambda _seconds: None)
-
-    def finish(_configuration, failure, readiness=()):
-        calls.append(failure)
-        return stopped
-
-    monkeypatch.setattr(launcher, "_finish_failed_start", finish)
-
-    with pytest.raises(LauncherError) as raised:
-        launcher.start()
-
-    assert raised.value.code == "readiness_timeout"
-    assert raised.value.status is stopped
-    assert len(calls) == 1
-
-
-def test_spawned_component_is_retained_when_next_spawn_raises(
+def test_manager_spawn_failure_ends_the_start_with_its_failure_recorded(
     tmp_path: Path, configuration_factory, monkeypatch
 ):
     launcher = NativeLauncher(_config(tmp_path))
@@ -228,9 +191,9 @@ def test_spawned_component_is_retained_when_next_spawn_raises(
     monkeypatch.setattr(launcher, "_port_available", lambda: None)
     monkeypatch.setattr(
         "manyforge_operator.orchestrator.native_commands",
-        lambda _config: (
+        lambda _config, previous_session_id=None: (
             ProcessSpec("manager", ("manager",), {}, tmp_path),
-            ProcessSpec("headless", ("headless",), {}, tmp_path),
+            (ApplicationProcess("headless", ("/bin/true",)),),
         ),
     )
     monkeypatch.setattr(
@@ -241,22 +204,7 @@ def test_spawned_component_is_retained_when_next_spawn_raises(
 
     def spawn(spec):
         spawned.append(spec.component_id)
-        if spec.component_id == "headless":
-            raise RuntimeError("second component failed")
-        launcher._managed[spec.component_id] = type(
-            "Managed",
-            (),
-            {
-                "component_id": spec.component_id,
-                "pid": 1,
-                "start_ticks": 1,
-                "boot_id": "22222222-2222-2222-2222-222222222222",
-                "process_group_id": 2,
-                "argv": spec.argv,
-                "log_path": tmp_path / "manager.log",
-            },
-        )()
-        return launcher._managed[spec.component_id]
+        raise RuntimeError("Manager could not start")
 
     monkeypatch.setattr(launcher, "_spawn", spawn)
 
@@ -264,7 +212,87 @@ def test_spawned_component_is_retained_when_next_spawn_raises(
         launcher.start()
 
     assert raised.value.code == "native_start_failed"
-    assert spawned == ["manager", "headless"]
-    record = launcher.store.read()
-    assert record is not None
-    assert "manager" in record[1]["processes"]
+    assert spawned == ["manager"]
+    assert raised.value.status is not None
+    assert raised.value.status.state is LaunchInstanceState.STOPPED
+    assert raised.value.status.last_failure.reason_code == "native_start_failed"
+
+
+def _live_manager(monkeypatch, *, ends_on_request: bool):
+    """A recorded, authenticated Manager; `os.kill` is observed, not sent."""
+
+    import signal as signal_module
+
+    alive = {999999}
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator._process_is_authenticated",
+        lambda record: int(record["pid"]) in alive,
+    )
+
+    def kill(pid: int, number: int) -> None:
+        signals.append((pid, number))
+        if ends_on_request:
+            alive.discard(pid)
+
+    monkeypatch.setattr("manyforge_operator.orchestrator.os.kill", kill)
+
+    def no_group_signal(*_args):
+        raise AssertionError("a live Manager is not signalled as a group")
+
+    monkeypatch.setattr("manyforge_operator.orchestrator.os.killpg", no_group_signal)
+    monkeypatch.setattr(
+        "manyforge_operator.orchestrator.request_manager_shutdown",
+        lambda *_args, **_kwargs: pytest.fail("stop sends a signal, not shutdown_runtime"),
+    )
+    return signals, signal_module.SIGTERM
+
+
+def test_stop_sends_one_sigterm_to_a_live_manager_and_follows_it_to_its_end(
+    tmp_path: Path, configuration_factory, status_factory, monkeypatch, capsys
+):
+    # OD-187: each `stop` is one stop request, one SIGTERM to the recorded
+    # Manager (its launcher has ended here); `stop` then follows the recorded
+    # process to its end with no time limit of its own.
+    launcher = NativeLauncher(_config(tmp_path))
+    status = status_factory(configuration_factory(), state=LaunchInstanceState.READY)
+    _write_record(launcher, status, {
+        "profile": "standard",
+        "processes": {"manager": _mechanical_process()},
+        "paths": {"manager_run_root": str(tmp_path / "manager-run")},
+    })
+    signals, sigterm = _live_manager(monkeypatch, ends_on_request=True)
+
+    stopped = launcher.stop()
+
+    assert stopped.state is LaunchInstanceState.STOPPED
+    assert signals == [(999999, sigterm)]
+    assert ("stop: asked the Manager (pid 999999) to stop the application; waiting "
+            "for it to end. Its log shows each step; a second stop request forces "
+            "the stop.") in capsys.readouterr().err
+
+
+def test_a_stop_while_the_instance_is_owned_is_one_more_request(
+    tmp_path: Path, configuration_factory, status_factory, monkeypatch
+):
+    # A running start (or another `stop`) holds the instance: this `stop` is
+    # one more SIGTERM to its Manager, then returns the owner's final record.
+    from manyforge_operator.orchestrator import _InstanceBusy
+
+    launcher = NativeLauncher(_config(tmp_path))
+    status = status_factory(configuration_factory(), state=LaunchInstanceState.READY)
+    _write_record(launcher, status, {
+        "profile": "standard",
+        "processes": {"manager": _mechanical_process()},
+        "paths": {"manager_run_root": str(tmp_path / "manager-run")},
+    })
+    signals, sigterm = _live_manager(monkeypatch, ends_on_request=False)
+
+    def busy():
+        raise _InstanceBusy()
+
+    monkeypatch.setattr(launcher, "_stop_locked", busy)
+
+    assert launcher.stop().state is LaunchInstanceState.READY
+    assert launcher.stop().state is LaunchInstanceState.READY
+    assert signals == [(999999, sigterm), (999999, sigterm)]

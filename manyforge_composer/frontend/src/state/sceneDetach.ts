@@ -4,6 +4,7 @@ import type {
   SceneTransactionRequest,
   SceneTransactionResponse,
 } from '../types/api';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import type { ControlSemanticStatus, ControlTransportStatus } from '../hooks/useHeadlessState';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { SceneOwnerFacts } from './sceneAuthoring';
@@ -60,16 +61,16 @@ export function sceneDetachUnavailableReason(
 export function sceneDetachRequest(
   attachment: CarriedObjectAttachment,
   facts: SceneOwnerFacts,
-  requestId: string,
+  applicationStartId: ApplicationStartId,
+  requestKey: string,
 ): SceneTransactionRequest {
   const expectedProjection = facts.logicalScene.access.active_projection;
   if (expectedProjection === null) throw new Error('The logical Scene has no active projection.');
   return {
+    application_start_id: applicationStartId,
     request_context: {
-      request_id: requestId,
-      request_owner_epoch: facts.sourceOwnerEpoch,
+      request_key: requestKey,
       source_label: 'composer_ui',
-      correlation_id: requestId,
     },
     expected_projection_revision: expectedProjection,
     operation: {
@@ -83,15 +84,17 @@ export function sceneDetachRequest(
   };
 }
 
+/**
+ * The receipt names this request (Headless sets the key's first byte, its
+ * class and part, so bytes 1-15 are compared) and a successor Scene revision.
+ */
 export function sceneDetachReceiptAccepted(
   response: SceneTransactionResponse,
-  requestId: string,
-  requestOwnerEpoch: string,
+  requestKey: string,
   expected: ProjectionRevision,
 ): boolean {
   const committed = response.committed_projection_revision;
-  return response.request_id === requestId
-    && response.request_owner_epoch === requestOwnerEpoch
+  return response.request_key.slice(2) === requestKey.slice(2)
     && committed.retained_bundle_id === expected.retained_bundle_id
     && committed.graph_revision === expected.graph_revision
     && committed.scene_revision.scene_id === expected.scene_revision.scene_id

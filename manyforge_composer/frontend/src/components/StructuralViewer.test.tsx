@@ -530,7 +530,7 @@ describe('viewer failure isolation', () => {
           presentation={presentation}
           manifest={manifest}
           objects={[sceneObject({ type: 'box', dimensions_m: { x: 1, y: 2, z: 3 } })]}
-          ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+          ownerIdentity={{ applicationStartId: '3f9a0000000000a1', generation: 4 }}
           onAssetError={() => undefined}
         >
           <span data-measured-tcp-marker="tcp-1" />
@@ -564,7 +564,7 @@ describe('viewer failure isolation', () => {
         presentation={{ ...presentation, measuredTcp: null }}
         manifest={manifest}
         objects={[carried]}
-        ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+        ownerIdentity={{ applicationStartId: '3f9a0000000000a1', generation: 4 }}
         onAssetError={() => undefined}
       />,
     )).toContain('name="measured-state-object:part:scene-runtime:part"');
@@ -574,7 +574,7 @@ describe('viewer failure isolation', () => {
         presentation={presentation}
         manifest={manifest}
         objects={[sceneObject({ type: 'box', dimensions_m: { x: 1, y: 2, z: 3 } })]}
-        ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+        ownerIdentity={{ applicationStartId: '3f9a0000000000a1', generation: 4 }}
         onAssetError={() => undefined}
       />,
     )).toBe('');

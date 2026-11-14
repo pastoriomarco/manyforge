@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 
-from .contracts import LaunchOperation, LaunchProfile, OperatorCommandResult
+from .contracts import RESULT_SCHEMA, LaunchOperation, LaunchProfile, OperatorCommandResult
 from .isaac import (
     IsaacLauncher,
     IsaacLauncherConfig,
@@ -19,6 +19,7 @@ from .orchestrator import (
     NativeLauncher,
     NativeLauncherConfig,
 )
+from . import run_session
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,6 +37,8 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--alarm-catalog-path", type=Path)
     start.add_argument("--composer-static-dir", type=Path)
     start.add_argument("--simulation-control-config", type=Path)
+    # Read only for its disk limits (standard profile); without it, the defaults.
+    start.add_argument("--site-settings", type=Path)
     start.add_argument(
         "--canonical-empty-admission-filename",
         default="canonical-empty-admission.json",
@@ -89,7 +92,7 @@ def _result(
     message: str | None = None,
 ) -> dict:
     value = {
-        "schema_version": "manyforge.operator_command_result.v1",
+        "schema_version": RESULT_SCHEMA,
         "operation": operation.value,
         "outcome": outcome,
     }
@@ -133,14 +136,16 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
         expected_source_fingerprint=args.expected_source_fingerprint,
         expected_head_commit=args.expected_head_commit,
         expected_head_tree=args.expected_head_tree,
-        readiness_timeout_seconds=args.readiness_timeout_s,
         poll_interval_seconds=args.poll_interval_s,
         reconciliation_period_ms=args.reconciliation_period_ms,
         manager_timeout_seconds=args.manager_timeout_s,
+        disk_limits=run_session.read_site_disk_limits(args.site_settings),
     )
 
 
 def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
+    if args.site_settings is not None:
+        raise ValueError("--site-settings applies to the standard profile only")
     required = (
         "remote_target",
         "advertised_host",
@@ -221,7 +226,7 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
 def _persisted_profile(state_root: Path, instance_id: str) -> LaunchProfile | None:
     instance_root = state_root.absolute() / instance_id
     if (instance_root / ".manyforge-cell-layout.json").is_file():
-        record = instance_root / "state" / "operator" / "launch_instance.json"
+        record = instance_root / "operator" / "launch_instance.json"
     else:
         record = instance_root / "launch_instance.json"
     if not record.is_file():
@@ -254,13 +259,32 @@ def main(argv: list[str] | None = None) -> int:
         if operation is LaunchOperation.START:
             if args.profile == LaunchProfile.ISAAC.value:
                 launcher = IsaacLauncher(_isaac_config(args))
-            else:
-                launcher = NativeLauncher(_config(args))
+                try:
+                    status = launcher.start()
+                    value = _result(
+                        operation,
+                        outcome="already_running" if launcher.last_start_idempotent else "started",
+                        status=status,
+                    )
+                    _emit(value, json_output=args.json_output)
+                    return 0
+                except LauncherError as error:
+                    value = _result(operation, outcome="failed", status=error.status, code=error.code, message=str(error))
+                    _emit(value, json_output=args.json_output)
+                    return error.exit_code
+            launcher = NativeLauncher(_config(args))
+            # The standard start stays resident: it reports "started" once the
+            # owners are ready, waits on the Manager for the application's
+            # whole life and reports "stopped" when the application ends.
+            def ready(status: object) -> None:
+                _emit(_result(operation, outcome="started", status=status), json_output=args.json_output)
+                sys.stdout.flush()
+
             try:
-                status = launcher.start()
+                status = launcher.start(on_ready=ready)
                 value = _result(
                     operation,
-                    outcome="already_running" if launcher.last_start_idempotent else "started",
+                    outcome="already_running" if launcher.last_start_idempotent else "stopped",
                     status=status,
                 )
                 _emit(value, json_output=args.json_output)

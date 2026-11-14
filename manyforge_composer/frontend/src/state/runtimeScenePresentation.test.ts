@@ -40,7 +40,7 @@ import type {
 
 function executionStatus(): ExecutionOwnerStatus {
   const status = {
-    ownerEpoch: 'owner-1',
+    applicationStartId: 'owner-1',
     cellId: 'cell-1',
     graphRevision: 'graph-1',
     retainedBundleId: 'bundle-1',
@@ -333,7 +333,7 @@ function viewerFrameWithSources(
 ): ExecutionObservationFrame {
   return {
     ...(frame ?? {
-      schemaVersion: 'manyforge.execution_observation_frame.v4', ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v5', applicationStartId: 'owner-1',
       cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'native-1', sourceSequence: 1, receivedAtMonotonicUs: 123,
       targets: [], measuredTargets: [],
@@ -521,8 +521,8 @@ describe('runtime scene presentation', () => {
 
   it('projects and caches compact owner observations once per frame', () => {
     let frame: ExecutionObservationFrame | null = {
-      schemaVersion: 'manyforge.execution_observation_frame.v4',
-      ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v5',
+      applicationStartId: 'owner-1',
       cellId: 'cell-1',
       retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1',
@@ -575,7 +575,7 @@ describe('runtime scene presentation', () => {
 
     const referenceEpoch = candidateObservationEpoch(frame, executionStatus());
     expect(referenceEpoch).not.toBeNull();
-    expect(candidateObservationEpoch(frame, { ...executionStatus(), ownerEpoch: 'owner-2' })).toBeNull();
+    expect(candidateObservationEpoch(frame, { ...executionStatus(), applicationStartId: 'owner-2' })).toBeNull();
     expect(candidateObservationEpoch({ ...frame, graphRevision: 'other' }, executionStatus())).toBeNull();
     expect(candidateObservationEpoch({ ...frame, sourceEpoch: 'restarted' }, executionStatus())).not.toBe(referenceEpoch);
     expect(candidateObservationEpoch({ ...frame, targets: [{ ...frame.targets[0], sourceEpoch: 'restarted-arm' }] }, executionStatus())).not.toBe(referenceEpoch);
@@ -602,8 +602,8 @@ describe('runtime scene presentation', () => {
       coordinateKinds: ['angular' as const], positionsSi: [0],
     };
     let frame: ExecutionObservationFrame | null = {
-      schemaVersion: 'manyforge.execution_observation_frame.v4',
-      ownerEpoch: 'owner-1', cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v5',
+      applicationStartId: 'owner-1', cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'native-1', sourceSequence: 5, receivedAtMonotonicUs: 123,
       targets: [commanded],
       measuredTargets: [{ ...commanded, sourceEpoch: 'measured-1', sourceSequence: 40, positionsSi: [Math.PI / 2] }],
@@ -655,7 +655,7 @@ describe('runtime scene presentation', () => {
     model.targets[1].model_groups = [{ ...model.targets[0].model_groups[0],
       model_instance_id: 'gripper-model', commandable_source_joint_names: ['finger'] }];
     const frame: ExecutionObservationFrame = {
-      schemaVersion: 'manyforge.execution_observation_frame.v4', ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v5', applicationStartId: 'owner-1',
       cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'render-1', sourceSequence: 10, receivedAtMonotonicUs: 123,
       targets: [
@@ -964,8 +964,8 @@ describe('runtime scene presentation', () => {
 
     const cellPose = (positionRad: number) => {
       const frame: ExecutionObservationFrame = {
-        schemaVersion: 'manyforge.execution_observation_frame.v4',
-        ownerEpoch: 'owner-1',
+        schemaVersion: 'manyforge.execution_observation_frame.v5',
+        applicationStartId: 'owner-1',
         cellId: 'cell-1',
         retainedBundleId: 'bundle-1',
         graphRevision: 'graph-1',
@@ -1117,7 +1117,7 @@ describe('runtime scene presentation', () => {
       topic: '/isaac_joint_states',
     });
     const toolFrame = (finger: number): ExecutionObservationFrame => ({
-      schemaVersion: 'manyforge.execution_observation_frame.v4', ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v5', applicationStartId: 'owner-1',
       cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'native-1', sourceSequence: 1, receivedAtMonotonicUs: 123,
       targets: [
@@ -1675,7 +1675,7 @@ describe('runtime scene presentation', () => {
 
   it('materializes only an exact retained-model motion-preview ghost', () => {
     const receipt = {
-      schemaVersion: 'manyforge.direct_control_motion_preview.v4',
+      schemaVersion: 'manyforge.direct_control_motion_preview.v5',
       receiptDigest: 'receipt-1',
       retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1',
@@ -1685,7 +1685,7 @@ describe('runtime scene presentation', () => {
           target: { componentId: 'robot-1', commandTargetId: 'arm' },
           frame: { componentId: 'robot-1', frameId: 'tcp' },
         },
-        source: 'active_tcp', ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 1,
+        source: 'active_tcp', registrationGeneration: 1, sequence: 1,
       },
       sourceJointNames: ['source-joint'],
       finalPositionsRad: [Math.PI / 2],
@@ -1772,11 +1772,11 @@ describe('runtime scene presentation', () => {
       sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
       coordinateKind: 'linear_m', minPosition: 0, maxPosition: 0.04,
       programId: 'direct-control-gripper', programRevision: 'schema-1',
-      programBindingId: 'gripper-binding', programRunId: 'gripper-run',
+      programBindingId: 'gripper-binding',
       targetDescriptor: {} as NonNullable<ExecutionOwnerStatus['directControlGripper']>['targetDescriptor'],
     } as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
     const receipt = {
-      schemaVersion: 'manyforge.direct_control_capability_command_preview.v2',
+      schemaVersion: 'manyforge.direct_control_capability_command_preview.v3',
       receiptDigest: 'gripper-receipt-1', retainedBundleId: 'bundle-1',
       graphRevision: 'graph-1', target: { componentId: 'robot-1', commandTargetId: 'gripper' },
       requiredCapabilityId: 'tool.gripper.command',

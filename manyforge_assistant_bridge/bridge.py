@@ -31,6 +31,10 @@ from jsonschema.exceptions import SchemaError
 import uvicorn
 
 from manyforge_headless_api.client import HeadlessHttpClient
+from manyforge_headless_api.internal_http import (
+    INTERNAL_HTTP_CLIENT_LIMITS,
+    INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
+)
 from manyforge_headless_api.read_client import (
     HeadlessReadClient,
     HeadlessReadInputError,
@@ -157,7 +161,7 @@ def _inspect_isaac_scene_report(
 ) -> dict[str, Any]:
     """Build a read-only presentation over Headless-owned scene truth."""
 
-    if scene.get("schema_version") != "manyforge.scene_projection.v1":
+    if scene.get("schema_version") != "manyforge.scene_projection.v2":
         raise BridgeRunError(
             "assistant_owner_response_invalid",
             "Headless returned an unsupported scene projection",
@@ -589,11 +593,13 @@ class BridgeService:
         # model component (projection ``model_endpoint``), never fixed here.
         self._upstream = upstream_client or httpx.AsyncClient(
             timeout=config.upstream_timeout_seconds,
+            limits=INTERNAL_HTTP_CLIENT_LIMITS,
         )
         self._owns_upstream = upstream_client is None
         self._composer = composer_client or httpx.AsyncClient(
             base_url=config.composer_base_url.rstrip("/"),
             timeout=config.callback_timeout_seconds,
+            limits=INTERNAL_HTTP_CLIENT_LIMITS,
         )
         self._owns_composer = composer_client is None
         self._history = SessionHistory(
@@ -734,7 +740,7 @@ class BridgeService:
         source = node_environment.get("source")
         if (
             node_environment.get("schema_version")
-            != "manyforge.node_environment_projection.v2"
+            != "manyforge.node_environment_projection.v3"
             or type(source) is not dict
             or source.get("available") is not True
             or source.get("freshness") != "fresh"
@@ -2496,7 +2502,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="inherited listening socket to serve on (the assistant host binds it)",
     )
     arguments = parser.parse_args(argv)
-    uvicorn.run(create_app(_config_from_environment()), fd=arguments.fd)
+    uvicorn.run(
+        create_app(_config_from_environment()),
+        fd=arguments.fd,
+        timeout_keep_alive=INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
+    )
     return 0
 
 

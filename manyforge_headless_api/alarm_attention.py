@@ -35,8 +35,8 @@ publication, i.e. at most ``D``. The real-path qualification
 receipt intervals under core-lock contention, delayed Kernel responses and
 shutdown during an outstanding exchange.
 
-Kernel-held copy. The Kernel answers each accepted publication with the owner
-epoch and generation it now retains. The publisher keeps that acknowledged
+Kernel-held copy. The Kernel answers each accepted publication with the
+generation it now retains. The publisher keeps that acknowledged
 projection's identity (``kernel_held_attention``), and Headless names it as
 ``kernel_attention`` in its alarm snapshots, so a client can wait for the
 Kernel's own admission state (reconciled, for the active configuration)
@@ -86,9 +86,8 @@ class AttentionPublicationCounts:
 class KernelHeldAttention:
     """The motion-attention projection the Kernel acknowledged retaining.
 
-    The Kernel answers each accepted publication with the owner epoch and
-    generation it now retains, and one generation of one epoch names exactly
-    one content, so the acknowledged projection is the Kernel's held copy.
+    The Kernel answers each accepted publication with the generation it now
+    retains, and one generation names exactly one content, so the acknowledged projection is the Kernel's held copy.
     Only its admission-relevant identity is kept: whether it is reconciled
     and which active configuration it was judged against. Clients use it to
     anticipate admission without polling the Kernel: a Run is
@@ -96,7 +95,6 @@ class KernelHeldAttention:
     configuration, which lags the owner by up to ``P + D``.
     """
 
-    owner_epoch: str
     generation: int
     reconciled: bool
     #: ``{"retained_bundle_id", "graph_revision"}``, or None before the owner
@@ -114,7 +112,6 @@ class KernelHeldAttention:
                 else dict(self.active_configuration)
             ),
             "generation": self.generation,
-            "owner_epoch": self.owner_epoch,
             "reconciled": self.reconciled,
         }
 
@@ -129,17 +126,14 @@ def _held_from(projection: Mapping[str, Any], at: float) -> KernelHeldAttention 
         if not isinstance(bundle, str) or not isinstance(graph, str):
             return None
         configuration = {"graph_revision": graph, "retained_bundle_id": bundle}
-    owner_epoch = projection.get("owner_epoch")
     generation = projection.get("generation")
     reconciled = projection.get("reconciled")
     if (
-        not isinstance(owner_epoch, str)
-        or type(generation) is not int
+        type(generation) is not int
         or type(reconciled) is not bool
     ):
         return None
     return KernelHeldAttention(
-        owner_epoch=owner_epoch,
         generation=generation,
         reconciled=reconciled,
         active_configuration=configuration,
@@ -184,7 +178,7 @@ class OperatorAlarmAttentionPublisher:
     def set_kernel_held_observer(self, observer: Callable[[], None] | None) -> None:
         """Observe a change of the Kernel-held projection's identity.
 
-        Called on the publisher thread when the acknowledged owner epoch,
+        Called on the publisher thread when the acknowledged
         generation, reconciliation or active configuration changes, or when
         the held copy is no longer known to be current; never for an
         unchanged heartbeat. The observer must not block.
@@ -270,8 +264,8 @@ class OperatorAlarmAttentionPublisher:
             return False
         with self._counts_lock:
             self._published += 1
-        # The Kernel acknowledged retaining exactly this epoch and generation
-        # (the transport verifies the acknowledgement names them).
+        # The Kernel acknowledged retaining exactly this generation (the
+        # transport verifies the acknowledgement names it).
         self._record_held(_held_from(projection, time.monotonic()))
         if self._failing:
             self._failing = False

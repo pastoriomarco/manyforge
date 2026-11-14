@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import { newRequestKey } from '../api/applicationIdentity';
 import { ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS } from '../state/robotControl';
 import {
   findProgramNode,
@@ -23,12 +24,6 @@ import type { ProgramWorkspaceController } from './useProgramWorkspace';
 import { motionPreviewRejectionMessage } from './useRobotControl';
 
 const NO_FORMULAS: ProgramFormulaReferences = { computedKeys: {}, nodes: {} };
-
-function identity(prefix: string): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `${prefix}.${random}`;
-}
 
 /** The latest advisory preview of the held node's Draft edits (D4). */
 export type HeldNodePreviewState =
@@ -117,24 +112,24 @@ export function useHeldNodePreview({
     return () => { mounted.current = false; };
   }, []);
 
-  // The native execution owner's epoch: Robot Control discards preview
-  // evidence when that owner is replaced, so a reply from a previous owner is
-  // never shown as ready for the current one.
-  const executionOwnerEpoch = snapshot?.executionControlStatus?.ownerEpoch ?? null;
+  // A reply of another start is never shown as ready: the start identity is
+  // in the key; the key also changes when the execution status appears.
+  const executionStatusPresent = snapshot?.executionControlStatus != null;
+  const applicationStartId = snapshot?.applicationStartId ?? null;
   const inputs = changes?.kind === 'inputs' ? changes.inputs : null;
   const [visibility, setVisibility] = useState({ visible, epoch: 0 });
   if (visibility.visible !== visible) setVisibility({ visible, epoch: visibility.epoch + 1 });
   const requestKey = !visible || held === null || inputs === null
     ? null
     : JSON.stringify([
-      visibility.epoch,
-      held.run.ownerEpoch, executionOwnerEpoch, held.offer.programRunId, held.offer.nodeInstanceId,
+      visibility.epoch, applicationStartId,
+      executionStatusPresent, held.offer.programRunId, held.offer.nodeInstanceId,
       held.offer.nodeAttemptId, held.run.capture.programBindingId,
       held.run.capture.programRevision, inputs,
     ]);
-  const basis = useRef({ held, inputs });
+  const basis = useRef({ held, inputs, applicationStartId });
   useEffect(() => {
-    basis.current = { held, inputs };
+    basis.current = { held, inputs, applicationStartId };
   });
   // A browser abort does not cancel the owner's synchronous planning, so a
   // superseded request is never aborted and re-sent: at most one preview is in
@@ -177,17 +172,21 @@ export function useHeldNodePreview({
   useEffect(() => {
     wanted.current = requestKey;
     if (!visible) setReply(null);
-    const { held: current, inputs: proposed } = basis.current;
+    const { held: current, inputs: proposed, applicationStartId: start } = basis.current;
     if (requestKey === null || current === null || proposed === null) {
       waiting.current = null;
       return undefined;
     }
     const key = requestKey;
+    if (start === null) {
+      setReply({ key, result: null, error: 'Execution owner identity is unavailable.' });
+      return undefined;
+    }
     const body: ProgramNodeCorrectionPreviewRequest = {
-      schema_version: 'manyforge.program_node_correction_preview_request.v1',
-      request_id: identity('node-correction-preview'),
+      schema_version: 'manyforge.program_node_correction_preview_request.v2',
+      request_key: newRequestKey(),
+      application_start_id: start,
       program_run_id: current.offer.programRunId,
-      expected_owner_epoch: current.run.ownerEpoch,
       program_id: current.run.capture.programId,
       program_revision: current.run.capture.programRevision,
       program_binding_id: current.run.capture.programBindingId,

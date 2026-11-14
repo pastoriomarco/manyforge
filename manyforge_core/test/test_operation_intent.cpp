@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <gtest/gtest.h>
 
 #include <limits>
@@ -27,18 +28,18 @@ using namespace manyforge::core;
       {},
       {}};
   return OperationIntentDTO{
-      PublicRequestContextDTO{RequestId("request.motion.1"), RequestOwnerEpoch("owner.epoch.1"),
-                              "test", std::nullopt},
+      PublicRequestContextDTO{TestRequestKey("request.motion.1"),
+                              "test"},
       ProgramId("program.pick"),
       ProgramRevision("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-      ProgramRunId("run.1"),
+      ProgramRunNumber(1U),
       GraphRevision("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
       RetainedBundleId("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
       std::nullopt,
       {OperationParticipantIntentDTO{{ControllableComponentId("robot"), CommandTargetId("arm")},
                                      CapabilityId("planning.motion.joint_goal"),
-                                     ActionSpanDTO{ActionSource::kProgramNode, "attempt.1", "run.1",
+                                     ActionSpanDTO{ActionSource::kProgramNode, "attempt.1", ProgramRunNumber(1U),
                                                    "root/move", "attempt.1", ""},
                                      std::move(motion)}},
       OperationCoordinationPolicy::kIndependent};
@@ -53,11 +54,11 @@ TEST(OperationIntentTest, EveryParticipantActionSpanMustMatchTheOperationRun) {
   auto operation = valid_motion_operation();
   operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
   operation.participants.push_back(operation.participants.front());
-  operation.participants.back().action_span->program_run_id = "run.other";
+  operation.participants.back().action_span->program_run_id = ProgramRunNumber(119U);
   const auto rejected = validate_operation_intent(operation);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "operation_action_span_run_mismatch");
-  operation.participants.back().action_span->program_run_id = operation.program_run_id.value();
+  operation.participants.back().action_span->program_run_id = operation.program_run_id;
   EXPECT_TRUE(validate_operation_intent(operation).ok());
 }
 
@@ -91,7 +92,7 @@ TEST(OperationIntentTest, MotionClearanceIsOptionalAndBounded) {
 
 TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {
   auto operation = valid_motion_operation();
-  operation.request_context.request_id = RequestId("request.command.1");
+  operation.request_context.request_key = TestRequestKey("request.command.1");
   operation.participants.front() = OperationParticipantIntentDTO{
       {ControllableComponentId("robot"), CommandTargetId("gripper")}, CapabilityId("tool.gripper.command"),
       std::nullopt,
@@ -106,7 +107,27 @@ TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {
   ASSERT_TRUE(result.ok()) << result.error().message;
 }
 
-TEST(OperationIntentTest, RejectsMalformedIdentityBeforeRuntimeResolution) {
+TEST(OperationIntentTest, ManualHandoverHasNoRunOfItsOwn) {
+  auto operation = valid_motion_operation();
+  operation.participants.front().action_span.reset();
+  operation.manual_handover =
+      ManualProgramHandoverContextDTO{ProgramRunNumber(1U), CellAdmissionClaimGeneration(2U), 0U};
+  const auto rejected = validate_operation_intent(operation);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "manual_handover_context_invalid");
+  operation.program_run_id.reset();
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  operation.manual_handover->program_run_id = ProgramRunNumber(0U);
+  EXPECT_FALSE(validate_operation_intent(operation).ok());
+}
+
+TEST(OperationIntentTest, RejectsZeroRunAndMalformedIdentityBeforeRuntimeResolution) {
+  auto zero_run = valid_motion_operation();
+  zero_run.program_run_id = ProgramRunNumber(0U);
+  ASSERT_FALSE(validate_operation_intent(zero_run).ok());
+  EXPECT_EQ(validate_operation_intent(zero_run).error().details.at("reason"),
+            "operation_identity_empty");
+
   auto operation = valid_motion_operation();
   operation.program_binding_id = ProgramBindingId("");
 

@@ -15,14 +15,17 @@ from manyforge_headless_api.client import HeadlessClientError
 def report(shutdown="unknown", effects="unknown"):
     identity = "a" * 32
     return {
-        "schema_version": "manyforge.workbench_previous_session.v1",
+        "schema_version": "manyforge.workbench_previous_session.v2",
         "session_id": identity,
-        "archive_relative_path": "previous-sessions/" + identity,
+        "archive_relative_path": "previous-runs/" + identity,
         "shutdown": shutdown,
         "effects": effects,
         "history_coverage": "not_imported",
         "journal_families": ["program_cycle", "scene", "manager", "kernel_operation"],
         "message": "Previous session preserved; Scene and Manager facts unknown. No old state was adopted. Previous journal events may be absent from History.",
+        "unfinished_operations": [{"operation_id": 7, "disposition": "host_replaced"}],
+        "unfinished_operation_count": 1,
+        "application_start_id": "3f9a0000000000a1",
     }
 
 
@@ -41,7 +44,12 @@ def test_notice_uses_closed_shutdown_and_positive_unresolved_facts(tmp_path, shu
 
 @pytest.mark.parametrize("key,value", [
     ("schema_version", "another.schema"), ("session_id", "../outside"),
-    ("archive_relative_path", "previous-sessions/another-session"),
+    ("archive_relative_path", "previous-runs/another-session"),
+    ("archive_relative_path", "previous-sessions/" + "a" * 32),
+    ("unfinished_operations", None),
+    ("unfinished_operations", [{"operation_id": "7", "disposition": "host_replaced"}]),
+    ("unfinished_operation_count", 0),
+    ("application_start_id", None), ("application_start_id", "3F9A"),
     ("shutdown", "assumed_clean"), ("effects", "assumed_closed"),
     ("history_coverage", "imported"), ("journal_families", ["program_cycle"]),
     ("message", ""), ("message", "x" * 1025),
@@ -90,7 +98,7 @@ def test_existing_health_path_preserves_notice_without_changing_readiness(tmp_pa
             raise HeadlessClientError("projection_unavailable", "Actual current Headless fault")
         return {"status": "ready", "headless_projection_ready": True}
 
-    state = ComposerState(headless_client=None if mode == "structural" else SimpleNamespace(health=health))
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=None if mode == "structural" else SimpleNamespace(health=health))
     client = TestClient(create_app(state))
     response = client.get("/api/health")
     assert response.status_code == 200

@@ -20,7 +20,6 @@ struct PreparedCommandSessionLifecycle {
   std::atomic<ResolvedPreparedCapabilityCommandStateDTO> state{
       ResolvedPreparedCapabilityCommandStateDTO::kPreparationFailed};
   std::optional<ControllerGoalId> controller_goal_id;
-  std::optional<ControllerGoalGeneration> controller_goal_generation;
   std::optional<CapabilityCommandDispatchReceiptDTO> dispatch_result;
   std::optional<ErrorDTO> error;
   bool ordinary_result_acknowledged{};
@@ -29,25 +28,24 @@ struct PreparedCommandSessionLifecycle {
   Result<std::optional<CapabilityCommandDispatchReceiptDTO>> BeginDispatch(
       std::uint64_t supplied_preparation_id, const ContentDigest* authoritative_digest,
       const ContentDigest& supplied_digest, const ControllerGoalId& goal,
-      ControllerGoalGeneration generation, BeforeCommit&& before_commit) {
+      BeforeCommit&& before_commit) {
     using Reply = Result<std::optional<CapabilityCommandDispatchReceiptDTO>>;
     if (preparation_id != supplied_preparation_id)
       return Reply::Err({kErrorMissingReference,
                          "Prepared capability-command identity is stale",
                          {{"reason", "prepared_command_identity_mismatch"}}});
     const bool exact = authoritative_digest && *authoritative_digest == supplied_digest &&
-                       controller_goal_id == goal && controller_goal_generation == generation;
+                       controller_goal_id == goal;
     if ((state == ResolvedPreparedCapabilityCommandStateDTO::kDispatched ||
          state == ResolvedPreparedCapabilityCommandStateDTO::kDispatchFailed) &&
         exact && dispatch_result)
       return Reply::Ok(dispatch_result);
     if (state != ResolvedPreparedCapabilityCommandStateDTO::kPrepared || !authoritative_digest ||
-        *authoritative_digest != supplied_digest || goal.empty() || !generation.nonzero())
+        *authoritative_digest != supplied_digest || !goal.nonzero())
       return Reply::Err({kErrorInvalidRequest,
                          "Prepared capability-command dispatch identity is invalid",
                          {{"reason", "prepared_command_dispatch_mismatch"}}});
     controller_goal_id = goal;
-    controller_goal_generation = generation;
     // Preserve the existing order: transport-specific precommit capture runs
     // before publishing the irreversible DispatchRequested transition.
     before_commit();

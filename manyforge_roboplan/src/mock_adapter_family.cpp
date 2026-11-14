@@ -4,6 +4,7 @@
 // settings and their reasons: manyforge_ros2_control_execution/lane/.
 
 #include <manyforge_roboplan/component_adapter_registry.hpp>
+#include <manyforge_roboplan/ros2_control_component_adapter.hpp>
 #include <manyforge_roboplan/mock_lane.hpp>
 #include <manyforge_roboplan/ros2_control_lane_family.hpp>
 
@@ -11,9 +12,17 @@ namespace {
 
 using namespace manyforge::roboplan_backend;
 
-/// The lane adapter is the component's adapter; Mock has no vendor steps.
+/// The lane adapter is the component's adapter; Mock has no vendor steps. As an
+/// xArm machine's driver, an exited launch is started again by Prepare or
+/// Recover through the host's driver-restart entry.
 ComponentAdapters make_mock_adapter(const ComponentAdapterContext &context) {
-  return {context.lane_adapter, {}, std::nullopt, std::nullopt};
+  if (!context.lane_adapter || !context.ros2_control || !context.restart_driver)
+    return {context.lane_adapter, {}, std::nullopt, std::nullopt};
+  return {std::make_shared<Ros2ControlDriverRestartAdapter>(
+              context.lane_adapter,
+              [handle = context.ros2_control] { return handle->ControllerLaunchExited(); },
+              context.restart_driver),
+          {}, std::nullopt, std::nullopt};
 }
 
 RetainedRos2ControlBackendConfig mock_arm_backend_config(const Ros2ControlArmLaneInput &input) {

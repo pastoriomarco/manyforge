@@ -501,7 +501,8 @@ TEST(XArmOwnerAdapter, ExternalControlOfTheArmIsTheOwnersFaultAndRecoverReleases
   auto arm = std::make_shared<XArmArmAdapter>(
       XArmArmAdapterConfig{6, kXArmJointAgreementToleranceRad, std::chrono::seconds(10)},
       XArmArmAdapterPorts{world.status, world.driver, arm_lane,
-                          [](bool, std::stop_token) {
+                          [](bool, std::optional<std::chrono::steady_clock::time_point>,
+                             std::stop_token) {
                             core::ActionResult made;
                             made.outcome = ActionOutcome::kSucceeded;
                             return made;

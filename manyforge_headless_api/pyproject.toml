@@ -13,6 +13,8 @@ dependencies = [
     "fastapi>=0.115",
     "httpx>=0.27",
     "manyforge_behavior>=0.2.0,<0.3.0",
+    # OD-215: the launchers' free-space floor rule (run_session).
+    "manyforge_operator>=0.2.0,<0.3.0",
     "pydantic>=2.7",
     "rfc8785==0.1.4",
     "uvicorn[standard]>=0.30",

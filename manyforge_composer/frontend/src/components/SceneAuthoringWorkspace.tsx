@@ -22,7 +22,7 @@ import {
 } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import { browserRequestIdentity } from '../utils/requestIdentity';
+import { newRequestKey } from '../api/applicationIdentity';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { SettingsSubheading } from './SettingsScope';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -1656,7 +1656,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     sceneResourceId: string,
     pose: LogicalScenePose,
     scale: [number, number, number],
-    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+    expectedDraftIdentity: { draftId: string; generation: number },
   ) => Promise<boolean>;
   onEditSelection: (kind: 'owner_object' | 'program_resource', id: string) => void;
   hiddenSelectionKeys: ReadonlySet<string>;
@@ -1746,19 +1746,21 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     retainedPresentation,
     productIdentity,
   ), [facts, productIdentity, resetPresentationHeld, retainedPresentation]);
+  // The facts come from this admitted snapshot's runtime, so its start
+  // identity is captured with them.
+  const factsApplicationStartId = headlessState.snapshot?.applicationStartId ?? null;
   useLayoutEffect(() => {
     if (!resetPresentationHeld && facts !== null && productIdentity !== null) {
       setRetainedPresentation((current) => (
         current?.productIdentity === productIdentity
+        && current.applicationStartId === factsApplicationStartId
         && current.facts.sourceGeneration === facts.sourceGeneration
-        && current.facts.sourceOwnerEpoch === facts.sourceOwnerEpoch
         && current.facts.runtimeSourceGeneration === facts.runtimeSourceGeneration
-        && current.facts.runtimeSourceOwnerEpoch === facts.runtimeSourceOwnerEpoch
           ? current
-          : { productIdentity, facts }
+          : { productIdentity, applicationStartId: factsApplicationStartId, facts }
       ));
     }
-  }, [facts, productIdentity, resetPresentationHeld]);
+  }, [facts, factsApplicationStartId, productIdentity, resetPresentationHeld]);
   const readyManifest = presentedManifest;
   const objects = presentationFacts?.logicalScene.snapshot?.objects
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
@@ -1931,10 +1933,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ghost, robotControl.selectedStatus, sourceValue, readyManifest, measured.linkTransforms,
         );
     const capabilityPreview = robotControl.state.preview?.schemaVersion
-      === 'manyforge.direct_control_capability_command_preview.v2'
+      === 'manyforge.direct_control_capability_command_preview.v3'
       ? robotControl.state.preview
       : null;
-    const currentMotionPreview = robotControl.state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+    const currentMotionPreview = robotControl.state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v5'
       ? robotControl.state.preview : null;
     const path = robotControl.state.diagnosticPreview ?? currentMotionPreview?.pathPreview;
     const sample = path?.samples[robotControl.state.previewSampleIndex];
@@ -2187,30 +2189,31 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         }]))
       : {}
   ), [objectsEditable, program?.scene, visibleObjects]);
-  const sceneOwnerEpoch = facts?.sourceOwnerEpoch;
+  // The start of the admitted snapshot the facts and the runtime came from.
+  const snapshotApplicationStartId = headlessState.snapshot?.applicationStartId;
+  const sceneOwnerStartId = facts === null ? undefined : snapshotApplicationStartId;
   const sceneOwnerGeneration = facts?.sourceGeneration;
   const sceneOwnerIdentity = useMemo(() => (
-    sceneOwnerEpoch === undefined || sceneOwnerGeneration === undefined
+    sceneOwnerStartId === undefined || sceneOwnerGeneration === undefined
       ? undefined
       : {
-          ownerEpoch: sceneOwnerEpoch,
+          applicationStartId: sceneOwnerStartId,
           generation: sceneOwnerGeneration,
         }
-  ), [sceneOwnerEpoch, sceneOwnerGeneration]);
+  ), [sceneOwnerStartId, sceneOwnerGeneration]);
   const viewerRuntime = headlessState.snapshot?.runtime;
-  const viewerFrameOwnerEpoch = viewerRuntime?.projectionOwnerEpoch;
   const viewerFrameGeneration = viewerRuntime?.projectionGeneration;
   const viewerFrameIdentity = useMemo(() => (
     viewerRuntime?.complete === true
-      && viewerFrameOwnerEpoch !== undefined
+      && snapshotApplicationStartId !== undefined
       && viewerFrameGeneration !== undefined ? {
-      ownerEpoch: viewerFrameOwnerEpoch,
+      applicationStartId: snapshotApplicationStartId,
       generation: viewerFrameGeneration,
     }
       : undefined
   ), [
     viewerFrameGeneration,
-    viewerFrameOwnerEpoch,
+    snapshotApplicationStartId,
     viewerRuntime?.complete,
   ]);
   const objectAxesVisibleIds = useMemo(() => visibleObjects.flatMap((object) => {
@@ -2342,7 +2345,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateTcpEditable={candidatePoseEditable}
       onEditCandidateTcpPose={finishCandidateDragStable}
       onBeginCandidateTcpDrag={beginCandidateDragStable}
-      candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
+      candidateContextKey={JSON.stringify([robotControl.selectedStatus?.applicationStartId,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
         robotControl.selectedStatus?.directControl?.programBindingId,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
@@ -2391,7 +2394,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       ioControlSurface={(
         <ToolIoPanel
           enabled={runtimeEnabled}
-          ownerEpoch={robotControl.selectedStatus?.ownerEpoch ?? null}
+          applicationStartId={robotControl.selectedStatus?.applicationStartId ?? null}
           retainedBundleId={robotControl.selectedStatus?.retainedBundleId ?? null}
           ioSignalBindings={robotControl.selectedStatus?.ioSignalBindings}
           systemSignals={robotControl.selectedStatus?.systemSignals}
@@ -2628,12 +2631,16 @@ export function SceneAuthoringWorkspace({
     if (facts === null) throw new Error('The current logical Scene owner is unavailable.');
     const expectedProjection = facts.logicalScene.access.active_projection;
     if (expectedProjection === null) throw new Error('The logical Scene has no active projection.');
-    const requestId = browserRequestIdentity('composer-scene-detach');
-    const response = await api.scene.commit(sceneDetachRequest(attachment, facts, requestId));
-    if (!sceneDetachReceiptAccepted(response, requestId, facts.sourceOwnerEpoch, expectedProjection)) {
+    const applicationStartId = headlessState.snapshot?.applicationStartId ?? null;
+    if (applicationStartId === null) throw new Error('Execution owner identity is unavailable.');
+    const requestKey = newRequestKey();
+    const response = await api.scene.commit(
+      sceneDetachRequest(attachment, facts, applicationStartId, requestKey),
+    );
+    if (!sceneDetachReceiptAccepted(response, requestKey, expectedProjection)) {
       throw new Error('The detach receipt does not confirm a successor Scene revision.');
     }
-  }, [detachUnavailableReasonFor, facts]);
+  }, [detachUnavailableReasonFor, facts, headlessState.snapshot]);
   const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
@@ -2774,12 +2781,12 @@ export function SceneAuthoringWorkspace({
     sceneResourceId: string,
     pose: LogicalScenePose,
     scale: [number, number, number],
-    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+    expectedDraftIdentity: { draftId: string; generation: number },
   ) => {
     if (
       busyDraft
       || draftId === null
-      || expectedDraftIdentity.ownerEpoch !== draftId
+      || expectedDraftIdentity.draftId !== draftId
       || expectedDraftIdentity.generation !== draftRevision
     ) return false;
     const resource = program?.scene?.find(
@@ -2881,8 +2888,8 @@ export function SceneAuthoringWorkspace({
           <details className="dcard">
             <summary>Owner and runtime source facts</summary>
             <dl>
-              <div><dt>Scene source</dt><dd><code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</dd></div>
-              <div><dt>Runtime source</dt><dd><code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</dd></div>
+              <div><dt>Scene source</dt><dd>{facts.sourceGeneration}</dd></div>
+              <div><dt>Runtime source</dt><dd>{facts.runtimeSourceGeneration}</dd></div>
               <div><dt>Scene revision</dt><dd><code>{facts.logicalScene.snapshot?.revision.revision_id}</code></dd></div>
               <div><dt>Observations</dt><dd>{runtimeStatus.freshGood} fresh / {runtimeStatus.total} total</dd></div>
             </dl>

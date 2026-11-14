@@ -17,7 +17,6 @@ from manyforge_headless_api.control_protocol import (
     ExecutionCommandEnvelopeDTO,
     ExecutionCommandRequestDTO,
     ExecutionControlDeltaDTO,
-    MAXIMUM_U64,
 )
 
 
@@ -35,21 +34,15 @@ class ManualClock:
 def _envelope(
     authority: ControlFreshnessAuthority,
     *,
-    owner: str = "runner.1",
     revision: int = 4,
 ) -> ExecutionCommandEnvelopeDTO:
     return ExecutionCommandEnvelopeDTO(
         schema_version=EXECUTION_COMMAND_SCHEMA,
         command_kind="program_run",
-        correlation_id="correlation.1",
         source_label="test-local-adapter",
-        control_session_id="session.1",
+        control_session_number=1,
         client_sequence="1",
-        freshness=authority.issue(
-            semantic_owner_epoch=owner,
-            execution_control_revision=revision,
-        ),
-        expected_semantic_owner_epoch=owner,
+        freshness=authority.issue(execution_control_revision=revision),
         expected_execution_control_revision=revision,
     )
 
@@ -58,7 +51,6 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
     clock = ManualClock()
     authority = ControlFreshnessAuthority(
         clock_ns=clock,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
     context = _envelope(authority).freshness
@@ -66,7 +58,6 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
     clock.advance(CONTROL_FRESHNESS_VALID_FOR_NS)
     deadline = authority.validate(
         context,
-        current_owner_epoch="runner.1",
         current_control_revision=4,
     )
     assert deadline == 1_000_000_000 + CONTROL_FRESHNESS_VALID_FOR_NS
@@ -74,8 +65,7 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
     with pytest.raises(ControlProtocolError) as expired:
         authority.validate(
             context,
-            current_owner_epoch="runner.1",
-            current_control_revision=4,
+                current_control_revision=4,
         )
     assert expired.value.code == "control_freshness_expired"
 
@@ -101,94 +91,47 @@ def test_freshness_profile_and_delta_shape_are_one_closed_contract() -> None:
         ExecutionControlDeltaDTO.model_validate({**delta, "shell": None})
 
 
-def test_freshness_rejects_tamper_owner_revision_and_receiver_replacement() -> None:
+def test_freshness_rejects_tamper_and_revision() -> None:
     clock = ManualClock()
     authority = ControlFreshnessAuthority(
         clock_ns=clock,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
     context = _envelope(authority).freshness
-    for owner, revision, code in (
-        ("runner.2", 4, "control_projection_stale"),
-        ("runner.1", 5, "control_projection_stale"),
-    ):
-        with pytest.raises(ControlProtocolError) as rejected:
-            authority.validate(
-                context,
-                current_owner_epoch=owner,
-                current_control_revision=revision,
-            )
-        assert rejected.value.code == code
+    with pytest.raises(ControlProtocolError) as rejected:
+        authority.validate(context, current_control_revision=5)
+    assert rejected.value.code == "control_projection_stale"
 
-    tampered = context.model_copy(update={"context_id": context.context_id[:-1] + "A"})
+    # A middle character carries six signature bits (the last one carries
+    # only two, and may already be "A"): any change alters the token.
+    position = len(context.context_id) // 2
+    replacement = "B" if context.context_id[position] == "A" else "A"
+    tampered = context.model_copy(
+        update={
+            "context_id": context.context_id[:position]
+            + replacement
+            + context.context_id[position + 1 :]
+        }
+    )
     with pytest.raises(ControlProtocolError) as invalid:
         authority.validate(
             tampered,
-            current_owner_epoch="runner.1",
-            current_control_revision=4,
+                current_control_revision=4,
         )
     assert invalid.value.code == "control_freshness_invalid"
-
-    authority.rotate_quiescent(active_sessions=0, inflight_commands=0)
-    with pytest.raises(ControlProtocolError) as replaced:
-        authority.validate(
-            context,
-            current_owner_epoch="runner.1",
-            current_control_revision=4,
-        )
-    assert replaced.value.code in {
-        "control_freshness_invalid",
-        "control_receiver_replaced",
-    }
-
-
-def test_sequence_is_lossless_and_rolls_only_at_a_quiescent_boundary() -> None:
-    authority = ControlFreshnessAuthority(
-        receiver_incarnation="receiver.1",
-        secret=b"x" * 32,
-    )
-    authority._sequence = MAXIMUM_U64 - 1  # exercise checked boundary directly
-    final = authority.issue(
-        semantic_owner_epoch="runner.1",
-        execution_control_revision=1,
-    )
-    assert final.issued_server_sequence == str(MAXIMUM_U64)
-    with pytest.raises(ControlProtocolError) as exhausted:
-        authority.issue(
-            semantic_owner_epoch="runner.1",
-            execution_control_revision=1,
-        )
-    assert exhausted.value.code == "control_sequence_rollover_required"
-    with pytest.raises(ControlProtocolError) as busy:
-        authority.rotate_quiescent(active_sessions=1, inflight_commands=0)
-    assert busy.value.code == "control_sequence_rollover_busy"
-    authority.rotate_quiescent(active_sessions=0, inflight_commands=0)
-    assert (
-        authority.issue(
-            semantic_owner_epoch="runner.1",
-            execution_control_revision=1,
-        ).issued_server_sequence
-        == "1"
-    )
 
 
 def test_virtual_time_beyond_thirty_years_creates_no_retained_history() -> None:
     clock = ManualClock()
     authority = ControlFreshnessAuthority(
         clock_ns=clock,
-        receiver_incarnation="receiver.1",
         secret=b"x" * 32,
     )
     thirty_one_years_ns = 31 * 366 * 24 * 60 * 60 * 1_000_000_000
     clock.advance(thirty_one_years_ns)
-    context = authority.issue(
-        semantic_owner_epoch="runner.1",
-        execution_control_revision=1,
-    )
+    context = authority.issue(execution_control_revision=1)
     authority.validate(
         context,
-        current_owner_epoch="runner.1",
         current_control_revision=1,
     )
     assert not hasattr(authority, "_contexts")
@@ -207,7 +150,7 @@ def test_command_envelope_is_closed_paired_and_payload_bounded() -> None:
         ExecutionCommandEnvelopeDTO.model_validate(
             {
                 **envelope.model_dump(mode="json"),
-                "control_session_id": None,
+                "control_session_number": None,
                 "extra": True,
             }
         )
@@ -222,7 +165,7 @@ def test_client_incident_is_a_closed_non_authoritative_enum() -> None:
     incident = {
         "schema_version": CONTROL_PROTOCOL_VERSION,
         "message_kind": "client_incident",
-        "control_session_id": "session.1",
+        "control_session_number": 1,
         "client_sequence": "1",
         "incident_id": "incident.1",
         "incident_kind": "control_disconnected",
@@ -252,4 +195,39 @@ def test_client_incident_is_a_closed_non_authoritative_enum() -> None:
                 {**incident, "incident_kind": kind, "reason_code": kind}
             ).incident_kind
             == kind
+        )
+
+
+def test_receipt_v3_always_carries_the_key_and_the_command_row() -> None:
+    """OD-214: the receipt names the formed key and a runner command's row;
+    both members are always present (null for a command never forwarded)."""
+
+    from manyforge_headless_api.control_protocol import (
+        EXECUTION_COMMAND_RECEIPT_SCHEMA,
+        ExecutionCommandReceiptDTO,
+    )
+
+    assert EXECUTION_COMMAND_RECEIPT_SCHEMA == "manyforge.execution_command_receipt.v3"
+    base = {
+        "schema_version": EXECUTION_COMMAND_RECEIPT_SCHEMA,
+        "control_session_number": 1,
+        "client_sequence": "3",
+        "received_server_sequence": "9",
+        "received_monotonic_ns": "100",
+        "disposition": "rejected",
+        "code": "command_not_allowed",
+        "execution_control_revision": 7,
+    }
+    rejected = ExecutionCommandReceiptDTO.model_validate(base).model_dump(mode="json")
+    assert rejected["request_key"] is None and rejected["command"] is None
+    row = {"kind": "start", "request_key": "0" * 32, "step": "admitting",
+           "accepted_at_ns": "1763112345678901234", "end": None}
+    received = ExecutionCommandReceiptDTO.model_validate({
+        **base, "disposition": "received", "code": "program_run_received",
+        "request_key": "0" * 32, "command": row,
+    }).model_dump(mode="json")
+    assert received["command"] == row
+    with pytest.raises(ValidationError):
+        ExecutionCommandReceiptDTO.model_validate(
+            {**base, "schema_version": "manyforge.execution_command_receipt.v2"}
         )

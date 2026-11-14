@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import { api } from '../api/client';
 import { programRunExists } from '../state/heldRunAuthoring';
 import { applyResultText } from '../components/ApplyImpact';
@@ -102,6 +103,8 @@ export function useResetApply({
       ? deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deployment.mutationUnavailableReason)
       : programActionUnavailableReason(programWorkspace, 'apply', program.mutationUnavailableReason);
     if (reason !== null) return reason;
+    // The Reset would meet another Program command and be refused (OD-144).
+    if (runtime.runnerBusyReason !== null) return runtime.runnerBusyReason;
     if (!runtime.runnerAllows('program_reset')) {
       const refusal = runtime.runnerRefusal('program_reset');
       return `Reset is not available now${refusal ? `: ${refusal.replaceAll('_', ' ')}` : ''}.`;
@@ -164,7 +167,6 @@ export function useResetApply({
       correlationId: identity('reset-apply'),
       document,
       programRunId: cycle.programRunId,
-      programRunnerOwnerEpoch: cycle.programRunnerOwnerEpoch,
       cycleGeneration: cycle.cycleGeneration,
       ...draft,
       scope: document === 'deployment' ? scope : null,
@@ -185,7 +187,6 @@ export function useResetApply({
     // Reset ends exactly the cycle the operator confirmed: the runtime
     // refuses, unsent, when the run changed while the context was recorded.
     const outcome = await latest.current.runtime.reset({
-      correlationId: plan.correlationId,
       expected: {
         programRunId: plan.programRunId,
         cycleGeneration: plan.cycleGeneration,
@@ -203,7 +204,7 @@ export function useResetApply({
         message: 'Reset returned an Idle cycle rather than the confirmed held run. Nothing was Applied.' });
       return null;
     }
-    // A lost reply is not a refusal: follow the same correlated settlement,
+    // A lost reply is not a refusal: follow the settlement this Reset causes,
     // never resend, and Apply nothing until it is observed.
     advance(plan.correlationId, {
       kind: 'awaiting_idle',
@@ -274,7 +275,6 @@ export function useResetApply({
       return;
     }
     void latest.current.program.apply({
-      correlationId,
       expectedDraft: {
         draftId: plan.draftId,
         draftRevision: plan.draftRevision,
@@ -306,10 +306,11 @@ export function useResetApply({
 
   // One Activity notice follows the chain with its correlation. A completed
   // Apply is a result, not progress: it clears by itself without Dismiss.
+  const applicationStartId = snapshot?.applicationStartId ?? null;
   const current = useMemo(
     // eslint-disable-next-line react-hooks/refs -- resetApplyNotice stores dismiss without calling it during render.
-    () => (sequence === null ? null : resetApplyNotice(sequence, dismiss)),
-    [dismiss, sequence],
+    () => (sequence === null ? null : resetApplyNotice(sequence, dismiss, applicationStartId)),
+    [applicationStartId, dismiss, sequence],
   );
   const applied = useBriefNotice(sequence?.phase.kind === 'applied' ? current : null);
   const notices = useMemo((): WorkbenchNotice[] => (
@@ -338,6 +339,7 @@ export type ResetApplyController = ReturnType<typeof useResetApply>;
 export function resetApplyNotice(
   sequence: ResetApplySequence,
   dismiss: () => void,
+  applicationStartId: ApplicationStartId | null = null,
 ): WorkbenchNotice {
   const { phase, plan } = sequence;
   const failedPhase = phase.kind === 'failed';
@@ -353,7 +355,7 @@ export function resetApplyNotice(
       : phase.kind === 'applied'
         ? `${name} Applied after Reset`
         : `Resetting the run to Apply the ${name}`,
-    message: `${resetApplyPhaseText(phase)} Correlation ${plan.correlationId}.`,
+    message: `${resetApplyPhaseText(phase, applicationStartId)} Correlation ${plan.correlationId}.`,
     busy: !resetApplyTerminal(phase),
     actions: resetApplyDismissible(phase) && phase.kind !== 'applied'
       ? [failedPhase

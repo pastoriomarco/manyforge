@@ -19,9 +19,8 @@ using testing::FakeExecutionPort;
 static_assert(std::is_abstract_v<IExecutionPort>);
 static_assert(std::has_virtual_destructor_v<IExecutionPort>);
 
-ExecutionGoalKey Key(std::uint64_t generation) {
-  return ExecutionGoalKey{ControllerGoalId("op-1.controller-goal.1"),
-                          ControllerGoalGeneration(generation)};
+ControllerGoalId Key(std::uint64_t generation) {
+  return ControllerGoalId{OperationNumber(901U), 1U, static_cast<std::uint32_t>(generation)};
 }
 
 TrajectoryDTO Trajectory(double end_s) {

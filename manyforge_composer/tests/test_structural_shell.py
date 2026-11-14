@@ -28,7 +28,7 @@ def _client(
         allowed_fs_roots=allowed_fs_roots or ["/workspace"],
         cors_origins=cors_origins or ["http://localhost:3000"],
     )
-    return TestClient(create_app(ComposerState(), security=security))
+    return TestClient(create_app(ComposerState(application_start_id=0x3F9A0000000000A1), security=security))
 
 
 def test_health_and_catalog_report_structural_only_state() -> None:
@@ -135,7 +135,7 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
         / "examples"
         / ("pick_and_place_minimal.program.yaml")
     )
-    state = ComposerState.from_paths(
+    state = ComposerState.from_paths(application_start_id=0x3F9A0000000000A1,
         program_path=str(program_path),
     )
     loaded = TestClient(create_app(state)).get("/api/program/draft")
@@ -152,8 +152,8 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
             "draftId": state.draft_session.draft_id,
             "expectedDraftRevision": state.draft_session.revision,
             "expectedAdmissionGeneration": 1,
-            "requestOwnerEpoch": "test-browser.epoch.1",
-            "requestId": "test-browser.request.1",
+            "applicationStartId": "3f9a0000000000a1",
+            "requestKey": "0123456789abcdef0123456789abcdef",
             "expectedWorkspaceEpoch": (
                 state.authoring_workspace.identity().workspace_epoch
             ),
@@ -162,12 +162,16 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
             ),
         },
     )
-    assert unavailable_apply.status_code == 503
-    assert unavailable_apply.json()["detail"]["code"] == "program_apply_unavailable"
+    # OD-214: accepted, then the preparation finds no Manager: the row ends
+    # with the typed code (5xx: failed, as History records it).
+    assert unavailable_apply.status_code == 200
+    ended = state.apply_commands.ended_row("0123456789abcdef0123456789abcdef")
+    assert (ended["end"]["outcome"], ended["end"]["code"]) == (
+        "failed", "program_apply_unavailable")
 
 
 def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:
-    state = ComposerState(headless_client=object())  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=object())  # type: ignore[arg-type]
     client = TestClient(create_app(state))
     response = client.post(
         "/api/assistant/bridge/tools/scene_draft_add_object",
@@ -200,7 +204,7 @@ def test_program_lifecycle_mutations_reject_oversized_bodies_atomically(
             raise AssertionError(f"unexpected headless call: {name}")
 
     headless = FailOnHeadlessCall()
-    state = ComposerState(headless_client=headless)  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=headless)  # type: ignore[arg-type]
     headless.calls.clear()
     before = state.draft_session.workspace_snapshot()
     body_size = 1024 * 1024 + 1
@@ -233,7 +237,7 @@ def test_program_lifecycle_mutations_reject_oversized_bodies_atomically(
 
 
 def test_unavailable_catch_all_has_stable_unique_openapi_operation_ids() -> None:
-    app = create_app(ComposerState())
+    app = create_app(ComposerState(application_start_id=0x3F9A0000000000A1))
     catch_all_routes = [
         route
         for route in app.routes
@@ -310,7 +314,7 @@ def test_request_log_replays_error_responses_with_repeated_headers() -> None:
     from fastapi.responses import JSONResponse
 
     app = create_app(
-        ComposerState(),
+        ComposerState(application_start_id=0x3F9A0000000000A1),
         security=SecurityConfig(
             allowed_fs_roots=["/workspace"],
             cors_origins=["http://localhost:3000"],
@@ -347,7 +351,7 @@ def test_composer_ingress_remains_open_when_legacy_token_env_is_set(
 ) -> None:
     monkeypatch.setenv("MANYFORGE_API_TOKEN", "stale-legacy-token")
     security = SecurityConfig.from_env()
-    client = TestClient(create_app(ComposerState(), security=security))
+    client = TestClient(create_app(ComposerState(application_start_id=0x3F9A0000000000A1), security=security))
 
     assert not hasattr(security, "api_token")
     assert client.get("/api/health").status_code == 200
@@ -1005,7 +1009,7 @@ def test_typed_refusals_name_their_producer_and_share_the_validation_shape() -> 
     from fastapi import HTTPException
 
     app = create_app(
-        ComposerState(),
+        ComposerState(application_start_id=0x3F9A0000000000A1),
         security=SecurityConfig(
             allowed_fs_roots=["/workspace"],
             cors_origins=["http://localhost:3000"],

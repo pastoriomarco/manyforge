@@ -26,7 +26,7 @@ IoSignalDescriptorDTO descriptor(std::string name, InterruptSourceId source) {
 
 std::shared_ptr<IoSignalSubsystem> signals(FakeClock& clock, std::size_t capacity = 4) {
   auto created = IoSignalSubsystem::Create(
-      {RequestOwnerEpoch("host"), 1, {descriptor("a", kA), descriptor("b", kB)}},
+      {1, {descriptor("a", kA), descriptor("b", kB)}},
       {2, 4, capacity, 4, 128, 1024}, clock);
   if (!created.ok()) return {};
   std::shared_ptr<IoSignalSubsystem> service(std::move(created.value()));
@@ -46,15 +46,14 @@ IoSourceAcquisitionDTO frame(std::uint64_t sequence, TimePoint received, bool va
 }
 
 IoLevelWatchRequestDTO watch() {
-  return {{RequestOwnerEpoch("runner"),
-           ProgramRunId("run"),
-           {ProgramNodeInstanceId("wait"), "attempt"}},
+  return {{ProgramRunNumber(107U),
+           {ProgramNodeInstanceId("wait"), NodeAttemptNumber(1U)}},
           id(),
           true};
 }
 
 IoSourceCursorDTO origin() {
-  return {RequestOwnerEpoch("host"), 1, kA, 0};
+  return {1, kA, 0};
 }
 
 TEST(IoSignalIngressTest, MockIngressFeedsWatchOnlyWhenCallerDrainsAndPreservesReceiptAge) {
@@ -84,7 +83,7 @@ TEST(IoSignalIngressTest, MockIngressFeedsWatchOnlyWhenCallerDrainsAndPreservesR
 TEST(IoSignalIngressTest, MultiSignalEnvelopeUsesOneQueueSlotAndOneSourceRecord) {
   FakeClock clock;
   auto created_service = IoSignalSubsystem::Create(
-      {RequestOwnerEpoch("host"), 1, {descriptor("a", kA), descriptor("other", kA)}},
+      {1, {descriptor("a", kA), descriptor("other", kA)}},
       {1, 2, 2, 4, 128, 1024}, clock);
   ASSERT_TRUE(created_service.ok());
   std::shared_ptr<IoSignalSubsystem> service(std::move(created_service.value()));
@@ -257,7 +256,7 @@ TEST(IoSignalIngressTest, SourceReplacementBeforeDrainRetiresOldDataAndLossHarml
 TEST(IoSignalIngressTest, TypedLossNeedsNoErrorTextBudgetAndObsoleteLossRetiresBeforeShapeCheck) {
   FakeClock clock;
   auto created_service = IoSignalSubsystem::Create(
-      {RequestOwnerEpoch("host"), 1, {descriptor("a", kA)}}, {1, 1, 4, 1, 128, 1},
+      {1, {descriptor("a", kA)}}, {1, 1, 4, 1, 128, 1},
       clock);  // a valid one-byte adapter-error budget
   ASSERT_TRUE(created_service.ok());
   std::shared_ptr<IoSignalSubsystem> service(std::move(created_service.value()));
@@ -312,8 +311,7 @@ TEST(IoSignalIngressTest, FailedApplicableLossAdmissionRemainsRetainedAndBlocksR
 TEST(IoSignalIngressTest, SourceDepthsRemainIndependentForIngressAndRecordRetention) {
   FakeClock clock;
   IoSignalLimitsDTO bounds{2, 2, 8, 2, 128, 1024, {{kA, 1}, {kB, 3}}};
-  const IoSignalCatalogDTO catalog{
-      RequestOwnerEpoch("host"), 1, {descriptor("a", kA), descriptor("b", kB)}};
+  const IoSignalCatalogDTO catalog{1, {descriptor("a", kA), descriptor("b", kB)}};
   auto invalid_bounds = bounds;
   invalid_bounds.records_per_source_overrides[kA] = 0;
   EXPECT_FALSE(IoSignalSubsystem::Create(catalog, invalid_bounds, clock).ok());

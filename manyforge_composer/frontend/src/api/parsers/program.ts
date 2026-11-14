@@ -40,6 +40,7 @@ import {
   nullableStringAt,
   numberAt,
   objectAt,
+  positiveIntegerAt,
   positiveNumberAt,
   quaternionAt,
   stringArrayAt,
@@ -210,17 +211,18 @@ function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
   exactKeysAt(record, [
     'schema_version', 'session_id', 'archive_relative_path', 'shutdown',
     'effects', 'history_coverage', 'journal_families', 'message',
+    'unfinished_operations', 'unfinished_operation_count', 'application_start_id',
   ], path);
-  if (record.schema_version !== 'manyforge.workbench_previous_session.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.workbench_previous_session.v1');
+  if (record.schema_version !== 'manyforge.workbench_previous_session.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.workbench_previous_session.v2');
   }
   const sessionId = stringAt(record.session_id, `${path}.session_id`);
   if (!/^[0-9a-f]{32}$/.test(sessionId)) {
     return fail(`${path}.session_id`, '32 lowercase hexadecimal characters');
   }
   const archiveRelativePath = stringAt(record.archive_relative_path, `${path}.archive_relative_path`);
-  if (archiveRelativePath !== `previous-sessions/${sessionId}`) {
-    return fail(`${path}.archive_relative_path`, 'the matching previous-session archive path');
+  if (archiveRelativePath !== `previous-runs/${sessionId}`) {
+    return fail(`${path}.archive_relative_path`, 'the matching previous-run archive path');
   }
   if (record.shutdown !== 'clean' && record.shutdown !== 'unknown') {
     return fail(`${path}.shutdown`, 'clean or unknown');
@@ -243,6 +245,31 @@ function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
     || message.normalize('NFC') !== message) {
     return fail(`${path}.message`, 'NFC UTF-8 text of at most 1024 bytes');
   }
+  let unfinishedOperationIds: number[] | null = null;
+  let unfinishedOperationCount: number | null = null;
+  let applicationStartId: string | null = null;
+  if (record.unfinished_operations !== null || record.unfinished_operation_count !== null
+    || record.application_start_id !== null) {
+    applicationStartId = stringAt(record.application_start_id, `${path}.application_start_id`);
+    if (!/^[0-9a-f]{16}$/.test(applicationStartId) || /^0{16}$/.test(applicationStartId)) {
+      return fail(`${path}.application_start_id`, '16 lowercase hexadecimal characters, not all zero');
+    }
+    unfinishedOperationIds = boundedArrayAt(
+      record.unfinished_operations, `${path}.unfinished_operations`, 64,
+    ).map((item, index) => {
+      const at = `${path}.unfinished_operations[${index}]`;
+      const row = objectAt(item, at);
+      exactKeysAt(row, ['operation_id', 'disposition'], at);
+      if (row.disposition !== 'host_replaced') return fail(`${at}.disposition`, 'host_replaced');
+      return positiveIntegerAt(row.operation_id, `${at}.operation_id`);
+    });
+    unfinishedOperationCount = integerAt(
+      record.unfinished_operation_count, `${path}.unfinished_operation_count`,
+    );
+    if (unfinishedOperationCount < unfinishedOperationIds.length) {
+      return fail(`${path}.unfinished_operation_count`, 'at least the listed operations');
+    }
+  }
   return {
     schemaVersion: record.schema_version,
     sessionId,
@@ -252,6 +279,9 @@ function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
     historyCoverage: record.history_coverage,
     journalFamilies,
     message,
+    unfinishedOperationIds,
+    unfinishedOperationCount,
+    applicationStartId,
   };
 }
 

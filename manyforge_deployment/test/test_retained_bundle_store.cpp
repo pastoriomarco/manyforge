@@ -2907,7 +2907,7 @@ TEST(FilesystemRetainedBundleRepositoryTest,
 }
 
 TEST(FilesystemRetentionStoreTest,
-     ReferenceRuntimeProductDurablyReloadsAndPointReadsAsOneExactPair) {
+     RosExecutionHostProductDurablyReloadsAndPointReadsAsOneExactPair) {
   const auto fixture = test::make_runtime_only_retention_fixture();
   ScopedTrustedRoot root;
   FilesystemBuildManifestRepository manifest_repository(
@@ -2946,22 +2946,24 @@ TEST(FilesystemRetentionStoreTest,
       bundle->retained_bundle_id(), product.product_id,
       core::RetainedProductKind::kRuntimeUnitConfiguration,
       core::ArtifactRoleId(std::string(
-          detail::kReferenceRuntimeManifestArtifactRole)),
+          detail::kRos2ControlExecutionRuntimeManifestArtifactRole)),
   });
   const auto launchable = artifact_source.get_verified({
       bundle->retained_bundle_id(), product.product_id,
       core::RetainedProductKind::kRuntimeUnitConfiguration,
       core::ArtifactRoleId(std::string(
-          detail::kReferenceRuntimeLaunchableArtifactRole)),
+          detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole)),
   });
   ASSERT_TRUE(manifest.has_value());
   ASSERT_TRUE(launchable.has_value());
-  EXPECT_EQ(launchable->bytes(), detail::reference_runtime_launchable_script());
+  EXPECT_EQ(launchable->bytes(),
+            detail::ros2_control_execution_runtime_launch_descriptor());
   EXPECT_NO_THROW(
-      detail::require_reference_runtime_product_matches_retained_bundle(
-          manifest->bytes(), launchable->bytes(), reloaded->value(),
-          group.runtime_unit_id));
-  const auto verified_runtime = verify_reference_runtime_unit_product(
+      detail::
+          require_ros2_control_execution_runtime_product_matches_retained_bundle(
+              manifest->bytes(), launchable->bytes(), reloaded->value(),
+              group.runtime_unit_id));
+  const auto verified_runtime = verify_runtime_unit_product(
       *reloaded, group.runtime_unit_id, artifact_source);
   ASSERT_TRUE(verified_runtime.has_value());
   EXPECT_EQ(verified_runtime->retained_bundle_id(),
@@ -2971,10 +2973,14 @@ TEST(FilesystemRetentionStoreTest,
   EXPECT_EQ(verified_runtime->configuration_identity(),
             manifest->artifact_ref().content_digest);
   EXPECT_EQ(verified_runtime->launchable_bytes(), launchable->bytes());
-  EXPECT_EQ(verified_runtime->operating_system(), "linux");
-  EXPECT_EQ(verified_runtime->shell_contract(), "posix.1-2017");
-  EXPECT_EQ(verified_runtime->runtime_role_id(), "manager_fixture");
-  EXPECT_EQ(verified_runtime->status_endpoint_role_id(), "runtime_status");
+  EXPECT_EQ(verified_runtime->operating_system(),
+            detail::kRos2ControlExecutionRuntimeOperatingSystem);
+  EXPECT_EQ(verified_runtime->shell_contract(),
+            detail::kRos2ControlExecutionRuntimeLaunchEnvironmentContract);
+  EXPECT_EQ(verified_runtime->runtime_role_id(),
+            detail::kRos2ControlExecutionRuntimeRoleId);
+  EXPECT_EQ(verified_runtime->status_endpoint_role_id(),
+            detail::kRos2ControlExecutionRuntimeStatusEndpointRoleId);
 }
 
 [[nodiscard]] CanonicalValue logic_only_program(std::string_view content_version) {

@@ -60,14 +60,14 @@ public:
     return port.action_client_ && port.state_sub_ && port.scale_pub_;
   }
   static void cancel_response(
-      Ros2ControlExecutionBackend &port, const core::ExecutionGoalKey &key,
+      Ros2ControlExecutionBackend &port, const core::ControllerGoalId &key,
       std::uint64_t sequence,
       const action_msgs::srv::CancelGoal::Response::SharedPtr &response) {
     Ros2ControlExecutionBackend::ReceiveCancelResponse(port.state_, key,
                                                        sequence, response);
   }
   static void terminal(
-      Ros2ControlExecutionBackend &port, const core::ExecutionGoalKey &key,
+      Ros2ControlExecutionBackend &port, const core::ControllerGoalId &key,
       const rclcpp_action::ClientGoalHandle<
           control_msgs::action::FollowJointTrajectory>::WrappedResult &result) {
     Ros2ControlExecutionBackend::ReceiveResult(port.state_, key, result);
@@ -125,9 +125,8 @@ private:
   std::atomic<bool> finished_{false};
   std::thread thread_;
 };
-ExecutionGoalKey key(std::uint64_t generation) {
-  return {ControllerGoalId("test.operation.arm"),
-          ControllerGoalGeneration(generation)};
+ControllerGoalId key(std::uint32_t generation) {
+  return {OperationNumber(1U), 1U, generation};
 }
 TrajectoryDTO trajectory() {
   TrajectoryDTO value;
@@ -369,7 +368,7 @@ public:
     config.lane_facts.goal_tolerance_policy = goal_tolerance_policy_;
     return config;
   }
-  ExecutionPortCommandResultDTO submit(const ExecutionGoalKey &goal_key) {
+  ExecutionPortCommandResultDTO submit(const ControllerGoalId &goal_key) {
     // Test waits for ROS discovery outside the port; port calls never wait.
     ExecutionPortCommandResultDTO result;
     EXPECT_TRUE(wait_until([&] {
@@ -379,7 +378,7 @@ public:
     }));
     return result;
   }
-  bool accepted(const ExecutionGoalKey &goal_key,
+  bool accepted(const ControllerGoalId &goal_key,
                 Ros2ControlExecutionBackend *port = nullptr) {
     if (!port)
       port = adapter.get();
@@ -760,6 +759,34 @@ TEST(JtcExecutionPort, SubmitMapsFullPvaAndReportsLocalAcceptanceAndUuid) {
   EXPECT_EQ(actual->goal_tolerance[0].position, -1.0);
 }
 
+// The goal table maps each goal key (operation participant goal and its
+// generation) to the ROS goal UUID rclcpp_action minted for it, kept as the
+// same 16 bytes the server sees; acceptance and the result match on them.
+TEST(JtcExecutionPort, GoalTableKeepsEachGoalUuidAsItsSixteenBytes) {
+  Rig rig;
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  const auto first = rig.adapter->ReadGoal(key(1));
+  const auto second = rig.adapter->ReadGoal(key(2));
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first->mechanism_goal_id.bytes, rig.handle(0)->get_goal_id());
+  EXPECT_EQ(second->mechanism_goal_id.bytes, rig.handle(1)->get_goal_id());
+  EXPECT_NE(first->mechanism_goal_id, second->mechanism_goal_id);
+  // The result for the first UUID ends the first record only.
+  auto result = std::make_shared<Action::Result>();
+  result->error_code = Action::Result::INVALID_GOAL;
+  result->error_string = "Current goal preempted by new incoming action.";
+  rig.handle(0)->abort(result);
+  ASSERT_TRUE(wait_until([&] { return rig.adapter->ReadGoal(key(1))->result.has_value(); }));
+  EXPECT_EQ(rig.adapter->ReadGoal(key(1))->mechanism_goal_id.bytes,
+            rig.handle(0)->get_goal_id());
+  EXPECT_FALSE(rig.adapter->ReadGoal(key(2))->result);
+}
+
 // Arrival: a lane that keeps goal tolerances sends none, so stock JTC
 // applies its configured per-joint `goal` constraint (the lane's arrival
 // tolerance) and succeeds only when finished within it.
@@ -785,7 +812,7 @@ TEST(JtcExecutionPort, StopGoalsKeepTheLaneArrivalCheckLikeMotionGoals) {
   Rig rig(false, true, ExecutionGoalTolerancePolicy::kKept);
   // The fake server never ends goals: preempt each predecessor like stock JTC,
   // so at most two goal records stay unfinished.
-  const auto preempt = [&](std::size_t index, const ExecutionGoalKey &predecessor) {
+  const auto preempt = [&](std::size_t index, const ControllerGoalId &predecessor) {
     auto result = std::make_shared<Action::Result>();
     result->error_code = Action::Result::INVALID_GOAL;
     // Stock JTC's preemption result, so the record ends known (evictable).

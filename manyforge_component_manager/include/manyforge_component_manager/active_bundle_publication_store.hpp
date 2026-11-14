@@ -10,11 +10,19 @@
 
 #include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
 
+namespace manyforge::persistence {
+class SqliteRecordWriter;
+}  // namespace manyforge::persistence
+
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kActiveBundlePublicationStoreSchemaId =
-    "manyforge.internal.active-bundle-publication-store.i4.v2";
-inline constexpr std::int64_t kActiveBundlePublicationStoreSchemaVersion = 2;
+    "manyforge.internal.active-bundle-publication-store.i4.v4";
+/// v3: a named Apply's `transaction_id` is its decimal Apply number (contract
+/// 1.16.1). v4: metadata `records_lost`, set by the record writer when records
+/// of this start were not written. A store of any other version is refused,
+/// never converted.
+inline constexpr std::int64_t kActiveBundlePublicationStoreSchemaVersion = 4;
 inline constexpr std::int64_t kActiveBundlePublicationStoreSqliteApplicationId =
     1296449872;
 inline constexpr std::int64_t kMaximumActiveBundlePublicationReceipts = 4096;
@@ -74,12 +82,17 @@ struct ActiveBundlePublicationStoreIntegrityReport final {
 /// receipt (never the head). The
 /// reader capability succeeds only when its requested generation still names
 /// the singleton active pointer.
+///
+/// The store's records live in memory and every answer comes from memory.
+/// The file is written afterwards by the record writer, in memory order;
+/// without a handed-in writer the store owns one and drains it at Close.
 class SqliteActiveBundlePublicationStore final
     : public manyforge::core::IActiveBundlePublicationStore {
  public:
   SqliteActiveBundlePublicationStore(
       std::filesystem::path database_path,
-      manyforge::core::CellId cell_id);
+      manyforge::core::CellId cell_id,
+      manyforge::persistence::SqliteRecordWriter* record_writer = nullptr);
   ~SqliteActiveBundlePublicationStore() override;
 
   SqliteActiveBundlePublicationStore(
@@ -105,29 +118,18 @@ class SqliteActiveBundlePublicationStore final
       manyforge::core::ActiveBundlePublicationGeneration
           publication_generation) const override;
 
-  /// Complete SQLite, schema, receipt-chain and head verification. The last
-  /// complete result is reused only while the database is provably unchanged
-  /// (same SQLite `data_version` and same total change count of this
-  /// connection); any commit forces complete re-verification on the next call.
+  /// The store's identity, receipt count and head, from memory. The file's
+  /// SQLite, schema, receipt-chain and head verification runs once, at open.
   [[nodiscard]] ActiveBundlePublicationStoreIntegrityReport
   VerifyIntegrity() const;
-  /// Number of complete verifications performed (reuse does not advance it).
+  /// Number of complete verifications of the file: one, at open.
   [[nodiscard]] std::uint64_t complete_verification_count() const;
 
   void Close();
 
  private:
-  friend manyforge::core::Result<manyforge::core::ActiveBundlePublicationReceiptDTO>
-  ReadActiveBundlePublicationReadOnly(const std::filesystem::path &,
-                                    const manyforge::core::CellId &);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-/// Observation-only current head from an existing store. No initialization,
-/// schema migration, write connection, checkpoint or publication permission.
-[[nodiscard]] manyforge::core::Result<manyforge::core::ActiveBundlePublicationReceiptDTO>
-ReadActiveBundlePublicationReadOnly(const std::filesystem::path &database_path,
-                                  const manyforge::core::CellId &cell_id);
 
 }  // namespace manyforge::component_manager

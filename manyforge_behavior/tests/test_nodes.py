@@ -508,3 +508,15 @@ def test_position_bounds_are_inclusive_by_choice_and_reject_empty_boxes() -> Non
     assert not position_within_bounds([1, 1, 1], [0, 0, 0], [1, 1, 1], inclusive=False)
     with pytest.raises(ValueError, match="exceeds"):
         position_within_bounds([0, 0, 0], [1, 0, 0], [0, 1, 1], inclusive=True)
+
+
+def test_initial_ready_nodes_come_from_the_first_published_snapshot() -> None:
+    # The hold revision counts for the whole application start, so the run's
+    # first view is not at revision 0; later views never replace it.
+    state = OperatorMotionStopState({"a": (), "b": ()})
+    assert state.initial_ready_nodes() == frozenset()
+    first = frozenset({"a", "b"})
+    state.publish(OperatorMotionStopSnapshot(41, first, ready_nodes=first))
+    state.publish(OperatorMotionStopSnapshot(42, frozenset({"b"}), ready_nodes=frozenset({"b"})))
+    assert state.initial_ready_nodes() == first
+    assert state.snapshot().hold_revision == 42

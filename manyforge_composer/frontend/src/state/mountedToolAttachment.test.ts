@@ -359,7 +359,6 @@ function section(payload: Record<string, unknown>): HeadlessSourceSection {
     knownGaps: [],
     payload,
     sourceGeneration: 466,
-    sourceOwnerEpoch: 'owner-epoch-1',
     sourceOwnerId: 'owner-1',
     receiverAgeNs: null,
   };

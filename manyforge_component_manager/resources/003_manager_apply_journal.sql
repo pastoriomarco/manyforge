@@ -1,4 +1,7 @@
--- ManyForge UA4 typed named-Apply journal, version 22.
+-- ManyForge UA4 typed named-Apply journal, version 24.
+--
+-- Version 24: metadata records_lost, set by the record writer when records of
+-- this start were not written.
 --
 -- This schema stores immutable named-Apply intents, including the exact UA2A
 -- prepared activation each operation accepted (captured source-closure digest,
@@ -25,12 +28,12 @@
 -- with every row it owns. accepted_sequence orders Applies for that choice.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 22;
+PRAGMA user_version = 24;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 22),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 24),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -99,20 +102,20 @@ CREATE TABLE IF NOT EXISTS apply_journal_metadata (
             maximum_main_database_page_image_bytes > 0
             AND maximum_main_database_page_image_bytes
                 <= 9223372036854775807
-        )
+        ),
+    -- Set by the record writer when records of this start were not written.
+    records_lost INTEGER NOT NULL DEFAULT 0 CHECK (records_lost IN (0, 1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_intents (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL
         CHECK (
             apply_generation > 0
             AND apply_generation <= 9223372036854775807
         ),
-    request_id TEXT NOT NULL,
-    request_owner_epoch TEXT NOT NULL,
+    request_key BLOB NOT NULL CHECK (length(request_key) = 16),
     source_label TEXT NOT NULL,
-    correlation_id TEXT,
     predecessor_retained_bundle_id TEXT NOT NULL,
     predecessor_graph_revision TEXT NOT NULL,
     predecessor_scene_id TEXT NOT NULL,
@@ -158,13 +161,13 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
         <> (parent_authoring_claim IS NOT NULL)
     ),
     PRIMARY KEY (apply_id, apply_generation),
-    UNIQUE (request_owner_epoch, request_id),
+    UNIQUE (request_key),
     UNIQUE (apply_id, apply_generation, intent_digest),
     UNIQUE (accepted_sequence)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_affected_scopes (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     intent_digest TEXT NOT NULL,
     components_encoding TEXT NOT NULL,
@@ -185,14 +188,12 @@ CREATE TABLE IF NOT EXISTS manager_apply_affected_scopes (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_fence_attempts (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     intent_digest TEXT NOT NULL,
     affected_scope_digest TEXT NOT NULL,
-    request_id TEXT NOT NULL,
-    request_owner_epoch TEXT NOT NULL,
+    request_key BLOB NOT NULL CHECK (length(request_key) = 16),
     source_label TEXT NOT NULL,
-    correlation_id TEXT,
     components_encoding TEXT NOT NULL,
     domains_encoding TEXT NOT NULL,
     bindings_encoding TEXT NOT NULL,
@@ -221,7 +222,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_fence_attempts (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_fence_acceptances (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     fence_attempt_digest TEXT NOT NULL,
     configuration_fence_id TEXT NOT NULL,
@@ -245,7 +246,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_fence_acceptances (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_runtime_convergence_intents (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     intent_digest TEXT NOT NULL,
     candidate_retained_bundle_id TEXT NOT NULL,
@@ -273,7 +274,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_runtime_convergence_intents (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_runtime_staged_ready_sets (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     staged_ready_generation INTEGER NOT NULL
         CHECK (
@@ -301,7 +302,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_runtime_staged_ready_sets (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_private_materializations (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     authoritative_scene_snapshot_digest TEXT NOT NULL,
     candidate_retained_bundle_id TEXT NOT NULL,
@@ -325,7 +326,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_private_materializations (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_publication_receipts (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     candidate_retained_bundle_id TEXT NOT NULL,
     candidate_graph_revision TEXT NOT NULL,
@@ -355,7 +356,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_publication_receipts (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_fence_release_intents (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     scene_completion_digest TEXT NOT NULL,
     fence_acceptance_digest TEXT NOT NULL,
@@ -374,7 +375,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_fence_release_intents (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_fence_released_records (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     fence_release_intent_digest TEXT NOT NULL,
     released_fence_encoding TEXT NOT NULL,
@@ -388,7 +389,7 @@ CREATE TABLE IF NOT EXISTS manager_apply_fence_released_records (
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     fence_released_digest TEXT,
     scene_completion_digest TEXT,
@@ -498,8 +499,30 @@ CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
         )
 ) WITHOUT ROWID, STRICT;
 
+-- Every column but records_lost is immutable.
 CREATE TRIGGER IF NOT EXISTS apply_journal_metadata_no_update
-BEFORE UPDATE ON apply_journal_metadata
+BEFORE UPDATE OF
+    singleton,
+    schema_id,
+    schema_version,
+    schema_artifact_digest,
+    cell_id,
+    maximum_apply_intents,
+    maximum_fence_attempts,
+    maximum_affected_scopes,
+    maximum_fence_components,
+    maximum_fence_domains,
+    maximum_fence_bindings,
+    maximum_fence_resources,
+    maximum_runtime_convergence_intents,
+    maximum_runtime_staged_ready_sets,
+    maximum_private_materializations,
+    maximum_publication_receipts,
+    maximum_fence_release_intents,
+    maximum_fence_released_records,
+    maximum_terminal_outcomes,
+    maximum_main_database_page_image_bytes
+ON apply_journal_metadata
 BEGIN
     SELECT RAISE(ABORT, 'apply_journal_metadata is immutable');
 END;
@@ -576,19 +599,25 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_terminal_outcomes is immutable');
 END;
 
--- Operator acknowledgement and its one fence-release attempt for a failed
--- before-effect Apply. The terminal failure remains unchanged.
+-- The release of a failed Apply's held fence and claim: the operator's
+-- acknowledgement of a before-effect failure (one attempt), or New's release
+-- of any failure (no fence acceptance or fence release request when the
+-- Kernel held none; New begins an incomplete attempt again). The terminal
+-- failure remains unchanged.
 CREATE TABLE IF NOT EXISTS manager_apply_failed_release (
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL CHECK (apply_id > 0),
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
     terminal_outcome_digest TEXT NOT NULL,
-    fence_acceptance_digest TEXT NOT NULL,
-    acknowledgement_request_id TEXT NOT NULL,
+    fence_acceptance_digest TEXT,
+    acknowledgement_request_key BLOB NOT NULL
+        CHECK (length(acknowledgement_request_key) = 16),
     acknowledgement_source_label TEXT NOT NULL,
-    release_request_encoding TEXT NOT NULL,
+    release_request_encoding TEXT,
     released_fence_encoding TEXT,
     acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
-    CHECK (acknowledged = 0 OR released_fence_encoding IS NOT NULL),
+    CHECK (released_fence_encoding IS NULL OR release_request_encoding IS NOT NULL),
+    CHECK (acknowledged = 0 OR released_fence_encoding IS NOT NULL
+           OR release_request_encoding IS NULL),
     PRIMARY KEY (apply_id, apply_generation),
     FOREIGN KEY (apply_id, apply_generation, terminal_outcome_digest)
         REFERENCES manager_apply_terminal_outcomes
@@ -604,16 +633,22 @@ WHEN OLD.apply_id IS NOT NEW.apply_id
   OR OLD.apply_generation IS NOT NEW.apply_generation
   OR OLD.terminal_outcome_digest IS NOT NEW.terminal_outcome_digest
   OR OLD.fence_acceptance_digest IS NOT NEW.fence_acceptance_digest
-  OR OLD.acknowledgement_request_id IS NOT NEW.acknowledgement_request_id
-  OR OLD.acknowledgement_source_label IS NOT NEW.acknowledgement_source_label
-  OR OLD.release_request_encoding IS NOT NEW.release_request_encoding
   OR NOT (
-      (OLD.released_fence_encoding IS NULL AND NEW.released_fence_encoding IS NOT NULL
+      (OLD.released_fence_encoding IS NULL AND NEW.released_fence_encoding IS NULL
        AND OLD.acknowledged = 0 AND NEW.acknowledged = 0)
       OR
-      (OLD.released_fence_encoding IS NOT NULL
-       AND OLD.released_fence_encoding IS NEW.released_fence_encoding
-       AND OLD.acknowledged = 0 AND NEW.acknowledged = 1)
+      (OLD.acknowledgement_request_key IS NEW.acknowledgement_request_key
+       AND OLD.acknowledgement_source_label IS NEW.acknowledgement_source_label
+       AND OLD.release_request_encoding IS NEW.release_request_encoding
+       AND ((OLD.released_fence_encoding IS NULL AND NEW.released_fence_encoding IS NOT NULL
+             AND OLD.acknowledged = 0 AND NEW.acknowledged = 0)
+            OR
+            (OLD.released_fence_encoding IS NOT NULL
+             AND OLD.released_fence_encoding IS NEW.released_fence_encoding
+             AND OLD.acknowledged = 0 AND NEW.acknowledged = 1)
+            OR
+            (OLD.release_request_encoding IS NULL AND NEW.released_fence_encoding IS NULL
+             AND OLD.acknowledged = 0 AND NEW.acknowledged = 1)))
   )
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_failed_release permits one release and acknowledgement');

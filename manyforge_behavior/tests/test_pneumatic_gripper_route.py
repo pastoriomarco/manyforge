@@ -101,7 +101,7 @@ def _node(*, required, dwell=0.0, writes=None):
     operations = _Operations(route, events)
     attempts = []
     def begin(node):
-        identity = NodeAttemptIdentity("run", node, f"attempt.{len(attempts)}")
+        identity = NodeAttemptIdentity(1, node, len(attempts) + 1)
         attempts.append(identity)
         return identity
     adapter = GripperCommandAdapter(
@@ -112,7 +112,6 @@ def _node(*, required, dwell=0.0, writes=None):
             parameters=kwargs["parameters"], blackboard={})),
         port=operations, program_clock=ProgramClock(lambda: now[0]),
         io_watches=_Watches(levels, events), io_signals=_Reads(levels, events, writes or {}),
-        transport_timeout_s=5.0,
     )
     return adapter, events, levels, now
 

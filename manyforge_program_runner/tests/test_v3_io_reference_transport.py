@@ -17,14 +17,12 @@ from manyforge_program_runner.active_tcp_mirror import decode_active_tcp_rows
 
 def test_watch_uses_direct_signal_and_rejects_role_fields():
     request = {
-        "schema_version": "manyforge.io_watch_request.v2",
-        "owner_epoch": "owner",
+        "schema_version": "manyforge.io_watch_request.v3",
         "program_binding_id": "sha256:" + "0" * 64,
-        "program_runner_owner_epoch": "runner",
         "claim_generation": 1,
-        "program_run_id": "run",
+        "program_run_id": 1,
         "node_instance_id": "node",
-        "node_attempt_id": "attempt",
+        "node_attempt_id": 1,
         "signal": {"component_id": "robot_io", "signal_name": "CI0"},
         "condition": {"kind": "level", "expected_value": True},
     }
@@ -61,7 +59,7 @@ def test_active_tcp_reading_preserves_mounted_tool_frame_owner():
         "frame": {"component_id": "tool", "frame_id": "tcp"},
     }
     decoded = decode_active_tcp_rows([{
-        "component_id": "robot", "owner_epoch": "owner",
+        "component_id": "robot",
         "registration_generation": 1, "sequence": 1, "entry": entry,
     }])
     assert decoded[0][-1] == entry

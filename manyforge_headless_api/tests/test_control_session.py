@@ -40,22 +40,19 @@ from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
 from manyforge_headless_api.execution import ExecutionEventPump
 from manyforge_headless_api.tests.paged_event_stream import paged_subscription
-from manyforge_headless_api.execution_control import (
-    ExecutionControlBusyError,
-    ExecutionControlLane,
-)
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.service import HeadlessService
 from manyforge_headless_api import control_state as control_state_module
 from manyforge_headless_api.program_cycle import (
     program_cycle_event_class as _program_event_class,
 )
-from manyforge_headless_api.tests.source_snapshot_fixture import source_snapshot_text
 
 
-def _cycle() -> dict[str, Any]:
+APPLICATION_START_ID = "3f9a0000000000a1"
+
+
+def _cycle(**_kwargs: Any) -> dict[str, Any]:
     return {
-        "program_runner_owner_epoch": "runner.1",
         "execution_control_revision": 4,
         "cycle_generation": 2,
         "state": "idle_after_reset",
@@ -72,6 +69,7 @@ def _cycle() -> dict[str, Any]:
         "reset_options": None,
         "reset_robot_position": {"available": False, "reason": "unsupported"},
         "current_command_kind": None,
+        "runner_commands": {"in_progress": None, "ended": []},
         "allowed_commands": [
             {
                 "command_kind": "program_run",
@@ -80,9 +78,7 @@ def _cycle() -> dict[str, Any]:
                 "disabled_reason": None,
             }
         ],
-        "causal_correlation_id": None,
-        "causal_session_id": None,
-        "causal_client_sequence": None,
+        "causal_request_key": None,
         "failure": None,
     }
 
@@ -103,29 +99,25 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
     }
     capture.update(
         {
-            "schema_version": "manyforge.program_run_capture.v2",
-            "program_run_id": "run.1",
+            "schema_version": "manyforge.program_run_capture.v3",
+            "program_run_id": 1,
             "scenario_id": "pick",
             "program_id": "program.pick",
             "node_policies": [],
             "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
             "owner_identities": [
-                {
-                    "owner_role": "program_runner",
-                    "owner_id": "runner",
-                    "owner_epoch": "runner.1",
-                }
+                {"role": "program_runner", "application_start_id": APPLICATION_START_ID}
             ],
         }
     )
     run = {
-        "schema_version": "manyforge.program_run_status.v4",
+        "schema_version": "manyforge.program_run_status.v5",
         "owner_id": "runner",
-        "owner_epoch": "runner.1",
         "run_revision": 1,
         "capture": capture,
         "state": "running",
         "tree_status": "running",
+        "halt": None,
         "node_status_revision": node_revision,
         "node_statuses": {"root": "running"},
         "active_operation_count": 1,
@@ -138,7 +130,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
     return {
         **_cycle(),
         "state": "running",
-        "program_run_id": "run.1",
+        "program_run_id": 1,
         "cycle_claim_generation": 1,
         "run": run,
         "run_revision": 1,
@@ -153,7 +145,6 @@ def _ingress(stamps: list[Any]) -> ExecutionControlIngress:
             ExecutionIngressResult(
                 disposition="received",
                 code=f"{request.command_envelope.command_kind}_received",
-                semantic_owner_epoch="runner.1",
                 execution_control_revision=4,
                 current_identity={"cycle_generation": 2},
             ),
@@ -161,12 +152,10 @@ def _ingress(stamps: list[Any]) -> ExecutionControlIngress:
         )
 
     return ExecutionControlIngress(
-        projection=lambda: ("runner.1", 4),
+        projection=lambda: 4,
         dispatch=dispatch,
-        authority=ControlFreshnessAuthority(
-            receiver_incarnation="receiver.1",
-            secret=b"x" * 32,
-        ),
+        application_start_id=APPLICATION_START_ID,
+        authority=ControlFreshnessAuthority(secret=b"x" * 32),
     )
 
 
@@ -220,7 +209,6 @@ class _Source:
         return ControlSemanticContext(
             status="current",
             reason=None,
-            semantic_owner_epoch=self.frame.control.semantic_owner_epoch,
             execution_control_revision=self.frame.control.execution_control_revision,
         )
 
@@ -271,7 +259,7 @@ class _CommandSocket(_HandshakeSocket):
     def __init__(self, frame: ControlStateFrame) -> None:
         super().__init__()
         self.frame = frame
-        self.session_id: str | None = None
+        self.session_number: int | None = None
         self.done = asyncio.Event()
 
     async def receive_text(self) -> str:
@@ -287,27 +275,23 @@ class _CommandSocket(_HandshakeSocket):
                 }
             )
         if self.receives == 2:
-            while self.session_id is None:
+            while self.session_number is None:
                 await asyncio.sleep(0)
             control = self.frame.control
             return json.dumps(
                 {
                     "schema_version": CONTROL_PROTOCOL_VERSION,
                     "message_kind": "command",
-                    "control_session_id": self.session_id,
+                    "control_session_number": self.session_number,
                     "client_sequence": "1",
                     "command": {
                         "command_envelope": {
                             "schema_version": EXECUTION_COMMAND_SCHEMA,
                             "command_kind": "program_run",
-                            "correlation_id": "request.1",
                             "source_label": "test",
-                            "control_session_id": self.session_id,
+                            "control_session_number": self.session_number,
                             "client_sequence": "1",
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (
-                                control.semantic_owner_epoch
-                            ),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -323,7 +307,7 @@ class _CommandSocket(_HandshakeSocket):
         value = json.loads(payload)
         self.sent.append(value)
         if value["message_kind"] == "server_hello":
-            self.session_id = value["control_session_id"]
+            self.session_number = value["control_session_number"]
         if value["message_kind"] == "command_receipt":
             self.done.set()
             raise WebSocketDisconnect()
@@ -352,21 +336,18 @@ def _frame(ingress: ExecutionControlIngress) -> ControlStateFrame:
 
 def _shell_for_cycle(cycle: dict[str, Any]) -> dict[str, Any]:
     runtime = {
-        "projection_owner_epoch": "runtime.1",
+        "application_start_id": "3f9a0000000000a1",
         "sections": {
-            "manager": {"source_owner_epoch": "manager.1"},
+            "manager": {},
             "logical_scene": {
-                "source_owner_epoch": "scene.1",
                 "source_generation": 3,
             },
             "scene_runtime": {
-                "source_owner_epoch": "scene-runtime.1",
                 "source_generation": 5,
             },
         },
     }
     alarms = {
-        "owner_epoch": "alarms.1",
         "generation": 7,
         "state_revision": 11,
     }
@@ -377,17 +358,11 @@ def _shell_for_cycle(cycle: dict[str, Any]) -> dict[str, Any]:
         "authoring_admission": authoring,
         "component_overview": {
             "basis": {
-                "runtime_projection_owner_epoch": "runtime.1",
-                "manager_source_owner_epoch": "manager.1",
-                "logical_scene_source_owner_epoch": "scene.1",
                 "logical_scene_source_generation": 3,
-                "scene_runtime_source_owner_epoch": "scene-runtime.1",
                 "scene_runtime_source_generation": 5,
-                "alarm_owner_epoch": "alarms.1",
                 "alarm_generation": 7,
                 "alarm_state_revision": 11,
                 "admission_generation": 13,
-                "program_runner_owner_epoch": cycle["program_runner_owner_epoch"],
                 "program_cycle_generation": cycle["cycle_generation"],
             }
         },
@@ -424,11 +399,10 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
         def identity():
             identity_reads.append(None)
             # Ready identity deliberately has no admission generation.
-            return {"ok": True, "identity": {"owner_epoch": "execution.1"}}
+            return {"ok": True, "identity": {"application_start_id": APPLICATION_START_ID}}
 
-        def events(owner_epoch, after_sequence, *, limit):
+        def events(after_sequence, *, limit):
             return {
-                "owner_epoch": owner_epoch,
                 "execution_owner_ready": True,
                 "runtime_faults": {
                     "operation_journal_write_fault": None,
@@ -468,10 +442,11 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
             execution := SimpleNamespace(
                 identity=identity,
                 events=events,
-                subscribe_events=lambda after_cursor, owner_epoch: paged_subscription(
-                    execution, after_cursor, owner_epoch
+                subscribe_events=lambda after_cursor: paged_subscription(
+                    execution, after_cursor
                 ),
             ),
+            application_start_id=APPLICATION_START_ID,
             poll_seconds=0.01,
         )
         pump.set_change_observer(source.notify_cold)
@@ -504,10 +479,10 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
 @pytest.mark.parametrize(
     "target_owner,control_owner",
     [
-        (None, "new"),
-        ("old", None),
-        ("old", "new"),
-        ("new", "new"),
+        (None, 2),
+        (1, None),
+        (1, 2),
+        (2, 2),
     ],
 )
 def test_control_shell_never_publishes_a_partial_or_crossed_execution_pair(
@@ -517,19 +492,21 @@ def test_control_shell_never_publishes_a_partial_or_crossed_execution_pair(
     targets = (
         None
         if target_owner is None
-        else {"ok": True, "identity": {"owner_epoch": target_owner}}
+        else {"ok": True, "identity": {"active_publication_generation": target_owner}}
     )
     control = (
         None
         if control_owner is None
-        else {"ok": True, "identity": {"owner_epoch": control_owner}}
+        else {"ok": True, "identity": {"active_publication_generation": control_owner}}
     )
     facts = replace(
         _facts_for_cycle(_cycle()),
         execution_targets_response=targets,
         execution_control_response=control,
     )
-    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    shell = HeadlessControlStateSource._shell_from_facts(
+        facts, application_start_id=APPLICATION_START_ID
+    )
     coherent = target_owner is not None and target_owner == control_owner
     assert shell["execution_targets"] == (targets if coherent else None)
     assert shell["execution_control_state"] == (control if coherent else None)
@@ -537,30 +514,45 @@ def test_control_shell_never_publishes_a_partial_or_crossed_execution_pair(
     assert facts.execution_control_response is control
 
 
+def test_snapshot_program_cycle_carries_the_causal_display() -> None:
+    key = "00" + "00000000000004" + "0000000000000076"
+    cycle = {**_cycle(), "causal_request_key": key}
+    shell = HeadlessControlStateSource._shell_from_facts(
+        _facts_for_cycle(cycle), application_start_id=APPLICATION_START_ID
+    )
+    # Like ``/api/cycle/status``: the key as received plus its display.
+    assert shell["program_cycle"]["causal_request_key"] == key
+    assert shell["program_cycle"]["causal_display"] == "3f9a/s4.118"
+
+
 @pytest.mark.parametrize("paired", [True, False])
 def test_control_shell_publishes_the_held_run_draft_edit_rule(paired) -> None:
     held = {
         **_cycle(),
         "state": "running",
-        "program_run_id": "run.1",
-        "run": {"state": "running", "capture": {"program_run_id": "run.1"}},
+        "program_run_id": 1,
+        "run": {"state": "running", "capture": {"program_run_id": 1}},
         "recovery_offer": None,
         "runtime_controls": {"execution_selections": {"motion_held": True}},
     }
-    identity = {"owner_epoch": "kernel.1"}
+    identity = {"active_publication_generation": 1}
     facts = replace(
         _facts_for_cycle(held),
         execution_targets_response={"ok": True, "identity": identity},
         execution_control_response={
             "ok": True,
-            "identity": identity if paired else {"owner_epoch": "kernel.2"},
+            "identity": identity if paired else {"active_publication_generation": 2},
             "control_state": {"manual_operations": []},
         },
     )
-    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    shell = HeadlessControlStateSource._shell_from_facts(
+        facts, application_start_id=APPLICATION_START_ID
+    )
     # Manual-operation settlement is only proven by a coherent control capture.
     assert shell["held_run_draft_edit_allowed"] is paired
-    idle = HeadlessControlStateSource._shell_from_facts(_facts_for_cycle(_cycle()))
+    idle = HeadlessControlStateSource._shell_from_facts(
+        _facts_for_cycle(_cycle()), application_start_id=APPLICATION_START_ID
+    )
     assert idle["held_run_draft_edit_allowed"] is False
 
 
@@ -576,7 +568,9 @@ def test_control_shell_preserves_failed_native_responses_only_as_diagnostic_fact
         execution_targets_response={"ok": targets_ok, "error": "owner_unavailable"},
         execution_control_response={"ok": control_ok, "error": "owner_unavailable"},
     )
-    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    shell = HeadlessControlStateSource._shell_from_facts(
+        facts, application_start_id=APPLICATION_START_ID
+    )
     assert shell["execution_targets"] is None
     assert shell["execution_control_state"] is None
     assert facts.execution_targets_response["ok"] is targets_ok
@@ -603,9 +597,16 @@ def test_control_session_starts_with_versioned_current_snapshot() -> None:
         "heartbeat_challenge",
         "snapshot",
     ]
+    # The hello names this start's ``A`` and the integer session number.
+    assert socket.sent[0]["application_start_id"] == APPLICATION_START_ID
+    assert type(socket.sent[0]["control_session_number"]) is int
+    assert socket.sent[0]["control_session_number"] >= 1
     assert socket.sent[1]["semantic_status"] == "current"
     assert socket.sent[2]["complete"] is True
     assert socket.sent[2]["control"]["cycle_state"] == "idle_after_reset"
+    assert socket.sent[2]["control"]["application_start_id"] == APPLICATION_START_ID
+    assert socket.sent[2]["control"]["causal_request_key"] is None
+    assert socket.sent[2]["control"]["causal_display"] is None
 
 
 def test_operation_progress_reuses_cached_facts_and_sends_only_progress() -> None:
@@ -615,7 +616,7 @@ def test_operation_progress_reuses_cached_facts_and_sends_only_progress() -> Non
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
             ingress, program_runner_websocket_url=None,
         )
-        sample = {"owner_epoch": "owner.1", "operation_id": "operation.1", "operation_revision": 1, "progress": 0.5}
+        sample = {"operation_id": 7, "operation_revision": 1, "progress": 0.5}
         source.notify_operation_progress([{**sample, "progress": 0.1}])
         subscription = await source.subscribe()
         try:
@@ -834,7 +835,10 @@ def test_websocket_command_uses_the_same_ingress_without_waiting_for_state_poll(
         if message["message_kind"] == "command_receipt"
     ]
     assert len(receipts) == 1
-    assert receipts[0]["receipt"]["correlation_id"] == "request.1"
+    # A WebSocket receipt is matched by its session and client sequence.
+    assert receipts[0]["receipt"]["control_session_number"] == socket.session_number
+    assert receipts[0]["receipt"]["client_sequence"] == "1"
+    assert receipts[0]["receipt"]["request_key"] is None
     assert receipts[0]["receipt"]["disposition"] == "received"
     assert int(receipts[0]["receipt"]["received_monotonic_ns"]) > 0
     assert int(receipts[0]["emitted_monotonic_ns"]) >= int(
@@ -875,7 +879,6 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
                 ExecutionIngressResult(
                     disposition="received",
                     code=f"{request.command_envelope.command_kind}_received",
-                    semantic_owner_epoch="runner.1",
                     execution_control_revision=4,
                     current_identity={"cycle_generation": 2},
                 ),
@@ -883,12 +886,10 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
             )
 
         ingress = ExecutionControlIngress(
-            projection=lambda: ("runner.1", 4),
+            projection=lambda: 4,
             dispatch=dispatch,
-            authority=ControlFreshnessAuthority(
-                receiver_incarnation="receiver.1",
-                secret=b"x" * 32,
-            ),
+            application_start_id=APPLICATION_START_ID,
+            authority=ControlFreshnessAuthority(secret=b"x" * 32),
         )
         source = _Source(_frame(ingress))
         session = ExecutionControlSession(  # type: ignore[arg-type]
@@ -902,20 +903,16 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
                 {
                     "schema_version": CONTROL_PROTOCOL_VERSION,
                     "message_kind": "command",
-                    "control_session_id": session._session_id,  # noqa: SLF001
+                    "control_session_number": session._session_number,  # noqa: SLF001
                     "client_sequence": str(sequence),
                     "command": {
                         "command_envelope": {
                             "schema_version": EXECUTION_COMMAND_SCHEMA,
                             "command_kind": kind,
-                            "correlation_id": f"request.{sequence}",
                             "source_label": "test",
-                            "control_session_id": session._session_id,  # noqa: SLF001
+                            "control_session_number": session._session_number,  # noqa: SLF001
                             "client_sequence": str(sequence),
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (
-                                control.semantic_owner_epoch
-                            ),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -1275,7 +1272,7 @@ def test_runtime_semantics_reach_existing_session_delta(section, path, value) ->
         "manager_ready": False,
         "active": {"graph_revision": "graph.1"},
         "apply": {"mutation_available": True, "records": [{
-            "apply_id": "apply.1", "incomplete": True,
+            "apply_id": 1, "incomplete": True,
             "phase": "runtime_converged", "terminal_state": None,
         }]},
         "runtime": {"converged": False, "observed_units": [{
@@ -1352,124 +1349,6 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     assert _shell_key(alarm_change) != _shell_key(first)
 
 
-def test_source_file_freshness_pulse_does_not_wake_owner_reduction(tmp_path) -> None:
-    source_path = tmp_path / "manager-source.json"
-
-    def publish(*, generation: int, report: int, health: str = "healthy") -> None:
-        source_path.write_text(
-            source_snapshot_text(
-                {
-                    "api_version": "manyforge.source_snapshot.v1",
-                    "observed_at_ns": report,
-                    "payload": {
-                        "runtime": {
-                            "observed_units": [
-                                {
-                                    "process_observation_sequence": report,
-                                    "source_report_sequence": report,
-                                    "source_health": health,
-                                }
-                            ]
-                        }
-                    },
-                    "record_digest": f"record.{report}",
-                    "semantic_content_digest": f"semantic.{report}",
-                    "source_generation": generation,
-                    "source_owner_epoch": "manager.1",
-                    "source_owner_id": "manager",
-                    "source_owner_kind": "component_manager",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    ingress = _ingress([])
-    source = HeadlessControlStateSource(
-        object(),  # type: ignore[arg-type]
-        ingress,
-        program_runner_websocket_url=None,
-        cold_watch_paths=(source_path,),
-    )
-    wakes: list[bool] = []
-    source.notify_cold = lambda: wakes.append(True)  # type: ignore[method-assign]
-    try:
-        publish(generation=1, report=1)
-        asyncio.run(source._refresh_file_watches(notify=False))  # noqa: SLF001
-        publish(generation=2, report=2)
-        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
-        assert wakes == []
-
-        publish(generation=3, report=3, health="faulted")
-        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
-        assert wakes == [True]
-    finally:
-        ingress.close()
-
-
-def test_scene_runtime_pose_only_update_does_not_wake_cold_projection(
-    tmp_path,
-) -> None:
-    source_path = tmp_path / "scene-runtime-source.json"
-
-    def publish(*, generation: int, sequence: int, state: str = "open") -> None:
-        source_path.write_text(
-            source_snapshot_text(
-                {
-                    "api_version": "manyforge.source_snapshot.v1",
-                    "observed_at_ns": sequence,
-                    "payload": {
-                        "api_version": "manyforge.scene_runtime_source.v1",
-                        "cell_id": "cell.1",
-                        "state": {
-                            "api_version": "manyforge.scene_runtime_state.v2",
-                            "active_replay_id": None,
-                            "counters": {"buffered": 0},
-                            "deferred": False,
-                            "error": None,
-                            "initialization_generation": 1,
-                            "initialization_token": None,
-                            "pose_sources": [{"source_sequence": sequence}],
-                            "reason": "ready",
-                            "runtime_identity": {"runtime_generation": 1},
-                            "started_at_ns": 1,
-                            "state": state,
-                            "updated_at_ns": sequence,
-                        },
-                    },
-                    "record_digest": f"record.{sequence}",
-                    "semantic_content_digest": f"semantic.{sequence}",
-                    "source_generation": generation,
-                    "source_owner_epoch": "scene-runtime.1",
-                    "source_owner_id": "scene-runtime",
-                    "source_owner_kind": "scene_runtime",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    ingress = _ingress([])
-    source = HeadlessControlStateSource(
-        object(),  # type: ignore[arg-type]
-        ingress,
-        program_runner_websocket_url=None,
-        cold_watch_paths=(source_path,),
-    )
-    wakes: list[bool] = []
-    source.notify_cold = lambda: wakes.append(True)  # type: ignore[method-assign]
-    try:
-        publish(generation=1, sequence=1)
-        asyncio.run(source._refresh_file_watches(notify=False))  # noqa: SLF001
-        publish(generation=2, sequence=2)
-        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
-        assert wakes == []
-
-        publish(generation=3, sequence=3, state="resetting")
-        asyncio.run(source._refresh_file_watches(notify=True))  # noqa: SLF001
-        assert wakes == [True]
-    finally:
-        ingress.close()
-
-
 def test_server_sequence_is_assigned_after_latest_slot_replacement() -> None:
     async def exercise() -> None:
         ingress = _ingress([])
@@ -1506,41 +1385,6 @@ def test_control_completion_wakes_non_program_facts_with_runner_stream() -> None
         ingress.close()
 
 
-def test_owner_replacement_requires_a_new_snapshot_barrier() -> None:
-    async def exercise() -> None:
-        stamps: list[Any] = []
-        ingress = _ingress(stamps)
-        source = _Source(_frame(ingress))
-        socket = _HandshakeSocket()
-        session = ExecutionControlSession(socket, source, ingress)  # type: ignore[arg-type]
-        subscription = await source.subscribe()
-        session._subscription = subscription  # noqa: SLF001
-        session._latest_frame = source.frame  # noqa: SLF001
-        session._snapshot_sent = True  # noqa: SLF001
-        replacement_cycle = {**_cycle(), "program_runner_owner_epoch": "runner.2"}
-        source.frame = ControlStateFrame(
-            generation=2,
-            event_class="critical",
-            control=build_control_projection(replacement_cycle, ingress),
-            shell={"program_cycle": replacement_cycle},
-        )
-        subscription.frame = source.frame
-        subscription.wake.set()
-        task = asyncio.create_task(session._state_sender())  # noqa: SLF001
-        queued = await asyncio.wait_for(session._slots.take(), 0.2)  # noqa: SLF001
-        payload = queued.model_dump(mode="json")
-        assert payload["message_kind"] == "resync_required"
-        assert payload["reason_code"] == "control_owner_replaced"
-        assert session._resync_required is True  # noqa: SLF001
-        session._closed = True  # noqa: SLF001
-        subscription.closed = True
-        subscription.wake.set()
-        await task
-        ingress.close()
-
-    asyncio.run(exercise())
-
-
 def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     class NoReadService:
         def __getattr__(self, name: str):
@@ -1558,8 +1402,6 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
         assert source.active_clients == 0
         assert source._runner_task is None  # noqa: SLF001
         assert source._cold_task is None  # noqa: SLF001
-        assert source._watch_task is None  # noqa: SLF001
-        assert source._cold_expiry_handle is None  # noqa: SLF001
         await source.close()
 
     try:
@@ -1637,7 +1479,7 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
                 self.sequence += 1
                 return json.dumps(
                     {
-                        "schema_version": "manyforge.program_control_state.v2",
+                        "schema_version": "manyforge.program_control_state.v4",
                         "server_sequence": str(self.sequence),
                         **(
                             {"event_class": classification}
@@ -1684,8 +1526,10 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
             requests.put_nowait((_cycle(), "critical"))
             await asyncio.wait_for(first.wake.wait(), 1)
             assert source.semantic_context().status == "current"
-            assert source.take(first).shell["program_cycle"] == _cycle()
-            assert source.take(second).shell["program_cycle"] == _cycle()
+            # Headless adds the display of the causal key (1.16.2).
+            shown = {**_cycle(), "causal_display": None}
+            assert source.take(first).shell["program_cycle"] == shown
+            assert source.take(second).shell["program_cycle"] == shown
             assert not source._runner_task.done()  # noqa: SLF001
         finally:
             await source.unsubscribe(first)
@@ -1786,7 +1630,7 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
         loop = asyncio.get_running_loop()
         recovered_read = asyncio.Event()
 
-        def read():
+        def read(**_kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -1839,7 +1683,7 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
 
 
 @pytest.mark.parametrize("missing_fact", [False, True])
-def test_cold_source_failure_recovers_without_a_second_file_event(
+def test_cold_source_failure_recovers_without_a_second_source_change(
     monkeypatch, missing_fact
 ) -> None:
     async def exercise() -> None:
@@ -1915,57 +1759,6 @@ def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(
         assert source.diagnostics()["incident_recording_failures"] == 102
     finally:
         ingress.close()
-
-
-def test_file_watcher_failure_invalidates_and_recovers_without_client_churn(
-    monkeypatch, tmp_path
-) -> None:
-    async def exercise() -> None:
-        ingress = _ingress([])
-        fail = asyncio.Event()
-        retry = asyncio.Event()
-        count = 0
-
-        async def watches(*_args):
-            nonlocal count
-            count += 1
-            if count == 1:
-                await fail.wait()
-                raise OSError("watch root disappeared")
-            retry.set()
-            yield set()
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr(control_state_module, "awatch", watches)
-        monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
-        source = HeadlessControlStateSource(
-            SimpleNamespace(
-                program_cycle_status=_cycle,
-                component_overview_facts=lambda *, program_cycle, cancelled=None: _facts_for_cycle(
-                    program_cycle
-                ),
-            ),
-            ingress,
-            program_runner_websocket_url=None,
-            cold_watch_paths=(tmp_path / "source.json",),
-        )
-        subscription = await source.subscribe()
-        try:
-            await asyncio.wait_for(subscription.wake.wait(), 1)
-            source.take(subscription)
-            fail.set()
-            await asyncio.wait_for(retry.wait(), 1)
-            await asyncio.wait_for(subscription.wake.wait(), 1)
-            assert source.semantic_context().status == "current"
-            assert source.diagnostics()["source_failures"] == 1
-            assert not source._watch_task.done()  # noqa: SLF001
-        finally:
-            await source.unsubscribe(subscription)
-            assert source._watch_task is None  # noqa: SLF001
-            assert source._cold_expiry_handle is None  # noqa: SLF001
-            ingress.close()
-
-    asyncio.run(exercise())
 
 
 def test_last_client_teardown_finishes_before_a_new_source_generation() -> None:
@@ -2087,9 +1880,8 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("busy", [False, True])
 def test_stop_rejection_does_not_require_initial_semantic_snapshot(
-    monkeypatch, busy, caplog
+    monkeypatch, caplog
 ) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
@@ -2097,25 +1889,23 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
             object(), ingress, program_runner_websocket_url=None
         )
         session = ExecutionControlSession(_HandshakeSocket(), source, ingress)
-        session_id = session._session_id  # noqa: SLF001
+        session_number = session._session_number  # noqa: SLF001
         command = ExecutionControlCommandDTO.model_validate(
             {
                 "schema_version": CONTROL_PROTOCOL_VERSION,
                 "message_kind": "command",
-                "control_session_id": session_id,
+                "control_session_number": session_number,
                 "client_sequence": "1",
                 "command": {
                     "command_envelope": {
                         "schema_version": EXECUTION_COMMAND_SCHEMA,
-                        "command_kind": "program_stop",
-                        "correlation_id": "stop.before.snapshot",
+                        "command_kind": "program_motion_stop",
                         "source_label": "test",
-                        "control_session_id": session_id,
+                        "control_session_number": session_number,
                         "client_sequence": "1",
-                        "freshness": ingress.freshness_for("runner.1", 4).model_dump(
+                        "freshness": ingress.freshness_for(4).model_dump(
                             mode="json"
                         ),
-                        "expected_semantic_owner_epoch": "runner.1",
                         "expected_execution_control_revision": 4,
                     },
                     "payload": {},
@@ -2125,8 +1915,6 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
         failed = asyncio.get_running_loop().create_future()
 
         def start(*_args, **_kwargs):
-            if busy:
-                raise ExecutionControlBusyError(ExecutionControlLane.STOP, 1)
             failed.set_exception(OSError("Stop dispatch unavailable"))
             return failed
 
@@ -2138,12 +1926,11 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
             receipts = list(session._slots.receipts)  # noqa: SLF001
             assert len(receipts) == 1
             assert receipts[0].receipt.disposition == "rejected"
-            assert receipts[0].receipt.correlation_id == "stop.before.snapshot"
+            assert receipts[0].receipt.client_sequence == "1"
             assert receipts[0].receipt.current_identity is None
-            if not busy:
-                assert "correlation_id=stop.before.snapshot" in caplog.text
-                assert "command=program_stop" in caplog.text
-                assert "Stop dispatch unavailable" in caplog.text
+            assert f"session={session_number} client_sequence=1" in caplog.text
+            assert "command=program_motion_stop" in caplog.text
+            assert "Stop dispatch unavailable" in caplog.text
             assert not session._closed  # noqa: SLF001
             assert session._next_heartbeat(1) is not None  # noqa: SLF001
         finally:
@@ -2151,50 +1938,6 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
             ingress.close()
 
     asyncio.run(exercise())
-
-
-def test_cold_freshness_uses_one_deadline_and_cancels_it_without_clients(
-    tmp_path,
-) -> None:
-    source_path = tmp_path / "manager-source.json"
-    source_path.write_text(
-        source_snapshot_text(
-            {
-                "api_version": "manyforge.source_snapshot.v1",
-                "payload": {},
-                "source_owner_epoch": "manager.1",
-                "source_owner_id": "manager",
-                "source_owner_kind": "component_manager",
-            }
-        ),
-        encoding="utf-8",
-    )
-    ingress = _ingress([])
-
-    async def exercise() -> None:
-        source = HeadlessControlStateSource(
-            object(),  # type: ignore[arg-type]
-            ingress,
-            program_runner_websocket_url=None,
-            cold_watch_paths=(source_path,),
-            cold_freshness_paths=(source_path,),
-            cold_freshness_budget_ns=10_000_000_000,
-        )
-        source._loop = asyncio.get_running_loop()  # noqa: SLF001
-        subscription = ControlStateSubscription(asyncio.Event())
-        source._subscriptions.add(subscription)  # noqa: SLF001
-        await source._refresh_file_watches(notify=False)  # noqa: SLF001
-        handle = source._cold_expiry_handle  # noqa: SLF001
-        assert handle is not None
-        await source.unsubscribe(subscription)
-        assert handle.cancelled()
-        assert source._cold_expiry_handle is None  # noqa: SLF001
-        await source.close()
-
-    try:
-        asyncio.run(exercise())
-    finally:
-        ingress.close()
 
 
 def test_control_source_rejects_clients_above_the_fixed_product_cap() -> None:
@@ -2297,25 +2040,25 @@ def test_client_incident_episode_survives_reconnect_without_duplicate_activation
     source.record_client_incident_transition(
         **common,
         phase="activated",
-        control_session_id="session.1",
+        control_session_number=1,
         now_ns=200,
     )
     source.record_client_incident_transition(
         **common,
         phase="activated",
-        control_session_id="session.2",
+        control_session_number=2,
         now_ns=300,
     )
     source.record_client_incident_transition(
         **{**common, "reason_code": "control_websocket_recovered"},
         phase="resolved",
-        control_session_id="session.2",
+        control_session_number=2,
         now_ns=400,
     )
 
-    assert [(item["phase"], item["control_session_id"]) for item in recorded] == [
-        ("activated", "session.1"),
-        ("resolved", "session.2"),
+    assert [(item["phase"], item["control_session_number"]) for item in recorded] == [
+        ("activated", 1),
+        ("resolved", 2),
     ]
     assert recorded[1]["first_observed_ns"] == 100
     assert recorded[1]["last_observed_ns"] == 300
@@ -2340,7 +2083,7 @@ def test_incident_enqueue_uses_native_async_boundary_without_executor_queue() ->
             runtime={
                 "sections": {
                     "logical_scene": {  # noqa: SLF001
-                        "source_owner_epoch": "scene.owner.at.incident",
+                        "source_owner_id": "scene.owner.at.incident",
                         "freshness": "fresh",
                         "payload": {
                             "access": {
@@ -2364,11 +2107,12 @@ def test_incident_enqueue_uses_native_async_boundary_without_executor_queue() ->
         await asyncio.sleep(0)
         assert len(recorded) == 1
         context = recorded[0].pop("causal_context")
-        assert context["program_run_id"] == "run.1"
+        assert context["program_run_id"] == "1"
         assert context["program_source_current"] == "true"
         assert context["scene_id"] == "scene.at.incident"
         assert context["scene_revision_id"] == "4"
-        assert context["scene_source_owner_epoch"] == "scene.owner.at.incident"
+        assert context["scene_source_owner_id"] == "scene.owner.at.incident"
+        assert "scene_source_owner_epoch" not in context
         assert recorded == [{"incident_id": "incident.1", "phase": "activated"}]
 
     try:
@@ -2392,7 +2136,7 @@ def test_abandoned_client_incident_correlations_remain_bounded_for_years() -> No
             incident_id=f"incident.{index}",
             incident_kind="control_disconnected",
             phase="activated",
-            control_session_id=f"session.{index}",
+            control_session_number=index + 1,
             source_label="operator_ui",
             occurrence_count=1,
             maximum_delay_ns=None,
@@ -2410,7 +2154,7 @@ def test_abandoned_client_incident_correlations_remain_bounded_for_years() -> No
         incident_id="incident.0",
         incident_kind="control_disconnected",
         phase="resolved",
-        control_session_id="session.current",
+        control_session_number=10_001,
         source_label="operator_ui",
         occurrence_count=1,
         maximum_delay_ns=None,
@@ -2605,7 +2349,7 @@ def test_control_source_reduces_new_cycle_from_cached_owner_facts() -> None:
 
 
 def _control_with_pose(positions: list[float]) -> tuple[dict[str, Any], dict[str, Any]]:
-    identity = {"owner_epoch": "execution.1"}
+    identity = {"application_start_id": APPLICATION_START_ID}
     row = {
         "controllable_component_id": "ur5e_robot",
         "command_target_id": "arm",
@@ -2620,8 +2364,7 @@ def _control_with_pose(positions: list[float]) -> tuple[dict[str, Any], dict[str
 def test_active_tcp_is_a_meaningful_control_change_but_joint_samples_are_not() -> None:
     _targets, before = _control_with_pose([0.0])
     _targets, after = _control_with_pose([0.4])
-    first = {"entry": None, "display": None, "owner_epoch": "execution.1",
-             "registration_generation": 1, "sequence": 0}
+    first = {"entry": None, "display": None, "registration_generation": 1, "sequence": 0}
     before["control_state"]["observed_targets"][0]["active_tcp"] = first
     after["control_state"]["observed_targets"][0]["active_tcp"] = dict(first)
     key = control_state_module._meaningful_execution_control_key  # noqa: SLF001
@@ -2693,7 +2436,7 @@ def test_cold_reduction_refreshes_only_reset_robot_position_from_direct_read() -
         admission = {"admission_generation": 29, "allowed": False}
         available = {"available": True, "reason": None}
 
-        def read() -> dict[str, Any]:
+        def read(**_kwargs) -> dict[str, Any]:
             if mode == "fail":
                 raise HeadlessApiError("program_runner_unavailable", "down")
             cycle = _cycle()
@@ -2702,7 +2445,7 @@ def test_cold_reduction_refreshes_only_reset_robot_position_from_direct_read() -
                 cycle["execution_control_revision"] = 5
             elif mode == "same":
                 cycle["reset_robot_position"] = available
-                cycle["causal_correlation_id"] = "corr.direct"  # never taken
+                cycle["causal_request_key"] = "ab" * 16  # never taken
             return cycle
 
         def facts(*, program_cycle, cancelled=None):
@@ -2765,7 +2508,7 @@ def test_cold_reduction_drops_direct_reset_read_overtaken_by_the_stream() -> Non
         entered = asyncio.Event()
         release = threading.Event()
 
-        def read() -> dict[str, Any]:
+        def read(**_kwargs) -> dict[str, Any]:
             nonlocal mode
             if mode == "fail":
                 raise HeadlessApiError("program_runner_unavailable", "down")
@@ -2796,7 +2539,7 @@ def test_cold_reduction_drops_direct_reset_read_overtaken_by_the_stream() -> Non
             source.notify_cold()
             await asyncio.wait_for(entered.wait(), 1)
             # The stream delivers a newer cycle (same control key) mid-read.
-            newer = {**_cycle(), "causal_correlation_id": "corr.newer"}
+            newer = {**_cycle(), "causal_request_key": "cd" * 16}
             source._accept_cycle(newer, "critical")  # noqa: SLF001
             release.set()
             reductions = source.diagnostics()["reductions"]
@@ -2804,7 +2547,10 @@ def test_cold_reduction_drops_direct_reset_read_overtaken_by_the_stream() -> Non
                 await asyncio.sleep(0.005)
             await asyncio.sleep(0.1)
             assert source._cycle == newer  # noqa: SLF001
-            assert source.take(subscription).shell["program_cycle"] == newer
+            # The shell adds the display of the causal key (1.16.2).
+            assert source.take(subscription).shell["program_cycle"] == {
+                **newer, "causal_display": "3f9a/kcdcdcdcd"
+            }
         finally:
             release.set()
             await source.unsubscribe(subscription)
@@ -2819,7 +2565,7 @@ def test_cold_reduction_does_not_revive_an_invalidated_program_source() -> None:
         loop = asyncio.get_running_loop()
         direct_read = asyncio.Event()
 
-        def read() -> dict[str, Any]:
+        def read(**_kwargs) -> dict[str, Any]:
             cycle = _cycle()
             if mode == "same":
                 loop.call_soon_threadsafe(direct_read.set)
@@ -2887,3 +2633,104 @@ def test_control_delta_carries_changed_rest_pose_without_meaningful_change() -> 
 
     assert message.shell == {"complete": False, "execution_control_state": after}
     assert unchanged.shell == {"complete": False}
+
+
+class _FrameSocket(_HandshakeSocket):
+    """Feeds the given raw client frames, then disconnects."""
+
+    def __init__(self, frames: list[str]) -> None:
+        super().__init__()
+        self.frames = list(frames)
+
+    async def receive_text(self) -> str:
+        if self.frames:
+            return self.frames.pop(0)
+        raise WebSocketDisconnect()
+
+
+def _command_frame(
+    ingress: ExecutionControlIngress, session_number: int, kind: str, sequence: str
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": CONTROL_PROTOCOL_VERSION,
+            "message_kind": "command",
+            "control_session_number": session_number,
+            "client_sequence": sequence,
+            "command": {
+                "command_envelope": {
+                    "schema_version": EXECUTION_COMMAND_SCHEMA,
+                    "command_kind": kind,
+                    "source_label": "test",
+                    "control_session_number": session_number,
+                    "client_sequence": sequence,
+                    "freshness": ingress.freshness_for(4).model_dump(mode="json"),
+                    "expected_execution_control_revision": 4,
+                },
+                "payload": {"request_context": {"source_label": "test"}},
+            },
+        }
+    )
+
+
+def _receive_frames(
+    kinds_and_sequences: list[tuple[str, str]], *, rate_exhausted: bool = False
+) -> tuple[list[str], BaseException | None]:
+    """Run one session's receiver over the frames; the dispatched kinds and
+    the error that ended the session (None for a clean disconnect)."""
+
+    ingress = _ingress([])
+    source = _Source(_frame(ingress))
+    session = ExecutionControlSession(  # type: ignore[arg-type]
+        _HandshakeSocket(), source, ingress
+    )
+    number = session._session_number  # noqa: SLF001
+    session._websocket = _FrameSocket(  # noqa: SLF001
+        [_command_frame(ingress, number, kind, seq) for kind, seq in kinds_and_sequences]
+    )
+    if rate_exhausted:
+        session._rate_count = CONTROL_MAXIMUM_MESSAGES_PER_SECOND  # noqa: SLF001
+    dispatched: list[str] = []
+    session._receive_command = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda message: dispatched.append(message.command.command_envelope.command_kind)
+    )
+    error: BaseException | None = None
+    try:
+        asyncio.run(session._receiver())  # noqa: SLF001
+    except WebSocketDisconnect:
+        pass
+    except ValueError as raised:
+        error = raised
+    finally:
+        ingress.close()
+    return dispatched, error
+
+
+@pytest.mark.parametrize(
+    "kind", ["program_motion_stop", "operation_stop", "stop_all", "halt"]
+)
+def test_a_stop_frame_is_dispatched_before_the_sequence_check(kind: str) -> None:
+    """PD-6: a Stop with a gap in the client sequence still reaches the Stop
+    lane; the session then ends on the sequence check as before."""
+
+    dispatched, error = _receive_frames([(kind, "5")])
+    assert dispatched == [kind]
+    assert error is not None and "not contiguous" in str(error)
+
+
+def test_a_stop_frame_is_dispatched_before_the_rate_check() -> None:
+    dispatched, error = _receive_frames([("halt", "1")], rate_exhausted=True)
+    assert dispatched == ["halt"]
+    assert error is not None and "rate exceeded" in str(error)
+
+
+def test_an_ordinary_frame_still_meets_the_session_checks_first() -> None:
+    dispatched, error = _receive_frames([("program_reset", "5")])
+    assert dispatched == []
+    assert error is not None and "not contiguous" in str(error)
+
+
+def test_contiguous_stop_frames_are_each_dispatched_once() -> None:
+    dispatched, error = _receive_frames([("stop_all", "1"), ("halt", "2")])
+    assert dispatched == ["stop_all", "halt"]
+    assert error is None

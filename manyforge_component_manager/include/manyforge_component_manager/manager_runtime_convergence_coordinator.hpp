@@ -80,7 +80,7 @@ VerifyExecutionHostContinuity(
 ///
 /// The complete candidate and predecessor runtime products are verified and
 /// the current predecessor publication is read before the fence coordinator
-/// may perform an effect. After accepted-fence rehydration, one immutable
+/// may perform an effect. After fence acceptance, one immutable
 /// aggregate convergence intent is committed before any managed-process
 /// Ensure. Every unit is observed first and evaluated through the sole C++
 /// runtime reducer in dependency order. A complete staged-ready set is

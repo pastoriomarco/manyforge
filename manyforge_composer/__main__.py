@@ -12,9 +12,15 @@ from typing import Any, Final, Sequence
 import uvicorn
 
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.application_identity import (
+    parse_application_start_id,
+)
 from manyforge_composer.backend.composer_settings import ComposerSettingsStore
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.security import SecurityConfig
+from manyforge_headless_api.internal_http import (
+    INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
+)
 from manyforge_composer.backend.state import (
     RUNTIME_UNAVAILABLE_MESSAGE,
     RUNTIME_UNAVAILABLE_REASON_CODE,
@@ -83,18 +89,15 @@ def _open_startup_scenario_document(
     try:
         if state.authoring_admission is None:
             raise RuntimeError("startup authoring admission is unavailable")
-        # This activation precedes ASGI lifespan entry. Establish the
-        # process' exact authoring-owner epoch before the shared loader
-        # acquires its claim; lifespan recovery is an idempotent recheck.
-        state.authoring_admission.recover()
         from manyforge_composer.backend.routes_scenario_documents import (
             load_exact_scenario_document,
         )
 
-        result = load_exact_scenario_document(state, project_path)
-        if result["outcome"] != "succeeded":
+        row = load_exact_scenario_document(state, project_path)
+        end = row["end"]
+        if end["outcome"] != "succeeded":
             # The orchestrated Load ended at a failed step; nothing is retried.
-            raise _StartupLoadFailed(result["error"])
+            raise _StartupLoadFailed({"code": end["code"], "message": end["code"]})
     except Exception as error:  # Every refused startup load takes this one path.
         detail = getattr(error, "detail", None)
         code = detail.get("code") if isinstance(detail, dict) else None
@@ -112,11 +115,18 @@ def _open_startup_scenario_document(
 
 
 class _StartupLoadFailed(RuntimeError):
-    """The startup Load's ApplyResult ended `failed`; carries its error."""
+    """The startup Load's row ended other than `succeeded`; carries its code."""
 
     def __init__(self, error: dict) -> None:
         super().__init__(error.get("message", ""))
         self.detail = error
+
+
+def _application_start_id(text: str) -> int:
+    try:
+        return parse_application_start_id(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def main() -> None:
@@ -126,6 +136,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="ManyForge Composer structural and headless-client shell"
+    )
+    parser.add_argument(
+        "--application-start-id",
+        required=True,
+        type=_application_start_id,
+        help="this application start's identity (16 lowercase hex), from the Manager",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
@@ -169,6 +185,7 @@ def main() -> None:
         )
     try:
         state = ComposerState.from_paths(
+            application_start_id=args.application_start_id,
             program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
             allowed_program_write_roots=security.allowed_program_write_roots,
@@ -202,6 +219,7 @@ def main() -> None:
             host=args.host,
             port=args.port,
             access_log=False,
+            timeout_keep_alive=INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
             # Real-time control/viewer frames favor bounded CPU and latency;
             # initial static assets still use normal HTTP compression/caching.
             ws_per_message_deflate=False,

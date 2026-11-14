@@ -8,6 +8,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -18,12 +19,11 @@
 namespace manyforge::core {
 
 /// Public caller identity carried into the internal owner-to-owner fence
-/// request. Transport attribution is deliberately not part of this value.
+/// request: the request's 16-byte key and its label. Transport attribution is
+/// deliberately not part of this value.
 struct PublicRequestContextDTO final {
-  RequestId request_id;
-  RequestOwnerEpoch request_owner_epoch;
+  RequestKey request_key;
   std::string source_label;
-  std::optional<std::string> correlation_id;
 
   friend bool operator==(const PublicRequestContextDTO&, const PublicRequestContextDTO&) = default;
 };
@@ -76,7 +76,6 @@ enum class RequestReplayStatusDTO {
   kRequestResultExpired,
   kRequestIdConflict,
   kRequestLedgerFull,
-  kStaleRequestOwnerEpoch,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(RequestReplayStatusDTO status) noexcept {
@@ -91,8 +90,6 @@ enum class RequestReplayStatusDTO {
       return "request_id_conflict";
     case RequestReplayStatusDTO::kRequestLedgerFull:
       return "request_ledger_full";
-    case RequestReplayStatusDTO::kStaleRequestOwnerEpoch:
-      return "stale_request_owner_epoch";
   }
   return {};
 }
@@ -104,7 +101,6 @@ enum class RequestReplayStatusDTO {
     case RequestReplayStatusDTO::kRequestResultExpired:
     case RequestReplayStatusDTO::kRequestIdConflict:
     case RequestReplayStatusDTO::kRequestLedgerFull:
-    case RequestReplayStatusDTO::kStaleRequestOwnerEpoch:
       return true;
   }
   return false;
@@ -118,7 +114,6 @@ enum class RequestReplayStatusDTO {
     case RequestReplayStatusDTO::kRequestResultExpired:
     case RequestReplayStatusDTO::kRequestIdConflict:
     case RequestReplayStatusDTO::kRequestLedgerFull:
-    case RequestReplayStatusDTO::kStaleRequestOwnerEpoch:
       return false;
   }
   return false;
@@ -129,22 +124,10 @@ struct ApplyFenceOwnerDTO final {
   ApplyGeneration apply_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero();
+    return apply_id.nonzero() && apply_generation.nonzero();
   }
 
   friend bool operator==(const ApplyFenceOwnerDTO&, const ApplyFenceOwnerDTO&) = default;
-};
-
-/// Exact reference to the immutable Manager-owned configured bring-up plan.
-/// A reference is observation data, never a claim or permission by itself.
-struct ApplyComponentBringUpReferenceDTO final {
-  ApplyFenceOwnerDTO owner;
-  ContentDigest plan_digest;
-
-  [[nodiscard]] bool valid() const noexcept { return owner.valid() && !plan_digest.empty(); }
-
-  friend bool operator==(const ApplyComponentBringUpReferenceDTO&,
-                         const ApplyComponentBringUpReferenceDTO&) = default;
 };
 
 struct ControllerConfigurationFenceDomainDTO final {
@@ -431,9 +414,7 @@ struct ApplyConfigurationFenceIntentDTO final {
   std::string reason;
 
   [[nodiscard]] bool valid() const noexcept {
-    if (owner_request_context.request_id.empty() ||
-        owner_request_context.request_owner_epoch.empty() ||
-        owner_request_context.source_label.empty() || !owner_transaction.valid() ||
+    if (owner_request_context.source_label.empty() || !owner_transaction.valid() ||
         !scope.valid() || !IsKnownApplyFenceBusyDisposition(busy_disposition) ||
         expected_retained_bundle_id.empty() || expected_graph_revision.empty() || reason.empty()) {
       return false;
@@ -492,7 +473,6 @@ struct ConfigurationFenceAcceptedDTO final {
 
 enum class ConfigurationFenceState {
   kHeld,
-  kReleasePending,
   kReleased,
 };
 
@@ -500,24 +480,21 @@ enum class ConfigurationFenceState {
   switch (state) {
     case ConfigurationFenceState::kHeld:
       return "held";
-    case ConfigurationFenceState::kReleasePending:
-      return "release_pending";
     case ConfigurationFenceState::kReleased:
       return "released";
   }
   return {};
 }
 
-/// Kernel incarnation used during Apply/fence restart reconciliation.
+/// The execution host's runtime unit and fence ledger as an Apply sees them.
 struct ExecutionHostEpochDTO final {
   RuntimeUnitId runtime_unit_id;
   RuntimeEpoch runtime_epoch;
-  RequestOwnerEpoch request_owner_epoch;
   ContentDigest durable_stop_fence_ledger_digest;
   ActiveBundlePublicationGeneration publication_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !runtime_unit_id.empty() && !runtime_epoch.empty() && !request_owner_epoch.empty() &&
+    return !runtime_unit_id.empty() && !runtime_epoch.empty() &&
            !durable_stop_fence_ledger_digest.empty() && publication_generation.nonzero();
   }
 
@@ -534,10 +511,9 @@ struct ExecutionHostEpochDTO final {
 /// configuration change cannot be accepted from a stale observation.
 struct ConfigurationFenceAdmissionQueryDTO final {
   ConfigurationFenceScopeDTO affected_scope;
-  RuntimeEpoch manager_runtime_epoch;
 
   [[nodiscard]] bool valid() const noexcept {
-    return affected_scope.valid() && !manager_runtime_epoch.empty();
+    return affected_scope.valid();
   }
 
   friend bool operator==(const ConfigurationFenceAdmissionQueryDTO&,
@@ -636,10 +612,9 @@ struct ConfigurationFenceReconciliationEvidenceDTO final {
 /// execution host refused the Apply before any effect.
 struct ConfigurationFenceReleaseDTO final {
   ConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
-  RuntimeEpoch manager_runtime_epoch;
 
   [[nodiscard]] bool valid() const noexcept {
-    return reconciliation_evidence.valid() && !manager_runtime_epoch.empty() &&
+    return reconciliation_evidence.valid() &&
            reconciliation_evidence.affected_queued_operation_count == 0U &&
            reconciliation_evidence.affected_active_operation_count == 0U;
   }
@@ -671,45 +646,14 @@ struct ConfigurationFenceStatusQueryDTO final {
   ConfigurationFenceId configuration_fence_id;
   ConfigurationFenceGeneration configuration_fence_generation;
   ConfigurationFenceScopeDTO expected_scope;
-  RuntimeEpoch manager_runtime_epoch;
 
   [[nodiscard]] bool valid() const noexcept {
     return owner_transaction.valid() && !configuration_fence_id.empty() &&
-           configuration_fence_generation.nonzero() && expected_scope.valid() &&
-           !manager_runtime_epoch.empty();
+           configuration_fence_generation.nonzero() && expected_scope.valid();
   }
 
   friend bool operator==(const ConfigurationFenceStatusQueryDTO&,
                          const ConfigurationFenceStatusQueryDTO&) = default;
-};
-
-/// Private parent proof carried to a narrowly delegated component or
-/// Scene operation. Shape validation grants no effects: the original live
-/// continuation must verify the full claim and exact fence are still held.
-/// Manager owns the full immutable plan; this value does not duplicate it.
-struct ApplyComponentBringUpAuthorityDTO final {
-  ApplyComponentBringUpReferenceDTO parent;
-  CellAdmissionClaimDTO parent_claim;
-  ConfigurationFenceStatusQueryDTO held_fence_query;
-
-  [[nodiscard]] bool valid() const noexcept {
-    const auto& intent = parent_claim.intent;
-    return parent.valid() && held_fence_query.valid() &&
-           held_fence_query.owner_transaction == parent.owner &&
-           intent.claim_kind == CellAdmissionClaimKindDTO::kManagerApply &&
-           intent.owner_role == CellAdmissionOwnerRoleDTO::kManager &&
-           intent.owner_transaction_id == parent.owner.apply_id.value() &&
-           intent.request_payload_digest == parent.plan_digest && !intent.owner_epoch.empty() &&
-           !intent.request_id.empty() && intent.expected_admission_generation.nonzero() &&
-           intent.scope.resources.empty() && intent.scope.configurations.empty() &&
-           !intent.program_cycle_evidence.has_value() &&
-           !intent.intervention_evidence.has_value() && !intent.program_node_evidence.has_value() &&
-           parent_claim.claim_generation.nonzero() &&
-           parent_claim.acquired_admission_generation.nonzero() && parent_claim.accepted_at_ns >= 0;
-  }
-
-  friend bool operator==(const ApplyComponentBringUpAuthorityDTO&,
-                         const ApplyComponentBringUpAuthorityDTO&) = default;
 };
 
 struct ConfigurationFenceStatusDTO final {
@@ -736,9 +680,6 @@ struct ConfigurationFenceStatusDTO final {
       case ConfigurationFenceState::kHeld:
         return admission_fenced && !release_receipt.has_value() &&
                required_compensation_or_operator_direction.empty() && !error.has_value();
-      case ConfigurationFenceState::kReleasePending:
-        return admission_fenced && !release_receipt.has_value() &&
-               !required_compensation_or_operator_direction.empty() && error.has_value();
       case ConfigurationFenceState::kReleased:
         return !admission_fenced && release_receipt.has_value() && release_receipt->valid() &&
                release_receipt->request.reconciliation_evidence == reconciliation_evidence &&
@@ -754,7 +695,7 @@ struct ConfigurationFenceStatusDTO final {
 
 /// Exact durable Manager attempt used to reconcile a lost Acquire response,
 /// or to observe the original held fence before candidate installation.
-/// The latter read grants no retry, acceptance write or rehydration authority.
+/// The latter read grants no retry or acceptance write authority.
 ///
 /// The complete immutable intent is included deliberately: request identity
 /// alone cannot distinguish an exact result from an ID conflict. The attempt
@@ -762,11 +703,9 @@ struct ConfigurationFenceStatusDTO final {
 struct ApplyFenceAcquireAttemptQueryDTO final {
   ApplyConfigurationFenceIntentDTO persisted_intent;
   ContentDigest persisted_attempt_digest;
-  RuntimeEpoch manager_runtime_epoch;
 
   [[nodiscard]] bool valid() const noexcept {
-    return persisted_intent.valid() && !persisted_attempt_digest.empty() &&
-           !manager_runtime_epoch.empty();
+    return persisted_intent.valid() && !persisted_attempt_digest.empty();
   }
 
   friend bool operator==(const ApplyFenceAcquireAttemptQueryDTO&,
@@ -796,12 +735,12 @@ enum class ApplyFenceAcquireAttemptReconcileState {
 }
 
 /// Closed read-only result for an exact Manager acquire-attempt query.
-/// Product adoption also reads an already accepted original attempt before installation;
-/// that observation does not enter the lost-Acquire recovery workflow.
+/// Scene configuration adoption also reads an already accepted original attempt before
+/// installation; that observation does not enter the lost-Acquire recovery workflow.
 ///
 /// `kNotSeen` is the sole state that permits retrying the exact persisted
 /// Acquire request. `kAcceptedExact` supplies the result that Manager must
-/// append before normal fence rehydration. Conflict or uncertainty always
+/// append. Conflict or uncertainty always
 /// leaves admission fenced and requires explicit recovery direction.
 struct ApplyFenceAcquireAttemptReconcileResultDTO final {
   ExecutionHostEpochDTO execution_host_epoch;
@@ -840,140 +779,6 @@ struct ApplyFenceAcquireAttemptReconcileResultDTO final {
 
   [[nodiscard]] bool matches(const ApplyFenceAcquireAttemptQueryDTO& query) const noexcept {
     return presence_valid() && query.valid() && echoed_query == query;
-  }
-};
-
-struct ApplyFenceRehydrateDTO final {
-  ApplyId apply_id;
-  ApplyGeneration apply_generation;
-  RequestId request_id;
-  RequestOwnerEpoch request_owner_epoch;
-  ContentDigest intent_digest;
-  RetainedBundleId expected_old_retained_bundle_id;
-  GraphRevision expected_old_graph_revision;
-  RetainedBundleId expected_new_retained_bundle_id;
-  GraphRevision expected_new_graph_revision;
-  ConfigurationFenceId persisted_configuration_fence_id;
-  ConfigurationFenceGeneration persisted_configuration_fence_generation;
-  ConfigurationFenceScopeDTO persisted_scope;
-  std::string last_durable_phase;
-  RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() && !request_id.empty() &&
-           !request_owner_epoch.empty() && !intent_digest.empty() &&
-           !expected_old_retained_bundle_id.empty() && !expected_old_graph_revision.empty() &&
-           !expected_new_retained_bundle_id.empty() && !expected_new_graph_revision.empty() &&
-           !persisted_configuration_fence_id.empty() &&
-           persisted_configuration_fence_generation.nonzero() && persisted_scope.valid() &&
-           !last_durable_phase.empty() && !manager_runtime_epoch.empty();
-  }
-
-  friend bool operator==(const ApplyFenceRehydrateDTO&, const ApplyFenceRehydrateDTO&) = default;
-};
-
-enum class ApplyFenceReconcileState {
-  kMatched,
-  kRecreated,
-  kMissing,
-  kConflicting,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ApplyFenceReconcileState state) noexcept {
-  switch (state) {
-    case ApplyFenceReconcileState::kMatched:
-      return "matched";
-    case ApplyFenceReconcileState::kRecreated:
-      return "recreated";
-    case ApplyFenceReconcileState::kMissing:
-      return "missing";
-    case ApplyFenceReconcileState::kConflicting:
-      return "conflicting";
-  }
-  return {};
-}
-
-struct ApplyFenceReconcileEntryDTO final {
-  ConfigurationFenceId persisted_configuration_fence_id;
-  ConfigurationFenceGeneration persisted_configuration_fence_generation;
-  ApplyFenceReconcileState state;
-  std::optional<ConfigurationFenceId> reconciled_configuration_fence_id;
-  std::optional<ConfigurationFenceGeneration> reconciled_configuration_fence_generation;
-
-  [[nodiscard]] bool presence_valid() const noexcept {
-    const bool has_id = reconciled_configuration_fence_id.has_value();
-    const bool has_generation = reconciled_configuration_fence_generation.has_value();
-    if (persisted_configuration_fence_id.empty() ||
-        !persisted_configuration_fence_generation.nonzero() || has_id != has_generation) {
-      return false;
-    }
-
-    switch (state) {
-      case ApplyFenceReconcileState::kMatched:
-      case ApplyFenceReconcileState::kMissing:
-      case ApplyFenceReconcileState::kConflicting:
-        return !has_id;
-      case ApplyFenceReconcileState::kRecreated:
-        return has_id && !reconciled_configuration_fence_id->empty() &&
-               reconciled_configuration_fence_generation->nonzero();
-    }
-    return false;
-  }
-
-  [[nodiscard]] bool matches(const ApplyFenceRehydrateDTO& request) const noexcept {
-    return presence_valid() && request.valid() &&
-           persisted_configuration_fence_id == request.persisted_configuration_fence_id &&
-           persisted_configuration_fence_generation ==
-               request.persisted_configuration_fence_generation;
-  }
-};
-
-struct ApplyFenceReconcileResultDTO final {
-  ExecutionHostEpochDTO execution_host_epoch;
-  std::vector<ApplyFenceReconcileEntryDTO> fence_results;
-  bool admission_fenced;
-  std::string required_compensation_or_operator_direction;
-  ContentDigest result_digest;
-  std::optional<ErrorDTO> error;
-
-  [[nodiscard]] bool presence_valid() const noexcept {
-    if (!execution_host_epoch.valid() || fence_results.empty() || result_digest.empty()) {
-      return false;
-    }
-
-    bool all_reconciled = true;
-    for (std::size_t index = 0U; index < fence_results.size(); ++index) {
-      const auto& result = fence_results[index];
-      if (!result.presence_valid()) {
-        return false;
-      }
-      if (index != 0U && !(fence_results[index - 1U].persisted_configuration_fence_id <
-                           result.persisted_configuration_fence_id)) {
-        return false;
-      }
-      all_reconciled = all_reconciled && (result.state == ApplyFenceReconcileState::kMatched ||
-                                          result.state == ApplyFenceReconcileState::kRecreated);
-    }
-
-    const bool has_error = error.has_value();
-    if (has_error && error->code.empty()) {
-      return false;
-    }
-
-    if (!admission_fenced) {
-      return all_reconciled && !has_error && required_compensation_or_operator_direction.empty();
-    }
-
-    if (!all_reconciled || has_error) {
-      return has_error && !required_compensation_or_operator_direction.empty();
-    }
-
-    return !required_compensation_or_operator_direction.empty();
-  }
-
-  [[nodiscard]] bool matches(const ApplyFenceRehydrateDTO& request) const noexcept {
-    return presence_valid() && request.valid() && fence_results.size() == 1U &&
-           fence_results.front().matches(request);
   }
 };
 

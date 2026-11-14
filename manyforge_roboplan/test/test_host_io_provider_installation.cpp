@@ -23,6 +23,7 @@
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <memory>
@@ -106,7 +107,7 @@ protected:
     scheduler = std::make_shared<SimpleScheduler>();
     const auto cell_id = bundle->value().cell_graph.cell_id;
     core::ResourceAddressedExecutionKernelConfig config{
-        core::RequestOwnerEpoch("helper.kernel"), cell_id, 32U};
+        core::kTestApplicationStartId, cell_id, 32U};
     config.empty_runtime_retained_bundle_id = bundle->retained_bundle_id();
     config.empty_runtime_graph_revision =
         bundle->value().cell_graph.graph_revision;
@@ -115,8 +116,6 @@ protected:
         bundle->retained_bundle_id(),
         core::ComputeRequiredRuntimeSetDigest({}),
         core::RuntimeUnitId("helper.manager"),
-        core::RuntimeEpoch("helper.manager.epoch"),
-        core::RequestOwnerEpoch("helper.manager.owner"),
         {}};
     cell = std::make_unique<RetainedCellRuntime>(
         RetainedCellRuntimeInput{.clock = clock,
@@ -127,8 +126,7 @@ protected:
                                        .kernel_config = std::move(config)});
     const core::CellAdmissionReadinessSnapshotDTO idle{
         true,
-        core::ProgramCycleStatusDTO{core::RequestOwnerEpoch("helper.runner"),
-                                    1U,
+        core::ProgramCycleStatusDTO{1U,
                                     core::ProgramCycleStateDTO::kIdleAfterReset,
                                     {},
                                     {},
@@ -206,7 +204,7 @@ protected:
       core::ResolvedLifecycleControlDomainScopeDTO scope{
           domain.control_domain_id, domain.control_domain_revision,
           core::ResolvedProviderDomainScopeDTO{
-              *provider, epoch, {}, resources}};
+              *provider, epoch, resources}};
       core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
           domain.control_domain_id,
           domain.control_domain_revision,
@@ -262,9 +260,7 @@ protected:
   core::ActiveBundlePublicationGeneration NewPublication() {
     publication = publication_store->PublishActiveBundle(
         {core::NamedApplyPublicationTransactionDTO{
-             core::ApplyId(
-                 "helper.apply." +
-                 std::to_string(publication->publication_generation.value())),
+             core::ApplyId(publication->publication_generation.value() + 1U),
              core::ApplyGeneration(1U)},
          projection, bundle->retained_bundle_id(), projection.graph_revision,
          publication->publication_generation, materialization});

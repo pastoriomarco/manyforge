@@ -55,12 +55,13 @@ describe('Composer shell continuity', () => {
     await import('./components/StructuralViewer');
     await Promise.resolve();
     healthProjection.value = { ...health, workbenchSessionNotice: {
-      schemaVersion: 'manyforge.workbench_previous_session.v1',
+      schemaVersion: 'manyforge.workbench_previous_session.v2',
       sessionId: 'a'.repeat(32),
-      archiveRelativePath: `previous-sessions/${'a'.repeat(32)}`,
+      archiveRelativePath: `previous-runs/${'a'.repeat(32)}`,
       shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
       journalFamilies: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
       message: 'Session a: journals retained; motion effects unknown. Nothing was resumed.',
+      unfinishedOperationIds: null, unfinishedOperationCount: null, applicationStartId: null,
     } };
     const markup = renderToStaticMarkup(<App />);
     expect(markup).toContain('ManyForge did not close correctly last time.');
@@ -114,7 +115,7 @@ describe('Composer shell continuity', () => {
     const viewer = markup.indexOf('id="viewer-title"');
 
     expect(markup).toContain('aria-label="ManyForge Composer"');
-    expect(markup).toContain('aria-label="Workbench sections"');
+    expect(markup).toContain('aria-label="ManyForge sections"');
     expect(markup).toContain('>Program</button>');
     expect(markup).toContain('>Scene</button>');
     // Components sits with Program, Scene and Deployment, before Deployment.

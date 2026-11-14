@@ -447,7 +447,7 @@ TEST(Ros2GripperCommandBackendTest,
   auto declared = health.Declare(
       core::ControllableComponentId("robot_1"),
       {"gripper_feedback", 1'000'000'000LL, core::StreamSeverityDTO::kFault,
-       core::StreamRecoveryDTO::kAck, core::StreamTimestampSourceDTO::kArrival});
+       core::StreamTimestampSourceDTO::kArrival});
   ASSERT_TRUE(declared.ok());
   std::shared_ptr<Ros2TransportResources> resources = test_transport_resources(sink, clock, "arm");
   Ros2GripperCommandBackend backend(resources, sink, clock, scheduler, false);
@@ -1753,6 +1753,44 @@ TEST(SceneProjectionWorkerLifetime, ConcurrentStopCallersKeepTheirOwnDeadlines) 
   EXPECT_FALSE(shorter.get());
   sink->release(1);
   EXPECT_TRUE(longer.get());
+}
+
+// A defect while taking the next request ends the worker through its ordinary
+// exit with one typed line; the process keeps running and later work is refused.
+TEST(SceneProjectionWorkerLifetime, TakeDefectEndsTheWorkerWithOneTypedLine) {
+  struct ThrowingCopyCallback final {
+    std::shared_ptr<std::atomic<bool>> armed;
+    explicit ThrowingCopyCallback(std::shared_ptr<std::atomic<bool>> value)
+        : armed(std::move(value)) {}
+    ThrowingCopyCallback(const ThrowingCopyCallback &other) : armed(other.armed) {
+      if (armed->load()) throw std::runtime_error("injected take defect");
+    }
+    ThrowingCopyCallback(ThrowingCopyCallback &&) noexcept = default;
+    void operator()(const detail::SceneProjectionCompletion &) const {}
+  };
+  core::FakeClock clock;
+  auto sink = std::make_shared<SequencedProjectionSink>();
+  detail::SceneProjectionWorker worker(sink, "arm", clock);
+  auto armed = std::make_shared<std::atomic<bool>>(false);
+  const auto slot =
+      worker.register_joint_slot("arm", "joint", ThrowingCopyCallback(armed));
+  armed->store(true);
+  ::testing::internal::CaptureStderr();
+  ASSERT_TRUE(worker.submit_active_joint(slot, 0.2, 0, {}));
+  bool refused = false;
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!refused && std::chrono::steady_clock::now() < deadline) {
+    refused = !worker.submit_active_joint(slot, 0.3, 0, {});
+    if (!refused) std::this_thread::sleep_for(5ms);
+  }
+  const bool joined = worker.stop_and_join_for(2s);
+  const std::string output = ::testing::internal::GetCapturedStderr();
+  EXPECT_TRUE(refused);
+  EXPECT_TRUE(joined);
+  const std::string line = "manyforge_fault code=scene_projection_take_failed\n";
+  const auto first = output.find(line);
+  ASSERT_NE(first, std::string::npos) << output;
+  EXPECT_EQ(output.find(line, first + line.size()), std::string::npos) << output;
 }
 
 void exercise_projection_submission_overlap(bool reject_second) {
@@ -3105,10 +3143,9 @@ TEST(Ros2GripperCommandBackendTest,
 }
 
 core::AddressedGripperCommandIdentityDTO committed_identity() {
-  return {core::OperationId{"pneumatic_operation"}, core::OperationRevision{1U},
-          core::OperationParticipantId{"pneumatic_participant"},
-          core::ControllerGoalId{"pneumatic_goal"},
-          core::ControllerGoalGeneration{1U}};
+  return {core::OperationNumber{1U}, core::OperationRevision{1U},
+          core::OperationParticipantId{core::OperationNumber{1U}, 1U},
+          core::ControllerGoalId{core::OperationNumber{1U}, 1U, 1U}};
 }
 
 TEST(Ros2GripperCommandBackendTest,
@@ -4074,6 +4111,9 @@ TEST(
     const auto endpoint =
         "/manyforge_position_timeout_values_" + unique_suffix();
     ControlledPneumaticServer server(*resources, endpoint);
+    // The acceptance is held until after the deadline, so the timeout always
+    // precedes it (late acceptance after timeout).
+    server.hold_goal_response = true;
     TestTransportLifetime lifetime(*resources, backend);
     auto config = pneumatic_mock_config(endpoint);
     config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
@@ -4085,8 +4125,8 @@ TEST(
                                         "position_reached");
     request.completion_timeout_s = timeout;
     ASSERT_TRUE(backend.command_gripper(request).accepted);
-    ASSERT_TRUE(server.wait_for_goal());
-      const auto deadline =
+    ASSERT_TRUE(wait_for_gripper_fact([&] { return server.requests.load() == 1U; }));
+    const auto deadline =
         static_cast<core::Duration>((timeout + 0.25) * 1e9);
     clock.advance(deadline - 1);
     scheduler.advance_to(clock.now());
@@ -4098,6 +4138,19 @@ TEST(
     EXPECT_EQ(failed.state, core::GripperCommandState::kFailed);
     ASSERT_TRUE(failed.error);
     EXPECT_EQ(failed.error->code,
+              ros2_control_fault_reason::kGripperResultTimeout);
+    EXPECT_EQ(server.cancels.load(), 0U);
+    // The late acceptance only cancels that goal; the timeout failure stays.
+    server.release_goal_response = true;
+    ASSERT_TRUE(server.wait_for_goal());
+    ASSERT_TRUE(wait_for_gripper_fact([&] {
+      scheduler.advance_to(clock.now());
+      return server.cancels.load() == 1U;
+    }));
+    const auto still_failed = backend.get_gripper_status("tool");
+    EXPECT_EQ(still_failed.state, core::GripperCommandState::kFailed);
+    ASSERT_TRUE(still_failed.error);
+    EXPECT_EQ(still_failed.error->code,
               ros2_control_fault_reason::kGripperResultTimeout);
   }
 }

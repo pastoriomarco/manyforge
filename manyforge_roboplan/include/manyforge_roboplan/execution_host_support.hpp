@@ -2,7 +2,6 @@
 
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
-#include <manyforge_core/stop_terminal_state.hpp>
 
 #include <array>
 #include <atomic>
@@ -12,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -103,7 +103,8 @@ class SimpleScheduler final : public core::IScheduler {
   /// and clears it (empty sink) before that Kernel is destroyed. Clearing
   /// waits for a containment already in progress.
   void set_safety_path_fault_sink(std::function<void(std::string_view)> sink);
-  /// Hands the typed reason to the installed sink; terminates without one.
+  /// Hands the typed reason to the installed sink; without one it writes one
+  /// typed line and the lane continues.
   void contain_safety_path_fault(std::string_view reason_code) noexcept override;
 
  private:
@@ -140,7 +141,8 @@ class SimpleScheduler final : public core::IScheduler {
     std::string startup_error;
 
     void worker_loop(std::stop_token st);
-    void ensure_started_locked(Worker* self);
+    /// Construction only: creates the thread and waits for its startup report.
+    void start(Worker* self);
     void drain();
     bool drain_for(std::chrono::nanoseconds timeout);
   };
@@ -163,5 +165,14 @@ class SimpleScheduler final : public core::IScheduler {
 
   std::array<Worker, core::kSchedulerPriorityCount> workers_;
 };
+
+/// OD-217: one robot's own collision-check thread. Its RuntimeSafety lane
+/// gets the cell's RuntimeSafety OS profile (policy, priority, CPUs, stack
+/// prefault) and starts now, at composition, not at the robot's first motion;
+/// its other lanes are never used. A throwing check is contained by the cell
+/// scheduler's installed sink, as on the cell's own lane.
+[[nodiscard]] std::shared_ptr<SimpleScheduler> make_runtime_collision_check_scheduler(
+    const SimpleSchedulerConfig &cell_config,
+    std::shared_ptr<SimpleScheduler> cell_scheduler);
 
 }  // namespace manyforge::roboplan_backend

@@ -8,6 +8,7 @@ import {
   useState,
 } from 'react';
 import { api, ApiError } from '../api/client';
+import { newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
 import { CommandRefusalError, commandRefusalCause } from '../state/commandRefusal';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import { parseMotionPreviewDiagnostic } from '../api/parsers/execution';
@@ -83,7 +84,7 @@ type TcpFence = {
 };
 
 function tcpAtLeast(current: DirectControlMotionStatus['activeTcp'], fence: TcpFence): boolean {
-  if (current === null || current.ownerEpoch !== fence.value.ownerEpoch) return false;
+  if (current === null || current.applicationStartId !== fence.value.applicationStartId) return false;
   if (current.registrationGeneration !== fence.value.registrationGeneration)
     return current.registrationGeneration > fence.value.registrationGeneration;
   if (current.sequence !== fence.value.sequence) return current.sequence > fence.value.sequence;
@@ -93,23 +94,21 @@ function tcpAtLeast(current: DirectControlMotionStatus['activeTcp'], fence: TcpF
 }
 
 function setTcpReceiptFence(result: unknown, status: ExecutionOwnerStatus,
-  motion: DirectControlMotionStatus, requestId: string, admittedFailure = false): TcpFence {
+  motion: DirectControlMotionStatus, admittedFailure = false): TcpFence {
   if (result === null || typeof result !== 'object' || Array.isArray(result))
     throw new Error('Set TCP returned no confirmed Active TCP.');
   const envelope = result as Record<string, unknown>;
   const accepted = envelope.accepted;
   if ((!admittedFailure && (envelope.ok !== true || envelope.command !== 'submit'
     || accepted === null || typeof accepted !== 'object' || Array.isArray(accepted)
-    || (accepted as Record<string, unknown>).request_id !== requestId
-    || typeof (accepted as Record<string, unknown>).operation_id !== 'string'
-    || !(accepted as Record<string, unknown>).operation_id)) || !Array.isArray(envelope.active_tcp))
+    || !positiveSafeInteger((accepted as Record<string, unknown>).operation_id))) || !Array.isArray(envelope.active_tcp))
     throw new Error('Set TCP returned an invalid acceptance.');
   const rows = envelope.active_tcp.filter((item: unknown) => item !== null && typeof item === 'object'
     && !Array.isArray(item) && (item as Record<string, unknown>).component_id === motion.controllableComponentId);
   if (rows.length !== 1) throw new Error('Set TCP returned no unique robot Active TCP.');
   const row = rows[0] as Record<string, unknown>;
   const entry = row.entry;
-  if (row.owner_epoch !== status.ownerEpoch || !Number.isSafeInteger(row.registration_generation)
+  if (!Number.isSafeInteger(row.registration_generation)
     || (row.registration_generation as number) < 1 || !Number.isSafeInteger(row.sequence)
     || (row.sequence as number) < 0 || (entry !== null && (typeof entry !== 'object' || Array.isArray(entry))))
     throw new Error('Set TCP returned an invalid Active TCP identity.');
@@ -133,16 +132,16 @@ function setTcpReceiptFence(result: unknown, status: ExecutionOwnerStatus,
   }
   return { componentId: motion.controllableComponentId, targetId: motion.commandTargetId,
     graphRevision: status.graphRevision, retainedBundleId: status.retainedBundleId,
-    strict: false, adopt: true, value: { entry: selected, display, ownerEpoch: status.ownerEpoch,
+    strict: false, adopt: true, value: { entry: selected, display, applicationStartId: status.applicationStartId,
       registrationGeneration: row.registration_generation as number, sequence: row.sequence as number } };
 }
 
-function requestId(): string {
-  return globalThis.crypto?.randomUUID?.()
-    ?? `composer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
 }
 
-function acceptedOperationId(receipt: ExecutionCommandReceipt, expectedRequestId: string): string | null {
+/** The operation number of the receipt's command (receipts are matched by client sequence). */
+function acceptedOperationId(receipt: ExecutionCommandReceipt): number | null {
   const result = receipt.result;
   if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
   const envelope = result as Record<string, unknown>;
@@ -150,10 +149,7 @@ function acceptedOperationId(receipt: ExecutionCommandReceipt, expectedRequestId
   if (envelope.ok !== true || envelope.command !== 'submit'
     || accepted === null || typeof accepted !== 'object' || Array.isArray(accepted)) return null;
   const identity = accepted as Record<string, unknown>;
-  return identity.request_id === expectedRequestId
-    && typeof identity.operation_id === 'string' && identity.operation_id !== ''
-    ? identity.operation_id
-    : null;
+  return positiveSafeInteger(identity.operation_id) ? identity.operation_id : null;
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -225,7 +221,7 @@ export function runtimeScaleFlushDelay(
 }
 
 export function runtimeScaleControlScopeFence(
-  ownerEpoch: string,
+  applicationStartId: string,
   status: RuntimeScaleControlStatus,
 ): string {
   const memberScope = status.selector.kind === 'group'
@@ -246,7 +242,7 @@ export function runtimeScaleControlScopeFence(
     })
     : undefined;
   return JSON.stringify([
-    ownerEpoch,
+    applicationStartId,
     status.selector.programBindingId,
     runtimeScaleSelectorIdentity(status.selector),
     status.controlDomainId ?? 'no-control-domain',
@@ -277,12 +273,10 @@ export function mergeRuntimeScaleStatus(
 export function acceptedRuntimeScaleStatus(
   submitted: RuntimeScaleControlStatus,
   accepted: RuntimeScaleControlAccepted,
-  expectedRequestId: string,
   expectedScale: number,
 ): RuntimeScaleControlStatus {
   if (
-    accepted.requestId !== expectedRequestId
-    || accepted.controlGeneration !== submitted.controlGeneration + 1
+    accepted.controlGeneration !== submitted.controlGeneration + 1
     || accepted.requestedScale !== expectedScale
     || runtimeScaleSelectorIdentity(accepted.selector)
       !== runtimeScaleSelectorIdentity(submitted.selector)
@@ -307,19 +301,19 @@ export function buildManualAvailabilityIntent(
   status: ExecutionOwnerStatus,
   mode: RobotControlMode,
   draftGripperPosition: number | null,
-  requestIdentity: string,
+  requestKey: string,
 ): DirectControlOperationIntent {
   if (mode !== 'gripper') {
     if (status.observedMotion === null) throw new Error('Motion observation is unavailable.');
-    return buildJointMotionIntent(status, status.observedMotion.positionsRad, requestIdentity);
+    return buildJointMotionIntent(status, status.observedMotion.positionsRad, requestKey);
   }
   if (!hasPneumaticGripperDescriptor(status)) {
     if (status.observedGripper === null) throw new Error('Gripper observation is unavailable.');
-    return buildGripperCommandIntent(status, status.observedGripper.position, requestIdentity);
+    return buildGripperCommandIntent(status, status.observedGripper.position, requestKey);
   }
   if (draftGripperPosition !== null) {
     try {
-      return buildGripperCommandIntent(status, draftGripperPosition, requestIdentity);
+      return buildGripperCommandIntent(status, draftGripperPosition, requestKey);
     } catch {
       // An invalid draft is never repaired. Only the query may use its configured preset.
     }
@@ -329,7 +323,7 @@ export function buildManualAvailabilityIntent(
   if (descriptor.openStateRef === null || presets.length !== 1) {
     throw new Error('The configured gripper open preset is unavailable or ambiguous.');
   }
-  return buildGripperCommandIntent(status, presets[0].masterPosition, requestIdentity);
+  return buildGripperCommandIntent(status, presets[0].masterPosition, requestKey);
 }
 
 /** Cold ownership/hold revisions only; never pose samples or node tick status. */
@@ -349,11 +343,11 @@ export function manualAvailabilityScopeFence(
   const target = mode === 'gripper' ? selected.directControlGripper : selected.directControl;
   if (target === null) return null;
   return JSON.stringify([
-    status.ownerEpoch, status.retainedBundleId, status.graphRevision,
-    target.programBindingId, target.programRunId,
+    status.applicationStartId, status.retainedBundleId, status.graphRevision,
+    target.programBindingId,
     ...(mode === 'gripper' && hasPneumaticGripperDescriptor(selected) ? [target.targetDescriptor] : []),
     snapshot.authoringAdmission.admissionGeneration,
-    cycle.programRunnerOwnerEpoch, cycle.cycleGeneration, cycle.state,
+    cycle.cycleGeneration, cycle.state,
     cycle.executionControlRevision,
     cycle.runtimeControls?.executionSelections,
     status.runtimeScaleControl?.activeControlConfigurationGeneration,
@@ -363,6 +357,8 @@ export function manualAvailabilityScopeFence(
 
 export interface RobotControlController {
   state: RobotControlState;
+  /** The current application-start id, for the display form of ids (BS 2.9). */
+  applicationStartId?: ApplicationStartId | null;
   /** Current owner projection, unlike state.status retained for presentation. */
   currentStatus: ExecutionOwnerStatus | null;
   /** Fresh owner rows for the Resume comparison, including a confirmed Set TCP receipt. */
@@ -441,14 +437,14 @@ export function useRobotControl(
   const [tcpApplying, setTcpApplying] = useState(false);
   const [tcpError, setTcpError] = useState<string | null>(null);
   const [tcpFence, setTcpFence] = useState<TcpFence | null>(null);
-  const tcpInFlight = useRef<{ id: string; ownerEpoch: string } | null>(null);
-  const [tcpWaitOwner, setTcpWaitOwner] = useState<{ ownerEpoch: string; graphRevision: string; retainedBundleId: string;
+  const tcpInFlight = useRef<{ id: string; applicationStartId: string } | null>(null);
+  const [tcpWaitOwner, setTcpWaitOwner] = useState<{ applicationStartId: string; graphRevision: string; retainedBundleId: string;
     componentId: string; targetId: string } | null>(null);
   const [runtimeScaleStatus, setRuntimeScaleStatus] = useState<RuntimeScaleControlStatus | null>(null);
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
   const [runtimeScalePending, setRuntimeScalePending] = useState(false);
   const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
-  const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
+  const approveInFlight = useRef<{ applicationStartId: string; generation: number } | null>(null);
   const pneumaticWriteAbort = useRef<AbortController | null>(null);
   useEffect(() => () => pneumaticWriteAbort.current?.abort(), []);
   const dragGeneration = useRef<number | null>(null);
@@ -463,7 +459,7 @@ export function useRobotControl(
     setAuthoringPending(pendingAuthoringInputs.current.size > 0);
   }, []);
   const pendingOperationControl = useRef<{
-    control: 'stop' | 'reset'; ownerEpoch: string | null; operationId: string;
+    control: 'stop' | 'reset'; applicationStartId: string | null; operationId: number;
   } | null>(null);
   const runtimeScaleStatusRef = useRef<RuntimeScaleControlStatus | null>(null);
   const runtimeScaleQueued = useRef<number | null>(null);
@@ -509,7 +505,7 @@ export function useRobotControl(
   const selectedStatus = useMemo(() => {
     const motion = ownerSelectedStatus?.directControl;
     if (ownerSelectedStatus === null || motion == null || tcpFence === null
-      || !tcpFence.adopt || ownerSelectedStatus.ownerEpoch !== tcpFence.value.ownerEpoch
+      || !tcpFence.adopt || ownerSelectedStatus.applicationStartId !== tcpFence.value.applicationStartId
       || ownerSelectedStatus.graphRevision !== tcpFence.graphRevision
       || ownerSelectedStatus.retainedBundleId !== tcpFence.retainedBundleId
       || motion.controllableComponentId !== tcpFence.componentId || motion.commandTargetId !== tcpFence.targetId
@@ -538,7 +534,7 @@ export function useRobotControl(
   const freshStatus = tcpResumeFresh ? headlessSnapshot?.executionControlStatus ?? null : null;
   const tcpResumeCycle = tcpResumeFresh ? headlessSnapshot?.programCycle ?? null : null;
   const tcpResumeStatus = useMemo(() => freshStatus === null || !tcpApplying || tcpWaitOwner === null
-    || freshStatus.ownerEpoch !== tcpWaitOwner.ownerEpoch
+    || freshStatus.applicationStartId !== tcpWaitOwner.applicationStartId
     || freshStatus.graphRevision !== tcpWaitOwner.graphRevision
     || freshStatus.retainedBundleId !== tcpWaitOwner.retainedBundleId
     ? freshStatus : {
@@ -547,7 +543,7 @@ export function useRobotControl(
         if (row.controllableComponentId !== tcpWaitOwner.componentId || row.commandTargetId !== tcpWaitOwner.targetId) return row;
         if (tcpFence === null || !tcpFence.adopt
           || tcpFence.componentId !== tcpWaitOwner.componentId || tcpFence.targetId !== tcpWaitOwner.targetId
-          || tcpFence.value.ownerEpoch !== freshStatus.ownerEpoch
+          || tcpFence.value.applicationStartId !== freshStatus.applicationStartId
           || tcpFence.graphRevision !== freshStatus.graphRevision || tcpFence.retainedBundleId !== freshStatus.retainedBundleId)
           return { ...row, activeTcp: null };
         return tcpAtLeast(row.activeTcp, tcpFence) ? row : { ...row, activeTcp: tcpFence.value };
@@ -560,7 +556,7 @@ export function useRobotControl(
     // snapshot that has not yet replaced the drafts and pose it presents.
     const live = state.status;
     if (live == null) return;
-    if (live.ownerEpoch !== tcpFence.value.ownerEpoch || live.graphRevision !== tcpFence.graphRevision
+    if (live.applicationStartId !== tcpFence.value.applicationStartId || live.graphRevision !== tcpFence.graphRevision
       || live.retainedBundleId !== tcpFence.retainedBundleId) {
       setTcpFence(null);
       setTcpApplying(false);
@@ -578,7 +574,7 @@ export function useRobotControl(
 
   useEffect(() => {
     const live = headlessSnapshot?.executionControlStatus;
-    if (tcpWaitOwner !== null && live != null && (live.ownerEpoch !== tcpWaitOwner.ownerEpoch
+    if (tcpWaitOwner !== null && live != null && (live.applicationStartId !== tcpWaitOwner.applicationStartId
       || live.graphRevision !== tcpWaitOwner.graphRevision || live.retainedBundleId !== tcpWaitOwner.retainedBundleId)) {
       tcpInFlight.current = null;
       setTcpFence(null);
@@ -610,7 +606,7 @@ export function useRobotControl(
   const cartesianMode = state.mode === 'pose_goal' || state.mode === 'cartesian_path'
     || (state.mode === 'move_to' && state.moveToKind === 'pose');
   const tcpBlocksCartesian = tcpApplying && cartesianMode;
-  const projectedOwnerRef = useRef<string | null>(null);
+  const projectedOwnerRef = useRef(false);
   const previewStatusRef = useRef(selectedStatus);
   previewStatusRef.current = selectedStatus;
   const availabilityStatusRef = useRef(selectedStatus);
@@ -640,8 +636,7 @@ export function useRobotControl(
     // An old owner's response cannot block or reject a successor's draft.
     cleanupInFlight.current = null;
     setCleanupFailure(null);
-  }, [headlessSnapshot?.executionControlStatus?.ownerEpoch,
-    headlessSnapshot?.programCycle?.programRunnerOwnerEpoch,
+  }, [headlessSnapshot?.executionControlStatus?.applicationStartId,
     headlessSnapshot?.programCycle?.programRunId]);
 
   const availabilityGripperDraft = selectedStatus !== null
@@ -655,10 +650,12 @@ export function useRobotControl(
     let current = true;
     const read = async () => {
       try {
+        const applicationStartId = latestSnapshot.current?.applicationStartId;
+        if (applicationStartId === undefined) throw new Error('Execution owner identity is unavailable.');
         const intent = buildManualAvailabilityIntent(
-          status, state.mode, availabilityGripperDraft, requestId(),
+          status, state.mode, availabilityGripperDraft, newRequestKey(),
         );
-        const result = await api.execution.manualAvailability(intent, controller.signal);
+        const result = await api.execution.manualAvailability(intent, applicationStartId, controller.signal);
         if (current) setAvailability({ scope: availabilityScope, result, error: null });
       } catch (error: unknown) {
         if (current) setAvailability({ scope: availabilityScope, result: null,
@@ -676,7 +673,7 @@ export function useRobotControl(
 
   useEffect(() => {
     if (!enabled) {
-      projectedOwnerRef.current = null;
+      projectedOwnerRef.current = false;
       dispatch({ type: 'clear' });
       return;
     }
@@ -687,8 +684,8 @@ export function useRobotControl(
       // transport absence is not evidence that a robot command failed.
       return;
     }
-    const initialize = projectedOwnerRef.current === null;
-    projectedOwnerRef.current = status.ownerEpoch;
+    const initialize = !projectedOwnerRef.current;
+    projectedOwnerRef.current = true;
     dispatch({
       type: initialize ? 'status_resolved' : 'status_refreshed',
       status,
@@ -732,7 +729,7 @@ export function useRobotControl(
       if (!manualPanelVisibleRef.current || dragGeneration.current !== null) return;
       let intent: DirectControlOperationIntent;
       try {
-        intent = buildPreviewIntent(previewDraft, requestId());
+        intent = buildPreviewIntent(previewDraft, newRequestKey());
       } catch (error: unknown) {
         if (current) {
           dispatch({
@@ -757,12 +754,10 @@ export function useRobotControl(
                 || cycle.runRevision == null) {
                 throw new Error('The held Program changed before manual cleanup.');
               }
-              const cleanupId = requestId();
               const pending = controlSource.sendExecutionCommand('program_manual_handover', {
-                request_id: cleanupId, program_run_id: context.program_run_id,
-                expected_owner_epoch: context.program_runner_owner_epoch,
+                program_run_id: context.program_run_id,
                 expected_run_revision: cycle.runRevision, operation: intent,
-              }, cleanupId).then(() => undefined);
+              }).then(() => undefined);
               cleanupInFlight.current = pending;
               void pending.then(() => {
                 if (cleanupInFlight.current !== pending) return;
@@ -781,10 +776,12 @@ export function useRobotControl(
           }
         }
         if (!current || !manualPanelVisibleRef.current) return null;
+        const applicationStartId = latestSnapshot.current?.applicationStartId;
+        if (applicationStartId === undefined) throw new Error('Execution owner identity is unavailable.');
         dispatch({ type: 'preview_started', generation, intent });
         return intent.participants[0].payload.kind === 'motion'
-          ? api.execution.previewMotion(intent, controller.signal)
-          : api.execution.previewCapabilityCommand(intent, controller.signal);
+          ? api.execution.previewMotion(intent, applicationStartId, controller.signal)
+          : api.execution.previewCapabilityCommand(intent, applicationStartId, controller.signal);
       };
       void preparePreview()
         .then((receipt) => {
@@ -861,12 +858,11 @@ export function useRobotControl(
       || !enabled || controlSource === null || status === null || motion == null || motion.activeTcp === null
       || tcp === undefined || (motion.activeTcp?.entry != null
         && tcpEntryIdentityKey(motion.activeTcp.entry) === entryKey)) return;
-    const id = requestId();
+    const id = newRequestKey();
     const intent: DirectControlSetTcpIntent = {
-      request_context: { request_id: id, request_owner_epoch: status.ownerEpoch,
-        source_label: 'composer_ui', correlation_id: null },
+      request_context: { request_key: id, source_label: 'composer_ui' },
       program_id: motion.programId, program_revision: motion.programRevision,
-      program_binding_id: motion.programBindingId, program_run_id: motion.programRunId,
+      program_binding_id: motion.programBindingId,
       expected_graph_revision: status.graphRevision, expected_retained_bundle_id: status.retainedBundleId,
       expected_scene_revision: null, coordination_policy: 'independent',
       participants: [{ target: { component_id: motion.controllableComponentId, command_target_id: motion.commandTargetId },
@@ -875,11 +871,11 @@ export function useRobotControl(
           component_id: tcp.entry.componentId, command_target_id: tcp.entry.targetId,
         }, frame: { component_id: tcp.entry.frameComponentId, frame_id: tcp.entry.frameRoleId } } } }],
     };
-    const flight = { id, ownerEpoch: status.ownerEpoch };
+    const flight = { id, applicationStartId: status.applicationStartId };
     tcpInFlight.current = flight;
     dispatch({ type: 'active_tcp_change_started' });
     setTcpApplying(true);
-    setTcpWaitOwner({ ownerEpoch: status.ownerEpoch, graphRevision: status.graphRevision,
+    setTcpWaitOwner({ applicationStartId: status.applicationStartId, graphRevision: status.graphRevision,
       retainedBundleId: status.retainedBundleId, componentId: motion.controllableComponentId,
       targetId: motion.commandTargetId });
     setTcpError(null);
@@ -892,7 +888,9 @@ export function useRobotControl(
     };
     void (async () => {
       if (observeProgramRun) {
-        let availability = await api.execution.manualAvailability(intent);
+        const applicationStartId = latestSnapshot.current?.applicationStartId;
+        if (applicationStartId === undefined) throw new Error('Execution owner identity is unavailable.');
+        let availability = await api.execution.manualAvailability(intent, applicationStartId);
         if (!availability.available || availability.manualHandover === null)
           throw new Error(availability.unavailableReason ?? 'The held target is not available for manual control.');
         if (availability.cleanupRequired) {
@@ -902,12 +900,10 @@ export function useRobotControl(
           const cycle = latestSnapshot.current?.programCycle;
           if (cycle?.programRunId !== context.program_run_id || cycle.runRevision == null)
             throw new Error('The held Program changed before manual cleanup.');
-          const cleanupId = requestId();
           const cleanup = controlSource.sendExecutionCommand('program_manual_handover', {
-            request_id: cleanupId, program_run_id: context.program_run_id,
-            expected_owner_epoch: context.program_runner_owner_epoch,
+            program_run_id: context.program_run_id,
             expected_run_revision: cycle.runRevision, operation: { ...intent, manual_handover: context },
-          }, cleanupId).then(() => undefined);
+          }).then(() => undefined);
           cleanupInFlight.current = cleanup;
           try {
             await cleanup;
@@ -919,14 +915,14 @@ export function useRobotControl(
             setAvailability(null);
             refreshAvailability();
           }
-          availability = await api.execution.manualAvailability(intent);
+          availability = await api.execution.manualAvailability(intent, applicationStartId);
           if (!availability.available || availability.cleanupRequired || availability.manualHandover === null)
             throw new Error(availability.unavailableReason ?? 'The held target changed after manual cleanup.');
         }
         intent.manual_handover = availability.manualHandover;
       }
       const live = latestSnapshot.current?.executionControlStatus;
-      if (live == null || live.ownerEpoch !== status.ownerEpoch
+      if (live == null || live.applicationStartId !== status.applicationStartId
         || live.graphRevision !== status.graphRevision || live.retainedBundleId !== status.retainedBundleId)
         throw new Error('The robot control target changed before Set TCP.');
       const target = previewStatusRef.current?.directControl;
@@ -937,16 +933,16 @@ export function useRobotControl(
       const payload: Record<string, unknown> = { ...intent };
       delete payload.request_context;
       setTcpSubmitted = true;
-      const receipt = await controlSource.sendExecutionCommand('operation_start', payload, id);
+      const receipt = await controlSource.sendExecutionCommand('operation_start', payload);
       const afterReply = latestSnapshot.current?.executionControlStatus;
-      if (tcpInFlight.current !== flight || afterReply == null || afterReply.ownerEpoch !== status.ownerEpoch
+      if (tcpInFlight.current !== flight || afterReply == null || afterReply.applicationStartId !== status.applicationStartId
         || afterReply.graphRevision !== status.graphRevision || afterReply.retainedBundleId !== status.retainedBundleId) return;
       // Once a result is received, do not re-enable Cartesian work until the
       // corresponding owner status has caught up. If the reply is invalid,
       // require a version strictly newer than the pre-command status.
       waitingForStatus = true;
       setTcpFence(fallbackFence);
-      const fence = setTcpReceiptFence(receipt.result, status, motion, id);
+      const fence = setTcpReceiptFence(receipt.result, status, motion);
       setTcpFence(fence);
     })().catch((error: unknown) => {
       if (tcpInFlight.current === flight && setTcpSubmitted && error instanceof CommandDeliveryUnconfirmedError) {
@@ -954,7 +950,7 @@ export function useRobotControl(
         setTcpFence(fallbackFence);
       }
       const current = latestSnapshot.current?.executionControlStatus;
-      if (tcpInFlight.current === flight && current?.ownerEpoch === status.ownerEpoch && current.graphRevision === status.graphRevision
+      if (tcpInFlight.current === flight && current?.applicationStartId === status.applicationStartId && current.graphRevision === status.graphRevision
         && current.retainedBundleId === status.retainedBundleId) {
         const raw = error instanceof CommandRefusalError ? error.executionResult : null;
         const result = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
@@ -966,7 +962,7 @@ export function useRobotControl(
         if (result?.ok === false && details?.immediate_step === 'admitted') {
           waitingForStatus = true;
           try {
-            setTcpFence(setTcpReceiptFence(raw, status, motion, id, true));
+            setTcpFence(setTcpReceiptFence(raw, status, motion, true));
           } catch {
             setTcpFence(fallbackFence);
           }
@@ -990,20 +986,20 @@ export function useRobotControl(
 
   useEffect(() => {
     const pending = pendingOperationControl.current;
-    if (pending !== null && (pending.ownerEpoch !== (state.status?.ownerEpoch ?? null)
+    if (pending !== null && (pending.applicationStartId !== (state.status?.applicationStartId ?? null)
       || pending.operationId !== state.operation?.operationId)) {
       pendingOperationControl.current = null;
       setControlPending(null);
     }
-  }, [state.status?.ownerEpoch, state.operation?.operationId]);
+  }, [state.status?.applicationStartId, state.operation?.operationId]);
 
   useEffect(() => {
     const pending = approveInFlight.current;
-    if (pending !== null && (pending.ownerEpoch !== state.status?.ownerEpoch
+    if (pending !== null && (pending.applicationStartId !== state.status?.applicationStartId
       || pending.generation !== state.generation || state.phase !== 'approving')) {
       approveInFlight.current = null;
     }
-  }, [state.status?.ownerEpoch, state.generation, state.phase]);
+  }, [state.status?.applicationStartId, state.generation, state.phase]);
 
   const sendOperationControl = useCallback(async (
     control: 'stop' | 'reset',
@@ -1013,18 +1009,18 @@ export function useRobotControl(
     // The owner status is not a Stop prerequisite: an operation to stop is enough.
     if (state.operation === null) return;
     const pending = {
-      control, ownerEpoch: state.status?.ownerEpoch ?? null, operationId: state.operation.operationId,
+      control, applicationStartId: state.status?.applicationStartId ?? null, operationId: state.operation.operationId,
     };
     pendingOperationControl.current = pending;
     try {
       if (controlSource === null) throw new Error('Control connection is not synchronized.');
       // Dispatch first. Local click feedback is not a command prerequisite.
-      const response = controlSource.sendExecutionCommand(kind, payload, requestId());
+      const response = controlSource.sendExecutionCommand(kind, payload);
       setControlPending(control);
       await response;
     } catch (error: unknown) {
       if (pendingOperationControl.current === pending) dispatch({
-        type: 'operation_control_failed', ownerEpoch: pending.ownerEpoch, operationId: pending.operationId,
+        type: 'operation_control_failed', applicationStartId: pending.applicationStartId, operationId: pending.operationId,
         error: errorMessage(error, `Operation ${control} was rejected.`),
         errorRefusal: commandRefusalCause(error),
       });
@@ -1042,10 +1038,9 @@ export function useRobotControl(
   const runtimeScaleScopeFence = enabled
     && state.status !== null
     && projectedRuntimeScale !== null
-    ? runtimeScaleControlScopeFence(state.status.ownerEpoch, projectedRuntimeScale)
+    ? runtimeScaleControlScopeFence(state.status.applicationStartId, projectedRuntimeScale)
     : null;
   const runtimeScaleContext = useRef<{
-    ownerEpoch: string;
     scopeFence: string;
     selector: RuntimeScaleControlStatus['selector'];
   } | null>(null);
@@ -1053,7 +1048,6 @@ export function useRobotControl(
     && state.status !== null
     && projectedRuntimeScale !== null
     ? {
-        ownerEpoch: state.status.ownerEpoch,
         scopeFence: runtimeScaleScopeFence,
         selector: projectedRuntimeScale.selector,
       }
@@ -1109,7 +1103,6 @@ export function useRobotControl(
       if (controlSource === null) {
         throw new Error('Control connection is not synchronized.');
       }
-      const commandRequestId = requestId();
       const receipt = await controlSource.sendExecutionCommand(
         'runtime_scale',
         {
@@ -1127,14 +1120,12 @@ export function useRobotControl(
           expected_control_generation: observed.controlGeneration,
           scale,
         },
-        commandRequestId,
       );
       if (runtimeScaleInFlight.current !== pending
         || runtimeScaleContext.current?.scopeFence !== pending.scopeFence) return;
       const accepted = acceptedRuntimeScaleStatus(
         observed,
         parseRuntimeScaleControlAccepted(receipt.result),
-        commandRequestId,
         scale,
       );
       const current = runtimeScaleStatusRef.current;
@@ -1309,7 +1300,7 @@ export function useRobotControl(
       || state.intent === null
       || state.status === null
     ) return;
-    const pending = { ownerEpoch: state.status.ownerEpoch, generation: state.generation };
+    const pending = { applicationStartId: state.status.applicationStartId, generation: state.generation };
     approveInFlight.current = pending;
     let pneumaticAbort: AbortController | null = null;
     try {
@@ -1341,17 +1332,13 @@ export function useRobotControl(
         });
         checkCurrent();
       }
-      const receipt = await controlSource.sendExecutionCommand(
-        'operation_start',
-        payload,
-        state.intent.request_context.request_id,
-      );
-      const operationId = acceptedOperationId(receipt, state.intent.request_context.request_id);
+      const receipt = await controlSource.sendExecutionCommand('operation_start', payload);
+      const operationId = acceptedOperationId(receipt);
       if (operationId !== null) dispatch({
         type: 'operation_mode_accepted',
         generation: state.generation,
-        ownerEpoch: state.status.ownerEpoch,
-        requestId: state.intent.request_context.request_id,
+        applicationStartId: state.status.applicationStartId,
+        requestKey: state.intent.request_context.request_key,
         operationId,
         mode: state.mode,
       });
@@ -1385,7 +1372,6 @@ export function useRobotControl(
       operations: [{
         operation_id: operation.operationId,
         expected_operation_revision: operation.operationRevision,
-        expected_stop_generation: operation.activeStopGeneration ?? 0,
       }],
       reason: 'operator Robot Control Stop',
     });
@@ -1418,8 +1404,10 @@ export function useRobotControl(
     dispatch({ type: 'dismiss_error' });
   }, []);
 
+  const applicationStartId = headlessSnapshot?.applicationStartId ?? null;
   return useMemo(() => ({
     state,
+    applicationStartId,
     // Keep the complete owner projection for cross-target recovery and cell
     // controls. Target-specific authoring uses selectedStatus below.
     currentStatus: state.status,
@@ -1470,6 +1458,7 @@ export function useRobotControl(
     retry,
     selectPreviewSample: (index: number) => dispatch({ type: 'select_preview_sample', index }),
   }), [
+    applicationStartId,
     approve,
     controlPending,
     editGripper,

@@ -1202,7 +1202,7 @@ def _owner_mesh_references(
         ) from error
     if (
         type(projection) is not dict
-        or projection.get("schema_version") != "manyforge.scene_projection.v1"
+        or projection.get("schema_version") != "manyforge.scene_projection.v2"
     ):
         raise _scene_mesh_error(
             503,
@@ -1215,8 +1215,6 @@ def _owner_mesh_references(
         or section.get("available") is not True
         or section.get("freshness") != "fresh"
         or section.get("known_gaps") != []
-        or type(section.get("source_owner_epoch")) is not str
-        or not section["source_owner_epoch"]
         or type(section.get("source_generation")) is not int
         or isinstance(section.get("source_generation"), bool)
         or section["source_generation"] < 0

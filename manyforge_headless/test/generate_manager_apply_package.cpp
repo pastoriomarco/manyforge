@@ -110,7 +110,13 @@ void KeepOnlyRobotiq(CanonicalValue::Object &root) {
 constexpr std::string_view kUsage =
     "usage: generate_manager_apply_package --package-root <path> "
     "--metadata <path> --profile ros2-control|assistant-ros2-control|"
+    "assistant-ros2-control-stoppable-motion|"
     "gripper-pneumatic-commanded|gripper-only-robotiq-position";
+
+/// The profile whose Program's one joint move runs long enough to be stopped:
+/// the assistant-ros2-control cell with that Program instead of the probe.
+constexpr std::string_view kStoppableMotionProfile =
+    "assistant-ros2-control-stoppable-motion";
 
 [[nodiscard]] Profile SelectProfile(const std::string_view name) {
   // The Lite 6 machine (owner `lite6`, arm member `lite6_robot`) with its
@@ -118,7 +124,7 @@ constexpr std::string_view kUsage =
   if (name == "ros2-control")
     return {"examples/mock_lite6_pick_and_place.scenario", nullptr, "lite6_robot", "arm", true};
   // The UR10e + Robotiq 2F-140 cell with its scene-authoring assistant.
-  if (name == "assistant-ros2-control")
+  if (name == "assistant-ros2-control" || name == kStoppableMotionProfile)
     return {"examples/mock_ur10e_assistant_scene_authoring.scenario", nullptr, "ur10e_robot", "arm", false};
   // The Lite gripper alone: pneumatic, commanded output, with feedback.
   if (name == "gripper-pneumatic-commanded")
@@ -153,12 +159,46 @@ struct ProgramPublication final {
   std::shared_ptr<const deployment::ProgramBindingContract> program;
 };
 
+/// The UR10e arm's one slow joint move: the shoulder pan from its start
+/// position (the Scenario's initial joint positions) through 1.5 rad at 5 %
+/// velocity and acceleration, no automatic retry. It runs for many seconds in
+/// the Mock lane, so a test can stop it while it executes.
+[[nodiscard]] CanonicalValue StoppableJointMove(const Profile &profile) {
+  using V = CanonicalValue;
+  const auto joint = [](const std::string_view name, const double position) {
+    return V(V::Object{{"joint_name", V(std::string(name))},
+                       {"position_rad", V(position)}});
+  };
+  return V(V::Object{
+      {"node_id", V("motion.move_to_joint_target")},
+      {"instance_id", V("stoppable_joint_move")},
+      {"parameters",
+       V(V::Object{
+           {"target", V(V::Object{{"component_id", V(std::string(profile.component_id))},
+                                  {"command_target_id",
+                                   V(std::string(profile.command_target_id))}})},
+           {"base_frame", V(V::Object{{"component_id", V(std::string(profile.component_id))},
+                                      {"frame_id", V("base")}})},
+           {"goal", V(V::Array{joint("shoulder_pan_joint", 1.5),
+                               joint("shoulder_lift_joint", -1.57),
+                               joint("elbow_joint", 1.57),
+                               joint("wrist_1_joint", -1.57),
+                               joint("wrist_2_joint", -1.57),
+                               joint("wrist_3_joint", 0.0)})},
+           {"velocity_scale", V(0.05)},
+           {"acceleration_scale", V(0.05)},
+           {"execution_timeout_s", V(120.0)},
+           {"automatic_retries", V(0.0)}})},
+      {"children", V(V::Array{})}});
+}
+
 /// A timer-first Program that retains the exact v3 target/frame test inputs.
 /// The fallback succeeds on the timer and never executes the following node.
+/// With `stoppable_motion`, a sequence of the one slow joint move instead.
 [[nodiscard]] ProgramPublication PublishProgram(
     const std::filesystem::path &package_root,
     const detail::PreparedActivationMaterialization &physical,
-    const Profile &profile) {
+    const Profile &profile, const bool stoppable_motion) {
   using V = CanonicalValue;
   deployment::test::ProgramOptions options;
   options.catalog_content_version =
@@ -189,9 +229,16 @@ struct ProgramPublication final {
       {"parameters", V(std::move(selected_parameters))}, {"children", V(V::Array{})}});
   const auto timer = deployment::parse_strict_json_model_yaml(
       R"({"node_id":"timer","instance_id":"apply_fixture_timer","parameters":{"duration_s":0.001},"children":[]})").root();
-  authored = With(std::move(authored), "tree", V(V::Object{
-      {"node_id", V("fallback")}, {"instance_id", V("apply_fixture_root")},
-      {"parameters", V(V::Object{})}, {"children", V(V::Array{timer, selected})}}));
+  authored = With(std::move(authored), "tree",
+                  stoppable_motion
+                      ? V(V::Object{{"node_id", V("sequence")},
+                                    {"instance_id", V("stoppable_motion_root")},
+                                    {"parameters", V(V::Object{})},
+                                    {"children", V(V::Array{StoppableJointMove(profile)})}})
+                      : V(V::Object{{"node_id", V("fallback")},
+                                    {"instance_id", V("apply_fixture_root")},
+                                    {"parameters", V(V::Object{})},
+                                    {"children", V(V::Array{timer, selected})}}));
   if (profile.initial_scene) {
     // Apply never loads a Program's scene; the marker proves it stays out.
     authored = With(std::move(authored), "scene",
@@ -220,6 +267,8 @@ struct ProgramPublication final {
     throw std::logic_error("fixture binding lost its exact authored target");
   if (arm)
     for (const auto *id : {"base", "flange"}) {
+      // The joint move states only its base frame.
+      if (stoppable_motion && std::string_view(id) == "flange") continue;
       const core::ProgramFrameReferenceDTO frame{expected_target.component_id,
                                                   core::FrameRoleId(id)};
       if (std::none_of(binding->value().frame_bindings.begin(),
@@ -328,6 +377,8 @@ int main(int argc, char **argv) {
     const std::filesystem::path package_root(argv[2]);
     const std::filesystem::path metadata_path(argv[4]);
     const auto profile = SelectProfile(argv[6]);
+    const bool stoppable_motion =
+        std::string_view(argv[6]) == kStoppableMotionProfile;
     std::filesystem::create_directories(package_root);
     const std::filesystem::path workspace(MANYFORGE_WORKSPACE_ROOT);
 
@@ -362,7 +413,8 @@ int main(int argc, char **argv) {
     const auto admission = detail::publish_cell_scoped_canonical_empty_admission(
         package_root, admission_filename, *close.canonical_empty_bundle);
 
-    const auto program = PublishProgram(package_root, physical, profile);
+    const auto program =
+        PublishProgram(package_root, physical, profile, stoppable_motion);
     WriteMetadata(metadata_path, admission, admission_filename, *close.bundle,
                   *physical.bundle, program,
                   PublishPreparedActivations(package_root, physical, program));

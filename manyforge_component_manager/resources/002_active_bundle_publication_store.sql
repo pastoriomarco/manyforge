@@ -1,4 +1,8 @@
--- ManyForge I4 durable active-bundle publication store, version 2.
+-- ManyForge I4 durable active-bundle publication store, version 4.
+--
+-- Version 3: a named Apply's transaction_id is its decimal Apply number.
+-- Version 4: metadata records_lost, set by the record writer when records of
+-- this start were not written.
 --
 -- This schema has exactly one public-pointer owner. Immutable receipts retain
 -- exact replay and independent generation-bound reread evidence; the singleton
@@ -9,12 +13,12 @@
 -- ending at the head. The head receipt itself can never be deleted.
 
 PRAGMA application_id = 1296449872;
-PRAGMA user_version = 2;
+PRAGMA user_version = 4;
 
 CREATE TABLE IF NOT EXISTS publication_store_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 4),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_receipts INTEGER NOT NULL
@@ -27,7 +31,9 @@ CREATE TABLE IF NOT EXISTS publication_store_metadata (
             maximum_main_database_page_image_bytes > 0
             AND maximum_main_database_page_image_bytes
                 <= 9223372036854775807
-        )
+        ),
+    -- Set by the record writer when records of this start were not written.
+    records_lost INTEGER NOT NULL DEFAULT 0 CHECK (records_lost IN (0, 1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS active_bundle_publication_receipts (
@@ -119,8 +125,17 @@ CREATE TABLE IF NOT EXISTS active_bundle_publication_head (
     )
 ) STRICT;
 
+-- Every column but records_lost is immutable.
 CREATE TRIGGER IF NOT EXISTS publication_store_metadata_no_update
-BEFORE UPDATE ON publication_store_metadata
+BEFORE UPDATE OF
+    singleton,
+    schema_id,
+    schema_version,
+    schema_artifact_digest,
+    cell_id,
+    maximum_receipts,
+    maximum_main_database_page_image_bytes
+ON publication_store_metadata
 BEGIN
     SELECT RAISE(ABORT, 'publication_store_metadata is immutable');
 END;

@@ -132,16 +132,16 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
     'schema_version',
     'source',
   ], 'assistantModes');
-  if (root.schema_version !== 'manyforge.assistant_mode_index.v2') {
+  if (root.schema_version !== 'manyforge.assistant_mode_index.v3') {
     fail('assistantModes.schema_version', 'the supported version');
   }
   const source = objectAt(root.source, 'assistantModes.source');
   exact(source, [
     'available', 'freshness', 'known_gaps', 'projection_generation',
-    'projection_owner_epoch', 'receiver_age_ns', 'selection_projection_generation',
+    'receiver_age_ns', 'selection_projection_generation',
     'selection_source_content_digest', 'selection_source_generation',
-    'selection_source_owner_epoch', 'selection_source_owner_id', 'source_content_digest',
-    'source_generation', 'source_owner_epoch', 'source_owner_id', 'source_owner_kind',
+    'selection_source_owner_id', 'source_content_digest',
+    'source_generation', 'source_owner_id', 'source_owner_kind',
   ], 'assistantModes.source');
   if (bool(source.available, 'assistantModes.source.available') !== true
     || source.freshness !== 'fresh'
@@ -156,8 +156,7 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
     integer(source[field], `assistantModes.source.${field}`);
   }
   for (const field of [
-    'projection_owner_epoch', 'selection_source_owner_epoch',
-    'selection_source_owner_id', 'source_owner_epoch', 'source_owner_id',
+    'selection_source_owner_id', 'source_owner_id',
   ]) {
     text(source[field], `assistantModes.source.${field}`);
   }

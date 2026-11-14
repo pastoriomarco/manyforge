@@ -2,9 +2,11 @@
 
 #include "native_projection_transition_internal.hpp"
 
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <set>
@@ -86,6 +88,21 @@ void RequireInstalledState(const bool condition, const std::string &detail) {
   return status.terminal_outcome.has_value();
 }
 
+/// Marks one Apply lane step (OD-145): set before the step takes
+/// operation_mutex_, cleared after it released it.
+class StepInProgressScope final {
+public:
+  explicit StepInProgressScope(std::atomic<bool> &flag) noexcept : flag_(flag) {
+    flag_.store(true, std::memory_order_release);
+  }
+  ~StepInProgressScope() { flag_.store(false, std::memory_order_release); }
+  StepInProgressScope(const StepInProgressScope &) = delete;
+  StepInProgressScope &operator=(const StepInProgressScope &) = delete;
+
+private:
+  std::atomic<bool> &flag_;
+};
+
 /// Map one durable terminal outcome to its public result state.
 ///
 /// A terminal failure or unknown-effect operation is never reported as success
@@ -120,7 +137,7 @@ MaintenanceBoundary(const ManagerPlannedMaintenanceResult &result) {
 /// compacted claim for this request, before durable acquisition; or the
 /// Manager's channel refused before sending. Refusals that only prove "no NEW
 /// claim" (`request_result_expired`, `request_id_conflict`, and the checks made
-/// before that lookup: `invalid_request`, `stale_request_owner_epoch`) are not
+/// before that lookup: `invalid_request`) are not
 /// listed. This is stricter than the `kBeforeEffect` contract (no
 /// configuration, runtime, component or Scene change) and so conservative.
 [[nodiscard]] bool IsKnownAdmissionRefusal(const std::string_view code) {
@@ -132,12 +149,18 @@ MaintenanceBoundary(const ManagerPlannedMaintenanceResult &result) {
 
 /// The effect boundary of one admission failure. No configuration change is
 /// ever made on this path, but `kBeforeEffect` is given only for a typed known
-/// refusal (this Apply never had an admission effect). `persistence_outcome_unknown`, a lost or undecodable
+/// refusal (this Apply never had an admission effect). A lost or undecodable
 /// reply and anything untyped may leave a claim behind and give `kUnknown`.
 [[nodiscard]] ManagerApplyEffectBoundary
 AdmissionRefusalBoundary(const std::exception &error) {
   const auto *typed = dynamic_cast<const core::TypedError *>(&error);
-  return typed != nullptr && IsKnownAdmissionRefusal(typed->code())
+  if (typed == nullptr) return ManagerApplyEffectBoundary::kUnknown;
+  // A late host refuses a call before sending anything (`effect: none`); the
+  // exchange that itself timed out carries no such detail and stays unknown.
+  const auto effect = typed->details().find("effect");
+  const bool late_host_refusal = typed->code() == core::error_codes::kExecutionHostLate &&
+                                 effect != typed->details().end() && effect->second == "none";
+  return IsKnownAdmissionRefusal(typed->code()) || late_host_refusal
              ? ManagerApplyEffectBoundary::kBeforeEffect
              : ManagerApplyEffectBoundary::kUnknown;
 }
@@ -285,7 +308,6 @@ public:
     const ManagerActiveRuntimePlanDTO &active_plan,
     SqliteManagerApplyJournal &journal,
     core::IManagerKernelApplyFencePort &kernel_fence,
-    const core::RuntimeEpoch &manager_runtime_epoch,
     IManagerSelectedRuntimeCompositionPort *runtime_composition,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const deployment::SiteFacts &site_facts) {
@@ -303,7 +325,7 @@ public:
 
   auto scope = deployment::derive_apply_configuration_fence_scope(predecessor,
                                                                   candidate);
-  core::ConfigurationFenceAdmissionQueryDTO query{scope, manager_runtime_epoch};
+  core::ConfigurationFenceAdmissionQueryDTO query{scope};
   Require(query.valid(), "derived Kernel admission query is invalid");
 
   auto snapshot = kernel_fence.ObserveAdmission(query);
@@ -325,7 +347,6 @@ public:
         active_plan.active_publication.durable_public_pointer_content_digest,
         snapshot.execution_host_epoch.runtime_unit_id,
         snapshot.execution_host_epoch.runtime_epoch,
-        manager_runtime_epoch,
         true};
     const auto inventory =
         runtime_composition->InspectInstalledComponentProcesses(
@@ -333,7 +354,7 @@ public:
     if (!inventory.ok())
       FailCause(inventory.error(),
                 "actual_installed_state_unknown: " + inventory.error().message +
-                    "; restart the workbench container");
+                    "; restart ManyForge");
     RequireInstalledState(inventory.value().valid() &&
                               inventory.value().request == inventory_request,
                           "installed process inventory is foreign");
@@ -341,7 +362,7 @@ public:
       FailCause(*inventory.value().error,
                 inventory.value().error->code + ": " +
                     inventory.value().error->message +
-                    "; restart the workbench container");
+                    "; restart ManyForge");
     // This observation runs under the held parent admission and before a
     // fence attempt, runtime convergence or Scene staging. A
     // replaced or removed component that is still Active with a live process
@@ -382,7 +403,7 @@ public:
       RequireInstalledState(row.process_presence != ProcessPresenceState::kUnknown &&
                                 row.installed_runtime_identity,
                             "installed process identity or presence is "
-                            "unknown; restart the workbench container");
+                            "unknown; restart ManyForge");
       const auto wanted = deployment::derive_component_runtime_identity(
           candidate, site_facts, row.controllable_component_id);
       if ((!no_launch && row.process_presence != ProcessPresenceState::kPresent) ||
@@ -443,7 +464,7 @@ public:
       RequireInstalledState(
           source != nullptr,
           "installed failed candidate lacks its exact terminal product; "
-          "restart the workbench container");
+          "restart ManyForge");
       if (std::none_of(terminal_products.begin(), terminal_products.end(),
                        [&](const auto &known) {
                          return known->retained_bundle_id() ==
@@ -517,11 +538,9 @@ DirectAdmissionIntent(const PersistedManagerApplyIntent &durable) {
           "direct Manager Apply lacks its admission generation");
   core::CellAdmissionClaimIntentDTO claim{
       core::CellAdmissionClaimKindDTO::kManagerApply,
-      core::CellAdmissionOwnerRoleDTO::kManager,
-      intent.request_context.request_owner_epoch,
-      intent.apply_id.value(),
-      intent.request_context.request_id,
-      durable.intent_digest,
+      core::ApplicationRole::kManager,
+      core::CellAdmissionOwnerTransactionId(intent.apply_id),
+      intent.request_context.request_key,
       *intent.expected_admission_generation,
       {},
       std::nullopt,
@@ -568,7 +587,8 @@ DirectAdmissionIntent(const PersistedManagerApplyIntent &durable) {
   Require(receipt.value().status ==
               core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
           "Manager Apply admission claim is conflicting or already settled");
-  const auto acquired = cell_admission.AcquireCellAdmissionClaim(intent);
+  const auto acquired = cell_admission.AcquireManagerApplyClaim(
+      intent, durable.intent.candidate_retained_bundle_id);
   if (!acquired.ok()) {
     const auto &error = acquired.error();
     const auto reason = error.details.find("reason");
@@ -617,15 +637,16 @@ bool ReleaseAdmission(
                                    : core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
   const core::CellAdmissionClaimReleaseDTO release{
       claim.intent.owner_role,
-      claim.intent.owner_epoch,
       claim.intent.owner_transaction_id,
-      claim.intent.request_id,
-      claim.intent.request_payload_digest,
+      claim.intent.request_key,
       claim.acquired_admission_generation,
       claim.claim_generation,
       {settlement_kind, terminal.terminal_outcome_digest},
   };
-  const auto released = cell_admission.ReleaseCellAdmissionClaim(release);
+  // The execution host acts on the Apply's outcome; it reads no Manager store.
+  const auto released = cell_admission.ReleaseManagerApplyClaim(
+      release, {durable.intent.apply_id, durable.intent.apply_generation,
+                terminal.terminal_outcome.succeeded()});
   if (!released.ok()) {
     const auto reason = released.error().details.find("reason");
     FailCause(released.error(),
@@ -640,6 +661,23 @@ bool ReleaseAdmission(
 }
 
 } // namespace
+
+std::chrono::nanoseconds ManagerApplyBound(const deployment::RetainedBundle &predecessor,
+                                           const deployment::RetainedBundle &candidate) {
+  namespace host_contract = deployment::ros2_control_execution_runtime_contract;
+  // The candidate's budget wins over the predecessor's (the Composer's
+  // `_timeouts`); the keys are every component of either graph.
+  auto budgets = host_contract::component_composition_budgets_ns(candidate.value().cell_graph);
+  for (const auto &[component, budget] :
+       host_contract::component_composition_budgets_ns(predecessor.value().cell_graph))
+    budgets.try_emplace(component, budget);
+  std::chrono::nanoseconds total{0};
+  for (const auto &[component, budget] : budgets) {
+    static_cast<void>(component);
+    total += std::chrono::nanoseconds(budget) + core::kControllerLaunchStopGrace;
+  }
+  return std::max(total, std::chrono::nanoseconds(deployment::kDefaultLifecycleBudgetNs));
+}
 
 core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
     const deployment::RetainedBundle &predecessor, const deployment::SiteFacts &site_facts,
@@ -737,14 +775,10 @@ bool ManagerNamedApplyRequestDTO::valid() const noexcept {
                       parent_authoring_claim->intent.claim_kind ==
                           core::CellAdmissionClaimKindDTO::kAuthoringMutation &&
                       parent_authoring_claim->intent.owner_role ==
-                          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+                          core::ApplicationRole::kAuthoringOwner;
   return (scene_initialization == ManagerSceneInitialization::kPreserve ||
           scene_initialization == ManagerSceneInitialization::kInitialize) &&
-         (direct || parent) && !request_context.request_id.empty() &&
-         !request_context.request_owner_epoch.empty() &&
-         !request_context.source_label.empty() &&
-         (!request_context.correlation_id.has_value() ||
-          !request_context.correlation_id->empty()) &&
+         (direct || parent) && !request_context.source_label.empty() &&
          !deployment_artifact_id.empty() &&
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          !expected_current_retained_bundle_id.empty() &&
@@ -766,7 +800,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     IRuntimeUnitProcessPort &process_port,
     IRuntimeUnitProgressPort &progress_port,
     ManagerPlannedMaintenanceCoordinator &planned_maintenance,
-    core::RuntimeEpoch manager_runtime_epoch, std::string operating_system,
+    std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
     RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory,
     InitialSceneSource initial_scene_source,
@@ -780,13 +814,12 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       scene_owner_(scene_owner), kernel_fence_(kernel_fence),
       cell_admission_(cell_admission),
       runtime_composition_port_(runtime_composition),
-      manager_runtime_epoch_(std::move(manager_runtime_epoch)),
       apply_id_factory_(std::move(apply_id_factory)),
       initial_scene_source_(std::move(initial_scene_source)),
       apply_progress_observer_(std::move(apply_progress_observer)),
       successful_settlement_preparation_(std::move(successful_settlement_preparation)),
-      site_facts_(std::move(site_facts)),
-      fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_, site_facts_),
+      site_facts_(std::move(site_facts)), clock_ns_(clock_ns),
+      fence_coordinator_(apply_journal_, kernel_fence_, site_facts_),
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
                                   progress_port, clock_ns, pre_start_guard),
@@ -798,11 +831,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       runtime_composition_coordinator_(apply_journal_, runtime_composition),
       selected_bundle_coordinator_(apply_journal_, publication_store,
                                    scene_owner),
-      fence_release_coordinator_(apply_journal_, kernel_fence_, scene_owner,
-                                 manager_runtime_epoch_) {
+      fence_release_coordinator_(apply_journal_, kernel_fence_, scene_owner) {
   static_cast<void>(bootstrap_scene_owner);
-  Require(!manager_runtime_epoch_.empty(),
-          "Manager runtime epoch cannot be empty");
   Require(static_cast<bool>(apply_id_factory_), "Apply ID factory is required");
   Require(static_cast<bool>(initial_scene_source_),
           "Apply initial-Scene source is required");
@@ -830,6 +860,65 @@ bool ManagerNamedApplyCoordinator::SettleSuccessfulAdmission(
   return true;
 }
 
+void ManagerNamedApplyCoordinator::DeferSettlement(const ManagerApplyIntentDTO &intent,
+                                                   const std::exception &error) {
+  const auto cause = core::CauseOf(error, "manager_command_rejected", kApplyProducer);
+  std::cerr << "Manager Apply " << intent.apply_id.value()
+            << ": its admission claim release did not settle and is retried on "
+               "the heartbeat: "
+            << cause.error.code << ": " << cause.error.message << '\n';
+  last_settlement_retry_error_ = cause.error.code + ": " + cause.error.message;
+  pending_settlement_ = core::NamedApplyPublicationTransactionDTO{
+      intent.apply_id, intent.apply_generation};
+}
+
+ManagerNamedApplyResult ManagerNamedApplyCoordinator::RetainPreEffectFailure(
+    const PersistedManagerApplyIntent &durable, const std::string &code,
+    const core::TypedCause &cause, const ManagerApplyEffectDisposition disposition,
+    const ManagerApplyEffectBoundary boundary, const bool request_replayed) {
+  const auto &intent = durable.intent;
+  auto result = RetainTerminalFailure(apply_journal_, durable, code, cause, disposition,
+                                      request_replayed, boundary);
+  if (disposition == ManagerApplyEffectDisposition::kKnown) {
+    const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
+    Require(terminal.has_value(), "pre-effect failure lacks terminal evidence");
+    try {
+      ReleaseAdmission(durable, *terminal, cell_admission_);
+    } catch (const std::exception &error) {
+      // The failure is written; the heartbeat retries the release (OD-188 P1).
+      DeferSettlement(intent, error);
+    }
+  }
+  return result;
+}
+
+ManagerNamedApplyResult ManagerNamedApplyCoordinator::EndApplyByManager(
+    const PersistedManagerApplyIntent &durable, const std::string &code,
+    const core::TypedCause &cause) {
+  const auto &intent = durable.intent;
+  std::cerr << "Manager Apply " << intent.apply_id.value() << " ended " << code << ": "
+            << cause.error.code << ": " << cause.error.message << '\n';
+  // Before the fence attempt only reads and this Apply's own claim happened
+  // (preflight, claim lookup/acquire, plan, continuity, inventory reads).
+  if (!apply_journal_.ReadFenceAttempt(intent.apply_id, intent.apply_generation))
+    return RetainPreEffectFailure(durable, code, cause, ManagerApplyEffectDisposition::kKnown,
+                                  ManagerApplyEffectBoundary::kBeforeEffect, true);
+  return RetainTerminalFailure(apply_journal_, durable, code, cause,
+                               ManagerApplyEffectDisposition::kUnknown, true);
+}
+
+std::unique_lock<std::mutex> ManagerNamedApplyCoordinator::LockUnlessStepInProgress() {
+  // One look, no wait: the flag shows a lane step; the single try also
+  // refuses when the lane took the lock between that look and this one.
+  std::unique_lock lock(operation_mutex_, std::defer_lock);
+  if (step_in_progress_.load(std::memory_order_acquire) || !lock.try_lock())
+    throw core::TypedError("apply_busy",
+                           "An Apply step is in progress; nothing was done. "
+                           "Try again when it ends.",
+                           {{"effect", "none"}}, std::string(kApplyProducer));
+  return lock;
+}
+
 std::optional<core::NamedApplyPublicationTransactionDTO>
 ManagerNamedApplyCoordinator::PendingSettlementForHeartbeat() {
   std::unique_lock lock(operation_mutex_, std::try_to_lock);
@@ -842,29 +931,44 @@ ManagerNamedApplyCoordinator::RetryPendingSettlementOnHeartbeat(
     const core::NamedApplyPublicationTransactionDTO &expected) {
   // The independent heartbeat may not wait behind active Apply/Scene effects.
   // Keep the same pending reference for its next ordinary cadence instead.
+  const StepInProgressScope step(step_in_progress_);
   std::unique_lock lock(operation_mutex_, std::try_to_lock);
   if (!lock.owns_lock()) return std::nullopt;
   if (!pending_settlement_ || *pending_settlement_ != expected) return std::nullopt;
   const auto reference = *pending_settlement_;
+  const ManagerNamedApplyResult still_pending{reference.apply_id, reference.apply_generation,
+      ManagerNamedApplyResultState::kPending, true, std::nullopt, true};
   try {
     const auto durable = apply_journal_.ReadIntent(reference.apply_id, reference.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(reference.apply_id, reference.apply_generation);
-    Require(durable && terminal && terminal->terminal_outcome.succeeded(),
-            "pending Apply settlement lost its exact successful journal record");
-    if (!SettleSuccessfulAdmission(*durable, *terminal,
-                                  ManagerApplySettlementAttempt::kOrdinaryHeartbeat))
-      return PendingSettlementResult(durable->intent, true);
+    Require(durable && terminal, "pending Apply settlement lost its exact journal record");
+    if (terminal->terminal_outcome.succeeded()) {
+      if (!SettleSuccessfulAdmission(*durable, *terminal,
+                                    ManagerApplySettlementAttempt::kOrdinaryHeartbeat))
+        return still_pending;
+    } else {
+      // A known before-effect failure's release (retain_pre_effect_failure).
+      Require(ReleaseAdmission(*durable, *terminal, cell_admission_),
+              "failed Apply admission claim could not be settled");
+      pending_settlement_.reset();
+    }
     if (captured_apply_inputs_ && captured_apply_inputs_->apply_id == reference.apply_id &&
         captured_apply_inputs_->apply_generation == reference.apply_generation)
       captured_apply_inputs_.reset();
     return ManagerNamedApplyResult{reference.apply_id, reference.apply_generation,
-        ManagerNamedApplyResultState::kSucceeded, true, terminal->terminal_outcome};
-  } catch (...) {
-    // Source/read/validation errors and uncertain release are not permission
-    // to retry. Leave actual claim/terminal evidence for the old diagnosis path;
-    // only a known preparation-false result retains this scheduling reference.
-    pending_settlement_.reset();
-    throw;
+        ResultStateFromTerminal(terminal->terminal_outcome), true, terminal->terminal_outcome};
+  } catch (const std::exception &error) {
+    // OD-188 P1: the terminal outcome is written; only the release is left.
+    // It stays pending and the next heartbeat retries it until it settles.
+    // Each distinct failure is logged once, with its typed code.
+    const auto cause = core::CauseOf(error, "manager_command_rejected", kApplyProducer);
+    auto text = cause.error.code + ": " + cause.error.message;
+    if (last_settlement_retry_error_ != text) {
+      std::cerr << "Manager Apply " << reference.apply_id.value()
+                << ": admission claim release retry failed: " << text << '\n';
+      last_settlement_retry_error_ = std::move(text);
+    }
+    return still_pending;
   }
 }
 
@@ -872,7 +976,7 @@ core::ApplyId ManagerNamedApplyCoordinator::MintApplyId() {
   for (std::size_t attempt = 0U; attempt < kMaximumApplyIdMintAttempts;
        ++attempt) {
     auto apply_id = apply_id_factory_();
-    if (!apply_id.empty() &&
+    if (apply_id.nonzero() &&
         !apply_journal_.ReadApplyGenerationHighWater(apply_id).has_value()) {
       return apply_id;
     }
@@ -928,18 +1032,17 @@ ManagerNamedApplyCoordinator::CaptureOriginalConfigurationAdoption(
               core::ValidateCellAdmissionRecoveryReceipt(claim_receipt.value()).ok() &&
               claim_receipt.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
               claim_receipt.value().matched_claim == claim &&
-              !claim_receipt.value().matched_release && !claim_receipt.value().matched_reconcile_settlement,
+              !claim_receipt.value().matched_release,
           "configuration original claim is no longer held exactly");
   const auto &fence = status->fence_acceptance->accepted_fence;
   const core::ConfigurationFenceStatusQueryDTO query{
       {intent.apply_id, intent.apply_generation}, fence.configuration_fence_id,
-      fence.configuration_fence_generation, fence.captured_scope, manager_runtime_epoch_};
+      fence.configuration_fence_generation, fence.captured_scope};
   Require(query.valid(), "configuration parent fence query is invalid");
   if (staging_attempt) {
     Require(staging_attempt->valid() &&
                 staging_attempt->persisted_intent == status->fence_attempt->fence_intent &&
                 staging_attempt->persisted_attempt_digest == status->fence_attempt->fence_attempt_digest &&
-                staging_attempt->manager_runtime_epoch == manager_runtime_epoch_ &&
                 staging_attempt->persisted_intent.owner_request_context == intent.request_context &&
                 staging_attempt->persisted_intent.owner_transaction == query.owner_transaction &&
                 staging_attempt->persisted_intent.scope == query.expected_scope,
@@ -955,8 +1058,7 @@ ManagerNamedApplyCoordinator::CaptureOriginalConfigurationAdoption(
                 std::any_of(status->latest_runtime_staged_ready->staged_ready.runtime_units.begin(),
                             status->latest_runtime_staged_ready->staged_ready.runtime_units.end(),
                             [&](const auto &runtime) {
-                              return runtime.valid() && runtime.runtime_unit_id == held.execution_host_epoch.runtime_unit_id &&
-                                  runtime.runtime_epoch == held.execution_host_epoch.runtime_epoch;
+                              return runtime.valid() && runtime.runtime_unit_id == held.execution_host_epoch.runtime_unit_id;
                             }),
             "configuration staging fence is not actually held by the staged host");
   } else {
@@ -964,7 +1066,7 @@ ManagerNamedApplyCoordinator::CaptureOriginalConfigurationAdoption(
     Require(held.matches(query) && held.state == core::ConfigurationFenceState::kHeld && held.admission_fenced,
             "configuration Scene adoption fence is no longer held exactly");
   }
-  return {{{intent.apply_id, intent.apply_generation}, status->intent.intent_digest, claim, query},
+  return {{{intent.apply_id, intent.apply_generation}, claim, query},
       *captured.original_predecessor_publication, intent.expected_active_projection_revision,
       {intent.expected_active_projection_revision.scene_revision, intent.cell_id}, captured.candidate->value(),
       detail::DeriveCandidateNativeProjectionBindings(captured.candidate->value(),
@@ -983,7 +1085,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
     Require(status && status->fence_attempt && status->fence_acceptance,
             "configuration staging lacks original fence acceptance");
     const core::ApplyFenceAcquireAttemptQueryDTO attempt{
-        status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest, manager_runtime_epoch_};
+        status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest};
     const core::ProjectionRevisionDTO target{intent.candidate_retained_bundle_id,
         intent.candidate_graph_revision, intent.expected_active_projection_revision.scene_revision};
     if (!captured.original_preparation_completed) {
@@ -1066,8 +1168,10 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
                      : ManagerApplyEffectBoundary::kUnknown);
     if (host_refused) {
       try {
+        // The release carries the key of the request that causes it: the
+        // Apply itself (contract 1.15.2).
         ReleaseFailedApply(intent.apply_id, intent.apply_generation,
-            core::RequestId("host-refusal-release." + intent.apply_id.value()),
+            intent.request_context.request_key,
             "manager: execution host refused the candidate before any effect", false);
       } catch (const std::exception &release_error) {
         // The failure stays retained; its fence and claim stay held.
@@ -1131,7 +1235,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
     return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kSucceeded,
         request_replayed, released.durable_terminal_outcome.record.terminal_outcome};
   } catch (const std::exception &error) {
-    if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) throw;
+    if (const auto terminal =
+            apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) {
+      // The success is written (it is the last step of the fence release);
+      // only the claim release is left: the heartbeat retries it (OD-188 P1).
+      if (!terminal->terminal_outcome.succeeded()) throw;
+      DeferSettlement(intent, error);
+      return PendingSettlementResult(intent, request_replayed);
+    }
     return RetainTerminalFailure(apply_journal_, durable, "configuration_settlement_failed",
         error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
@@ -1144,16 +1255,17 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
   Require(request.valid(), "named Apply request is invalid");
 
   if (const auto existing = apply_journal_.ReadRequest(
-          request.request_context.request_owner_epoch,
-          request.request_context.request_id);
+          request.request_context.request_key);
       existing.has_value()) {
     Require(MatchesRequest(existing->intent, request),
             "public request identity is already bound to another Apply");
-    if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
-            existing->intent.apply_id, existing->intent.apply_generation})
-      return PendingSettlementResult(existing->intent, true);
     const auto terminal = apply_journal_.ReadTerminalOutcome(
         existing->intent.apply_id, existing->intent.apply_generation);
+    // A failure whose release is pending replays as the failure it is.
+    if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
+            existing->intent.apply_id, existing->intent.apply_generation} &&
+        (!terminal || terminal->terminal_outcome.succeeded()))
+      return PendingSettlementResult(existing->intent, true);
     return {existing->intent.apply_id, existing->intent.apply_generation,
             terminal.has_value()
                 ? ResultStateFromTerminal(terminal->terminal_outcome)
@@ -1164,7 +1276,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
   }
 
   if (pending_settlement_)
-    throw ManagerNamedApplyBusyError("another successful Apply retains its original admission claim");
+    throw ManagerNamedApplyBusyError("another Apply retains its admission claim until its release settles");
 
   const auto candidate =
       LoadBundle(retained_bundle_source_, request.candidate_retained_bundle_id,
@@ -1251,6 +1363,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       std::move(original_prepare_acknowledgement)});
   captured_apply_inputs_->original_parent_claim = accepted_claim;
   captured_apply_inputs_->original_predecessor_publication = active_plan.active_publication;
+  captured_apply_inputs_->deadline_ns =
+      clock_ns_() + static_cast<std::uint64_t>(ManagerApplyBound(*predecessor, *candidate).count());
   if (apply_progress_observer_) {
     apply_progress_observer_(durable_intent.intent);
   }
@@ -1287,17 +1401,8 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
       [&](const std::string &code, const core::TypedCause &cause,
           const ManagerApplyEffectDisposition disposition,
           const ManagerApplyEffectBoundary boundary) {
-        auto result = RetainTerminalFailure(apply_journal_, durable_intent,
-                                            code, cause, disposition,
-                                            request_replayed, boundary);
-        if (disposition == ManagerApplyEffectDisposition::kKnown) {
-          const auto terminal = apply_journal_.ReadTerminalOutcome(
-              intent.apply_id, intent.apply_generation);
-          Require(terminal.has_value(),
-                  "pre-effect failure lacks terminal evidence");
-          ReleaseAdmission(durable_intent, *terminal, cell_admission_);
-        }
-        return result;
+        return RetainPreEffectFailure(durable_intent, code, cause, disposition,
+                                      boundary, request_replayed);
       };
 
   // Reading the current state for the fence changes nothing: before a fence
@@ -1381,7 +1486,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   try {
     expectation.emplace(FenceExpectation(
         intent, predecessor, candidate, *active_plan, apply_journal_,
-        kernel_fence_, manager_runtime_epoch_,
+        kernel_fence_,
         // Component processes and lifecycles live in the execution host.
         // Every Apply whose predecessor runs it inspects them; a predecessor
         // without it has none to inspect.
@@ -1477,6 +1582,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
 
 std::optional<ManagerNamedApplyResult>
 ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
+  const StepInProgressScope step(step_in_progress_);
   std::lock_guard lock(operation_mutex_);
   if (pending_settlement_)
     return ManagerNamedApplyResult{
@@ -1500,7 +1606,52 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
       captured_apply_inputs_->apply_id == pending->intent.intent.apply_id &&
       captured_apply_inputs_->apply_generation ==
           pending->intent.intent.apply_generation) {
-    auto result = Continue(pending->intent.intent, true);
+    const auto &intent = pending->intent.intent;
+    // OD-188 P1: a step that fails unexpectedly ends this Apply, typed; the
+    // lane runs on and New clears it as any failed Apply.
+    const auto progression_failed = [&](const core::TypedCause &cause) {
+      return EndApplyByManager(pending->intent, "apply_progression_failed", cause);
+    };
+    auto result = [&] {
+      try {
+        return Continue(intent, true);
+      } catch (const std::exception &error) {
+        if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation))
+          throw;
+        return progression_failed(
+            core::CauseOf(error, "apply_progression_failed", kApplyProducer));
+      } catch (...) {
+        if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation))
+          throw;
+        return progression_failed(PlainCause(
+            "apply_progression_failed", "an Apply step failed with a non-standard error"));
+      }
+    }();
+    // OD-188 P2: one deadline per Apply, checked on each pending pass.
+    if (result.state == ManagerNamedApplyResultState::kPending && !result.settlement_pending &&
+        clock_ns_() >= captured_apply_inputs_->deadline_ns) {
+      result = EndApplyByManager(pending->intent, "apply_timed_out", PlainCause(
+          "apply_timed_out",
+          "the Apply did not reach a terminal state within its bound"));
+    }
+    if (result.state == ManagerNamedApplyResultState::kFailed ||
+        result.state == ManagerNamedApplyResultState::kUnknownEffect) {
+      // No Scene adoption outlives its Apply. The Apply's answer is written;
+      // if ending the adoption fails, the adoption stays as it is.
+      try {
+        const auto publication =
+            apply_journal_.ReadPublicationReceipt(intent.apply_id, intent.apply_generation);
+        scene_owner_.EndOriginalManagerConfigurationAdoption(
+            intent.apply_id, intent.apply_generation,
+            publication ? std::optional{publication->publication.publication_receipt}
+                        : std::nullopt);
+      } catch (const std::exception &error) {
+        const auto cause = core::CauseOf(error, "scene_adoption_end_failed", kApplyProducer);
+        std::cerr << "Manager Apply " << intent.apply_id.value()
+                  << ": its Scene adoption could not be ended: " << cause.error.code << ": "
+                  << cause.error.message << '\n';
+      }
+    }
     if (result.state != ManagerNamedApplyResultState::kPending) {
       captured_apply_inputs_.reset();
     }
@@ -1544,49 +1695,48 @@ FailedApplyAcknowledgementState ManagerNamedApplyCoordinator::FailedApplyAcknowl
 
 void ManagerNamedApplyCoordinator::AcknowledgeFailedApply(
     const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
-    const core::RequestId &request_id, const std::string &source_label) {
-  std::lock_guard lock(operation_mutex_);
-  ReleaseFailedApply(apply_id, apply_generation, request_id, source_label, false);
+    const core::RequestKey &request_key, const std::string &source_label) {
+  const auto lock = LockUnlessStepInProgress();
+  ReleaseFailedApply(apply_id, apply_generation, request_key, source_label, false);
 }
 
 std::optional<core::NamedApplyPublicationTransactionDTO>
-ManagerNamedApplyCoordinator::ReleaseFailedApplyForNew(const core::RequestId &request_id,
+ManagerNamedApplyCoordinator::ReleaseFailedApplyForNew(const core::RequestKey &request_key,
                                                        const std::string &source_label) {
-  std::lock_guard lock(operation_mutex_);
+  const auto lock = LockUnlessStepInProgress();
+  std::optional<core::NamedApplyPublicationTransactionDTO> released;
+  // Every ended failure: the Kernel answers what each one still holds.
   for (const auto &status : apply_journal_.ReadStatusInventory()) {
-    const auto &intent = status.intent.intent;
-    if (!FailedApplyNewReleaseEligible(status) ||
-        apply_journal_.ReadFailedApplyRelease(intent.apply_id, intent.apply_generation))
-      continue;
-    // The failed Apply that holds the cell is the one whose claim the Kernel
-    // still holds; an earlier one's ended with its Kernel.
-    const auto &parent = intent.parent_authoring_claim;
-    const auto claim = cell_admission_.GetCellAdmissionRecoveryReceipt(
-        {parent ? parent->intent : DirectAdmissionIntent(status.intent), parent, std::nullopt});
-    if (!claim.ok()) FailCause(claim.error(), claim.error().message, kKernelProducer);
-    if (claim.value().status != core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact) continue;
-    ReleaseFailedApply(intent.apply_id, intent.apply_generation, request_id, source_label, true);
-    return core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation};
+    if (!FailedApplyNewReleaseEligible(status)) continue;
+    const core::NamedApplyPublicationTransactionDTO apply{status.intent.intent.apply_id,
+                                                          status.intent.intent.apply_generation};
+    try {
+      if (!ReleaseFailedApply(apply.apply_id, apply.apply_generation, request_key, source_label, true))
+        continue;
+    } catch (const core::TypedError &error) {
+      // An earlier Apply was released by this New: the refusal is no longer "no effect".
+      if (!released) throw;
+      auto cause = error.error();
+      cause.details.erase("effect");
+      throw core::TypedError(cause, error.producer());
+    }
+    // New performed the claim release the heartbeat was retrying.
+    if (pending_settlement_ == apply) pending_settlement_.reset();
+    released = apply;
   }
-  return std::nullopt;
+  return released;
 }
 
-void ManagerNamedApplyCoordinator::ReleaseFailedApply(
+bool ManagerNamedApplyCoordinator::ReleaseFailedApply(
     const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
-    const core::RequestId &request_id, const std::string &source_label, const bool for_new) {
+    const core::RequestKey &request_key, const std::string &source_label, const bool for_new) {
   std::optional<PersistedManagerApplyStatus> status;
+  std::optional<PersistedFailedApplyRelease> previous;
   std::optional<core::ConfigurationFenceReleaseDTO> release_request;
+  bool claim_held = false;
   // This block makes only read-only checks. Only a refusal from here is
   // explicitly known not to have started the acknowledgement attempt.
   try {
-    const auto &id = request_id.value();
-    if (id.empty() || id.size() > kMaximumManagerApplyJournalIdentifierBytes ||
-        std::any_of(id.begin(), id.end(), [](char c) {
-          const auto byte = static_cast<unsigned char>(c);
-          return byte < 0x21U || byte > 0x7eU;
-        }))
-      throw core::RequestInvalid("request_context.request_id", "invalid",
-                                 "Acknowledgement request ID must be bounded printable ASCII.");
     if (source_label.empty() || source_label.size() > kMaximumManagerApplySourceLabelBytes ||
         std::any_of(source_label.begin(), source_label.end(), [](char c) {
           const auto byte = static_cast<unsigned char>(c);
@@ -1599,8 +1749,10 @@ void ManagerNamedApplyCoordinator::ReleaseFailedApply(
                                : FailedApplyAcknowledgementEligible(*status)),
             for_new ? "failed Apply holds no fence New can release"
                     : "failed Apply is not eligible for before-effect acknowledgement");
-    const auto previous = apply_journal_.ReadFailedApplyRelease(apply_id, apply_generation);
-    Require(!previous, "failed Apply release was already attempted; inspect its outcome");
+    previous = apply_journal_.ReadFailedApplyRelease(apply_id, apply_generation);
+    // For New an incomplete earlier attempt is evidence: it asks the Kernel again.
+    Require(for_new || !previous, "failed Apply release was already attempted; inspect its outcome");
+    if (previous && previous->acknowledged) return false;
 
     const auto &intent = status->intent.intent;
     const auto &parent = intent.parent_authoring_claim;
@@ -1608,81 +1760,108 @@ void ManagerNamedApplyCoordinator::ReleaseFailedApply(
     const core::CellAdmissionRecoveryReceiptQueryDTO claim_query{claim_intent, parent, std::nullopt};
     const auto claim = cell_admission_.GetCellAdmissionRecoveryReceipt(claim_query);
     if (!claim.ok()) FailCause(claim.error(), claim.error().message, kKernelProducer);
-    Require(core::ValidateCellAdmissionRecoveryReceiptQuery(claim_query).ok() &&
-                core::ValidateCellAdmissionRecoveryReceipt(claim.value()).ok() &&
-                claim.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                claim.value().matched_claim && claim.value().matched_claim->intent == claim_intent &&
-                (!parent || claim.value().matched_claim == parent),
-            "failed Apply admission claim is not held exactly");
+    claim_held = core::ValidateCellAdmissionRecoveryReceiptQuery(claim_query).ok() &&
+                 core::ValidateCellAdmissionRecoveryReceipt(claim.value()).ok() &&
+                 claim.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
+                 claim.value().matched_claim && claim.value().matched_claim->intent == claim_intent &&
+                 (!parent || claim.value().matched_claim == parent);
+    // New releases the claim only when the Kernel still holds it.
+    Require(for_new || claim_held, "failed Apply admission claim is not held exactly");
 
-    const auto active = active_plan_source_.ReadCurrentPlan();
-    const auto scene = scene_owner_.CurrentProjectionRevision();
     const auto &predecessor = intent.expected_active_projection_revision;
-    Require(active.valid() && SameDeploymentRevision(
-                active.active_publication.request.candidate_projection_revision, predecessor) &&
-                scene.valid() && SameDeploymentRevision(scene, predecessor) &&
-                scene.scene_revision.scene_id == predecessor.scene_revision.scene_id,
-            "failed Apply predecessor is no longer current");
-    const auto &accepted = status->fence_acceptance->accepted_fence;
-    const core::ConfigurationFenceStatusQueryDTO query{
-        {apply_id, apply_generation}, accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, accepted.captured_scope, manager_runtime_epoch_};
-    const auto held = kernel_fence_.QueryStatus(query);
-    const auto &evidence = held.reconciliation_evidence;
-    Require(held.matches(query) && held.state == core::ConfigurationFenceState::kHeld &&
-                held.admission_fenced &&
-                SameDeploymentRevision(evidence.active_projection_revision, predecessor) &&
-                evidence.active_projection_revision.scene_revision.scene_id ==
-                    predecessor.scene_revision.scene_id &&
-                evidence.active_publication_generation == active.active_publication.publication_generation &&
-                evidence.active_public_pointer_digest ==
-                    active.active_publication.durable_public_pointer_content_digest &&
-                // New empties whatever the failed Apply changed.
-                (for_new || evidence.active_control_configurations ==
-                    status->fence_attempt->fence_intent.expected_active_control_configurations),
-            "failed Apply fence no longer proves the unchanged predecessor");
-    release_request = core::ConfigurationFenceReleaseDTO{evidence, manager_runtime_epoch_};
-    Require(release_request->valid(), "failed Apply fence still contains affected operations");
+    std::optional<ManagerActiveRuntimePlanDTO> active;
+    std::optional<core::ConfigurationFenceAcceptedDTO> accepted;
+    if (!for_new) {
+      active = active_plan_source_.ReadCurrentPlan();
+      const auto scene = scene_owner_.CurrentProjectionRevision();
+      Require(active->valid() && SameDeploymentRevision(
+                  active->active_publication.request.candidate_projection_revision, predecessor) &&
+                  scene.valid() && SameDeploymentRevision(scene, predecessor) &&
+                  scene.scene_revision.scene_id == predecessor.scene_revision.scene_id,
+              "failed Apply predecessor is no longer current");
+      accepted = status->fence_acceptance->accepted_fence;
+    } else if (status->fence_attempt && !(previous && previous->released)) {
+      // The Kernel's fence for this attempt: none when released or never committed.
+      const core::ApplyFenceAcquireAttemptQueryDTO attempt{
+          status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest};
+      const auto found = kernel_fence_.ReconcileAcquireAttempt(attempt);
+      Require(found.matches(attempt) &&
+                  found.state != core::ApplyFenceAcquireAttemptReconcileState::kUncertain,
+              "Kernel cannot tell whether the failed Apply fence is held");
+      if (found.state == core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact)
+        accepted = found.accepted_fence;
+    }
+    if (accepted) {
+      const core::ConfigurationFenceStatusQueryDTO query{
+          {apply_id, apply_generation}, accepted->configuration_fence_id,
+          accepted->configuration_fence_generation, accepted->captured_scope};
+      const auto held = kernel_fence_.QueryStatus(query);
+      const auto &evidence = held.reconciliation_evidence;
+      // New releases what the Kernel holds and then empties the cell.
+      Require(held.matches(query) && held.state == core::ConfigurationFenceState::kHeld &&
+                  held.admission_fenced &&
+                  (for_new ||
+                   (SameDeploymentRevision(evidence.active_projection_revision, predecessor) &&
+                    evidence.active_projection_revision.scene_revision.scene_id ==
+                        predecessor.scene_revision.scene_id &&
+                    evidence.active_publication_generation == active->active_publication.publication_generation &&
+                    evidence.active_public_pointer_digest ==
+                        active->active_publication.durable_public_pointer_content_digest &&
+                    evidence.active_control_configurations ==
+                        status->fence_attempt->fence_intent.expected_active_control_configurations)),
+              "failed Apply fence no longer proves the unchanged predecessor");
+      release_request = core::ConfigurationFenceReleaseDTO{evidence};
+      Require(release_request->valid(), "failed Apply fence still contains affected operations");
+    }
+    // Nothing held and nothing recorded: no effect.
+    if (!release_request && !claim_held && !previous) return false;
   } catch (const std::exception &error) {
     auto cause = core::CauseOf(error, "manager_command_rejected", kApplyProducer);
     cause.error.details["effect"] = "none";
     throw core::TypedError(cause.error, std::move(cause.producer));
   }
-  const auto &request = *release_request;
   const auto &parent = status->intent.intent.parent_authoring_claim;
   // The exact held claim and fence are release conditions. Readiness is not:
   // ordinary liveness renewal recomputes it separately; a still-closed gate
   // remains closed until its own evidence permits admission.
-  // Persist the one operator-authorized attempt before sending. If the call's
-  // outcome is unknown the row remains incomplete and no resend is permitted.
-  try {
-    apply_journal_.BeginFailedApplyRelease(apply_id, apply_generation, request_id, source_label, request);
-  } catch (const std::exception &error) {
-    FailAcknowledgementUncertain(error, "record_attempt", kApplyProducer,
-        "The acknowledgement record could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+  // Persist the attempt before sending. If the call's outcome is unknown the
+  // row remains incomplete; only New asks the Kernel again.
+  if (!(previous && previous->released)) {
+    try {
+      apply_journal_.BeginFailedApplyRelease(apply_id, apply_generation, request_key, source_label,
+                                             release_request, for_new);
+    } catch (const std::exception &error) {
+      FailAcknowledgementUncertain(error, "record_attempt", kApplyProducer,
+          "The acknowledgement record could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+    }
   }
-  std::optional<core::ConfigurationFenceReleasedDTO> released;
-  try {
-    released = kernel_fence_.Release(request);
-    Require(released->valid() && released->request == request,
-            "Kernel did not return the acknowledged fence release");
-  } catch (const std::exception &error) {
-    FailAcknowledgementUncertain(error, "fence_release", kKernelProducer,
-        "The Apply hold release could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+  if (release_request) {
+    const auto &request = *release_request;
+    std::optional<core::ConfigurationFenceReleasedDTO> released;
+    try {
+      released = kernel_fence_.Release(request);
+      Require(released->valid() && released->request == request,
+              "Kernel did not return the acknowledged fence release");
+    } catch (const std::exception &error) {
+      FailAcknowledgementUncertain(error, "fence_release", kKernelProducer,
+          "The Apply hold release could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+    }
+    try {
+      apply_journal_.CompleteFailedApplyRelease(apply_id, apply_generation, *released);
+    } catch (const std::exception &error) {
+      FailAcknowledgementUncertain(error, "record_release", kApplyProducer,
+          "The Apply hold was released, but its record could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+    }
   }
-  try {
-    apply_journal_.CompleteFailedApplyRelease(apply_id, apply_generation, *released);
-  } catch (const std::exception &error) {
-    FailAcknowledgementUncertain(error, "record_release", kApplyProducer,
-        "The Apply hold was released, but its record could not be confirmed. Inspect the current admission state and diagnose the outcome.");
-  }
-  try {
-    Require(ReleaseAdmission(status->intent, *status->terminal_outcome, cell_admission_,
-                             parent),
-            "failed Apply admission claim could not be settled");
-  } catch (const std::exception &error) {
-    FailAcknowledgementUncertain(error, "claim_release", kKernelProducer,
-        "The Apply hold was released, but admission settlement could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+  if (claim_held) {
+    try {
+      Require(ReleaseAdmission(status->intent, *status->terminal_outcome, cell_admission_,
+                               parent),
+              "failed Apply admission claim could not be settled");
+    } catch (const std::exception &error) {
+      FailAcknowledgementUncertain(error, "claim_release", kKernelProducer,
+          "The Apply hold was released, but admission settlement could not be confirmed. Inspect the current admission state and diagnose the outcome.");
+    }
   }
   try {
     apply_journal_.CompleteFailedApplyAcknowledgement(apply_id, apply_generation);
@@ -1690,6 +1869,7 @@ void ManagerNamedApplyCoordinator::ReleaseFailedApply(
     FailAcknowledgementUncertain(error, "record_acknowledgement", kApplyProducer,
         "Admission was settled, but the acknowledgement record could not be confirmed. Inspect the current admission state and diagnose the outcome.");
   }
+  return true;
 }
 
 } // namespace manyforge::component_manager

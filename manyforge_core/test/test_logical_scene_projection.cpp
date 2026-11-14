@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <gtest/gtest.h>
 
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -47,7 +48,7 @@ SceneTransactionDTO Transaction(const LogicalSceneSnapshotDTO& previous,
   const bool resolution_evidence_required =
       !std::holds_alternative<ResolvedRemoveSceneObjectDTO>(operation) &&
       !std::holds_alternative<ResolvedCollisionPolicyDTO>(operation);
-  return {RequestId("request-" + std::to_string(candidate.transaction_sequence)),
+  return {TestRequestKey("request-" + std::to_string(candidate.transaction_sequence)),
           {},
           candidate.transaction_sequence,
           Projection(previous),

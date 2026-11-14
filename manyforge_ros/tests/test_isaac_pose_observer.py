@@ -393,7 +393,6 @@ class _FakeSceneRuntimeClient:
         self.owner_reads += 1
         return SceneRuntimeOwnerSnapshot(
             cell_id="cell.1",
-            owner_epoch=f"owner.{self.owner_reads}",
             runtime_identity=self.identity,
             initialization_generation=1,
             initialization_state="open",

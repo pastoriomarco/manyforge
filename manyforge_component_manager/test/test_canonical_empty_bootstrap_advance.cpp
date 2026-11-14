@@ -562,6 +562,8 @@ TEST(CanonicalEmptyBootstrapAdvance, RebuildPublishFinalizeAndReplay) {
   EXPECT_EQ(
       inventory.active_bundle_publication.current_generation.value(), 1U);
 
+  // The store writes its file afterwards; Close drains it before the reopen.
+  stores.active_bundle_publication_store().Close();
   SqliteActiveBundlePublicationStore reopened(
       stores.active_bundle_publication_store().database_path(),
       admission.cell_id());
@@ -612,7 +614,7 @@ TEST(CanonicalEmptyBootstrapAdvance, RebuildingIsObservedWithoutAnotherEffect) {
 
 TEST(
     CanonicalEmptyBootstrapAdvance,
-    ExactPublishedHeadSurvivesFinalizeFailureAndBeginReplay) {
+    ExactPublishedHeadSurvivesFinalizeFailure) {
   TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ExternallyProvisionedManagerStores stores(directory.path(), admission);
@@ -634,9 +636,6 @@ TEST(
       stores.StartupInventory().active_bundle_publication.receipt_count,
       1);
 
-  const auto accepted_replay = coordinator.BeginOrRecover(admission);
-  EXPECT_EQ(
-      accepted_replay.accepted_target, seeded.accepted_target);
   const auto finalized = coordinator.AdvanceOrRecover(admission);
   EXPECT_EQ(finalized.state, ProjectionBootstrapStatusState::kFinalized);
   EXPECT_EQ(owner.finalize_effects(), 1U);
@@ -773,9 +772,6 @@ TEST(
 
     EXPECT_THROW(
         coordinator.AdvanceOrRecover(admission),
-        CanonicalEmptyBootstrapCoordinatorError);
-    EXPECT_THROW(
-        coordinator.BeginOrRecover(admission),
         CanonicalEmptyBootstrapCoordinatorError);
     EXPECT_EQ(owner.rebuild_calls(), rebuild_calls);
     EXPECT_EQ(owner.rebuild_effects(), rebuild_effects);

@@ -126,7 +126,7 @@ StagedReady(std::vector<RuntimeUnitStagedReadyEvidenceDTO> runtimes) {
             [](const auto &left, const auto &right) {
               return left.runtime_unit_id < right.runtime_unit_id;
             });
-  return {ApplyId("apply.1"),
+  return {ApplyId(1U),
           ApplyGeneration(1U),
           1U,
           ContentDigest(std::string(kDigestOne)),

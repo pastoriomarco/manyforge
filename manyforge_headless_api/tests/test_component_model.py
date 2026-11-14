@@ -7,22 +7,21 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from manyforge_headless_api.app import create_app
 from manyforge_headless_api.component_model import (
-    DEFAULT_LIFECYCLE_TIMEOUT_S,
     ComponentModel,
-    action_wait_s,
     enable_all_targets,
     group_action_order,
     latch_summary,
-    launch_settle_bound_s,
-    lifecycle_timeouts_s,
     manual_operation_resident,
     prepare_all_targets,
     parse_component_model,
+    CycleUnknown,
+    run_cycle_facts,
     run_readiness,
     wait_for_action,
 )
@@ -32,6 +31,7 @@ from manyforge_headless_api.control_state import (
     control_shell_fact_key,
 )
 from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 from manyforge_headless_api.tests.test_app import (
     FakeCore,
     FakeExecution,
@@ -54,8 +54,8 @@ def _state(component_id: str, lifecycle: str = "enabled", **extra: Any) -> dict[
 
 
 _FAULT = {
-    "code": "fault_estop",
-    "message": "Emergency stop active",
+    "code": "fault_protective_stop",
+    "message": "Robot stopped itself",
     "clearable": True,
     "operator_action": "enable",
     "since_ns": 3,
@@ -246,8 +246,8 @@ def _codes(readiness: dict[str, Any]) -> list[str]:
 
 
 def _cycle(state: str = "idle_after_reset", *, resume: bool = False) -> dict[str, Any]:
-    return {"state": state, "allowed_commands": [
-        {"command_kind": "program_resume_full_stop", "allowed": resume}]}
+    return run_cycle_facts({"state": state, "allowed_commands": [
+        {"command_kind": "program_resume_halt", "allowed": resume}]})
 
 
 def _ready(model: ComponentModel, state: str = "idle_after_reset", *,
@@ -265,7 +265,7 @@ def test_a_latched_cell_blocks_with_its_summary() -> None:
     latch = {"latched": True, "causes": [{"component_id": "robot", "kind": "fault", "fault": _FAULT}]}
     readiness = _ready(_model(cell_latch=latch))
     assert _codes(readiness) == ["cell_latched"]
-    assert readiness["blocked_reasons"][0]["message"] == "robot: Emergency stop active"
+    assert readiness["blocked_reasons"][0]["message"] == "robot: Robot stopped itself"
 
 
 def test_a_prepared_component_is_not_enabled_with_its_id() -> None:
@@ -456,7 +456,7 @@ def test_a_stale_or_missing_required_input_names_its_signal(samples: list[dict[s
     ]
 
 
-@pytest.mark.parametrize("cycle", ["starting", "stopping", "resetting",
+@pytest.mark.parametrize("cycle", ["starting", "resetting",
                                    "terminal_awaiting_reset"])
 def test_any_run_blocks_execute(cycle: str) -> None:
     readiness = _ready(_model(), cycle)
@@ -475,23 +475,6 @@ def test_an_execution_block_blocks_execute_and_resume_with_its_code(code: str) -
     assert _ready(_model(execution_blocks=[]))["can_execute"] is True
 
 
-def test_before_the_first_component_report_after_a_restart_readiness_names_it() -> None:
-    block = {"code": "execution_host_restart_awaiting_components", "message": "waits",
-             "details": {}}
-    readiness = _ready(_model(component_states=[], execution_blocks=[block]))
-    assert readiness["can_execute"] is False
-    assert readiness["blocked_reasons"] == [
-        {"code": "execution_host_restart_awaiting_components", "message": "waits"}]
-
-
-def test_a_restart_settling_block_names_its_busy_component() -> None:
-    block = {"code": "execution_host_restart_settling", "message": "waits",
-             "details": {"component_id": "robot"}}
-    reasons = _ready(_model(execution_blocks=[block]))["blocked_reasons"]
-    assert reasons == [{"code": "execution_host_restart_settling", "message": "waits",
-                        "component_id": "robot"}]
-
-
 def test_resume_needs_the_runners_resume_and_no_other_reason() -> None:
     assert _ready(_model(), "running", resume=True)["can_resume"] is True
     blocked = _ready(_model(component_states=[_state("robot", "prepared")]), "running",
@@ -506,10 +489,13 @@ def test_program_motion_running_blocks_resume_with_its_reason() -> None:
     assert _codes(readiness) == ["run_in_progress", "program_motion_running"]
 
 
-def test_an_unavailable_runner_blocks_execute_and_resume() -> None:
-    readiness = run_readiness(_model(), None, manual_operation_in_progress=False)
+@pytest.mark.parametrize(
+    "code", ["program_control_state_synchronizing", "program_control_source_unavailable"]
+)
+def test_unknown_cycle_facts_block_execute_and_resume_with_their_reason(code: str) -> None:
+    readiness = run_readiness(_model(), CycleUnknown(code), manual_operation_in_progress=False)
     assert readiness["can_execute"] is False and readiness["can_resume"] is False
-    assert _codes(readiness) == ["program_runner_unavailable"]
+    assert _codes(readiness) == [code]
 
 
 def test_a_resident_manual_operation_blocks_execute_and_resume() -> None:
@@ -550,7 +536,7 @@ def test_latch_summary_counts_every_cause() -> None:
         {"component_id": "robot", "kind": "fault", "fault": _FAULT},
         {"component_id": "io", "kind": "offline"},
     ]}
-    assert latch_summary(latch) == "2 errors require attention · robot: Emergency stop active"
+    assert latch_summary(latch) == "2 errors require attention · robot: Robot stopped itself"
     assert latch_summary({"latched": True, "causes": [
         {"component_id": "io", "kind": "activity_unknown"}]}) == "io: activity unknown"
 
@@ -597,25 +583,62 @@ def test_wait_for_action_returns_the_new_last_action() -> None:
     ])
     assert (
         wait_for_action(
-            lambda: next(reads), "robot", "disable", old, timeout_s=10.0, poll_seconds=0.0
+            lambda: next(reads), "robot", "disable", old, poll_seconds=0.0
         )
         == new
     )
 
 
-def test_wait_for_action_ends_unknown_after_the_lifecycle_timeout() -> None:
-    busy = [_state("robot", action={"action": "prepare", "started_at_ns": 3})]
-    result = wait_for_action(
-        lambda: busy, "robot", "prepare", None, timeout_s=0.0, poll_seconds=0.0
-    )
+_OWNER_STALL = {
+    "code": "component_owner_stalled",
+    "message": "robot has not finished an internal task",
+    "clearable": False,
+    "operator_action": "recover",
+    "since_ns": 4,
+}
+
+
+def test_wait_for_action_ends_unknown_on_the_owner_stall_fault() -> None:
+    # OD-214 (T26, T34): no limit of its own; an action whose owner stalled
+    # never finishes, and the wait ends with the stall's own code.
+    busy = {"action": "prepare", "started_at_ns": 3}
+    reads = iter([
+        [_state("robot", "not_prepared", action=busy)],
+        [_state("robot", "fault", action=busy, fault=_OWNER_STALL)],
+    ])
+    result = wait_for_action(lambda: next(reads), "robot", "prepare", None, poll_seconds=0.0)
     assert result["outcome"] == "unknown"
     assert result["action"] == "prepare"
-    assert result["error"]["code"] == "component_action_outcome_unknown"
+    assert result["error"] == {
+        "code": "component_owner_stalled", "message": "robot has not finished an internal task"}
+
+
+def test_wait_for_action_keeps_waiting_through_any_other_fault() -> None:
+    # A fault is often what the action is for (a Recover of an exited
+    # process): only the owner-stall fault ends the wait.
+    busy = {"action": "recover", "started_at_ns": 3}
+    exited = dict(_FAULT, code="fault_process_exited", operator_action="recover")
+    done = {"action": "recover", "outcome": "succeeded", "started_at_ns": 3, "finished_at_ns": 5}
+    reads = iter([
+        [_state("robot", "fault", action=busy, fault=exited)],
+        [_state("robot", "fault", action=busy, fault=exited)],
+        [_state("robot", "prepared", last_action=done)],
+    ])
+    assert wait_for_action(lambda: next(reads), "robot", "recover", None, poll_seconds=0.0) == done
+
+
+def test_wait_for_action_ends_when_the_host_read_fails() -> None:
+    def lost() -> list[Any]:
+        raise HeadlessApiError("execution_owner_unavailable", "native execution transport failed")
+
+    with pytest.raises(HeadlessApiError) as failed:
+        wait_for_action(lost, "robot", "enable", None, poll_seconds=0.0)
+    assert failed.value.code == "execution_owner_unavailable"
 
 
 def test_wait_for_action_refuses_a_component_that_left_the_cell() -> None:
     with pytest.raises(HeadlessApiError) as missing:
-        wait_for_action(lambda: [], "robot", "enable", None, timeout_s=1.0, poll_seconds=0.0)
+        wait_for_action(lambda: [], "robot", "enable", None, poll_seconds=0.0)
     assert missing.value.code == "component_not_found"
 
 
@@ -634,9 +657,10 @@ class _ModelExecution(FakeExecution):
         self.stop_after_first = False
 
     def control_state(self) -> dict[str, Any]:
-        generation = 2 if self.stop_after_first and self.actions else 1
+        # A new Stop event id: "a Stop happened" (H3).
+        last_event_id = 2 if self.stop_after_first and self.actions else None
         return {"ok": True, "command": "control_state",
-                "control_state": {"cell_stop_action": {"expected_stop_generation": generation}}}
+                "control_state": {"cell_stop_action": {"last_event_id": last_event_id}}}
 
     def component_model(self) -> dict[str, Any]:
         return self.reply
@@ -672,20 +696,71 @@ def _rest(reply: dict[str, Any] | None = None) -> tuple[TestClient, _ModelExecut
     return TestClient(create_app(service=service)), execution
 
 
+_RUNNER_READINESS = {
+    "schema_version": "manyforge.run_readiness_request.v1",
+    "program_cycle": {"state": "idle_after_reset", "resume_halt_allowed": False},
+}
+
+
 def test_component_reads_have_the_contract_shapes() -> None:
     client, _execution = _rest()
     with client:
         components = client.get("/api/components").json()
         latch = client.get("/api/cell/latch").json()
         signals = client.get("/api/io").json()
-        readiness = client.get("/api/program/readiness").json()
+        readiness = client.post("/api/program/readiness", json=_RUNNER_READINESS).json()
     assert [row["component_id"] for row in components] == ["robot", "gripper"]
     assert latch == {"latched": False, "causes": []}
     assert [row["signal_id"] for row in signals] == ["door", "CO0"]
-    # The shape; can_resume follows the fake runner's allowed commands.
     assert set(readiness) == {"can_execute", "can_resume", "motion_clear", "blocked_reasons"}
-    assert readiness["can_execute"] is True and isinstance(readiness["can_resume"], bool)
-    assert readiness["blocked_reasons"] == []
+    assert readiness == {"can_execute": True, "can_resume": False,
+                         "motion_clear": True, "blocked_reasons": []}
+
+
+def test_the_runners_readiness_is_answered_without_calling_the_runner() -> None:
+    requests: list[httpx.Request] = []
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    raw = httpx.Client(base_url="http://runner.test", transport=httpx.MockTransport(unreachable))
+    service = _service(
+        FakeCore(), FakeManager(), _ModelExecution(_reply()),
+        program_runner=ProgramRunnerHttpClient("http://runner.test", client=raw),
+    )
+    try:
+        with TestClient(create_app(service=service)) as client:
+            execute = client.post("/api/program/readiness", json=_RUNNER_READINESS)
+            resume = client.post("/api/program/readiness", json={
+                **_RUNNER_READINESS,
+                "program_cycle": {"state": "running", "resume_halt_allowed": True},
+            })
+    finally:
+        raw.close()
+    assert execute.status_code == 200 and execute.json()["can_execute"] is True
+    assert resume.status_code == 200 and resume.json()["can_resume"] is True
+    assert requests == []
+
+
+def test_a_readiness_request_must_carry_exactly_the_cycle_facts() -> None:
+    client, _execution = _rest()
+    with client:
+        extra = client.post("/api/program/readiness", json={
+            **_RUNNER_READINESS,
+            "program_cycle": {**_RUNNER_READINESS["program_cycle"], "allowed_commands": []},
+        })
+        unversioned = client.post("/api/program/readiness", json={
+            "program_cycle": _RUNNER_READINESS["program_cycle"]})
+    assert extra.status_code == 422 and unversioned.status_code == 422
+
+
+def test_readiness_before_any_cycle_facts_is_synchronizing() -> None:
+    client, _execution = _rest()
+    with client:
+        readiness = client.get("/api/program/readiness").json()
+    assert readiness["can_execute"] is False and readiness["can_resume"] is False
+    assert _codes(readiness) == ["program_control_state_synchronizing"]
 
 
 def test_one_action_is_accepted_with_202() -> None:
@@ -840,64 +915,97 @@ def test_a_machine_recover_prepares_its_unprepared_members_after_it() -> None:
     assert execution.actions == [("lite6", "recover"), ("lite6_arm", "prepare")]
 
 
-def _graph(**timeouts: float) -> dict[str, Any]:
-    """An active cell graph authoring `timeouts`; `io` is an I/O device."""
-
-    return {"runtime_units": [{"configuration": {
-        "lifecycle_command_timeouts": [
-            {"controllable_component_id": component_id, "lifecycle_command_timeout_s": value}
-            for component_id, value in timeouts.items() if component_id != "io"],
-        "io_provider_devices": [
-            {"controllable_component_id": "io", "lifecycle_command_timeout_s": timeouts["io"]}
-        ] if "io" in timeouts else [],
-    }}]}
-
-
-def test_lifecycle_timeouts_are_read_from_the_active_cell_graph_as_the_host_reads_them() -> None:
-    assert lifecycle_timeouts_s(_graph(robot=25.0, io=3)) == {"robot": 25.0, "io": 3.0}
-    assert lifecycle_timeouts_s({"runtime_units": [{"configuration": {}}]}) == {}
-
-
-def test_the_launch_bound_sums_lifecycle_timeouts_and_a_prepare_awaits_an_unsettled_launch() -> None:
-    assert launch_settle_bound_s([25.0, 10.0]) == 35.0
-    assert launch_settle_bound_s([]) == DEFAULT_LIFECYCLE_TIMEOUT_S
-    assert action_wait_s("prepare", 25.0, 35.0, launch_settled=False) == 60.0
-    assert action_wait_s("prepare", 25.0, 35.0, launch_settled=True) == 25.0
-    assert action_wait_s("enable", 25.0, 35.0, launch_settled=False) == 25.0
-
-
-def test_a_group_action_waits_for_each_result_within_its_component_bound(monkeypatch) -> None:
+def test_a_group_action_waits_for_each_result_with_no_limit_of_its_own(monkeypatch) -> None:
+    # OD-214 (T26): each step waits for its `last_action`; nothing reads a
+    # lifecycle timeout or the cell graph for it.
     import manyforge_headless_api.service as service_module
 
-    bounds: list[tuple[str, float]] = []
+    waits: list[tuple[str, dict[str, Any]]] = []
     real_wait = service_module.wait_for_action
 
-    def record(read_states, component_id, action, previous, *, timeout_s):  # type: ignore[no-untyped-def]
-        bounds.append((component_id, timeout_s))
-        return real_wait(read_states, component_id, action, previous, timeout_s=timeout_s)
+    def record(read_states, component_id, action, previous, **options):  # type: ignore[no-untyped-def]
+        waits.append((component_id, options))
+        return real_wait(read_states, component_id, action, previous, **options)
 
     monkeypatch.setattr(service_module, "wait_for_action", record)
     settled = {"action": "disable", "outcome": "succeeded", "started_at_ns": 0, "finished_at_ns": 1}
     reply = _reply(component_states=[
         _state("robot", "not_prepared"),  # just launched: no action yet
         _state("gripper", "not_prepared", last_action=settled),
-        _state("io", "not_prepared", last_action=settled),
     ])
     execution = _ModelExecution(reply)
-    core = FakeCore()
-    core.manager_payload["active"]["cell_graph"] = _graph(robot=25.0, io=3.0)
-    service = _service(core, FakeManager(), execution,
+    service = _service(FakeCore(), FakeManager(), execution,
                        program_runner=FakeProgramRunner(active=False))
-    service.component_actions("prepare", ["robot", "gripper", "io"])
+
+    def no_graph() -> dict[str, Any]:
+        raise AssertionError("a group action reads no cell graph")
+
+    service.manager_graph = no_graph  # type: ignore[method-assign]
+    service.component_actions("prepare", ["robot", "gripper"])
     for thread in threading.enumerate():
         if thread.name == "component-group-action":
             thread.join(5.0)
-    launch = 25.0 + DEFAULT_LIFECYCLE_TIMEOUT_S + 3.0  # every component of the cell
-    assert bounds == [
-        ("robot", launch + 25.0),
-        ("gripper", DEFAULT_LIFECYCLE_TIMEOUT_S),
-        ("io", 3.0),
-    ]
+    assert waits == [("robot", {}), ("gripper", {})]
+    assert [row["last_action"]["outcome"] for row in reply["component_states"]] == [
+        "succeeded", "succeeded"]
+
+
+class _StallingExecution(_ModelExecution):
+    """`robot`'s action never finishes: its owner stalled (U5)."""
+
+    def component_action(self, component_id: str, action: str) -> dict[str, Any]:
+        if component_id != "robot":
+            return super().component_action(component_id, action)
+        self.actions.append((component_id, action))
+        for row in self.reply["component_states"]:
+            if row["component_id"] == component_id:
+                row["action"] = {"action": action, "started_at_ns": 1}
+                row["lifecycle"] = "fault"
+                row["fault"] = dict(_OWNER_STALL)
+        return {"ok": True, "command": "component_action",
+                "accepted": {"component_id": component_id, "action": action}}
+
+
+def test_a_group_step_ends_on_the_owner_stall_and_the_group_goes_on() -> None:
+    # OD-214 (T26): the stalled step ends unknown with the stall's code; as
+    # any failed step, it doesn't stop the rest, and the group lock is freed.
+    reply = _reply(component_states=[_state("robot", "prepared"), _state("gripper", "prepared")])
+    execution = _StallingExecution(reply)
+    service = _service(FakeCore(), FakeManager(), execution,
+                       program_runner=FakeProgramRunner(active=False))
+    service.component_actions("enable", ["robot", "gripper"])
+    for thread in threading.enumerate():
+        if thread.name == "component-group-action":
+            thread.join(5.0)
+    assert execution.actions == [("robot", "enable"), ("gripper", "enable")]
+    assert "last_action" not in reply["component_states"][0]  # the host's row is untouched
+    assert service._group_action_lock.acquire(blocking=False)
+    service._group_action_lock.release()
+
+
+def test_a_group_step_ends_when_the_host_read_fails() -> None:
+    # OD-214 (T26): a lost host ends the wait with the read's error; the
+    # group ends and frees its lock.
+    reply = _reply(component_states=[_state("robot", "prepared")])
+    execution = _ModelExecution(reply)
+    dispatch = execution.component_action
+
+    def dispatch_then_lose(component_id: str, action: str) -> dict[str, Any]:
+        answer = dispatch(component_id, action)
+        execution.reply = {"ok": False, "error": {
+            "code": "execution_owner_unavailable", "message": "native execution transport failed"}}
+        return answer
+
+    execution.component_action = dispatch_then_lose  # type: ignore[method-assign]
+    service = _service(FakeCore(), FakeManager(), execution,
+                       program_runner=FakeProgramRunner(active=False))
+    service.component_actions("enable", ["robot"])
+    for thread in threading.enumerate():
+        if thread.name == "component-group-action":
+            thread.join(5.0)
+    assert execution.actions == [("robot", "enable")]
+    assert service._group_action_lock.acquire(blocking=False)
+    service._group_action_lock.release()
 
 
 def test_a_stop_ends_the_group_action() -> None:
@@ -1026,7 +1134,7 @@ def test_overview_has_one_tile_per_component_from_its_state() -> None:
     assert tiles["component:robot"]["status"] == "healthy"
     assert tiles["component:gripper"]["status"] == "waiting"
     assert tiles["component:io"]["status"] == "fault"
-    assert tiles["component:io"]["reason_code"] == "fault_estop"
+    assert tiles["component:io"]["reason_code"] == "fault_protective_stop"
     assert tiles["component:plc"]["status"] == "offline"
     assert tiles["component:plc"]["reason_code"] == "process_exited"
     assert not any(tile_id.startswith("runtime_unit:") for tile_id in tiles)
@@ -1051,11 +1159,11 @@ def test_run_end_shape_is_the_contract_one() -> None:
     )
     assert _valid_run_end(
         {"end_reason": "cell_fault", "details": {"component_id": "robot",
-                                                  "error": {"code": "fault_estop", "message": "e-stop"}}}
+                                                  "error": {"code": "fault_protective_stop", "message": "protective stop"}}}
     )
     assert not _valid_run_end({"end_reason": "finished", "details": {}})
     assert not _valid_run_end({"end_reason": "stopped", "details": {"stopped_by": "nobody"}})
-    assert not _valid_run_end({"end_reason": "failed", "details": {"operation_id": "x"}})
+    assert not _valid_run_end({"end_reason": "failed", "details": {"operation_id": 7}})
 
 
 def test_simulator_only_latch_cause_does_not_block_execute() -> None:
@@ -1078,3 +1186,22 @@ def test_activation_targets_skip_simulator_but_keep_ordinary_inactive_components
 
     assert prepare_all_targets(states) == ["offline_robot"]
     assert enable_all_targets(states) == ["prepared_robot"]
+
+
+def test_latch_cause_carries_the_stop_unconfirmed_reason_unchanged() -> None:
+    reason = {"code": "stop_unconfirmed", "message": "Last Stop not confirmed"}
+    model = parse_component_model({
+        "component_states": [{
+            "component_id": "robot", "lifecycle": "enabled", "activity": "unknown",
+            "reason": reason, "streams": [], "capabilities": [], "observed_at_ns": 1,
+        }],
+        "cell_latch": {"latched": True, "causes": [
+            {"component_id": "robot", "kind": "activity_unknown", "reason": reason},
+            {"component_id": "gripper", "kind": "offline", "reason": None},
+        ]},
+        "signal_samples": [],
+        "rule_holds": [],
+    })
+    assert model.component_states[0]["reason"] == reason
+    assert model.cell_latch["causes"][0]["reason"] == reason
+    assert model.cell_latch["causes"][1]["reason"] is None

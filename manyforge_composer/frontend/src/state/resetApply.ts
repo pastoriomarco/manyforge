@@ -5,7 +5,7 @@
  * The Program Draft (Scene included) may be edited while a run is held with
  * all its motion stopped. Its edits reach the robot only through Apply, and
  * Apply first ends the run: after one informed confirmation the browser
- * sends the exact-identity Reset, observes that Reset's correlated cycle Idle
+ * sends the exact-identity Reset, observes that Reset's own cycle Idle
  * (a receipt is never settlement) and authoring admission, then sends the
  * ordinary Apply of exactly the confirmed Draft revision and follows it with
  * the existing Apply tracker. Nothing is Saved, Executed, Run, resumed or
@@ -13,12 +13,15 @@
  * run is stopped or held (the server refuses it during a run);
  * a finished run awaiting Reset is reset by the server's Apply itself.
  */
+import { displayApplyId, type ApplicationStartId } from '../api/applicationIdentity';
 import type {
   ManagerApplyStatus,
   ProgramCycleStatus,
   ResetApplyContext,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
+import type { ExecutionCommandSessionIdentity } from '../hooks/useHeadlessState';
+import { requestKeyNamesWebSocketCommand } from '../api/applicationIdentity';
 import { applyMayHaveActed, type ManagerApplyIdentity } from './managerApply';
 
 export type ResetApplyDocument = 'program' | 'deployment';
@@ -34,10 +37,10 @@ export function deploymentApplyResetsRun(snapshot: ComposerHeadlessState | null)
 
 /** Everything confirmed at once: the run Reset ends and the Draft Applied. */
 export interface ResetApplyPlan {
+  /** Names this chain in its Activity notice and Composer's context log. */
   correlationId: string;
   document: ResetApplyDocument;
-  programRunId: string;
-  programRunnerOwnerEpoch: string;
+  programRunId: number;
   /** The held cycle the operator confirmed; Reset must end exactly this one. */
   cycleGeneration: number;
   draftId: string;
@@ -52,11 +55,10 @@ export interface ResetApplyPlan {
 
 export function resetApplyContext(plan: ResetApplyPlan): ResetApplyContext {
   return {
-    schemaVersion: 'manyforge.composer_reset_apply_context.v1',
+    schemaVersion: 'manyforge.composer_reset_apply_context.v2',
     correlationId: plan.correlationId,
     document: plan.document,
     programRunId: plan.programRunId,
-    programRunnerOwnerEpoch: plan.programRunnerOwnerEpoch,
     cycleGeneration: plan.cycleGeneration,
     draftId: plan.draftId,
     draftRevision: plan.draftRevision,
@@ -67,10 +69,9 @@ export function resetApplyContext(plan: ResetApplyPlan): ResetApplyContext {
 
 /** The Reset this chain sent, as returned by the runtime controller. */
 export interface ResetApplyResetIdentity {
-  requestId: string;
-  correlationId: string;
-  programRunId: string;
-  programRunnerOwnerEpoch: string;
+  /** The WebSocket command: the cycle names it as its cause once Reset acts. */
+  command: ExecutionCommandSessionIdentity;
+  programRunId: number;
   cycleGeneration: number;
 }
 
@@ -82,13 +83,13 @@ export type ResetApplyPhase =
     reset: ResetApplyResetIdentity;
     /** `unconfirmed`: Reset was submitted but its reply was lost, so whether
      * the owner received it is unknown. It is never resent; only the cycle's
-     * correlated settlement can prove what happened. */
+     * settlement caused by this Reset can prove what happened. */
     delivery: 'confirmed' | 'unconfirmed';
   }
   | {
     kind: 'applying';
     reset: ResetApplyResetIdentity;
-    /** The correlated Idle that settled Reset; rechecked before Apply. */
+    /** The Idle this Reset caused; rechecked before Apply. */
     idle: { cycleGeneration: number };
     sent: boolean;
   }
@@ -112,7 +113,7 @@ export interface ResetApplySequence {
 export interface ResetApplyFacts {
   cycle: Pick<ProgramCycleStatus,
     | 'state' | 'cycleGeneration' | 'programRunId'
-    | 'causalCorrelationId' | 'failure'> | null;
+    | 'causalRequestKey' | 'failure'> | null;
   /** The ordinary Apply of this document is admitted (Idle, fences current). */
   applyAvailable: boolean;
   /** An operation of this document's workspace is still in flight. */
@@ -138,10 +139,22 @@ function failed(
   return { kind: 'phase', phase: { kind: 'failed', stage, message, unknown, apply } };
 }
 
+/** The cycle's last accepted command is exactly this chain's Reset. */
+function causedByReset(
+  cycle: NonNullable<ResetApplyFacts['cycle']>,
+  reset: ResetApplyResetIdentity,
+): boolean {
+  return cycle.causalRequestKey !== null && requestKeyNamesWebSocketCommand(
+    cycle.causalRequestKey,
+    reset.command.controlSessionNumber,
+    reset.command.clientSequence,
+  );
+}
+
 /**
  * The next action from current owner facts. Pure: the hook performs
  * `send_apply` once and applies `phase` transitions. A Reset receipt alone
- * is never settlement; only its correlated cycle Idle is.
+ * is never settlement; only the cycle Idle that Reset caused is.
  */
 export function nextResetApplyStep(
   sequence: ResetApplySequence,
@@ -151,7 +164,7 @@ export function nextResetApplyStep(
   if (phase.kind === 'awaiting_idle') {
     const cycle = facts.cycle;
     if (cycle === null) return { kind: 'wait' };
-    if (cycle.causalCorrelationId === plan.correlationId) {
+    if (causedByReset(cycle, phase.reset)) {
       if (cycle.state === 'idle_after_reset'
         && cycle.cycleGeneration > phase.reset.cycleGeneration) {
         return {
@@ -183,7 +196,7 @@ export function nextResetApplyStep(
         cycle.state !== 'idle_after_reset'
         || cycle.cycleGeneration !== phase.idle.cycleGeneration
         || cycle.programRunId !== null
-        || cycle.causalCorrelationId !== plan.correlationId
+        || !causedByReset(cycle, phase.reset)
       ) {
         return failed('apply', 'The cycle changed after Reset reached Idle (another run or request). Apply was not sent; review the state and Apply again.');
       }
@@ -228,7 +241,10 @@ export function nextResetApplyStep(
 }
 
 /** Plain phase text for Activity; never claims more than observed. */
-export function resetApplyPhaseText(phase: ResetApplyPhase): string {
+export function resetApplyPhaseText(
+  phase: ResetApplyPhase,
+  applicationStartId: ApplicationStartId | null = null,
+): string {
   switch (phase.kind) {
     case 'recording': return 'Recording the Apply context…';
     case 'resetting': return 'Sending Reset…';
@@ -236,7 +252,7 @@ export function resetApplyPhaseText(phase: ResetApplyPhase): string {
       ? 'Reset sent; waiting for the run to end and the cycle to reach Idle.'
       : 'Reset delivery unknown: reconciling from the observed cycle. Reset is not resent, and nothing is Applied until its settlement is observed.';
     case 'applying': return phase.sent ? 'Applying the Draft…' : 'Idle reached; waiting for authoring admission to Apply.';
-    case 'awaiting_apply': return `Apply ${phase.apply.applyId} accepted; waiting for activation to settle.`;
+    case 'awaiting_apply': return `Apply ${displayApplyId(applicationStartId, phase.apply.applyId)} accepted; waiting for activation to settle.`;
     case 'applied': return 'Applied; awaiting Execute/Run; not saved to Scenario.';
     case 'failed': return phase.message;
   }

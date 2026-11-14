@@ -31,6 +31,23 @@ std::string Text(const CanonicalValue &root, std::string_view name,
   return *value;
 }
 
+core::RequestKey RequestKeyMember(const CanonicalValue &root, std::string_view name) {
+  const auto *value = std::get_if<std::string>(&Member(root, name).storage());
+  const auto key =
+      value != nullptr ? core::ParseRequestKey(*value) : std::optional<core::RequestKey>{};
+  Require(key.has_value(), "command field " + std::string(name) + " must be 32 hex characters");
+  return *key;
+}
+
+core::ApplicationStartId ApplicationStartIdMember(const CanonicalValue &root,
+                                                  std::string_view name) {
+  const auto *value = std::get_if<std::string>(&Member(root, name).storage());
+  const auto start =
+      value != nullptr ? core::ParseApplicationStartId(*value) : std::nullopt;
+  Require(start.has_value(), "command field " + std::string(name) + " must be 16 hex characters");
+  return *start;
+}
+
 double Number(const CanonicalValue &root, std::string_view name) {
   const auto *value = std::get_if<double>(&Member(root, name).storage());
   Require(value != nullptr && std::isfinite(*value),
@@ -79,6 +96,12 @@ std::optional<std::uint64_t> OptionalCounter(const CanonicalValue &root,
           "command field " + std::string(name) +
               " must be null or one safe unsigned integer");
   return static_cast<std::uint64_t>(*value);
+}
+
+/// A Program run number, or null for manual work.
+std::optional<core::ProgramRunNumber> OptionalRun(const CanonicalValue &root) {
+  const auto run = OptionalCounter(root, "program_run_id", 1U);
+  return run ? std::optional{core::ProgramRunNumber(*run)} : std::nullopt;
 }
 
 std::optional<std::string> OptionalText(const CanonicalValue &root,
@@ -295,7 +318,7 @@ DecodeActionSpan(const CanonicalValue &value) {
   };
   return core::ActionSpanDTO{*source,
                              Text(value, "action_span_id"),
-                             optional_or_empty("program_run_id"),
+                             OptionalRun(value),
                              optional_or_empty("node_instance_id"),
                              optional_or_empty("node_attempt_id"),
                              optional_or_empty("parent_node_attempt_id")};
@@ -303,11 +326,9 @@ DecodeActionSpan(const CanonicalValue &value) {
 
 [[nodiscard]] core::PublicRequestContextDTO
 DecodeRequestContext(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 4U, "public request context");
-  return core::PublicRequestContextDTO{
-      core::RequestId(Text(value, "request_id")),
-      core::RequestOwnerEpoch(Text(value, "request_owner_epoch")),
-      Text(value, "source_label"), OptionalText(value, "correlation_id")};
+  RequireExactObjectSize(value, 2U, "public request context");
+  return core::PublicRequestContextDTO{RequestKeyMember(value, "request_key"),
+                                       Text(value, "source_label")};
 }
 
 [[nodiscard]] core::RequestAttributionDTO
@@ -654,7 +675,7 @@ DecodeProgramExecutionScope(const CanonicalValue &value,
   RequireExactObjectSize(*scope, 2U, "Program node execution scope");
   core::ProgramNodeExecutionScopeDTO decoded{
       core::ProgramNodeInstanceId(Text(*scope, "node_instance_id")),
-      Text(*scope, "node_attempt_id")};
+      core::NodeAttemptNumber(Counter(*scope, "node_attempt_id", 1U))};
   Require(core::valid_program_node_execution_scope(decoded),
           "Program node execution scope is malformed or oversized");
   return decoded;
@@ -669,14 +690,12 @@ DecodeOperation(const CanonicalValue &value,
   std::optional<core::ManualProgramHandoverContextDTO> manual_handover;
   if (manual_context != nullptr &&
       !std::holds_alternative<std::nullptr_t>(manual_context->storage())) {
-    RequireExactObjectSize(*manual_context, 4U, "manual handover context");
+    RequireExactObjectSize(*manual_context, 3U, "manual handover context");
     manual_handover = core::ManualProgramHandoverContextDTO{
-        core::RequestOwnerEpoch(
-            Text(*manual_context, "program_runner_owner_epoch")),
-        core::ProgramRunId(Text(*manual_context, "program_run_id")),
+        core::ProgramRunNumber(Counter(*manual_context, "program_run_id", 1U)),
         core::CellAdmissionClaimGeneration(
             Counter(*manual_context, "claim_generation", 1U)),
-        Counter(*manual_context, "selection_revision", 0U)};
+        Counter(*manual_context, "hold_revision", 0U)};
   }
   const auto &request = Member(value, "request_context");
   const auto &participant_values = Array(value, "participants");
@@ -725,7 +744,7 @@ DecodeOperation(const CanonicalValue &value,
       core::ProgramId(Text(value, "program_id")),
       core::ProgramRevision(Text(value, "program_revision")),
       core::ProgramBindingId(Text(value, "program_binding_id")),
-      core::ProgramRunId(Text(value, "program_run_id")),
+      OptionalRun(value),
       core::GraphRevision(Text(value, "expected_graph_revision")),
       core::RetainedBundleId(Text(value, "expected_retained_bundle_id")),
       std::move(expected_scene),
@@ -842,7 +861,7 @@ DecodeOperationControlRequest(const CanonicalValue &value,
                          "operation control request");
   return core::OperationControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
-      core::OperationId(Text(value, "operation_id")),
+      core::OperationNumber(Counter(value, "operation_id", 1U)),
       core::OperationRevision(
           Counter(value, "expected_operation_revision", 1U)),
       OptionalBoundedText(value, "reason", kMaximumReasonBytes),
@@ -873,13 +892,11 @@ DecodeStopIntent(const CanonicalValue &value,
             "Stop operation selector exceeds its row bound");
     targets.reserve(rows.size());
     for (const auto &target : rows) {
-      RequireExactObjectSize(target, 3U, "Stop operation target");
+      RequireExactObjectSize(target, 2U, "Stop operation target");
       targets.push_back(core::StopOperationTargetDTO{
-          core::OperationId(Text(target, "operation_id")),
+          core::OperationNumber(Counter(target, "operation_id", 1U)),
           core::OperationRevision(
-              Counter(target, "expected_operation_revision", 1U)),
-          core::StopGeneration(
-              Counter(target, "expected_stop_generation", 0U))});
+              Counter(target, "expected_operation_revision", 1U))});
     }
     selector = std::move(targets);
   } else if (value.find_object_member("components") != nullptr) {
@@ -905,13 +922,11 @@ DecodeStopIntent(const CanonicalValue &value,
             "Stop resource selector exceeds its row bound");
     targets.reserve(rows.size());
     for (const auto &target : rows) {
-      RequireExactObjectSize(target, 4U, "Stop resource target");
+      RequireExactObjectSize(target, 3U, "Stop resource target");
       targets.push_back(core::StopResourceTargetDTO{
           core::ResourceId(Text(target, "resource_id")),
           core::GraphRevision(Text(target, "expected_graph_revision")),
-          Counter(target, "expected_operation_resource_generation", 0U),
-          core::StopGeneration(
-              Counter(target, "expected_stop_generation", 0U))});
+          Counter(target, "expected_operation_resource_generation", 0U)});
     }
     selector = std::move(targets);
   }
@@ -924,31 +939,21 @@ DecodeStopIntent(const CanonicalValue &value,
       std::move(selector), std::move(reason), attribution};
 }
 
-[[nodiscard]] core::StopIntentDTO
-DecodeProgramRunStopIntent(const CanonicalValue &value,
-                           const core::RequestAttributionDTO &attribution) {
-  Require(value.is_object() && (value.as_object().size() == 2U ||
-                                value.as_object().size() == 3U),
-          "Program-run Stop intent has an unknown or missing field");
-  std::optional<std::string> reason;
-  if (value.find_object_member("reason") != nullptr) {
-    reason = OptionalBoundedText(value, "reason", kMaximumReasonBytes);
-  }
-  return core::StopIntentDTO{
+[[nodiscard]] core::ProgramRunEndIntentDTO
+DecodeProgramRunEndIntent(const CanonicalValue &value,
+                          const core::RequestAttributionDTO &attribution) {
+  RequireExactObjectSize(value, 2U, "Program-run end intent");
+  return core::ProgramRunEndIntentDTO{
       DecodeRequestContext(Member(value, "request_context")),
-      std::vector<core::StopProgramRunTargetDTO>{core::StopProgramRunTargetDTO{
-          core::ProgramRunId(Text(value, "program_run_id"))}},
-      std::move(reason), attribution};
+      core::ProgramRunNumber(Counter(value, "program_run_id", 1U)), attribution};
 }
 
 [[nodiscard]] core::FullStopIntentDTO
 DecodeFullStopIntent(const CanonicalValue &value,
                      const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 2U, "Full Stop intent");
+  RequireExactObjectSize(value, 1U, "cell-wide Stop intent");
   return core::FullStopIntentDTO{
-      DecodeRequestContext(Member(value, "request_context")),
-      core::StopGeneration(Counter(value, "expected_stop_generation", 0U)),
-      attribution};
+      DecodeRequestContext(Member(value, "request_context")), attribution};
 }
 
 [[nodiscard]] core::RuntimeScaleControlSelectorDTO
@@ -1025,17 +1030,15 @@ DecodeRecoveryAction(const std::string_view value) {
 DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   const bool has_fresh_motion_attempt =
       value.find_object_member("fresh_motion_attempt") != nullptr;
-  RequireExactObjectSize(value, has_fresh_motion_attempt ? 10U : 9U,
+  RequireExactObjectSize(value, has_fresh_motion_attempt ? 8U : 7U,
                          "operation recovery request");
   return core::KernelRecoveryActionRequestDTO{
-      Text(value, "request_id"),
+      RequestKeyMember(value, "request_key"),
       DecodeRecoveryAction(Text(value, "action")),
       Text(value, "principal_id", true),
       Counter(value, "expected_assessment_revision", 1U),
       Counter(value, "expected_control_command_epoch", 0U),
       Counter(value, "expected_execution_id", 1U),
-      Text(value, "expected_stop_certificate_id", true),
-      Counter(value, "expected_stop_owner_generation", 0U),
       Text(value, "reason", true),
       has_fresh_motion_attempt ? Boolean(value, "fresh_motion_attempt")
                                : false};
@@ -1045,8 +1048,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// motion-preview session (and pick/place planning built on one) retains that
 /// ordering for its whole planning transaction, so these commands run on the
 /// submission-ordered lane, FIFO in host enqueue order, and never occupy the
-/// ordinary lane that serves Stop status, Reset, events, cell admission and
-/// operator-alarm attention. Speed scaling takes no submission ordering: it
+/// ordinary lane that serves Reset, events and cell admission. Speed scaling takes no submission ordering: it
 /// runs on its own lane.
 [[nodiscard]] bool IsSubmissionOrdered(const CommandKind kind) noexcept {
   switch (kind) {
@@ -1074,25 +1076,44 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
          kind == CommandKind::kTargets || kind == CommandKind::kControlState;
 }
 
-/// In-memory Stop-progression reads of the stable Kernel. They are served
+/// The in-memory Stop-progression read of the stable Kernel. It is served
 /// beside Stop on the independent control socket, never on the ordinary one.
 [[nodiscard]] bool IsStopLaneRead(const CommandKind kind) noexcept {
-  return kind == CommandKind::kReadStop || kind == CommandKind::kReadComponentModel ||
+  return kind == CommandKind::kReadStop;
+}
+
+/// Served only on the independent component socket.
+[[nodiscard]] bool IsComponentLaneCommand(const CommandKind kind) noexcept {
+  return kind == CommandKind::kReadComponentModel ||
          kind == CommandKind::kComponentRecoveryPreflight ||
          kind == CommandKind::kComponentAction;
 }
 
+[[nodiscard]] bool IsPlanningJobCommand(const CommandKind kind) noexcept {
+  return kind == CommandKind::kPlanPick || kind == CommandKind::kPlanPlace;
+}
+
+[[nodiscard]] bool IsPlanningJobControl(const CommandKind kind) noexcept {
+  return kind == CommandKind::kReadPlanningJob ||
+         kind == CommandKind::kCancelPlanningJob ||
+         kind == CommandKind::kReleasePlanningJob;
+}
+
 /// Every Stop form preempts advisory planning before it is dispatched: a
 /// preview is effect-free and re-requestable, and containment never waits
-/// for one. An accepted Reset preempts it after acceptance (a refused Reset
-/// changed nothing a preview depends on).
+/// for one. A pick/place planning job is not preempted by a Stop: only its
+/// own cancel stops it (OD-213 (1)). A reset-position move preempts planning
+/// jobs too, and an accepted Reset preempts both after acceptance (a refused
+/// Reset changed nothing a preview depends on).
 [[nodiscard]] bool PreemptsPlanning(const CommandKind kind) noexcept {
   switch (kind) {
   case CommandKind::kStop:
   case CommandKind::kStopProgramRun:
   case CommandKind::kStopProgramSelection:
-  case CommandKind::kFullStop:
-  case CommandKind::kMalformedStop:
+  case CommandKind::kStopAll:
+  case CommandKind::kHalt:
+  case CommandKind::kCellStop:
+  case CommandKind::kRecognizedStop:
   case CommandKind::kResetRobotPosition:
     return true;
   default:
@@ -1107,13 +1128,51 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 [[nodiscard]] bool PreemptsPlanning(
     const component_manager::detail::KernelCellAdmissionRpcPacket
         &packet) noexcept {
-  const auto *intent =
-      std::get_if<core::CellAdmissionClaimIntentDTO>(&packet.request);
-  return intent != nullptr &&
-         intent->claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset;
+  return std::holds_alternative<
+      component_manager::detail::ProgramResetClaimAcquireRequest>(packet.request);
 }
 
 namespace {
+
+/// The Program runner's current cycle status carried by a Reset position
+/// command (OD-139); the Kernel validates it in memory.
+core::ProgramCycleStatusDTO ProgramCycleStatusMember(const CanonicalValue &root,
+                                                     std::string_view name) {
+  const auto &status = Member(root, name);
+  RequireExactObjectSize(status, 6U, "Program cycle status");
+  const auto state_text = Text(status, "state", false);
+  std::optional<core::ProgramCycleStateDTO> state;
+  for (const auto candidate : {core::ProgramCycleStateDTO::kIdleAfterReset,
+                               core::ProgramCycleStateDTO::kStarting,
+                               core::ProgramCycleStateDTO::kRunning,
+                               core::ProgramCycleStateDTO::kStopping,
+                               core::ProgramCycleStateDTO::kTerminalAwaitingReset,
+                               core::ProgramCycleStateDTO::kInterventionOrRecovery,
+                               core::ProgramCycleStateDTO::kResetting,
+                               core::ProgramCycleStateDTO::kRecoveryRequired})
+    if (core::to_string(candidate) == state_text) state = candidate;
+  Require(state.has_value(), "Program cycle status has an unknown state");
+  const auto cycle_claim = OptionalCounter(status, "cycle_claim_generation", 1U);
+  const auto reference = OptionalText(status, "terminal_or_settlement_reference");
+  std::optional<core::AcceptedProgramResetDTO> accepted;
+  if (const auto &reset = Member(status, "accepted_reset");
+      !std::holds_alternative<std::nullptr_t>(reset.storage())) {
+    RequireExactObjectSize(reset, 5U, "accepted Program Reset");
+    const auto reset_claim = OptionalCounter(reset, "reset_claim_generation", 1U);
+    accepted = core::AcceptedProgramResetDTO{
+        RequestKeyMember(reset, "request_key"),
+        core::ContentDigest(Text(reset, "request_payload_digest", false)),
+        Boolean(reset, "reload_initial_scene"), Boolean(reset, "reset_robot_position"),
+        reset_claim ? std::optional{core::CellAdmissionClaimGeneration(*reset_claim)}
+                    : std::nullopt};
+  }
+  return core::ProgramCycleStatusDTO{
+      Counter(status, "cycle_generation", 1U), *state, OptionalRun(status),
+      cycle_claim ? std::optional{core::CellAdmissionClaimGeneration(*cycle_claim)}
+                  : std::nullopt,
+      reference ? std::optional{core::ContentDigest(*reference)} : std::nullopt,
+      std::move(accepted)};
+}
 
 std::uint64_t IoCounter(const CanonicalValue& object, std::string_view name,
                         std::uint64_t minimum) {
@@ -1132,60 +1191,56 @@ std::uint64_t IoCounter(const CanonicalValue& object, std::string_view name,
 }
 
 core::IoWatchRegistrationDTO DecodeIoWatchRegistration(const CanonicalValue& value) {
-  RequireExactObjectSize(value, 4U, "I/O watch registration");
+  RequireExactObjectSize(value, 3U, "I/O watch registration");
   const auto& scope = Member(value, "scope");
-  RequireExactObjectSize(scope, 3U, "I/O watch scope");
+  RequireExactObjectSize(scope, 2U, "I/O watch scope");
   const auto& node = Member(scope, "node");
   RequireExactObjectSize(node, 2U, "I/O watch node scope");
   core::ProgramNodeExecutionScopeDTO node_scope{
       core::ProgramNodeInstanceId(Text(node, "node_instance_id")),
-      Text(node, "node_attempt_id")};
+      core::NodeAttemptNumber(Counter(node, "node_attempt_id", 1U))};
   Require(core::valid_program_node_execution_scope(node_scope),
           "I/O watch node scope is invalid");
-  return {core::RequestOwnerEpoch(Text(value, "owner_epoch")),
-          IoCounter(value, "catalog_generation", 1U),
+  return {IoCounter(value, "catalog_generation", 1U),
           IoCounter(value, "registration_id", 1U),
-          {core::RequestOwnerEpoch(Text(scope, "program_runner_owner_epoch")),
-           core::ProgramRunId(Text(scope, "program_run_id")),
+          {core::ProgramRunNumber(Counter(scope, "program_run_id", 1U)),
            std::move(node_scope)}};
 }
 
 core::ProgramIoWatchScopeReleaseRequestDTO
 DecodeIoWatchScopeRelease(const CanonicalValue &request) {
-  RequireExactObjectSize(request, 8U, "I/O watch scope release");
+  RequireExactObjectSize(request, 6U, "I/O watch scope release");
   Require(Text(request, "schema_version") ==
-              "manyforge.io_watch_scope_release.v1",
+              "manyforge.io_watch_scope_release.v2",
           "I/O watch scope release schema is unsupported");
   core::ProgramNodeExecutionScopeDTO node{
       core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
-      Text(request, "node_attempt_id")};
+      core::NodeAttemptNumber(Counter(request, "node_attempt_id", 1U))};
   Require(core::valid_program_node_execution_scope(node),
           "I/O watch node scope is invalid");
-  return {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
-          core::ProgramBindingId(Text(request, "program_binding_id")),
-          core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+  return {core::ProgramBindingId(Text(request, "program_binding_id")),
           core::CellAdmissionClaimGeneration(
               Counter(request, "claim_generation", 1U)),
-          core::ProgramRunId(Text(request, "program_run_id")),
+          core::ProgramRunNumber(Counter(request, "program_run_id", 1U)),
           std::move(node)};
 }
 
 core::IoProgramBlackboardPublicationDTO
 DecodeBlackboardPublication(const CanonicalValue &request) {
-  RequireExactObjectSize(request, 12U, "Program BB publication");
+  RequireExactObjectSize(request, 10U, "Program BB publication");
   Require(Text(request, "schema_version") ==
-              "manyforge.program_bbkey_publication.v1",
+              "manyforge.program_bbkey_publication.v2",
           "Program BB publication schema is unsupported");
   const auto &claim = Member(request, "claim_generation");
   const auto &run = Member(request, "program_run_id");
   Require(claim.is_null() == run.is_null(),
           "Program BB Run and claim must both be present or both null");
   std::optional<core::CellAdmissionClaimGeneration> claim_generation;
-  std::optional<core::ProgramRunId> program_run_id;
+  std::optional<core::ProgramRunNumber> program_run_id;
   if (!claim.is_null()) {
     claim_generation = core::CellAdmissionClaimGeneration(
         Counter(request, "claim_generation", 1U));
-    program_run_id = core::ProgramRunId(Text(request, "program_run_id"));
+    program_run_id = core::ProgramRunNumber(Counter(request, "program_run_id", 1U));
   }
   const auto kind = Text(request, "kind");
   Require(kind == "baseline" || kind == "update",
@@ -1241,9 +1296,7 @@ DecodeBlackboardPublication(const CanonicalValue &request) {
     values.push_back({std::move(name), value_kind, std::move(value)});
   }
   return {
-      {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
-       core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
-       Counter(request, "cycle_generation", 1U), std::move(claim_generation),
+      {Counter(request, "cycle_generation", 1U), std::move(claim_generation),
        std::move(program_run_id),
        core::ProgramBindingId(Text(request, "program_binding_id")),
        core::ActiveBundlePublicationGeneration(
@@ -1321,8 +1374,8 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
                 !attribution.principal_id.has_value(), "Run Mock simulation requires internal owner attribution");
     const auto& request = Member(root, "request");
-    RequireExactObjectSize(request, 9U, "Run Mock simulation clock request");
-    Require(Text(request, "schema_version") == "manyforge.mock_io_run_pause.v1",
+    RequireExactObjectSize(request, 7U, "Run Mock simulation clock request");
+    Require(Text(request, "schema_version") == "manyforge.mock_io_run_pause.v2",
             "Run Mock simulation clock schema is unsupported");
     std::vector<core::ProgramNodeInstanceId> held_nodes;
     for (const auto& value : Array(request, "held_node_instance_ids")) {
@@ -1334,10 +1387,9 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     }
     Command decoded{CommandKind::kSetMockIoRunPaused};
     decoded.mock_run_simulation_pause = core::ProgramRunMockSimulationPauseRequestDTO{
-        {core::RequestOwnerEpoch(Text(request, "owner_epoch")), core::ProgramBindingId(Text(request, "program_binding_id")),
-         core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        {core::ProgramBindingId(Text(request, "program_binding_id")),
          core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
-         core::ProgramRunId(Text(request, "program_run_id"))},
+         core::ProgramRunNumber(Counter(request, "program_run_id", 1U))},
         IoCounter(request, "run_revision", 1U), Boolean(request, "paused"), std::move(held_nodes)};
     return decoded;
   }
@@ -1349,17 +1401,16 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(), "Node Mock simulation requires internal owner attribution");
     const auto& request = Member(root, "request");
     const bool ending = command == "end_mock_io_node_simulation";
-    RequireExactObjectSize(request, ending ? 9U : 10U, "Node Mock simulation request");
-    Require(Text(request, "schema_version") == (ending ? "manyforge.mock_io_node_end.v1" : "manyforge.mock_io_node_start.v2"),
+    RequireExactObjectSize(request, ending ? 7U : 8U, "Node Mock simulation request");
+    Require(Text(request, "schema_version") == (ending ? "manyforge.mock_io_node_end.v2" : "manyforge.mock_io_node_start.v3"),
             "Node Mock simulation schema is unsupported");
     core::ProgramNodeExecutionScopeDTO node{core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
-                                           Text(request, "node_attempt_id")};
+                                           core::NodeAttemptNumber(Counter(request, "node_attempt_id", 1U))};
     Require(core::valid_program_node_execution_scope(node), "Node Mock simulation scope is invalid");
     core::ProgramNodeMockSimulationScopeDTO scope{
-        core::RequestOwnerEpoch(Text(request, "owner_epoch")), core::ProgramBindingId(Text(request, "program_binding_id")),
-        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
+        core::ProgramBindingId(Text(request, "program_binding_id")),
         core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
-        core::ProgramRunId(Text(request, "program_run_id")), std::move(node),
+        core::ProgramRunNumber(Counter(request, "program_run_id", 1U)), std::move(node),
         IoCounter(request, "node_start_index", 1U)};
     Command decoded{ending ? CommandKind::kEndMockIoNodeSimulation : CommandKind::kStartMockIoNodeSimulation};
     if (ending) decoded.mock_node_simulation_end = std::move(scope);
@@ -1377,12 +1428,11 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(),
             "Mock input commands require internal owner attribution");
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 6U, "Mock input request");
-    Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v2",
+    RequireExactObjectSize(request, 5U, "Mock input request");
+    Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v3",
             "Mock input request schema is unsupported");
     // Validate before nested aggregate construction so refusal unwinds only
     // independent owning locals, preserving the original field order.
-    auto owner = core::RequestOwnerEpoch(Text(request, "owner_epoch"));
     auto binding = core::ProgramBindingId(Text(request, "program_binding_id"));
     const auto &signal = Member(request, "signal");
     RequireExactObjectSize(signal, 2U, "Mock input signal");
@@ -1394,7 +1444,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     const auto value = Boolean(request, "value");
     Command decoded{CommandKind::kSetMockIoInput};
     decoded.mock_io_input_set = MockIoInputSetRequest{
-        {std::move(owner), std::move(binding), std::nullopt, {}, {}, {},
+        {std::move(binding), std::nullopt, {}, {}, {},
          std::move(reference)},
         std::move(source_epoch), value};
     return decoded;
@@ -1454,24 +1504,22 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       return decoded;
     }
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 10U, "I/O watch request");
-    Require(Text(request, "schema_version") == "manyforge.io_watch_request.v2",
+    RequireExactObjectSize(request, 8U, "I/O watch request");
+    Require(Text(request, "schema_version") == "manyforge.io_watch_request.v3",
             "I/O watch request schema is unsupported");
     const auto& condition = Member(request, "condition");
     RequireExactObjectSize(condition, 2U, "I/O watch condition");
     RequireExactObjectSize(Member(request, "signal"), 2U, "I/O watch signal");
     core::ProgramNodeExecutionScopeDTO node{
         core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
-        Text(request, "node_attempt_id")};
+        core::NodeAttemptNumber(Counter(request, "node_attempt_id", 1U))};
     Require(core::valid_program_node_execution_scope(node), "I/O watch node scope is invalid");
     Command decoded{CommandKind::kRegisterIoWatch};
     decoded.io_watch_condition_unsupported = Text(condition, "kind") != "level";
     decoded.io_watch_request = core::ProgramIoWatchRequestDTO{
-        core::RequestOwnerEpoch(Text(request, "owner_epoch")),
         core::ProgramBindingId(Text(request, "program_binding_id")),
-        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
         core::CellAdmissionClaimGeneration(Counter(request, "claim_generation", 1U)),
-        core::ProgramRunId(Text(request, "program_run_id")), std::move(node),
+        core::ProgramRunNumber(Counter(request, "program_run_id", 1U)), std::move(node),
         {core::ControllableComponentId(Text(Member(request, "signal"), "component_id")),
          Text(Member(request, "signal"), "signal_name")},
         Boolean(condition, "expected_value")};
@@ -1486,28 +1534,28 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                            "Program selection command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
-    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
-                attribution.assurance ==
-                    core::RequestAssuranceDTO::kUnverified &&
-                !attribution.principal_id.has_value(),
+    // A Stop comes from any caller and records its principal (K-10); Run
+    // and Resume are the Program owner's.
+    Require(!(start || release) ||
+                (attribution.transport == core::RequestTransportDTO::kInternal &&
+                 attribution.assurance ==
+                     core::RequestAssuranceDTO::kUnverified &&
+                 !attribution.principal_id.has_value()),
             "Program selection requires internal owner attribution");
     const auto &request = Member(root, "request");
     const bool node_release = request.find_object_member("node_instance_id") != nullptr;
     Require(!node_release || release,
             "exact node selection is exclusive to individual hold release");
-    RequireExactObjectSize(request, node_release ? 7U : 6U, "Program selection request");
+    RequireExactObjectSize(request, node_release ? 5U : 4U, "Program selection request");
     Require(Text(request, "schema_version") ==
-                "manyforge.program_execution_selection.v2",
+                "manyforge.program_execution_selection.v3",
             "Program selection request schema is unsupported");
     Command decoded{start   ? CommandKind::kStartProgramSelection
                     : release ? CommandKind::kReleaseProgramSelection
                               : CommandKind::kStopProgramSelection};
     decoded.program_selection = core::ProgramExecutionSelectionRequestDTO{
         DecodeRequestContext(Member(request, "request_context")),
-        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
-        core::CellAdmissionClaimGeneration(
-            Counter(request, "claim_generation", 1U)),
-        core::ProgramRunId(Text(request, "program_run_id")),
+        core::ProgramRunNumber(Counter(request, "program_run_id", 1U)),
         TextArray(request, "group_ids", core::kMaxProgramExecutionGroups),
         attribution};
     if (node_release) {
@@ -1517,8 +1565,8 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
           core::ProgramNodeInstanceId(Text(request, "node_instance_id"));
     }
     if (start || release)
-      decoded.expected_selection_revision =
-          Counter(root, "expected_selection_revision", 0U);
+      decoded.expected_hold_revision =
+          Counter(root, "expected_hold_revision", 0U);
     return decoded;
   }
   if (command == "check_program_node_motion_attention") {
@@ -1531,17 +1579,14 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(),
             "Program node check requires internal owner attribution");
     const auto &request = Member(root, "request");
-    RequireExactObjectSize(request, 6U, "Program node check request");
+    RequireExactObjectSize(request, 4U, "Program node check request");
     Require(Text(request, "schema_version") ==
-                "manyforge.program_node_motion_attention_check.v1",
+                "manyforge.program_node_motion_attention_check.v2",
             "Program node check request schema is unsupported");
     Command decoded{CommandKind::kCheckProgramNodeMotionAttention};
     decoded.program_node_attention = core::ProgramNodeMotionAttentionCheckDTO{
         DecodeRequestContext(Member(request, "request_context")),
-        core::RequestOwnerEpoch(Text(request, "program_runner_owner_epoch")),
-        core::CellAdmissionClaimGeneration(
-            Counter(request, "claim_generation", 1U)),
-        core::ProgramRunId(Text(request, "program_run_id")),
+        core::ProgramRunNumber(Counter(request, "program_run_id", 1U)),
         core::ProgramNodeInstanceId(Text(request, "node_instance_id")),
         attribution};
     return decoded;
@@ -1558,23 +1603,21 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
   if (command == "read_program_execution_scope") {
     RequireExactObjectSize(root, 3U, "Program execution scope read");
     Command decoded{CommandKind::kReadProgramExecutionScope};
-    decoded.program_run_id = core::ProgramRunId(Text(root, "program_run_id"));
+    decoded.program_run_id = core::ProgramRunNumber(Counter(root, "program_run_id", 1U));
     return decoded;
   }
   if (command == "register_program_run_capture") {
     RequireExactObjectSize(root, 3U, "Program capture registration command");
     const auto &capture = Member(root, "capture");
-    RequireExactObjectSize(capture, 10U, "Program capture registration");
+    RequireExactObjectSize(capture, 8U, "Program capture registration");
     Require(Text(capture, "schema_version") ==
-                "manyforge.program_run_execution_capture.v1",
+                "manyforge.program_run_execution_capture.v2",
             "Program capture registration schema is unsupported");
     Command decoded{CommandKind::kRegisterProgramCapture};
     decoded.program_capture = core::ProgramRunExecutionCaptureDTO{
-        core::RequestOwnerEpoch(Text(capture, "request_owner_epoch")),
-        core::RequestOwnerEpoch(Text(capture, "program_runner_owner_epoch")),
         core::CellAdmissionClaimGeneration(
             Counter(capture, "claim_generation", 1U)),
-        core::ProgramRunId(Text(capture, "program_run_id")),
+        core::ProgramRunNumber(Counter(capture, "program_run_id", 1U)),
         core::ProgramId(Text(capture, "program_id")),
         core::ProgramRevision(Text(capture, "program_revision")),
         core::ProgramBindingId(Text(capture, "program_binding_id")),
@@ -1598,28 +1641,26 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
   if (command == "reset_robot_position") {
     RequireExactObjectSize(root, 4U, "Reset position command");
     const auto &authorization = Member(root, "authorization");
-    RequireExactObjectSize(authorization, 9U, "Reset position authorization");
-    const auto run = OptionalText(authorization, "program_run_id");
+    RequireExactObjectSize(authorization, 8U, "Reset position authorization");
     const auto cycle_claim = OptionalCounter(authorization, "cycle_claim_generation", 1U);
     const auto reference = OptionalText(authorization, "terminal_or_settlement_reference");
     const auto reset_claim = OptionalCounter(authorization, "reset_claim_generation", 1U);
     core::ProgramResetPositionAuthorizationDTO grant{
-        core::RequestOwnerEpoch(Text(authorization, "program_runner_owner_epoch")),
         Counter(authorization, "cycle_generation", 1U),
-        core::RequestOwnerEpoch(Text(authorization, "request_owner_epoch")),
-        core::RequestId(Text(authorization, "request_id")),
+        RequestKeyMember(authorization, "request_key"),
         core::ContentDigest(Text(authorization, "request_payload_digest")),
-        run ? std::optional{core::ProgramRunId(*run)} : std::nullopt,
+        OptionalRun(authorization),
         cycle_claim ? std::optional{core::CellAdmissionClaimGeneration(*cycle_claim)} : std::nullopt,
         reference ? std::optional{core::ContentDigest(*reference)} : std::nullopt,
-        reset_claim ? std::optional{core::CellAdmissionClaimGeneration(*reset_claim)} : std::nullopt};
+        reset_claim ? std::optional{core::CellAdmissionClaimGeneration(*reset_claim)} : std::nullopt,
+        ProgramCycleStatusMember(authorization, "program_cycle_status")};
     Require(core::ValidateProgramResetPositionAuthorization(grant).ok(),
             "Reset position authorization has an invalid shape");
     const auto &expected = Member(root, "expected_deployment_identity");
     RequireExactObjectSize(expected, 4U, "Reset position expected Deployment");
     Command decoded{CommandKind::kResetRobotPosition};
     decoded.reset_robot_position = ProgramResetPositionRequest{
-        std::move(grant), core::RequestOwnerEpoch(Text(expected, "owner_epoch")),
+        std::move(grant), ApplicationStartIdMember(expected, "application_start_id"),
         core::ActiveBundlePublicationGeneration(Counter(expected, "active_publication_generation", 1U)),
         core::RetainedBundleId(Text(expected, "retained_bundle_id")),
         core::GraphRevision(Text(expected, "graph_revision"))};
@@ -1662,16 +1703,15 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     const auto &query = Member(root, "query");
     const auto kind = Text(query, "kind");
     if (kind == "frame_transform") {
-      RequireExactObjectSize(query, 7U, "frame transform query");
+      RequireExactObjectSize(query, 6U, "frame transform query");
       Require(Text(query, "schema_version") ==
-                  "manyforge.target_observation_query.v2",
+                  "manyforge.target_observation_query.v3",
               "target observation query schema is unsupported");
       const auto &pose = Member(query, "pose");
       const auto &source = Member(query, "source_frame");
       const auto &target = Member(query, "target_frame");
       Command decoded{CommandKind::kQueryTarget};
       decoded.target_query = TargetObservationQuery{
-          core::RequestOwnerEpoch(Text(query, "owner_epoch")),
           core::ProgramBindingId(Text(query, "program_binding_id")),
           std::nullopt,
           std::nullopt,
@@ -1682,14 +1722,13 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       return decoded;
     }
     if (kind == "io_signal") {
-      RequireExactObjectSize(query, 5U, "I/O signal query");
-      Require(Text(query, "schema_version") == "manyforge.target_observation_query.v2",
+      RequireExactObjectSize(query, 4U, "I/O signal query");
+      Require(Text(query, "schema_version") == "manyforge.target_observation_query.v3",
               "target observation query schema is unsupported");
       const auto &signal = Member(query, "signal");
       RequireExactObjectSize(signal, 2U, "I/O signal reference");
       Command decoded{CommandKind::kQueryTarget};
       decoded.target_query = TargetObservationQuery{
-          core::RequestOwnerEpoch(Text(query, "owner_epoch")),
           core::ProgramBindingId(Text(query, "program_binding_id")),
           std::nullopt, {}, {}, {},
           core::ProgramSignalReferenceDTO{
@@ -1700,13 +1739,13 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     Require(kind == "frame_pose" || kind == "gripper_status",
             "target observation kind is unsupported");
     if (kind == "frame_pose") {
-      Require(query.as_object().size() == 6U || query.as_object().size() == 7U,
+      Require(query.as_object().size() == 5U || query.as_object().size() == 6U,
               "target observation query has an unexpected field count");
     } else {
-      RequireExactObjectSize(query, 5U, "target observation query");
+      RequireExactObjectSize(query, 4U, "target observation query");
     }
     Require(Text(query, "schema_version") ==
-                "manyforge.target_observation_query.v2",
+                "manyforge.target_observation_query.v3",
             "target observation query schema is unsupported");
     const auto relative_frame =
         std::find_if(query.as_object().begin(), query.as_object().end(),
@@ -1723,7 +1762,6 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
           core::FrameRoleId(Text(frame, "frame_id"))};
     };
     decoded.target_query = TargetObservationQuery{
-        core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
         core::ProgramTargetReferenceDTO{
             core::ControllableComponentId(Text(target, "component_id")),
@@ -1736,17 +1774,16 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
   if (command == "query_operation") {
     RequireExactObjectSize(root, 3U, "Program operation query command");
     const auto &query = Member(root, "query");
-    RequireExactObjectSize(query, 5U, "Program operation query");
+    RequireExactObjectSize(query, 4U, "Program operation query");
     Require(Text(query, "schema_version") ==
-                "manyforge.program_operation_query.v2",
+                "manyforge.program_operation_query.v3",
             "Program operation query schema is unsupported");
     Command decoded{CommandKind::kQueryOperation};
     const auto &target = Member(query, "target");
     RequireExactObjectSize(target, 2U, "operation query target");
     decoded.operation_query = ProgramOperationQuery{
-        core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
-        core::ProgramRunId(Text(query, "program_run_id")),
+        core::ProgramRunNumber(Counter(query, "program_run_id", 1U)),
         {core::ControllableComponentId(Text(target, "component_id")),
          core::CommandTargetId(Text(target, "command_target_id"))}};
     return decoded;
@@ -1761,21 +1798,23 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     Command decoded{CommandKind::kObservation};
     if (root.as_object().size() == 5U) {
       decoded.observation_cursor_supplied = true;
-      const auto owner_epoch = OptionalText(root, "after_owner_epoch");
+      const auto start = OptionalText(root, "after_application_start_id");
       const auto source_epoch = OptionalText(root, "after_source_epoch");
       const auto source_sequence =
           OptionalCounter(root, "after_source_sequence", 0U);
-      const bool initial = !owner_epoch.has_value() &&
+      const bool initial = !start.has_value() &&
                            !source_epoch.has_value() &&
                            !source_sequence.has_value();
-      const bool complete = owner_epoch.has_value() &&
+      const bool complete = start.has_value() &&
                             source_epoch.has_value() &&
                             source_sequence.has_value();
       Require(initial || complete,
               "observation cursor must be wholly null or complete");
       if (complete) {
-        decoded.observation_after_owner_epoch =
-            core::RequestOwnerEpoch(*owner_epoch);
+        decoded.observation_after_application_start_id =
+            core::ParseApplicationStartId(*start);
+        Require(decoded.observation_after_application_start_id.has_value(),
+                "observation cursor start identity is invalid");
         decoded.observation_after_source_epoch = *source_epoch;
         decoded.observation_after_source_sequence = *source_sequence;
       }
@@ -1783,13 +1822,11 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     return decoded;
   }
   if (command == "events") {
-    RequireExactObjectSize(root, 5U, "events command");
+    RequireExactObjectSize(root, 4U, "events command");
     const auto limit = Counter(root, "limit", 1U);
     Require(limit <= kMaximumEventPage,
             "events command exceeds its page bound");
     Command decoded{CommandKind::kEvents};
-    decoded.event_owner_epoch =
-        core::RequestOwnerEpoch(Text(root, "owner_epoch"));
     decoded.after_sequence = Counter(root, "after_sequence", 0U);
     decoded.event_limit = static_cast<std::size_t>(limit);
     return decoded;
@@ -1797,7 +1834,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
   if (command == "read") {
     RequireExactObjectSize(root, 3U, "read command");
     Command decoded{CommandKind::kRead};
-    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    decoded.operation_id = core::OperationNumber(Counter(root, "operation_id", 1U));
     return decoded;
   }
   if (command == "read_stop") {
@@ -1810,19 +1847,19 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(),
             "Stop-status read requires internal unverified attribution");
     Command decoded{CommandKind::kReadStop};
-    decoded.stop_id = core::StopId(Text(root, "stop_id"));
+    decoded.stop_event_id = core::StopEventId(Counter(root, "event_id", 1U));
     return decoded;
   }
   if (command == "get_operation_recovery") {
     RequireExactObjectSize(root, 3U, "operation recovery query command");
     Command decoded{CommandKind::kGetOperationRecovery};
-    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    decoded.operation_id = core::OperationNumber(Counter(root, "operation_id", 1U));
     return decoded;
   }
   if (command == "apply_operation_recovery") {
     RequireExactObjectSize(root, 5U, "operation recovery action command");
     Command decoded{CommandKind::kApplyOperationRecovery};
-    decoded.operation_id = core::OperationId(Text(root, "operation_id"));
+    decoded.operation_id = core::OperationNumber(Counter(root, "operation_id", 1U));
     decoded.expected_operation_revision = core::OperationRevision(
         Counter(root, "expected_operation_revision", 1U));
     decoded.operation_recovery =
@@ -1879,6 +1916,19 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         DecodePickPlanningIntent(Member(root, "intent"), attribution);
     return decoded;
   }
+  if (command == "read_planning_job" || command == "cancel_planning_job" ||
+      command == "release_planning_job") {
+    RequireExactObjectSize(root, 3U, "planning job command");
+    Command decoded{command == "read_planning_job" ? CommandKind::kReadPlanningJob
+                    : command == "cancel_planning_job"
+                        ? CommandKind::kCancelPlanningJob
+                        : CommandKind::kReleasePlanningJob};
+    auto job_id = Text(root, "job_id");
+    Require(job_id.size() <= core::kMaxPickPlaceSequenceIdBytes,
+            "planning job id exceeds its bound");
+    decoded.planning_job_id = std::move(job_id);
+    return decoded;
+  }
   if (command == "plan_place") {
     RequireExactObjectSize(root, 4U, "place planning command");
     const auto attribution =
@@ -1906,46 +1956,53 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
                 !attribution.principal_id.has_value(),
             "Program-run Stop requires internal unverified attribution");
     Command decoded{CommandKind::kStopProgramRun};
-    decoded.stop =
-        DecodeProgramRunStopIntent(Member(root, "request"), attribution);
+    decoded.program_run_end =
+        DecodeProgramRunEndIntent(Member(root, "request"), attribution);
     return decoded;
   }
-  if (command == "release_program_run_stop_fence") {
-    RequireExactObjectSize(root, 6U, "Program-run Stop fence release command");
+  if (command == "release_halt") {
+    RequireExactObjectSize(root, 5U, "Halt release command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
     Require(attribution.transport == core::RequestTransportDTO::kInternal &&
                 attribution.assurance ==
                     core::RequestAssuranceDTO::kUnverified &&
                 !attribution.principal_id.has_value(),
-            "Program-run Stop fence release requires internal attribution");
-    Command decoded{CommandKind::kReleaseProgramRunStopFence};
-    decoded.program_run_id = core::ProgramRunId(Text(root, "program_run_id"));
-    decoded.stop_id = core::StopId(Text(root, "stop_id"));
-    decoded.stop_generation =
-        core::StopGeneration(Counter(root, "stop_generation", 1U));
+            "Halt release requires internal attribution");
+    Command decoded{CommandKind::kReleaseHalt};
+    decoded.program_run_id = core::ProgramRunNumber(Counter(root, "program_run_id", 1U));
+    decoded.expected_hold_revision = Counter(root, "expected_hold_revision", 0U);
     return decoded;
   }
-  if (command == "full_stop") {
-    RequireExactObjectSize(root, 4U, "Full Stop command");
+  if (command == "stop_all" || command == "halt" || command == "cell_stop") {
+    RequireExactObjectSize(root, 4U, "cell-wide Stop command");
     const auto attribution =
         DecodeRequestAttribution(Member(root, "attribution"));
-    Command decoded{CommandKind::kFullStop};
-    decoded.full_stop =
+    // The cell Stop is the Program node's own primitive, sent by the runner.
+    Require(command != "cell_stop" ||
+                (attribution.transport == core::RequestTransportDTO::kInternal &&
+                 attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                 !attribution.principal_id.has_value()),
+            "cell Stop requires internal unverified attribution");
+    Command decoded{command == "stop_all" ? CommandKind::kStopAll
+                    : command == "halt"   ? CommandKind::kHalt
+                                          : CommandKind::kCellStop};
+    decoded.cell_wide_stop =
         DecodeFullStopIntent(Member(root, "request"), attribution);
     return decoded;
   }
-  if (command == "malformed_stop") {
-    RequireExactObjectSize(root, 6U, "recognized malformed Stop command");
+  if (command == "recognized_stop") {
+    RequireExactObjectSize(root, 7U, "recognized Stop command");
     const auto route = Text(root, "recognized_route");
     Require(route == "/api/execution/stops" ||
-                route == "/api/execution/full-stop",
-            "recognized malformed Stop command names an unknown route");
-    Command decoded{CommandKind::kMalformedStop};
-    decoded.malformed_stop = MalformedStopCommand{
-        core::RequestId(Text(root, "request_id")),
+                route == "/api/execution/stop-all" ||
+                route == "/api/execution/halt",
+            "recognized Stop command names an unknown route");
+    Command decoded{CommandKind::kRecognizedStop};
+    decoded.recognized_stop = RecognizedStopCommand{
+        RequestKeyMember(root, "request_key"),
         DecodeRequestAttribution(Member(root, "attribution")), route,
-        Text(root, "reason")};
+        Text(root, "reason"), OptionalText(root, "source_label")};
     return decoded;
   }
   if (command == "read_component_model") {
@@ -2126,9 +2183,6 @@ DecodeRequestReplayStatus(const CanonicalValue &root,
   }
   if (value == "request_ledger_full") {
     return core::RequestReplayStatusDTO::kRequestLedgerFull;
-  }
-  if (value == "stale_request_owner_epoch") {
-    return core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch;
   }
   Fail("Manager scene replay status is unsupported");
 }

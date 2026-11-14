@@ -20,12 +20,13 @@ import {
   positiveIntegerAt,
   stringAt,
 } from './shared';
+import { isApplicationStartId } from '../applicationIdentity';
 
 function parseHistorianEvent(value: unknown, path: string): HistorianEvent {
   const record = objectAt(value, path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.historian_event.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.historian_event.v2');
+  if (schemaVersion !== 'manyforge.historian_event.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event.v3');
   }
   return {
     schemaVersion,
@@ -68,8 +69,8 @@ function parseHistorianEventSummary(
     'wall_clock_regressed',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.historian_event_summary.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.historian_event_summary.v2');
+  if (schemaVersion !== 'manyforge.historian_event_summary.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.historian_event_summary.v3');
   }
   return {
     schemaVersion,
@@ -83,8 +84,10 @@ function parseHistorianEventSummary(
     ),
     occurredAtWall: stringAt(record.occurred_at_wall, `${path}.occurred_at_wall`),
     message: stringAt(record.message, `${path}.message`),
-    programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
-    operationId: nullableStringAt(record.operation_id, `${path}.operation_id`),
+    programRunId: record.program_run_id === null
+      ? null : positiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
+    operationId: record.operation_id === null
+      ? null : positiveIntegerAt(record.operation_id, `${path}.operation_id`),
     conditionId: nullableStringAt(record.condition_id, `${path}.condition_id`),
     conditionSeverity: stringAt(record.condition_severity, `${path}.condition_severity`),
     occurredAtUtcNs: record.occurred_at_utc_ns === null ? null : nonnegativeInt64TextAt(record.occurred_at_utc_ns, `${path}.occurred_at_utc_ns`),
@@ -97,9 +100,9 @@ function parseHistorianRetention(value: unknown): HistorianRetention | null {
   if (value === null) return null;
   const path = 'history.retention';
   const record = objectAt(value, path);
-  exactKeysAt(record, ['schema_version', 'partitions', 'captures', 'partition_row_limit', 'partition_record_byte_limit', 'database_page_byte_limit', 'duration_guaranteed', 'prior_pruning_known'], path);
-  if (record.schema_version !== 'manyforge.historian_retention.v2' || record.duration_guaranteed !== false) {
-    return fail(path, 'the bounded local retention v2 profile');
+  exactKeysAt(record, ['schema_version', 'partitions', 'captures', 'partition_row_limit', 'partition_record_byte_limit', 'database_page_byte_limit', 'duration_guaranteed', 'prior_pruning_known', 'older_history_files'], path);
+  if (record.schema_version !== 'manyforge.historian_retention.v3' || record.duration_guaranteed !== false) {
+    return fail(path, 'the bounded local retention v3 profile');
   }
   const partitions = arrayAt(record.partitions, `${path}.partitions`);
   if (partitions.length !== 2) return fail(path, 'routine and important retention partitions');
@@ -126,6 +129,15 @@ function parseHistorianRetention(value: unknown): HistorianRetention | null {
     databasePageByteLimit: nonnegativeInt64TextAt(record.database_page_byte_limit, `${path}.database_page_byte_limit`),
     durationGuaranteed: false,
     priorPruningKnown: booleanAt(record.prior_pruning_known, `${path}.prior_pruning_known`),
+    olderHistoryFiles: arrayAt(record.older_history_files, `${path}.older_history_files`).map((value, index) => {
+      const filePath = `${path}.older_history_files[${index}]`;
+      const file = objectAt(value, filePath);
+      exactKeysAt(file, ['file_name', 'format'], filePath);
+      return {
+        fileName: stringAt(file.file_name, `${filePath}.file_name`),
+        format: file.format === null ? null : nonnegativeInt64TextAt(file.format, `${filePath}.format`),
+      };
+    }),
     partitions: partitions.map((value, index) => {
       const partPath = `${path}.partitions[${index}]`;
       const part = objectAt(value, partPath);
@@ -268,7 +280,8 @@ export function parseHistorianDiscovery(value: unknown): HistorianDiscovery {
   exactKeysAt(record, ['schema_version', 'kind', 'values', 'truncated', 'next_after'], 'history.discovery');
   if (record.schema_version !== 'manyforge.historian_discovery.v1') return fail('history.discovery.schema_version', 'manyforge.historian_discovery.v1');
   const kind = stringAt(record.kind, 'history.discovery.kind');
-  if (kind !== 'program_run_id' && kind !== 'component' && kind !== 'channel' && kind !== 'event_type') return fail('history.discovery.kind', 'a declared discovery kind');
+  if (kind !== 'program_run_id' && kind !== 'component' && kind !== 'channel' && kind !== 'event_type'
+    && kind !== 'application_start_id') return fail('history.discovery.kind', 'a declared discovery kind');
   const values = arrayAt(record.values, 'history.discovery.values').map((value) => stringAt(value, 'history.discovery.value'));
   if (values.length > 32 || new Set(values).size !== values.length || values.some((value) => !value || new TextEncoder().encode(value).length > 1024 || value !== value.normalize('NFC'))) return fail('history.discovery.values', 'at most 32 unique nonempty NFC values of at most 1024 bytes');
   const truncated = booleanAt(record.truncated, 'history.discovery.truncated');
@@ -288,8 +301,8 @@ export function parseHistorianPage(value: unknown): HistorianPage {
     'retention',
   ], 'history');
   const schemaVersion = stringAt(record.schema_version, 'history.schema_version');
-  if (schemaVersion !== 'manyforge.historian_summary_page.v2') {
-    return fail('history.schema_version', 'manyforge.historian_summary_page.v2');
+  if (schemaVersion !== 'manyforge.historian_summary_page.v3') {
+    return fail('history.schema_version', 'manyforge.historian_summary_page.v3');
   }
   const window = objectAt(record.time_window, 'history.time_window');
   exactKeysAt(window, ['start_utc_ns', 'end_utc_ns'], 'history.time_window');
@@ -299,8 +312,16 @@ export function parseHistorianPage(value: unknown): HistorianPage {
     schemaVersion,
     events: events.map((value, index) => {
       const stored = objectAt(value, `history.events[${index}]`);
-      exactKeysAt(stored, ['event', 'sequence'], `history.events[${index}]`);
+      exactKeysAt(stored, ['application_start_id', 'event', 'sequence'], `history.events[${index}]`);
+      const applicationStartId = stringAt(
+        stored.application_start_id,
+        `history.events[${index}].application_start_id`,
+      );
+      if (!isApplicationStartId(applicationStartId)) {
+        return fail(`history.events[${index}].application_start_id`, '16 lowercase hexadecimal characters');
+      }
       return {
+        applicationStartId,
         sequence: positiveIntegerAt(
           stored.sequence,
           `history.events[${index}].sequence`,
@@ -344,8 +365,8 @@ export function parseHistorianDetail(value: unknown): HistorianDetail {
   const record = objectAt(value, 'historyDetail');
   exactKeysAt(record, ['event', 'schema_version', 'sections', 'sequence'], 'historyDetail');
   const schemaVersion = stringAt(record.schema_version, 'historyDetail.schema_version');
-  if (schemaVersion !== 'manyforge.historian_detail.v2') {
-    return fail('historyDetail.schema_version', 'manyforge.historian_detail.v2');
+  if (schemaVersion !== 'manyforge.historian_detail.v3') {
+    return fail('historyDetail.schema_version', 'manyforge.historian_detail.v3');
   }
   const sections = objectAt(record.sections, 'historyDetail.sections');
   exactKeysAt(

@@ -10,21 +10,26 @@ from manyforge_behavior.kernel_client import (
     KernelClient,
     KernelClientResponseError,
 )
+from manyforge_behavior.request_keys import KeyClass, request_key
 from manyforge_behavior.runner import OrchestratorRunner
+
+_KEY = request_key(KeyClass.HTTP_CLIENT, 1, 1)
+_GRIPPER_KEY = request_key(KeyClass.HTTP_CLIENT, 1, 2)
+_STOP_KEY = request_key(KeyClass.HTTP_CLIENT, 1, 3)
 
 
 class RecordingTransport:
     def __init__(self) -> None:
         self.submitted: Mapping[str, Any] | None = None
-        self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
+        self.controls: list[tuple[str, int, Mapping[str, Any]]] = []
 
     def identity(self) -> dict[str, Any]:
-        # execution_identity.v2: runtime identity only.
+        # execution_identity.v3: runtime identity only.
         return {
             "ok": True,
             "identity": {
-                "schema_version": "manyforge.execution_identity.v2",
-                "owner_epoch": "owner-epoch-7",
+                "schema_version": "manyforge.execution_identity.v3",
+                "application_start_id": "3f9a00000000abcd",
                 "cell_id": "cell-1",
                 "active_publication_generation": 1,
                 "control_management_mode": "component_lifecycle",
@@ -37,17 +42,17 @@ class RecordingTransport:
         self.submitted = body
         return {
             "ok": True,
-            "accepted": {"operation_id": "operation-1"},
+            "accepted": {"operation_id": 1},
         }
 
-    def read(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: int) -> dict[str, Any]:
         return {
             "ok": True,
             "operation": {"operation_id": operation_id, "state": "completed"},
         }
 
     def _control(
-        self, kind: str, operation_id: str, body: Mapping[str, Any]
+        self, kind: str, operation_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         self.controls.append((kind, operation_id, body))
         return {
@@ -55,7 +60,7 @@ class RecordingTransport:
             "accepted": {
                 "operation_id": operation_id,
                 "operations": [operation_id],
-                "stop_id": "stop-1",
+                "event_id": 1,
             },
         }
 
@@ -124,26 +129,29 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
 
     accepted = runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},
-        request_id="request-1",
-        program_run_id="run-1",
+        request_key=_KEY,
+        program_run_id=1,
         target={"component_id": "lite6_arm", "command_target_id": "arm"},
         node_instance_id="root/move[0]",
-        node_attempt_id="run-1/move[0]/attempt-1",
+        node_attempt_id=1,
         move_id="move-1",
         joint_names=("joint2", "joint1"),
         positions_rad=(0.2, -0.1),
     )
 
-    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert accepted["accepted"]["operation_id"] == 1
     assert transport.submitted is not None
     request = transport.submitted
-    assert request["request_context"]["request_owner_epoch"] == "owner-epoch-7"
+    assert request["request_context"] == {
+        "request_key": _KEY.hex(),
+        "source_label": "manyforge_behavior",
+    }
     assert request["program_binding_id"] == "binding-1"
     assert request["expected_retained_bundle_id"] == "sha256:" + "3" * 64
     participant = request["participants"][0]
     assert participant["target"] == {"component_id": "lite6_arm", "command_target_id": "arm"}
     assert participant["execution_scope"] == {
-        "node_instance_id": "root/move[0]", "node_attempt_id": "run-1/move[0]/attempt-1"
+        "node_instance_id": "root/move[0]", "node_attempt_id": 1
     }
     assert participant["payload"]["tcp_endpoint"] == {
         "kind": "entry", "target": {"component_id": "lite6_arm", "command_target_id": "arm"},
@@ -166,7 +174,7 @@ def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
     with pytest.raises(ValueError, match="no unique end-effector TCP"):
         runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},
-            request_id="request-1", program_run_id="run-1", target={"component_id": "lite6_arm", "command_target_id": "arm"}, node_instance_id="move", node_attempt_id="attempt",
+            request_key=_KEY, program_run_id=1, target={"component_id": "lite6_arm", "command_target_id": "arm"}, node_instance_id="move", node_attempt_id=1,
             move_id="move-1", joint_names=("joint1",), positions_rad=(0.1,),
         )
     assert transport.submitted is None
@@ -174,8 +182,8 @@ def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
 
 def test_runner_reads_owner_projection_without_reducing_it() -> None:
     runner = OrchestratorRunner(KernelClient(RecordingTransport()), _applied_binding())
-    assert runner.operation("operation-1")["operation"] == {
-        "operation_id": "operation-1",
+    assert runner.operation(1)["operation"] == {
+        "operation_id": 1,
         "state": "completed",
     }
 
@@ -185,11 +193,11 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     accepted = runner.submit_gripper_position(
-        request_id="request-gripper-1",
-        program_run_id="run-1",
+        request_key=_GRIPPER_KEY,
+        program_run_id=1,
         target={"component_id": "lite6_gripper", "command_target_id": "gripper"},
         node_instance_id="root/gripper[0]",
-        node_attempt_id="run-1/gripper[0]/attempt-1",
+        node_attempt_id=1,
         position_kind="linear_m",
         position=0.004,
         max_effort=5.0,
@@ -197,12 +205,12 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
         completion_timeout_s=2.0,
     )
 
-    assert accepted["accepted"]["operation_id"] == "operation-1"
+    assert accepted["accepted"]["operation_id"] == 1
     assert transport.submitted is not None
     participant = transport.submitted["participants"][0]
     assert participant["target"] == {"component_id": "lite6_gripper", "command_target_id": "gripper"}
     assert participant["execution_scope"] == {
-        "node_instance_id": "root/gripper[0]", "node_attempt_id": "run-1/gripper[0]/attempt-1"
+        "node_instance_id": "root/gripper[0]", "node_attempt_id": 1
     }
     assert participant["required_capability_id"] == "tool.gripper.command"
     assert participant["payload"] == {
@@ -228,11 +236,11 @@ def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     runner.submit_gripper_position(
-        request_id="request-gripper-1",
-        program_run_id="run-1",
+        request_key=_GRIPPER_KEY,
+        program_run_id=1,
         target={"component_id": "lite6_gripper", "command_target_id": "gripper"},
         node_instance_id="root/gripper[0]",
-        node_attempt_id="run-1/gripper[0]/attempt-1",
+        node_attempt_id=1,
         position_kind="linear_m",
         position=0.004,
         command_duration_s=0.25,
@@ -252,40 +260,33 @@ def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     first = runner.stop_operation(
-        request_id="request-stop-1",
-        operation_id="operation-1",
+        request_key=_STOP_KEY,
+        operation_id=1,
         expected_operation_revision=4,
-        expected_stop_generation=0,
         reason="operator requested Stop",
-        correlation_id="cycle-1",
     )
     replay = runner.stop_operation(
-        request_id="request-stop-1",
-        operation_id="operation-1",
+        request_key=_STOP_KEY,
+        operation_id=1,
         expected_operation_revision=4,
-        expected_stop_generation=0,
         reason="operator requested Stop",
-        correlation_id="cycle-1",
     )
 
-    assert first["accepted"]["stop_id"] == "stop-1"
-    assert replay["accepted"]["stop_id"] == "stop-1"
+    assert first["accepted"]["event_id"] == 1
+    assert replay["accepted"]["event_id"] == 1
     assert transport.controls[0] == transport.controls[1]
     kind, operation_id, request = transport.controls[0]
     assert kind == "stop"
-    assert operation_id == "operation-1"
+    assert operation_id == 1
     assert request == {
         "request_context": {
-            "request_id": "request-stop-1",
-            "request_owner_epoch": "owner-epoch-7",
+            "request_key": _STOP_KEY.hex(),
             "source_label": "manyforge_behavior",
-            "correlation_id": "cycle-1",
         },
         "operations": [
             {
-                "operation_id": "operation-1",
+                "operation_id": 1,
                 "expected_operation_revision": 4,
-                "expected_stop_generation": 0,
             }
         ],
         "reason": "operator requested Stop",
@@ -295,7 +296,7 @@ def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
 def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> None:
     class IncompleteIdentityTransport(RecordingTransport):
         def identity(self) -> dict[str, Any]:
-            return {"ok": True, "identity": {"owner_epoch": "owner-epoch-7"}}
+            return {"ok": True, "identity": {"application_start_id": "3f9a00000000abcd"}}
 
     transport = IncompleteIdentityTransport()
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
@@ -303,11 +304,11 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
     with pytest.raises(KernelClientResponseError, match="incomplete"):
         runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},
-            request_id="request-1",
-            program_run_id="run-1",
+            request_key=_KEY,
+            program_run_id=1,
             target={"component_id": "lite6_arm", "command_target_id": "arm"},
             node_instance_id="root/move[0]",
-            node_attempt_id="run-1/move[0]/attempt-1",
+            node_attempt_id=1,
             move_id="move-1",
             joint_names=("joint1",),
             positions_rad=(0.1,),
@@ -320,10 +321,10 @@ def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
     transport = RecordingTransport()
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
     arguments = {
-        "request_id": "request-1",
-        "program_run_id": "run-1",
+        "request_key": _KEY,
+        "program_run_id": 1,
         "node_instance_id": "root/move[0]",
-        "node_attempt_id": "run-1/move[0]/attempt-1",
+        "node_attempt_id": 1,
         "move_id": "move-1",
         "joint_names": ("joint1",),
         "positions_rad": (0.1,),

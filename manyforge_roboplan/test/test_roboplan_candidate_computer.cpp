@@ -188,8 +188,7 @@ moving_request(CandidateFixture &fixture) {
       fixture.binding, fixture.start + divergence * velocity +
                            0.5 * divergence * divergence * acceleration);
   input.moving_replacement = MovingReplacementInputDTO{
-      ExecutionGoalKey{ControllerGoalId("source-moving"),
-                       ControllerGoalGeneration(11U)},
+      ControllerGoalId{OperationNumber(901U), 1U, 11U},
       ExecutionBindingEpoch(7U),
       1.0,
       std::move(prefix),

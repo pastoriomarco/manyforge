@@ -59,7 +59,7 @@ class SceneClient:
         value = self._transport.scene()
         if (
             not isinstance(value, dict)
-            or value.get("schema_version") != "manyforge.scene_projection.v1"
+            or value.get("schema_version") != "manyforge.scene_projection.v2"
         ):
             raise SceneClientResponseError(
                 "headless scene read returned an unsupported projection"
@@ -93,7 +93,7 @@ class SceneClient:
         if (
             not isinstance(value, dict)
             or value.get("api_version")
-            != "manyforge.manager_command_response.v2"
+            != "manyforge.manager_command_response.v3"
         ):
             raise SceneOutcomeUnknownError("Scene result is malformed")
         if (value.get("ok") is False
@@ -117,7 +117,7 @@ class SceneClient:
         """Read the exact result; absence never permits another submission."""
         value = self._transport.scene_transaction_status(request)
         if (not isinstance(value, dict) or set(value) != {"api_version", "ok", "result"}
-            or value.get("api_version") != "manyforge.manager_command_response.v2"
+            or value.get("api_version") != "manyforge.manager_command_response.v3"
             or value.get("ok") is not True):
             raise SceneOutcomeUnknownError("Scene result lookup is unavailable")
         return None if value["result"] is None else self.result(value["result"])

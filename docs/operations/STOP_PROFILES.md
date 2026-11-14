@@ -102,7 +102,13 @@ Resume always plans from fresh state; it never continues the stopped
 trajectory. Never infer physical standstill from a browser state or a lost
 response.
 
-A Stop never latches the cell by itself. After a Stop, the cell is latched
+Each robot uses its Stop settings for every Stop level: Stop, Stop all and
+Halt ([Stop, Stop all and Halt](DEVELOPMENT_WORKBENCH.md#stop-stop-all-and-halt)).
+
+A Stop that completes never latches the cell by itself. A Stop that cannot
+confirm that a robot stopped (its last stage failed) raises a Halt; that
+robot's component shows **Stop not confirmed** with activity unknown until its
+controller reports it idle. After a Stop, the cell is latched
 while any component still in the cell is in fault or offline, or cannot
 report whether it is still executing. The latch is derived from component
 states and clears by itself once every component is healthy and idle; Recover

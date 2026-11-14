@@ -1,8 +1,12 @@
 #include "manyforge_headless/runtime_snapshot.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <exception>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -184,6 +188,100 @@ void ValidateSceneRuntimePayload(const CanonicalValue &payload,
   }
 }
 
+// The `source_content_digest` of a section: the same function and domain the
+// former status files used, so equal payloads keep their digest.
+constexpr std::string_view kSourceSemanticIdentityDomain =
+    "manyforge-source-snapshot-semantic";
+constexpr std::string_view kSourceSemanticIdentityVersion =
+    "manyforge.source_snapshot.v2";
+
+/// The fixed owner role of each mirrored section (owners are fixed roles).
+struct SectionRole final {
+  std::string_view name;
+  std::string_view owner_kind;
+  std::string_view owner_id;
+};
+constexpr std::array<SectionRole, ManagerStatusMirror::kSectionCount> kRoles{{
+    {"manager", "component_manager", "manager"},
+    {"logical_scene", "logical_scene", "logical_scene"},
+    {"scene_runtime", "scene_runtime", "scene_runtime"},
+    {"viewer_pose_sessions", "scene_runtime", "scene_runtime"},
+}};
+
+std::string SemanticDigest(const SectionRole &role,
+                           const CanonicalValue &payload) {
+  return content_identity::framed_sha256(
+      kSourceSemanticIdentityDomain, kSourceSemanticIdentityVersion,
+      CanonicalValue(CanonicalValue::Object{
+          {"payload", payload},
+          {"source_owner_id", CanonicalValue(std::string(role.owner_id))},
+          {"source_owner_kind", CanonicalValue(std::string(role.owner_kind))},
+      }));
+}
+
+/// What the control state shows of a section value: pose samples, the
+/// scene runtime's update time and the Manager's observation counters are
+/// left out, so they do not wake the control state.
+CanonicalValue ControlPayload(const CanonicalValue &value, const std::size_t index,
+                              const std::string_view location = "") {
+  if (!value.is_object())
+    return value;
+  const bool manager = index == ManagerStatusMirror::kManager;
+  const bool scene_runtime = index == ManagerStatusMirror::kSceneRuntime;
+  if (scene_runtime && location == "state")
+    ValidatePoseSourcesShape(value);
+  CanonicalValue::Object result;
+  for (const auto &[key, child] : value.as_object()) {
+    if (manager && location == "observed_unit" &&
+        (key == "process_observation_sequence" || key == "source_report_sequence")) {
+      // Malformed ignored counters must not masquerade as valid pulses.
+      if (!child.is_null())
+        static_cast<void>(content_identity::parse_nonnegative_int64(child));
+      continue;
+    }
+    if (scene_runtime && location == "state" &&
+        (key == "pose_sources" || key == "updated_at_ns"))
+      continue;
+    if (manager && location == "runtime" && key == "observed_units" &&
+        child.is_array()) {
+      CanonicalValue::Array rows;
+      for (const auto &row : child.as_array())
+        rows.push_back(ControlPayload(row, index, "observed_unit"));
+      result.emplace_back(key, CanonicalValue(std::move(rows)));
+    } else if (location.empty() && ((manager && key == "runtime") ||
+                                    (scene_runtime && key == "state"))) {
+      result.emplace_back(key, ControlPayload(child, index, key));
+    } else {
+      result.emplace_back(key, child);
+    }
+  }
+  return CanonicalValue(std::move(result));
+}
+
+void ValidateViewerPoseSessions(const CanonicalValue &payload) {
+  Require(payload.is_object() && payload.as_object().size() == 2U &&
+              payload.find_object_member("runtime_identity") != nullptr &&
+              RequiredMember(payload, "sessions").is_array(),
+          "viewer pose sessions are not the closed v1 shape");
+}
+
+[[noreturn]] void StreamInvalid(const std::string &detail) {
+  throw ManagerStatusStreamError("manager_status_stream_invalid",
+                                 "Manager status stream: " + detail);
+}
+
+std::uint64_t StreamCounter(const CanonicalValue &object,
+                            const std::string_view name) {
+  const auto *value = object.find_object_member(name);
+  if (value == nullptr || !value->is_number())
+    StreamInvalid(std::string(name) + " is not a counter");
+  const double number = value->as_number();
+  if (number < 0.0 || number > static_cast<double>(kMaximumSafeInteger) ||
+      static_cast<double>(static_cast<std::uint64_t>(number)) != number)
+    StreamInvalid(std::string(name) + " is not a counter");
+  return static_cast<std::uint64_t>(number);
+}
+
 enum class Freshness {
   kFresh,
   kStale,
@@ -203,7 +301,7 @@ std::string_view ToString(const Freshness value) noexcept {
 }
 
 struct Section final {
-  std::optional<SourceSnapshotFileObservation> source;
+  std::shared_ptr<const ManagerStatusMirror::Value> source;
   Freshness freshness{Freshness::kUnavailable};
   std::optional<std::uint64_t> receiver_age_ns;
   std::vector<std::string> known_gaps;
@@ -218,103 +316,38 @@ CanonicalValue StringArray(const std::vector<std::string> &values) {
   return CanonicalValue(std::move(result));
 }
 
-CanonicalValue ControlPayload(const CanonicalValue& value, const std::string_view kind,
-                              const std::string_view location = "") {
-  if (!value.is_object()) return value;
-  if (kind == "scene-runtime-source.json" && location == "state") ValidatePoseSourcesShape(value);
-  CanonicalValue::Object result;
-  for (const auto& [key, child] : value.as_object()) {
-    if (kind == "manager-source.json" && location == "observed_unit" &&
-        (key == "process_observation_sequence" || key == "source_report_sequence")) {
-      // Malformed ignored counters must not masquerade as valid pulses.
-      if (!child.is_null()) static_cast<void>(content_identity::parse_nonnegative_int64(child));
-      continue;
-    }
-    if (kind == "scene-runtime-source.json" && location == "state" &&
-        (key == "pose_sources" || key == "updated_at_ns"))
-      continue;
-    if (kind == "manager-source.json" && location == "runtime" && key == "observed_units" &&
-        child.is_array()) {
-      CanonicalValue::Array rows;
-      for (const auto& row : child.as_array())
-        rows.push_back(ControlPayload(row, kind, "observed_unit"));
-      result.emplace_back(key, CanonicalValue(std::move(rows)));
-    } else if (location.empty() && ((kind == "manager-source.json" && key == "runtime") ||
-                                    (kind == "scene-runtime-source.json" && key == "state"))) {
-      result.emplace_back(key, ControlPayload(child, kind, key));
-    } else {
-      result.emplace_back(key, child);
-    }
-  }
-  return CanonicalValue(std::move(result));
-}
-
-Section ObserveSection(
-    AtomicSourceSnapshotChannel &channel,
-    std::optional<SourceSnapshotFileObservation> &last_valid,
-    const std::string_view expected_owner_kind,
-    const std::string &expected_owner_id,
-    const std::function<std::int64_t()> &wall_clock_ns,
-    const std::int64_t maximum_age_ns,
-    const std::function<void(const CanonicalValue &)> &validate_payload,
-    const std::string_view section_name) {
-  std::optional<SourceSnapshotFileObservation> current;
-  std::string failure_code;
-  try {
-    current = channel.ReadObserved();
-    if (!current.has_value()) {
-      failure_code = std::string(section_name) + "_source_absent";
-    } else if (current->snapshot.source_owner_kind != expected_owner_kind ||
-               current->snapshot.source_owner_id != expected_owner_id) {
-      failure_code = std::string(section_name) + "_source_identity_mismatch";
-      current.reset();
-    } else {
-      validate_payload(current->snapshot.payload);
-      last_valid = current;
-    }
-  } catch (...) {
-    failure_code = std::string(section_name) + "_source_invalid";
-    current.reset();
-  }
-  if (!current.has_value()) {
-    Section result;
-    result.source = last_valid;
-    result.known_gaps.push_back(
-        failure_code.empty() ? std::string(section_name) + "_source_unavailable"
-                             : failure_code);
-    return result;
-  }
-
-  // Sample after the atomic file observation. A source may publish between
-  // an earlier clock read and open/stat/read; comparing that newer mtime to
-  // the earlier sample would invent a publication-time-in-future outage.
-  const auto now_wall_ns = wall_clock_ns();
-  Require(now_wall_ns >= 0, "wall clock must be nonnegative");
+/// One section's freshness from the mirror. A Manager that does not answer
+/// (its connection ended, or no new tick within the bound) makes every
+/// section with a value stale with the one code `manager_status_unavailable`.
+Section ObserveSection(const ManagerStatusMirror::View &view,
+                       const std::size_t index, const bool answering,
+                       const std::optional<std::uint64_t> tick_age_ns) {
+  const auto &state = view.sections[index];
+  const std::string name(kRoles[index].name);
   Section result;
-  result.source = current;
-  if (current->file_modified_at_unix_ns > now_wall_ns) {
-    result.known_gaps.push_back(std::string(section_name) +
-                                "_publication_time_in_future");
-    return result;
-  }
-  const auto raw_age = static_cast<std::uint64_t>(
-      now_wall_ns - current->file_modified_at_unix_ns);
-  result.receiver_age_ns = std::min(raw_age, kMaximumSafeInteger);
-  if (raw_age > kMaximumSafeInteger) {
+  result.source = state.last_valid;
+  if (!answering && view.connection != ManagerStatusMirror::Connection::kNeverConnected &&
+      state.last_valid != nullptr) {
     result.freshness = Freshness::kStale;
-    result.known_gaps.push_back(std::string(section_name) +
-                                "_receiver_age_saturated");
-  } else if (raw_age > static_cast<std::uint64_t>(maximum_age_ns)) {
-    result.freshness = Freshness::kStale;
-    result.known_gaps.push_back(std::string(section_name) + "_source_stale");
+    result.receiver_age_ns = tick_age_ns;
+    result.known_gaps.emplace_back("manager_status_unavailable");
+  } else if (state.current &&
+             state.problem == ManagerStatusMirror::Problem::kOversized) {
+    result.known_gaps.emplace_back("manager_status_section_oversized");
+  } else if (state.current &&
+             state.problem == ManagerStatusMirror::Problem::kInvalid) {
+    result.known_gaps.push_back(name + "_source_invalid");
+  } else if (!state.current || state.last_valid == nullptr) {
+    result.known_gaps.push_back(name + "_source_absent");
   } else {
     result.freshness = Freshness::kFresh;
+    result.receiver_age_ns = tick_age_ns;
   }
   return result;
 }
 
-CanonicalValue SemanticSection(const Section &section) {
-  if (!section.source.has_value()) {
+CanonicalValue SemanticSection(const Section &section, const std::size_t index) {
+  if (section.source == nullptr) {
     return CanonicalValue(CanonicalValue::Object{
         {"available", CanonicalValue(false)},
         {"freshness", CanonicalValue(std::string(ToString(section.freshness)))},
@@ -322,12 +355,11 @@ CanonicalValue SemanticSection(const Section &section) {
         {"payload", CanonicalValue(nullptr)},
         {"source_content_digest", CanonicalValue(nullptr)},
         {"source_generation", CanonicalValue(nullptr)},
-        {"source_owner_epoch", CanonicalValue(nullptr)},
         {"source_owner_id", CanonicalValue(nullptr)},
         {"source_owner_kind", CanonicalValue(nullptr)},
     });
   }
-  const auto &source = section.source->snapshot;
+  const auto &source = *section.source;
   return CanonicalValue(CanonicalValue::Object{
       {"available", CanonicalValue(true)},
       {"freshness", CanonicalValue(std::string(ToString(section.freshness)))},
@@ -335,16 +367,16 @@ CanonicalValue SemanticSection(const Section &section) {
       {"payload", source.payload},
       {"source_content_digest", CanonicalValue(source.semantic_content_digest)},
       {"source_generation",
-       Number(source.source_generation, "source_generation", true)},
-      {"source_owner_epoch", CanonicalValue(source.source_owner_epoch)},
-      {"source_owner_id", CanonicalValue(source.source_owner_id)},
-      {"source_owner_kind", CanonicalValue(source.source_owner_kind)},
+       Number(source.generation, "source_generation", true)},
+      {"source_owner_id", CanonicalValue(std::string(kRoles[index].owner_id))},
+      {"source_owner_kind",
+       CanonicalValue(std::string(kRoles[index].owner_kind))},
   });
 }
 
-CanonicalValue ProjectedSection(const Section &section,
+CanonicalValue ProjectedSection(const Section &section, const std::size_t index,
                                 const std::uint64_t projection_generation) {
-  CanonicalValue::Object members = SemanticSection(section).as_object();
+  CanonicalValue::Object members = SemanticSection(section, index).as_object();
   members.emplace_back(
       "projection_generation",
       Number(projection_generation, "projection_generation", true));
@@ -353,8 +385,8 @@ CanonicalValue ProjectedSection(const Section &section,
                            ? Number(*section.receiver_age_ns, "receiver_age_ns")
                            : CanonicalValue(nullptr));
   members.emplace_back("source_observed_at_ns",
-                       section.source.has_value()
-                           ? Number(section.source->snapshot.observed_at_ns,
+                       section.source != nullptr
+                           ? Number(section.source->observed_at_ns,
                                     "source_observed_at_ns")
                            : CanonicalValue(nullptr));
   return CanonicalValue(std::move(members));
@@ -366,11 +398,10 @@ struct ActiveIdentity final {
 };
 
 ActiveIdentity ActiveFromManager(const Section &manager) {
-  if (!manager.source.has_value()) {
+  if (manager.source == nullptr) {
     return {};
   }
-  const auto &active =
-      RequiredMember(manager.source->snapshot.payload, "active");
+  const auto &active = RequiredMember(manager.source->payload, "active");
   return {
       RequiredString(active, "retained_bundle_id"),
       RequiredString(active, "graph_revision"),
@@ -398,172 +429,271 @@ CanonicalValue Scope() {
 
 } // namespace
 
-std::optional<std::pair<std::string, std::int64_t>> ReadControlSourceFileHint(
-    const std::filesystem::path& path) {
-  try {
-    const auto observed =
-        AtomicSourceSnapshotChannel(path.parent_path(), path.filename().string()).ReadObserved();
-    if (!observed) return std::nullopt;
-    const auto& source = observed->snapshot;
-    const auto meaning = CanonicalValue(CanonicalValue::Object{
-        {"payload", ControlPayload(source.payload, path.filename().string())},
-        {"source_owner_epoch", CanonicalValue(source.source_owner_epoch)},
-        {"source_owner_id", CanonicalValue(source.source_owner_id)},
-        {"source_owner_kind", CanonicalValue(source.source_owner_kind)},
-    });
-    return std::pair{content_identity::sha256_digest(content_identity::canonical_json(meaning)),
-                     observed->file_modified_at_unix_ns};
-  } catch (const SourceSnapshotError&) {
-    return std::nullopt;
-  } catch (const RuntimeSnapshotError&) {
-    return std::nullopt;
-  } catch (const std::invalid_argument&) {
-    return std::nullopt;
-  }
+ManagerStatusMirror::ManagerStatusMirror(std::string cell_id,
+                                         const std::int64_t manager_silence_ns,
+                                         Clock monotonic_clock_ns)
+    : cell_id_(std::move(cell_id)), manager_silence_ns_(manager_silence_ns),
+      monotonic_clock_ns_(std::move(monotonic_clock_ns)),
+      view_(std::make_shared<const View>()) {
+  Require(!cell_id_.empty(), "cell identity must be non-empty");
+  Require(manager_silence_ns_ > 0 &&
+              static_cast<std::uint64_t>(manager_silence_ns_) <=
+                  kMaximumSafeInteger,
+          "the Manager silence bound must be a positive I-JSON safe integer");
+  Require(static_cast<bool>(monotonic_clock_ns_),
+          "the mirror's monotonic clock is required");
 }
 
-std::optional<std::tuple<std::string, std::string, std::int64_t>>
-ReadViewerSceneSource(const std::filesystem::path &path, const std::string &cell_id) {
+bool ManagerStatusMirror::Answering(const View &view,
+                                    const std::int64_t now_ns) const noexcept {
+  return view.connection == Connection::kConnected &&
+         now_ns - view.last_tick_advance_ns <= manager_silence_ns_;
+}
+
+ManagerStatusMirror::ApplyResult
+ManagerStatusMirror::Apply(const std::string_view frame) {
+  CanonicalValue root;
   try {
-    const auto observed = AtomicSourceSnapshotChannel(
-        path.parent_path(), path.filename().string()).ReadObserved();
-    if (!observed || observed->snapshot.source_owner_kind != "scene_runtime" ||
-        observed->snapshot.source_owner_id != "scene-runtime." + cell_id)
-      return std::nullopt;
-    ValidateSceneRuntimePayload(observed->snapshot.payload, cell_id);
-    return std::tuple{content_identity::canonical_json(observed->snapshot.payload),
-                      observed->snapshot.source_owner_epoch,
-                      observed->file_modified_at_unix_ns};
-  } catch (const SourceSnapshotError &) {
-    return std::nullopt;
-  } catch (const RuntimeSnapshotError &) {
-    return std::nullopt;
-  } catch (const std::invalid_argument &) {
-    return std::nullopt;
+    root = content_identity::parse_canonical_json(
+        frame, content_identity::CanonicalJsonParseLimits{
+                   content_identity::kMaximumCanonicalJsonBytes,
+                   content_identity::kMaximumCanonicalJsonDepth,
+                   content_identity::kMaximumCanonicalJsonNodes});
+  } catch (const std::exception &error) {
+    StreamInvalid(std::string("frame is not canonical JSON: ") + error.what());
   }
+  if (!root.is_object())
+    StreamInvalid("frame is not an object");
+  const auto *type = root.find_object_member("type");
+  if (type == nullptr || !type->is_string())
+    StreamInvalid("frame has no type");
+  const auto &kind = type->as_string();
+  if (kind == "error") {
+    const auto *error = root.find_object_member("error");
+    const auto *code = error == nullptr ? nullptr : error->find_object_member("code");
+    const auto *message =
+        error == nullptr ? nullptr : error->find_object_member("message");
+    if (code == nullptr || !code->is_string() || code->as_string().empty())
+      StreamInvalid("error frame has no code");
+    throw ManagerStatusStreamError(
+        code->as_string(), message != nullptr && message->is_string()
+                               ? message->as_string()
+                               : std::string("Manager status stream ended"));
+  }
+  const auto *api = root.find_object_member("api_version");
+  if (api == nullptr || !api->is_string() ||
+      api->as_string() != kManagerStatusStreamApiVersion)
+    StreamInvalid("frame has another version");
+  const auto *start = root.find_object_member("application_start_id");
+  if (start == nullptr || !start->is_string() || start->as_string().empty())
+    StreamInvalid("frame has no application start");
+  const auto tick = StreamCounter(root, "tick");
+  const auto now = monotonic_clock_ns_();
+  const auto current = view_.load();
+  auto next = std::make_shared<View>(*current);
+  ApplyResult result;
+  if (kind == "snapshot") {
+    const auto *generations = root.find_object_member("generations");
+    if (root.as_object().size() != 5U || generations == nullptr ||
+        !generations->is_object() || generations->as_object().size() != kSectionCount)
+      StreamInvalid("snapshot frame is not the closed v1 shape");
+    for (const auto &role : kRoles)
+      static_cast<void>(StreamCounter(*generations, role.name));
+    // A new subscription: every section waits for its own frame.
+    next->connection = Connection::kConnected;
+    for (auto &section : next->sections) {
+      section.current = false;
+      section.problem = Problem::kNone;
+    }
+    next->tick = tick;
+    next->last_tick_advance_ns = now;
+    view_.store(std::move(next));
+    return {true, true, true};
+  }
+  if (current->connection != Connection::kConnected)
+    StreamInvalid("frame before the snapshot");
+  if (tick < current->tick)
+    StreamInvalid("tick moved backwards");
+  if (tick > current->tick) {
+    next->tick = tick;
+    next->last_tick_advance_ns = now;
+    result.tick_advanced = true;
+  }
+  if (kind == "keepalive") {
+    if (root.as_object().size() != 4U)
+      StreamInvalid("keepalive frame is not the closed v1 shape");
+  } else if (kind == "section") {
+    const auto *name = root.find_object_member("name");
+    const auto *value = root.find_object_member("section");
+    if (root.as_object().size() != 6U || name == nullptr || !name->is_string() ||
+        value == nullptr || !value->is_object() || value->as_object().size() != 4U)
+      StreamInvalid("section frame is not the closed v1 shape");
+    const auto role = std::find_if(kRoles.begin(), kRoles.end(), [&](const auto &entry) {
+      return entry.name == name->as_string();
+    });
+    if (role == kRoles.end())
+      StreamInvalid("section frame names an unknown section");
+    const auto index = static_cast<std::size_t>(role - kRoles.begin());
+    const auto generation = StreamCounter(*value, "generation");
+    const auto *observed = value->find_object_member("observed_at_ns");
+    const auto *oversized = value->find_object_member("oversized");
+    const auto *payload = value->find_object_member("payload");
+    std::int64_t observed_at_ns{};
+    try {
+      if (observed == nullptr)
+        throw std::invalid_argument("missing");
+      observed_at_ns = content_identity::parse_nonnegative_int64(*observed);
+    } catch (const std::exception &) {
+      StreamInvalid("section observed_at_ns is invalid");
+    }
+    if (generation == 0U || oversized == nullptr || !oversized->is_bool() ||
+        payload == nullptr || oversized->as_bool() != payload->is_null())
+      StreamInvalid("section value is not the closed v1 shape");
+    auto &section = next->sections[index];
+    const auto before = section;
+    section.current = true;
+    if (oversized->as_bool()) {
+      section.problem = Problem::kOversized;
+    } else {
+      try {
+        switch (index) {
+        case kManager:
+          ValidateManagerPayload(*payload, cell_id_);
+          break;
+        case kLogicalScene:
+          ValidateScenePayload(*payload, cell_id_);
+          break;
+        case kSceneRuntime:
+          ValidateSceneRuntimePayload(*payload, cell_id_);
+          break;
+        default:
+          ValidateViewerPoseSessions(*payload);
+          break;
+        }
+        auto stored = std::make_shared<Value>();
+        stored->generation = generation;
+        stored->observed_at_ns = observed_at_ns;
+        stored->payload = *payload;
+        stored->semantic_content_digest = SemanticDigest(*role, *payload);
+        if (index != kViewerPoseSessions)
+          stored->control_digest = content_identity::sha256_digest(
+              content_identity::canonical_json(ControlPayload(*payload, index)));
+        if (index == kSceneRuntime || index == kViewerPoseSessions)
+          stored->payload_json = content_identity::canonical_json(*payload);
+        section.last_valid = std::move(stored);
+        section.problem = Problem::kNone;
+      } catch (const std::exception &) {
+        // A payload the Headless cannot use: the section shows it, the
+        // subscription goes on (the last valid value stays).
+        section.problem = Problem::kInvalid;
+      }
+    }
+    result.control_changed =
+        index != kViewerPoseSessions &&
+        (before.current != section.current || before.problem != section.problem ||
+         (before.last_valid == nullptr) != (section.last_valid == nullptr) ||
+         (section.last_valid != nullptr &&
+          before.last_valid->control_digest != section.last_valid->control_digest));
+    result.viewer_changed = index == kSceneRuntime || index == kViewerPoseSessions;
+  } else {
+    StreamInvalid("frame type is unknown");
+  }
+  view_.store(std::move(next));
+  return result;
+}
+
+bool ManagerStatusMirror::MarkDisconnected() {
+  const auto current = view_.load();
+  if (current->connection != Connection::kConnected)
+    return false;
+  auto next = std::make_shared<View>(*current);
+  next->connection = Connection::kDisconnected;
+  view_.store(std::move(next));
+  return true;
 }
 
 std::optional<std::pair<std::string, std::string>>
-ReadViewerPoseSessions(const std::filesystem::path &path, const std::string &cell_id) {
-  try {
-    const auto observed = AtomicSourceSnapshotChannel(
-        path.parent_path(), path.filename().string()).ReadObserved();
-    if (!observed || observed->snapshot.source_owner_kind != "scene_runtime" ||
-        observed->snapshot.source_owner_id != "scene-runtime." + cell_id)
-      return std::nullopt;
-    return std::pair{content_identity::canonical_json(observed->snapshot.payload),
-                     observed->snapshot.source_owner_epoch};
-  } catch (const SourceSnapshotError &) {
+ManagerStatusMirror::ViewerPoseSources() const {
+  const auto view = view_.load();
+  if (!Answering(*view, monotonic_clock_ns_()))
     return std::nullopt;
-  } catch (const std::invalid_argument &) {
+  const auto &scene = view->sections[kSceneRuntime];
+  const auto &sessions = view->sections[kViewerPoseSessions];
+  if (!scene.current || scene.problem != Problem::kNone ||
+      scene.last_valid == nullptr || !sessions.current ||
+      sessions.problem != Problem::kNone || sessions.last_valid == nullptr)
     return std::nullopt;
-  }
+  return std::pair{scene.last_valid->payload_json,
+                   sessions.last_valid->payload_json};
 }
 
 RuntimeSnapshotAggregator::RuntimeSnapshotAggregator(
-    std::filesystem::path publication_root, std::string cell_id,
-    std::string projection_owner_id, std::string projection_owner_epoch,
-    const RuntimeSnapshotFreshnessPolicy freshness_policy, Clock wall_clock_ns,
-    Clock projection_clock_ns)
-    : manager_source_(publication_root, "manager-source.json"),
-      logical_scene_source_(std::move(publication_root),
-                            "logical-scene-source.json"),
-      scene_runtime_source_(logical_scene_source_.directory(),
-                            "scene-runtime-source.json"),
-      cell_id_(std::move(cell_id)),
-      projection_owner_id_(std::move(projection_owner_id)),
-      projection_owner_epoch_(std::move(projection_owner_epoch)),
-      freshness_policy_(freshness_policy),
-      wall_clock_ns_(std::move(wall_clock_ns)),
+    const ManagerStatusMirror &mirror, std::string projection_owner_id,
+    std::string application_start_id, Clock projection_clock_ns)
+    : mirror_(mirror), projection_owner_id_(std::move(projection_owner_id)),
+      application_start_id_(std::move(application_start_id)),
       projection_clock_ns_(std::move(projection_clock_ns)) {
-  Require(!cell_id_.empty() && !projection_owner_id_.empty() &&
-              !projection_owner_epoch_.empty(),
-          "cell and projection-owner identities must be non-empty");
-  Require(freshness_policy_.manager_maximum_age_ns > 0 &&
-              freshness_policy_.logical_scene_maximum_age_ns > 0 &&
-              static_cast<std::uint64_t>(
-                  freshness_policy_.manager_maximum_age_ns) <=
-                  kMaximumSafeInteger &&
-              static_cast<std::uint64_t>(
-                  freshness_policy_.logical_scene_maximum_age_ns) <=
-                  kMaximumSafeInteger &&
-              freshness_policy_.scene_runtime_maximum_age_ns > 0 &&
-              static_cast<std::uint64_t>(
-                  freshness_policy_.scene_runtime_maximum_age_ns) <=
-                  kMaximumSafeInteger,
-          "freshness budgets must be positive I-JSON safe integers");
-  Require(static_cast<bool>(wall_clock_ns_) &&
-              static_cast<bool>(projection_clock_ns_),
-          "both projection clocks are required");
+  Require(!projection_owner_id_.empty() && !application_start_id_.empty(),
+          "projection-owner and start identities must be non-empty");
+  Require(static_cast<bool>(projection_clock_ns_),
+          "the projection clock is required");
 }
 
 HeadlessRuntimeSnapshot RuntimeSnapshotAggregator::Evaluate() {
   std::lock_guard lock(mutex_);
-  const auto initial_wall_ns = wall_clock_ns_();
   const auto projected_at_ns = projection_clock_ns_();
-  Require(initial_wall_ns >= 0 && projected_at_ns >= 0,
-          "projection clocks must be nonnegative");
+  Require(projected_at_ns >= 0, "projection clock must be nonnegative");
+  const auto status = mirror_.Load();
+  const auto now_ns = mirror_.Now();
+  const bool answering = mirror_.Answering(*status, now_ns);
+  std::optional<std::uint64_t> tick_age_ns;
+  if (status->connection != ManagerStatusMirror::Connection::kNeverConnected)
+    tick_age_ns = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, now_ns - status->last_tick_advance_ns));
 
-  const auto manager = ObserveSection(
-      manager_source_, last_manager_source_, "component_manager",
-      "component-manager." + cell_id_, wall_clock_ns_,
-      freshness_policy_.manager_maximum_age_ns,
-      [this](const CanonicalValue &payload) {
-        ValidateManagerPayload(payload, cell_id_);
-      },
-      "manager");
+  const auto manager = ObserveSection(*status, ManagerStatusMirror::kManager,
+                                      answering, tick_age_ns);
   const auto logical_scene = ObserveSection(
-      logical_scene_source_, last_logical_scene_source_, "logical_scene",
-      "logical-scene." + cell_id_, wall_clock_ns_,
-      freshness_policy_.logical_scene_maximum_age_ns,
-      [this](const CanonicalValue &payload) {
-        ValidateScenePayload(payload, cell_id_);
-      },
-      "logical_scene");
+      *status, ManagerStatusMirror::kLogicalScene, answering, tick_age_ns);
   const auto scene_runtime = ObserveSection(
-      scene_runtime_source_, last_scene_runtime_source_, "scene_runtime",
-      "scene-runtime." + cell_id_, wall_clock_ns_,
-      freshness_policy_.scene_runtime_maximum_age_ns,
-      [this](const CanonicalValue &payload) {
-        ValidateSceneRuntimePayload(payload, cell_id_);
-      },
-      "scene_runtime");
+      *status, ManagerStatusMirror::kSceneRuntime, answering, tick_age_ns);
   const bool complete = manager.freshness == Freshness::kFresh &&
                         logical_scene.freshness == Freshness::kFresh &&
                         scene_runtime.freshness == Freshness::kFresh;
   std::vector<std::string> unavailable_sections;
   std::vector<std::string> reasons;
-  if (manager.freshness != Freshness::kFresh) {
-    unavailable_sections.emplace_back("manager");
-    reasons.insert(reasons.end(), manager.known_gaps.begin(),
-                   manager.known_gaps.end());
-  }
-  if (logical_scene.freshness != Freshness::kFresh) {
-    unavailable_sections.emplace_back("logical_scene");
-    reasons.insert(reasons.end(), logical_scene.known_gaps.begin(),
-                   logical_scene.known_gaps.end());
-  }
-  if (scene_runtime.freshness != Freshness::kFresh) {
-    unavailable_sections.emplace_back("scene_runtime");
-    reasons.insert(reasons.end(), scene_runtime.known_gaps.begin(),
-                   scene_runtime.known_gaps.end());
-  }
+  const auto add_reasons = [&](const Section &section, const char *name) {
+    if (section.freshness == Freshness::kFresh)
+      return;
+    unavailable_sections.emplace_back(name);
+    for (const auto &gap : section.known_gaps) {
+      // "Not answering" is one condition: it appears once.
+      if (std::find(reasons.begin(), reasons.end(), gap) == reasons.end())
+        reasons.push_back(gap);
+    }
+  };
+  add_reasons(manager, "manager");
+  add_reasons(logical_scene, "logical_scene");
+  add_reasons(scene_runtime, "scene_runtime");
   const auto active = ActiveFromManager(manager);
   const CanonicalValue semantic(CanonicalValue::Object{
       {"active_graph_revision", OptionalString(active.graph_revision)},
       {"active_retained_bundle_id", OptionalString(active.retained_bundle_id)},
+      {"application_start_id", CanonicalValue(application_start_id_)},
       {"complete", CanonicalValue(complete)},
-      {"projection_owner_epoch", CanonicalValue(projection_owner_epoch_)},
       {"projection_owner_id", CanonicalValue(projection_owner_id_)},
       {"reasons", StringArray(reasons)},
       {"schema_version",
        CanonicalValue(std::string(kHeadlessRuntimeSnapshotSchemaVersion))},
       {"scope", Scope()},
-      {"sections", CanonicalValue(CanonicalValue::Object{
-                       {"logical_scene", SemanticSection(logical_scene)},
-                       {"manager", SemanticSection(manager)},
-                       {"scene_runtime", SemanticSection(scene_runtime)},
-                   })},
+      {"sections",
+       CanonicalValue(CanonicalValue::Object{
+           {"logical_scene",
+            SemanticSection(logical_scene, ManagerStatusMirror::kLogicalScene)},
+           {"manager", SemanticSection(manager, ManagerStatusMirror::kManager)},
+           {"scene_runtime",
+            SemanticSection(scene_runtime, ManagerStatusMirror::kSceneRuntime)},
+       })},
       {"unavailable_sections", StringArray(unavailable_sections)},
   });
   const auto semantic_digest = content_identity::framed_sha256(
@@ -581,12 +711,12 @@ HeadlessRuntimeSnapshot RuntimeSnapshotAggregator::Evaluate() {
   const CanonicalValue root(CanonicalValue::Object{
       {"active_graph_revision", OptionalString(active.graph_revision)},
       {"active_retained_bundle_id", OptionalString(active.retained_bundle_id)},
+      {"application_start_id", CanonicalValue(application_start_id_)},
       {"complete", CanonicalValue(complete)},
       {"projected_at_ns", Number(projected_at_ns, "projected_at_ns")},
       {"projection_content_digest", CanonicalValue(semantic_digest)},
       {"projection_generation",
        Number(projection_generation_, "projection_generation", true)},
-      {"projection_owner_epoch", CanonicalValue(projection_owner_epoch_)},
       {"projection_owner_id", CanonicalValue(projection_owner_id_)},
       {"reasons", StringArray(reasons)},
       {"schema_version",
@@ -595,10 +725,13 @@ HeadlessRuntimeSnapshot RuntimeSnapshotAggregator::Evaluate() {
       {"sections",
        CanonicalValue(CanonicalValue::Object{
            {"logical_scene",
-            ProjectedSection(logical_scene, projection_generation_)},
-           {"manager", ProjectedSection(manager, projection_generation_)},
+            ProjectedSection(logical_scene, ManagerStatusMirror::kLogicalScene,
+                             projection_generation_)},
+           {"manager", ProjectedSection(manager, ManagerStatusMirror::kManager,
+                                        projection_generation_)},
            {"scene_runtime",
-            ProjectedSection(scene_runtime, projection_generation_)},
+            ProjectedSection(scene_runtime, ManagerStatusMirror::kSceneRuntime,
+                             projection_generation_)},
        })},
       {"unavailable_sections", StringArray(unavailable_sections)},
   });

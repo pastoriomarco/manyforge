@@ -113,7 +113,9 @@ change the Active TCP.
 default TCP of a component, a specific TCP, or **Current**. A specific entry may be supplied
 directly from a `tcp_entry` key. **Current** uses the current Active TCP; it
 does not select a different one. The node completes when the selected Active
-TCP is reflected in the Program's key.
+TCP is reflected in the Program's key, at the earliest on the Program tick
+after the step: a node running in parallel that reads the Active TCP while
+the step runs reads the previous one.
 
 - It may run while the robot is not enabled. With offset sync selected, the
   controller gets the new offset at the next Enable. With sync off, Enable
@@ -215,7 +217,7 @@ TCP.
 If a run is held and the Active TCP of one of its robots changes during
 manual control, **Resume** asks "Resume with the new TCP?" and lists each
 change as "<robot>: Active TCP is now <new> (was <old>)." The dialog offers
-**Resume** and **Cancel**. This applies to Resume after a Full Stop too. The
+**Resume** and **Cancel**. This applies to Execute after a Halt too. The
 question appears only when both values are known and differ; a page reload,
 lost hold snapshot, unavailable value, replaced owner, or more than one held
 group skips it. A new Run from Ready and API Resume do not ask. The hold and

@@ -39,24 +39,25 @@ const blocked: RunReadiness = { can_execute: false, can_resume: false, motion_cl
   { code: 'component_not_enabled', message: 'lite_gripper is not enabled', component_id: 'lite_gripper' },
 ] };
 const ready: RunReadiness = { can_execute: true, can_resume: false, motion_clear: true, blocked_reasons: [] };
+const START = '3f9a000000000001';
 
-async function mount(states: ComponentState[], readiness: RunReadiness, stopGeneration: number | null = null) {
+async function mount(states: ComponentState[], readiness: RunReadiness, lastStopEventId: number | null = null) {
   const { host } = reactPropsHost();
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   const execute = vi.fn(async () => undefined);
   let controller: ActivateExecuteController | null = null;
-  function Probe(props: { states: ComponentState[]; readiness: RunReadiness; stopGeneration: number | null; execute: () => Promise<void> }) {
-    const value = useActivateExecute(props.states, props.readiness, props.execute, props.stopGeneration);
+  function Probe(props: { states: ComponentState[]; readiness: RunReadiness; lastStopEventId: number | null; execute: () => Promise<void> }) {
+    const value = useActivateExecute(props.states, props.readiness, props.execute, props.lastStopEventId, START);
     useLayoutEffect(() => { controller = value; }, [value]);
     return null;
   }
-  let stop = stopGeneration;
+  let stop = lastStopEventId;
   let currentExecute: () => Promise<void> = execute;
   const render = (next: ComponentState[], nextReadiness: RunReadiness = readiness, nextStop: number | null = stop, nextExecute: () => Promise<void> = currentExecute) => act(() => {
     stop = nextStop;
     currentExecute = nextExecute;
-    root.render(<Probe states={next} readiness={nextReadiness} stopGeneration={nextStop} execute={nextExecute} />);
+    root.render(<Probe states={next} readiness={nextReadiness} lastStopEventId={nextStop} execute={nextExecute} />);
   });
   await render(states);
   return {
@@ -223,15 +224,15 @@ describe('Activate and execute', () => {
       expect(api.groupAction).toHaveBeenCalledExactlyOnceWith('enable', ['lite6_robot', 'lite_gripper']);
       await mounted.render([prepared[0]!, state('lite6_robot', 'enabled', member), state('lite_gripper', 'prepared', {
         last_action: { action: 'enable', outcome: 'failed', started_at_ns: 5, finished_at_ns: 6,
-          error: { code: 'fault_estop', message: 'C2' } },
+          error: { code: 'fault_protective_stop', message: 'C31' } },
       })]);
       expect(mounted.controller.flow?.phase).toBe('failed');
       expect(mounted.controller.flow?.failures).toEqual([
-        { componentId: 'lite_gripper', text: 'Enable failed: Emergency stop active' },
+        { componentId: 'lite_gripper', text: 'Enable failed: Robot stopped itself' },
       ]);
       const dialog = renderToStaticMarkup(<ActivateExecuteDialog activation={mounted.controller} />);
       expect(dialog).toContain('Activation stopped; the Program was not executed.');
-      expect(dialog).toContain('Enable failed: Emergency stop active');
+      expect(dialog).toContain('Enable failed: Robot stopped itself');
       await mounted.render(enabled, ready);
       expect(mounted.execute).not.toHaveBeenCalled();
     } finally { await mounted.unmount(); }
@@ -426,7 +427,7 @@ describe('Activate and execute: Recover and enable first (OD-54)', () => {
       expect(api.recoverEnable).toHaveBeenLastCalledWith('lite6_robot', { snapshot_id: 's-lite6_robot', confirmed: [
         { component_id: 'lite6', cause_code: 'estop', vendor_code: 'C2', stop_code: 'estop', stop_vendor_code: 'C2', eligibility: 'recover' },
         { component_id: 'lite6_robot', cause_code: null, vendor_code: null, stop_code: null, stop_vendor_code: null, eligibility: 'unknown' },
-      ] });
+      ] }, START);
       expect(mounted.controller.flow?.phase).toBe('recover');
       // The machine recovered with the arm: the gripper now has nothing to recover, so it stays within what was confirmed.
       api.recoverEnablePreflight.mockImplementation(async (id: string) => ({ snapshot_id: `t-${id}`,
@@ -437,7 +438,7 @@ describe('Activate and execute: Recover and enable first (OD-54)', () => {
         state('lite_gripper', 'prepared', { owner_id: 'lite6', role: 'tool' })];
       await mounted.render(armDone);
       await flush();
-      expect(api.recoverEnable).toHaveBeenLastCalledWith('lite_gripper', expect.objectContaining({ snapshot_id: 't-lite_gripper' }));
+      expect(api.recoverEnable).toHaveBeenLastCalledWith('lite_gripper', expect.objectContaining({ snapshot_id: 't-lite_gripper' }), START);
       const allDone = [armDone[0]!, armDone[1]!, state('lite_gripper', 'enabled', { owner_id: 'lite6', role: 'tool',
         last_action: { action: 'enable', outcome: 'succeeded', started_at_ns: 7, finished_at_ns: 8 } })];
       // Readiness not pushed yet: only a reason Activate clears remains.

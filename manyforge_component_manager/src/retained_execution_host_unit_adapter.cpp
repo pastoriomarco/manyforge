@@ -6,6 +6,7 @@
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 #include "manyforge_component_manager/execution_host_exit.hpp"
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 
 #include <fcntl.h>
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <functional>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -51,6 +53,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 extern char **environ;
@@ -97,18 +100,6 @@ constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
 constexpr auto kManagerLivenessTimeout = std::chrono::milliseconds(750);
 constexpr auto kProjectionPreparationTimeout = std::chrono::seconds(10);
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
-
-[[nodiscard]] std::string_view ProjectionOperationName(
-    const detail::NativeProjectionRpcRequest &request) noexcept {
-  static constexpr std::array<std::string_view, 10U> names{
-      "prepare", "health", "transaction", "rebuild", "bootstrap-rebuild",
-      "bootstrap-status", "retain", "release", "scene-frame",
-      "effective-policy",
-  };
-  static_assert(names.size() ==
-                std::variant_size_v<detail::NativeProjectionRpcRequest>);
-  return names[request.index()];
-}
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw RetainedExecutionHostUnitAdapterError(detail);
@@ -219,30 +210,6 @@ void RequireDisjointDirectories(const std::filesystem::path &left,
       mismatch.second == canonical_right.end()) {
     Fail("native execution state/run capabilities must be disjoint directory "
          "trees");
-  }
-}
-
-void RequirePathOutsideDirectory(const std::filesystem::path &path,
-                                 const std::filesystem::path &directory) {
-  if (path.empty()) {
-    return;
-  }
-  std::error_code error;
-  const auto canonical_parent =
-      std::filesystem::canonical(path.parent_path(), error);
-  if (error) {
-    Fail("native durable path parent is unavailable");
-  }
-  const auto canonical_path = canonical_parent / path.filename();
-  const auto canonical_directory = std::filesystem::canonical(directory, error);
-  if (error) {
-    Fail("native disposable run capability is unavailable");
-  }
-  const auto mismatch =
-      std::mismatch(canonical_directory.begin(), canonical_directory.end(),
-                    canonical_path.begin(), canonical_path.end());
-  if (mismatch.first == canonical_directory.end()) {
-    Fail("native durable paths must be outside disposable run storage");
   }
 }
 
@@ -376,7 +343,7 @@ void SetNonBlocking(const int fd) {
   return result;
 }
 
-/// Writes the Manager-validated site document (`manyforge.site.v1`) into one
+/// Writes the Manager-validated site document (`manyforge.site.v2`) into one
 /// fresh private run-root snapshot. It is retained with the run's evidence and
 /// never rewritten, so a launched child always reads the bytes it was given.
 [[nodiscard]] std::filesystem::path
@@ -473,36 +440,40 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   return bytes;
 }
 
-[[nodiscard]] std::pair<std::string_view, std::string_view> AdmissionIdentity(
-    const detail::KernelCellAdmissionRpcPacket &packet) noexcept {
+// Diagnostic identity of one exchange (log text only; never on a Stop path).
+[[nodiscard]] std::pair<std::string_view, std::string> AdmissionIdentity(
+    const detail::KernelCellAdmissionRpcPacket &packet) {
+  using manyforge::core::RequestKeyText;
   if (const auto *intent = std::get_if<manyforge::core::CellAdmissionClaimIntentDTO>(&packet.request))
-    return {"request_id", intent->request_id.value()};
+    return {"request_key", RequestKeyText(intent->request_key)};
   if (const auto *release = std::get_if<manyforge::core::CellAdmissionClaimReleaseDTO>(&packet.request))
-    return {"request_id", release->request_id.value()};
+    return {"request_key", RequestKeyText(release->request_key)};
+  if (const auto *apply = std::get_if<detail::ManagerApplyClaimAcquireRequest>(&packet.request))
+    return {"request_key", RequestKeyText(apply->intent.request_key)};
+  if (const auto *apply = std::get_if<detail::ManagerApplyClaimReleaseRequest>(&packet.request))
+    return {"request_key", RequestKeyText(apply->release.request_key)};
   if (const auto *query = std::get_if<manyforge::core::CellAdmissionRecoveryReceiptQueryDTO>(&packet.request))
-    return {"request_id", query->intent.request_id.value()};
+    return {"request_key", RequestKeyText(query->intent.request_key)};
   if (const auto *reset = std::get_if<manyforge::core::ProgramResetSceneAuthorizationDTO>(&packet.request)) {
     if (reset->reset_claim.has_value())
-      return {"request_id", reset->reset_claim->request_id.value()};
-    return {"program_run_id", reset->program_run_id.value()};
+      return {"request_key", RequestKeyText(reset->reset_claim->request_key)};
+    return {"program_run_id", std::to_string(reset->program_run_id.value())};
   }
   return {"none", {}};
 }
 
 template <typename Request>
-[[nodiscard]] std::pair<std::string_view, std::string_view>
-FenceIdentity(const Request &request) noexcept {
+[[nodiscard]] std::pair<std::string_view, std::string>
+FenceIdentity(const Request &request) {
   using namespace manyforge::core;
   if constexpr (std::is_same_v<Request, ApplyConfigurationFenceIntentDTO>)
-    return {"apply_id", request.owner_transaction.apply_id.value()};
+    return {"apply_id", std::to_string(request.owner_transaction.apply_id.value())};
   else if constexpr (std::is_same_v<Request, ApplyFenceAcquireAttemptQueryDTO>)
-    return {"apply_id", request.persisted_intent.owner_transaction.apply_id.value()};
-  else if constexpr (std::is_same_v<Request, ApplyFenceRehydrateDTO>)
-    return {"apply_id", request.apply_id.value()};
+    return {"apply_id", std::to_string(request.persisted_intent.owner_transaction.apply_id.value())};
   else if constexpr (std::is_same_v<Request, ConfigurationFenceStatusQueryDTO>)
-    return {"apply_id", request.owner_transaction.apply_id.value()};
+    return {"apply_id", std::to_string(request.owner_transaction.apply_id.value())};
   else if constexpr (std::is_same_v<Request, ConfigurationFenceReleaseDTO>)
-    return {"apply_id", request.reconciliation_evidence.owner_transaction.apply_id.value()};
+    return {"apply_id", std::to_string(request.reconciliation_evidence.owner_transaction.apply_id.value())};
   else
     return {"none", {}};
 }
@@ -510,13 +481,13 @@ FenceIdentity(const Request &request) noexcept {
 // Rate limit ordinary slow records independently per command; timeouts bypass it.
 [[nodiscard]] bool AllowSlowKernelLog(const std::string_view command,
                                       const std::chrono::steady_clock::time_point now) noexcept {
-  static constexpr std::array<std::string_view, 16> kinds{
+  static constexpr std::array<std::string_view, 14> kinds{
       "cell_admission_get", "cell_admission_update_readiness",
       "cell_admission_publish_liveness", "cell_admission_acquire",
-      "cell_admission_release", "cell_admission_reconcile",
+      "cell_admission_release",
       "cell_admission_recovery_receipt", "cell_admission_validate_program_reset_scene",
       "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
-      "fence_rehydrate", "fence_query_status", "fence_release",
+      "fence_query_status", "fence_release",
       "status", "host_apply"};
   static std::array<std::atomic<std::int64_t>, kinds.size() + 1U> last{};
   const auto found = std::find(kinds.begin(), kinds.end(), command);
@@ -528,6 +499,30 @@ FenceIdentity(const Request &request) noexcept {
       return true;
   }
   return false;
+}
+
+// The management exchanges that can make the host late (OD-121 (4)): the
+// projection operations in request order, then the fence, cell-admission,
+// Host Apply and status exchanges by their command names. The index of one
+// row is what the Manager's tick reads lock-free.
+constexpr std::array<std::string_view, 22U> kLateExchangeKinds{
+    "projection_prepare", "projection_health", "projection_transaction",
+    "projection_rebuild", "projection_bootstrap_rebuild",
+    "projection_bootstrap_status", "projection_retain", "projection_release",
+    "projection_scene_frame", "projection_effective_policy",
+    "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
+    "fence_query_status", "fence_release",
+    "cell_admission_get", "cell_admission_acquire", "cell_admission_release",
+    "cell_admission_recovery_receipt",
+    "cell_admission_validate_program_reset_scene", "host_apply", "status"};
+static_assert(std::variant_size_v<detail::NativeProjectionRpcRequest> == 10U);
+
+[[nodiscard]] std::uint8_t LateExchangeKind(const std::string_view name) {
+  const auto found =
+      std::find(kLateExchangeKinds.begin(), kLateExchangeKinds.end(), name);
+  if (found == kLateExchangeKinds.end())
+    Fail("management exchange kind is not a late-host kind");
+  return static_cast<std::uint8_t>(found - kLateExchangeKinds.begin());
 }
 
 // These protocols do not have a universal per-request ID.
@@ -923,6 +918,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     bool reaped{};
     std::optional<int> exit_status;
     bool shutdown_requested{};
+    // OD-187 (1): ended by SIGKILL after a second stop request.
+    bool force_killed{};
     bool shutdown_acknowledged{};
     bool shutdown_progress_pending{};
     RuntimeEpoch runtime_epoch;
@@ -931,22 +928,25 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     std::string configuration_identity;
     std::string runtime_contract_offer_digest;
     std::set<ProjectionBindingKey> admitted_projection_bindings;
-    // At most one observation response may be outstanding. A timeout never
-    // closes the shared host's channel or terminates its healthy components.
-    std::optional<ManagerComponentProcessInventoryRequestDTO> pending_inspection;
-    bool invalid_pending_inspection_response{};
-    struct PendingProcessStop final {
-      ManagerComponentProcessStopRequestDTO request;
-      bool read_only;
-      // A consuming READ's late response remains in this exact association
-      // until its caller reads it. Other observations may settle the packet,
-      // but cannot consume or replace its proof.
-      std::optional<std::variant<ManagerComponentProcessStopResultDTO,
-                                 detail::SelectedRuntimeCompositionRpcFailure>>
-          response;
+    // True when a late packet is this exchange's reply (what it echoes, L-1).
+    using EchoMatch = std::function<bool(const std::string &)>;
+    // The channel's one outstanding exchange: a request whose reply has not
+    // been read. Nothing new is sent on the channel until its reply arrives
+    // and is consumed (OD-121 (4)). A timeout never closes the host's channel
+    // or stops the host.
+    struct PendingExchange final {
+      std::variant<EchoMatch, ManagerComponentProcessInventoryRequestDTO>
+          request;
+      // A timed-out ordinary management exchange: the host is late. An
+      // inspection keeps its own answers.
+      bool late{};
+      std::uint8_t kind{};
+      std::chrono::milliseconds bound{};
+      // A consumed malformed or foreign reply cannot restore correlation; the
+      // exchange then stays unsettled until the host's owned shutdown.
+      bool invalid_response{};
     };
-    std::optional<PendingProcessStop> pending_process_stop;
-    bool invalid_pending_process_stop_response{};
+    std::optional<PendingExchange> pending;
 
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
@@ -970,13 +970,15 @@ struct RetainedExecutionHostUnitAdapter::Impl final
 
   struct LivenessEndpoint final {
     pid_t pid;
-    RuntimeEpoch runtime_epoch;
     UniqueFd channel;
+    // The liveness channel's one outstanding exchange (L-5), by what its
+    // reply echoes: a cell-admission command, or kLivenessRenewal. Nothing
+    // new is sent on this channel until its reply is consumed.
+    std::optional<std::string> pending_command;
+    bool pending_invalid{};
 
-    LivenessEndpoint(pid_t child_pid, RuntimeEpoch child_epoch,
-                     UniqueFd child_channel)
-        : pid(child_pid), runtime_epoch(std::move(child_epoch)),
-          channel(std::move(child_channel)) {}
+    LivenessEndpoint(pid_t child_pid, UniqueFd child_channel)
+        : pid(child_pid), channel(std::move(child_channel)) {}
 
     LivenessEndpoint(const LivenessEndpoint &) = delete;
     LivenessEndpoint &operator=(const LivenessEndpoint &) = delete;
@@ -990,9 +992,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     ExecutionHostUnitAdmission admission;
   };
 
-  Impl(std::filesystem::path trusted_installed_target_root,
+  Impl(const manyforge::core::ApplicationStartId application_start_id,
+       std::filesystem::path trusted_installed_target_root,
        std::filesystem::path trusted_package_root,
-       std::filesystem::path manager_state_root,
        std::filesystem::path manager_run_root,
        std::filesystem::path execution_state_root,
        std::filesystem::path execution_run_root,
@@ -1002,8 +1004,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
            &selected_artifact_source,
        std::string selected_operating_system,
        std::vector<std::string> selected_launch_environment_contracts,
-       std::filesystem::path logical_scene_database,
-       std::filesystem::path program_cycle_journal,
        std::filesystem::path activation_root,
        std::filesystem::path scene_asset_root,
        std::optional<std::string> site_settings_document)
@@ -1023,31 +1023,30 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                 ? std::filesystem::path{}
                 : NormalizedPlainDirectory(std::move(scene_asset_root),
                                            "scene-asset root")),
-        manager_state_root_path(NormalizedPlainDirectory(
-            std::move(manager_state_root), "Manager state root")),
         manager_run_root_path(NormalizedPlainDirectory(
             std::move(manager_run_root), "Manager run root")),
         execution_state_root_path(NormalizedPlainDirectory(
             std::move(execution_state_root), "native execution state root")),
         execution_run_root_path(NormalizedPlainDirectory(
             std::move(execution_run_root), "native execution run root")),
-        logical_scene_database_path(std::move(logical_scene_database)),
-        program_cycle_journal_path(std::move(program_cycle_journal)),
         bundle_source(selected_bundle_source),
         artifact_source(selected_artifact_source),
         operating_system(std::move(selected_operating_system)),
         launch_environment_contracts(
             std::move(selected_launch_environment_contracts)),
         site_settings_document(std::move(site_settings_document)),
-        observer_instance_id("native-observer-" + RandomHex()) {
+        observer_instance_id("native-observer-" + RandomHex()),
+        start_epoch([&] {
+          const auto text = FormatApplicationStartId(application_start_id);
+          return RuntimeEpoch(std::string(text.data(), text.size()));
+        }()) {
     if (this->site_settings_document.has_value() &&
         this->site_settings_document->find('\0') != std::string::npos) {
       Fail("site settings document cannot contain NUL");
     }
-    const std::array<const std::filesystem::path *, 4U> typed_roots{
-        &manager_state_root_path, &manager_run_root_path,
-        &execution_state_root_path, &execution_run_root_path};
-    RequirePrivateDirectory(manager_state_root_path, "Manager state root");
+    const std::array<const std::filesystem::path *, 3U> typed_roots{
+        &manager_run_root_path, &execution_state_root_path,
+        &execution_run_root_path};
     RequirePrivateDirectory(manager_run_root_path, "Manager run root");
     RequirePrivateDirectory(execution_state_root_path,
                             "native execution state root");
@@ -1078,15 +1077,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         RequireDisjointDirectories(scene_asset_root_path, *typed_root);
       }
       scene_asset_root_fd = OpenPinnedPackageRoot(scene_asset_root_path);
-    }
-    const std::array<const std::filesystem::path *, 2U> durable_paths{
-        &logical_scene_database_path, &program_cycle_journal_path};
-    const std::array<const std::filesystem::path *, 2U> run_roots{
-        &manager_run_root_path, &execution_run_root_path};
-    for (const auto *durable_path : durable_paths) {
-      for (const auto *run_root : run_roots) {
-        RequirePathOutsideDirectory(*durable_path, *run_root);
-      }
     }
     std::sort(launch_environment_contracts.begin(),
               launch_environment_contracts.end());
@@ -1133,6 +1123,37 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   void EraseChild(const std::map<std::string, Child>::iterator child) {
     EraseLivenessEndpoint(child->first);
     children.erase(child);
+  }
+
+  [[nodiscard]] static manyforge::core::ErrorDTO
+  BusyError(const std::string &runtime_unit_id, const std::string_view phase) {
+    return {std::string(kRuntimeUnitLaunchInProgressCode),
+            "the execution host is " +
+                std::string(phase == "launching" ? "being launched"
+                                                 : "preparing its projections") +
+                "; retry the call",
+            {{"phase", std::string(phase)},
+             {"runtime_unit_id", runtime_unit_id}}};
+  }
+
+  // Under `mutex`: the busy answer for one unit, if it is launching or
+  // preparing.
+  [[nodiscard]] std::optional<manyforge::core::ErrorDTO>
+  BusyLocked(const std::string &runtime_unit_id) const {
+    const auto found = busy_units.find(runtime_unit_id);
+    if (found == busy_units.end()) return std::nullopt;
+    return BusyError(found->first, found->second);
+  }
+
+  // Under `mutex`: the busy answer for calls addressed to the sole host.
+  [[nodiscard]] std::optional<manyforge::core::ErrorDTO> AnyBusyLocked() const {
+    if (busy_units.empty()) return std::nullopt;
+    return BusyError(busy_units.begin()->first, busy_units.begin()->second);
+  }
+
+  void ThrowIfBusyLocked(const std::string &runtime_unit_id) const {
+    if (auto busy = BusyLocked(runtime_unit_id))
+      throw manyforge::core::TypedError(*busy, "component_manager");
   }
 
   [[nodiscard]] std::pair<std::shared_ptr<const RetainedBundle>,
@@ -1215,9 +1236,14 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (result == child.pid) {
       if (WIFEXITED(status)) {
         child.exit_status = WEXITSTATUS(status);
+        host_exit_value.store(WEXITSTATUS(status), std::memory_order_relaxed);
+        host_exited.store(true, std::memory_order_release);
         std::cerr << "execution host child exited: pid=" << child.pid
                   << " status=" << WEXITSTATUS(status) << '\n';
       } else if (WIFSIGNALED(status)) {
+        host_exit_signaled.store(true, std::memory_order_relaxed);
+        host_exit_value.store(WTERMSIG(status), std::memory_order_relaxed);
+        host_exited.store(true, std::memory_order_release);
         std::cerr << "execution host child terminated: pid=" << child.pid
                   << " signal=" << WTERMSIG(status) << '\n';
       } else {
@@ -1237,92 +1263,154 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     Fail("execution host child observation returned a foreign PID");
   }
 
-  [[nodiscard]] bool SettlePendingProcessStop(Child &child) {
-    if (!child.pending_process_stop) return true;
-    if (child.invalid_pending_process_stop_response) return false;
-    if (child.pending_process_stop->response) return true;
-    try {
-      const auto packet = ReceivePacket(child.channel.get(), std::chrono::milliseconds(0));
-      if (!packet) return false;
-      auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
-      if (const auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response)) {
-        if (!result->valid() || result->request != child.pending_process_stop->request) {
-          child.invalid_pending_process_stop_response = true;
-          return false;
-        }
-      } else if (!std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(response)) {
-        child.invalid_pending_process_stop_response = true;
-        return false;
-      }
-      if (child.pending_process_stop->read_only) {
-        if (auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response))
-          child.pending_process_stop->response.emplace(std::move(*result));
-        else
-          child.pending_process_stop->response.emplace(
-              std::move(std::get<detail::SelectedRuntimeCompositionRpcFailure>(response)));
-      } else {
-        child.pending_process_stop.reset();
-      }
-      return true;
-    } catch (...) {
-      child.invalid_pending_process_stop_response = true;
-      return false;
-    }
+  // The typed answer of a call that meets the late host, and of the exchange
+  // that timed out (OD-121 (4)): the outcome of the request is unknown.
+  [[nodiscard]] static manyforge::core::ErrorDTO
+  LateError(const std::string_view exchange,
+            const std::chrono::milliseconds bound) {
+    return {std::string(kExecutionHostLateCode),
+            "the execution host did not answer within its bound; the outcome "
+            "of the request is unknown",
+            {{"exchange", std::string(exchange)},
+             {"bound_ms", std::to_string(bound.count())}}};
   }
 
-  [[nodiscard]] bool SettlePendingInspection(Child &child) {
-    if (!SettlePendingProcessStop(child)) return false;
-    if (!child.pending_inspection) return true;
-    if (child.invalid_pending_inspection_response) return false;
-    try {
-      const auto packet = ReceivePacket(child.channel.get(), std::chrono::milliseconds(0));
-      if (!packet) return false;
-      const auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
-      const auto *result =
-          std::get_if<ManagerComponentProcessInventoryResultDTO>(&response);
-      const bool matched = result && result->valid() &&
-                           result->request == *child.pending_inspection;
-      if (!matched &&
-          !std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(
-              response)) {
-        child.invalid_pending_inspection_response = true;
-        return false;
-      }
-      std::cerr << "component inspection late response settled: pid=" << child.pid
-                << " epoch=" << child.runtime_epoch.value() << '\n';
-      child.pending_inspection.reset();
-      return true;
-    } catch (...) {
-      // A consumed malformed/foreign reply cannot restore channel correlation.
-      // Leave it unresolved; only explicit owned shutdown can discard it.
-      child.invalid_pending_inspection_response = true;
-      return false;
-    }
+  // The answer of a call that meets the late host: nothing was sent, so it is
+  // refused before any effect (`effect: none`, which the Apply journal reads
+  // as a known before-effect failure). Only the exchange that timed out
+  // itself has an unknown outcome.
+  [[nodiscard]] static manyforge::core::ErrorDTO
+  LateError(const Child::PendingExchange &pending) {
+    auto error = LateError(kLateExchangeKinds[pending.kind], pending.bound);
+    error.details.emplace("effect", "none");
+    return error;
   }
 
-  void RequireSettledInspection(Child &child) {
-    if (!SettlePendingInspection(child))
-      Fail("shared runtime channel has an unresolved component inspection response");
+  // Under `mutex` (or the unit's busy phase): a timed-out ordinary exchange
+  // becomes the channel's one pending exchange and the host is late. Nothing
+  // is closed, stopped or killed (OD-120 (4)). The Manager's tick reads the
+  // late state lock-free.
+  [[nodiscard]] manyforge::core::ErrorDTO
+  BeginLate(Child &child, Child::EchoMatch match, const std::uint8_t kind,
+            const std::chrono::milliseconds bound,
+            const std::chrono::steady_clock::time_point started) {
+    child.pending.emplace(
+        Child::PendingExchange{std::move(match), true, kind, bound, false});
+    host_late_kind.store(kind, std::memory_order_relaxed);
+    host_late_bound_ms.store(bound.count(), std::memory_order_relaxed);
+    host_late_since_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            started.time_since_epoch())
+            .count(),
+        std::memory_order_relaxed);
+    host_late.store(true, std::memory_order_relaxed);
+    host_late_episode.fetch_add(1U, std::memory_order_release);
+    return LateError(kLateExchangeKinds[kind], bound);
+  }
+
+  // True when `packet` is the pending exchange's reply.
+  [[nodiscard]] static bool MatchPendingReply(const Child::PendingExchange &pending,
+                                              const std::string &packet) {
+    if (const auto *match = std::get_if<Child::EchoMatch>(&pending.request))
+      return (*match)(packet);
+    auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(packet);
+    const bool failure =
+        std::holds_alternative<detail::SelectedRuntimeCompositionRpcFailure>(
+            response);
+    const auto &inspection =
+        std::get<ManagerComponentProcessInventoryRequestDTO>(pending.request);
+    const auto *result =
+        std::get_if<ManagerComponentProcessInventoryResultDTO>(&response);
+    return failure ||
+           (result && result->valid() && result->request == inspection);
+  }
+
+  // Under `mutex` (or the unit's busy phase): settle the channel's one
+  // outstanding exchange with a non-blocking receive; true when the channel
+  // is free. A late reply is consumed and discarded and the late state ends:
+  // the host unit stops counting as faulted by itself (no latch, no Reset).
+  [[nodiscard]] bool SettlePending(Child &child) {
+    if (!child.pending) return true;
+    auto &pending = *child.pending;
+    if (pending.invalid_response) return false;
+    try {
+      const auto packet =
+          ReceivePacket(child.channel.get(), std::chrono::milliseconds(0));
+      if (!packet) return false;
+      if (!MatchPendingReply(pending, *packet)) {
+        pending.invalid_response = true;
+        return false;
+      }
+    } catch (...) {
+      pending.invalid_response = true;
+      return false;
+    }
+    if (pending.late) {
+      std::cerr << "execution host late reply settled: pid=" << child.pid
+                << " exchange=" << kLateExchangeKinds[pending.kind] << '\n';
+      host_late.store(false, std::memory_order_release);
+    } else if (std::holds_alternative<ManagerComponentProcessInventoryRequestDTO>(
+                   pending.request)) {
+      std::cerr << "component inspection late response settled: pid="
+                << child.pid << " epoch=" << child.runtime_epoch.value()
+                << '\n';
+    }
+    child.pending.reset();
+    return true;
+  }
+
+  // For callers that answer by throwing: the channel is free, or the typed
+  // late answer, or the existing unresolved inspection failure.
+  void RequireSettled(Child &child) {
+    if (SettlePending(child)) return;
+    if (child.pending->late)
+      throw manyforge::core::TypedError(LateError(*child.pending),
+                                        "component_manager");
+    Fail("shared runtime channel has an unresolved component inspection response");
+  }
+
+  // A projection reply decodes as a projection response; Prepare echoes its
+  // exact request (L-1).
+  [[nodiscard]] static Child::EchoMatch
+  ProjectionEcho(const detail::NativeProjectionRpcRequest &request) {
+    std::optional<detail::NativeProjectionPrepareRequest> prepare;
+    if (const auto *selected =
+            std::get_if<detail::NativeProjectionPrepareRequest>(&request))
+      prepare = *selected;
+    return [prepare = std::move(prepare)](const std::string &packet) {
+      const auto response = detail::DecodeNativeProjectionRpcResponse(packet);
+      if (!prepare ||
+          std::holds_alternative<detail::NativeProjectionRpcFailure>(response))
+        return true;
+      const auto *prepared =
+          std::get_if<detail::NativeProjectionPrepareResult>(&response);
+      return prepared != nullptr &&
+             prepared->request.execution_host_binding ==
+                 prepare->execution_host_binding &&
+             prepared->request.candidate_retained_bundle_id ==
+                 prepare->candidate_retained_bundle_id &&
+             prepared->request.candidate_graph_revision ==
+                 prepare->candidate_graph_revision &&
+             prepared->request.planning_collision_model ==
+                 prepare->planning_collision_model;
+    };
   }
 
   [[nodiscard]] detail::NativeProjectionRpcResponse ExchangeProjectionRaw(
       Child &child, const detail::NativeProjectionRpcRequest &request,
       const std::chrono::milliseconds timeout = kStatusTimeout) {
-    RequireSettledInspection(child);
+    RequireSettled(child);
     const auto encoded = detail::EncodeNativeProjectionRpcRequest(request);
+    const auto started = std::chrono::steady_clock::now();
     SendPacket(child.channel.get(), encoded, timeout);
     const auto packet = ReceivePacket(child.channel.get(), timeout);
     if (!packet.has_value()) {
-      // A late response on this untagged request/reply channel could otherwise
-      // be consumed as the reply to a later command.  Once a request times
-      // out, the stream is no longer usable: stop this exact child.  Periodic
-      // convergence only observes the lost unit; only the Manager daemon
-      // bootstrap (a workbench restart) creates a fresh epoch.
-      child.channel.Reset();
-      StopChildNoThrow(child);
-      Fail("native projection " +
-           std::string(ProjectionOperationName(request)) +
-           " response timed out");
+      // Late, not lost: the reply is recognised and discarded when it comes.
+      throw manyforge::core::TypedError(
+          BeginLate(child, ProjectionEcho(request),
+                    static_cast<std::uint8_t>(request.index()), timeout,
+                    started),
+          "component_manager");
     }
     auto response = detail::DecodeNativeProjectionRpcResponse(*packet);
     return response;
@@ -1350,9 +1438,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       Fail("native projection request binding is invalid");
     }
     std::lock_guard lock(mutex);
+    ThrowIfBusyLocked(binding.runtime_unit_id.value());
     const auto found = children.find(binding.runtime_unit_id.value());
-    if (found == children.end() ||
-        found->second.runtime_epoch != binding.runtime_epoch) {
+    if (found == children.end()) {
       Fail("native projection client no longer names the current child epoch");
     }
     const ProjectionBindingKey key{binding.provider_binding_id,
@@ -1380,9 +1468,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       Fail("native projection request binding is invalid");
     }
     std::lock_guard lock(mutex);
+    ThrowIfBusyLocked(binding.runtime_unit_id.value());
     const auto found = children.find(binding.runtime_unit_id.value());
-    if (found == children.end() ||
-        found->second.runtime_epoch != binding.runtime_epoch) {
+    if (found == children.end()) {
       Fail("native projection client no longer names the current child epoch");
     }
     const ProjectionBindingKey key{binding.provider_binding_id,
@@ -1408,7 +1496,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
 
   template <typename Response, typename Request>
   [[nodiscard]] Response KernelFenceCall(const Request &request) {
+    // Read from the Manager's own plan before the channel lock is taken.
+    detail::KernelApplyFenceRpcPacket packet{request, std::nullopt};
+    if constexpr (!std::is_same_v<Request, manyforge::core::ConfigurationFenceReleaseDTO>)
+      packet.active_publication = active_publication();
     std::lock_guard lock(mutex);
+    if (auto busy = AnyBusyLocked())
+      throw manyforge::core::TypedError(*busy, "component_manager");
     if (children.size() != 1U) {
       Fail("Kernel Apply-fence request requires the sole managed native "
            "execution child");
@@ -1418,28 +1512,46 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       EraseChild(found);
       Fail("managed Kernel child exited before its fence response");
     }
-    return ExchangeKernelFence<Response>(found->second, request);
+    return ExchangeKernelFence<Response>(found->second, request, packet);
   }
 
   template <typename Response, typename Request>
   [[nodiscard]] Response ExchangeKernelFence(Child &child,
-                                             const Request &request) {
-    RequireSettledInspection(child);
-    const detail::KernelApplyFenceRpcRequest kind(request);
-    const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(kind);
-    static constexpr std::array<std::string_view, 6> names{
+                                             const Request &request,
+                                             const detail::KernelApplyFenceRpcPacket &packet) {
+    RequireSettled(child);
+    const auto &kind = packet.request;
+    const auto encoded = detail::EncodeKernelApplyFenceRpcPacket(packet);
+    static constexpr std::array<std::string_view, 5> names{
         "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
-        "fence_rehydrate", "fence_query_status", "fence_release"};
+        "fence_query_status", "fence_release"};
     static_assert(names.size() == std::variant_size_v<detail::KernelApplyFenceRpcRequest>);
     const auto [id_type, id] = FenceIdentity(request);
-    const auto packet = TimedKernelExchange(child.channel.get(), encoded,
+    const auto started = std::chrono::steady_clock::now();
+    const auto fence_reply = TimedKernelExchange(child.channel.get(), encoded,
         kStatusTimeout, names[kind.index()], child.pid, id_type, id);
-    if (!packet.has_value()) {
-      child.channel.Reset();
-      StopChildNoThrow(child);
-      Fail("managed Kernel Apply-fence response timed out");
+    if (!fence_reply.has_value()) {
+      // Late, not lost: a fence reply carries its request's identity.
+      Child::EchoMatch echo = [request](const std::string &late) {
+        const auto response = detail::DecodeKernelApplyFenceRpcResponse(late);
+        if (std::holds_alternative<detail::KernelApplyFenceRpcFailure>(response))
+          return true;
+        const auto *typed = std::get_if<Response>(&response);
+        if (typed == nullptr) return false;
+        if constexpr (requires(const Response &reply, const Request &query) {
+                        reply.matches(query);
+                      })
+          return typed->matches(request);
+        else
+          return true;
+      };
+      throw manyforge::core::TypedError(
+          BeginLate(child, std::move(echo),
+                    LateExchangeKind(names[kind.index()]), kStatusTimeout,
+                    started),
+          "component_manager");
     }
-    auto response = detail::DecodeKernelApplyFenceRpcResponse(*packet);
+    auto response = detail::DecodeKernelApplyFenceRpcResponse(*fence_reply);
     if (const auto *failure =
             std::get_if<detail::KernelApplyFenceRpcFailure>(&response)) {
       Fail("managed Kernel Apply-fence request failed [" + failure->error.code +
@@ -1456,6 +1568,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   [[nodiscard]] manyforge::core::Result<Response>
   KernelCellAdmissionCall(const detail::KernelCellAdmissionRpcPacket &request) {
     std::lock_guard lock(mutex);
+    if (auto busy = AnyBusyLocked())
+      return manyforge::core::Result<Response>::Err(std::move(*busy));
     if (children.size() != 1U) {
       return manyforge::core::Result<Response>::Err(
           {"kernel_owner_unavailable",
@@ -1473,17 +1587,27 @@ struct RetainedExecutionHostUnitAdapter::Impl final
            "managed Kernel child exited before its cell-admission response",
            {{"reason", std::string(exit_reason)}}});
     }
-    if (!SettlePendingInspection(found->second))
+    if (!SettlePending(found->second)) {
+      if (found->second.pending->late)
+        return manyforge::core::Result<Response>::Err(
+            LateError(*found->second.pending));
       return manyforge::core::Result<Response>::Err(
           {"installed_process_inspection_pending", "shared runtime channel has an unresolved inspection response", {}});
+    }
     const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
     const auto [id_type, id] = AdmissionIdentity(request);
+    const auto started = std::chrono::steady_clock::now();
     const auto packet = TimedKernelExchange(found->second.channel.get(), encoded,
         kStatusTimeout, request.command, found->second.pid, id_type, id);
     if (!packet.has_value()) {
-      found->second.channel.Reset();
-      StopChildNoThrow(found->second);
-      Fail("managed Kernel cell-admission response timed out");
+      // Late, not lost: a cell-admission reply echoes its command.
+      return manyforge::core::Result<Response>::Err(BeginLate(
+          found->second,
+          [command = request.command](const std::string &late) {
+            return detail::DecodeKernelCellAdmissionRpcResponse(late).command ==
+                   command;
+          },
+          LateExchangeKind(request.command), kStatusTimeout, started));
     }
     const auto response = detail::DecodeKernelCellAdmissionRpcResponse(*packet);
     if (response.command != request.command) {
@@ -1501,76 +1625,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     return manyforge::core::Result<Response>::Ok(*typed);
   }
 
-  [[nodiscard]] manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-  ComponentProcessStopCall(const ManagerComponentProcessStopRequestDTO &request, bool read_only) {
-    using Result = manyforge::core::Result<ManagerComponentProcessStopResultDTO>;
-    if (!request.valid()) Fail("component process Stop request is invalid");
-    const auto unknown = [&](const char *code, const char *message) {
-      return Result::Ok({request, manyforge::core::ControllerLaunchCleanupState::kUnknown,
-                         std::nullopt, manyforge::core::ErrorDTO{code, message, {}}});
-    };
-    const auto encoded = read_only
-        ? detail::EncodeSelectedRuntimeCompositionRpcRequest(ManagerComponentProcessStopReadRequestDTO{request})
-        : detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
-    std::lock_guard lock(mutex);
-    const auto found = children.find(request.runtime_unit_id.value());
-    if (found == children.end())
-      return unknown("component_process_stop_owner_unavailable", "the original managed host is unavailable");
-    if (!ChildIsLive(found->second)) {
-      EraseChild(found);
-      return unknown("component_process_stop_owner_unavailable", "the original managed host exited without drain proof");
-    }
-    if (found->second.runtime_epoch != request.runtime_epoch)
-      return Result::Err({"component_process_stop_foreign_host", "process Stop names a different host occurrence", {}});
-    if (!SettlePendingInspection(found->second))
-      return unknown("component_process_stop_pending", "the original managed response remains unresolved");
-    if (found->second.pending_process_stop) {
-      auto &pending = *found->second.pending_process_stop;
-      if (read_only) {
-        if (pending.request != request)
-          return unknown("component_process_stop_pending",
-                         "the retained READ response belongs to another exact request");
-        auto response = std::move(*pending.response);
-        found->second.pending_process_stop.reset();
-        if (auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(&response))
-          return Result::Err(std::move(failure->error));
-        return Result::Ok(std::move(std::get<ManagerComponentProcessStopResultDTO>(response)));
-      }
-      if (pending.request == request) {
-        // Exact duplicate Stop returns the already received result without
-        // sending or consuming the retained READ association.
-        if (const auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
-                &*pending.response))
-          return Result::Err(failure->error);
-        return Result::Ok(std::get<ManagerComponentProcessStopResultDTO>(*pending.response));
-      }
-      // A newer explicit Stop replaces the previous settled association, as
-      // the host's existing latest-result contract does. A READ never does.
-      found->second.pending_process_stop.reset();
-    }
-    Child::PendingProcessStop pending{request, read_only, std::nullopt};
-    // This explicit teardown reuses the original management lane's retire_exact.
-    // A late response keeps correlation and the host alive; READ never signals.
-    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
-    found->second.pending_process_stop.emplace(std::move(pending));
-    const auto packet = ReceivePacket(found->second.channel.get(), kStatusTimeout);
-    if (!packet)
-      return unknown("component_process_stop_response_unavailable", "process Stop has no exact response yet");
-    found->second.invalid_pending_process_stop_response = true;
-    const auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
-    if (const auto *failure = std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(&response)) {
-      found->second.pending_process_stop.reset();
-      found->second.invalid_pending_process_stop_response = false;
-      return Result::Err(failure->error);
-    }
-    const auto *result = std::get_if<ManagerComponentProcessStopResultDTO>(&response);
-    if (!result || !result->valid() || result->request != request)
-      Fail("managed host returned a foreign component process Stop result");
-    found->second.pending_process_stop.reset();
-    found->second.invalid_pending_process_stop_response = false;
-    return Result::Ok(*result);
-  }
-
   [[nodiscard]] manyforge::core::Result<
       ManagerComponentProcessInventoryResultDTO>
   InspectInstalledComponentProcesses(
@@ -1582,6 +1636,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     const auto encoded =
         detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
     std::lock_guard lock(mutex);
+    if (auto busy = BusyLocked(request.runtime_unit_id.value()))
+      return Result::Err(std::move(*busy));
     const auto found = children.find(request.runtime_unit_id.value());
     if (found == children.end())
       return Result::Err({"installed_process_inspection_unavailable",
@@ -1594,42 +1650,38 @@ struct RetainedExecutionHostUnitAdapter::Impl final
            "managed child exited before installed process inspection",
            {}});
     }
-    if (found->second.runtime_epoch != request.runtime_epoch)
-      return Result::Err(
-          {"installed_process_inspection_foreign_runtime",
-           "installed process inspection names another actual host epoch",
-           {}});
-    if (!SettlePendingInspection(found->second))
+    if (!SettlePending(found->second)) {
+      if (found->second.pending->late)
+        return Result::Err(LateError(*found->second.pending));
       return Result::Err({"installed_process_inspection_pending",
                           "previous process read or Stop has no exact response",
                           {}});
+    }
     const auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
         kProjectionPreparationTimeout);
-    auto pending = request;
     SendPacket(found->second.channel.get(), encoded, timeout);
-    found->second.pending_inspection.emplace(std::move(pending));
+    found->second.pending.emplace(
+        Child::PendingExchange{request, false, 0U, timeout, false});
     const auto packet = ReceivePacket(found->second.channel.get(), timeout);
     if (!packet)
       return Result::Err({"installed_process_inspection_timed_out",
                           "installed process inventory response is "
                           "unavailable; shared host remains running",
                           {}});
-    found->second.invalid_pending_inspection_response = true;
+    found->second.pending->invalid_response = true;
     const auto response =
         detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
     if (const auto *failure =
             std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
                 &response)) {
-      found->second.pending_inspection.reset();
-      found->second.invalid_pending_inspection_response = false;
+      found->second.pending.reset();
       return Result::Err(failure->error);
     }
     const auto *result =
         std::get_if<ManagerComponentProcessInventoryResultDTO>(&response);
     if (!result || !result->valid() || result->request != request)
       Fail("managed child returned foreign installed process inventory");
-    found->second.pending_inspection.reset();
-    found->second.invalid_pending_inspection_response = false;
+    found->second.pending.reset();
     return Result::Ok(*result);
   }
 
@@ -1647,6 +1699,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         manyforge::deployment::ros2_control_execution_runtime_contract::
             component_composition_budgets_ns(candidate->value().cell_graph);
     std::lock_guard lock(mutex);
+    if (auto busy = BusyLocked(runtime_unit_id.value()))
+      return manyforge::core::Result<HostApplyResult>::Err(std::move(*busy));
     const auto found = children.find(runtime_unit_id.value());
     if (found == children.end()) {
       Fail("host Apply names no current execution host");
@@ -1655,17 +1709,34 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       EraseChild(found);
       Fail("execution host exited before its Apply response");
     }
-    RequireSettledInspection(found->second);
+    if (!SettlePending(found->second)) {
+      if (found->second.pending->late)
+        return manyforge::core::Result<HostApplyResult>::Err(
+            LateError(*found->second.pending));
+      Fail("shared runtime channel has an unresolved component inspection response");
+    }
     const auto encoded = detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
     // The host installs every added or replaced component inside this one
     // exchange, so it waits for the sum of their budgets.
     const auto timeout = detail::HostApplyTimeout(request, budgets_ns);
+    const auto started = std::chrono::steady_clock::now();
     const auto packet = TimedKernelExchange(found->second.channel.get(), encoded, timeout,
-        "host_apply", found->second.pid, "apply_id", request.apply.apply_id.value());
+        "host_apply", found->second.pid, "apply_id", std::to_string(request.apply.apply_id.value()));
     if (!packet.has_value()) {
-      found->second.channel.Reset();
-      StopChildNoThrow(found->second);
-      Fail("execution-host Apply response timed out");
+      // Late, not lost: the outcome is unknown and the Apply journal records
+      // it through its unknown-effect path (L-4). The host Apply reply
+      // carries no Apply id; the one pending exchange identifies it (L-1).
+      return manyforge::core::Result<HostApplyResult>::Err(BeginLate(
+          found->second,
+          [](const std::string &late) {
+            const auto response =
+                detail::DecodeSelectedRuntimeCompositionRpcResponse(late);
+            const auto *result = std::get_if<HostApplyResult>(&response);
+            return std::holds_alternative<
+                       detail::SelectedRuntimeCompositionRpcFailure>(response) ||
+                   (result != nullptr && result->valid());
+          },
+          LateExchangeKind("host_apply"), timeout, started));
     }
     const auto response = detail::DecodeSelectedRuntimeCompositionRpcResponse(*packet);
     if (const auto *failure =
@@ -1694,11 +1765,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     const auto &required_set = requests.front().required_set;
     const auto &heartbeat = requests.front().heartbeat;
     const auto &policy = requests.front().policy;
-    const auto publication_generation =
-        requests.front().active_publication_generation;
-    const auto graph_revision = requests.front().active_graph_revision;
-    const auto public_pointer_digest =
-        requests.front().active_public_pointer_digest;
+    const auto &publication = requests.front().active_publication;
     std::set<std::string> requested_receivers;
     for (const auto &request : requests) {
       if (!manyforge::core::ValidateManagerLivenessRequiredSet(
@@ -1706,9 +1773,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                .ok() ||
           request.required_set != required_set ||
           request.heartbeat != heartbeat || request.policy != policy ||
-          request.active_publication_generation != publication_generation ||
-          request.active_graph_revision != graph_revision ||
-          request.active_public_pointer_digest != public_pointer_digest ||
+          request.active_publication != publication ||
           !requested_receivers.insert(request.receiver_runtime_unit_id.value())
                .second) {
         Fail("Manager-liveness batch is not one exact required-set renewal");
@@ -1739,9 +1804,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
           endpoint == liveness_endpoints.end()) {
         Fail("Manager-liveness request names an unavailable native receiver");
       }
-      if (endpoint->second.runtime_epoch != required->runtime_epoch) {
-        throw ManagerLivenessRuntimeTransition();
-      }
       encoded.push_back(detail::EncodeManagerLivenessRpcRequest(request));
     }
 
@@ -1762,10 +1824,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       auto found =
           liveness_endpoints.find(request.receiver_runtime_unit_id.value());
       if (expected == required_set.required_receivers.end() ||
-          found == liveness_endpoints.end() ||
-          found->second.runtime_epoch != expected->runtime_epoch) {
+          found == liveness_endpoints.end()) {
         throw ManagerLivenessRuntimeTransition();
       }
+      if (!SettleLiveness(found->second))
+        throw manyforge::core::TypedError(
+            LateError(*found->second.pending_command, kManagerLivenessTimeout),
+            "component_manager");
       targets.push_back(&found->second);
       descriptors.push_back({found->second.channel.get(), 0, 0});
     }
@@ -1782,12 +1847,24 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                  : "execution host liveness batch packet was not sent "
                    "atomically");
       }
+      targets[index]->pending_command = std::string(kLivenessRenewal);
     }
-    WaitForAll(descriptors, POLLIN, deadline.value());
+    try {
+      WaitForAll(descriptors, POLLIN, deadline.value());
+    } catch (const RetainedExecutionHostUnitAdapterError &error) {
+      // The call fails; nothing is stopped. Each unread renewal stays its
+      // channel's one pending exchange until its reply arrives.
+      if (std::string_view(error.what()) != "execution host liveness batch timed out")
+        throw;
+      throw manyforge::core::TypedError(
+          LateError(kLivenessRenewal, kManagerLivenessTimeout),
+          "component_manager");
+    }
     std::vector<std::string> packets;
     packets.reserve(targets.size());
-    for (const auto *target : targets) {
+    for (auto *target : targets) {
       packets.push_back(ReceiveReadyPacket(target->channel.get()));
+      target->pending_command.reset();
     }
     std::vector<manyforge::core::ManagerLivenessObservationDTO> responses;
     responses.reserve(targets.size());
@@ -1818,41 +1895,45 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       }
       Fail("Manager-liveness batch returned mixed renewal outcomes");
     }
-    for (std::size_t index = 0U; index < responses.size(); ++index) {
-      auto &response = responses[index];
-      const auto &request = requests[index];
-      const auto receiver = std::find_if(
-          required_set.required_receivers.begin(),
-          required_set.required_receivers.end(), [&](const auto &row) {
-            return row.runtime_unit_id == request.receiver_runtime_unit_id;
-          });
-      if (receiver == required_set.required_receivers.end() ||
-          response.active_bundle_id != required_set.active_bundle_id ||
-          response.required_runtime_set_digest !=
-              required_set.required_runtime_set_digest ||
-          response.status.receiver_runtime_unit_id !=
-              request.receiver_runtime_unit_id ||
-          response.status.receiver_runtime_epoch !=
-              receiver->runtime_epoch ||
-          response.status.manager_runtime_unit_id !=
-              required_set.manager_runtime_unit_id ||
-          response.status.manager_runtime_epoch !=
-              required_set.manager_runtime_epoch ||
-          response.status.manager_owner_epoch !=
-              required_set.manager_owner_epoch ||
-          response.status.runtime_policy_id !=
-              receiver->runtime_policy_id ||
-          response.status.runtime_policy_revision !=
-              receiver->runtime_policy_revision ||
-          response.status.last_accepted_heartbeat_sequence !=
-              request.heartbeat.heartbeat_sequence ||
-          response.receiver_status_digest !=
-              manyforge::core::ComputeManagerLivenessStatusDigest(
-                  response.status)) {
-        Fail("native liveness receiver returned foreign evidence");
-      }
-    }
     return responses;
+  }
+
+  static constexpr std::string_view kLivenessRenewal = "manager_liveness_renewal";
+
+  // Under `liveness_mutex`: settle the liveness channel's one outstanding
+  // exchange with a non-blocking receive; true when the channel is free. A
+  // late reply is consumed and discarded.
+  [[nodiscard]] static bool SettleLiveness(LivenessEndpoint &endpoint) {
+    if (!endpoint.pending_command) return true;
+    if (endpoint.pending_invalid) return false;
+    try {
+      const auto packet =
+          ReceivePacket(endpoint.channel.get(), std::chrono::milliseconds(0));
+      if (!packet) return false;
+      bool matched = true;
+      if (*endpoint.pending_command == kLivenessRenewal) {
+        try {
+          static_cast<void>(detail::DecodeManagerLivenessRpcResponse(*packet));
+        } catch (const detail::ManagerLivenessRpcRejection &) {
+          // A refused renewal is still that renewal's reply.
+        }
+      } else {
+        matched = detail::DecodeKernelCellAdmissionRpcResponse(*packet).command ==
+                  *endpoint.pending_command;
+      }
+      if (!matched) {
+        endpoint.pending_invalid = true;
+        return false;
+      }
+    } catch (...) {
+      endpoint.pending_invalid = true;
+      return false;
+    }
+    std::cerr << "execution host late liveness reply settled: pid="
+              << endpoint.pid << " exchange=" << *endpoint.pending_command
+              << '\n';
+    endpoint.pending_command.reset();
+    return true;
   }
 
   template <typename Response>
@@ -1870,12 +1951,18 @@ struct RetainedExecutionHostUnitAdapter::Impl final
            {{"reason", "execution_host_child_unavailable"}}});
     }
     auto &endpoint = liveness_endpoints.begin()->second;
+    if (!SettleLiveness(endpoint))
+      return manyforge::core::Result<Response>::Err(
+          LateError(*endpoint.pending_command, kManagerLivenessTimeout));
     const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
     const auto [id_type, id] = AdmissionIdentity(request);
     const auto packet = TimedKernelExchange(endpoint.channel.get(), encoded,
         kManagerLivenessTimeout, request.command, endpoint.pid, id_type, id);
     if (!packet.has_value()) {
-      Fail("managed Kernel liveness/readiness response timed out");
+      // The call fails; nothing is stopped. The reply echoes its command.
+      endpoint.pending_command = request.command;
+      return manyforge::core::Result<Response>::Err(
+          LateError(request.command, kManagerLivenessTimeout));
     }
     const auto response = detail::DecodeKernelCellAdmissionRpcResponse(*packet);
     if (response.command != request.command) {
@@ -1962,10 +2049,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (!packet)
       Fail("shutdown progress response is unavailable");
     child.shutdown_progress_pending = false;
-    auto result = detail::DecodeNativeShutdownRpcResponse(*packet);
-    if (result.runtime_epoch != child.runtime_epoch.value())
-      Fail("shutdown progress names a foreign runtime epoch");
-    return result;
+    return detail::DecodeNativeShutdownRpcResponse(*packet);
   }
 
   void StopChildNoThrow(Child &child) noexcept {
@@ -1975,12 +2059,12 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         return;
       } catch (const std::exception &error) {
         // Unknown direct-child ownership is not permission to target a reused
-        // PID. Normal destruction waits for an explicit operator force action.
+        // PID: this waits until the Manager process itself is ended (only a
+        // defect reaches here; a stop request does not end this wait).
         std::cerr << "shutdown stuck at child-exit-observation: "
-                  << error.what() << "; to force: manyforge-operator stop\n";
+                  << error.what() << '\n';
       } catch (...) {
-        std::cerr << "shutdown stuck at child-exit-observation; to force: "
-                     "manyforge-operator stop\n";
+        std::cerr << "shutdown stuck at child-exit-observation\n";
       }
       std::this_thread::sleep_for(kGracefulStopTimeout);
     }
@@ -2008,17 +2092,25 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                     << '\n';
       }
     }
+    // No time limit (OD-187 (1)): the host's exit (waitpid) ends the wait;
+    // each change of its published phase is logged, so the last line names
+    // where it waits. A second stop request ends the host with SIGKILL; this
+    // runs under `mutex`, so only the signal and memory work happen here and
+    // the Manager logs the kill (HostForceKilledPid).
     std::optional<detail::NativeShutdownProgress> last_progress;
-    auto last_change = std::chrono::steady_clock::now();
-    bool stuck_reported = false;
     std::string last_observation_error;
     while (ChildIsLive(child)) {
+      if (const auto force = shutdown_force.load(std::memory_order_acquire);
+          !child.force_killed && force != nullptr && force()) {
+        child.force_killed = true;
+        if (::kill(child.pid, SIGKILL) == 0)
+          host_force_killed_pid.store(child.pid, std::memory_order_release);
+        continue;
+      }
       try {
         const auto progress = ReadShutdownProgress(child);
         if (!last_progress || progress != *last_progress) {
           last_progress = progress;
-          last_change = std::chrono::steady_clock::now();
-          stuck_reported = false;
           std::cerr << "native shutdown entering/waiting at "
                     << detail::NativeShutdownPhaseName(progress.phase)
                     << " pid=" << child.pid
@@ -2042,19 +2134,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                     << '\n';
         }
       }
-      // Reuse the former graceful observation window only for one diagnostic;
-      // it is no longer an automatic kill budget. Unchanged replies do not
-      // refresh actual progress. The explicit operator path retains force.
-      if (!stuck_reported && std::chrono::steady_clock::now() - last_change >=
-                                 kGracefulStopTimeout) {
-        std::cerr << "shutdown stuck at "
-                  << (last_progress ? detail::NativeShutdownPhaseName(
-                                          last_progress->phase)
-                                    : std::string_view("progress-unavailable"))
-                  << " pid=" << child.pid
-                  << "; to force: manyforge-operator stop\n";
-        stuck_reported = true;
-      }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   }
@@ -2068,7 +2147,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     auto exec_pipe = MakePipe();
     SetNonBlocking(channels[0].get());
     SetNonBlocking(liveness_channels[0].get());
-    const RuntimeEpoch runtime_epoch("execution-host-" + RandomHex());
+    const RuntimeEpoch runtime_epoch = start_epoch;
     const auto launch_arguments =
         admission.launch_arguments(kChildChannelFd, runtime_epoch);
     std::vector<std::string> arguments;
@@ -2082,8 +2161,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     arguments.push_back(std::to_string(kChildProgramArtifactRootFd));
     arguments.emplace_back("--manyforge-managed-liveness-channel-fd");
     arguments.push_back(std::to_string(kChildLivenessChannelFd));
-    arguments.emplace_back("--manyforge-managed-manager-state-root");
-    arguments.push_back(manager_state_root_path.string());
     arguments.emplace_back("--manyforge-managed-manager-run-root");
     arguments.push_back(manager_run_root_path.string());
     arguments.emplace_back("--manyforge-managed-execution-state-root");
@@ -2100,14 +2177,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     arguments.push_back(bundle.retained_bundle_id().value());
     arguments.emplace_back("--manyforge-managed-graph-revision");
     arguments.push_back(bundle.value().cell_graph.graph_revision.value());
-    if (!logical_scene_database_path.empty()) {
-      arguments.emplace_back("--manyforge-managed-logical-scene-database");
-      arguments.push_back(logical_scene_database_path.string());
-    }
-    if (!program_cycle_journal_path.empty()) {
-      arguments.emplace_back("--manyforge-managed-program-cycle-journal");
-      arguments.push_back(program_cycle_journal_path.string());
-    }
     if (scene_asset_root_fd) {
       arguments.emplace_back("--manyforge-managed-scene-asset-root-fd");
       arguments.push_back(std::to_string(kChildSceneAssetRootFd));
@@ -2178,8 +2247,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       std::lock_guard lock(liveness_mutex);
       const auto [_, inserted] = liveness_endpoints.emplace(
           admission.product().runtime_unit_id().value(),
-          LivenessEndpoint(pid, runtime_epoch,
-                           std::move(liveness_channels[0])));
+          LivenessEndpoint(pid, std::move(liveness_channels[0])));
       if (!inserted) {
         StopChildNoThrow(child);
         Fail("execution host liveness endpoint insertion conflicted");
@@ -2236,19 +2304,11 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) {
     auto [bundle, admission] = Admission(query);
     static_cast<void>(bundle);
+    static_cast<void>(admission);
     std::lock_guard lock(mutex);
+    ThrowIfBusyLocked(query.plan.runtime_unit_id.value());
     const auto found = children.find(query.plan.runtime_unit_id.value());
     if (found == children.end()) {
-      return Presence(query, ProcessPresenceState::kAbsent);
-    }
-    if (!SameChildProduct(admission, found->second.product_identity,
-                          found->second.configuration_identity,
-                          found->second.runtime_contract_offer_digest)) {
-      if (ChildIsLive(found->second)) {
-        Fail("live execution host child differs from the selected product; "
-             "planned maintenance must stop it before initialization");
-      }
-      EraseChild(found);
       return Presence(query, ProcessPresenceState::kAbsent);
     }
     if (!ChildIsLive(found->second)) {
@@ -2259,37 +2319,64 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                     found->second.runtime_epoch.value());
   }
 
+  // The host is launched once per application start (Q1). A live host is
+  // only prepared for the selected bundle's projection bindings; an exited
+  // host is never relaunched: its exit ends the application (OD-122 (1)).
+  // The launch, its handshake and the preparation run with no lock held;
+  // the unit's visible phase answers concurrent calls (B13, contract 1.3).
   [[nodiscard]] ProcessPresenceObservation
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) {
     auto [bundle, admission] = Admission(query);
-    std::lock_guard lock(mutex);
     const auto runtime_id = query.plan.runtime_unit_id.value();
-    auto found = children.find(runtime_id);
-    if (found != children.end()) {
-      if (!SameChildProduct(admission, found->second.product_identity,
-                            found->second.configuration_identity,
-                            found->second.runtime_contract_offer_digest)) {
-        if (ChildIsLive(found->second))
-          Fail("cannot initialize over a live native child with another "
-               "product; planned maintenance must stop it first");
-        EraseChild(found);
-      } else if (ChildIsLive(found->second)) {
-        PrepareChildProjectionBindings(found->second, *bundle,
-                                       query.plan.runtime_unit_id);
-        return Presence(query, ProcessPresenceState::kPresent,
-                        found->second.runtime_epoch.value());
+    Child *live = nullptr;
+    {
+      std::lock_guard lock(mutex);
+      ThrowIfBusyLocked(runtime_id);
+      if (host_exited.load(std::memory_order_acquire))
+        Fail("the execution host exited; it is never relaunched and its exit "
+             "ends the application");
+      const auto found = children.find(runtime_id);
+      if (found != children.end()) {
+        if (!ChildIsLive(found->second)) {
+          EraseChild(found);
+          Fail("the execution host exited; it is never relaunched and its "
+               "exit ends the application");
+        }
+        live = &found->second;
+        busy_units.emplace(runtime_id, "preparing");
       } else {
-        EraseChild(found);
+        busy_units.emplace(runtime_id, "launching");
       }
     }
-    auto launched = LaunchChild(admission, *bundle);
-    auto [inserted, unique] =
-        children.try_emplace(runtime_id, std::move(launched));
-    if (!unique) {
-      EraseLivenessEndpoint(runtime_id);
-      StopChildNoThrow(launched);
-      Fail("execution host child registry insertion conflicted");
+    const auto clear_phase = [&] {
+      std::lock_guard lock(mutex);
+      busy_units.erase(runtime_id);
+    };
+    if (live != nullptr) {
+      // The phase keeps every other caller off this child and its channel.
+      try {
+        PrepareChildProjectionBindings(*live, *bundle,
+                                       query.plan.runtime_unit_id);
+      } catch (...) {
+        clear_phase();
+        throw;
+      }
+      std::lock_guard lock(mutex);
+      busy_units.erase(runtime_id);
+      return Presence(query, ProcessPresenceState::kPresent,
+                      live->runtime_epoch.value());
     }
+    std::optional<Child> launched;
+    try {
+      launched.emplace(LaunchChild(admission, *bundle));
+    } catch (...) {
+      clear_phase();
+      throw;
+    }
+    std::lock_guard lock(mutex);
+    busy_units.erase(runtime_id);
+    const auto inserted =
+        children.emplace(runtime_id, std::move(*launched)).first;
     return Presence(query, ProcessPresenceState::kPresent,
                     inserted->second.runtime_epoch.value());
   }
@@ -2299,6 +2386,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     auto [bundle, admission] = Admission(query);
     static_cast<void>(bundle);
     std::lock_guard lock(mutex);
+    ThrowIfBusyLocked(query.plan.runtime_unit_id.value());
     const auto found = children.find(query.plan.runtime_unit_id.value());
     if (found == children.end()) {
       return Presence(query, ProcessPresenceState::kAbsent);
@@ -2325,9 +2413,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       Fail("retained native adapter received an empty runtime epoch");
     }
     std::lock_guard lock(mutex);
+    ThrowIfBusyLocked(query.plan.runtime_unit_id.value());
     const auto found = children.find(query.plan.runtime_unit_id.value());
-    if (found == children.end() ||
-        found->second.runtime_epoch != runtime_epoch) {
+    if (found == children.end()) {
       return std::nullopt;
     }
     if (!SameChildProduct(admission, found->second.product_identity,
@@ -2339,12 +2427,14 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       EraseChild(found);
       return std::nullopt;
     }
-    if (!SettlePendingInspection(found->second)) return std::nullopt;
-    // A killed child closes its private channel before the kernel makes it
-    // waitable, so ChildIsLive can still report it live. A failed channel
-    // exchange is the same child loss as an unanswered status: contain it
-    // (stop and reap) and report no source evidence, never an observation
-    // failure of the whole runtime.
+    // An unsettled exchange (a late host, or an inspection
+    // reply) sends nothing and reports no new source evidence.
+    if (!SettlePending(found->second)) return std::nullopt;
+    // An unanswered status makes the host late. A failed exchange with the
+    // host alive makes it late until it is stopped: no reply can settle a
+    // broken channel, which stays open so the host is not ended by its close.
+    // An exited host is reaped here or at the next observation.
+    const auto started = std::chrono::steady_clock::now();
     std::optional<std::string> packet;
     try {
       packet = TimedKernelExchange(found->second.channel.get(), "status",
@@ -2352,12 +2442,25 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     } catch (const RetainedExecutionHostUnitAdapterError &error) {
       std::cerr << "execution host child private channel failed: pid="
                 << found->second.pid << ": " << error.what() << '\n';
-      packet.reset();
+      if (!ChildIsLive(found->second)) {
+        EraseChild(found);
+        return std::nullopt;
+      }
+      static_cast<void>(BeginLate(
+          found->second, [](const std::string &) { return false; },
+          LateExchangeKind("status"), kStatusTimeout, started));
+      found->second.pending->invalid_response = true;
+      return std::nullopt;
     }
     if (!packet.has_value()) {
-      found->second.channel.Reset();
-      StopChildNoThrow(found->second);
-      EraseChild(found);
+      static_cast<void>(BeginLate(
+          found->second,
+          [status_admission = admission,
+           epoch = runtime_epoch](const std::string &late) mutable {
+            static_cast<void>(status_admission.parse_status_packet(epoch, late));
+            return true;
+          },
+          LateExchangeKind("status"), kStatusTimeout, started));
       return std::nullopt;
     }
     try {
@@ -2379,12 +2482,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   UniqueFd activation_root_fd;
   std::filesystem::path scene_asset_root_path;
   UniqueFd scene_asset_root_fd;
-  std::filesystem::path manager_state_root_path;
   std::filesystem::path manager_run_root_path;
   std::filesystem::path execution_state_root_path;
   std::filesystem::path execution_run_root_path;
-  std::filesystem::path logical_scene_database_path;
-  std::filesystem::path program_cycle_journal_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
@@ -2393,13 +2493,43 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   std::optional<std::string> site_settings_document;
   std::optional<std::filesystem::path> site_settings_snapshot;
   std::string observer_instance_id;
+  // The 16-hex text of the application-start identity: the one host
+  // occurrence of this application start carries it (contract 1.1).
+  RuntimeEpoch start_epoch;
   UniqueFd target_root_fd;
+  std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+      active_publication;
   std::mutex admission_mutex;
   std::mutex mutex;
   std::mutex liveness_mutex;
   std::uint64_t observation_sequence{};
   std::map<std::string, AdmissionCacheEntry> admission_cache;
   std::map<std::string, Child> children;
+  // Guarded by `mutex`. A unit being launched or prepared, with its phase
+  // ("launching" or "preparing"). The fork, the handshake and the projection
+  // preparation run with no lock; a call that meets the unit here gets the
+  // typed busy answer instead of waiting (B13, contract 1.3).
+  std::map<std::string, std::string_view> busy_units;
+  // Set once when the host child's exit is first observed; read lock-free by
+  // the Manager's observation tick (OD-122 (1)).
+  std::atomic<bool> host_exited{false};
+  std::atomic<bool> host_exit_signaled{false};
+  std::atomic<int> host_exit_value{0};
+  // OD-187 (1): the Manager's "a second stop request came" (set once before
+  // any stop), and the host PID StopChild killed for it (0: none).
+  std::atomic<bool (*)() noexcept> shutdown_force{nullptr};
+  std::atomic<pid_t> host_force_killed_pid{0};
+  // The late host (OD-121 (4), (16), (17)). Written under `mutex` (or the
+  // unit's busy phase) when an ordinary exchange times out or its late reply
+  // settles; read lock-free by the Manager's observation tick. `host_late`:
+  // the reply is outstanding; the host unit counts as faulted exactly while
+  // it is set. The episode counts timed-out exchanges and publishes the
+  // details stored before it.
+  std::atomic<bool> host_late{false};
+  std::atomic<std::uint64_t> host_late_episode{0U};
+  std::atomic<std::uint8_t> host_late_kind{0U};
+  std::atomic<std::int64_t> host_late_bound_ms{0};
+  std::atomic<std::int64_t> host_late_since_ns{0};
   std::map<std::string, LivenessEndpoint> liveness_endpoints;
 };
 
@@ -2585,6 +2715,10 @@ RetainedExecutionHostUnitAdapter::Impl::ResolveProjection(
   }
   {
     std::lock_guard lock(mutex);
+    if (auto busy = BusyLocked(binding.runtime_unit_id.value()))
+      return manyforge::core::
+          Result<std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Err(
+              std::move(*busy));
     const auto found = children.find(binding.runtime_unit_id.value());
     if (found == children.end()) {
       return missing("no Manager child owns the execution host unit");
@@ -2592,9 +2726,6 @@ RetainedExecutionHostUnitAdapter::Impl::ResolveProjection(
     if (!ChildIsLive(found->second)) {
       EraseChild(found);
       return missing("the Manager child is no longer live");
-    }
-    if (found->second.runtime_epoch != binding.runtime_epoch) {
-      return missing("the Manager child has a different runtime epoch");
     }
     const ProjectionBindingKey key{binding.provider_binding_id,
                                    binding.provider_binding_revision};
@@ -2609,9 +2740,9 @@ RetainedExecutionHostUnitAdapter::Impl::ResolveProjection(
 }
 
 RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
+    const manyforge::core::ApplicationStartId application_start_id,
     std::filesystem::path trusted_installed_target_root,
     std::filesystem::path trusted_package_root,
-    std::filesystem::path manager_state_root,
     std::filesystem::path manager_run_root,
     std::filesystem::path execution_state_root,
     std::filesystem::path execution_run_root,
@@ -2619,26 +2750,25 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source,
     std::string operating_system, std::string launch_environment_contract,
-    std::filesystem::path logical_scene_database,
-    std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
     std::filesystem::path scene_asset_root,
-    std::optional<std::string> site_settings_document)
+    std::optional<std::string> site_settings_document,
+    std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+        active_publication)
     : RetainedExecutionHostUnitAdapter(
-          std::move(trusted_installed_target_root),
-          std::move(trusted_package_root), std::move(manager_state_root),
+          application_start_id, std::move(trusted_installed_target_root),
+          std::move(trusted_package_root),
           std::move(manager_run_root), std::move(execution_state_root),
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
-          std::move(logical_scene_database), std::move(program_cycle_journal),
           std::move(activation_root), std::move(scene_asset_root),
-          std::move(site_settings_document)) {}
+          std::move(site_settings_document), std::move(active_publication)) {}
 
 RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
+    const manyforge::core::ApplicationStartId application_start_id,
     std::filesystem::path trusted_installed_target_root,
     std::filesystem::path trusted_package_root,
-    std::filesystem::path manager_state_root,
     std::filesystem::path manager_run_root,
     std::filesystem::path execution_state_root,
     std::filesystem::path execution_run_root,
@@ -2647,22 +2777,65 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
         &artifact_source,
     std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
-    std::filesystem::path logical_scene_database,
-    std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
     std::filesystem::path scene_asset_root,
-    std::optional<std::string> site_settings_document)
+    std::optional<std::string> site_settings_document,
+    std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+        active_publication)
     : impl_(std::make_shared<Impl>(
-          std::move(trusted_installed_target_root),
-          std::move(trusted_package_root), std::move(manager_state_root),
+          application_start_id, std::move(trusted_installed_target_root),
+          std::move(trusted_package_root),
           std::move(manager_run_root), std::move(execution_state_root),
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
-          std::move(logical_scene_database), std::move(program_cycle_journal),
           std::move(activation_root), std::move(scene_asset_root),
-          std::move(site_settings_document))) {}
+          std::move(site_settings_document))) {
+  impl_->active_publication = std::move(active_publication);
+}
 
 RetainedExecutionHostUnitAdapter::~RetainedExecutionHostUnitAdapter() = default;
+
+std::optional<ExecutionHostExitDTO>
+RetainedExecutionHostUnitAdapter::HostExit() const noexcept {
+  if (!impl_->host_exited.load(std::memory_order_acquire)) return std::nullopt;
+  return ExecutionHostExitDTO{
+      impl_->host_exit_signaled.load(std::memory_order_relaxed),
+      impl_->host_exit_value.load(std::memory_order_relaxed)};
+}
+
+void RetainedExecutionHostUnitAdapter::SetShutdownForce(
+    bool (*const force_requested)() noexcept) noexcept {
+  impl_->shutdown_force.store(force_requested, std::memory_order_release);
+}
+
+bool RetainedExecutionHostUnitAdapter::HasHostChild() const {
+  std::lock_guard lock(impl_->mutex);
+  return std::any_of(impl_->children.begin(), impl_->children.end(),
+                     [](const auto &entry) { return !entry.second.reaped; });
+}
+
+std::optional<pid_t>
+RetainedExecutionHostUnitAdapter::HostForceKilledPid() const noexcept {
+  const auto pid = impl_->host_force_killed_pid.load(std::memory_order_acquire);
+  if (pid == 0) return std::nullopt;
+  return pid;
+}
+
+std::optional<ExecutionHostLateDTO>
+RetainedExecutionHostUnitAdapter::HostLate() const noexcept {
+  const auto episode = impl_->host_late_episode.load(std::memory_order_acquire);
+  if (!impl_->host_late.load(std::memory_order_acquire)) return std::nullopt;
+  const auto since = std::chrono::steady_clock::time_point(
+      std::chrono::nanoseconds(
+          impl_->host_late_since_ns.load(std::memory_order_relaxed)));
+  return ExecutionHostLateDTO{
+      episode,
+      kLateExchangeKinds[impl_->host_late_kind.load(std::memory_order_relaxed)],
+      std::chrono::milliseconds(
+          impl_->host_late_bound_ms.load(std::memory_order_relaxed)),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - since)};
+}
 
 ProcessPresenceObservation RetainedExecutionHostUnitAdapter::ObserveProcess(
     const RuntimeUnitConvergenceQueryDTO &query) {
@@ -2705,13 +2878,6 @@ RetainedExecutionHostUnitAdapter::ReconcileAcquireAttempt(
     const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &query) const {
   return impl_->KernelFenceCall<
       manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO>(query);
-}
-
-manyforge::core::ApplyFenceReconcileResultDTO
-RetainedExecutionHostUnitAdapter::Rehydrate(
-    const manyforge::core::ApplyFenceRehydrateDTO &request) {
-  return impl_->KernelFenceCall<manyforge::core::ApplyFenceReconcileResultDTO>(
-      request);
 }
 
 manyforge::core::ConfigurationFenceStatusDTO
@@ -2769,6 +2935,15 @@ RetainedExecutionHostUnitAdapter::AcquireCellAdmissionClaim(
       {"cell_admission_acquire", intent});
 }
 
+manyforge::core::Result<manyforge::core::CellAdmissionClaimDTO>
+RetainedExecutionHostUnitAdapter::AcquireManagerApplyClaim(
+    const manyforge::core::CellAdmissionClaimIntentDTO &intent,
+    const manyforge::core::RetainedBundleId &candidate_retained_bundle_id) {
+  return impl_->KernelCellAdmissionCall<manyforge::core::CellAdmissionClaimDTO>(
+      {"cell_admission_acquire",
+       detail::ManagerApplyClaimAcquireRequest{intent, candidate_retained_bundle_id}});
+}
+
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
 RetainedExecutionHostUnitAdapter::ReleaseCellAdmissionClaim(
     const manyforge::core::CellAdmissionClaimReleaseDTO &release) {
@@ -2777,10 +2952,12 @@ RetainedExecutionHostUnitAdapter::ReleaseCellAdmissionClaim(
 }
 
 manyforge::core::Result<manyforge::core::AuthoringAdmissionDTO>
-RetainedExecutionHostUnitAdapter::ReconcileCellAdmissionClaims(
-    const manyforge::core::CellAdmissionReconcileDTO &reconcile) {
+RetainedExecutionHostUnitAdapter::ReleaseManagerApplyClaim(
+    const manyforge::core::CellAdmissionClaimReleaseDTO &release,
+    const manyforge::core::ManagerApplyReleaseOutcomeDTO &outcome) {
   return impl_->KernelCellAdmissionCall<manyforge::core::AuthoringAdmissionDTO>(
-      {"cell_admission_reconcile", reconcile});
+      {"cell_admission_release",
+       detail::ManagerApplyClaimReleaseRequest{release, outcome}});
 }
 
 manyforge::core::Result<manyforge::core::CellAdmissionRecoveryReceiptDTO>
@@ -2814,18 +2991,6 @@ RetainedExecutionHostUnitAdapter::ApplyOnHost(
     const manyforge::core::RuntimeUnitId &runtime_unit_id,
     const HostApplyRequest &request) {
   return impl_->ApplyOnHost(runtime_unit_id, request);
-}
-
-manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-RetainedExecutionHostUnitAdapter::StopComponentProcess(
-    const ManagerComponentProcessStopRequestDTO &request) {
-  return impl_->ComponentProcessStopCall(request, false);
-}
-manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-RetainedExecutionHostUnitAdapter::ReadComponentProcessStop(
-    const ManagerComponentProcessStopReadRequestDTO &request) {
-  if (!request.valid()) Fail("component process Stop read request is invalid");
-  return impl_->ComponentProcessStopCall(request.request, true);
 }
 
 manyforge::core::Result<ManagerComponentProcessInventoryResultDTO>

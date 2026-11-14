@@ -4,6 +4,7 @@ import type {
   ProgramTreeNode,
 } from '../types/api';
 import type { DirectControlMotionStatus, ProgramRunAdmittedSpeeds } from '../types/robotControl';
+import { displayId, type ApplicationStartId } from '../api/applicationIdentity';
 
 /**
  * The owner-admitted speeds for Run details, as read from the backend. The
@@ -77,9 +78,11 @@ function requestSummary(requests: SpeedRequest[]): { value: string; note: string
 function AdmittedSpeedCell({
   admitted,
   target,
+  applicationStartId,
 }: {
   admitted: AdmittedSpeedsView;
   target: DirectControlMotionStatus;
+  applicationStartId: ApplicationStartId | null;
 }) {
   const row = admitted.kind === 'ready'
     ? admitted.speeds.targets.find((candidate) => (
@@ -91,8 +94,10 @@ function AdmittedSpeedCell({
     const requested = row.requestedTcpLinearSpeedMps === null
       ? 'no per-motion request'
       : `requested ${row.requestedTcpLinearSpeedMps} m/s`;
+    const operation = applicationStartId === null
+      ? `op${row.operationId}` : displayId(applicationStartId, 'op', row.operationId);
     return (
-      <div className="program-run-setup-stat" title={`Admitted by the owner for operation ${row.operationId} (prepared ${row.occurredAtWall}): ${requested}, Deployment maximum ${row.deploymentMaximumTcpLinearSpeedMps} m/s.`}>
+      <div className="program-run-setup-stat" title={`Admitted by the owner for operation ${operation} (prepared ${row.occurredAtWall}): ${requested}, Deployment maximum ${row.deploymentMaximumTcpLinearSpeedMps} m/s.`}>
         <span className="program-run-setup-stat-label" title={ADMITTED_HEADER_HINT}>Last admitted</span>
         <span className="program-run-setup-stat-value">{row.admittedTcpLinearSpeedMps} m/s</span>
         <span className="program-run-setup-stat-note">by the Kernel</span>
@@ -123,11 +128,14 @@ function AdmittedSpeedCell({
  */
 export function ProgramRunSetup({
   applied,
+  applicationStartId,
   targets,
   groups,
   admitted,
 }: {
   applied: AppliedProgramSelection | null;
+  /** The current application start, for the display form of operation numbers. */
+  applicationStartId: ApplicationStartId | null;
   targets: DirectControlMotionStatus[];
   groups: Array<{ groupId: string; nodeCount: number; state: string; velocity: string }>;
   admitted: AdmittedSpeedsView;
@@ -177,7 +185,11 @@ export function ProgramRunSetup({
                     </div>
                   );
                 })()}
-                <AdmittedSpeedCell admitted={admitted} target={target} />
+                <AdmittedSpeedCell
+                  admitted={admitted}
+                  target={target}
+                  applicationStartId={applicationStartId}
+                />
               </div>
             </div>
           );

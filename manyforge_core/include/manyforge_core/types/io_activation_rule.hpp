@@ -87,7 +87,6 @@ enum class IoRuleStateProjectionStatusDTO { kPending, kReady };
 /// Actual successful Applied identity, including a qualified empty product
 /// that has no signal service and therefore no catalog generation.
 struct IoRuleAppliedContextDTO final {
-  RequestOwnerEpoch owner_epoch;
   ActiveBundlePublicationGeneration active_publication_generation;
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
@@ -103,9 +102,9 @@ struct IoRuleWaitingForProgramCatalogDTO final {
                          const IoRuleWaitingForProgramCatalogDTO&) = default;
 };
 struct IoRuleStateProjectionDTO final {
+  /// Pending only while a rule waits for a Program; never for the journal.
   IoRuleStateProjectionStatusDTO status;
-  /// Present only at a coherent ready cut, with no older queued/in-flight
-  /// transition. Projection failure does not erase actual rule/latch state.
+  /// Every rule's state from memory; present exactly when ready with a catalog.
   std::optional<IoRuleStateBaselineDTO> baseline;
   /// Same-lock actual catalog snapshot for both existing events siblings.
   /// Consumers must not pair two separately captured getter results.

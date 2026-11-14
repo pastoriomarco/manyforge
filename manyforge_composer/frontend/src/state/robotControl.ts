@@ -17,6 +17,7 @@ import type {
   Pose3Value,
 } from '../types/robotControl';
 import { tcpEntryIdentityKey } from '../types/robotControl';
+import { sameClientRequestKey } from '../api/parsers/execution';
 import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
 import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
 import { poseTupleFromValue, poseValueFromTuple, samePose } from '../utils/poseTransforms';
@@ -150,8 +151,8 @@ export interface RobotControlState {
   intent: DirectControlOperationIntent | null;
   /** The mode from a locally accepted operation, tied to its owner identity. */
   acceptedOperationMode: {
-    ownerEpoch: string;
-    operationId: string;
+    applicationStartId: string;
+    operationId: number;
     mode: RobotControlMode;
     controllableComponentId: string;
     commandTargetId: string;
@@ -247,9 +248,10 @@ export type RobotControlAction =
   | {
       type: 'operation_mode_accepted';
       generation: number;
-      ownerEpoch: string;
-      requestId: string;
-      operationId: string;
+      applicationStartId: string;
+      /** The key of the previewed intent the accepted command was built from. */
+      requestKey: string;
+      operationId: number;
       mode: RobotControlMode;
     }
   | { type: 'preview_diagnostic'; generation: number; diagnostic: MotionPreviewPath }
@@ -258,7 +260,7 @@ export type RobotControlAction =
   | { type: 'approve_rejected'; generation: number; error: string; errorRefusal?: StructuredError | null }
   | { type: 'retry_preview' }
   | { type: 'operation_observed'; operation: OperationObservation }
-  | { type: 'operation_control_failed'; ownerEpoch: string | null; operationId: string; error: string; errorRefusal?: StructuredError | null }
+  | { type: 'operation_control_failed'; applicationStartId: string | null; operationId: number; error: string; errorRefusal?: StructuredError | null }
   | { type: 'dismiss_error' }
   | { type: 'revert' }
   | { type: 'clear' };
@@ -480,7 +482,7 @@ export function robotControlAcceptedOperationMode(
   const accepted = state.acceptedOperationMode;
   if (!robotControlHasActiveOperation(state) || operation === null
     || operationStateIsTerminal(operation.state) || accepted === null
-    || accepted.ownerEpoch !== state.status?.ownerEpoch
+    || accepted.applicationStartId !== state.status?.applicationStartId
     || accepted.operationId !== operation.operationId
     || (operation.controllableComponentId !== undefined
       && accepted.controllableComponentId !== operation.controllableComponentId)
@@ -646,18 +648,15 @@ export function robotControlPreviewApprovable(state: RobotControlState): boolean
 }
 
 function commonReceiptMatches(
-  status: ExecutionOwnerStatus,
   intent: DirectControlOperationIntent,
   receipt: DirectControlPreviewReceipt,
 ): boolean {
   const participant = intent.participants[0];
   return receipt.commitEligible
-    && receipt.requestId === intent.request_context.request_id
-    && receipt.requestOwnerEpoch === status.ownerEpoch
+    && sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
     && receipt.programId === intent.program_id
     && receipt.programRevision === intent.program_revision
     && receipt.programBindingId === intent.program_binding_id
-    && receipt.programRunId === intent.program_run_id
     && receipt.graphRevision === intent.expected_graph_revision
     && receipt.retainedBundleId === intent.expected_retained_bundle_id
     && receipt.target.componentId === participant.target.component_id
@@ -673,8 +672,8 @@ function receiptMatchesCurrentDraft(
   const status = selectedStatusForState(state);
   if (intent === null || status === null) return false;
   const payload = intent.participants[0].payload;
-  if (!commonReceiptMatches(status, intent, receipt)) return false;
-  if (receipt.schemaVersion !== 'manyforge.direct_control_capability_command_preview.v2') {
+  if (!commonReceiptMatches(intent, receipt)) return false;
+  if (receipt.schemaVersion !== 'manyforge.direct_control_capability_command_preview.v3') {
     if (payload.kind !== 'motion' || status.directControl === null) return false;
     const expectedNames = status.directControl.targetDescriptor.joints.map(
       (joint) => joint.sourceJointName,
@@ -724,16 +723,6 @@ export function robotControlHasLocalDraft(state: RobotControlState): boolean {
       || state.phase === 'approving' || state.phase === 'blocked');
 }
 
-function operationMatchesSelectedTarget(
-  _status: ExecutionOwnerStatus,
-  selectedStatus: ExecutionOwnerStatus,
-  operation: OperationObservation,
-): boolean {
-  if (operation.controllableComponentId === undefined || operation.commandTargetId === undefined) return false;
-  return [selectedStatus.directControl, selectedStatus.directControlGripper].some((target) =>
-    target !== null && target.controllableComponentId === operation.controllableComponentId
-      && target.commandTargetId === operation.commandTargetId);
-}
 
 function resolveStatus(
   state: RobotControlState,
@@ -773,13 +762,14 @@ function resolveStatus(
     // No TCP: joint jog only.
     state = { ...state, mode: 'joint' };
   }
-  const selectedRun = state.mode === 'gripper'
-    ? selectedStatus.directControlGripper?.programRunId ?? null
-    : selectedStatus.directControl?.programRunId ?? null;
-  const projected = status.manualOperations.filter((operation) => {
-    if (operation.programRunId !== selectedRun) return false;
-    return operationMatchesSelectedTarget(status, selectedStatus, operation);
-  });
+  // The selected mode's target: its manual operation is the one to own.
+  const selectedTarget = state.mode === 'gripper'
+    ? selectedStatus.directControlGripper
+    : selectedStatus.directControl;
+  const projected = selectedTarget === null ? [] : status.manualOperations.filter((operation) => (
+    operation.controllableComponentId === selectedTarget.controllableComponentId
+    && operation.commandTargetId === selectedTarget.commandTargetId
+  ));
   const retainedOperation = state.operation?.resident
     ? status.manualOperations.find((operation) => (
       operation.operationId === state.operation?.operationId
@@ -817,7 +807,7 @@ function resolveStatus(
       !== selectedStatus.directControlGripper?.commandTargetId
   );
   if (state.status !== null && (
-    state.status.ownerEpoch !== status.ownerEpoch
+    state.status.applicationStartId !== status.applicationStartId
     || state.status.retainedBundleId !== status.retainedBundleId
     || state.status.graphRevision !== status.graphRevision
     || selectedBindingChanged
@@ -827,7 +817,7 @@ function resolveStatus(
     // explicit outcome and attention. Discarded uncommitted manual work gets
     // exactly one informational notice; a purely idle replacement rebases
     // silently without producing an operational error.
-    const discardedEvidence = state.status.ownerEpoch !== status.ownerEpoch
+    const discardedEvidence = state.status.applicationStartId !== status.applicationStartId
       ? 'The execution owner restarted. The prior preview was discarded.'
       : 'The target binding changed. The prior preview was discarded.';
     const discardedUncommittedWork = robotControlHasLocalDraft(state)
@@ -1463,15 +1453,15 @@ export function robotControlReducer(
         ...state,
         phase: 'ready',
         diagnosticPreview: null,
-        previewSampleIndex: action.receipt.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+        previewSampleIndex: action.receipt.schemaVersion === 'manyforge.direct_control_motion_preview.v5'
           ? Math.max(0, action.receipt.pathPreview.samples.length - 1) : 0,
         preview: action.receipt,
         ghost: action.receipt.schemaVersion
-          !== 'manyforge.direct_control_capability_command_preview.v2'
+          !== 'manyforge.direct_control_capability_command_preview.v3'
           ? action.receipt
           : state.ghost,
         ghostStale: action.receipt.schemaVersion
-          !== 'manyforge.direct_control_capability_command_preview.v2'
+          !== 'manyforge.direct_control_capability_command_preview.v3'
           ? false
           : state.ghost !== null,
         previewIssue: null,
@@ -1500,7 +1490,7 @@ export function robotControlReducer(
       return { ...state, diagnosticPreview: action.diagnostic,
         previewSampleIndex: Math.max(0, action.diagnostic.samples.length - 1) };
     case 'select_preview_sample': {
-      const path = state.diagnosticPreview ?? (state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+      const path = state.diagnosticPreview ?? (state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v5'
         ? state.preview.pathPreview : undefined);
       if (path === undefined || path === null || !Number.isInteger(action.index)
           || action.index < 0 || action.index >= path.samples.length) return state;
@@ -1512,13 +1502,13 @@ export function robotControlReducer(
         error: null, errorRefusal: null, errorLocal: false };
     case 'operation_mode_accepted': {
       const intent = state.intent;
-      if (action.generation !== state.generation || state.status?.ownerEpoch !== action.ownerEpoch
-        || intent === null || intent.request_context.request_id !== action.requestId) return state;
+      if (action.generation !== state.generation || state.status?.applicationStartId !== action.applicationStartId
+        || intent === null || intent.request_context.request_key !== action.requestKey) return state;
       const participant = intent.participants[0];
       return {
         ...state,
         acceptedOperationMode: {
-          ownerEpoch: action.ownerEpoch,
+          applicationStartId: action.applicationStartId,
           operationId: action.operationId,
           mode: action.mode,
           controllableComponentId: participant.target.component_id,
@@ -1560,7 +1550,7 @@ export function robotControlReducer(
         errorLocal: action.operation.terminalError === null ? state.errorLocal : false,
       };
     case 'operation_control_failed':
-      return (state.status?.ownerEpoch ?? null) === action.ownerEpoch
+      return (state.status?.applicationStartId ?? null) === action.applicationStartId
         && state.operation?.operationId === action.operationId
         ? { ...state, error: action.error, errorRefusal: action.errorRefusal ?? null, errorLocal: false }
         : state;
@@ -1660,13 +1650,13 @@ function requireMotionStatus(
 function buildMotionIntent(
   status: ExecutionOwnerStatus,
   motion: DirectControlMotionSpec,
-  requestId: string,
+  requestKey: string,
   settings: ManualMotionSettings,
 ): DirectControlOperationIntent {
   const capability = `planning.motion.${motion.kind}`;
   requireMotionStatus(status, capability);
   const selectedMotion = requireSelectedMotion(status).motion;
-  if (requestId.trim() === '') {
+  if (requestKey.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
   if (!motionSettingsAreValid(status, settings)) throw new Error('Manual motion limits are invalid.');
@@ -1678,7 +1668,7 @@ function buildMotionIntent(
   }));
   const payload: MotionParticipantPayload = {
     kind: 'motion',
-    move_id: `robot-control-${requestId}`,
+    move_id: `robot-control-${requestKey}`,
     base_frame: { component_id: selectedMotion.baseFrame.componentId, frame_id: selectedMotion.baseFrame.frameId },
     tcp_endpoint: { kind: 'current' },
     tolerances: {
@@ -1709,15 +1699,12 @@ function buildMotionIntent(
   };
   return {
     request_context: {
-      request_id: requestId,
-      request_owner_epoch: status.ownerEpoch,
+      request_key: requestKey,
       source_label: 'composer_ui',
-      correlation_id: null,
     },
     program_id: requireSelectedMotion(status).motion.programId,
     program_revision: requireSelectedMotion(status).motion.programRevision,
     program_binding_id: requireSelectedMotion(status).motion.programBindingId,
-    program_run_id: requireSelectedMotion(status).motion.programRunId,
     expected_graph_revision: status.graphRevision,
     expected_retained_bundle_id: status.retainedBundleId,
     expected_scene_revision: null,
@@ -1734,7 +1721,7 @@ function buildMotionIntent(
 export function buildJointMotionIntent(
   status: ExecutionOwnerStatus,
   positionsRad: number[],
-  requestId: string,
+  requestKey: string,
   settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   if (!positionsAreValid(status, positionsRad)) {
@@ -1746,7 +1733,7 @@ export function buildJointMotionIntent(
       (joint) => joint.sourceJointName,
     ),
     positions_rad: [...positionsRad],
-  }, requestId, settings);
+  }, requestKey, settings);
 }
 
 function normalizedPose(pose: Pose3Value): Pose3Value {
@@ -1771,19 +1758,19 @@ function normalizedPose(pose: Pose3Value): Pose3Value {
 export function buildPoseMotionIntent(
   status: ExecutionOwnerStatus,
   pose: Pose3Value,
-  requestId: string,
+  requestKey: string,
   settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   return buildMotionIntent(status, {
     kind: 'pose_goal',
     goal: normalizedPose(pose),
-  }, requestId, settings);
+  }, requestKey, settings);
 }
 
 export function buildCartesianMotionIntent(
   status: ExecutionOwnerStatus,
   pose: Pose3Value,
-  requestId: string,
+  requestKey: string,
   settings: ManualMotionSettings = initialMotionSettings(status),
 ): DirectControlOperationIntent {
   requireMotionStatus(status, 'planning.motion.cartesian_path');
@@ -1805,7 +1792,7 @@ export function buildCartesianMotionIntent(
     fallback_policy: 'fail_closed',
     // Exact corners; timing follows the Deployment's cartesian_timing.
     blend_radii_m: [0, 0],
-  }, requestId, settings);
+  }, requestKey, settings);
 }
 
 /** The strict current descriptor is a projection, never command authority. */
@@ -1832,7 +1819,7 @@ export function hasPneumaticGripperDescriptor(status: ExecutionOwnerStatus): boo
 export function buildGripperCommandIntent(
   status: ExecutionOwnerStatus,
   position: number,
-  requestId: string,
+  requestKey: string,
 ): DirectControlOperationIntent {
   const gripper = status.directControlGripper;
   if (gripper === null) {
@@ -1853,7 +1840,7 @@ export function buildGripperCommandIntent(
   if (!gripperPositionIsValid(status, position)) {
     throw new Error('The authored gripper target is outside its retained limits.');
   }
-  if (requestId.trim() === '') {
+  if (requestKey.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
   const commandSchema = descriptor.contracts.commandSchema;
@@ -1872,15 +1859,12 @@ export function buildGripperCommandIntent(
     : { kind: 'linear_m' as const, value_m: selectedPosition };
   return {
     request_context: {
-      request_id: requestId,
-      request_owner_epoch: status.ownerEpoch,
+      request_key: requestKey,
       source_label: 'composer_ui',
-      correlation_id: null,
     },
     program_id: gripper.programId,
     program_revision: gripper.programRevision,
     program_binding_id: gripper.programBindingId,
-    program_run_id: gripper.programRunId,
     expected_graph_revision: status.graphRevision,
     expected_retained_bundle_id: status.retainedBundleId,
     expected_scene_revision: null,
@@ -1920,7 +1904,7 @@ export function buildPreviewIntent(
     | 'draftGripperPosition'
     | 'motionSettings'
   >,
-  requestId: string,
+  requestKey: string,
 ): DirectControlOperationIntent {
   if (state.status === null) {
     throw new Error('The execution owner contract is unavailable.');
@@ -1930,27 +1914,27 @@ export function buildPreviewIntent(
       return buildJointMotionIntent(
         state.status,
         state.draftPositionsRad,
-        requestId,
+        requestKey,
         state.motionSettings,
       );
     case 'pose_goal':
-      return buildPoseMotionIntent(state.status, state.draftPose, requestId, state.motionSettings);
+      return buildPoseMotionIntent(state.status, state.draftPose, requestKey, state.motionSettings);
     case 'move_to':
       return state.moveToKind === 'joint'
         ? buildJointMotionIntent(
             state.status,
             state.draftPositionsRad,
-            requestId,
+            requestKey,
             state.motionSettings,
           )
         : state.moveToPath === 'linear'
-          ? buildCartesianMotionIntent(state.status, state.draftPose, requestId, state.motionSettings)
-          : buildPoseMotionIntent(state.status, state.draftPose, requestId, state.motionSettings);
+          ? buildCartesianMotionIntent(state.status, state.draftPose, requestKey, state.motionSettings)
+          : buildPoseMotionIntent(state.status, state.draftPose, requestKey, state.motionSettings);
     case 'cartesian_path':
       return buildCartesianMotionIntent(
         state.status,
         state.draftPose,
-        requestId,
+        requestKey,
         state.motionSettings,
       );
     case 'gripper':
@@ -1960,7 +1944,7 @@ export function buildPreviewIntent(
       return buildGripperCommandIntent(
         state.status,
         state.draftGripperPosition,
-        requestId,
+        requestKey,
       );
   }
 }
@@ -2017,5 +2001,5 @@ export function isCapabilityCommandReceipt(
   receipt: DirectControlPreviewReceipt,
 ): receipt is CapabilityCommandPreviewReceipt {
   return receipt.schemaVersion
-    === 'manyforge.direct_control_capability_command_preview.v2';
+    === 'manyforge.direct_control_capability_command_preview.v3';
 }

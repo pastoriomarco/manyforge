@@ -28,21 +28,24 @@ import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import RLock
+from threading import Condition, Lock, RLock, Thread
 from typing import Any, Final
 
-from manyforge_behavior.orchestration_ports import PersistentValueUncertainError
 from manyforge_behavior.program import BlackboardKeyDeclaration
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v3"
-# The previous layout keyed rows by Scenario id; such a file is moved aside
-# (one bounded slot, never migrated) and the register starts empty.
-_SUPERSEDED_SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v2"
+FORMAT_VERSION: Final = 4
+SCHEMA_VERSION: Final = f"manyforge.persistent_key_register.v{FORMAT_VERSION}"
+# The register file is named by its format version, and only that file is
+# opened or created. Files of an earlier format (the unversioned name or a
+# lower version) are never opened, moved, rewritten or deleted.
+REGISTER_FILE_NAME: Final = f"persistent-keys.v{FORMAT_VERSION}.json"
+_OLDER_FILE_NAME: Final = re.compile(r"persistent-keys(?:\.v([1-9][0-9]{0,8}))?\.json")
 MAX_ROWS: Final = 4_096
 MAX_VALUE_BYTES: Final = 65_536
 MAX_EDITS: Final = 256
@@ -53,6 +56,8 @@ OPERATOR_WRITABLE_ACCESS: Final = frozenset({"write", "read_write"})
 _MAX_ID_BYTES: Final = 256
 _MAX_PROJECT_PATH_BYTES: Final = 4_096
 _MAX_DETAIL_BYTES: Final = 512
+# The application start ``A`` in its only text form (16 lowercase hex, not 0).
+_APPLICATION_START_ID: Final = re.compile(r"[0-9a-f]{16}")
 
 
 _EDIT_FIELDS: Final = frozenset(
@@ -61,7 +66,8 @@ _EDIT_FIELDS: Final = frozenset(
         "project_path",
         "key",
         "action",
-        "request_id",
+        "application_start_id",
+        "request_key",
         "source_label",
         "program_run_id",
         "node_instance_id",
@@ -92,22 +98,14 @@ FAULT_APPLY_NOT_OBSERVED: Final = "applied_program_not_observed"
 
 
 class PersistentKeyRegisterError(RuntimeError):
-    """The register cannot be read or written; a refused change changed nothing."""
+    """The register file cannot be read, or a change is refused; a refused
+    change changed nothing."""
 
 
 class PersistentKeyRegisterVersionError(PersistentKeyRegisterError):
     """The file has another layout; it is left untouched, never migrated."""
 
     code: Final = "persistent_key_register_version_unsupported"
-
-
-class PersistentKeyStorageUncertainError(
-    PersistentKeyRegisterError, PersistentValueUncertainError
-):
-    """The change is in the file and in memory, but may not survive a crash.
-
-    The register refuses further changes until it is reconciled with disk.
-    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,22 +166,24 @@ class PersistentKeyReconciliation:
 class PersistentKeyEdit:
     """Who made one value change; audited with the change itself.
 
-    Operator edits name their request; writes from a run name the run and,
-    when a node wrote, the node instance and attempt.
+    Operator edits name their request (its request key, 32 hex); writes from
+    a run name the run number and, when a node wrote, the node instance and
+    attempt number. Run and attempt numbers restart with every application
+    start: the register records the start that wrote each change with it.
     """
 
-    request_id: str | None
+    request_key: str | None
     source_label: str
-    program_run_id: str | None = None
+    program_run_id: int | None = None
     node_instance_id: str | None = None
-    node_attempt_id: str | None = None
+    node_attempt_id: int | None = None
 
     @classmethod
     def from_write_metadata(cls, metadata: Mapping[str, Any]) -> "PersistentKeyEdit":
         """The identity a run's value store attached to one write."""
 
         return cls(
-            request_id=metadata.get("request_id"),
+            request_key=metadata.get("request_key"),
             source_label=metadata.get("value_source", "program_node"),
             program_run_id=metadata.get("program_run_id"),
             node_instance_id=metadata.get("node_instance_id"),
@@ -232,6 +232,24 @@ def _require_id(value: str, *, field: str) -> str:
     return value
 
 
+def _require_number(value: int, *, field: str) -> int:
+    if type(value) is not int or value < 1:
+        raise PersistentKeyRegisterError(f"{field} must be a positive integer")
+    return value
+
+
+def _require_start_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or _APPLICATION_START_ID.fullmatch(value) is None
+        or value == "0" * 16
+    ):
+        raise PersistentKeyRegisterError(
+            "application_start_id must be 16 lowercase hex characters, not all zeros"
+        )
+    return value
+
+
 def _require_project(value: str) -> str:
     """A Scenario project folder path: the register's Scenario identity."""
 
@@ -274,15 +292,15 @@ def _audit(
         "reason": reason,
         "detail": _bounded_detail(detail),
     }
-    for field_name in (
-        "request_id",
-        "program_run_id",
-        "node_instance_id",
-        "node_attempt_id",
-    ):
+    for field_name in ("request_key", "node_instance_id"):
         value = getattr(edit, field_name)
         record[field_name] = (
             None if value is None else _require_id(value, field=field_name)
+        )
+    for field_name in ("program_run_id", "node_attempt_id"):
+        value = getattr(edit, field_name)
+        record[field_name] = (
+            None if value is None else _require_number(value, field=field_name)
         )
     return record
 
@@ -314,13 +332,38 @@ def _drop_audit(notice: PersistentKeyNotice, edit: PersistentKeyEdit) -> dict[st
 
 
 class PersistentKeyRegister:
-    """One small versioned file; every change is committed before it returns."""
+    """One small versioned file, always rewritten whole by write-then-rename.
 
-    def __init__(self, path: Path) -> None:
-        if not isinstance(path, Path) or not path.is_absolute():
-            raise ValueError("persistent-key register path must be absolute")
-        self._path = path
+    Memory is the authority while the runner runs: every change changes
+    memory and returns, every reader reads memory, and the register's writer
+    thread then writes the latest state to the file. The file is a copy for
+    the next start, read once by the constructor.
+
+    The file is ``REGISTER_FILE_NAME`` in ``directory``. ``application_start_id``
+    is this application start ``A`` (16 hex): every change written here
+    records it, so a change keeps the start that wrote it when it is read
+    under a later start.
+    """
+
+    def __init__(self, directory: Path, *, application_start_id: str) -> None:
+        if not isinstance(directory, Path) or not directory.is_absolute():
+            raise ValueError("persistent-key register directory must be absolute")
+        self._path = directory / REGISTER_FILE_NAME
+        self._application_start_id = _require_start_id(application_start_id)
+        # Lock order: _lock, then _writer_cv. _lock guards memory only; no
+        # file call is made under either. Only the writer thread writes the
+        # file, one state after the other, so a newer state is never
+        # overwritten by an older one.
         self._lock = RLock()
+        # Memory changes counted (under _lock), and the count the file last
+        # holds (writer thread only).
+        self._generation = 0
+        self._written = 0
+        self._writer_cv = Condition(Lock())
+        self._writer_wanted = False
+        self._writer_busy = False
+        self._writer_closing = False
+        self._write_failures = 0
         self._sequence = 0
         # (project_path, key) -> {"fingerprint", "value", "sequence"}
         self._rows: dict[tuple[str, str], dict[str, Any]] = {}
@@ -336,18 +379,120 @@ class PersistentKeyRegister:
         self._unobserved: dict[str, str] = {}
         # Values a run start dropped, for that run's audit (see take_notices).
         self._notices: list[PersistentKeyNotice] = []
-        # Set when a replaced file may not be durable; see _reconcile_disk.
-        self._uncertain = False
         self._load()
+        self._writer = Thread(
+            target=self._writer_loop, name="persistent-key-writer", daemon=True
+        )
+        self._writer.start()
 
     @property
     def path(self) -> Path:
         return self._path
 
+    @property
+    def write_failures(self) -> int:
+        """Failed file writes of the writer thread since this start."""
+
+        with self._writer_cv:
+            return self._write_failures
+
+    def wait_written(self, timeout_s: float | None = None) -> bool:
+        """Wait until the writer has handled every change made so far."""
+
+        with self._writer_cv:
+            return self._writer_cv.wait_for(
+                lambda: not self._writer_wanted and not self._writer_busy, timeout_s
+            )
+
+    def close(self, timeout_s: float) -> bool:
+        """Write the latest state and stop the writer, within ``timeout_s``.
+
+        False when the writer has not finished in time: the file then holds
+        the last complete state written, without the newest changes.
+        """
+
+        with self._writer_cv:
+            self._writer_closing = True
+            self._writer_cv.notify_all()
+        self._writer.join(timeout_s)
+        if self._writer.is_alive():
+            _LOGGER.warning(
+                "stored values: the last changes were not written within %.1f s",
+                timeout_s,
+            )
+            return False
+        return True
+
+    def _writer_loop(self) -> None:
+        while True:
+            with self._writer_cv:
+                while not self._writer_wanted and not self._writer_closing:
+                    self._writer_cv.wait()
+                self._writer_wanted = False
+                self._writer_busy = True
+                closing = self._writer_closing
+            self._flush()
+            with self._writer_cv:
+                self._writer_busy = False
+                self._writer_cv.notify_all()
+            if closing:
+                return
+
+    def _flush(self) -> None:
+        """Write the latest state if memory is ahead of the file (writer thread)."""
+
+        with self._lock:
+            generation = self._generation
+            if generation == self._written:
+                return
+            # Memory state is replaced, never changed in place, so these
+            # references stay as taken while they are encoded unlocked.
+            state = (
+                self._rows,
+                self._edits,
+                self._sequence,
+                self._activation,
+                self._reconciled,
+                self._unobserved,
+            )
+        try:
+            self._replace_file(self._encode(*state))
+            self._sync_directory()
+        except Exception:
+            with self._writer_cv:
+                self._write_failures += 1
+            _LOGGER.exception(
+                "stored values could not be written; the next change or "
+                "shutdown writes the latest state again"
+            )
+            return
+        self._written = generation
+
+    def _log_older_files(self) -> None:
+        """Name, in one line, register files of an earlier format left beside it."""
+        try:
+            names = os.listdir(self._path.parent)
+        except OSError:
+            return
+        older = sorted(
+            str(self._path.parent / name)
+            for name in names
+            if (match := _OLDER_FILE_NAME.fullmatch(name)) is not None
+            and (match.group(1) is None or int(match.group(1)) < FORMAT_VERSION)
+        )
+        if older:
+            _LOGGER.warning(
+                "stored values start empty: %s %s in an older format and %s left in place",
+                ", ".join(older),
+                "is" if len(older) == 1 else "are",
+                "was" if len(older) == 1 else "were",
+            )
+
     def _load(self) -> None:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            self._log_older_files()
             return
         except OSError as error:
             raise PersistentKeyRegisterError(
@@ -360,23 +505,6 @@ class PersistentKeyRegister:
                 "persistent-key register is not valid JSON"
             ) from error
         found = document.get("schema_version") if type(document) is dict else None
-        if found == _SUPERSEDED_SCHEMA_VERSION:
-            superseded = self._path.with_name(f"{self._path.name}.v2.superseded")
-            try:
-                os.replace(self._path, superseded)
-            except OSError as error:
-                raise PersistentKeyRegisterError(
-                    f"persistent-key register {self._path} has the superseded "
-                    f"layout and could not be moved aside: {error}"
-                ) from error
-            _LOGGER.warning(
-                "persistent-key register %s had the superseded layout %s; it "
-                "was moved aside to %s and the register starts empty",
-                self._path,
-                found,
-                superseded,
-            )
-            return
         if found != SCHEMA_VERSION:
             raise PersistentKeyRegisterVersionError(
                 f"persistent-key register {self._path} has schema_version "
@@ -478,16 +606,47 @@ class PersistentKeyRegister:
         reconciled: frozenset[str] | None = None,
         unobserved: dict[str, str] | None = None,
     ) -> None:
+        """Change memory (caller holds _lock) and wake the writer thread,
+        which writes the file afterwards."""
+
         if isinstance(audits, dict):
             audits = [audits]
         edits = self._edits
         if audits:
-            edits = [*edits, *({"sequence": sequence, **audit} for audit in audits)][
-                -MAX_EDITS:
-            ]
+            edits = [
+                *edits,
+                *(
+                    {
+                        "sequence": sequence,
+                        "application_start_id": self._application_start_id,
+                        **audit,
+                    }
+                    for audit in audits
+                ),
+            ][-MAX_EDITS:]
         activation = self._activation if activation is None else activation
         reconciled = self._reconciled if reconciled is None else reconciled
         unobserved = self._unobserved if unobserved is None else unobserved
+        self._rows = rows
+        self._edits = edits
+        self._sequence = sequence
+        self._activation = None if activation is None else dict(activation)
+        self._reconciled = reconciled
+        self._unobserved = dict(unobserved)
+        self._generation += 1
+        with self._writer_cv:
+            self._writer_wanted = True
+            self._writer_cv.notify_all()
+
+    @staticmethod
+    def _encode(
+        rows: dict[tuple[str, str], dict[str, Any]],
+        edits: list[dict[str, Any]],
+        sequence: int,
+        activation: dict[str, str] | None,
+        reconciled: frozenset[str],
+        unobserved: dict[str, str],
+    ) -> str:
         document = {
             "schema_version": SCHEMA_VERSION,
             "sequence": sequence,
@@ -503,7 +662,11 @@ class PersistentKeyRegister:
                 for digest, project in sorted(unobserved.items())
             ],
         }
-        encoded = json.dumps(document, sort_keys=True, indent=1, allow_nan=False)
+        return json.dumps(document, sort_keys=True, indent=1, allow_nan=False)
+
+    def _replace_file(self, encoded: str) -> None:
+        """Write a complete file beside the register, then rename it over it."""
+
         temporary = self._path.with_name(f".{self._path.name}.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -516,22 +679,6 @@ class PersistentKeyRegister:
             raise PersistentKeyRegisterError(
                 f"persistent-key register could not be written: {error}"
             ) from error
-        # The file now holds the change, so memory follows it even if the
-        # directory entry cannot be made durable below.
-        self._rows = rows
-        self._edits = edits
-        self._sequence = sequence
-        self._activation = None if activation is None else dict(activation)
-        self._reconciled = reconciled
-        self._unobserved = dict(unobserved)
-        try:
-            self._sync_directory()
-        except OSError as error:
-            self._uncertain = True
-            raise PersistentKeyStorageUncertainError(
-                "persistent-key register was written but may not be durable: "
-                f"{error}"
-            ) from error
 
     def _sync_directory(self) -> None:
         directory = os.open(self._path.parent, os.O_RDONLY)
@@ -539,24 +686,6 @@ class PersistentKeyRegister:
             os.fsync(directory)
         finally:
             os.close(directory)
-
-    def _reconcile_disk(self) -> None:
-        """Before a change, re-read a possibly non-durable file and sync it.
-
-        Until both succeed every change is refused; nothing is written.
-        """
-
-        if not self._uncertain:
-            return
-        try:
-            self._load()
-            self._sync_directory()
-        except (OSError, PersistentKeyRegisterError) as error:
-            raise PersistentKeyRegisterError(
-                "persistent-key register is not reconciled after a write that "
-                f"may not be durable: {error}"
-            ) from error
-        self._uncertain = False
 
     def reconcile(self, activation: CommittedActivation) -> PersistentKeyReconciliation:
         """Make the stored rows follow one committed Scenario activation.
@@ -569,7 +698,7 @@ class PersistentKeyRegister:
         new publication history is accepted. Manager evicts old committed
         Applies, so the history continues while the last reconciled activation
         is still retained; faults naming evicted Applies go with them. All
-        changes are written in one
+        changes are made in one
         step. An activation already accounted for changes nothing, so
         repeated or late notifications are harmless.
         """
@@ -577,9 +706,6 @@ class PersistentKeyRegister:
         if not isinstance(activation, CommittedActivation):
             raise TypeError("reconcile requires one CommittedActivation")
         with self._lock:
-            # Settle a write that may not be durable first: memory may count
-            # an activation as reconciled that the disk does not yet hold.
-            self._reconcile_disk()
             if activation.record_digest in self._reconciled:
                 current = self._activation
                 return PersistentKeyReconciliation(
@@ -679,11 +805,9 @@ class PersistentKeyRegister:
         _require_project(project_path)
         with self._lock:
             if (
-                self._uncertain
-                or self._activation is None
+                self._activation is None
                 or self._activation["project_path"] != project_path
             ):
-                # Nothing is restored while a write may not be durable.
                 return {}
             restored: dict[str, Any] = {}
             for (row_project, key), row in self._rows.items():
@@ -708,8 +832,7 @@ class PersistentKeyRegister:
     ) -> None:
         """Forget a stored value the committed Program no longer accepts.
 
-        The notice is kept for the starting run's audit even when the row
-        could not be removed; a failed removal raises.
+        The notice is kept for the starting run's audit.
         """
 
         identity = (
@@ -727,7 +850,6 @@ class PersistentKeyRegister:
             )
         with self._lock:
             self._notices.append(notice)
-            self._reconcile_disk()
             if identity not in self._rows:
                 return
             rows = dict(self._rows)
@@ -746,7 +868,9 @@ class PersistentKeyRegister:
 
         A value is written only when it changes: a stored row with the same
         structure and value is kept as it is, with no new sequence or audit.
-        An absent row is never equal, even to `initial:`.
+        An absent row is never equal, even to `initial:`. Every write
+        returns once in memory and never waits for the disk; the writer
+        thread stores it.
         """
 
         identity = (
@@ -765,26 +889,34 @@ class PersistentKeyRegister:
             )
         fingerprint = declaration_fingerprint(declaration)
         with self._lock:
-            self._reconcile_disk()
-            stored = self._rows.get(identity)
-            if (
-                stored is not None
-                and stored["fingerprint"] == fingerprint
-                and _canonical(stored["value"]) == encoded
-            ):
-                return
-            rows = dict(self._rows)
-            if identity not in rows and len(rows) >= MAX_ROWS:
-                raise PersistentKeyRegisterError(
-                    f"persistent-key register is full ({MAX_ROWS} rows)"
-                )
-            sequence = self._sequence + 1
-            rows[identity] = {
-                "fingerprint": fingerprint,
-                "value": json.loads(encoded),
-                "sequence": sequence,
-            }
-            self._write(rows, sequence, _audit(edit, "set", *identity))
+            self._commit_locked(identity, fingerprint, encoded, edit)
+
+    def _commit_locked(
+        self,
+        identity: tuple[str, str],
+        fingerprint: str,
+        encoded: str,
+        edit: PersistentKeyEdit | Mapping[str, Any] | None,
+    ) -> None:
+        stored = self._rows.get(identity)
+        if (
+            stored is not None
+            and stored["fingerprint"] == fingerprint
+            and _canonical(stored["value"]) == encoded
+        ):
+            return
+        rows = dict(self._rows)
+        if identity not in rows and len(rows) >= MAX_ROWS:
+            raise PersistentKeyRegisterError(
+                f"persistent-key register is full ({MAX_ROWS} rows)"
+            )
+        sequence = self._sequence + 1
+        rows[identity] = {
+            "fingerprint": fingerprint,
+            "value": json.loads(encoded),
+            "sequence": sequence,
+        }
+        self._write(rows, sequence, _audit(edit, "set", *identity))
 
     def remove(
         self,
@@ -800,7 +932,6 @@ class PersistentKeyRegister:
             _require_id(key, field="key"),
         )
         with self._lock:
-            self._reconcile_disk()
             if identity not in self._rows:
                 return False
             rows = dict(self._rows)
@@ -831,7 +962,6 @@ class PersistentKeyRegister:
             if declaration.access in OPERATOR_WRITABLE_ACCESS
         }
         with self._lock:
-            self._reconcile_disk()
             rows = {
                 identity: row
                 for identity, row in self._rows.items()
@@ -856,9 +986,9 @@ class PersistentKeyRegister:
         """Forget every stored value of the Scenario's persistent keys.
 
         The Program Reset that reloads the initial scene: each key, whatever
-        its access, starts again from `initial:` (or empty). One write, with
-        one `reset` audit per key naming the value it had; a refused write
-        changes nothing. Returns the forgotten values by key.
+        its access, starts again from `initial:` (or empty). One change, with
+        one `reset` audit per key naming the value it had. Returns the
+        forgotten values by key.
         """
 
         _require_project(project_path)
@@ -868,7 +998,6 @@ class PersistentKeyRegister:
             if declaration.persistence == "persistent"
         }
         with self._lock:
-            self._reconcile_disk()
             forgotten = {
                 key: json.loads(_canonical(row["value"]))
                 for (row_project, key), row in sorted(self._rows.items())
@@ -953,7 +1082,7 @@ __all__ = [
     "PersistentKeyRegister",
     "PersistentKeyRegisterError",
     "PersistentKeyRegisterVersionError",
-    "PersistentKeyStorageUncertainError",
+    "REGISTER_FILE_NAME",
     "FAULT_APPLY_NOT_OBSERVED",
     "REASON_DECLARATION_CHANGED",
     "REASON_NOT_DECLARED",

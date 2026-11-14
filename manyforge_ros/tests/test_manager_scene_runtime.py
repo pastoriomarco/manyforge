@@ -49,7 +49,6 @@ def _owner_response() -> dict[str, object]:
         "initialization_state": "open",
         "ok": True,
         "runtime_identity": _identity(),
-        "scene_runtime_owner_epoch": "scene-runtime-owner.1",
     }
 
 
@@ -156,7 +155,6 @@ def test_client_exchanges_exact_canonical_owner_open_and_observe_packets(
     assert server_failure == []
     assert owner == SceneRuntimeOwnerSnapshot(
         cell_id="cell.ur10",
-        owner_epoch="scene-runtime-owner.1",
         runtime_identity=owner.runtime_identity,
         initialization_generation=7,
         initialization_state="open",
@@ -416,8 +414,8 @@ def test_client_accepts_unchanged_sample_with_unchanged_projection(
 def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> None:
     for index, response in enumerate(
         (
-            b'{"api_version": "manyforge.manager_command_response.v2","ok":true}',
-            b'{"api_version":"manyforge.manager_command_response.v2",'
+            b'{"api_version": "manyforge.manager_command_response.v3","ok":true}',
+            b'{"api_version":"manyforge.manager_command_response.v3",'
             b'"ok":true,"ok":true}',
         )
     ):
@@ -626,7 +624,7 @@ def test_manager_scene_runtime_validates_optional_reference_payload(
         with connection:
             connection.recv(4096)
             connection.send(rfc8785.dumps({
-                "api_version": "manyforge.manager_command_response.v2",
+                "api_version": "manyforge.manager_command_response.v3",
                 "error": error,
                 "ok": False,
             }))

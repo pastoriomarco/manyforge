@@ -92,9 +92,12 @@ struct RetainedResolvedParticipant final {
   std::optional<core::PreviewTcpCapture> preview_tcp_capture{};
 };
 
+/// The third argument is the Kernel's held-run resolution context (OD-234):
+/// null unless the operation names the run the Kernel holds.
 using RetainedRuntimeParticipantResolver =
     std::function<core::Result<RetainedResolvedParticipant>(
-        const core::OperationIntentDTO &, std::size_t)>;
+        const core::OperationIntentDTO &, std::size_t,
+        const core::ProgramRunResolutionContext &)>;
 
 using RetainedRuntimeParticipantResolverFactory =
     std::function<RetainedRuntimeParticipantResolver(
@@ -348,7 +351,6 @@ struct RetainedExecutionHost final {
   std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
   /// The fault profile above is Deployment-authored, not derived.
   bool motion_fault_stop_profile_from_deployment{false};
-  std::optional<core::RequestOwnerEpoch> addressed_request_owner_epoch;
   std::optional<core::CellId> addressed_cell_id;
   std::shared_ptr<RetainedObservedStateChannel> motion_state_channel;
 

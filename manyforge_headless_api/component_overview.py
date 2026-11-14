@@ -18,7 +18,7 @@ import rfc8785
 from .component_model import ComponentModel, owner_ids
 
 
-COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v2"
+COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v3"
 
 _HEALTHY = "healthy"
 _WAITING = "waiting"
@@ -145,7 +145,6 @@ def _component(
     required: bool,
     required_for: tuple[str, ...],
     owner_id: object = None,
-    owner_epoch: object = None,
     generation: object = None,
     reason_code: object = None,
     scope: str,
@@ -159,9 +158,6 @@ def _component(
         "required": required,
         "required_for": list(required_for),
         "owner_id": owner_id if isinstance(owner_id, str) and owner_id else None,
-        "owner_epoch": (
-            owner_epoch if isinstance(owner_epoch, str) and owner_epoch else None
-        ),
         "generation": (
             generation
             if isinstance(generation, int)
@@ -309,10 +305,8 @@ def _current_empty_physical_graph(
         and manager_source.get("available") is True
         and manager_source.get("freshness") == "fresh"
         and manager_source.get("known_gaps") == []
-        and all(
-            isinstance(manager_source.get(field), str) and manager_source[field]
-            for field in ("source_owner_id", "source_owner_epoch")
-        )
+        and isinstance(manager_source.get("source_owner_id"), str)
+        and bool(manager_source["source_owner_id"])
         and type(generation) is int
         and generation > 0
         and manager.get("manager_ready") is True
@@ -401,8 +395,8 @@ def build_component_overview(
         apply_generation = operation.get("apply_generation")
         phase = operation.get("phase")
         if (
-            isinstance(apply_id, str)
-            and bool(apply_id)
+            type(apply_id) is int
+            and apply_id >= 1
             and isinstance(apply_generation, int)
             and not isinstance(apply_generation, bool)
             and apply_generation >= 1
@@ -469,7 +463,6 @@ def build_component_overview(
             required=True,
             required_for=("Observe / Render", "Plan / Preview", "Execute / Control"),
             owner_id=manager_section.get("source_owner_id"),
-            owner_epoch=manager_section.get("source_owner_epoch"),
             generation=_mapping(active.get("publication")).get(
                 "publication_generation"
             ),
@@ -531,7 +524,6 @@ def build_component_overview(
             required=True,
             required_for=("Execute / Control",),
             owner_id=applied_source.get("source_owner_id"),
-            owner_epoch=applied_source.get("source_owner_epoch"),
             generation=applied_source.get("source_generation"),
             reason_code=applied_reason,
             scope="program",
@@ -581,7 +573,6 @@ def build_component_overview(
                 required=True,
                 required_for=("Observe / Render", "Plan / Preview"),
                 owner_id=section.get("source_owner_id"),
-                owner_epoch=section.get("source_owner_epoch"),
                 # Scene-runtime generation advances for pose samples. The
                 # exact value remains in basis, not operator-visible health.
                 generation=(
@@ -625,7 +616,6 @@ def build_component_overview(
             required=True,
             required_for=("Observe / Render", "Plan / Preview"),
             owner_id=source_model_source.get("source_owner_id"),
-            owner_epoch=source_model_source.get("source_owner_epoch"),
             generation=source_model_source.get("source_generation"),
             reason_code=viewer_reason,
             scope="model",
@@ -670,7 +660,6 @@ def build_component_overview(
             ),
             required=True,
             required_for=("Plan / Preview", "Execute / Control"),
-            owner_epoch=identity.get("owner_epoch"),
             generation=identity.get("active_publication_generation"),
             reason_code=execution_reason,
             scope="execution",
@@ -733,7 +722,6 @@ def build_component_overview(
             ),
             required=True,
             required_for=("Plan / Preview", "Execute / Control"),
-            owner_epoch=identity.get("owner_epoch"),
             generation=identity.get("active_publication_generation"),
             reason_code=target_reason,
             scope="execution",
@@ -768,7 +756,6 @@ def build_component_overview(
             ),
             required=True,
             required_for=("Plan / Preview",),
-            owner_epoch=identity.get("owner_epoch"),
             generation=identity.get("active_publication_generation"),
             reason_code=(None if planner_status == _HEALTHY else "planning_contract_unavailable"),
             scope="planning",
@@ -802,9 +789,8 @@ def build_component_overview(
             ),
             required=True,
             required_for=("Execute / Control",),
-            owner_epoch=identity.get("owner_epoch"),
             generation=(
-                cell_stop_action.get("expected_stop_generation")
+                cell_stop_action.get("last_event_id")
                 or identity.get("active_publication_generation")
             ),
             reason_code=stop_reason,
@@ -830,7 +816,6 @@ def build_component_overview(
             ),
             required=True,
             required_for=("Execute / Control",),
-            owner_epoch=program_cycle.get("program_runner_owner_epoch"),
             generation=program_cycle.get("cycle_generation"),
             reason_code=cycle_reason,
             scope="program",
@@ -878,7 +863,6 @@ def build_component_overview(
             required=True,
             required_for=("scope named by each alarm",),
             owner_id=alarms.get("owner_id"),
-            owner_epoch=alarms.get("owner_epoch"),
             generation=alarms.get("generation"),
             reason_code=alarm_reason,
             scope="alarms",
@@ -906,8 +890,8 @@ def build_component_overview(
         not identity_error and not targets_error and not control_error
         and execution_status == _HEALTHY
         and identity.get("cell_id") == manager_payload.get("cell_id")
-        and isinstance(identity.get("owner_epoch"), str)
-        and bool(identity["owner_epoch"])
+        and isinstance(identity.get("application_start_id"), str)
+        and bool(identity["application_start_id"])
         and type(identity.get("active_publication_generation")) is int
         and identity.get("active_publication_generation")
         == _mapping(active.get("publication")).get("publication_generation")
@@ -1075,30 +1059,18 @@ def build_component_overview(
         "components": [*scope_components, *components],
         "maintenance_operation": maintenance_operation,
         "basis": {
-            "runtime_projection_owner_epoch": runtime.get("projection_owner_epoch"),
             "runtime_projection_generation": runtime.get("projection_generation"),
-            "manager_source_owner_epoch": manager_section.get("source_owner_epoch"),
-            "logical_scene_source_owner_epoch": _mapping(
-                sections.get("logical_scene")
-            ).get("source_owner_epoch"),
             "logical_scene_source_generation": _mapping(
                 sections.get("logical_scene")
             ).get("source_generation"),
-            "scene_runtime_source_owner_epoch": _mapping(
-                sections.get("scene_runtime")
-            ).get("source_owner_epoch"),
             "scene_runtime_source_generation": _mapping(
                 sections.get("scene_runtime")
             ).get("source_generation"),
-            "alarm_owner_epoch": alarms.get("owner_epoch"),
             "alarm_generation": alarms.get("generation"),
             "alarm_state_revision": alarms.get("state_revision"),
             "admission_generation": authoring_admission.get("admission_generation"),
-            "program_runner_owner_epoch": program_cycle.get("program_runner_owner_epoch"),
             "program_cycle_generation": program_cycle.get("cycle_generation"),
-            "applied_program_owner_epoch": applied_source.get("source_owner_epoch"),
             "applied_program_generation": applied_source.get("source_generation"),
-            "execution_owner_epoch": identity.get("owner_epoch"),
             "execution_publication_generation": identity.get("active_publication_generation"),
         },
     }

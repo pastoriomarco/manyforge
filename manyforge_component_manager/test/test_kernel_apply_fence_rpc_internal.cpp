@@ -5,6 +5,7 @@
 #include <manyforge_deployment/apply_fence_qualification.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -116,11 +117,11 @@ ActiveConfigurations(const core::ConfigurationFenceScopeDTO &scope,
 [[nodiscard]] core::ApplyConfigurationFenceIntentDTO
 MaximumIntent(const core::ConfigurationFenceScopeDTO &scope) {
   return {
-      {core::RequestId(Identifier('q', 1U, 256U)),
-       core::RequestOwnerEpoch(Identifier('o', 1U, 256U)),
-       Text('s', kMaximumManagerApplySourceLabelBytes),
-       Text('k', kMaximumManagerApplyCorrelationIdBytes)},
-      {core::ApplyId(Identifier('p', 1U, 256U)), core::ApplyGeneration(1U)},
+      {core::RequestKey::Make(
+           core::RequestKeyClass::kInternal, 0U,
+           static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), 1U),
+       Text('s', kMaximumManagerApplySourceLabelBytes)},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       core::RetainedBundleId(std::string(kDigestOne)),
@@ -135,7 +136,6 @@ MaximumIntent(const core::ConfigurationFenceScopeDTO &scope) {
 [[nodiscard]] core::ExecutionHostEpochDTO ExecutionHostEpoch() {
   return {core::RuntimeUnitId(Identifier('u', 1U, 128U)),
           core::RuntimeEpoch(Identifier('e', 1U, 256U)),
-          core::RequestOwnerEpoch(Identifier('w', 1U, 256U)),
           core::ContentDigest(std::string(kDigestThree)),
           core::ActiveBundlePublicationGeneration(9U)};
 }
@@ -182,15 +182,12 @@ TEST(KernelApplyFenceRpcInternal,
   const auto scope = MaximumTransitionScope();
   const auto intent = MaximumIntent(scope);
   ASSERT_TRUE(intent.valid());
-  const core::ConfigurationFenceAdmissionQueryDTO admission_query{
-      scope, core::RuntimeEpoch(Identifier('m', 1U, 256U))};
+  const core::ConfigurationFenceAdmissionQueryDTO admission_query{scope};
   const core::ApplyFenceAcquireAttemptQueryDTO attempt_query{
-      intent, core::ContentDigest(std::string(kDigestThree)),
-      admission_query.manager_runtime_epoch};
+      intent, core::ContentDigest(std::string(kDigestThree))};
   const auto evidence = Evidence(scope, intent.owner_transaction);
   ASSERT_TRUE(evidence.valid());
-  const core::ConfigurationFenceReleaseDTO release{
-      evidence, admission_query.manager_runtime_epoch};
+  const core::ConfigurationFenceReleaseDTO release{evidence};
   ASSERT_TRUE(release.valid());
 
   ExpectRequestRoundTripWithinPacket(admission_query);
@@ -198,8 +195,7 @@ TEST(KernelApplyFenceRpcInternal,
   ExpectRequestRoundTripWithinPacket(attempt_query);
   ExpectRequestRoundTripWithinPacket(core::ConfigurationFenceStatusQueryDTO{
       intent.owner_transaction, evidence.configuration_fence_id,
-      evidence.configuration_fence_generation, scope,
-      admission_query.manager_runtime_epoch});
+      evidence.configuration_fence_generation, scope});
   ExpectRequestRoundTripWithinPacket(release);
 }
 
@@ -210,10 +206,8 @@ TEST(KernelApplyFenceRpcInternal,
   const auto evidence = Evidence(scope, intent.owner_transaction);
   const core::ConfigurationFenceStatusQueryDTO status_query{
       intent.owner_transaction, evidence.configuration_fence_id,
-      evidence.configuration_fence_generation, scope,
-      core::RuntimeEpoch(Identifier('m', 1U, 256U))};
-  const core::ConfigurationFenceReleaseDTO release{
-      evidence, status_query.manager_runtime_epoch};
+      evidence.configuration_fence_generation, scope};
+  const core::ConfigurationFenceReleaseDTO release{evidence};
   const core::ConfigurationFenceReleasedDTO released{
       release, evidence.execution_host_epoch, 10U,
       core::RequestReplayStatusDTO::kAcceptedNew,
@@ -248,8 +242,7 @@ TEST(KernelApplyFenceRpcInternal,
   ASSERT_TRUE(accepted.matches(intent));
   const core::ApplyFenceAcquireAttemptReconcileResultDTO attempt_result{
       evidence.execution_host_epoch,
-      {intent, core::ContentDigest(std::string(kDigestTwo)),
-       status_query.manager_runtime_epoch},
+      {intent, core::ContentDigest(std::string(kDigestTwo))},
       core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact,
       accepted,
       true,
@@ -270,6 +263,81 @@ TEST(KernelApplyFenceRpcInternal,
   EXPECT_EQ(attempt_round_trip->accepted_fence, accepted);
 }
 
+[[nodiscard]] core::ActiveBundlePublicationReceiptDTO NamedApplyPublication() {
+  const auto projection = ActiveProjection();
+  return {{core::NamedApplyPublicationTransactionDTO{core::ApplyId(3U),
+                                                     core::ApplyGeneration(2U)},
+           projection, projection.retained_bundle_id, projection.graph_revision,
+           core::ActiveBundlePublicationGeneration(8U),
+           core::ContentDigest(std::string(kDigestOne))},
+          core::ActiveBundlePublicationGeneration(9U),
+          core::ContentDigest(std::string(kDigestThree))};
+}
+
+[[nodiscard]] core::ActiveBundlePublicationReceiptDTO BootstrapPublication() {
+  const auto projection = ActiveProjection();
+  return {{core::BootstrapPublicationTransactionDTO{core::BootstrapId("bootstrap.active"),
+                                                    core::BootstrapGeneration(1U)},
+           projection, projection.retained_bundle_id, projection.graph_revision,
+           std::nullopt, core::ContentDigest(std::string(kDigestOne))},
+          core::ActiveBundlePublicationGeneration(1U),
+          core::ContentDigest(std::string(kDigestThree))};
+}
+
+// A channel packet is the unchanged request record followed by the optional
+// publication: present for every request but Release.
+TEST(KernelApplyFenceRpcInternal, ChannelPacketIsTheRecordThenTheActivePublication) {
+  const auto scope = MaximumTransitionScope();
+  const auto intent = MaximumIntent(scope);
+  const KernelApplyFenceRpcRequest query{core::ConfigurationFenceAdmissionQueryDTO{scope}};
+  const KernelApplyFenceRpcRequest release{
+      core::ConfigurationFenceReleaseDTO{Evidence(scope, intent.owner_transaction)}};
+  const auto query_record = EncodeKernelApplyFenceRpcRequest(query);
+  const auto release_record = EncodeKernelApplyFenceRpcRequest(release);
+
+  for (const auto &publication : {NamedApplyPublication(), BootstrapPublication()}) {
+    ASSERT_TRUE(publication.valid());
+    const KernelApplyFenceRpcPacket packet{query, publication};
+    const auto bytes = EncodeKernelApplyFenceRpcPacket(packet);
+    ASSERT_GT(bytes.size(), query_record.size());
+    EXPECT_EQ(bytes.substr(0U, query_record.size()), query_record);
+    EXPECT_EQ(DecodeKernelApplyFenceRpcPacket(bytes), packet);
+    EXPECT_EQ(EncodeKernelApplyFenceRpcPacket(DecodeKernelApplyFenceRpcPacket(bytes)), bytes);
+  }
+
+  const KernelApplyFenceRpcPacket release_packet{release, std::nullopt};
+  const auto release_bytes = EncodeKernelApplyFenceRpcPacket(release_packet);
+  EXPECT_EQ(release_bytes, release_record + std::string(1U, '\0'));
+  EXPECT_EQ(DecodeKernelApplyFenceRpcPacket(release_bytes), release_packet);
+  EXPECT_EQ(DecodeKernelApplyFenceRpcRequest(release_record), release);
+}
+
+// A non-Release request without the publication, and a Release with one, are
+// refused on both sides.
+TEST(KernelApplyFenceRpcInternal, ChannelPacketRefusesAMisplacedActivePublication) {
+  const auto scope = MaximumTransitionScope();
+  const auto intent = MaximumIntent(scope);
+  const KernelApplyFenceRpcRequest query{core::ConfigurationFenceAdmissionQueryDTO{scope}};
+  const KernelApplyFenceRpcRequest release{
+      core::ConfigurationFenceReleaseDTO{Evidence(scope, intent.owner_transaction)}};
+  EXPECT_THROW((void)EncodeKernelApplyFenceRpcPacket({query, std::nullopt}),
+               std::invalid_argument);
+  EXPECT_THROW((void)EncodeKernelApplyFenceRpcPacket({release, NamedApplyPublication()}),
+               std::invalid_argument);
+
+  const auto query_record = EncodeKernelApplyFenceRpcRequest(query);
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcPacket(query_record + std::string(1U, '\0')),
+               std::invalid_argument);
+  // The record alone lacks the presence byte.
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcPacket(query_record), std::invalid_argument);
+  const auto query_packet =
+      EncodeKernelApplyFenceRpcPacket({query, NamedApplyPublication()});
+  const auto present_publication = query_packet.substr(query_record.size());
+  EXPECT_THROW((void)DecodeKernelApplyFenceRpcPacket(
+                   EncodeKernelApplyFenceRpcRequest(release) + present_publication),
+               std::invalid_argument);
+}
+
 } // namespace
 TEST(KernelApplyFenceRpcInternal,
      ProviderScopesUseExplicitEnvelopeAndRetainExactProof) {
@@ -286,16 +354,15 @@ TEST(KernelApplyFenceRpcInternal,
       {},
       occurrence.output_resources};
   ASSERT_TRUE(scope.valid());
-  const core::ConfigurationFenceAdmissionQueryDTO query{
-      scope, core::RuntimeEpoch("manager")};
+  const core::ConfigurationFenceAdmissionQueryDTO query{scope};
   const auto request = EncodeKernelApplyFenceRpcRequest(query);
-  EXPECT_EQ(request.substr(0U, 8U), "MFNKAFR5");
+  EXPECT_EQ(request.substr(0U, 8U), "MFNKAFR6");
   EXPECT_TRUE(IsKernelApplyFenceRpcPacket(request));
   EXPECT_EQ(std::get<core::ConfigurationFenceAdmissionQueryDTO>(
                 DecodeKernelApplyFenceRpcRequest(request)),
             query);
   auto alias = request;
-  alias[7] = '2';
+  alias[7] = '3';
   EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(alias),
                std::invalid_argument);
   const core::ConfigurationFenceAcceptedDTO accepted{
@@ -303,7 +370,7 @@ TEST(KernelApplyFenceRpcInternal,
       core::ConfigurationFenceGeneration(1U), scope, 1,
       core::RequestReplayStatusDTO::kAcceptedNew};
   const auto reply = EncodeKernelApplyFenceRpcResponse(accepted);
-  EXPECT_EQ(reply.substr(0U, 8U), "MFNKAFR5");
+  EXPECT_EQ(reply.substr(0U, 8U), "MFNKAFR6");
   EXPECT_EQ(std::get<core::ConfigurationFenceAcceptedDTO>(
                 DecodeKernelApplyFenceRpcResponse(reply)),
             accepted);
@@ -312,15 +379,22 @@ TEST(KernelApplyFenceRpcInternal,
             reply);
   auto physical = MaximumIntent(MaximumTransitionScope());
   const auto legacy = EncodeKernelApplyFenceRpcRequest(physical);
-  EXPECT_EQ(legacy.substr(0U, 8U), "MFNKAFR2");
-  alias = legacy;
-  alias[7] = '3';
-  EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(alias),
-               std::invalid_argument);
+  EXPECT_EQ(legacy.substr(0U, 8U), "MFNKAFR3");
+  EXPECT_EQ(std::get<core::ApplyConfigurationFenceIntentDTO>(
+                DecodeKernelApplyFenceRpcRequest(legacy)),
+            physical);
+  // Earlier versions (2, 4, 5) are refused exactly like an unknown one.
+  for (const char version : {'2', '4', '5', '7'}) {
+    alias = legacy;
+    alias[7] = version;
+    EXPECT_FALSE(IsKernelApplyFenceRpcPacket(alias));
+    EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(alias),
+                 std::invalid_argument);
+  }
 }
 
 TEST(KernelApplyFenceRpcInternal,
-     ProviderAdmissionRoundTripsExplicitV5WithoutLineage) {
+     ProviderAdmissionRoundTripsExplicitV6WithoutLineage) {
   const core::ProviderConfigurationFenceOccurrenceDTO occurrence{
       core::ControllableComponentId("io"),
       core::ProviderInstanceId("provider.io"),
@@ -334,7 +408,7 @@ TEST(KernelApplyFenceRpcInternal,
       {},
       {}};
   core::ConfigurationFenceAdmissionSnapshotDTO snapshot{
-      {scope, core::RuntimeEpoch("manager.io")},
+      {scope},
       ExecutionHostEpoch(),
       ActiveProjection(),
       core::ContentDigest(std::string(kDigestOne)),
@@ -346,7 +420,7 @@ TEST(KernelApplyFenceRpcInternal,
       core::ContentDigest(std::string(kDigestTwo))};
   ASSERT_TRUE(snapshot.presence_valid());
   const auto bytes = EncodeKernelApplyFenceRpcResponse(snapshot);
-  EXPECT_EQ(bytes.substr(0U, 8U), "MFNKAFR5");
+  EXPECT_EQ(bytes.substr(0U, 8U), "MFNKAFR6");
   EXPECT_EQ(std::get<core::ConfigurationFenceAdmissionSnapshotDTO>(
                 DecodeKernelApplyFenceRpcResponse(bytes)),
             snapshot);
@@ -354,19 +428,23 @@ TEST(KernelApplyFenceRpcInternal,
   intent.expected_active_control_configurations.clear();
   ASSERT_TRUE(intent.valid());
   const auto intent_bytes = EncodeKernelApplyFenceRpcRequest(intent);
-  EXPECT_EQ(intent_bytes.substr(0U, 8U), "MFNKAFR5");
+  EXPECT_EQ(intent_bytes.substr(0U, 8U), "MFNKAFR6");
   EXPECT_EQ(std::get<core::ApplyConfigurationFenceIntentDTO>(
                 DecodeKernelApplyFenceRpcRequest(intent_bytes)),
             intent);
-  // The lineage-carrying v4 packet is no longer accepted.
-  auto old = bytes;
-  old[7] = '4';
-  EXPECT_THROW((void)DecodeKernelApplyFenceRpcResponse(old),
-               std::invalid_argument);
-  old = intent_bytes;
-  old[7] = '4';
-  EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(old),
-               std::invalid_argument);
+  // The lineage-carrying v4 and the pre-request-key v5 packets are no
+  // longer accepted.
+  for (const char version : {'4', '5'}) {
+    auto old = bytes;
+    old[7] = version;
+    EXPECT_FALSE(IsKernelApplyFenceRpcPacket(old));
+    EXPECT_THROW((void)DecodeKernelApplyFenceRpcResponse(old),
+                 std::invalid_argument);
+    old = intent_bytes;
+    old[7] = version;
+    EXPECT_THROW((void)DecodeKernelApplyFenceRpcRequest(old),
+                 std::invalid_argument);
+  }
 }
 
 TEST(KernelApplyFenceRpcInternal,
@@ -398,7 +476,7 @@ TEST(KernelApplyFenceRpcInternal,
                std::invalid_argument);
   // A record is never a packet of the base version.
   auto alias = provider_record;
-  alias[7] = '2';
+  alias[7] = '3';
   EXPECT_THROW((void)DecodeConfigurationFenceScopeRecord(alias),
                std::invalid_argument);
 }

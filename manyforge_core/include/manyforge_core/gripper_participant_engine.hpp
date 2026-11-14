@@ -67,13 +67,12 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
   Result<ResolvedPreparedCapabilityCommandSnapshotDTO> ObservePreparedCapabilityCommand(
       std::uint64_t preparation_id) const override;
   Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
-      std::uint64_t preparation_id, const ContentDigest& digest, const ControllerGoalId& goal,
-      ControllerGoalGeneration generation) override;
+      std::uint64_t preparation_id, const ContentDigest& digest, const ControllerGoalId& goal) override;
   Result<void> CancelPreparedCapabilityCommand(std::uint64_t preparation_id) override;
   ParticipantStopStageResultDTO TranslateStopStage(
       const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
       std::stop_token cancellation) override;
-  AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+  AddressedParticipantStopFenceResult fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept override;
   Result<AddressedParticipantStopSettlementDTO> settle_addressed_participant_stop(
       const AddressedParticipantStopSettlementRequestDTO& request) override;
@@ -95,7 +94,7 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
     return unsupported<ResolvedRuntimeScaleAcceptedDTO>();
   }
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId&, const ControlBindingId&) const override {
+      const OperationNumber&, const ControlBindingId&) const override {
     return unsupported<ResolvedRuntimeScaleStatusDTO>();
   }
   /// A command participant has no motion phase; its command state is read

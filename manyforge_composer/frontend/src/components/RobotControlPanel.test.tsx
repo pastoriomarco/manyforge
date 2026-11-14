@@ -25,7 +25,7 @@ const controller = vi.hoisted(() => ({
   state: {
     mountedToolByRobot: {},
     status: {
-      ownerEpoch: 'owner-1',
+      applicationStartId: 'owner-1',
       cellId: 'cell-1',
       activePublicationGeneration: 1,
       graphRevision: 'sha256:graph',
@@ -37,14 +37,13 @@ const controller = vi.hoisted(() => ({
         baseFrameRoleId: 'base',
         tcpFrameRoleId: 'tcp',
         activeTcp: { entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' }, display: 'robot-1.tcp',
-          ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 },
+          applicationStartId: 'owner-1', registrationGeneration: 1, sequence: 0 },
         operationCapabilityId: 'execution.trajectory.execute',
         planningCapabilityIds: ['planning.motion.joint_goal'],
         frameRoleIds: ['base', 'tcp'],
         programId: 'manyforge.direct_control.motion',
         programRevision: 'sha256:motion-program',
         programBindingId: 'sha256:motion-binding',
-        programRunId: 'motion-run',
         joints: [{
           sourceJointName: 'joint_1',
           minPositionRad: -1,
@@ -90,7 +89,6 @@ const controller = vi.hoisted(() => ({
         programId: 'manyforge.direct_control.gripper',
         programRevision: 'sha256:gripper-program',
         programBindingId: 'sha256:gripper-binding',
-        programRunId: 'gripper-run',
         commandSchemaId: 'gripper.command_position',
         commandSchemaRevision: 'sha256:gripper-schema',
         sourceCoordinateName: 'finger_joint',
@@ -148,8 +146,8 @@ const controller = vi.hoisted(() => ({
       cellStopAction: {
         available: true,
         unavailableReason: null,
-        expectedStopGeneration: 0,
-        latestTerminal: null,
+        lastEventId: null,
+        lastCompleted: null,
       },
     },
     phase: 'ready',
@@ -198,7 +196,6 @@ const controller = vi.hoisted(() => ({
   approve: vi.fn(),
   revert: vi.fn(),
   stop: vi.fn(),
-  fullStop: vi.fn(),
   reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
@@ -415,7 +412,7 @@ describe('RobotControlPanel layout', () => {
     const key = tcpEntryIdentityKey(toolTcp.entry);
     status.observedMotion!.tcpPoses[key] = status.observedMotion!.currentTcpPose!;
     status.directControl!.activeTcp = { entry: toolTcp.entry, display: toolTcp.qualifiedName,
-      ownerEpoch: status.ownerEpoch, registrationGeneration: 1, sequence: 1 };
+      applicationStartId: status.applicationStartId, registrationGeneration: 1, sequence: 1 };
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
 
     const unmounted = structuredClone(status);
@@ -494,7 +491,7 @@ describe('RobotControlPanel layout', () => {
   it('B1: without an end-effector TCP offers joint jog only, with a plain note', () => {
     const status = statusFixture();
     status.directControl!.tcpFrameRoleId = null;
-    status.directControl!.activeTcp = { entry: null, display: null, ownerEpoch: status.ownerEpoch,
+    status.directControl!.activeTcp = { entry: null, display: null, applicationStartId: status.applicationStartId,
       registrationGeneration: 1, sequence: 0 };
     status.observedMotion!.currentTcpPose = null;
     const row = status.directControl!.targetDescriptor.tcps[0];
@@ -561,8 +558,8 @@ describe('RobotControlPanel layout', () => {
       expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
       panelController.manualControlAllowed = true;
       panelController.state = { ...state, phase: 'executing', operation: {
-        operationId: 'resident', operationRevision: 1, resident: true, state: 'executing', progress: 0,
-        activeStopId: null, activeStopGeneration: null, terminalError: null,
+        operationId: 3, operationRevision: 1, resident: true, state: 'executing', progress: 0,
+        stopEventId: null, terminalError: null, payloadKind: 'motion',
       } };
       expect(render()).toMatch(/class="approve-button"[^>]*disabled=""/);
       panelController.state = { ...state, phase: 'blocked', preview: null };
@@ -742,8 +739,8 @@ describe('RobotControlPanel layout', () => {
       expect(idle).toContain('Headless execution is not connected.');
       expect(idle).not.toContain('>Stop operation</button>');
       Object.assign(state, { phase: 'executing', operation: {
-        operationId: 'operation-1', operationRevision: 1, resident: true, state: 'executing', progress: 0,
-        activeStopId: null, activeStopGeneration: null, terminalError: null,
+        operationId: 1, operationRevision: 1, resident: true, state: 'executing', progress: 0,
+        stopEventId: null, terminalError: null, payloadKind: 'motion',
       } });
       const moving = renderToStaticMarkup(<RobotControlPanel enabled={false} />);
       expect(moving).toContain('Headless execution is not connected.');
@@ -809,14 +806,14 @@ describe('RobotControlPanel layout', () => {
     const state = controller.state as unknown as Record<string, unknown>;
     state.phase = 'executing';
     state.operation = {
-      operationId: 'operation-1',
+      operationId: 1,
       operationRevision: 4,
       resident: true,
       state: 'executing',
       progress: 0.4,
-      activeStopId: null,
-      activeStopGeneration: null,
+      stopEventId: null,
       terminalError: null,
+      payloadKind: 'motion',
     };
     let markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     expect(markup).not.toMatch(/>Pause<\/button>/);
@@ -966,7 +963,7 @@ it('explains the shown sample contact using its resolved link and object', () =>
 
 it('warns on a changed Scene only for a successful sampled path', () => {
   const ready = readyState();
-  if (ready.preview?.schemaVersion !== 'manyforge.direct_control_motion_preview.v4') throw new Error('expected motion fixture');
+  if (ready.preview?.schemaVersion !== 'manyforge.direct_control_motion_preview.v5') throw new Error('expected motion fixture');
   const state = { ...ready, preview: { ...ready.preview,
     pathPreview: { sourceJointNames: ['joint'], pairs: [], samples: [
       { timeFromStartS: 0, positionsRad: [0], contacts: [], status: 'checked' as const },

@@ -2,7 +2,9 @@
 
 #include "embedded_active_bundle_publication_schema.hpp"
 #include "sqlite_store_startup_internal.hpp"
+#include <charconv>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 
 #include <openssl/evp.h>
 #include <sqlite3.h>
@@ -27,6 +29,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -171,10 +174,6 @@ class Statement final {
           "stored publication integer column has an invalid SQLite type");
     }
     return sqlite3_column_int64(statement_, column);
-  }
-
-  [[nodiscard]] int Changes() const noexcept {
-    return sqlite3_changes(database_);
   }
 
  private:
@@ -448,6 +447,17 @@ enum class TransactionKind {
   kNamedApply,
 };
 
+// A named Apply's transaction id is its Apply number in decimal (contract
+// 1.16.1); anything else is a corrupt row.
+[[nodiscard]] std::uint64_t ApplyNumberText(const std::string &text) {
+  std::uint64_t value = 0U;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size() || value == 0U ||
+      std::to_string(value) != text)
+    throw std::runtime_error("stored Apply number is invalid");
+  return value;
+}
+
 struct RequestEncoding final {
   TransactionKind kind;
   std::string transaction_id;
@@ -456,6 +466,14 @@ struct RequestEncoding final {
   std::int64_t expected_previous_generation;
   std::int64_t scene_revision_id;
 };
+
+// A receipt's transaction identity, as Publish replay looks it up.
+using TransactionKey = std::tuple<TransactionKind, std::string, std::int64_t>;
+
+TransactionKey KeyOf(const RequestEncoding& encoded) {
+  return {encoded.kind, encoded.transaction_id,
+          encoded.transaction_generation};
+}
 
 std::string_view ToString(const TransactionKind kind) {
   switch (kind) {
@@ -516,7 +534,7 @@ RequestEncoding ValidateAndEncodeRequest(
             std::is_same_v<Transaction,
                            NamedApplyPublicationTransactionDTO>) {
           encoded.kind = TransactionKind::kNamedApply;
-          encoded.transaction_id = transaction.apply_id.value();
+          encoded.transaction_id = std::to_string(transaction.apply_id.value());
           encoded.transaction_generation = CheckedSigned(
               transaction.apply_generation.value(), "apply_generation");
           // Version-1 storage used a per-Stage coordinate. Idle maintenance
@@ -735,9 +753,14 @@ struct StoredReceipt final {
 
 class SqliteActiveBundlePublicationStore::Impl final {
  public:
-  Impl(std::filesystem::path database_path, core::CellId cell_id)
+  Impl(
+      std::filesystem::path database_path,
+      core::CellId cell_id,
+      persistence::SqliteRecordWriter* record_writer)
       : database_path_(ValidateDatabasePath(std::move(database_path))),
-        cell_id_(std::move(cell_id)) {
+        cell_id_(std::move(cell_id)),
+        schema_artifact_digest_(
+            RawDigest(detail::kEmbeddedActiveBundlePublicationSchema)) {
     ValidateBoundedIdentity(cell_id_.value(), "cell_id");
     if (sqlite3_libversion_number() < 3037000) {
       throw ActiveBundlePublicationStoreError(
@@ -784,21 +807,27 @@ class SqliteActiveBundlePublicationStore::Impl final {
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
       static_cast<void>(VerifyIntegrityLocked());
+      ++complete_verifications_;
+      LoadLocked();
       transaction.Commit();
     } catch (...) {
       sqlite3_close(database_);
       database_ = nullptr;
       throw;
     }
+    if (record_writer == nullptr) {
+      owned_writer_ = std::make_unique<persistence::SqliteRecordWriter>();
+      record_writer = owned_writer_.get();
+    }
+    writer_ = record_writer;
+    slot_ = writer_->RegisterConnection(
+        database_,
+        "active-bundle-publication",
+        "UPDATE publication_store_metadata SET records_lost = 1 "
+        "WHERE singleton = 1");
   }
 
-  // Non-owning read-only view, matching the Apply journal's existing reader.
-  Impl(sqlite3 *borrowed_database, const core::CellId &cell_id)
-      : cell_id_(cell_id), database_(borrowed_database), borrowed_(true) {}
-
   ~Impl() {
-    if (borrowed_)
-      return;
     try {
       Close();
     } catch (...) {
@@ -813,6 +842,10 @@ class SqliteActiveBundlePublicationStore::Impl final {
   }
 
   void Close() {
+    // A handed-in writer is drained by its owner before Close.
+    if (owned_writer_ != nullptr) {
+      owned_writer_->DrainAndStop();
+    }
     auto startup_lock =
         sqlite_startup_internal::
             AcquireManagerSqliteStoreStartupLockForClose();
@@ -863,10 +896,10 @@ class SqliteActiveBundlePublicationStore::Impl final {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     }
-    Exec(database_, "PRAGMA synchronous = FULL");
-    if (ScalarInteger(database_, "PRAGMA synchronous") != 2) {
+    Exec(database_, "PRAGMA synchronous = NORMAL");
+    if (ScalarInteger(database_, "PRAGMA synchronous") != 1) {
       throw ActiveBundlePublicationIntegrityError(
-          "SQLite FULL synchronous mode is required");
+          "SQLite NORMAL synchronous mode is required");
     }
     Exec(database_, "PRAGMA trusted_schema = OFF");
     if (ScalarInteger(database_, "PRAGMA trusted_schema") != 0) {
@@ -1012,7 +1045,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
                       static_cast<std::uint64_t>(transaction_generation)}}}
         : core::ActiveBundlePublicationTransactionRefDTO{
               NamedApplyPublicationTransactionDTO{
-                  core::ApplyId{transaction_id},
+                  core::ApplyId{ApplyNumberText(transaction_id)},
                   core::ApplyGeneration{
                       static_cast<std::uint64_t>(transaction_generation)}}};
     std::optional<ActiveBundlePublicationGeneration> expected_previous;
@@ -1070,61 +1103,6 @@ class SqliteActiveBundlePublicationStore::Impl final {
     };
   }
 
-  [[nodiscard]] std::optional<StoredReceipt> ReceiptByGenerationLocked(
-      const std::int64_t publication_generation) const {
-    Statement row(
-        database_,
-        "SELECT publication_generation,transaction_kind,transaction_id,"
-        "transaction_generation,projection_stage_generation,"
-        "expected_previous_publication_generation,"
-        "candidate_retained_bundle_id,candidate_graph_revision,"
-        "candidate_scene_id,candidate_scene_revision_id,"
-        "candidate_scene_content_hash,private_materialization_content_digest,"
-        "obsolete_managed_command_surfaces_retired_evidence_digest,"
-        "request_digest,durable_public_pointer_content_digest "
-        "FROM active_bundle_publication_receipts "
-        "WHERE publication_generation=?");
-    row.Bind(1, publication_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    auto result = ReceiptFromRow(row);
-    if (row.Step()) {
-      throw ActiveBundlePublicationIntegrityError(
-          "publication generation is not unique");
-    }
-    return result;
-  }
-
-  [[nodiscard]] std::optional<StoredReceipt> ReceiptByTransactionLocked(
-      const RequestEncoding& encoded) const {
-    Statement row(
-        database_,
-        "SELECT publication_generation,transaction_kind,transaction_id,"
-        "transaction_generation,projection_stage_generation,"
-        "expected_previous_publication_generation,"
-        "candidate_retained_bundle_id,candidate_graph_revision,"
-        "candidate_scene_id,candidate_scene_revision_id,"
-        "candidate_scene_content_hash,private_materialization_content_digest,"
-        "obsolete_managed_command_surfaces_retired_evidence_digest,"
-        "request_digest,durable_public_pointer_content_digest "
-        "FROM active_bundle_publication_receipts "
-        "WHERE transaction_kind=? AND transaction_id=? "
-        "AND transaction_generation=?");
-    row.Bind(1, ToString(encoded.kind));
-    row.Bind(2, encoded.transaction_id);
-    row.Bind(3, encoded.transaction_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    auto result = ReceiptFromRow(row);
-    if (row.Step()) {
-      throw ActiveBundlePublicationIntegrityError(
-          "publication transaction identity is not unique");
-    }
-    return result;
-  }
-
   struct Head final {
     std::int64_t generation;
     std::string request_digest;
@@ -1147,6 +1125,38 @@ class SqliteActiveBundlePublicationStore::Impl final {
           "active-bundle publication head singleton is invalid");
     }
     return result;
+  }
+
+  struct HeldReceipt final {
+    StoredReceipt stored;
+    TransactionKey key;
+  };
+
+  // Loads the records of a reopened file at open; a new file loads nothing.
+  // The open's complete verification has already checked them.
+  void LoadLocked() {
+    Statement rows(
+        database_,
+        "SELECT publication_generation,transaction_kind,transaction_id,"
+        "transaction_generation,projection_stage_generation,"
+        "expected_previous_publication_generation,"
+        "candidate_retained_bundle_id,candidate_graph_revision,"
+        "candidate_scene_id,candidate_scene_revision_id,"
+        "candidate_scene_content_hash,private_materialization_content_digest,"
+        "obsolete_managed_command_surfaces_retired_evidence_digest,"
+        "request_digest,durable_public_pointer_content_digest "
+        "FROM active_bundle_publication_receipts "
+        "ORDER BY publication_generation");
+    while (rows.Step()) {
+      auto stored = ReceiptFromRow(rows);
+      const auto generation = static_cast<std::int64_t>(
+          stored.receipt.publication_generation.value());
+      auto key = KeyOf(ValidateAndEncodeRequest(stored.receipt.request));
+      transaction_generations_.emplace(key, generation);
+      receipts_.emplace(
+          generation, HeldReceipt{std::move(stored), std::move(key)});
+    }
+    head_ = HeadLocked();
   }
 
   [[nodiscard]] ActiveBundlePublicationStoreIntegrityReport
@@ -1278,26 +1288,20 @@ class SqliteActiveBundlePublicationStore::Impl final {
     const auto request_digest =
         PublicationRequestDigest(
             cell_id_, request, encoded, compatibility_retirement_digest);
+    auto key = KeyOf(encoded);
     std::lock_guard lock(mutex_);
     RequireOpen();
-    Transaction transaction(database_, "BEGIN IMMEDIATE");
-    // The complete verification runs at open and on explicit request. Publish
-    // reads only the state it decides on; a receipt it reads is still
-    // decoded and digest-checked.
-    const auto current_generation = HeadLocked().generation;
-    const auto receipt_count = ScalarInteger(
-        database_,
-        "SELECT COUNT(*) FROM active_bundle_publication_receipts");
+    const auto current_generation = head_.generation;
 
-    if (const auto existing = ReceiptByTransactionLocked(encoded);
-        existing.has_value()) {
-      if (existing->receipt.request != request) {
+    if (const auto existing = transaction_generations_.find(key);
+        existing != transaction_generations_.end()) {
+      const auto& receipt = receipts_.at(existing->second).stored.receipt;
+      if (receipt.request != request) {
         throw ActiveBundlePublicationConflictError(
             "publication transaction identity conflicts with its durable "
             "request");
       }
-      transaction.Commit();
-      return existing->receipt;
+      return receipt;
     }
     if (encoded.expected_previous_generation != current_generation) {
       throw ActiveBundlePublicationConflictError(
@@ -1317,75 +1321,6 @@ class SqliteActiveBundlePublicationStore::Impl final {
     const auto publication_generation = current_generation + 1;
     const auto pointer_digest = PublicPointerDigest(
         cell_id_, publication_generation, request_digest);
-    // Bound by eviction, never refusal: drop the oldest receipt in this same
-    // transaction. It is never the head (the inventory is full), and no
-    // reader needs it: Read and the read-only reader answer only for the
-    // head (an older generation is stale_generation either way), and exact
-    // Publish replay matters only for the in-flight transaction, whose
-    // receipt is the head or not yet written. A replay of an evicted old
-    // transaction cannot republish: its expected previous generation is
-    // older than the head, so the compare-and-swap below refuses it.
-    if (receipt_count >= kMaximumActiveBundlePublicationReceipts) {
-      Statement evict(
-          database_,
-          "DELETE FROM active_bundle_publication_receipts WHERE "
-          "publication_generation=(SELECT MIN(publication_generation) FROM "
-          "active_bundle_publication_receipts)");
-      static_cast<void>(evict.Step());
-    }
-
-    Statement insert(
-        database_,
-        "INSERT INTO active_bundle_publication_receipts ("
-        "publication_generation,transaction_kind,transaction_id,"
-        "transaction_generation,projection_stage_generation,"
-        "expected_previous_publication_generation,"
-        "candidate_retained_bundle_id,candidate_graph_revision,"
-        "candidate_scene_id,candidate_scene_revision_id,"
-        "candidate_scene_content_hash,private_materialization_content_digest,"
-        "obsolete_managed_command_surfaces_retired_evidence_digest,"
-        "request_digest,durable_public_pointer_content_digest"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    insert.Bind(1, publication_generation);
-    insert.Bind(2, ToString(encoded.kind));
-    insert.Bind(3, encoded.transaction_id);
-    insert.Bind(4, encoded.transaction_generation);
-    insert.Bind(5, encoded.projection_stage_generation);
-    insert.Bind(6, encoded.expected_previous_generation);
-    insert.Bind(7, request.candidate_retained_bundle_id.value());
-    insert.Bind(8, request.candidate_graph_revision.value());
-    insert.Bind(
-        9,
-        request.candidate_projection_revision.scene_revision.scene_id
-            .value());
-    insert.Bind(10, encoded.scene_revision_id);
-    insert.Bind(
-        11,
-        request.candidate_projection_revision.scene_revision.content_hash
-            .value());
-    insert.Bind(
-        12, request.private_materialization_content_digest.value());
-    insert.Bind(13, compatibility_retirement_digest.value());
-    insert.Bind(14, request_digest);
-    insert.Bind(15, pointer_digest);
-    static_cast<void>(insert.Step());
-
-    Statement update(
-        database_,
-        "UPDATE active_bundle_publication_head SET "
-        "publication_generation=?,request_digest=?,"
-        "durable_public_pointer_content_digest=? "
-        "WHERE singleton=1 AND publication_generation=?");
-    update.Bind(1, publication_generation);
-    update.Bind(2, request_digest);
-    update.Bind(3, pointer_digest);
-    update.Bind(4, current_generation);
-    static_cast<void>(update.Step());
-    if (update.Changes() != 1) {
-      throw ActiveBundlePublicationConflictError(
-          "active-bundle publication head compare-and-swap failed");
-    }
-
     const ActiveBundlePublicationReceiptDTO receipt{
         request,
         ActiveBundlePublicationGeneration{
@@ -1396,7 +1331,77 @@ class SqliteActiveBundlePublicationStore::Impl final {
       throw ActiveBundlePublicationIntegrityError(
           "publication store produced an invalid receipt");
     }
-    transaction.Commit();
+
+    persistence::SqliteRecord record;
+    // Bound by eviction, never refusal: drop the oldest receipt in this same
+    // record. It is never the head (the inventory is full), and no reader
+    // needs it: Read answers only for the head (an older generation is
+    // stale_generation either way), and exact Publish replay matters only for
+    // the in-flight transaction, whose receipt is the head or not yet
+    // written. A replay of an evicted old transaction cannot republish: its
+    // expected previous generation is older than the head, so the
+    // compare-and-swap above refuses it.
+    if (receipts_.size() >=
+        static_cast<std::size_t>(kMaximumActiveBundlePublicationReceipts)) {
+      record.Statement(
+          "DELETE FROM active_bundle_publication_receipts WHERE "
+          "publication_generation=(SELECT MIN(publication_generation) FROM "
+          "active_bundle_publication_receipts)");
+      const auto oldest = receipts_.begin();
+      transaction_generations_.erase(oldest->second.key);
+      receipts_.erase(oldest);
+    }
+    record
+        .Statement(
+            "INSERT INTO active_bundle_publication_receipts ("
+            "publication_generation,transaction_kind,transaction_id,"
+            "transaction_generation,projection_stage_generation,"
+            "expected_previous_publication_generation,"
+            "candidate_retained_bundle_id,candidate_graph_revision,"
+            "candidate_scene_id,candidate_scene_revision_id,"
+            "candidate_scene_content_hash,"
+            "private_materialization_content_digest,"
+            "obsolete_managed_command_surfaces_retired_evidence_digest,"
+            "request_digest,durable_public_pointer_content_digest"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .Bind(1, publication_generation)
+        .Bind(2, ToString(encoded.kind))
+        .Bind(3, encoded.transaction_id)
+        .Bind(4, encoded.transaction_generation)
+        .Bind(5, encoded.projection_stage_generation)
+        .Bind(6, encoded.expected_previous_generation)
+        .Bind(7, request.candidate_retained_bundle_id.value())
+        .Bind(8, request.candidate_graph_revision.value())
+        .Bind(
+            9,
+            request.candidate_projection_revision.scene_revision.scene_id
+                .value())
+        .Bind(10, encoded.scene_revision_id)
+        .Bind(
+            11,
+            request.candidate_projection_revision.scene_revision.content_hash
+                .value())
+        .Bind(12, request.private_materialization_content_digest.value())
+        .Bind(13, compatibility_retirement_digest.value())
+        .Bind(14, request_digest)
+        .Bind(15, pointer_digest);
+    record
+        .Statement(
+            "UPDATE active_bundle_publication_head SET "
+            "publication_generation=?,request_digest=?,"
+            "durable_public_pointer_content_digest=? "
+            "WHERE singleton=1 AND publication_generation=?")
+        .Bind(1, publication_generation)
+        .Bind(2, request_digest)
+        .Bind(3, pointer_digest)
+        .Bind(4, current_generation)
+        .ExpectChanges(1);
+    transaction_generations_.emplace(key, publication_generation);
+    receipts_.emplace(
+        publication_generation,
+        HeldReceipt{StoredReceipt{receipt, request_digest}, std::move(key)});
+    head_ = Head{publication_generation, request_digest, pointer_digest};
+    writer_->Post(slot_, std::move(record));
     return receipt;
   }
 
@@ -1415,43 +1420,10 @@ class SqliteActiveBundlePublicationStore::Impl final {
     try {
       std::lock_guard lock(mutex_);
       RequireOpen();
-      Transaction transaction(database_, "BEGIN");
-      ValidateMetadataLocked();
-      if (ReadSchemaObjects(database_) != ExpectedSchemaObjects()) {
-        throw ActiveBundlePublicationIntegrityError(
-            "publication-store schema objects differ from the versioned "
-            "artifact");
-      }
-      const auto head = HeadLocked();
-      const auto receipt_count = ScalarInteger(
-          database_,
-          "SELECT COUNT(*) FROM active_bundle_publication_receipts");
-      if (receipt_count < 0 ||
-          receipt_count > kMaximumActiveBundlePublicationReceipts ||
-          receipt_count > head.generation ||
-          (receipt_count == 0) != (head.generation == 0)) {
-        throw ActiveBundlePublicationIntegrityError(
-            "active-bundle publication head and receipt cardinality "
-            "disagree");
-      }
-      std::optional<StoredReceipt> current_receipt;
-      if (head.generation != 0) {
-        current_receipt = ReceiptByGenerationLocked(head.generation);
-        if (!current_receipt.has_value() ||
-            current_receipt->request_digest != head.request_digest ||
-            current_receipt->receipt
-                    .durable_public_pointer_content_digest.value() !=
-                head.pointer_digest) {
-          throw ActiveBundlePublicationIntegrityError(
-              "active-bundle publication head is inconsistent");
-        }
-      }
-      const auto receipt = ReceiptByGenerationLocked(
-          static_cast<std::int64_t>(generation.value()));
-      transaction.Commit();
+      const auto requested = static_cast<std::int64_t>(generation.value());
+      const auto receipt = receipts_.find(requested);
       // An evicted older generation is still answered as stale.
-      if (!receipt.has_value() &&
-          static_cast<std::int64_t>(generation.value()) >= head.generation) {
+      if (receipt == receipts_.end() && requested >= head_.generation) {
         return Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
             "missing_reference",
             "active-bundle publication generation is not present",
@@ -1460,18 +1432,17 @@ class SqliteActiveBundlePublicationStore::Impl final {
              {"reference_id", std::to_string(generation.value())}},
         });
       }
-      if (head.generation !=
-          static_cast<std::int64_t>(generation.value())) {
+      if (head_.generation != requested) {
         return Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
             "stale_generation",
             "requested publication generation is no longer the active "
             "public pointer",
             {{"expected_generation", std::to_string(generation.value())},
-             {"current_generation", std::to_string(head.generation)}},
+             {"current_generation", std::to_string(head_.generation)}},
         });
       }
       return Result<ActiveBundlePublicationReceiptDTO>::Ok(
-          receipt->receipt);
+          receipt->second.stored.receipt);
     } catch (const std::exception& error) {
       return Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
           "internal_error",
@@ -1481,104 +1452,46 @@ class SqliteActiveBundlePublicationStore::Impl final {
     }
   }
 
+  // Answers from memory; the file itself is verified once, at open.
   [[nodiscard]] ActiveBundlePublicationStoreIntegrityReport
   VerifyIntegrity() const {
     std::lock_guard lock(mutex_);
     RequireOpen();
-    Transaction transaction(database_, "BEGIN");
-    // Reading data_version opens this transaction's read snapshot. A commit
-    // through any other connection changes it; a write through this
-    // connection changes its total change count. Only a provably unchanged
-    // database reuses the last complete verification.
-    const auto data_version = ScalarInteger(database_, "PRAGMA data_version");
-    const auto own_total_changes = sqlite3_total_changes64(database_);
-    if (verified_.has_value() && verified_->data_version == data_version &&
-        verified_->own_total_changes == own_total_changes) {
-      auto report = verified_->report;
-      transaction.Commit();
-      return report;
-    }
-    verified_.reset();
-    auto report = VerifyIntegrityLocked();
-    transaction.Commit();
-    ++complete_verifications_;
-    verified_.emplace(VerifiedIntegrity{data_version, own_total_changes, report});
-    return report;
+    return ActiveBundlePublicationStoreIntegrityReport{
+        cell_id_,
+        std::string(kActiveBundlePublicationStoreSchemaId),
+        kActiveBundlePublicationStoreSchemaVersion,
+        schema_artifact_digest_,
+        static_cast<std::int64_t>(receipts_.size()),
+        ActiveBundlePublicationGeneration{
+            static_cast<std::uint64_t>(head_.generation)},
+        head_.pointer_digest,
+    };
   }
-
-  struct VerifiedIntegrity final {
-    std::int64_t data_version{};
-    sqlite3_int64 own_total_changes{};
-    ActiveBundlePublicationStoreIntegrityReport report;
-  };
 
   std::filesystem::path database_path_;
   core::CellId cell_id_;
+  std::string schema_artifact_digest_;
   sqlite3* database_{};
   mutable std::mutex mutex_;
   bool closed_{};
-  bool borrowed_{};
-  /// Last complete integrity verification and the change identity it held
-  /// under. Guarded by `mutex_`; discarded before every re-verification.
-  mutable std::optional<VerifiedIntegrity> verified_;
-  mutable std::uint64_t complete_verifications_{};
+  // The retained receipts by generation, the head, and each receipt's
+  // generation by transaction identity. Guarded by `mutex_`.
+  std::map<std::int64_t, HeldReceipt> receipts_;
+  Head head_{};
+  std::map<TransactionKey, std::int64_t> transaction_generations_;
+  std::uint64_t complete_verifications_{};
+  std::unique_ptr<persistence::SqliteRecordWriter> owned_writer_;
+  persistence::SqliteRecordWriter* writer_{};
+  persistence::SqliteRecordWriter::StoreSlot slot_{};
 };
-
-Result<ActiveBundlePublicationReceiptDTO>
-ReadActiveBundlePublicationReadOnly(const std::filesystem::path &database_path,
-                                    const core::CellId &cell_id) {
-  using Reply = Result<ActiveBundlePublicationReceiptDTO>;
-  const auto rejected = [] {
-    return Reply::Err(
-        {"active_bundle_publication_unavailable",
-         "The current active publication cannot be verified read-only",
-         {{"reason", "active_bundle_publication_read_invalid"}}});
-  };
-  sqlite3 *raw = nullptr;
-  try {
-    ValidateBoundedIdentity(cell_id.value(), "cell_id");
-    const auto path = ValidateDatabasePath(database_path);
-    PreflightPublicationStore(path, cell_id);
-    if (sqlite3_open_v2(path.string().c_str(), &raw,
-                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
-                            SQLITE_OPEN_NOFOLLOW,
-                        nullptr) != SQLITE_OK) {
-      if (raw)
-        sqlite3_close(raw);
-      raw = nullptr;
-      return rejected();
-    }
-    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(raw,
-                                                                sqlite3_close);
-    raw = nullptr;
-    Check(database.get(),
-          sqlite3_busy_timeout(database.get(), kBusyTimeoutMilliseconds),
-          "configure read-only publication timeout");
-    Exec(database.get(), "PRAGMA query_only=ON");
-    Transaction snapshot(database.get(), "BEGIN");
-    ValidatePublicationStoreIdentityAndSchema(database.get(), cell_id);
-    SqliteActiveBundlePublicationStore::Impl view(database.get(), cell_id);
-    const auto integrity = view.VerifyIntegrityLocked();
-    if (!integrity.current_generation.nonzero())
-      return rejected();
-    const auto receipt = view.ReceiptByGenerationLocked(
-        static_cast<std::int64_t>(integrity.current_generation.value()));
-    if (!receipt)
-      return rejected();
-    snapshot.Commit();
-    return Reply::Ok(receipt->receipt);
-  } catch (const std::exception &) {
-    if (raw)
-      sqlite3_close(raw);
-    return rejected();
-  }
-}
 
 SqliteActiveBundlePublicationStore::SqliteActiveBundlePublicationStore(
     std::filesystem::path database_path,
-    core::CellId cell_id)
+    core::CellId cell_id,
+    persistence::SqliteRecordWriter* record_writer)
     : impl_(std::make_unique<Impl>(
-          std::move(database_path), std::move(cell_id))) {}
+          std::move(database_path), std::move(cell_id), record_writer)) {}
 
 SqliteActiveBundlePublicationStore::~SqliteActiveBundlePublicationStore() =
     default;

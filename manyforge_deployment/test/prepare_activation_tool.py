@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -1682,7 +1683,7 @@ def _observe_manager_ros() -> int:
         return response
 
     # This is the actual installed compiled target, including model source name.
-    status = command({"api_version": "manyforge.execution_command.v3", "command": "targets"})
+    status = command({"api_version": "manyforge.execution_command.v4", "command": "targets"})
     components = {row["controllable_component_id"]: row for row in status["targets"]["components"]}
     if args.component not in components or args.gripper_component not in components:
         raise AssertionError("Installed target components differ from the observed ones")
@@ -1782,14 +1783,16 @@ def _observe_manager_ros() -> int:
             identity, manual = status["identity"], direct["manual_control"]
             kind = direct["resource"]["coordinate_kind"]
             position = {"kind": kind, "value_rad" if kind == "angular_rad" else "value_m": sample["position"]}
-            operation = {"request_context": {"request_id": "empty-ros-one-mock." + args.label + ".gripper", "request_owner_epoch": identity["owner_epoch"], "source_label": "manager_ros_apply_fixture", "correlation_id": None},
-                         **{key: manual[key] for key in ("program_id", "program_revision", "program_binding_id", "program_run_id")},
+            # One request key per request label: 16 bytes as 32 hex (contract 1.4).
+            request_key = hashlib.sha256(("empty-ros-one-mock." + args.label + ".gripper").encode("utf-8")).hexdigest()[:32]
+            operation = {"request_context": {"request_key": request_key, "source_label": "manager_ros_apply_fixture"},
+                         **{key: manual[key] for key in ("program_id", "program_revision", "program_binding_id")}, "program_run_id": None,
                          "expected_graph_revision": identity["graph_revision"], "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": None,
                          "participants": [{"target": direct["target"], "required_capability_id": target["operation_capability_id"], "action_span": None,
                                            "payload": {"kind": "capability_command", "command_schema_id": direct["command_schema_id"], "command_schema_revision": direct["command_schema_revision"],
                                                        "command_value": {"kind": "gripper_position", "position": position, "max_effort": None}, "completion_timeout_s": 2.0,
                                                        "caller_options": [{"option_id": "command_duration_s", "value_s": 0.5}]}}], "coordination_policy": "independent"}
-            envelope = {"api_version": "manyforge.execution_command.v3", "command": "submit", "operation": operation,
+            envelope = {"api_version": "manyforge.execution_command.v4", "command": "submit", "operation": operation,
                         "attribution": {"assurance": "unverified", "principal_id": None, "transport": "http"}}
             refusal = command(envelope, allow_refusal=True)
             # Existing Kernel checks route publication/readback before component eligibility.

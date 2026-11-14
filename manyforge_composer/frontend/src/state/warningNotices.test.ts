@@ -52,7 +52,7 @@ describe('warnings: what blocks nothing stays until acknowledged', () => {
   it('keeps a refused Activation that changed nothing red, with one Acknowledge (item 21)', () => {
     const run = vi.fn();
     const dismiss = vi.fn();
-    const notice = activationFailureNotice('activation.b:1', 'apply.b', {
+    const notice = activationFailureNotice('activation.b:1', '3f9a/apply2', {
       state: 'failed',
       failureAcknowledgement: 'unavailable',
       failure: {
@@ -61,7 +61,7 @@ describe('warnings: what blocks nothing stays until acknowledged', () => {
         causeCode: 'typed_cause_code', causeDetails: {}, producer: 'component_manager',
         effectBoundary: 'before_effect',
       },
-    }, null, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss });
+    }, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss });
     expect(notice).not.toBeNull();
     // A failed Apply is an error: never a warning, never locally acknowledgeable as one.
     const [shown] = locallyAcknowledgedWarnings([notice!], new Set(), vi.fn());

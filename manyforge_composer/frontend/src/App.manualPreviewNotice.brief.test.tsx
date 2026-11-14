@@ -91,7 +91,7 @@ it('shows a preview refusal briefly and clears it as soon as the next preview st
     },
   });
   await render(repeatedRefusal);
-  expect(shown.current?.id).toBe(`robot-control.preview.${repeatedRefusal.status?.ownerEpoch}.${repeatedRefusal.generation}`);
+  expect(shown.current?.id).toBe(`robot-control.preview.${repeatedRefusal.status?.applicationStartId}.${repeatedRefusal.generation}`);
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown.current).toBeNull();
   await act(() => root.unmount());

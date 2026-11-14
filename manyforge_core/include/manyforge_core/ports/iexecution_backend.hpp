@@ -68,7 +68,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// backends retain ordinary preparation/dispatch behavior unchanged.
   virtual Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
       std::uint64_t /*execution_id*/, std::uint64_t /*execution_generation*/,
-      const ExecutionGoalKey& /*goal*/, const ContentDigest& /*digest*/) const {
+      const ControllerGoalId& /*goal*/, const ContentDigest& /*digest*/) const {
     return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
   }
 
@@ -100,7 +100,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   virtual PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& /*source*/, std::uint64_t /*candidate_id*/,
       const PreparedOperationParticipantDTO& /*participant*/,
-      const ExecutionGoalKey& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/,
+      const ControllerGoalId& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/,
       const ReplacementSendRecheck& /*recheck_before_send*/ = {}) {
     return {{ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
              ErrorDTO{kErrorUnsupportedCapability, "Motion replacement is unsupported", {}}},
@@ -131,8 +131,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// Exact repetition returns the same goal-bound handle and never sends a
   /// second transport command.
   virtual ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
-                                   const ControllerGoalId& controller_goal_id,
-                                   ControllerGoalGeneration controller_goal_generation) = 0;
+                                   const ControllerGoalId& controller_goal_id) = 0;
 
   /// Execute a trajectory
   ///

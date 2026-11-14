@@ -28,26 +28,28 @@ class _Client:
 
 
 class _Admission:
-    receiver_epoch = "composer.epoch.1"
+    application_start_id = 0x3F9A0000000000A1
 
 
 def _source() -> HeadlessStateSource:
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     return HeadlessStateSource(
         _Client(),  # type: ignore[arg-type]
         admission=_Admission(),  # type: ignore[arg-type]
-        workspace=ComposerState().authoring_workspace,
+        workspace=state.authoring_workspace,
+        apply_commands=state.apply_commands,
     )
 
 
 def _owner_snapshot() -> str:
     return json.dumps(
         {
-            "schema_version": "manyforge.execution_control.v2",
+            "schema_version": "manyforge.execution_control.v4",
             "message_kind": "snapshot",
-            "control_session_id": "control-session.1",
+            "control_session_number": 1,
             "server_sequence": "1",
             "received_client_sequence": None,
-            "control": {"semantic_owner_epoch": "runner.1"},
+            "control": {"execution_control_revision": 1},
             "shell": {"component_overview": {"readiness": "ready"}},
             "complete": True,
         }
@@ -61,11 +63,15 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
     second_value["message_kind"] = "delta"
     second_payload = json.dumps(second_value)
 
-    assert first["control"] == {"semantic_owner_epoch": "runner.1"}
+    assert first["control"] == {"execution_control_revision": 1}
     assert first["shell"]["schema_version"] == (
-        "manyforge.composer_headless_state.v2"
+        "manyforge.composer_headless_state.v4"
     )
-    assert first["shell"]["receiver_epoch"] == "composer.epoch.1"
+    # The Apply-level rows (OD-214), none yet.
+    assert first["shell"]["apply_commands"] == {"in_progress": None, "ended": []}
+    # Composer's own `A` replaces the per-process snapshot epoch (D9).
+    assert first["shell"]["application_start_id"] == "3f9a0000000000a1"
+    assert "receiver_epoch" not in first["shell"]
     assert first["shell"]["snapshot_sequence"] == 1
     assert first["shell"]["authoring_workspace"]["program_draft_revision"] == 0
     assert first["shell"]["authoring_workspace"]["workspace_revision"] == 1
@@ -75,7 +81,7 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
 
 def test_source_forwards_receipts_without_reencoding_them() -> None:
     source = _source()
-    receipt = '{ "schema_version":"manyforge.execution_control.v2", "message_kind":"command_receipt" }'
+    receipt = '{ "schema_version":"manyforge.execution_control.v4", "message_kind":"command_receipt" }'
 
     assert source.enrich(receipt) == receipt
 
@@ -190,7 +196,7 @@ def test_proxy_forwards_both_directions_and_releases_demand(
         assert browser.accepted and browser.closed
         assert upstream.sent == ['{"message_kind":"client_hello"}']
         assert browser.sent[0]["message_kind"] == "snapshot"
-        assert browser.sent[0]["shell"]["receiver_epoch"] == "composer.epoch.1"
+        assert browser.sent[0]["shell"]["application_start_id"] == "3f9a0000000000a1"
         assert connection_options["compression"] is None
         assert not source._local_subscriptions  # noqa: SLF001
 
@@ -198,7 +204,7 @@ def test_proxy_forwards_both_directions_and_releases_demand(
 
 
 @pytest.mark.parametrize(
-    "command_kind", ["program_run", "program_resume_full_stop", "execution_recovery"]
+    "command_kind", ["program_run", "program_resume_halt", "execution_recovery"]
 )
 def test_proxy_refuses_execution_start_that_bypasses_composer_admission(
     monkeypatch, command_kind: str,
@@ -209,7 +215,7 @@ def test_proxy_refuses_execution_start_that_bypasses_composer_admission(
             headless_ws, "connect_websocket", lambda *_args, **_kwargs: upstream
         )
         browser = _Browser(json.dumps({
-            "schema_version": "manyforge.execution_control.v2",
+            "schema_version": "manyforge.execution_control.v4",
             "message_kind": "command",
             "command": {
                 "command_envelope": {"command_kind": command_kind},
@@ -288,7 +294,7 @@ def test_a_slow_browser_send_keeps_the_connection_and_is_recorded(
         if "control proxy browser send slow" in record.getMessage()
     ]
     assert len(records) == 1
-    assert "control_session_id=control-session.1" in records[0]
+    assert "control_session_number=1" in records[0]
     assert "message_kind=snapshot" in records[0]
 
 
@@ -336,8 +342,9 @@ def test_local_draft_wake_emits_one_resequenced_latest_shell(
                 "deployment_draft_revision": identity.deployment_draft_revision,
             },
             "authoring_workspace_containment": None,
-            "receiver_epoch": "composer.epoch.1",
-            "schema_version": "manyforge.composer_headless_state.v2",
+            "application_start_id": "3f9a0000000000a1",
+            "apply_commands": {"in_progress": None, "ended": []},
+            "schema_version": "manyforge.composer_headless_state.v4",
             "snapshot_sequence": 2,
         }
         assert not source._local_subscriptions  # noqa: SLF001
@@ -488,5 +495,53 @@ def test_oversized_browser_message_is_rejected_before_upstream_send(
         )
         assert upstream.sent == []
         assert browser.closed
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "command_kind", ["program_motion_stop", "operation_stop", "stop_all", "halt"]
+)
+def test_oversized_stop_frame_is_forwarded_before_the_size_check(
+    monkeypatch, command_kind: str,
+) -> None:
+    """PD-6: a Stop frame reaches Headless before this relay's size check;
+    the relay then ends the session on the size check as before."""
+
+    async def exercise() -> None:
+        upstream = _Upstream(wait_for_browser=True)
+        monkeypatch.setattr(
+            headless_ws, "connect_websocket", lambda *_args, **_kwargs: upstream
+        )
+        frame = json.dumps({
+            "schema_version": "manyforge.execution_control.v4",
+            "message_kind": "command",
+            "command": {
+                "command_envelope": {"command_kind": command_kind},
+                "payload": {"padding": "x" * (64 * 1024)},
+            },
+        })
+        browser = _Browser(frame)
+        await asyncio.wait_for(serve_headless_state(browser, _source()), 0.5)  # type: ignore[arg-type]
+        assert upstream.sent == [frame]
+        assert browser.closed
+
+    asyncio.run(exercise())
+
+
+def test_an_apply_row_change_wakes_each_browser_and_rides_the_local_shell() -> None:
+    # OD-214: Apply, Load, New and Revert rows are pushed with the shell.
+    async def exercise() -> None:
+        source = _source()
+        subscription = await source.acquire()
+        source._apply_commands.rows.accept(  # noqa: SLF001
+            "scenario_new", "a" * 32, step=None, step_source=None
+        )
+        await asyncio.wait_for(subscription.wake.wait(), 0.5)
+        shell = source._local_shell(complete=False)  # noqa: SLF001
+        row = shell["apply_commands"]["in_progress"]
+        assert (row["kind"], row["request_key"], row["end"]) == ("scenario_new", "a" * 32, None)
+        await source.release(subscription)
+        await source.close()
 
     asyncio.run(exercise())

@@ -13,6 +13,8 @@ import uvicorn
 from .app import create_app
 from .client import HeadlessClientError, HeadlessHttpClient
 from .component_model import COMPONENT_ACTIONS, enable_all_targets, prepare_all_targets
+from .identity import parse_application_start_id
+from .internal_http import INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS
 from .native import (
     DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     HeadlessApiConfig,
@@ -32,11 +34,20 @@ def _print(value: Any) -> None:
     )
 
 
+def _application_start_id(text: str) -> str:
+    try:
+        parse_application_start_id(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return text
+
+
 def _caller_fields(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--request-id", required=True)
-    parser.add_argument("--request-owner-epoch", required=True)
+    parser.add_argument("--request-key", required=True)
+    parser.add_argument(
+        "--application-start-id", type=_application_start_id, required=True
+    )
     parser.add_argument("--source-label", default="manyforge-headless-cli")
-    parser.add_argument("--correlation-id")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,7 +57,6 @@ def _parser() -> argparse.ArgumentParser:
     serve = subcommands.add_parser("serve", help="start the independent headless API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=9010)
-    serve.add_argument("--projection-root", type=Path, required=True)
     serve.add_argument("--install-root", type=Path, required=True)
     serve.add_argument("--artifact-root", type=Path, required=True)
     serve.add_argument("--node-catalog-path", type=Path, required=True)
@@ -54,13 +64,24 @@ def _parser() -> argparse.ArgumentParser:
         "--node-environment-manifest-path", type=Path, required=True
     )
     serve.add_argument("--alarm-catalog-path", type=Path, required=True)
-    serve.add_argument("--historian-database-path", type=Path, required=True)
+    serve.add_argument("--historian-directory", type=Path, required=True)
     serve.add_argument("--workbench-previous-session-reports-root", type=Path)
     serve.add_argument("--workbench-previous-session-id")
     serve.add_argument("--manager-run-root", type=Path, required=True)
     serve.add_argument("--execution-run-root", type=Path, required=True)
+    # The disk check (OD-215): the free-space floor of the file systems that
+    # hold the records (--historian-directory and the parent of
+    # --execution-run-root), and the margin above it at which it clears.
+    # Both launchers pass them.
+    serve.add_argument("--disk-free-floor-bytes", type=int)
+    serve.add_argument("--disk-free-margin-bytes", type=int)
     serve.add_argument("--cell-id", required=True)
-    serve.add_argument("--owner-id", default="headless-api")
+    # Contract 1.1: the Manager appends it to every child's argv.
+    serve.add_argument(
+        "--application-start-id", type=_application_start_id, required=True
+    )
+    # OD-216: how long the Manager's status stream may show no new tick of
+    # its main loop before the Manager counts as not answering.
     serve.add_argument("--freshness-ms", type=int, default=2000)
     serve.add_argument(
         "--manager-timeout-s",
@@ -124,16 +145,10 @@ def _parser() -> argparse.ArgumentParser:
 
     acknowledge_all = subcommands.add_parser("acknowledge-all-alarms")
     acknowledge_all.add_argument("--url", default="http://127.0.0.1:9010")
-    acknowledge_all.add_argument("--request-id", required=True)
+    acknowledge_all.add_argument("--request-key", required=True)
     acknowledge_all.add_argument("--source-label", default="manyforge-headless-cli")
-    acknowledge_all.add_argument("--correlation-id")
     acknowledge_all.add_argument("--reason")
     acknowledge_all.add_argument("--confirmed", action="store_true")
-
-    reconcile = subcommands.add_parser("reconcile-historian")
-    reconcile.add_argument("--url", default="http://127.0.0.1:9010")
-    reconcile.add_argument("expected_health_generation", type=int)
-    _caller_fields(reconcile)
 
     # Component model v2, through the REST endpoints.
     components = subcommands.add_parser("components")
@@ -186,28 +201,26 @@ def _components(client: HeadlessHttpClient, args: argparse.Namespace) -> Any:
 
 def _caller(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "request_id": args.request_id,
-        "request_owner_epoch": args.request_owner_epoch,
+        "request_key": args.request_key,
+        "application_start_id": args.application_start_id,
         "source_label": args.source_label,
-        "correlation_id": args.correlation_id,
     }
 
 
 def _serve(args: argparse.Namespace) -> int:
     config = HeadlessApiConfig(
-        projection_root=args.projection_root,
         install_root=args.install_root,
         artifact_root=args.artifact_root,
         node_catalog_path=args.node_catalog_path,
         node_environment_manifest_path=args.node_environment_manifest_path,
         alarm_catalog_path=args.alarm_catalog_path,
-        historian_database_path=args.historian_database_path,
+        historian_directory=args.historian_directory,
         workbench_previous_session_reports_root=args.workbench_previous_session_reports_root,
         workbench_previous_session_id=args.workbench_previous_session_id,
         manager_run_root=args.manager_run_root,
         execution_run_root=args.execution_run_root,
         cell_id=args.cell_id,
-        owner_id=args.owner_id,
+        application_start_id=args.application_start_id,
         freshness_milliseconds=args.freshness_ms,
         manager_timeout_seconds=args.manager_timeout_s,
         program_runner_url=args.program_runner_url,
@@ -223,6 +236,8 @@ def _serve(args: argparse.Namespace) -> int:
             args.activation_preparer_timeout_s
         ),
         canonical_empty_admission_filename=args.canonical_empty_admission_filename,
+        disk_free_floor_bytes=args.disk_free_floor_bytes,
+        disk_free_margin_bytes=args.disk_free_margin_bytes,
     )
     # Internal request success is not a runtime event. Semantic owner state,
     # warnings, failures, and journals remain observable without a log line
@@ -232,6 +247,7 @@ def _serve(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         access_log=False,
+        timeout_keep_alive=INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
         # The Headless real-time channels carry small bounded messages. Avoid
         # per-frame deflate work on the same event loop that admits Stop.
         ws_per_message_deflate=False,
@@ -291,21 +307,12 @@ def _request(args: argparse.Namespace) -> int:
             snapshot = client.alarms(limit=0)
             value = client.acknowledge_all(
                 {
-                    "request_id": args.request_id,
-                    "request_owner_epoch": snapshot["owner_epoch"],
+                    "request_key": args.request_key,
                     "source_label": args.source_label,
-                    "correlation_id": args.correlation_id,
                     "members": snapshot["unacknowledged_membership"],
                     "expected_generation": snapshot["generation"],
                     "reason": args.reason,
                     "confirmed": args.confirmed,
-                }
-            )
-        elif args.command == "reconcile-historian":
-            value = client.reconcile_historian(
-                {
-                    **_caller(args),
-                    "expected_health_generation": args.expected_health_generation,
                 }
             )
         elif args.command == "components":

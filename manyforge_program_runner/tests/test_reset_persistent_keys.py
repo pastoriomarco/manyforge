@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,7 @@ from manyforge_program_runner.runtime import (
     ProgramRuntime,
 )
 from manyforge_program_runner.tests.test_persistent_values import (
+    _A_TEXT,
     _DOCUMENT,
     _PROJECT,
     _Headless,
@@ -34,6 +37,18 @@ from manyforge_program_runner.tests.test_runtime import (
     _program_cycle_claim,
     _retain_terminal_cycle,
 )
+
+
+def _kb(*parts) -> bytes:
+    """A deterministic 16-byte request key named by text, for readable tests."""
+
+    return hashlib.md5("/".join(map(str, parts)).encode()).digest()
+
+
+def _key(*parts) -> str:
+    """The wire form (32 lowercase hex) of ``_kb``."""
+
+    return _kb(*parts).hex()
 
 
 _OWNER = "runner.keys"
@@ -65,7 +80,7 @@ def _values(register: PersistentKeyRegister) -> dict[str, Any]:
 
 
 def _reconciled_register(tmp_path: Path) -> PersistentKeyRegister:
-    register = PersistentKeyRegister(tmp_path / "persistent-keys.json")
+    register = PersistentKeyRegister(tmp_path, application_start_id=_A_TEXT)
     register.reconcile(
         persistent_keys.CommittedActivation(
             record_digest="sha256:" + "a" * 64,
@@ -86,7 +101,7 @@ def test_register_resets_every_persistent_key_in_one_audited_write(tmp_path) -> 
     forgotten = register.reset_to_initial(
         _PROJECT,
         _declarations(),
-        edit=PersistentKeyEdit("reset.1", "program_reset", program_run_id="program-cycle.1"),
+        edit=PersistentKeyEdit("reset.1", "program_reset", program_run_id=1),
     )
 
     # Every persistent key, read keys included; run keys are never stored.
@@ -98,16 +113,17 @@ def test_register_resets_every_persistent_key_in_one_audited_write(tmp_path) -> 
     assert register.sequence == sequence + 1
     resets = register.edits(_PROJECT)[-3:]
     assert [
-        (edit["action"], edit["key"], edit["request_id"], edit["source_label"], edit["program_run_id"])
+        (edit["action"], edit["key"], edit["request_key"], edit["source_label"], edit["program_run_id"])
         for edit in resets
     ] == [
-        ("reset", "counted", "reset.1", "program_reset", "program-cycle.1"),
-        ("reset", "layer", "reset.1", "program_reset", "program-cycle.1"),
-        ("reset", "limit", "reset.1", "program_reset", "program-cycle.1"),
+        ("reset", "counted", "reset.1", "program_reset", 1),
+        ("reset", "layer", "reset.1", "program_reset", 1),
+        ("reset", "limit", "reset.1", "program_reset", 1),
     ]
     assert resets[1]["detail"] == "Reset reloaded the initial scene; was 3"
-    # Durable: a new register reads the same.
-    assert PersistentKeyRegister(register.path).values(_PROJECT) == {}
+    # Durable once written: a new register reads the same.
+    assert register.wait_written(5.0)
+    assert PersistentKeyRegister(register.path.parent, application_start_id=_A_TEXT).values(_PROJECT) == {}
     # Nothing stored: nothing written, nothing audited.
     assert register.reset_to_initial(
         _PROJECT, _declarations(), edit=PersistentKeyEdit("reset.2", "program_reset")
@@ -115,11 +131,12 @@ def test_register_resets_every_persistent_key_in_one_audited_write(tmp_path) -> 
     assert register.sequence == sequence + 1
 
 
-def test_register_reset_that_cannot_be_stored_changes_nothing(
+def test_register_reset_whose_file_write_fails_is_made_in_memory(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register = _reconciled_register(tmp_path)
     _stored(register)
+    assert register.wait_written(5.0)
     sequence = register.sequence
     original = register.path.read_bytes()
 
@@ -127,12 +144,14 @@ def test_register_reset_that_cannot_be_stored_changes_nothing(
         raise OSError("read-only file system")
 
     monkeypatch.setattr(persistent_keys.os, "replace", refuse)
-    with pytest.raises(PersistentKeyRegisterError):
-        register.reset_to_initial(
-            _PROJECT, _declarations(), edit=PersistentKeyEdit("reset.1", "program_reset")
-        )
-    assert _values(register) == {"counted": 7, "layer": 3, "limit": 0.7}
-    assert register.sequence == sequence
+    assert register.reset_to_initial(
+        _PROJECT, _declarations(), edit=PersistentKeyEdit("reset.1", "program_reset")
+    ) == {"counted": 7, "layer": 3, "limit": 0.7}
+    assert _values(register) == {}
+    assert register.sequence == sequence + 1
+    assert register.wait_written(5.0)
+    assert register.write_failures == 1
+    # The file keeps the last state written until a write succeeds.
     assert register.path.read_bytes() == original
 
 
@@ -147,8 +166,8 @@ def _reset_runtime(
     reload_scene: bool,
     events: list[str],
 ) -> tuple[ProgramRuntime, ProgramCycleJournal, PersistentKeyRegister, ProgramCycleResetRequest]:
-    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch=_OWNER)
-    reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim(_OWNER))
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
+    reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim())
 
     class Admission(_Admission):
         def get(self):
@@ -157,8 +176,8 @@ def _reset_runtime(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
-            owner_epoch=_OWNER,
-            persistent_key_register_path=tmp_path / "persistent-keys.json",
+            application_start_id=0x3F9A00000000002A,
+            persistent_key_register_directory=tmp_path,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
         execution_transport=_Transport(),  # type: ignore[arg-type]
@@ -180,10 +199,10 @@ def _reset_runtime(
     runtime._reconcile_persistent_keys(register)  # noqa: SLF001
     _stored(register)
     request = ProgramCycleResetRequest.model_validate({
-        "request_id": "reset.keys", "request_owner_epoch": "composer.1",
-        "source_label": "operator_ui", "correlation_id": None,
-        "program_run_id": None if idle else "program-cycle.1",
-        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "request_key": _key("reset.keys"),
+        "source_label": "operator_ui",
+        "program_run_id": None if idle else 1,
+        "expected_cycle_generation": 1,
         "expected_claim_generation": None if idle else 1, "terminal_reference": reference,
         "settlement_evidence_digest": reference, "reload_initial_scene": reload_scene,
     })
@@ -207,10 +226,13 @@ def test_reset_with_reload_returns_persistent_keys_to_initial(
         assert events == ["scene:[]"]
         # Recorded with this Reset in the stored-value edits.
         assert [
-            (edit["action"], edit["key"], edit["request_id"], edit["program_run_id"])
+            (
+                edit["action"], edit["key"], edit["request_key"],
+                edit["program_run_id"], edit["application_start_id"],
+            )
             for edit in register.edits(_PROJECT)[-3:]
         ] == [
-            ("reset", key, "reset.keys", None if idle else "program-cycle.1")
+            ("reset", key, _key("reset.keys"), None if idle else 1, _A_TEXT)
             for key in ("counted", "layer", "limit")
         ]
         # The next run restores nothing: every key starts from `initial:`.
@@ -270,7 +292,7 @@ def test_a_key_reset_that_cannot_be_stored_refuses_the_reset_before_the_scene(
 
         # Reset again: the same phase resumes, keys first, then the Scene.
         monkeypatch.setattr(register, "reset_to_initial", reset_to_initial)
-        runtime.reset_cycle(request.model_copy(update={"request_id": "reset.keys.again"}))
+        runtime.reset_cycle(request.model_copy(update={"request_key": _key("reset.keys.again")}))
         assert journal.read().state == "idle_after_reset"
         assert _values(register) == {}
         assert events == ["scene:[]"]

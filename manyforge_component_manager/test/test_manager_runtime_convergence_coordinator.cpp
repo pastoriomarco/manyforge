@@ -1,4 +1,5 @@
 #include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -15,10 +16,12 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <memory>
@@ -39,8 +42,7 @@
 #include "manyforge_component_manager/manager_runtime_convergence_coordinator.hpp"
 #include "manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp"
 #include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
-#include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
-#include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
+#include "manyforge_component_manager/retained_execution_host_unit_adapter.hpp"
 #include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "runtime_only_retention_fixture.hpp"
@@ -315,12 +317,10 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
   const auto &graph = bundle.value().cell_graph;
   return {
       PublicRequestContextDTO{
-          RequestId("request-1"),
-          RequestOwnerEpoch("manager-owner-1"),
+          TestRequestKey("request-1"),
           "runtime-convergence-test",
-          std::nullopt,
       },
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       graph.cell_id,
       ProjectionRevisionDTO{
@@ -340,7 +340,8 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
           bundle.value().deployment_revision,
           ProgramBindingId(std::string(kDigestOne)),
           ContentDigest(std::string(kDigestTwo)),
-          "{}",
+          "{\"program_id\":\"runtime-convergence.program\",\"program_revision\":\"" +
+              std::string(kDigestTwo) + "\"}",
       },
       AdmissionGeneration(7U),
       std::nullopt,
@@ -370,7 +371,6 @@ PredecessorPublication(const ManagerApplyIntentDTO &apply_intent) {
   return {
       RuntimeUnitId("runtime.kernel"),
       RuntimeEpoch("kernel-runtime-1"),
-      RequestOwnerEpoch("kernel-owner-1"),
       ContentDigest(std::string(kDigestOne)),
       ActiveBundlePublicationGeneration(3U),
   };
@@ -500,6 +500,7 @@ private:
 class AlwaysIdleMaintenanceGate final : public IPlannedMaintenanceGate {
 public:
   [[nodiscard]] ManagementIdleState ReadIdleState() const override {
+    if (on_read) on_read();
     return idle_state;
   }
 
@@ -511,6 +512,7 @@ public:
   bool close_succeeds{true};
   ManagementIdleState idle_state{ManagementIdleState::kIdle};
   std::function<void()> on_close;
+  std::function<void()> on_read;
 };
 
 class ExactFencePort final : public IManagerKernelApplyFencePort {
@@ -549,25 +551,6 @@ public:
     };
   }
 
-  [[nodiscard]] ApplyFenceReconcileResultDTO
-  Rehydrate(const ApplyFenceRehydrateDTO &request) override {
-    ++rehydrate_calls;
-    return {
-        HostEpoch(),
-        {ApplyFenceReconcileEntryDTO{
-            request.persisted_configuration_fence_id,
-            request.persisted_configuration_fence_generation,
-            ApplyFenceReconcileState::kMatched,
-            std::nullopt,
-            std::nullopt,
-        }},
-        false,
-        "",
-        ContentDigest(std::string(kDigestOne)),
-        std::nullopt,
-    };
-  }
-
   [[nodiscard]] ConfigurationFenceStatusDTO
   QueryStatus(const ConfigurationFenceStatusQueryDTO &) const override {
     throw std::runtime_error("release status is outside this fixture");
@@ -580,7 +563,6 @@ public:
 
   int acquire_calls{0};
   mutable int reconcile_calls{0};
-  int rehydrate_calls{0};
 };
 
 class ScriptedFenceReleasePort final : public IManagerKernelApplyFencePort {
@@ -606,11 +588,6 @@ public:
         "Acquire reconciliation is outside the release fixture");
   }
 
-  [[nodiscard]] ApplyFenceReconcileResultDTO
-  Rehydrate(const ApplyFenceRehydrateDTO &) override {
-    throw std::runtime_error("rehydration is outside the release fixture");
-  }
-
   [[nodiscard]] ConfigurationFenceStatusDTO
   QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
     ++status_calls;
@@ -626,7 +603,6 @@ public:
         ExecutionHostEpochDTO{
             RuntimeUnitId("runtime.kernel"),
             RuntimeEpoch("kernel-runtime-release-1"),
-            RequestOwnerEpoch("kernel-owner-release-1"),
             ContentDigest(std::string(kDigestOne)),
             receipt.publication_generation,
         },
@@ -654,17 +630,9 @@ public:
         state,
         state != ConfigurationFenceState::kReleased,
         state == ConfigurationFenceState::kReleased ? released_ : std::nullopt,
-        state == ConfigurationFenceState::kReleasePending
-            ? "complete explicit Kernel release recovery"
-            : "",
+        "",
         ContentDigest(std::string(kDigestOne)),
-        state == ConfigurationFenceState::kReleasePending
-            ? std::optional<ErrorDTO>{ErrorDTO{
-                  "fence_release_pending",
-                  "Kernel cannot prove the release outcome",
-                  {},
-              }}
-            : std::nullopt,
+        std::nullopt,
     };
   }
 
@@ -716,7 +684,6 @@ public:
     auto epoch = original_execution_host.value_or(ExecutionHostEpochDTO{
         RuntimeUnitId("runtime.kernel"),
         RuntimeEpoch("kernel-runtime-aggregate-1"),
-        RequestOwnerEpoch("kernel-owner-aggregate-1"),
         ContentDigest(std::string(kDigestOne)),
         predecessor_.publication_generation});
     epoch.publication_generation = predecessor_.publication_generation;
@@ -737,7 +704,9 @@ public:
   [[nodiscard]] ConfigurationFenceAcceptedDTO
   Acquire(const ApplyConfigurationFenceIntentDTO &intent) override {
     ++acquire_calls;
+    if (requests) requests->push_back("fence.acquire");
     captured_intent_ = intent;
+    if (refuse_acquire) throw std::runtime_error("scripted Acquire refused before any effect");
     accepted_ = ConfigurationFenceAcceptedDTO{
         ConfigurationFenceId("fence.aggregate.1"),
         ConfigurationFenceGeneration(intent.expected_fence_generation.value() +
@@ -746,6 +715,7 @@ public:
         100U,
         RequestReplayStatusDTO::kAcceptedNew,
     };
+    if (lose_acquire_reply) throw std::runtime_error("scripted lost Acquire reply");
     return *accepted_;
   }
 
@@ -753,6 +723,7 @@ public:
   ReconcileAcquireAttempt(
       const ApplyFenceAcquireAttemptQueryDTO &query) const override {
     ++reconcile_calls;
+    if (requests) requests->push_back("fence.reconcile");
     if (captured_intent_ && query.persisted_intent != *captured_intent_) {
       throw std::runtime_error("acquire-attempt query differs from the actual acquired intent");
     }
@@ -766,11 +737,14 @@ public:
       acceptance->configuration_fence_generation = ConfigurationFenceGeneration(
           acceptance->configuration_fence_generation.value() + 1U);
     }
+    // As the Kernel: a released row answers conflicting for its own request.
     if (released_attempt || released_) {
-      return {epoch, echoed, ApplyFenceAcquireAttemptReconcileState::kUncertain,
-              std::nullopt, true, "fence was already released",
+      return {epoch, echoed, ApplyFenceAcquireAttemptReconcileState::kConflicting,
+              std::nullopt, true, "keep affected admission closed and reconcile the exact durable "
+                                  "Kernel request ledger",
               ContentDigest(std::string(kDigestOne)),
-              ErrorDTO{"apply_fence_already_released", "the original held fence is unavailable", {}}};
+              ErrorDTO{"configuration_fence_request_conflict",
+                       "the durable request identity names another or already released fence outcome", {}}};
     }
     return {
         epoch, echoed,
@@ -781,33 +755,12 @@ public:
     };
   }
 
-  [[nodiscard]] ApplyFenceReconcileResultDTO
-  Rehydrate(const ApplyFenceRehydrateDTO &request) override {
-    ++rehydrate_calls;
-    if (!accepted_.has_value()) {
-      throw std::runtime_error(
-          "aggregate fence cannot rehydrate before Acquire");
-    }
-    return {
-        HostEpoch(),
-        {ApplyFenceReconcileEntryDTO{
-            request.persisted_configuration_fence_id,
-            request.persisted_configuration_fence_generation,
-            ApplyFenceReconcileState::kMatched,
-            std::nullopt,
-            std::nullopt,
-        }},
-        false,
-        "",
-        ContentDigest(std::string(kDigestOne)),
-        std::nullopt,
-    };
-  }
-
   [[nodiscard]] ConfigurationFenceStatusDTO
   QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
     ++status_calls;
-    if (std::exchange(throw_next_status, false))
+    if (requests) requests->push_back("fence.status");
+    if (std::exchange(throw_next_status, false) ||
+        (throw_status_after_calls >= 0 && throw_status_after_calls-- == 0))
       throw std::runtime_error("actual parent fence lookup unavailable");
     const auto publication = independent_reader_.ReadPublicationReceipt(
         query.owner_transaction.apply_id,
@@ -825,7 +778,7 @@ public:
     const auto &candidate = receipt.request.candidate_projection_revision;
     auto epoch = original_execution_host.value_or(ExecutionHostEpochDTO{
         RuntimeUnitId("runtime.kernel"), RuntimeEpoch("kernel-runtime-aggregate-1"),
-        RequestOwnerEpoch("kernel-owner-aggregate-1"), ContentDigest(std::string(kDigestOne)),
+        ContentDigest(std::string(kDigestOne)),
         receipt.publication_generation});
     epoch.publication_generation = receipt.publication_generation;
     ConfigurationFenceReconciliationEvidenceDTO evidence{
@@ -844,11 +797,6 @@ public:
         affected_active_operations,
         ContentDigest(std::string(kDigestTwo)),
     };
-    if (report_release_pending) {
-      return {query, std::move(evidence), ConfigurationFenceState::kReleasePending,
-              true, std::nullopt, "inspect pending release", ContentDigest(std::string(kDigestOne)),
-              ErrorDTO{"fence_release_pending", "release is pending", {}}};
-    }
     return {
         query,
         std::move(evidence),
@@ -865,6 +813,8 @@ public:
   [[nodiscard]] ConfigurationFenceReleasedDTO
   Release(const ConfigurationFenceReleaseDTO &request) override {
     ++release_calls;
+    if (requests) requests->push_back("fence.release");
+    if (refuse_release) throw std::runtime_error("scripted Release refused before any effect");
     released_ = ConfigurationFenceReleasedDTO{
         request,
         request.reconciliation_evidence.execution_host_epoch,
@@ -884,14 +834,19 @@ public:
   std::optional<ExecutionHostEpochDTO> original_execution_host{};
   bool foreign_attempt_digest{}, stale_attempt_host{}, released_attempt{}, foreign_attempt_acceptance{};
   mutable bool throw_next_status{false};
+  // Status calls answered before one throws (a late host); negative: none.
+  mutable int throw_status_after_calls{-1};
   bool allow_prepublication_status{false};
   bool lose_release_reply{false};
-  bool report_release_pending{false};
+  // Acquire: refused before any effect, or held with its reply lost.
+  bool refuse_acquire{false}, lose_acquire_reply{false};
+  bool refuse_release{false};
+  // The Kernel requests in order, when a test collects them.
+  std::vector<std::string> *requests{nullptr};
   std::uint64_t affected_active_operations{0};
   mutable int observe_admission_calls{0};
   int acquire_calls{0};
   mutable int reconcile_calls{0};
-  int rehydrate_calls{0};
   mutable int status_calls{0};
   int release_calls{0};
 
@@ -1035,21 +990,6 @@ public:
         InspectInstalledComponentProcesses(request);
   }
 
-  [[nodiscard]] Result<ManagerComponentProcessStopResultDTO>
-  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &) override {
-    ++component_stop_calls;
-    return Result<ManagerComponentProcessStopResultDTO>::Err(
-        {"fixture_unexpected_process_stop", "no child process Stop was expected", {}});
-  }
-  [[nodiscard]] Result<ManagerComponentProcessStopResultDTO>
-  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &) override {
-    ++component_stop_read_calls;
-    return Result<ManagerComponentProcessStopResultDTO>::Err(
-        {"fixture_unexpected_process_stop", "no child drain receipt was expected", {}});
-  }
-  int component_stop_calls{};
-  int component_stop_read_calls{};
-
   std::function<Result<ManagerComponentProcessInventoryResultDTO>(
       const ManagerComponentProcessInventoryRequestDTO &)> installed_processes;
 
@@ -1066,6 +1006,10 @@ public:
       if (failure_error) throw *failure_error;
       throw std::runtime_error("scripted exact host Apply failure");
     }
+    if (error_result) {
+      if (before_failure) before_failure(request);
+      return Result<HostApplyResult>::Err(*error_result);
+    }
     if (result) {
       if (before_failure) before_failure(request);
       return Result<HostApplyResult>::Ok(*result);
@@ -1077,6 +1021,8 @@ public:
   int fail_on_call{0};
   // The typed failure the exchange throws instead of the generic one.
   std::optional<core::TypedError> failure_error;
+  /// The adapter's own error answer (e.g. a late host).
+  std::optional<core::ErrorDTO> error_result;
   // A host decision returned instead of success.
   std::optional<HostApplyResult> result;
   std::function<void(const HostApplyRequest &)> installed;
@@ -1086,11 +1032,35 @@ public:
   std::optional<HostApplyRequest> last_request;
 };
 
+// The installed inventory of a predecessor that runs the execution host and
+// has launched no component process, answered only for the exact request the
+// Apply forms from AggregateFencePort's default host epoch.
+[[nodiscard]] std::function<Result<ManagerComponentProcessInventoryResultDTO>(
+    const ManagerComponentProcessInventoryRequestDTO &)>
+NoInstalledProcesses(const ActiveBundlePublicationReceiptDTO &predecessor) {
+  const ManagerComponentProcessInventoryRequestDTO expected{
+      predecessor.request.candidate_projection_revision,
+      predecessor.publication_generation,
+      predecessor.durable_public_pointer_content_digest,
+      RuntimeUnitId("runtime.kernel"),
+      RuntimeEpoch("kernel-runtime-aggregate-1"),
+      true};
+  return [expected](const ManagerComponentProcessInventoryRequestDTO &request) {
+    if (!request.valid() || request != expected) {
+      return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+          {"fixture_installed_inventory_foreign",
+           "installed process inspection does not name the fixture owner", {}});
+    }
+    return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
+        {request, {}, std::nullopt});
+  };
+}
+
 class ScriptedCellAdmissionPort final : public core::IKernelCellAdmissionPort {
 public:
   [[nodiscard]] core::AuthoringAdmissionDTO
   GetAuthoringAdmission() const override {
-    return {!held_claim_.has_value() && !external_block,
+    return {!held_claim_.has_value() && earlier_held_.empty() && !external_block,
             core::AdmissionGeneration(generation_)};
   }
 
@@ -1107,11 +1077,16 @@ public:
   AcquireCellAdmissionClaim(
       const core::CellAdmissionClaimIntentDTO &intent) override {
     ++acquire_calls;
+    if (requests) requests->push_back("claim.acquire");
     if (refuse_acquire.has_value()) {
       return core::Result<core::CellAdmissionClaimDTO>::Err(*refuse_acquire);
     }
     if (lose_acquire_reply) {
       throw std::runtime_error("managed Kernel cell-admission response timed out");
+    }
+    if (concurrent_claims && held_claim_.has_value() && held_claim_->intent != intent) {
+      earlier_held_.push_back(*held_claim_);
+      held_claim_.reset();
     }
     if (!held_claim_.has_value()) {
       // The expected generation is evidence only; the Kernel records the
@@ -1134,9 +1109,20 @@ public:
   ReleaseCellAdmissionClaim(
       const core::CellAdmissionClaimReleaseDTO &release) override {
     ++release_calls;
+    if (requests) requests->push_back("claim.release");
     if (refuse_release) {
       return core::Result<core::AuthoringAdmissionDTO>::Err(
           {"fixture_release_rejected", "scripted admission release refused", {}});
+    }
+    const auto earlier = std::find_if(earlier_held_.begin(), earlier_held_.end(), [&](const auto &claim) {
+      return claim.intent.owner_transaction_id == release.owner_transaction_id;
+    });
+    if (earlier != earlier_held_.end()) {
+      last_release = release;
+      earlier_released_.push_back(*earlier);
+      earlier_held_.erase(earlier);
+      ++generation_;
+      return core::Result<core::AuthoringAdmissionDTO>::Ok(GetAuthoringAdmission());
     }
     last_release = release;
     released_claim_ = held_claim_;
@@ -1146,27 +1132,27 @@ public:
         GetAuthoringAdmission());
   }
 
+  // Records the Apply's outcome, then releases like the Kernel.
   [[nodiscard]] core::Result<core::AuthoringAdmissionDTO>
-  ReconcileCellAdmissionClaims(
-      const core::CellAdmissionReconcileDTO &) override {
-    return core::Result<core::AuthoringAdmissionDTO>::Ok(
-        GetAuthoringAdmission());
+  ReleaseManagerApplyClaim(
+      const core::CellAdmissionClaimReleaseDTO &release,
+      const core::ManagerApplyReleaseOutcomeDTO &outcome) override {
+    last_release_outcome = outcome;
+    return ReleaseCellAdmissionClaim(release);
   }
 
   [[nodiscard]] core::Result<core::CellAdmissionRecoveryReceiptDTO>
   GetCellAdmissionRecoveryReceipt(
       const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
     lookup_intents.push_back(query.intent);
+    if (requests) requests->push_back("claim.receipt");
     if (refuse_lookup)
       return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Err(*refuse_lookup);
     core::CellAdmissionRecoveryReceiptDTO receipt{
         core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown,
-        core::RequestOwnerEpoch("kernel-owner.test"),
         core::AdmissionGeneration(generation_),
         std::nullopt,
         std::nullopt,
-        std::nullopt,
-        {},
         {},
     };
     if (return_invalid_held_generation) {
@@ -1184,12 +1170,25 @@ public:
       receipt.status =
           core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
       receipt.matched_claim = released_claim_;
+    } else {
+      const auto same = [&](const auto &claim) { return claim.intent == query.intent; };
+      const auto held = std::find_if(earlier_held_.begin(), earlier_held_.end(), same);
+      const auto released = std::find_if(earlier_released_.begin(), earlier_released_.end(), same);
+      if (held != earlier_held_.end()) {
+        receipt.status = core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact;
+        receipt.matched_claim = *held;
+        receipt.held_claims.push_back(*held);
+      } else if (released != earlier_released_.end()) {
+        receipt.status = core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
+        receipt.matched_claim = *released;
+      }
     }
     return core::Result<core::CellAdmissionRecoveryReceiptDTO>::Ok(
         std::move(receipt));
   }
 
   std::optional<core::CellAdmissionClaimReleaseDTO> last_release;
+  std::optional<core::ManagerApplyReleaseOutcomeDTO> last_release_outcome;
   int acquire_calls{0};
   int release_calls{0};
   bool refuse_release{false};
@@ -1200,12 +1199,17 @@ public:
   bool lose_acquire_reply_after_record{false};
   bool return_invalid_held_generation{false};
   bool acquire_at_current_generation{false};
+  // Direct Manager claims of different Applies coexist, as at the Kernel.
+  bool concurrent_claims{false};
+  std::vector<std::string> *requests{nullptr};
   mutable std::vector<core::CellAdmissionClaimIntentDTO> lookup_intents;
 
 private:
   std::uint64_t generation_{7U};
   std::optional<core::CellAdmissionClaimDTO> held_claim_;
   std::optional<core::CellAdmissionClaimDTO> released_claim_;
+  std::vector<core::CellAdmissionClaimDTO> earlier_held_;
+  std::vector<core::CellAdmissionClaimDTO> earlier_released_;
 };
 
 class MaintenanceSceneOwner final
@@ -1303,6 +1307,13 @@ public:
     return status_;
   }
 
+  // This fixture opens no original configuration adoption to end.
+  void EndOriginalManagerConfigurationAdoption(
+      const core::ApplyId &, const core::ApplyGeneration,
+      const std::optional<core::ActiveBundlePublicationReceiptDTO> &) override {
+    ++end_calls;
+  }
+
   [[nodiscard]] core::ProjectionAggregateHealthDTO
   ActiveProjectionHealth() const override {
     if (!status_.has_value()) {
@@ -1323,6 +1334,7 @@ public:
   bool foreign_current_projection{false};
   int install_scene_calls{0};
   int complete_calls{0};
+  int end_calls{0};
   mutable int read_calls{0};
   std::optional<core::ProjectionMaintenanceInitializationRequestDTO>
       last_request;
@@ -1338,14 +1350,15 @@ struct CoordinatorFixture final {
         apply_intent(ApplyIntent(*package.bundle)),
         journal(root / "apply.sqlite3",
                 package.bundle->value().cell_graph.cell_id),
-        independent_reader(root / "apply.sqlite3",
-                           package.bundle->value().cell_graph.cell_id),
+        independent_reader(journal),
         publication(PredecessorPublication(apply_intent)),
         runtime_ports(independent_reader),
-        fence_coordinator(journal, kernel, RuntimeEpoch("manager-runtime-1")),
+        fence_coordinator(journal, kernel),
         coordinator(journal, publication,
                     *package.artifact_source, runtime_ports, runtime_ports,
-                    "linux", "posix.1-2017", [] { return 1'000U; }) {}
+                    "linux",
+                    std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract),
+                    [] { return 1'000U; }) {}
 
   [[nodiscard]] ManagerApplyRuntimeConvergenceResult Run() {
     if (!journal.ReadFenceAcceptance(apply_intent.apply_id,
@@ -1364,7 +1377,7 @@ struct CoordinatorFixture final {
   RuntimePackage package;
   ManagerApplyIntentDTO apply_intent;
   SqliteManagerApplyJournal journal;
-  SqliteManagerApplyJournal independent_reader;
+  SqliteManagerApplyJournal &independent_reader;
   CurrentPublicationReader publication;
   ExactFencePort kernel;
   ScriptedRuntimePorts runtime_ports;
@@ -1383,11 +1396,10 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
                    ActiveBundlePublicationGeneration(3U))),
                ManagerRuntimeConvergenceCoordinatorError);
   EXPECT_EQ(fixture.kernel.acquire_calls, 0);
-  EXPECT_EQ(fixture.kernel.rehydrate_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.observe_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 0);
   EXPECT_FALSE(fixture.journal
-                   .ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                   .ReadRuntimeConvergenceIntent(ApplyId(1U),
                                                  ApplyGeneration(1U))
                    .has_value());
 }
@@ -1429,7 +1441,6 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
-  EXPECT_EQ(fixture.kernel.rehydrate_calls, 1);
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1453,7 +1464,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 
   fixture.runtime_ports.throw_after_ensure_effect = false;
@@ -1477,7 +1488,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.publication.read_calls, 2);
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 }
 
@@ -1500,51 +1511,16 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.progress_calls, 1);
   EXPECT_TRUE(
       fixture.journal
-          .ReadRuntimeConvergenceIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadRuntimeConvergenceIntent(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   const auto report = fixture.journal.VerifyIntegrity();
   EXPECT_EQ(report.fence_acceptance_count, 1);
   EXPECT_EQ(report.runtime_convergence_intent_count, 1);
   EXPECT_EQ(report.runtime_staged_ready_count, 0);
-}
-
-TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     StaleRetainedEpochFailsClosedWithoutReplacementOrRelaunch) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  const auto first = fixture.Run();
-  ASSERT_EQ(first.state, ManagerRuntimeConvergenceResultState::kStagedReady);
-  ASSERT_TRUE(first.durable_staged_ready.has_value());
-  ASSERT_TRUE(fixture.runtime_ports.last_report.has_value());
-  const auto prior_report = *fixture.runtime_ports.last_report;
-  fixture.runtime_ports.ReplaceProcess("process-epoch-2");
-
-  EXPECT_THROW(static_cast<void>(fixture.Run()),
-               ManagerRuntimeConvergenceCoordinatorError);
-  EXPECT_EQ(prior_report.process_incarnation(), "process-epoch-1");
-  EXPECT_EQ(prior_report.source_report_sequence(), 1U);
-  EXPECT_EQ(
-      prior_report.offered_runtime_contract_offer_digest(),
-      first.durable_staged_ready->record.staged_ready.runtime_units.front()
-          .observed_runtime_contract_offer_digest.value());
-  EXPECT_EQ(fixture.kernel.acquire_calls, 1);
-  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
-  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
-  EXPECT_EQ(fixture.runtime_ports.progress_calls, 1);
-  const auto latest = fixture.journal.ReadLatestRuntimeStagedReady(
-      ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(latest.has_value());
-  EXPECT_EQ(*latest, first.durable_staged_ready->record);
-  ASSERT_EQ(latest->staged_ready.runtime_units.size(), 1U);
-  EXPECT_EQ(latest->staged_ready.runtime_units.front().command_surface_state,
-            ManagedCommandSurfaceState::kClosedNoActiveEffect);
-  const auto report = fixture.journal.VerifyIntegrity();
-  EXPECT_EQ(report.runtime_convergence_intent_count, 1);
-  EXPECT_EQ(report.runtime_staged_ready_count, 1);
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1598,7 +1574,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.runtime_ports.progress_calls, 2);
   const auto intent = fixture.journal.ReadRuntimeConvergenceIntent(
-      ApplyId("apply-1"), ApplyGeneration(1U));
+      ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(intent.has_value());
   EXPECT_EQ(intent->runtime_convergence_intent.runtime_units.size(), 1U);
   EXPECT_EQ(intent->runtime_convergence_intent.runtime_units.front()
@@ -1609,7 +1585,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
             fixture.runtime_ports.last_query->plan);
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_EQ(fixture.journal.VerifyIntegrity().runtime_staged_ready_count, 0);
 }
@@ -1638,11 +1614,11 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_TRUE(
       fixture.journal
-          .ReadRuntimeConvergenceIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadRuntimeConvergenceIntent(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_EQ(fixture.journal.VerifyIntegrity().runtime_staged_ready_count, 0);
 }
@@ -1658,7 +1634,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 }
 
@@ -1680,30 +1656,29 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
                ManagerRuntimeConvergenceCoordinatorError);
   EXPECT_EQ(fixture.kernel.acquire_calls, 0);
   EXPECT_EQ(fixture.kernel.reconcile_calls, 0);
-  EXPECT_EQ(fixture.kernel.rehydrate_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.observe_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 0);
   EXPECT_EQ(fixture.runtime_ports.progress_calls, 0);
   EXPECT_FALSE(fixture.runtime_ports.last_query.has_value());
   EXPECT_FALSE(
-      fixture.journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+      fixture.journal.ReadIntent(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(
-      fixture.journal.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U))
+      fixture.journal.ReadAffectedScope(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(
-      fixture.journal.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U))
+      fixture.journal.ReadFenceAttempt(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(fixture.journal
-                   .ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U))
+                   .ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U))
                    .has_value());
   EXPECT_FALSE(
       fixture.journal
-          .ReadRuntimeConvergenceIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadRuntimeConvergenceIntent(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
   EXPECT_FALSE(
       fixture.journal
-          .ReadLatestRuntimeStagedReady(ApplyId("apply-1"), ApplyGeneration(1U))
+          .ReadLatestRuntimeStagedReady(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 }
 
@@ -1714,7 +1689,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   ScopedPackageRoot state_root;
   auto predecessor =
       MaterializeRosRuntimePackage(native_root.path());
-  auto candidate = MaterializeRuntimePackage(candidate_root.path());
+  auto candidate = MaterializeRuntimePackage(candidate_root.path(), true);
   ASSERT_EQ(predecessor.bundle->value().cell_graph.cell_id,
             candidate.bundle->value().cell_graph.cell_id);
   ASSERT_EQ(predecessor.bundle->value().cell_graph.runtime_units.size(), 1U);
@@ -1795,30 +1770,21 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
         package->bundle->value().cell_graph.runtime_units.front().runtime_unit_id,
         *package->artifact_source);
     ASSERT_TRUE(product.has_value());
-    ASSERT_TRUE(product->manager_liveness_policy().has_value());
-    EXPECT_EQ(*product->manager_liveness_policy(),
-              deployment::execution_runtime_contract::manager_liveness_policy());
   }
   EXPECT_TRUE(VerifyExecutionHostContinuity(
       *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source).ok());
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     RosExecutionHostRemovalOrReplacementRejectsBeforeRuntimeEffect) {
+     RosExecutionHostRemovalRejectsBeforeRuntimeEffect) {
   ScopedPackageRoot root;
   ScopedPackageRoot state_root;
   const auto predecessor = MaterializeRosRuntimePackage(root.path(), true);
   const auto removed = MaterializeRuntimePackage(root.path(), true);
-  const auto replaced = MaterializeRuntimePackage(root.path());
   const auto drifted = MaterializeRosRuntimePackage(root.path(), false, "unhosted_arm");
-  // Native-to-ROS positive-family setup retires with the native executor.
-  // The surviving ROS-to-POSIX replacement preserves before-effect refusal.
+  // One host profile remains (Q1): only removal of the host is refused here.
   EXPECT_TRUE(removed.bundle->value().cell_graph.runtime_units.empty());
-  ASSERT_EQ(replaced.bundle->value().cell_graph.runtime_units.size(), 1U);
-  EXPECT_EQ(replaced.bundle->value().cell_graph.runtime_units.front()
-                .runtime_profile_id.value(),
-            deployment::detail::kReferenceRuntimeProfileId);
-  for (const auto *candidate : {&removed, &replaced}) {
+  for (const auto *candidate : {&removed}) {
     auto intent = ApplyIntent(*predecessor.bundle);
     intent.candidate_retained_bundle_id = candidate->bundle->retained_bundle_id();
     intent.candidate_graph_revision = candidate->bundle->value().cell_graph.graph_revision;
@@ -1866,8 +1832,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
         (drifted.bundle->retained_bundle_id().value().substr(7U) + ".sqlite3");
     SqliteManagerApplyJournal journal(database, intent.cell_id);
     ExactFencePort kernel;
-    ManagerApplyFenceCoordinator fence_coordinator(
-        journal, kernel, RuntimeEpoch("manager-runtime-1"));
+    ManagerApplyFenceCoordinator fence_coordinator(journal, kernel);
     try {
       static_cast<void>(fence_coordinator.AcquireOrRecoverFence(
           intent, *predecessor.bundle, *drifted.bundle,
@@ -1887,76 +1852,6 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   }
 }
 
-TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     ConcreteRetainedProcessReachesDurableStagedReadyWithoutEpochReplacement) {
-  ScopedPackageRoot root;
-  auto package = MaterializeRuntimePackage(root.path());
-  const auto runtime_state_root = root.path() / "execution-state";
-  const auto runtime_run_root = root.path() / "execution-run";
-  ASSERT_TRUE(std::filesystem::create_directory(runtime_state_root));
-  ASSERT_TRUE(std::filesystem::create_directory(runtime_run_root));
-  const auto apply_intent = ApplyIntent(*package.bundle);
-  SqliteManagerApplyJournal journal(root.path() / "concrete-apply.sqlite3",
-                                    package.bundle->value().cell_graph.cell_id);
-  CurrentPublicationReader publication(PredecessorPublication(apply_intent));
-  ExactFencePort kernel;
-  ManagerApplyFenceCoordinator fence_coordinator(
-      journal, kernel, RuntimeEpoch("manager-runtime-1"));
-  RetainedPosixRuntimeUnitAdapter runtime_adapter(
-      runtime_state_root, runtime_run_root, *package.bundle_source,
-      *package.artifact_source, "linux", "posix.1-2017");
-  std::uint64_t now_ns = 1'000U;
-  ManagerApplyRuntimeConvergenceCoordinator coordinator(
-      journal, publication, *package.artifact_source,
-      runtime_adapter, runtime_adapter, "linux", "posix.1-2017",
-      [&now_ns] { return now_ns++; });
-  const auto run = [&] {
-    return coordinator.ConvergeOrRecover(apply_intent, *package.bundle,
-                                         *package.bundle,
-                                         ActiveBundlePublicationGeneration(3U));
-  };
-
-  static_cast<void>(fence_coordinator.AcquireOrRecoverFence(
-      apply_intent, *package.bundle, *package.bundle,
-      ManagerApplyFenceExpectationDTO{
-          0U, ConfigurationFenceGeneration(0U), {}}));
-  const auto first = run();
-  ASSERT_EQ(first.state, ManagerRuntimeConvergenceResultState::kStagedReady);
-  ASSERT_TRUE(first.durable_staged_ready.has_value());
-  ASSERT_EQ(
-      first.durable_staged_ready->record.staged_ready.runtime_units.size(), 1U);
-  const auto first_evidence =
-      first.durable_staged_ready->record.staged_ready.runtime_units.front();
-  EXPECT_EQ(first_evidence.source_report_sequence, 1U);
-
-  const auto second = run();
-  ASSERT_EQ(second.state, ManagerRuntimeConvergenceResultState::kStagedReady);
-  ASSERT_TRUE(second.durable_staged_ready.has_value());
-  ASSERT_EQ(
-      second.durable_staged_ready->record.staged_ready.runtime_units.size(),
-      1U);
-  const auto &second_evidence =
-      second.durable_staged_ready->record.staged_ready.runtime_units.front();
-  EXPECT_EQ(second_evidence.runtime_epoch, first_evidence.runtime_epoch);
-  EXPECT_EQ(second_evidence.source_report_sequence, 1U);
-  EXPECT_EQ(
-      second.durable_staged_ready->record.staged_ready.staged_ready_generation,
-      1U);
-  EXPECT_FALSE(second.durable_staged_ready->inserted);
-  EXPECT_EQ(kernel.acquire_calls, 1);
-  const auto &durable_runtime = second.durable_runtime_intent.record;
-  const RuntimeUnitConvergenceQueryDTO cleanup_query{
-      apply_intent.apply_id,
-      apply_intent.apply_generation,
-      package.bundle->retained_bundle_id(),
-      package.bundle->value().cell_graph.graph_revision,
-      durable_runtime.runtime_convergence_intent_digest,
-      durable_runtime.runtime_convergence_intent.runtime_units.front(),
-  };
-  EXPECT_EQ(runtime_adapter.EnsureStopped(cleanup_query).state(),
-            ProcessPresenceState::kAbsent);
-}
-
 TEST(ManagerNamedApplyCoordinator,
      StalePredecessorIsRefusedBeforeAnyDurableRecordOrEffect) {
   ScopedPackageRoot package_root;
@@ -1973,7 +1868,7 @@ TEST(ManagerNamedApplyCoordinator,
   FixedActiveRuntimePlanSource active_plan_source(
       predecessor, BuildVerifiedRuntimeConvergencePlan(
                        *package.bundle, *package.artifact_source, "linux",
-                       {"posix.1-2017"}));
+                       {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
   ScriptedRuntimePorts runtime_ports(independent_reader);
   MaintenanceSceneOwner scene_owner(
       predecessor.request.candidate_projection_revision);
@@ -1990,8 +1885,8 @@ TEST(ManagerNamedApplyCoordinator,
       *package.artifact_source, publication_store, scene_owner, nullptr,
       kernel_fence, cell_admission, runtime_composition, runtime_ports,
       runtime_ports, planned_maintenance,
-      RuntimeEpoch("manager-runtime.stale.1"), "linux", {"posix.1-2017"},
-      [] { return 1'000U; }, [] { return ApplyId("apply.stale.1"); },
+      "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+      [] { return 1'000U; }, [] { return ApplyId(1U); },
       [](const auto &, const auto &) {
         return std::vector<core::AddObjectRequestDTO>{};
       });
@@ -2013,8 +1908,7 @@ TEST(ManagerNamedApplyCoordinator,
 
   EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(request)),
                ManagerNamedApplyCoordinatorError);
-  EXPECT_FALSE(journal.ReadRequest(request.request_context.request_owner_epoch,
-                                   request.request_context.request_id)
+  EXPECT_FALSE(journal.ReadRequest(request.request_context.request_key)
                    .has_value());
   EXPECT_EQ(runtime_ports.ensure_calls, 0);
   EXPECT_EQ(scene_owner.begin_calls, 0);
@@ -2032,14 +1926,15 @@ TEST(ManagerNamedApplyCoordinator,
   const auto predecessor = PredecessorPublication(prototype);
   const auto database = state_root.path() / "status-responsive.sqlite3";
   SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id);
-  SqliteManagerApplyJournal reader(database, journal.cell_id());
+  auto &reader = journal;
   ScriptedPublicationStore publication(predecessor, &reader);
   FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
-      *package.bundle, *package.artifact_source, "linux", {"posix.1-2017"}));
+      *package.bundle, *package.artifact_source, "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
   ScriptedRuntimePorts runtime(reader);
   MaintenanceSceneOwner scene(predecessor.request.candidate_projection_revision);
   AggregateFencePort fence(reader, predecessor);
   ScriptedRuntimeCompositionPort composition;
+  composition.installed_processes = NoInstalledProcesses(predecessor);
   ScriptedCellAdmissionPort admission;
   AlwaysIdleMaintenanceGate gate;
   gate.close_succeeds = false;
@@ -2052,8 +1947,8 @@ TEST(ManagerNamedApplyCoordinator,
   ManagerNamedApplyCoordinator coordinator(
       journal, plan, *package.bundle_source, *package.artifact_source,
       publication, scene, nullptr, fence, admission, composition, runtime, runtime,
-      maintenance, RuntimeEpoch("manager-runtime.responsive"), "linux", {"posix.1-2017"},
-      [] { return 1'000U; }, [] { return ApplyId("apply.responsive"); },
+      maintenance, "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+      [] { return 1'000U; }, [] { return ApplyId(1U); },
       [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
   const ManagerNamedApplyRequestDTO request{
       prototype.request_context, package.bundle->value().deployment_artifact_id,
@@ -2098,16 +1993,17 @@ TEST(ManagerNamedApplyCoordinator,
     const auto predecessor = PredecessorPublication(prototype);
     const auto database = state_root.path() / "acknowledge.sqlite3";
     SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal reader(database, journal.cell_id());
+    auto &reader = journal;
     ScriptedPublicationStore publication(predecessor, &reader);
     FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
-        *package.bundle, *package.artifact_source, "linux", {"posix.1-2017"}));
+        *package.bundle, *package.artifact_source, "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
     ScriptedRuntimePorts runtime(reader);
     MaintenanceSceneOwner scene(predecessor.request.candidate_projection_revision);
     AggregateFencePort fence(reader, predecessor);
     fence.allow_prepublication_status = true;
     fence.lose_release_reply = scenario == 1;
     ScriptedRuntimeCompositionPort composition;
+    composition.installed_processes = NoInstalledProcesses(predecessor);
     ScriptedCellAdmissionPort admission;
     admission.refuse_release = scenario == 2;
     admission.acquire_at_current_generation = scenario == 8;
@@ -2118,8 +2014,8 @@ TEST(ManagerNamedApplyCoordinator,
     ManagerNamedApplyCoordinator coordinator(
         journal, plan, *package.bundle_source, *package.artifact_source,
         publication, scene, nullptr, fence, admission, composition, runtime, runtime,
-        maintenance, RuntimeEpoch("manager-runtime.ack"), "linux", {"posix.1-2017"},
-        [] { return 1'000U; }, [] { return ApplyId("apply.ack"); },
+        maintenance, "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+        [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     ManagerNamedApplyRequestDTO request{
         prototype.request_context, package.bundle->value().deployment_artifact_id,
@@ -2134,8 +2030,8 @@ TEST(ManagerNamedApplyCoordinator,
     if (scenario == 6) {
       const CellAdmissionClaimIntentDTO parent_intent{
           CellAdmissionClaimKindDTO::kAuthoringMutation,
-          CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("composer-owner"),
-          "composer-apply", RequestId("composer-apply"), ContentDigest(std::string(kDigestOne)),
+          ApplicationRole::kAuthoringOwner,
+          std::nullopt, TestRequestKey("composer-apply"),
           admission.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
       ASSERT_TRUE(ValidateCellAdmissionClaimIntent(parent_intent).ok());
       const auto parent = admission.AcquireCellAdmissionClaim(parent_intent);
@@ -2145,8 +2041,7 @@ TEST(ManagerNamedApplyCoordinator,
     }
     const auto accepted = coordinator.AcceptOrReplay(request);
     const PublicRequestContextDTO acknowledgement_context{
-        RequestId("operator-ack.1"), RequestOwnerEpoch("operator-owner.1"),
-        "composer_ui", std::nullopt};
+        TestRequestKey("operator-ack.1"), "composer_ui"};
     ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
     const auto result = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(result);
@@ -2201,19 +2096,26 @@ TEST(ManagerNamedApplyCoordinator,
                 claim.intent.expected_admission_generation.value());
     }
     const CellAdmissionClaimReleaseDTO proposed{
-        claim.intent.owner_role, claim.intent.owner_epoch, claim.intent.owner_transaction_id,
-        claim.intent.request_id, claim.intent.request_payload_digest,
+        claim.intent.owner_role, claim.intent.owner_transaction_id,
+        claim.intent.request_key,
         claim.acquired_admission_generation, claim.claim_generation,
         {scenario == 6 ? CellAdmissionSettlementKindDTO::kOwnerCommit
                        : CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
          before->terminal_outcome->terminal_outcome_digest}};
-    if (scenario != 6) {
-      EXPECT_FALSE(ValidateManagerApplyCellAdmissionSettlementReadOnly(
-          database, journal.cell_id(), claim, proposed).ok());
-    }
+    // The Kernel accepts a release naming the claim by role, typed transaction
+    // id, both generations and a settlement kind fit for the claim kind.
+    const auto expect_release_names_claim = [&](const CellAdmissionClaimReleaseDTO &release) {
+      EXPECT_TRUE(ValidateCellAdmissionClaimRelease(release).ok());
+      EXPECT_EQ(release.owner_role, proposed.owner_role);
+      EXPECT_EQ(release.owner_transaction_id, proposed.owner_transaction_id);
+      EXPECT_EQ(release.acquired_admission_generation, proposed.acquired_admission_generation);
+      EXPECT_EQ(release.claim_generation, proposed.claim_generation);
+      EXPECT_EQ(release.settlement.settlement_kind, proposed.settlement.settlement_kind);
+    };
+    EXPECT_FALSE(admission.last_release.has_value());
 
     if (scenario == 0) {
-      const auto expect_refusal = [&](const RequestId &id, const std::string &code) {
+      const auto expect_refusal = [&](const RequestKey &id, const std::string &code) {
         try {
           coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
                                               id, acknowledgement_context.source_label);
@@ -2230,44 +2132,39 @@ TEST(ManagerNamedApplyCoordinator,
         EXPECT_EQ(fence.release_calls, 0);
         EXPECT_EQ(admission.release_calls, 0);
       };
-      expect_refusal(RequestId("invalid request id"), "invalid_request");
       admission.refuse_lookup = ErrorDTO{"fixture_lookup_refused", "Kernel lookup refused", {}};
-      expect_refusal(acknowledgement_context.request_id, "fixture_lookup_refused");
+      expect_refusal(acknowledgement_context.request_key, "fixture_lookup_refused");
       admission.refuse_lookup.reset();
       scene.foreign_current_projection = true;
-      expect_refusal(acknowledgement_context.request_id, "manager_command_rejected");
+      expect_refusal(acknowledgement_context.request_key, "manager_command_rejected");
       scene.foreign_current_projection = false;
-      fence.report_release_pending = true;
-      expect_refusal(acknowledgement_context.request_id, "manager_command_rejected");
-      fence.report_release_pending = false;
       fence.affected_active_operations = 1;
-      expect_refusal(acknowledgement_context.request_id, "manager_command_rejected");
+      expect_refusal(acknowledgement_context.request_key, "manager_command_rejected");
       fence.affected_active_operations = 0;
       fence.throw_next_status = true;
-      expect_refusal(acknowledgement_context.request_id, "manager_command_rejected");
+      expect_refusal(acknowledgement_context.request_key, "manager_command_rejected");
     }
 
     if (scenario == 7) {
       const auto &accepted_fence = before->fence_acceptance->accepted_fence;
       const ConfigurationFenceStatusQueryDTO query{
           {accepted.apply_id, accepted.apply_generation}, accepted_fence.configuration_fence_id,
-          accepted_fence.configuration_fence_generation, accepted_fence.captured_scope,
-          RuntimeEpoch("manager-runtime.ack")};
+          accepted_fence.configuration_fence_generation, accepted_fence.captured_scope};
       const ConfigurationFenceReleaseDTO release_request{
-          fence.QueryStatus(query).reconciliation_evidence, RuntimeEpoch("manager-runtime.ack")};
+          fence.QueryStatus(query).reconciliation_evidence};
       EXPECT_THROW(journal.CompleteFailedApplyAcknowledgement(accepted.apply_id, accepted.apply_generation),
                    ManagerApplyJournalConflictError);
       journal.BeginFailedApplyRelease(accepted.apply_id, accepted.apply_generation,
-                                      acknowledgement_context.request_id,
+                                      acknowledgement_context.request_key,
                                       acknowledgement_context.source_label, release_request);
       EXPECT_THROW(journal.CompleteFailedApplyAcknowledgement(accepted.apply_id, accepted.apply_generation),
                    ManagerApplyJournalConflictError);
       EXPECT_THROW(journal.BeginFailedApplyRelease(accepted.apply_id, accepted.apply_generation,
-                                                   acknowledgement_context.request_id,
+                                                   acknowledgement_context.request_key,
                                                    acknowledgement_context.source_label, release_request),
                    ManagerApplyJournalConflictError);
       {
-        SqliteManagerApplyJournal pending_reader(database, journal.cell_id());
+        auto &pending_reader = journal;
         static_cast<void>(pending_reader.VerifyIntegrity());
         const auto pending = pending_reader.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
         ASSERT_TRUE(pending);
@@ -2293,18 +2190,16 @@ TEST(ManagerNamedApplyCoordinator,
       const auto retained = reopened.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
       ASSERT_TRUE(retained && retained->released);
       EXPECT_FALSE(retained->acknowledged);
-      EXPECT_TRUE(ValidateManagerApplyCellAdmissionSettlementReadOnly(
-          database, journal.cell_id(), claim, proposed).ok());
       ManagerNamedApplyCoordinator restarted(
           reopened, plan, *package.bundle_source, *package.artifact_source,
           publication, scene, nullptr, fence, admission, composition, runtime, runtime,
-          maintenance, RuntimeEpoch("manager-runtime.ack"), "linux", {"posix.1-2017"},
-          [] { return 1'000U; }, [] { return ApplyId("apply.ack"); },
+          maintenance, "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+          [] { return 1'000U; }, [] { return ApplyId(1U); },
           [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
       EXPECT_EQ(restarted.FailedApplyAcknowledgementStatus(accepted.apply_id, accepted.apply_generation),
                 FailedApplyAcknowledgementState::kUnavailable);
       EXPECT_THROW(restarted.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
-                                                    acknowledgement_context.request_id,
+                                                    acknowledgement_context.request_key,
                                                     acknowledgement_context.source_label),
                    core::TypedError);
       EXPECT_EQ(fence.release_calls, 1);
@@ -2315,11 +2210,11 @@ TEST(ManagerNamedApplyCoordinator,
     if (scenario == 0 || scenario == 3 || scenario == 4 || scenario == 6 || scenario == 8) {
       admission.external_block = scenario == 4;
       EXPECT_NO_THROW(coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
-                                                         acknowledgement_context.request_id,
+                                                         acknowledgement_context.request_key,
                                                          acknowledgement_context.source_label));
       if (scenario != 6) {
-        EXPECT_TRUE(ValidateManagerApplyCellAdmissionSettlementReadOnly(
-            database, journal.cell_id(), claim, proposed).ok());
+        ASSERT_TRUE(admission.last_release);
+        expect_release_names_claim(*admission.last_release);
       }
       EXPECT_EQ(admission.release_calls, 1);
       EXPECT_EQ(admission.GetAuthoringAdmission().authoring_allowed, scenario != 4);
@@ -2331,7 +2226,7 @@ TEST(ManagerNamedApplyCoordinator,
     } else {
       try {
         coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
-                                           acknowledgement_context.request_id,
+                                           acknowledgement_context.request_key,
                                            acknowledgement_context.source_label);
         FAIL() << "uncertain release unexpectedly succeeded";
       } catch (const core::TypedError &error) {
@@ -2344,7 +2239,7 @@ TEST(ManagerNamedApplyCoordinator,
     }
     const auto retained = journal.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
     ASSERT_TRUE(retained);
-    EXPECT_EQ(retained->acknowledgement_request_id, acknowledgement_context.request_id);
+    EXPECT_EQ(retained->acknowledgement_request_key, acknowledgement_context.request_key);
     EXPECT_EQ(retained->acknowledgement_source_label, acknowledgement_context.source_label);
     EXPECT_EQ(retained->released.has_value(), scenario != 1);
     const bool acknowledged = scenario == 0 || scenario == 3 || scenario == 4 || scenario == 6 || scenario == 8;
@@ -2360,7 +2255,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_NE(coordinator.FailedApplyAcknowledgementStatus(accepted.apply_id, accepted.apply_generation),
               FailedApplyAcknowledgementState::kAvailable);
     EXPECT_THROW(coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
-                                                    acknowledgement_context.request_id,
+                                                    acknowledgement_context.request_key,
                                                     acknowledgement_context.source_label),
                  core::TypedError);
     EXPECT_EQ(fence.release_calls, 1);
@@ -2375,83 +2270,6 @@ TEST(ManagerNamedApplyCoordinator,
   }
 }
 
-
-TEST(ManagerNamedApplyCoordinator,
-     ReopenedManagerMarksNonterminalCaptureInterruptedWithoutEffects) {
-  ScopedPackageRoot package_root;
-  ScopedPackageRoot state_root;
-  auto package = MaterializeRuntimePackage(package_root.path());
-  const auto intent_template = ApplyIntent(*package.bundle);
-  const auto predecessor = PredecessorPublication(intent_template);
-  const auto database = state_root.path() / "reopened-apply.sqlite3";
-  SqliteManagerApplyJournal journal(database,
-                                    package.bundle->value().cell_graph.cell_id);
-  SqliteManagerApplyJournal independent_reader(
-      database, package.bundle->value().cell_graph.cell_id);
-  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
-  FixedActiveRuntimePlanSource active_plan_source(
-      predecessor, BuildVerifiedRuntimeConvergencePlan(
-                       *package.bundle, *package.artifact_source, "linux",
-                       {"posix.1-2017"}));
-  ScriptedRuntimePorts runtime_ports(independent_reader);
-  MaintenanceSceneOwner scene_owner(
-      predecessor.request.candidate_projection_revision);
-  AggregateFencePort kernel_fence(independent_reader, predecessor);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ScriptedCellAdmissionPort cell_admission;
-  ManagerActiveRuntimeCoordinator active_runtime(
-      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
-  AlwaysIdleMaintenanceGate maintenance_gate;
-  ManagerPlannedMaintenanceCoordinator planned_maintenance(
-      active_plan_source, maintenance_gate);
-  const ManagerNamedApplyRequestDTO request{
-      intent_template.request_context,
-      package.bundle->value().deployment_artifact_id,
-      package.bundle->value().deployment_revision,
-      predecessor.request.candidate_retained_bundle_id,
-      predecessor.request.candidate_graph_revision,
-      package.bundle->retained_bundle_id(),
-      intent_template.prepared_activation,
-      core::AdmissionGeneration(7U),
-      std::nullopt,
-  };
-  {
-    ManagerNamedApplyCoordinator first(
-        journal, active_plan_source, *package.bundle_source,
-        *package.artifact_source, publication_store, scene_owner, nullptr,
-        kernel_fence, cell_admission, runtime_composition, runtime_ports,
-        runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
-        {"posix.1-2017"}, [] { return 1'000U; },
-        [] { return ApplyId("apply.reopened.1"); },
-        [](const auto &, const auto &) {
-          return std::vector<core::AddObjectRequestDTO>{};
-        });
-    EXPECT_EQ(first.AcceptOrReplay(request).state,
-              ManagerNamedApplyResultState::kPending);
-  }
-
-  ManagerNamedApplyCoordinator reopened(
-      journal, active_plan_source, *package.bundle_source,
-      *package.artifact_source, publication_store, scene_owner, nullptr,
-      kernel_fence, cell_admission, runtime_composition, runtime_ports,
-      runtime_ports, planned_maintenance,
-      RuntimeEpoch("manager-runtime.aggregate.2"), "linux",
-      {"posix.1-2017"}, [] { return 2'000U; },
-      [] { return ApplyId("must-not-be-minted"); },
-      [](const auto &, const auto &) {
-        return std::vector<core::AddObjectRequestDTO>{};
-      });
-  const auto interrupted = reopened.RecoverIncompleteApply();
-  ASSERT_TRUE(interrupted.has_value());
-  EXPECT_EQ(interrupted->state, ManagerNamedApplyResultState::kUnknownEffect);
-  EXPECT_EQ(runtime_ports.ensure_calls, 0);
-  EXPECT_EQ(scene_owner.begin_calls, 0);
-  EXPECT_EQ(runtime_composition.calls, 0);
-  EXPECT_EQ(publication_store.publish_calls, 0);
-  EXPECT_EQ(kernel_fence.acquire_calls, 0);
-  EXPECT_EQ(kernel_fence.release_calls, 0);
-}
 
 // Real Scene owner protocol with native participant test clients. Production
 // host registration is separately qualified; no Scene row/status is faked.
@@ -2595,37 +2413,6 @@ public:
       const ProjectionMaintenanceInitializationQueryDTO &query) const override {
     return owner_.ReadMaintenanceInitialization(query);
   }
-  std::vector<ProjectionHealthDTO> StageOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequestDTO &request,
-      const ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
-    ++stage_calls;
-    if (before_stage) before_stage(request);
-    return owner_.StageOriginalManagerProductAdoption(request, fence_, attempt_query);
-  }
-  std::vector<ProjectionHealthDTO> ReadOriginalManagerProductAdoptionProjectionHealth(
-      const QualifiedSceneProductAdoptionRequestDTO &request,
-      const ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
-    ++stage_read_calls;
-    return owner_.ReadOriginalManagerProductAdoptionProjectionHealth(request, fence_, attempt_query);
-  }
-  ProjectionMaintenanceInitializationStatusDTO BeginOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequestDTO &request) override {
-    ++begin_calls;
-    if (before_begin) before_begin(request);
-    auto input = request;
-    if (alter_begin) alter_begin(input);
-    const auto result = owner_.BeginOriginalManagerProductAdoption(input, fence_);
-    if (after_begin) after_begin();
-    return result;
-  }
-  ProjectionMaintenanceInitializationStatusDTO CompleteOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequestDTO &request,
-      const ActiveBundlePublicationReceiptDTO &receipt) override {
-    ++complete_calls;
-    const auto result = owner_.CompleteOriginalManagerProductAdoption(request, receipt, fence_);
-    if (after_complete) after_complete();
-    return result;
-  }
   std::vector<ProjectionHealthDTO> StageOriginalManagerConfigurationAdoption(
       const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
       const core::ApplyFenceAcquireAttemptQueryDTO &attempt) override {
@@ -2655,14 +2442,18 @@ public:
     if (configuration_event) configuration_event("Complete");
     return owner_.CompleteOriginalManagerConfigurationAdoption(request, receipt, fence_);
   }
+  void EndOriginalManagerConfigurationAdoption(
+      const ApplyId &apply_id, const ApplyGeneration apply_generation,
+      const std::optional<ActiveBundlePublicationReceiptDTO> &publication) override {
+    ++end_calls;
+    owner_.EndOriginalManagerConfigurationAdoption(apply_id, apply_generation, publication);
+  }
+  int end_calls{};
   std::function<void(const core::QualifiedSceneConfigurationAdoptionRequestDTO &)> before_configuration_stage;
   std::function<void()> after_configuration_stage;
   std::function<void(const std::string &)> configuration_event;
   int ordinary_begin_calls{}, ordinary_install_calls{}, ordinary_complete_calls{},
       stage_calls{}, stage_read_calls{}, begin_calls{}, complete_calls{};
-  std::function<void(const QualifiedSceneProductAdoptionRequestDTO &)> before_stage, before_begin;
-  std::function<void(QualifiedSceneProductAdoptionRequestDTO &)> alter_begin;
-  std::function<void()> after_begin, after_complete;
 private:
   scene::LogicalSceneOwner &owner_;
   AggregateFencePort &fence_;
@@ -2690,7 +2481,7 @@ ActiveBundlePublicationReceiptDTO EstablishActualScenePredecessor(
     throw std::runtime_error("actual Scene bootstrap did not finalize");
   if (predecessor.retained_bundle_id() == admission.retained_bundle().retained_bundle_id()) return bootstrap;
   const ProjectionMaintenanceInitializationRequestDTO request{
-      ApplyId("establish-actual-predecessor"), ApplyGeneration(1U), accepted.canonical_empty_target,
+      ApplyId(99U), ApplyGeneration(1U), accepted.canonical_empty_target,
       predecessor.value(), bindings};
   static_cast<void>(owner.BeginMaintenanceInitialization(request));
   const auto installed = owner.InstallInitialScene(request);
@@ -2751,9 +2542,7 @@ TEST(ManagerNamedApplyCoordinator,
     const auto initial_predecessor = PredecessorPublication(intent_template);
     SqliteManagerApplyJournal journal(state_root.path() / "named-apply.sqlite3",
                                       package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal independent_reader(
-        state_root.path() / "named-apply.sqlite3",
-        package.bundle->value().cell_graph.cell_id);
+    auto &independent_reader = journal;
     ScriptedPublicationStore publication_store(initial_predecessor, &independent_reader);
     ScriptedCellAdmissionPort cell_admission;
     RuntimeConfigurationSceneFixture actual_scene(
@@ -2779,7 +2568,7 @@ TEST(ManagerNamedApplyCoordinator,
     ASSERT_EQ(actual_runtime_plan.size(), 1U);
     kernel_fence.original_execution_host = ExecutionHostEpochDTO{
         actual_runtime_plan.front().runtime_unit_id,
-        RuntimeEpoch("process-epoch-1"), RequestOwnerEpoch("original-host-owner"),
+        RuntimeEpoch("process-epoch-1"),
         ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     kernel_fence.allow_prepublication_status = true;
     ScriptedRuntimeCompositionPort runtime_composition;
@@ -2796,8 +2585,7 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.publication_generation,
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
-        kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.aggregate.1"), true};
+        kernel_fence.original_execution_host->runtime_epoch, true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               actual_scene.empty.bundle->retained_bundle_id());
@@ -2821,6 +2609,9 @@ TEST(ManagerNamedApplyCoordinator,
     ManagerPlannedMaintenanceCoordinator planned_maintenance(
         active_plan_source, maintenance_gate);
     int authored_scene_reads = 0;
+    // Release calls the Kernel refused; a refused release leaves the
+    // settlement pending and the next heartbeat proves it again (OD-188 P1).
+    int refused_release_calls = 0;
     bool successor_renewal_available = !defer_renewal;
     std::vector<ManagerApplySettlementAttempt> settlement_attempts;
     std::optional<ManagerApplyIntentDTO> settlement_successor;
@@ -2828,11 +2619,10 @@ TEST(ManagerNamedApplyCoordinator,
         journal, active_plan_source, bundle_source,
         *package.artifact_source, publication_store, scene_owner, nullptr,
         kernel_fence, cell_admission, runtime_composition, runtime_ports,
-        runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
-        {"posix.1-2017", std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+        runtime_ports, planned_maintenance, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
         [] { return 1'000U; },
-        [] { return ApplyId("apply.aggregate.1"); },
+        [] { return ApplyId(1U); },
         [&](const auto &, const auto &) {
           ++authored_scene_reads;
           return std::vector<core::AddObjectRequestDTO>{
@@ -2860,7 +2650,7 @@ TEST(ManagerNamedApplyCoordinator,
           EXPECT_TRUE(independent_reader.ReadPublicationReceipt(
               intent.apply_id, intent.apply_generation).has_value());
           EXPECT_EQ(publication_store.publish_calls, 1);
-          EXPECT_EQ(cell_admission.release_calls, 0);
+          EXPECT_EQ(cell_admission.release_calls, refused_release_calls);
           EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
           return successor_renewal_available;
         });
@@ -2894,8 +2684,7 @@ TEST(ManagerNamedApplyCoordinator,
         });
     ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
     EXPECT_FALSE(accepted.request_replayed);
-    ASSERT_TRUE(journal.ReadRequest(request.request_context.request_owner_epoch,
-                                   request.request_context.request_id));
+    ASSERT_TRUE(journal.ReadRequest(request.request_context.request_key));
     const auto pending_replay = coordinator.AcceptOrReplay(request,
         [](const auto &, const auto &, const auto &) {
           ADD_FAILURE() << "pending replay replaced the original capture";
@@ -2946,11 +2735,12 @@ TEST(ManagerNamedApplyCoordinator,
       EXPECT_EQ(runtime_composition.calls, 1);
       EXPECT_EQ(publication_store.publish_calls, 1);
       auto another_request = request;
-      another_request.request_context.request_id = RequestId("request.while-settlement-held");
+      another_request.request_context.request_key =
+          TestRequestKey("request.while-settlement-held");
       EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(another_request)),
                    ManagerNamedApplyBusyError);
       const NamedApplyPublicationTransactionDTO foreign_reference{
-          ApplyId("apply.foreign-heartbeat"), completed->apply_generation};
+          ApplyId(completed->apply_id.value() + 1U), completed->apply_generation};
       EXPECT_FALSE(coordinator.RetryPendingSettlementOnHeartbeat(
           foreign_reference).has_value());
       auto stale_generation = *heartbeat_reference;
@@ -2980,6 +2770,8 @@ TEST(ManagerNamedApplyCoordinator,
       if (fail_journal_read) {
         const auto attempts_before_read_error = settlement_attempts;
         journal.Close();
+        SqliteManagerApplyJournal reopened_reader(state_root.path() / "named-apply.sqlite3",
+                                                  package.bundle->value().cell_graph.cell_id);
         const auto metadata = coordinator.RecoverIncompleteApply();
         ASSERT_TRUE(metadata.has_value());
         EXPECT_EQ(metadata->state, ManagerNamedApplyResultState::kPending);
@@ -2990,39 +2782,61 @@ TEST(ManagerNamedApplyCoordinator,
         EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
         EXPECT_EQ(settlement_attempts, attempts_before_read_error);
         EXPECT_EQ(cell_admission.release_calls, 0);
-        EXPECT_THROW(static_cast<void>(coordinator.RetryPendingSettlementOnHeartbeat(
-                         *heartbeat_reference)), std::runtime_error);
-        EXPECT_FALSE(coordinator.PendingSettlementForHeartbeat().has_value());
+        // OD-188 P1 (ported): a failed retry no longer drops the settlement
+        // and throws into the lane; it stays pending for the next heartbeat.
+        const auto unreadable = coordinator.RetryPendingSettlementOnHeartbeat(
+            *heartbeat_reference);
+        ASSERT_TRUE(unreadable.has_value());
+        EXPECT_TRUE(unreadable->settlement_pending);
+        EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
         EXPECT_EQ(settlement_attempts, attempts_before_read_error);
         EXPECT_EQ(cell_admission.release_calls, 0);
         EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
-        EXPECT_EQ(independent_reader.ReadTerminalOutcome(
+        EXPECT_EQ(reopened_reader.ReadTerminalOutcome(
                       completed->apply_id, completed->apply_generation),
                   durable_success);
-        EXPECT_FALSE(coordinator.RetryPendingSettlementOnHeartbeat(
-            *heartbeat_reference).has_value());
+        EXPECT_TRUE(coordinator.RetryPendingSettlementOnHeartbeat(
+            *heartbeat_reference)->settlement_pending);
         EXPECT_EQ(settlement_attempts, attempts_before_read_error);
         EXPECT_EQ(publication_store.publish_calls, 1);
         EXPECT_EQ(runtime_composition.calls, 1);
         continue;
       }
       if (fail_release) {
+        // OD-188 P1 (ported): a refused release stays the pending
+        // settlement; the next heartbeat retries it and it settles.
         cell_admission.refuse_release = true;
-        EXPECT_THROW(static_cast<void>(coordinator.RetryPendingSettlementOnHeartbeat(
-                         *heartbeat_reference)), std::runtime_error);
-        EXPECT_FALSE(coordinator.PendingSettlementForHeartbeat().has_value());
+        const auto refused = coordinator.RetryPendingSettlementOnHeartbeat(
+            *heartbeat_reference);
+        ASSERT_TRUE(refused.has_value());
+        EXPECT_TRUE(refused->settlement_pending);
+        EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
         EXPECT_EQ(cell_admission.release_calls, 1);
         EXPECT_FALSE(cell_admission.last_release.has_value());
         EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
         EXPECT_EQ(independent_reader.ReadTerminalOutcome(
                       completed->apply_id, completed->apply_generation),
                   durable_success);
-        const auto failed_attempts = settlement_attempts;
+        refused_release_calls = cell_admission.release_calls;
         cell_admission.refuse_release = false;
-        EXPECT_FALSE(coordinator.RetryPendingSettlementOnHeartbeat(
-            *heartbeat_reference).has_value());
-        EXPECT_EQ(settlement_attempts, failed_attempts);
-        EXPECT_EQ(cell_admission.release_calls, 1);
+        const auto settled = coordinator.RetryPendingSettlementOnHeartbeat(
+            *heartbeat_reference);
+        ASSERT_TRUE(settled.has_value());
+        EXPECT_EQ(settled->state, ManagerNamedApplyResultState::kSucceeded);
+        EXPECT_FALSE(settled->settlement_pending);
+        EXPECT_FALSE(coordinator.PendingSettlementForHeartbeat().has_value());
+        EXPECT_EQ(cell_admission.release_calls, 2);
+        EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+        // The lane never parked: a later Apply is no longer refused as busy
+        // by the settlement (it fails later on its own fixture inputs).
+        auto later_request = request;
+        later_request.request_context.request_key = TestRequestKey("request.after-settlement");
+        try {
+          static_cast<void>(coordinator.AcceptOrReplay(later_request));
+        } catch (const ManagerNamedApplyBusyError &) {
+          ADD_FAILURE() << "a settled release still refused the next Apply as busy";
+        } catch (const std::exception &) {
+        }
         EXPECT_EQ(runtime_composition.calls, 1);
         EXPECT_EQ(publication_store.publish_calls, 1);
         continue;
@@ -3081,6 +2895,12 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_TRUE(runtime_composition.last_request->retained_components.empty());
     EXPECT_TRUE(runtime_composition.last_request->removed_components.empty());
     EXPECT_TRUE(runtime_composition.last_request->removed_domains.empty());
+    // The prepared activation's bound Program travels with the host Apply.
+    EXPECT_EQ(runtime_composition.last_request->program,
+              std::optional(HostApplyProgramSelection{
+                  ProgramId("runtime-convergence.program"),
+                  ProgramRevision(std::string(kDigestTwo)),
+                  ProgramBindingId(std::string(kDigestOne))}));
     EXPECT_EQ(runtime_composition.last_runtime_unit,
               std::optional(kernel_fence.original_execution_host->runtime_unit_id));
     EXPECT_TRUE(journal.ReadPrivateMaterialization(
@@ -3128,7 +2948,9 @@ TEST(ManagerNamedApplyCoordinator,
   // 5: the host refuses an enabled replaced or removed component, a
   // known failure with no publication; 6: a host failure the host
   // caught before changing anything installed (`effect: none`).
-  for (const int failing_call : {1, 3, 4, 5, 6}) {
+  // 7: the Apply meets the late host and is refused before anything is sent
+  // (`effect: none`); 8: the Apply's own exchange timed out (outcome unknown).
+  for (const int failing_call : {1, 3, 4, 5, 6, 7, 8}) {
     SCOPED_TRACE(failing_call);
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
@@ -3140,7 +2962,7 @@ TEST(ManagerNamedApplyCoordinator,
     const auto database = state_root.path() / "failed-composition.sqlite3";
     const auto cell_id = package.bundle->value().cell_graph.cell_id;
     SqliteManagerApplyJournal journal(database, cell_id);
-    SqliteManagerApplyJournal independent_reader(database, cell_id);
+    auto &independent_reader = journal;
     ScriptedPublicationStore publication_store(initial_predecessor, &independent_reader);
     core::FakeClock kernel_clock;
     kernel_clock.set(1'000U);
@@ -3149,30 +2971,32 @@ TEST(ManagerNamedApplyCoordinator,
         state_root.path() / "kernel-operation.sqlite3", cell_id);
     const auto kernel_empty = MaterializeRosRuntimePackage(package_root.path(), true);
     core::ResourceAddressedExecutionKernelConfig kernel_config{
-        core::RequestOwnerEpoch("kernel.failed-composition.1"), cell_id, 64U};
+        core::kTestApplicationStartId, cell_id, 64U};
     kernel_config.empty_runtime_retained_bundle_id = kernel_empty.bundle->retained_bundle_id();
     kernel_config.empty_runtime_graph_revision = kernel_empty.bundle->value().cell_graph.graph_revision;
     core::ManagerLivenessRequiredSetDTO liveness{
         cell_id, kernel_empty.bundle->retained_bundle_id(),
         core::ComputeRequiredRuntimeSetDigest({}),
-        core::RuntimeUnitId("manager.failed-composition"),
-        core::RuntimeEpoch("manager-runtime.failed-composition.1"),
-        intent_template.request_context.request_owner_epoch, {}};
+        core::RuntimeUnitId("manager.failed-composition"), {}};
     kernel_config.manager_liveness_required_set = liveness;
     int settlement_calls = 0;
+    // Like the host: a Manager Apply release is proven by the Kernel's own exact
+    // identity and settlement-kind checks; no Manager store is read.
     kernel_config.cell_admission_settlement_validator =
-        [database, cell_id, &settlement_calls](const core::CellAdmissionClaimDTO &claim,
-                                             const core::CellAdmissionClaimReleaseDTO &release) {
+        [&settlement_calls](const core::CellAdmissionClaimDTO &claim,
+                            const core::CellAdmissionClaimReleaseDTO &release) {
           ++settlement_calls;
-          return ValidateManagerApplyCellAdmissionSettlementReadOnly(
-              database, cell_id, claim, release);
+          if (claim.intent.claim_kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
+              release.owner_transaction_id == claim.intent.owner_transaction_id)
+            return core::Result<void>::Ok();
+          return core::Result<void>::Err(
+              core::ErrorDTO{"fixture_settlement_refused", "not this Manager Apply claim", {}});
         };
     auto cell_admission_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {}, kernel_clock, kernel_scheduler, operation_journal, std::move(kernel_config));
     auto& cell_admission = *cell_admission_heap_test_owner;
     const core::ProgramCycleStatusDTO idle{
-        core::RequestOwnerEpoch("program.failed-composition"), 1U,
-        core::ProgramCycleStateDTO::kIdleAfterReset,
+        1U, core::ProgramCycleStateDTO::kIdleAfterReset,
         std::nullopt, std::nullopt, std::nullopt};
     const core::CellAdmissionReadinessSnapshotDTO ready{
         true, idle, true, 0U, 0U, true, true, 0U, 0U, 0U};
@@ -3200,8 +3024,7 @@ TEST(ManagerNamedApplyCoordinator,
     ASSERT_EQ(actual_runtime_plan.size(), 1U);
     kernel_fence.original_execution_host = ExecutionHostEpochDTO{
         actual_runtime_plan.front().runtime_unit_id, RuntimeEpoch("process-epoch-1"),
-        RequestOwnerEpoch("original-host-owner"), ContentDigest(std::string(kDigestOne)),
-        predecessor.publication_generation};
+        ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     kernel_fence.allow_prepublication_status = true;
     ScriptedRuntimeCompositionPort runtime_composition;
     ASSERT_TRUE(deployment::verify_retained_bundle_identity(*actual_scene.empty.bundle));
@@ -3217,8 +3040,7 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.publication_generation,
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
-        kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.failed-composition.1"), true};
+        kernel_fence.original_execution_host->runtime_epoch, true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               actual_scene.empty.bundle->retained_bundle_id());
@@ -3250,6 +3072,14 @@ TEST(ManagerNamedApplyCoordinator,
           core::ErrorDTO{"selected_runtime_composition_request_failed",
                          "Execution host: retained native owner differs from the planned predecessor",
                          {{"effect", "none"}}}};
+    if (failing_call == 7 || failing_call == 8) {
+      core::ErrorDTO late{std::string(kExecutionHostLateCode),
+                          "the execution host did not answer within its bound; the outcome "
+                          "of the request is unknown",
+                          {{"exchange", "host_apply"}, {"bound_ms", "750"}}};
+      if (failing_call == 7) late.details.emplace("effect", "none");
+      runtime_composition.error_result = std::move(late);
+    }
     if (failing_call == 4)
       runtime_composition.failure_error = core::TypedError(
           std::string(kScenarioCompositionRefusedCode),
@@ -3265,7 +3095,8 @@ TEST(ManagerNamedApplyCoordinator,
     runtime_composition.before_failure = [&](const auto &composition_request) {
       failed_request = composition_request;
       original_claim_before_failure = cell_admission.ReadHeldCellAdmissionClaim(
-          core::CellAdmissionClaimKindDTO::kManagerApply);
+          core::CellAdmissionClaimKindDTO::kManagerApply,
+          core::CellAdmissionOwnerTransactionId(composition_request.apply.apply_id));
       const auto parent = journal.ReadStatus(composition_request.apply.apply_id,
                                             composition_request.apply.apply_generation);
       if (!original_claim_before_failure || !parent || !parent->fence_acceptance)
@@ -3279,11 +3110,10 @@ TEST(ManagerNamedApplyCoordinator,
         journal, active_plan_source, *package.bundle_source,
         *package.artifact_source, publication_store, scene_owner, nullptr,
         kernel_fence, cell_admission, runtime_composition, runtime_ports,
-        runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.failed-composition.1"), "linux",
-        {"posix.1-2017", std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+        runtime_ports, planned_maintenance, "linux",
+        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
         [] { return 1'000U; },
-        [] { return ApplyId("apply.failed-composition.1"); },
+        [] { return ApplyId(1U); },
         [](const auto &, const auto &) {
           return std::vector<core::AddObjectRequestDTO>{};
         });
@@ -3313,7 +3143,8 @@ TEST(ManagerNamedApplyCoordinator,
     const auto failed = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(failed.has_value());
     // Only the host's typed refusals prove the candidate was never installed.
-    const bool known = failing_call == 4 || failing_call == 5 || failing_call == 6;
+    const bool known =
+        failing_call == 4 || failing_call == 5 || failing_call == 6 || failing_call == 7;
     ASSERT_EQ(failed->state, known ? ManagerNamedApplyResultState::kFailed
                                    : ManagerNamedApplyResultState::kUnknownEffect);
     ASSERT_TRUE(failed->terminal_outcome.has_value());
@@ -3330,7 +3161,15 @@ TEST(ManagerNamedApplyCoordinator,
                   ? "configuration Apply cannot replace or remove enabled component arm.1"
               : failing_call == 6
                   ? "Execution host: retained native owner differs from the planned predecessor"
+              : failing_call == 7 || failing_call == 8
+                  ? "the execution host did not answer within its bound; the outcome "
+                    "of the request is unknown"
                   : "scripted exact host Apply failure");
+    if (failing_call == 7 || failing_call == 8) {
+      // The late answer is the Manager adapter's own, never the host's.
+      EXPECT_EQ(failure.cause_code, kExecutionHostLateCode);
+      EXPECT_EQ(failure.producer, "component_manager");
+    }
     if (failing_call == 4) {
       EXPECT_EQ(failed->terminal_outcome->state, ManagerApplyTerminalOutcomeState::kFailed);
       EXPECT_EQ(failure.cause_code, kScenarioCompositionRefusedCode);
@@ -3397,13 +3236,13 @@ TEST(ManagerNamedApplyCoordinator,
       continue;
     }
     const auto original_claim = cell_admission.ReadHeldCellAdmissionClaim(
-        core::CellAdmissionClaimKindDTO::kManagerApply);
+        core::CellAdmissionClaimKindDTO::kManagerApply,
+        core::CellAdmissionOwnerTransactionId(failed->apply_id));
     ASSERT_TRUE(original_claim.has_value());
     EXPECT_EQ(original_claim, original_claim_before_failure);
     ASSERT_TRUE(status->fence_attempt);
     const core::ApplyFenceAcquireAttemptQueryDTO actual_attempt{
-        status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest,
-        RuntimeEpoch("manager-runtime.failed-composition.1")};
+        status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest};
     const auto actual_fence = kernel_fence.ReconcileAcquireAttempt(actual_attempt);
     ASSERT_TRUE(actual_fence.matches(actual_attempt));
     EXPECT_EQ(actual_fence.state, core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact);
@@ -3430,12 +3269,12 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(coordinator.FailedApplyAcknowledgementStatus(failed->apply_id, failed->apply_generation),
               FailedApplyAcknowledgementState::kUnavailable);
     EXPECT_THROW(coordinator.AcknowledgeFailedApply(failed->apply_id, failed->apply_generation,
-                                                    core::RequestId("ack.unknown"), "operator"),
+                                                    TestRequestKey("ack.unknown"), "operator"),
                  core::TypedError);
     // New releases the fence and claim the failed
     // Apply still holds, whatever it changed; the failure stays retained.
     const auto released =
-        coordinator.ReleaseFailedApplyForNew(core::RequestId("composer-new.1"), "manyforge_composer");
+        coordinator.ReleaseFailedApplyForNew(TestRequestKey("composer-new.1"), "manyforge_composer");
     ASSERT_TRUE(released.has_value());
     EXPECT_EQ(released->apply_id, failed->apply_id);
     EXPECT_EQ(released->apply_generation, failed->apply_generation);
@@ -3448,7 +3287,7 @@ TEST(ManagerNamedApplyCoordinator,
               FailedApplyAcknowledgementState::kUnavailable);
     // Nothing holds the cell any more: the next New releases nothing.
     EXPECT_FALSE(coordinator
-                     .ReleaseFailedApplyForNew(core::RequestId("composer-new.2"), "manyforge_composer")
+                     .ReleaseFailedApplyForNew(TestRequestKey("composer-new.2"), "manyforge_composer")
                      .has_value());
     EXPECT_EQ(kernel_fence.release_calls, 1);
     journal.Close();
@@ -3488,7 +3327,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
               package.bundle->value().cell_graph.controllable_components.front().controllable_component_id);
     const auto path = state_root.path() / "original-configuration.sqlite3";
     SqliteManagerApplyJournal journal(path, package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal independent_reader(path, journal.cell_id());
+    auto &independent_reader = journal;
     ScriptedPublicationStore publication_store(PredecessorPublication(ApplyIntent(*empty.bundle)), &independent_reader);
     ScriptedCellAdmissionPort cell_admission;
     const auto admission = deployment::detail::publish_cell_scoped_canonical_empty_admission(
@@ -3504,7 +3343,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         actual_scene, publication_store, admission, *previous.bundle, old_bindings);
     auto current = actual_scene.CurrentProjectionRevision();
     SceneTransactionRequestDTO add{
-        {RequestId("actual-add"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression", std::nullopt},
+        {TestRequestKey("actual-add"), "Manager regression"},
         {}, current, AddObjectRequestDTO{SceneResourceId("scene-box"), BoxShapeDTO{{0.1, 0.2, 0.3}},
                                         Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
         cell_admission.GetAuthoringAdmission().admission_generation};
@@ -3513,21 +3352,20 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ASSERT_TRUE(added.committed_projection_revision);
     current = *added.committed_projection_revision;
     SceneTransactionRequestDTO attach{
-        {RequestId("actual-attach"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression", std::nullopt},
+        {TestRequestKey("actual-attach"), "Manager regression"},
         {}, current,
         AttachCarriedObjectRequestDTO{CarriedObjectAttachmentId("attachment.1"), SceneResourceId("scene-box"),
             ControllableComponentId("component.1"), CommandTargetId("arm"), FrameRoleId("tool_frame"),
             {CollisionBodyRoleId("finger")}, {ComponentAttachmentRevision("component-attachment-revision-1")}},
         cell_admission.GetAuthoringAdmission().admission_generation};
     attach.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
-        RequestOwnerEpoch("runner.2"), ProgramRunId("program.2"), CellAdmissionClaimGeneration(9U),
-        "attach", "attach:attempt.1", "scene.carried_attachment"};
+        ProgramRunNumber(2U), CellAdmissionClaimGeneration(9U),
+        "attach", NodeAttemptNumber(1U), "scene.carried_attachment"};
     const auto attached = actual_scene.Commit(attach);
     ASSERT_TRUE(attached.success) << (attached.error ? attached.error->message : "missing error");
     if (streaming) {
       SceneTransactionRequestDTO add_streamed{
-          {RequestId("actual-add-streamed"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression",
-           std::nullopt},
+          {TestRequestKey("actual-add-streamed"), "Manager regression"},
           {}, actual_scene.CurrentProjectionRevision(),
           AddObjectRequestDTO{SceneResourceId("streamed-box"), BoxShapeDTO{{0.1, 0.1, 0.1}},
                               Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
@@ -3547,8 +3385,8 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       pose.position_m.x_m = x_m;
       ++streamed_sequence;
       const SceneTransactionRequestDTO update{
-          {RequestId("streamed-pose-" + std::to_string(streamed_sequence)),
-           actual_scene.CurrentRequestOwnerEpoch(), "pose source", std::nullopt},
+          {TestRequestKey("streamed-pose-" + std::to_string(streamed_sequence)),
+           "pose source"},
           {}, actual_scene.CurrentProjectionRevision(),
           UpdateObjectPoseRequestDTO{
               SceneResourceId("streamed-box"), pose, CellSceneFrameRefDTO{journal.cell_id()},
@@ -3562,7 +3400,6 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
       preserved_bytes = scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot());
     };
-    const auto original_scene_owner = actual_scene.CurrentRequestOwnerEpoch();
     FixedActiveRuntimePlanSource active_plan_source(
         predecessor, BuildVerifiedRuntimeConvergencePlan(
                          *previous.bundle, *previous.artifact_source, "linux",
@@ -3573,7 +3410,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ScriptedRuntimeCompositionPort runtime_composition;
     kernel_fence.original_execution_host = ExecutionHostEpochDTO{
         package.bundle->value().cell_graph.control_bindings.front().provider_runtime_unit_id,
-        RuntimeEpoch("process-epoch-1"), RequestOwnerEpoch("original-host-owner"),
+        RuntimeEpoch("process-epoch-1"),
         ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     kernel_fence.allow_prepublication_status = true;
     ASSERT_TRUE(deployment::verify_retained_bundle_identity(*previous.bundle));
@@ -3592,8 +3429,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         predecessor.publication_generation,
         predecessor.durable_public_pointer_content_digest,
         kernel_fence.original_execution_host->runtime_unit_id,
-        kernel_fence.original_execution_host->runtime_epoch,
-        RuntimeEpoch("manager-runtime.original"), true};
+        kernel_fence.original_execution_host->runtime_epoch, true};
     ASSERT_TRUE(installed_scope.valid());
     ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
               previous.bundle->retained_bundle_id());
@@ -3651,8 +3487,8 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       events.push_back("Stage");
       const auto stored = journal.ReadIntent(input.authority.owner.apply_id, input.authority.owner.apply_generation);
       ASSERT_TRUE(stored);
-      EXPECT_EQ(input.authority.persisted_manager_intent_digest, stored->intent_digest);
-      EXPECT_EQ(input.authority.held_cell_claim.intent.request_payload_digest, stored->intent_digest);
+      EXPECT_EQ(input.authority.held_cell_claim.intent.owner_transaction_id,
+                std::optional(core::CellAdmissionOwnerTransactionId(input.authority.owner.apply_id)));
       EXPECT_EQ(input.authority.held_cell_claim.intent.claim_kind, CellAdmissionClaimKindDTO::kManagerApply);
       EXPECT_TRUE(input.authority.held_cell_claim.intent.scope.resources.empty());
       EXPECT_TRUE(input.authority.held_cell_claim.intent.scope.configurations.empty());
@@ -3694,16 +3530,15 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ManagerNamedApplyCoordinator coordinator(
         journal, active_plan_source, *package.bundle_source, *package.artifact_source,
         publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-        runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.original"), "linux",
+        runtime_composition, runtime_ports, runtime_ports, planned_maintenance, "linux",
         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("apply.original-configuration"); },
+        [] { return 1'000U; }, [] { return ApplyId(1U); },
         [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
     std::optional<CellAdmissionClaimDTO> parent;
     if (eligibility == 2) {
       const CellAdmissionClaimIntentDTO intent{CellAdmissionClaimKindDTO::kAuthoringMutation,
-          CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("composer-owner"),
-          "composer-confirmed-apply", RequestId("composer-confirmed-apply"), ContentDigest(std::string(kDigestOne)),
+          ApplicationRole::kAuthoringOwner,
+          std::nullopt, TestRequestKey("composer-confirmed-apply"),
           cell_admission.GetAuthoringAdmission().admission_generation, {}, std::nullopt, std::nullopt};
       ASSERT_TRUE(ValidateCellAdmissionClaimIntent(intent).ok());
       const auto acquired = cell_admission.AcquireCellAdmissionClaim(intent);
@@ -3843,19 +3678,21 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     const auto snapshot = actual_scene.ReadActiveSnapshot();
     ASSERT_TRUE(snapshot);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*snapshot->shared()), preserved_bytes);
-    EXPECT_EQ(actual_scene.CurrentRequestOwnerEpoch(), original_scene_owner);
     if (!lose_stage_response) {
       // The successful Apply released its fence and settled its claim.
       EXPECT_EQ(kernel_fence.release_calls, 1);
       EXPECT_TRUE(cell_admission.last_release);
+      EXPECT_EQ(cell_admission.last_release_outcome,
+                std::optional(core::ManagerApplyReleaseOutcomeDTO{
+                    accepted.apply_id, accepted.apply_generation, true}));
       return;
     }
     EXPECT_EQ(kernel_fence.release_calls, 0);
     EXPECT_FALSE(cell_admission.last_release);
     const auto held_claim = cell_admission.GetCellAdmissionRecoveryReceipt({
-        {CellAdmissionClaimKindDTO::kManagerApply, CellAdmissionOwnerRoleDTO::kManager,
-         stored->intent.request_context.request_owner_epoch, stored->intent.apply_id.value(),
-         stored->intent.request_context.request_id, stored->intent_digest,
+        {CellAdmissionClaimKindDTO::kManagerApply, ApplicationRole::kManager,
+         core::CellAdmissionOwnerTransactionId(stored->intent.apply_id),
+         stored->intent.request_context.request_key,
          *stored->intent.expected_admission_generation, {}, std::nullopt, std::nullopt},
         std::nullopt, std::nullopt});
     ASSERT_TRUE(held_claim.ok());
@@ -3867,10 +3704,9 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ManagerNamedApplyCoordinator replacement(
         journal, active_plan_source, *package.bundle_source, *package.artifact_source,
         publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-        runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.replacement"), "linux",
+        runtime_composition, runtime_ports, runtime_ports, planned_maintenance, "linux",
         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("must-not-be-minted"); },
+        [] { return 1'000U; }, [] { return ApplyId(999U); },
         [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
     const auto replay = replacement.AcceptOrReplay(request);
     EXPECT_TRUE(replay.request_replayed);
@@ -3929,7 +3765,7 @@ namespace {
   return {publication.request.candidate_projection_revision, publication.publication_generation,
           publication.durable_public_pointer_content_digest,
           bundle.value().cell_graph.control_bindings.front().provider_runtime_unit_id,
-          RuntimeEpoch("none-host.original"), RuntimeEpoch("none-manager.original")};
+          RuntimeEpoch("none-host.original")};
 }
 
 } // namespace
@@ -4052,7 +3888,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     ASSERT_TRUE(continuity.ok()) << continuity.error().message;
     const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
     SqliteManagerApplyJournal journal(state.path() / "none.sqlite3", previous.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal reader(state.path() / "none.sqlite3", journal.cell_id());
+    auto &reader = journal;
     ScriptedPublicationStore publication(predecessor, &reader);
     FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
         *previous.bundle, *previous.artifact_source, "linux",
@@ -4062,7 +3898,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     runtime.report_available = false; // Stop at actual host convergence, before Scene effects.
     AggregateFencePort fence(reader, predecessor);
     fence.original_execution_host = ExecutionHostEpochDTO{inventory.runtime_unit_id, inventory.runtime_epoch,
-        RequestOwnerEpoch("none-host.owner"), ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+        ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     const auto expected_fence_scope = deployment::derive_apply_configuration_fence_scope(
         *previous.bundle, *candidate.bundle);
     ASSERT_TRUE(expected_fence_scope.valid());
@@ -4081,8 +3917,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
           ActiveControlConfigurationId("predecessor." + configured->control_domain_id.value()),
           ActiveControlConfigurationGeneration(1U)});
     }
-    const ConfigurationFenceAdmissionQueryDTO admission_query{
-        expected_fence_scope, inventory.manager_runtime_epoch};
+    const ConfigurationFenceAdmissionQueryDTO admission_query{expected_fence_scope};
     ASSERT_TRUE(admission_query.valid());
     ASSERT_TRUE(fence.ObserveAdmission(admission_query).matches(admission_query));
     MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
@@ -4099,9 +3934,9 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     ManagerPlannedMaintenanceCoordinator maintenance(plan, gate);
     ManagerNamedApplyCoordinator coordinator(journal, plan, *candidate.bundle_source, *candidate.artifact_source,
         publication, scene_owner, nullptr, fence, admission, composition, runtime, runtime, maintenance,
-        inventory.manager_runtime_epoch, "linux",
+        "linux",
         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("apply.none-inventory"); },
+        [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     auto prototype = ApplyIntent(*candidate.bundle);
     const ManagerNamedApplyRequestDTO request{prototype.request_context,
@@ -4123,8 +3958,6 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     EXPECT_EQ(fence.acquire_calls, 1);
     EXPECT_EQ(runtime.start_effect_calls, 0);
     EXPECT_EQ(runtime.stop_calls, 0);
-    EXPECT_EQ(composition.component_stop_calls, 0);
-    EXPECT_EQ(composition.component_stop_read_calls, 0);
     EXPECT_EQ(composition.calls, 0);
     EXPECT_EQ(scene_owner.begin_calls, 0);
     EXPECT_EQ(publication.publish_calls, 0);
@@ -4136,7 +3969,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
 }
 
 TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBeforeFenceAndEffects) {
-  for (const int variant : {0, 1, 2, 3, 4}) {
+  for (const int variant : {0, 2, 3, 4}) {
     SCOPED_TRACE(variant);
     ScopedPackageRoot root;
     ScopedPackageRoot state;
@@ -4146,7 +3979,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, inventory, exact).ok());
     const auto predecessor = PredecessorPublication(ApplyIntent(*package.bundle));
     SqliteManagerApplyJournal journal(state.path() / "foreign-none.sqlite3", package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal reader(state.path() / "foreign-none.sqlite3", journal.cell_id());
+    auto &reader = journal;
     ScriptedPublicationStore publication(predecessor, &reader);
     FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
         *package.bundle, *package.artifact_source, "linux",
@@ -4154,7 +3987,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     ScriptedRuntimePorts runtime(reader);
     AggregateFencePort fence(reader, predecessor);
     fence.original_execution_host = ExecutionHostEpochDTO{inventory.runtime_unit_id, inventory.runtime_epoch,
-        RequestOwnerEpoch("none-host.owner"), ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+        ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
     MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
     ScriptedRuntimeCompositionPort composition;
     composition.installed_processes = [inventory, exact, variant](const auto &request) {
@@ -4162,7 +3995,6 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
       response.include_component_lifecycles = request.include_component_lifecycles;
       auto row = exact;
       if (variant == 0) response.runtime_epoch = RuntimeEpoch("foreign-host");
-      if (variant == 1) response.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
       if (variant == 2) row.pneumatic_none_owner->control_binding_revision = ControlBindingRevision("foreign-binding");
       if (variant == 3) row.installed_runtime_identity = ContentDigest(std::string(kDigestOne));
       if (variant == 4) response.runtime_unit_id = RuntimeUnitId("foreign-source");
@@ -4176,9 +4008,9 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     ManagerPlannedMaintenanceCoordinator maintenance(plan, gate);
     ManagerNamedApplyCoordinator coordinator(journal, plan, *package.bundle_source, *package.artifact_source,
         publication, scene_owner, nullptr, fence, admission, composition, runtime, runtime, maintenance,
-        inventory.manager_runtime_epoch, "linux",
+        "linux",
         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("apply.foreign-none"); },
+        [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     const auto prototype = ApplyIntent(*package.bundle);
     const ManagerNamedApplyRequestDTO request{prototype.request_context,
@@ -4197,8 +4029,6 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     EXPECT_TRUE(admission.GetAuthoringAdmission().authoring_allowed);
     EXPECT_EQ(fence.acquire_calls, 0);
     EXPECT_EQ(runtime.ensure_calls, 0);
-    EXPECT_EQ(composition.component_stop_calls, 0);
-    EXPECT_EQ(composition.component_stop_read_calls, 0);
     EXPECT_EQ(composition.calls, 0);
     EXPECT_EQ(scene_owner.begin_calls, 0);
     EXPECT_EQ(publication.publish_calls, 0);
@@ -4220,6 +4050,751 @@ TEST(ManagerNamedApplyCoordinator, DeadActiveChangedComponentIsReplacedWithoutDi
 
 TEST(ManagerNamedApplyCoordinator, FaultedChangedComponentIsReplacedWithoutDisable) {
   ExerciseOriginalConfigurationScene(false, 5);
+}
+
+// OD-188 P1/P2 and OD-145: an Apply that stays pending after its fence (the
+// host's report never comes), on an injected clock, with a step hook.
+struct PendingAfterFenceFixture final {
+  explicit PendingAfterFenceFixture(const std::filesystem::path &root,
+                                    const std::filesystem::path &state)
+      : previous(MaterializeNoneInventoryPackage(root, "none", "pneumatic", false, false)),
+        candidate(MaterializeNoneInventoryPackage(root, "none", "pneumatic", false, false)),
+        row(NoneInventoryOccurrence(*previous.bundle)),
+        inventory(NoneInventoryRequest(*previous.bundle)),
+        predecessor(PredecessorPublication(ApplyIntent(*previous.bundle))),
+        journal(state / "pending.sqlite3", previous.bundle->value().cell_graph.cell_id),
+        reader(journal),
+        publication(predecessor, &reader),
+        plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
+            *previous.bundle, *previous.artifact_source, "linux",
+            {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)})),
+        runtime(reader), fence(reader, predecessor),
+        scene_owner(predecessor.request.candidate_projection_revision),
+        maintenance(plan, gate),
+        coordinator(journal, plan, *candidate.bundle_source, *candidate.artifact_source,
+            publication, scene_owner, nullptr, fence, admission, composition, runtime, runtime,
+            maintenance, "linux",
+            {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+            [this] { return now; }, [this] { return ApplyId(++next_apply); },
+            [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; }, {},
+            [this](const ManagerApplyIntentDTO &) { if (step_hook) step_hook(); }) {
+    runtime.ReplaceProcess(inventory.runtime_epoch.value());
+    runtime.report_available = false;  // Pending at host convergence, after the fence.
+    fence.original_execution_host = ExecutionHostEpochDTO{inventory.runtime_unit_id, inventory.runtime_epoch,
+        ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+    fence.allow_prepublication_status = true;
+    const auto scope = deployment::derive_apply_configuration_fence_scope(*previous.bundle, *candidate.bundle);
+    for (const auto &domain : scope.domains) {
+      if (!domain.predecessor_control_domain_revision) continue;
+      const auto &desired = previous.bundle->value().desired_control_configurations;
+      const auto configured = std::find_if(desired.begin(), desired.end(), [&](const auto &value) {
+        return value.control_domain_id == domain.control_domain_id &&
+            value.control_domain_revision == *domain.predecessor_control_domain_revision;
+      });
+      if (configured == desired.end()) continue;
+      fence.predecessor_configurations.push_back({configured->control_domain_id,
+          ActiveControlConfigurationId("predecessor." + configured->control_domain_id.value()),
+          ActiveControlConfigurationGeneration(1U)});
+    }
+    composition.installed_processes = [this](const auto &request) {
+      auto expected = inventory;
+      expected.include_component_lifecycles = true;
+      if (request != expected) return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+          {"fixture_foreign_inventory", "wrong original request", {}});
+      return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {row}, std::nullopt,
+          {{row.controllable_component_id, ComponentLifecycleGeneration(1U), ComponentLifecycleStateDTO::kDisabled}}});
+    };
+  }
+
+  [[nodiscard]] ManagerNamedApplyRequestDTO Request(const std::string &key) {
+    const auto prototype = ApplyIntent(*candidate.bundle);
+    auto context = prototype.request_context;
+    context.request_key = TestRequestKey(key);
+    return {context, candidate.bundle->value().deployment_artifact_id,
+        candidate.bundle->value().deployment_revision, previous.bundle->retained_bundle_id(),
+        previous.bundle->value().cell_graph.graph_revision, candidate.bundle->retained_bundle_id(),
+        prototype.prepared_activation, admission.GetAuthoringAdmission().admission_generation,
+        std::nullopt};
+  }
+
+  RuntimePackage previous;
+  RuntimePackage candidate;
+  ManagerComponentProcessOccurrenceDTO row;
+  ManagerComponentProcessInventoryRequestDTO inventory;
+  ActiveBundlePublicationReceiptDTO predecessor;
+  SqliteManagerApplyJournal journal;
+  SqliteManagerApplyJournal &reader;
+  ScriptedPublicationStore publication;
+  FixedActiveRuntimePlanSource plan;
+  ScriptedRuntimePorts runtime;
+  AggregateFencePort fence;
+  MaintenanceSceneOwner scene_owner;
+  ScriptedRuntimeCompositionPort composition;
+  ScriptedCellAdmissionPort admission;
+  AlwaysIdleMaintenanceGate gate;
+  ManagerPlannedMaintenanceCoordinator maintenance;
+  std::uint64_t now{1'000U};
+  std::uint64_t next_apply{0U};
+  std::function<void()> step_hook;
+  ManagerNamedApplyCoordinator coordinator;
+};
+
+void ExpectNewReleasesAndALaterApplyIsAccepted(PendingAfterFenceFixture &fixture,
+                                               const ManagerNamedApplyResult &failed) {
+  const auto released = fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.after-failure"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(*released, (NamedApplyPublicationTransactionDTO{failed.apply_id, failed.apply_generation}));
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  const auto later = fixture.coordinator.AcceptOrReplay(fixture.Request("request.later"));
+  EXPECT_EQ(later.state, ManagerNamedApplyResultState::kPending);
+  EXPECT_FALSE(later.request_replayed);
+  EXPECT_NE(later.apply_id, failed.apply_id);
+}
+
+TEST(ManagerNamedApplyCoordinator, PendingApplyTimesOutAtItsBoundAndNewClearsIt) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  const auto bound = static_cast<std::uint64_t>(
+      ManagerApplyBound(*fixture.previous.bundle, *fixture.candidate.bundle).count());
+  // The Composer's formula: each component's budget plus the stop grace.
+  EXPECT_GE(bound, static_cast<std::uint64_t>(
+      (std::chrono::nanoseconds(deployment::kDefaultLifecycleBudgetNs) +
+       core::kControllerLaunchStopGrace).count()));
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.timeout"));
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  ASSERT_EQ(fixture.coordinator.RecoverIncompleteApply()->state, ManagerNamedApplyResultState::kPending);
+  ASSERT_TRUE(fixture.journal.ReadFenceAcceptance(accepted.apply_id, accepted.apply_generation));
+
+  // Just before the deadline a pending pass is unaffected.
+  fixture.now = 1'000U + bound - 1U;
+  const auto before = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(before.has_value());
+  EXPECT_EQ(before->state, ManagerNamedApplyResultState::kPending);
+  EXPECT_FALSE(fixture.journal.ReadTerminalOutcome(accepted.apply_id, accepted.apply_generation));
+
+  fixture.now = 1'000U + bound;
+  const auto timed_out = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(timed_out && timed_out->terminal_outcome && timed_out->terminal_outcome->failure);
+  EXPECT_EQ(timed_out->state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(timed_out->terminal_outcome->failure->failure_code, "apply_timed_out");
+  EXPECT_EQ(timed_out->terminal_outcome->failure->cause_code, "apply_timed_out");
+  EXPECT_EQ(timed_out->terminal_outcome->failure->effect_disposition,
+            ManagerApplyEffectDisposition::kUnknown);
+  EXPECT_FALSE(fixture.coordinator.RecoverIncompleteApply().has_value());
+  ExpectNewReleasesAndALaterApplyIsAccepted(fixture, *timed_out);
+}
+
+TEST(ManagerNamedApplyCoordinator, ThrowingStepEndsTheApplyTypedAndNewClearsIt) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.throwing"));
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  ASSERT_EQ(fixture.coordinator.RecoverIncompleteApply()->state, ManagerNamedApplyResultState::kPending);
+  fixture.step_hook = [] { throw std::runtime_error("scripted unexpected step failure"); };
+  // No exception reaches the lane: the Apply ends typed (OD-188 P1).
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  fixture.step_hook = {};
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "apply_progression_failed");
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_message, "scripted unexpected step failure");
+  EXPECT_FALSE(fixture.coordinator.RecoverIncompleteApply().has_value());
+  ExpectNewReleasesAndALaterApplyIsAccepted(fixture, *failed);
+}
+
+TEST(ManagerNamedApplyCoordinator, NewAndAcknowledgeDuringAStepAreBusyAtOnceWithNoEffect) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.held-step"));
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  fixture.step_hook = [&] { entered.set_value(); release_future.wait(); };
+  auto step = std::async(std::launch::async, [&] { return fixture.coordinator.RecoverIncompleteApply(); });
+  if (entered.get_future().wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+    release.set_value();
+    step.wait();
+    FAIL() << "the Apply step did not start";
+  }
+  const auto expect_busy = [](const std::function<void()> &command) {
+    auto answered = std::async(std::launch::async, [command]() -> std::optional<ErrorDTO> {
+      try {
+        command();
+      } catch (const core::TypedError &error) {
+        return error.error();
+      }
+      return std::nullopt;
+    });
+    // It must not wait for the step: the step is still held open here.
+    ASSERT_EQ(answered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    const auto error = answered.get();
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->code, "apply_busy");
+    EXPECT_EQ(error->details.at("effect"), "none");
+  };
+  expect_busy([&] {
+    static_cast<void>(fixture.coordinator.ReleaseFailedApplyForNew(
+        TestRequestKey("composer-new.during-step"), "manyforge_composer"));
+  });
+  expect_busy([&] {
+    fixture.coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
+        TestRequestKey("acknowledge.during-step"), "manyforge_composer");
+  });
+  fixture.step_hook = {};
+  release.set_value();
+  ASSERT_TRUE(step.get().has_value());
+  // No step in progress: as before, New's release finds no failed Apply.
+  EXPECT_FALSE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.after-step"), "manyforge_composer").has_value());
+}
+
+TEST(ManagerNamedApplyCoordinator, BeforeEffectReleaseThatFailsIsRetriedOnTheHeartbeat) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  // The installed inventory names a foreign host: a known before-effect
+  // failure, whose claim release is refused once (OD-188 P1).
+  fixture.composition.installed_processes = [&](const auto &request) {
+    auto response = fixture.inventory;
+    response.include_component_lifecycles = request.include_component_lifecycles;
+    response.runtime_epoch = RuntimeEpoch("foreign-host");
+    return Result<ManagerComponentProcessInventoryResultDTO>::Ok({response, {fixture.row}, std::nullopt});
+  };
+  fixture.admission.refuse_release = true;
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.refused-release"));
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kFailed);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "apply_fence_evidence_failed");
+  EXPECT_EQ(fixture.admission.release_calls, 1);
+  const auto pending = fixture.coordinator.PendingSettlementForHeartbeat();
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(*pending, (NamedApplyPublicationTransactionDTO{accepted.apply_id, accepted.apply_generation}));
+  // A new Apply waits for the release (typed busy, nothing recorded).
+  EXPECT_THROW(static_cast<void>(fixture.coordinator.AcceptOrReplay(fixture.Request("request.next"))),
+               ManagerNamedApplyBusyError);
+  // Still refused: still pending, nothing thrown into the lane.
+  const auto again = fixture.coordinator.RetryPendingSettlementOnHeartbeat(*pending);
+  ASSERT_TRUE(again.has_value());
+  EXPECT_TRUE(again->settlement_pending);
+  EXPECT_EQ(fixture.admission.release_calls, 2);
+  fixture.admission.refuse_release = false;
+  const auto settled = fixture.coordinator.RetryPendingSettlementOnHeartbeat(*pending);
+  ASSERT_TRUE(settled.has_value());
+  EXPECT_EQ(settled->state, ManagerNamedApplyResultState::kFailed);
+  EXPECT_FALSE(settled->settlement_pending);
+  EXPECT_EQ(fixture.admission.release_calls, 3);
+  EXPECT_FALSE(fixture.coordinator.PendingSettlementForHeartbeat().has_value());
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(fixture.coordinator.AcceptOrReplay(fixture.Request("request.next")).state,
+            ManagerNamedApplyResultState::kPending);
+}
+
+TEST(ManagerNamedApplyCoordinator, ThrowBeforeTheFenceIsAKnownFailureThatReleasesItsClaim) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.preflight-throws"));
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  fixture.gate.on_read = [] { throw std::runtime_error("scripted preflight failure"); };
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  fixture.gate.on_read = {};
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  // Nothing outside the Manager's records changed before the fence attempt.
+  EXPECT_FALSE(fixture.journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation));
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kFailed);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "apply_progression_failed");
+  EXPECT_EQ(failed->terminal_outcome->failure->effect_disposition, ManagerApplyEffectDisposition::kKnown);
+  EXPECT_EQ(failed->terminal_outcome->failure->effect_boundary, ManagerApplyEffectBoundary::kBeforeEffect);
+  // The Manager released the claim itself; New needs no release.
+  EXPECT_EQ(fixture.admission.release_calls, 1);
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_FALSE(fixture.coordinator.PendingSettlementForHeartbeat().has_value());
+  EXPECT_FALSE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.after-preflight"), "manyforge_composer").has_value());
+  EXPECT_EQ(fixture.coordinator.AcceptOrReplay(fixture.Request("request.new")).state,
+            ManagerNamedApplyResultState::kPending);
+  EXPECT_EQ(fixture.fence.acquire_calls, 0);
+}
+
+TEST(ManagerNamedApplyCoordinator, LateHostRefusalAtAcceptanceIsAKnownBeforeEffectFailure) {
+  for (const bool refused_before_sending : {true, false}) {
+    SCOPED_TRACE(refused_before_sending);
+    ScopedPackageRoot root;
+    ScopedPackageRoot state;
+    PendingAfterFenceFixture fixture(root.path(), state.path());
+    ErrorDTO late{std::string(core::error_codes::kExecutionHostLate),
+                  "the execution host did not answer within its bound", {{"exchange", "kernel"}}};
+    // A call meeting the late host is refused before sending; only the
+    // exchange that timed out itself has an unknown outcome.
+    if (refused_before_sending) late.details.emplace("effect", "none");
+    fixture.admission.refuse_lookup = late;
+    const auto ended = fixture.coordinator.AcceptOrReplay(fixture.Request("request.late-host"));
+    ASSERT_TRUE(ended.terminal_outcome && ended.terminal_outcome->failure);
+    EXPECT_EQ(ended.terminal_outcome->failure->failure_code, "apply_admission_failed");
+    EXPECT_EQ(ended.terminal_outcome->failure->cause_code, "execution_host_late");
+    EXPECT_EQ(fixture.admission.acquire_calls, 0);
+    EXPECT_EQ(fixture.admission.release_calls, 0);
+    if (refused_before_sending) {
+      EXPECT_EQ(ended.state, ManagerNamedApplyResultState::kFailed);
+      EXPECT_EQ(ended.terminal_outcome->failure->effect_boundary,
+                ManagerApplyEffectBoundary::kBeforeEffect);
+      // No claim held: the next Apply is admitted once the host answers.
+      fixture.admission.refuse_lookup.reset();
+      EXPECT_EQ(fixture.coordinator.AcceptOrReplay(fixture.Request("request.after-late")).state,
+                ManagerNamedApplyResultState::kPending);
+    } else {
+      EXPECT_EQ(ended.state, ManagerNamedApplyResultState::kUnknownEffect);
+    }
+  }
+}
+
+// New's release, one test per class of ended Apply: it asks the Kernel what
+// each one still holds and releases exactly that, never acquiring a fence.
+
+std::optional<ErrorDTO> TypedFailure(const std::function<void()> &command) {
+  try {
+    command();
+  } catch (const core::TypedError &error) {
+    return error.error();
+  }
+  return std::nullopt;
+}
+
+// Ends one Apply after its fence was accepted: unknown effect (class 4).
+ManagerNamedApplyResult EndAfterTheFence(PendingAfterFenceFixture &fixture, const std::string &key) {
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request(key));
+  EXPECT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  EXPECT_EQ(fixture.coordinator.RecoverIncompleteApply()->state, ManagerNamedApplyResultState::kPending);
+  fixture.step_hook = [] { throw std::runtime_error("scripted unexpected step failure"); };
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  fixture.step_hook = {};
+  EXPECT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kUnknownEffect);
+  return *failed;
+}
+
+void ExpectAcknowledgementStillRefused(PendingAfterFenceFixture &fixture,
+                                       const ManagerNamedApplyResult &failed) {
+  const auto refused = TypedFailure([&] {
+    fixture.coordinator.AcknowledgeFailedApply(failed.apply_id, failed.apply_generation,
+        TestRequestKey("acknowledge.unknown-effect"), "manyforge_composer");
+  });
+  ASSERT_TRUE(refused.has_value());
+  EXPECT_EQ(refused->code, "manager_command_rejected");
+  EXPECT_EQ(refused->message, "failed Apply is not eligible for before-effect acknowledgement");
+  EXPECT_EQ(refused->details.at("effect"), "none");
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesTheDeferredClaimOfAKnownFailureAndClearsItsSettlement) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  fixture.composition.installed_processes = [&](const auto &request) {
+    auto response = fixture.inventory;
+    response.include_component_lifecycles = request.include_component_lifecycles;
+    response.runtime_epoch = RuntimeEpoch("foreign-host");
+    return Result<ManagerComponentProcessInventoryResultDTO>::Ok({response, {fixture.row}, std::nullopt});
+  };
+  fixture.admission.refuse_release = true;
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.deferred"));
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed && failed->state == ManagerNamedApplyResultState::kFailed);
+  ASSERT_EQ(fixture.coordinator.PendingSettlementForHeartbeat(),
+            (NamedApplyPublicationTransactionDTO{accepted.apply_id, accepted.apply_generation}));
+  fixture.admission.refuse_release = false;
+  std::vector<std::string> requests;
+  fixture.fence.requests = &requests;
+  fixture.admission.requests = &requests;
+  const auto released = fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.deferred"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(released->apply_id, accepted.apply_id);
+  // No fence attempt: the claim only.
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "claim.receipt", "claim.release"}));
+  EXPECT_FALSE(fixture.coordinator.PendingSettlementForHeartbeat().has_value());
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  const auto row = fixture.journal.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
+  ASSERT_TRUE(row && row->acknowledged);
+  EXPECT_FALSE(row->request.has_value());
+  EXPECT_FALSE(row->fence_acceptance_digest.has_value());
+  // The settlement no longer answers every later Apply with busy.
+  EXPECT_EQ(fixture.coordinator.AcceptOrReplay(fixture.Request("request.after-new")).state,
+            ManagerNamedApplyResultState::kPending);
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesTheAcceptedFenceAndClaimOfAnUnknownEffect) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  const auto failed = EndAfterTheFence(fixture, "request.unknown-effect");
+  ExpectAcknowledgementStillRefused(fixture, failed);
+  std::vector<std::string> requests;
+  fixture.fence.requests = &requests;
+  fixture.admission.requests = &requests;
+  const auto released = fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.unknown-effect"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "fence.reconcile", "fence.status",
+                                                "fence.release", "claim.receipt", "claim.release"}));
+  EXPECT_EQ(fixture.fence.acquire_calls, 1);
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  // Released: the next New asks nothing.
+  requests.clear();
+  EXPECT_FALSE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.again"), "manyforge_composer").has_value());
+  EXPECT_TRUE(requests.empty());
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesTheClaimWhenTheFenceAttemptWasNeverCommitted) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  fixture.fence.refuse_acquire = true;
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.not-committed"));
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "apply_fence_effect_unknown");
+  ASSERT_TRUE(fixture.journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation));
+  ASSERT_FALSE(fixture.journal.ReadFenceAcceptance(accepted.apply_id, accepted.apply_generation));
+  ExpectAcknowledgementStillRefused(fixture, *failed);
+  std::vector<std::string> requests;
+  fixture.fence.requests = &requests;
+  fixture.admission.requests = &requests;
+  ASSERT_TRUE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.not-committed"), "manyforge_composer").has_value());
+  // Not seen: no fence; the claim is released.
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "fence.reconcile", "claim.receipt",
+                                                "claim.release"}));
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  const auto row = fixture.journal.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
+  ASSERT_TRUE(row && row->acknowledged);
+  EXPECT_FALSE(row->request.has_value());
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesAFenceWhoseAcceptanceWasNeverRecorded) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  // The Kernel holds the fence; its reply was lost (as when the acceptance
+  // could not be recorded): the journal has the attempt only.
+  fixture.fence.lose_acquire_reply = true;
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.lost-acceptance"));
+  const auto failed = fixture.coordinator.RecoverIncompleteApply();
+  fixture.fence.lose_acquire_reply = false;
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "apply_fence_effect_unknown");
+  ASSERT_FALSE(fixture.journal.ReadFenceAcceptance(accepted.apply_id, accepted.apply_generation));
+  ExpectAcknowledgementStillRefused(fixture, *failed);
+  std::vector<std::string> requests;
+  fixture.fence.requests = &requests;
+  fixture.admission.requests = &requests;
+  ASSERT_TRUE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.lost-acceptance"), "manyforge_composer").has_value());
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "fence.reconcile", "fence.status",
+                                                "fence.release", "claim.receipt", "claim.release"}));
+  EXPECT_EQ(fixture.fence.acquire_calls, 1);
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  const auto row = fixture.journal.ReadFailedApplyRelease(accepted.apply_id, accepted.apply_generation);
+  ASSERT_TRUE(row && row->acknowledged && row->request && row->released);
+  EXPECT_FALSE(row->fence_acceptance_digest.has_value());
+  static_cast<void>(fixture.reader.VerifyIntegrity());
+}
+
+TEST(ManagerNamedApplyCoordinator, NewAsksTheKernelAgainAfterAnUncertainRelease) {
+  // 0: the fence was released, its reply lost; 1: the fence is still held;
+  // 2: the fence was released, the claim release refused.
+  for (const int scenario : {0, 1, 2}) {
+    SCOPED_TRACE(scenario);
+    ScopedPackageRoot root;
+    ScopedPackageRoot state;
+    PendingAfterFenceFixture fixture(root.path(), state.path());
+    const auto failed = EndAfterTheFence(fixture, "request.uncertain");
+    fixture.fence.lose_release_reply = scenario == 0;
+    fixture.fence.refuse_release = scenario == 1;
+    fixture.admission.refuse_release = scenario == 2;
+    const auto uncertain = TypedFailure([&] {
+      static_cast<void>(fixture.coordinator.ReleaseFailedApplyForNew(
+          TestRequestKey("composer-new.first"), "manyforge_composer"));
+    });
+    ASSERT_TRUE(uncertain.has_value());
+    EXPECT_EQ(uncertain->code, "apply_acknowledgement_outcome_unknown");
+    EXPECT_EQ(uncertain->details.at("stage"), scenario == 2 ? "claim_release" : "fence_release");
+    const auto incomplete = fixture.journal.ReadFailedApplyRelease(failed.apply_id, failed.apply_generation);
+    ASSERT_TRUE(incomplete);
+    EXPECT_FALSE(incomplete->acknowledged);
+    EXPECT_EQ(incomplete->released.has_value(), scenario == 2);
+    EXPECT_FALSE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+    ExpectAcknowledgementStillRefused(fixture, failed);
+
+    fixture.fence.lose_release_reply = false;
+    fixture.fence.refuse_release = false;
+    fixture.admission.refuse_release = false;
+    std::vector<std::string> requests;
+    fixture.fence.requests = &requests;
+    fixture.admission.requests = &requests;
+    const auto released = fixture.coordinator.ReleaseFailedApplyForNew(
+        TestRequestKey("composer-new.second"), "manyforge_composer");
+    ASSERT_TRUE(released.has_value());
+    const std::vector<std::vector<std::string>> expected{
+        {"claim.receipt", "fence.reconcile", "claim.receipt", "claim.release"},
+        {"claim.receipt", "fence.reconcile", "fence.status", "fence.release", "claim.receipt",
+         "claim.release"},
+        {"claim.receipt", "claim.receipt", "claim.release"}};
+    EXPECT_EQ(requests, expected[scenario]);
+    EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+    const auto row = fixture.journal.ReadFailedApplyRelease(failed.apply_id, failed.apply_generation);
+    ASSERT_TRUE(row && row->acknowledged);
+    // The record names the attempt that settled it.
+    EXPECT_EQ(row->acknowledgement_request_key,
+              TestRequestKey(scenario == 2 ? "composer-new.first" : "composer-new.second"));
+    EXPECT_EQ(row->request.has_value(), scenario != 0);
+    static_cast<void>(fixture.reader.VerifyIntegrity());
+  }
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesTheClaimOfAnUncertainAdmissionFailure) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  // The Kernel recorded the claim and its reply was lost.
+  fixture.admission.lose_acquire_reply_after_record = true;
+  const auto ended = fixture.coordinator.AcceptOrReplay(fixture.Request("request.lost-claim"));
+  fixture.admission.lose_acquire_reply_after_record = false;
+  ASSERT_TRUE(ended.terminal_outcome && ended.terminal_outcome->failure);
+  EXPECT_EQ(ended.state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(ended.terminal_outcome->failure->failure_code, "apply_admission_failed");
+  ASSERT_FALSE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  std::vector<std::string> requests;
+  fixture.fence.requests = &requests;
+  fixture.admission.requests = &requests;
+  ASSERT_TRUE(fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.lost-claim"), "manyforge_composer").has_value());
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "claim.receipt", "claim.release"}));
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(fixture.fence.acquire_calls, 0);
+}
+
+TEST(ManagerNamedApplyCoordinator, OneNewReleasesEveryEndedApplyThatStillHoldsTheCell) {
+  ScopedPackageRoot root;
+  ScopedPackageRoot state;
+  PendingAfterFenceFixture fixture(root.path(), state.path());
+  fixture.admission.concurrent_claims = true;
+  fixture.admission.lose_acquire_reply_after_record = true;
+  const auto claim_only = fixture.coordinator.AcceptOrReplay(fixture.Request("request.claim-only"));
+  fixture.admission.lose_acquire_reply_after_record = false;
+  ASSERT_EQ(claim_only.state, ManagerNamedApplyResultState::kUnknownEffect);
+  const auto fenced = EndAfterTheFence(fixture, "request.fenced");
+  ASSERT_NE(fenced.apply_id, claim_only.apply_id);
+  ASSERT_FALSE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  const auto released = fixture.coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.both"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(fixture.admission.release_calls, 2);
+  EXPECT_EQ(fixture.fence.release_calls, 1);
+  EXPECT_EQ(fixture.fence.acquire_calls, 1);
+  EXPECT_TRUE(fixture.admission.GetAuthoringAdmission().authoring_allowed);
+  for (const auto &apply : {claim_only.apply_id, fenced.apply_id}) {
+    const auto row = fixture.journal.ReadFailedApplyRelease(apply, ApplyGeneration(1U));
+    ASSERT_TRUE(row);
+    EXPECT_TRUE(row->acknowledged);
+  }
+  EXPECT_EQ(fixture.coordinator.AcceptOrReplay(fixture.Request("request.after-both")).state,
+            ManagerNamedApplyResultState::kPending);
+}
+
+TEST(ManagerNamedApplyCoordinator, NewReleasesAFailureAfterThePublicationReceipt) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRosRuntimePackage(
+      package_root.path(), true, deployment::test::kLite6ArmTargetId, {},
+      "runtime-only-configuration-candidate");
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto database = state_root.path() / "published-failure.sqlite3";
+  SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id);
+  auto &independent_reader = journal;
+  ScriptedPublicationStore publication_store(PredecessorPublication(intent_template), &independent_reader);
+  ScriptedCellAdmissionPort cell_admission;
+  RuntimeConfigurationSceneFixture actual_scene(
+      package_root.path(), state_root.path(), package, publication_store, cell_admission);
+  const auto &predecessor = actual_scene.predecessor;
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+          *actual_scene.empty.bundle, *actual_scene.empty.artifact_source, "linux",
+          {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  OriginalSceneAdapter scene_owner(actual_scene.owner, kernel_fence);
+  const auto runtime_plan = BuildVerifiedRuntimeConvergencePlan(
+      *package.bundle, *package.artifact_source, "linux",
+      {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)});
+  ASSERT_EQ(runtime_plan.size(), 1U);
+  kernel_fence.original_execution_host = ExecutionHostEpochDTO{
+      runtime_plan.front().runtime_unit_id, RuntimeEpoch("process-epoch-1"),
+      ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+  kernel_fence.allow_prepublication_status = true;
+  ScriptedRuntimeCompositionPort runtime_composition;
+  const ManagerComponentProcessInventoryRequestDTO installed_scope{
+      predecessor.request.candidate_projection_revision, predecessor.publication_generation,
+      predecessor.durable_public_pointer_content_digest,
+      kernel_fence.original_execution_host->runtime_unit_id,
+      kernel_fence.original_execution_host->runtime_epoch, true};
+  runtime_composition.installed_processes = [installed_scope](const auto &request) {
+    if (request != installed_scope)
+      return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+          {"fixture_installed_inventory_foreign", "foreign installed inventory request", {}});
+    return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {}, std::nullopt});
+  };
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source, maintenance_gate);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *package.bundle_source, *package.artifact_source,
+      publication_store, scene_owner, nullptr, kernel_fence, cell_admission, runtime_composition,
+      runtime_ports, runtime_ports, planned_maintenance, "linux",
+      {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+      [] { return 1'000U; }, [] { return ApplyId(1U); },
+      [](const auto &, const auto &) { return std::vector<core::AddObjectRequestDTO>{}; });
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context, package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation,
+      std::nullopt};
+  // The candidate is published; Scene Complete then fails.
+  scene_owner.configuration_event = [](const std::string &event) {
+    if (event == "Complete") throw std::runtime_error("scripted Scene Complete failure");
+  };
+  ASSERT_EQ(coordinator.AcceptOrReplay(request).state, ManagerNamedApplyResultState::kPending);
+  const auto failed = coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "configuration_settlement_failed");
+  ASSERT_TRUE(journal.ReadPublicationReceipt(failed->apply_id, failed->apply_generation));
+  // OD-202: the failed Apply ended its Scene adoption with its publication;
+  // the Scene reads work at once and name the published candidate.
+  EXPECT_EQ(scene_owner.end_calls, 1);
+  const auto ended = actual_scene.owner.ReadMaintenanceInitialization(
+      {failed->apply_id, failed->apply_generation});
+  ASSERT_TRUE(ended);
+  EXPECT_EQ(ended->state, ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_TRUE(actual_scene.owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_TRUE(SameProjectionIdentity(
+      actual_scene.owner.CurrentProjectionRevision(),
+      journal.ReadPublicationReceipt(failed->apply_id, failed->apply_generation)
+          ->publication.publication_receipt.request.candidate_projection_revision));
+  EXPECT_NE(actual_scene.owner.LogicalSnapshot(), nullptr);
+  ASSERT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  std::vector<std::string> requests;
+  kernel_fence.requests = &requests;
+  cell_admission.requests = &requests;
+  const auto released = coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.published"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(requests, (std::vector<std::string>{"claim.receipt", "fence.reconcile", "fence.status",
+                                                "fence.release", "claim.receipt", "claim.release"}));
+  EXPECT_EQ(kernel_fence.acquire_calls, 1);
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  const auto row = journal.ReadFailedApplyRelease(failed->apply_id, failed->apply_generation);
+  ASSERT_TRUE(row && row->acknowledged && row->request);
+  // The release evidence names the published candidate.
+  EXPECT_EQ(row->request->reconciliation_evidence.active_projection_revision.retained_bundle_id,
+            package.bundle->retained_bundle_id());
+  static_cast<void>(independent_reader.VerifyIntegrity());
+}
+
+// OD-202, state B: the Scene completion commits, then its own last check of
+// the held parent meets a late host. The failed Apply ends its adoption, so
+// the Scene keeps no capture and New's release runs.
+TEST(ManagerNamedApplyCoordinator, FailureAfterTheSceneCompletionCommitEndsItsAdoption) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRosRuntimePackage(
+      package_root.path(), true, deployment::test::kLite6ArmTargetId, {},
+      "runtime-only-configuration-candidate");
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto database = state_root.path() / "completed-failure.sqlite3";
+  SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id);
+  auto &independent_reader = journal;
+  ScriptedPublicationStore publication_store(PredecessorPublication(intent_template), &independent_reader);
+  ScriptedCellAdmissionPort cell_admission;
+  RuntimeConfigurationSceneFixture actual_scene(
+      package_root.path(), state_root.path(), package, publication_store, cell_admission);
+  const auto &predecessor = actual_scene.predecessor;
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+          *actual_scene.empty.bundle, *actual_scene.empty.artifact_source, "linux",
+          {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  OriginalSceneAdapter scene_owner(actual_scene.owner, kernel_fence);
+  const auto runtime_plan = BuildVerifiedRuntimeConvergencePlan(
+      *package.bundle, *package.artifact_source, "linux",
+      {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)});
+  ASSERT_EQ(runtime_plan.size(), 1U);
+  kernel_fence.original_execution_host = ExecutionHostEpochDTO{
+      runtime_plan.front().runtime_unit_id, RuntimeEpoch("process-epoch-1"),
+      ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
+  kernel_fence.allow_prepublication_status = true;
+  ScriptedRuntimeCompositionPort runtime_composition;
+  const ManagerComponentProcessInventoryRequestDTO installed_scope{
+      predecessor.request.candidate_projection_revision, predecessor.publication_generation,
+      predecessor.durable_public_pointer_content_digest,
+      kernel_fence.original_execution_host->runtime_unit_id,
+      kernel_fence.original_execution_host->runtime_epoch, true};
+  runtime_composition.installed_processes = [installed_scope](const auto &request) {
+    if (request != installed_scope)
+      return Result<ManagerComponentProcessInventoryResultDTO>::Err(
+          {"fixture_installed_inventory_foreign", "foreign installed inventory request", {}});
+    return Result<ManagerComponentProcessInventoryResultDTO>::Ok({request, {}, std::nullopt});
+  };
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source, maintenance_gate);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *package.bundle_source, *package.artifact_source,
+      publication_store, scene_owner, nullptr, kernel_fence, cell_admission, runtime_composition,
+      runtime_ports, runtime_ports, planned_maintenance, "linux",
+      {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
+      [] { return 1'000U; }, [] { return ApplyId(1U); },
+      [](const auto &, const auto &) { return std::vector<core::AddObjectRequestDTO>{}; });
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context, package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation,
+      std::nullopt};
+  // Inside Scene Complete the held parent is checked twice before the commit
+  // and once after it; the third check meets the late host.
+  scene_owner.configuration_event = [&](const std::string &event) {
+    if (event == "Complete") kernel_fence.throw_status_after_calls = 2;
+  };
+  ASSERT_EQ(coordinator.AcceptOrReplay(request).state, ManagerNamedApplyResultState::kPending);
+  const auto failed = coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed && failed->terminal_outcome && failed->terminal_outcome->failure);
+  EXPECT_EQ(failed->state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code, "configuration_settlement_failed");
+  const auto receipt = journal.ReadPublicationReceipt(failed->apply_id, failed->apply_generation);
+  ASSERT_TRUE(receipt);
+  EXPECT_EQ(scene_owner.complete_calls, 1);
+  EXPECT_EQ(scene_owner.end_calls, 1);
+  const auto ended = actual_scene.owner.ReadMaintenanceInitialization(
+      {failed->apply_id, failed->apply_generation});
+  ASSERT_TRUE(ended);
+  EXPECT_EQ(ended->state, ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_TRUE(actual_scene.owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_TRUE(SameProjectionIdentity(
+      actual_scene.owner.CurrentProjectionRevision(),
+      receipt->publication.publication_receipt.request.candidate_projection_revision));
+  EXPECT_NE(actual_scene.owner.LogicalSnapshot(), nullptr);
+  const auto released = coordinator.ReleaseFailedApplyForNew(
+      TestRequestKey("composer-new.completed"), "manyforge_composer");
+  ASSERT_TRUE(released.has_value());
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
 }
 
 } // namespace manyforge::component_manager

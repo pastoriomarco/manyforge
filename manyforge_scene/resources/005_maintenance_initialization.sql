@@ -2,9 +2,7 @@
 --
 -- This is the single operation-level record for fresh projection
 -- initialization. It deliberately stores no per-projection progress or
--- resumable job generation. An intent without a result is interrupted on
--- owner reopen and remains closed until a later explicitly authorized
--- operation initializes afresh.
+-- resumable job generation.
 
 PRAGMA user_version = 8;
 
@@ -32,7 +30,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_maintenance_initialization_intents (
         initialization_sequence > 0
         AND initialization_sequence <= 9007199254740991
     ),
-    apply_id TEXT NOT NULL,
+    apply_id INTEGER NOT NULL,
     apply_generation INTEGER NOT NULL CHECK (
         apply_generation > 0
         AND apply_generation <= 9007199254740991
@@ -108,131 +106,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_maintenance_initialization_completions 
         )
 ) STRICT;
 
--- One immutable migration snapshot replaces the former per-projection
--- recovery journal. Later successful operations derive their active bindings
--- directly from the append-only maintenance completion ledger.
-CREATE TABLE IF NOT EXISTS logical_scene_maintenance_migration_state (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    legacy_native_effects_uncertain INTEGER NOT NULL CHECK (
-        legacy_native_effects_uncertain IN (0, 1)
-    ),
-    FOREIGN KEY (singleton)
-        REFERENCES logical_scene_store_metadata (singleton)
-) STRICT;
-
--- Completed pre-UA4 structural operations are reduced to the only facts
--- ordinary Scene replay still needs: their total-order identity and resulting
--- composite projection. The deployment handoff protocol itself is discarded.
-CREATE TABLE IF NOT EXISTS logical_scene_migrated_structural_completions (
-    completion_sequence INTEGER PRIMARY KEY CHECK (
-        completion_sequence > 0 AND completion_sequence <= 256
-    ),
-    apply_id TEXT NOT NULL,
-    apply_generation INTEGER NOT NULL CHECK (
-        apply_generation > 0 AND apply_generation <= 9007199254740991
-    ),
-    target_retained_bundle_id TEXT NOT NULL,
-    target_graph_revision TEXT NOT NULL,
-    target_scene_id TEXT NOT NULL,
-    target_scene_revision_id INTEGER NOT NULL CHECK (
-        target_scene_revision_id > 0
-        AND target_scene_revision_id <= 9007199254740991
-    ),
-    target_scene_content_hash TEXT NOT NULL,
-    UNIQUE (apply_id, apply_generation)
-) STRICT;
-
-INSERT OR IGNORE INTO logical_scene_migrated_structural_completions
-SELECT s.lineage_generation,s.apply_id,s.apply_generation,
-       s.candidate_retained_bundle_id,s.candidate_graph_revision,
-       s.candidate_scene_id,s.candidate_scene_revision_id,
-       s.candidate_scene_content_hash
-FROM logical_scene_named_apply_stages AS s
-INNER JOIN logical_scene_named_apply_finalizations AS f
-    USING(apply_id,apply_generation,projection_stage_generation)
-ORDER BY s.lineage_generation;
-
-INSERT OR IGNORE INTO logical_scene_maintenance_migration_state(
-    singleton, legacy_native_effects_uncertain
-)
-SELECT 1, EXISTS(
-    SELECT 1
-    FROM logical_scene_execution_host_recovery_intents AS i
-    LEFT JOIN logical_scene_execution_host_recovery_completions AS c
-        USING(recovery_generation)
-    WHERE c.recovery_generation IS NULL
-      AND i.structural_lineage_generation = (
-          SELECT max(s.lineage_generation)
-          FROM logical_scene_named_apply_stages AS s
-          INNER JOIN logical_scene_named_apply_finalizations AS f
-              USING(apply_id,apply_generation,projection_stage_generation)
-      )
-) OR EXISTS(
-    SELECT 1
-    FROM logical_scene_named_apply_stages AS s
-    LEFT JOIN logical_scene_named_apply_finalizations AS f
-        USING(apply_id,apply_generation,projection_stage_generation)
-    LEFT JOIN logical_scene_named_apply_discards AS d
-        USING(apply_id,apply_generation,projection_stage_generation)
-    WHERE f.apply_id IS NULL AND d.apply_id IS NULL
-);
-
-CREATE TABLE IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings (
-    binding_ordinal INTEGER PRIMARY KEY CHECK (
-        binding_ordinal >= 0 AND binding_ordinal < 256
-    ),
-    provider_binding_id TEXT NOT NULL,
-    provider_binding_revision TEXT NOT NULL,
-    runtime_unit_id TEXT NOT NULL,
-    runtime_epoch TEXT NOT NULL
-) STRICT;
-
--- Prefer the latest fully completed runtime replacement. If none exists,
--- preserve the binding set of the latest finalized structural deployment.
-INSERT OR IGNORE INTO logical_scene_migrated_active_execution_host_bindings
-SELECT b.binding_ordinal,b.provider_binding_id,b.provider_binding_revision,
-       b.runtime_unit_id,b.runtime_epoch
-FROM logical_scene_execution_host_recovery_bindings AS b
-INNER JOIN logical_scene_execution_host_recovery_intents AS i
-    USING(recovery_generation)
-WHERE b.recovery_generation = (
-    SELECT max(c.recovery_generation)
-    FROM logical_scene_execution_host_recovery_completions AS c
-    INNER JOIN logical_scene_execution_host_recovery_intents AS i2
-        USING(recovery_generation)
-    WHERE i2.structural_lineage_generation = (
-        SELECT max(s2.lineage_generation)
-        FROM logical_scene_named_apply_stages AS s2
-        INNER JOIN logical_scene_named_apply_finalizations AS f2
-            USING(apply_id,apply_generation,projection_stage_generation)
-    )
-)
-ORDER BY b.binding_ordinal;
-
-INSERT OR IGNORE INTO logical_scene_migrated_active_execution_host_bindings
-SELECT row_number() OVER (ORDER BY r.provider_binding_id,
-                                   r.provider_binding_revision) - 1,
-       r.provider_binding_id,r.provider_binding_revision,
-       r.runtime_unit_id,r.runtime_epoch
-FROM logical_scene_named_apply_native_transition_rows AS r
-INNER JOIN logical_scene_named_apply_stages AS s
-    USING(apply_id,apply_generation,projection_stage_generation)
-INNER JOIN logical_scene_named_apply_finalizations AS f
-    USING(apply_id,apply_generation,projection_stage_generation)
-WHERE r.disposition != 'removed'
-  AND NOT EXISTS (
-      SELECT 1 FROM logical_scene_migrated_active_execution_host_bindings
-  )
-  AND s.lineage_generation = (
-      SELECT max(s2.lineage_generation)
-      FROM logical_scene_named_apply_stages AS s2
-      INNER JOIN logical_scene_named_apply_finalizations AS f2
-          USING(apply_id,apply_generation,projection_stage_generation)
-  )
-ORDER BY r.provider_binding_id,r.provider_binding_revision;
-
--- Replace deployment-specific compaction/recovery watermarks with the one
--- structural fact retained by the UA4 migration snapshot.
+-- Replace deployment-specific compaction/recovery watermarks.
 DROP TRIGGER IF EXISTS logical_scene_history_state_no_delete;
 DROP TRIGGER IF EXISTS logical_scene_owner_events_no_delete;
 -- The bounded-history delete guards read this table. Remove them before the
@@ -251,11 +125,6 @@ CREATE TABLE logical_scene_history_state_ua4 (
         compaction_generation >= 0
         AND compaction_generation <= 9007199254740991
     ),
-    request_epoch_generation INTEGER NOT NULL CHECK (
-        request_epoch_generation >= 0
-        AND request_epoch_generation <= 9007199254740991
-    ),
-    request_owner_epoch TEXT,
     compacted_through_transaction_sequence INTEGER NOT NULL CHECK (
         compacted_through_transaction_sequence >= 0
         AND compacted_through_transaction_sequence <= 9007199254740991
@@ -263,10 +132,6 @@ CREATE TABLE logical_scene_history_state_ua4 (
     compacted_through_owner_event_sequence INTEGER NOT NULL CHECK (
         compacted_through_owner_event_sequence >= 0
         AND compacted_through_owner_event_sequence <= 9007199254740991
-    ),
-    compacted_structural_completion_count INTEGER NOT NULL CHECK (
-        compacted_structural_completion_count >= 0
-        AND compacted_structural_completion_count <= 256
     ),
     compacted_maintenance_completion_count INTEGER NOT NULL CHECK (
         compacted_maintenance_completion_count >= 0
@@ -286,17 +151,9 @@ CREATE TABLE logical_scene_history_state_ua4 (
         compaction_in_progress IN (0, 1)
     ),
     CHECK (
-        (request_epoch_generation = 0 AND request_owner_epoch IS NULL)
-        OR
-        (request_epoch_generation > 0 AND request_owner_epoch IS NOT NULL)
-    ),
-    CHECK (
         (compaction_generation = 0
-         AND request_epoch_generation = 0
-         AND request_owner_epoch IS NULL
          AND compacted_through_transaction_sequence = 0
          AND compacted_through_owner_event_sequence = 0
-         AND compacted_structural_completion_count = 0
          AND compacted_maintenance_completion_count = 0
          AND checkpoint_retained_bundle_id IS NULL
          AND checkpoint_graph_revision IS NULL
@@ -306,7 +163,6 @@ CREATE TABLE logical_scene_history_state_ua4 (
          AND checkpoint_snapshot_json IS NULL)
         OR
         (compaction_generation > 0
-         AND request_epoch_generation > 1
          AND checkpoint_retained_bundle_id IS NOT NULL
          AND checkpoint_graph_revision IS NOT NULL
          AND checkpoint_scene_id IS NOT NULL
@@ -318,13 +174,9 @@ CREATE TABLE logical_scene_history_state_ua4 (
         REFERENCES logical_scene_store_metadata (singleton)
 ) STRICT;
 INSERT INTO logical_scene_history_state_ua4
-SELECT singleton,compaction_generation,request_epoch_generation,
-       request_owner_epoch,compacted_through_transaction_sequence,
+SELECT singleton,compaction_generation,
+       compacted_through_transaction_sequence,
        compacted_through_owner_event_sequence,
-       (SELECT count(*)
-        FROM logical_scene_migrated_structural_completions AS c
-        WHERE c.completion_sequence <=
-              h.compacted_named_apply_stage_count),
        0,
        recovered_through_transaction_sequence,
        checkpoint_retained_bundle_id,checkpoint_graph_revision,
@@ -379,34 +231,15 @@ CREATE TABLE logical_scene_owner_events_ua4 (
         AND owner_event_sequence <= 9007199254740991
     ),
     event_kind TEXT NOT NULL CHECK (
-        event_kind IN ('scene_transaction_intent',
-                       'migrated_structural_completion')
+        event_kind = 'scene_transaction_intent'
     ),
     transaction_sequence INTEGER UNIQUE,
-    structural_completion_sequence INTEGER UNIQUE,
-    CHECK (
-        (event_kind = 'scene_transaction_intent'
-         AND transaction_sequence IS NOT NULL
-         AND structural_completion_sequence IS NULL)
-        OR
-        (event_kind = 'migrated_structural_completion'
-         AND transaction_sequence IS NULL
-         AND structural_completion_sequence IS NOT NULL)
-    ),
+    CHECK (transaction_sequence IS NOT NULL),
     FOREIGN KEY (transaction_sequence)
-        REFERENCES logical_scene_transaction_intents (transaction_sequence),
-    FOREIGN KEY (structural_completion_sequence)
-        REFERENCES logical_scene_migrated_structural_completions (
-            completion_sequence
-        )
+        REFERENCES logical_scene_transaction_intents (transaction_sequence)
 ) STRICT;
 INSERT INTO logical_scene_owner_events_ua4
-SELECT owner_event_sequence,
-       CASE event_kind
-           WHEN 'named_apply_finalized' THEN 'migrated_structural_completion'
-           ELSE event_kind
-       END,
-       transaction_sequence,named_apply_lineage_generation
+SELECT owner_event_sequence,event_kind,transaction_sequence
 FROM logical_scene_owner_events
 ORDER BY owner_event_sequence;
 DROP TABLE logical_scene_owner_events;
@@ -460,41 +293,6 @@ DROP TABLE IF EXISTS logical_scene_named_apply_activations;
 DROP TABLE IF EXISTS logical_scene_named_apply_discards;
 DROP TABLE IF EXISTS logical_scene_named_apply_stages;
 
-ALTER TABLE logical_scene_store_metadata
-    RENAME COLUMN maximum_named_apply_stages
-    TO maximum_migrated_structural_completions;
-
-CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_migration_state_no_update
-BEFORE UPDATE ON logical_scene_maintenance_migration_state
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene maintenance migration state is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_migration_state_no_delete
-BEFORE DELETE ON logical_scene_maintenance_migration_state
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene maintenance migration state is immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings_no_update
-BEFORE UPDATE ON logical_scene_migrated_active_execution_host_bindings
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene migrated active bindings are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings_no_delete
-BEFORE DELETE ON logical_scene_migrated_active_execution_host_bindings
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene migrated active bindings are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_structural_completions_no_update
-BEFORE UPDATE ON logical_scene_migrated_structural_completions
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene migrated structural completions are immutable');
-END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_structural_completions_no_delete
-BEFORE DELETE ON logical_scene_migrated_structural_completions
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene migrated structural completions are immutable');
-END;
-
 -- Rows are immutable. Only the owner's bounded eviction of the oldest settled
 -- initialization deletes them, inside its compaction_in_progress window.
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_intents_no_update
@@ -530,9 +328,8 @@ WHEN NOT (
     AND OLD.first_error_message IS NULL
     AND OLD.effects_unknown = 0
     AND NEW.state = 'interrupted'
-    AND NEW.first_error_code = 'scene_initialization_interrupted'
-    AND NEW.first_error_message =
-        'Scene owner reopened before maintenance completion'
+    -- A Scene adoption whose Apply ended before its publication.
+    AND NEW.first_error_code = 'scene_adoption_ended_without_publication'
     AND NEW.effects_unknown = 1
 )
 BEGIN

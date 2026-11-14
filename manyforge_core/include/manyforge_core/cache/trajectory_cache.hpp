@@ -22,14 +22,14 @@ namespace manyforge::core {
 struct TrajectoryCacheKey final {
   ProgramRevision program_revision{std::string{}};
   ProgramBindingId program_binding_id{std::string{}};
-  ProgramRunId program_run_id{std::string{}};
+  std::optional<ProgramRunNumber> program_run_id{};
   MoveId move_id{std::string{}};
   ControllableComponentId controllable_component_id{std::string{}};
   CommandTargetId command_target_id{std::string{}};
   CapabilityId capability_id{std::string{}};
 
   [[nodiscard]] bool valid() const noexcept {
-    return !program_revision.empty() && !program_binding_id.empty() && !program_run_id.empty() &&
+    return !program_revision.empty() && !program_binding_id.empty() &&
            !move_id.empty() && !controllable_component_id.empty() && !command_target_id.empty() &&
            !capability_id.empty();
   }

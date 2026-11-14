@@ -50,6 +50,9 @@ run_package \
   manyforge_content_identity \
   DMANYFORGE_CONTENT_IDENTITY_BUILD_TESTING
 run_package \
+  manyforge_private_stream \
+  DMANYFORGE_PRIVATE_STREAM_BUILD_TESTING
+run_package \
   manyforge_persistence \
   DMANYFORGE_PERSISTENCE_BUILD_TESTING
 run_package \

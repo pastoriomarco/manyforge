@@ -114,7 +114,7 @@ class ReferenceResolver final : public IReferencePoseResolver {
 
 ExecuteRequestDTO base_request() {
   auto request = testing::make_test_execute_request(
-      {"joint_a", "joint_b"}, "run:motion-resolution-test");
+      {"joint_a", "joint_b"}, ProgramRunNumber(1U));
   request.move_id = "move";
   std::get<ResolvedComponentModelFrameDTO>(request.binding.tcp_frame)
       .compiled_frame_name = "tool";

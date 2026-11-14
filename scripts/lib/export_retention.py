@@ -18,14 +18,39 @@ import shutil
 import stat
 import sys
 import time
-from typing import BinaryIO, Callable, Mapping
+from typing import BinaryIO, Callable
+import importlib.util
+
+
+def _load_run_session():
+    # The run selection and its retention pass are shared with the operator
+    # launcher (manyforge_operator/run_session.py). It is loaded by file: this
+    # helper runs on the host, where the operator package's contract
+    # dependencies (pydantic) are not installed.
+    name = "manyforge_run_session"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parents[2] / "manyforge_operator/run_session.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+run_session = _load_run_session()
+_safe_path = run_session._safe_path
+_check_root_identity = run_session._check_root_identity
+_open_relative_directory = run_session._open_relative_directory
+_mounted_children = run_session._mounted_children
+_allocated_bytes = run_session._allocated_bytes
+_children = run_session._children
+_safe_inventory_path = run_session._safe_inventory_path
 
 
 CONSOLE_TAIL_BYTES = 10_000_000
 _MAX_DELETIONS = 8
 _MAX_SCAN_ENTRIES = 100_000
-_MAX_PREVIOUS_SESSIONS = 5
-_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _LEGACY_SESSION_ENTRIES = frozenset({
     "manager", "manager-run", "execution-state", "execution-run", "publications",
     "artifacts", "composer-authoring", "installed-targets", "workbench-startup-timing.json",
@@ -36,25 +61,10 @@ _RECEIPT_PARTIAL = re.compile(r"\.mounted-[0-9a-f]{64}\.partial\Z")
 _EXPORT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z(?:\.[0-9]{9})?(?:\.partial)?\Z")
 
 
-@dataclass(frozen=True)
-class SiteRetentionPolicy:
-    max_disk_percent: int = 10
-    min_free_bytes: int = 10_000_000_000
-
-    def __post_init__(self) -> None:
-        if not 1 <= self.max_disk_percent <= 100 or self.min_free_bytes < 0:
-            raise ValueError("disk percent must be in [1,100] and minimum free bytes nonnegative")
-
-    @classmethod
-    def from_environment(cls, settings: Mapping[str, str]) -> SiteRetentionPolicy:
-        return cls(int(settings.get("MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT", "10")),
-                   int(settings.get("MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES", "10000000000")))
-
-
-@dataclass(frozen=True)
-class DiskFacts:
-    total_bytes: int
-    free_bytes: int
+# One set of disk limits (from the site settings file) and one free-space
+# reading for both launchers (run_session).
+SiteRetentionPolicy = run_session.DiskLimits
+DiskFacts = run_session.DiskReading
 
 
 @dataclass(frozen=True)
@@ -83,79 +93,11 @@ def capture_tail(source: BinaryIO, destination: Path, *, limit: int = CONSOLE_TA
             output.write(chunk)
 
 
-def _safe_path(path: Path, root: Path | None = None) -> Path:
-    # Resolve the selected root once; only descendants are forbidden symlinks.
-    if root is None:
-        return path.resolve()
-    relative = path.relative_to(root)
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError(f"symlink below retained-log root: {current}")
-    return path
-
-
 def _identity(row: os.stat_result) -> tuple[int, ...]:
     return row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns
 
 
-def _disk_facts(root_fd: int) -> DiskFacts:
-    row = os.fstatvfs(root_fd)
-    return DiskFacts(row.f_blocks * row.f_frsize, row.f_bavail * row.f_frsize)
-
-
-def _check_root_identity(root: Path, root_fd: int) -> None:
-    path_row = root.stat(follow_symlinks=False)
-    held_row = os.fstat(root_fd)
-    if (path_row.st_dev, path_row.st_ino) != (held_row.st_dev, held_row.st_ino):
-        raise ValueError("selected state root changed during retention")
-
-
-def _open_relative_directory(root_fd: int, relative: Path) -> int:
-    """Anchor every parent component to the held owner root, without symlinks."""
-    current = os.dup(root_fd)
-    try:
-        for part in relative.parts:
-            if part in ("..", "/"):
-                raise ValueError("retained unit is outside the held state root")
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-            os.close(current)
-            current = child
-        return current
-    except BaseException:
-        os.close(current)
-        raise
-
-
-def _mounted_children(root: Path) -> set[Path]:
-    mounts = set()
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
-        mount = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), line.split()[4]))
-        if mount != root and mount.is_relative_to(root):
-            mounts.add(mount)
-    return mounts
-
-
-def _allocated_bytes(root: Path, device: int, mounts: set[Path], seen: set[tuple[int, int]], root_fd: int) -> tuple[int, bool]:
-    if any(mount == root or mount.is_relative_to(root) for mount in mounts):
-        raise ValueError(f"mounted child in {root}; accounting incomplete")
-    size, entries = 0, 0
-    for _, directories, files, fd in os.fwalk(".", topdown=True, follow_symlinks=False, dir_fd=root_fd):
-        for name in (".", *directories, *files):
-            entries += 1
-            if entries > _MAX_SCAN_ENTRIES:
-                raise ValueError("retained-log accounting exceeds bounded scan")
-            row = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            if row.st_dev != device:
-                raise ValueError(f"cross-filesystem child in {root}; accounting incomplete")
-            if stat.S_ISLNK(row.st_mode) and name in directories:
-                directories.remove(name)
-            identity = (row.st_dev, row.st_ino)
-            if identity not in seen:
-                seen.add(identity)
-                size += row.st_blocks * 512
-    return size, True
+_disk_facts = run_session.read_disk
 
 
 def _read_summary(folder: Path) -> dict:
@@ -338,26 +280,6 @@ def prepare_capture(evidence: Path, timestamp: str, summary: dict,
         return evidence / partial_name
 
 
-def _children(path: Path, warnings: list[str], label: str) -> list[Path]:
-    children = []
-    with os.scandir(path) as entries:
-        for entry in entries:
-            if len(children) == 1000:
-                warnings.append(f"{label}: inventory incomplete (1001+ entries; 1000 observed, unseen 1+ protected; measured usage is a lower bound)")
-                break
-            children.append(path / entry.name)
-    return children
-
-
-def _safe_inventory_path(path: Path, root: Path, owner: Path, warnings: list[str]) -> bool:
-    try:
-        _safe_path(path, root)
-        return True
-    except ValueError:
-        warnings.append(f"{owner / path.relative_to(root)}: symlink below retained-log root; protected, accounting incomplete (lower bound)")
-        return False
-
-
 def _ros_session_name(name: str) -> tuple[int, int] | None:
     match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]{0,19})", name)
     return (int(match[1]), int(match[2])) if match else None
@@ -478,11 +400,11 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
             latest = max(completed, key=lambda folder: folder.name)
             units = [(folder, reason or ("most recent console capture" if folder == latest else None), order) for folder, reason, order in units]
     # Cold-session archives contain the original owner journals, including
-    # facts not imported into History. Every archive is preserved;
-    # account for disk pressure, but grant no new journal retirement authority.
-    previous = root / "previous-sessions"
+    # facts not imported into History. This loop only accounts for them; the
+    # shared run pruning (run_session.prune_own_files) alone deletes them.
+    previous = root / "previous-runs"
     if _safe_inventory_path(previous, root, ownership_root, warnings) and previous.exists():
-        for folder in _children(previous, warnings, str(ownership_root / "previous-sessions")):
+        for folder in _children(previous, warnings, str(ownership_root / "previous-runs")):
             if _safe_inventory_path(folder, root, ownership_root, warnings) and folder.is_dir():
                 units.append((folder, "previous-session journals kept; history coverage not_imported or unknown", None))
     runtime = root / "current" if (root / "current").exists() else root
@@ -520,180 +442,6 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
     return [(folder, "sibling root (not this quiescent owner)" if sibling else reason, order) for folder, reason, order in units]
 
 
-def _session_metadata(path: Path) -> dict | None:
-    """Read a session marker without following a symlink or an unbounded file."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as source:
-            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                return None
-            data = source.read(64 * 1024 + 1)
-        if len(data) > 64 * 1024:
-            return None
-        value = json.loads(data)
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def _session_order(folder: Path, row: os.stat_result) -> tuple[int, str]:
-    marker = _session_metadata(folder / "session.json")
-    if marker and marker.get("session_id") == folder.name:
-        try:
-            started = datetime.fromisoformat(marker["started_at_wall"])
-            if started.utcoffset() is not None:
-                return int(started.timestamp() * 1_000_000_000), folder.name
-        except (KeyError, TypeError, ValueError, OverflowError):
-            pass
-    return row.st_mtime_ns, folder.name
-
-
-def _remove_old_session(root: Path, root_fd: int, folder: Path,
-                        before: os.stat_result) -> None:
-    parent_fd = _open_relative_directory(root_fd, folder.relative_to(root).parent)
-    try:
-        if (os.fstat(parent_fd).st_dev != os.fstat(root_fd).st_dev or
-                folder.parent in _mounted_children(root)):
-            raise ValueError("mounted previous-sessions during removal")
-        row = os.stat(folder.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (row.st_dev, row.st_ino) != (before.st_dev, before.st_ino):
-            raise ValueError("previous session changed before removal")
-        if not shutil.rmtree.avoids_symlink_attacks:
-            raise ValueError("platform cannot delete without following directory symlinks")
-        unit_fd = os.open(folder.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                          dir_fd=parent_fd)
-        try:
-            held = os.fstat(unit_fd)
-            if (held.st_dev, held.st_ino) != (before.st_dev, before.st_ino):
-                raise ValueError("previous session changed during open")
-            _allocated_bytes(folder, os.fstat(root_fd).st_dev,
-                             _mounted_children(root), set(), unit_fd)
-            # Archives are sealed read-only. Removing children requires write
-            # permission on directories, not on the archived files.
-            try:
-                for _, _, _, fd in os.fwalk(".", topdown=False, follow_symlinks=False,
-                                            dir_fd=unit_fd):
-                    os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) | stat.S_IWUSR | stat.S_IXUSR)
-                shutil.rmtree(folder.name, dir_fd=parent_fd)
-            except OSError:
-                # If removal failed, leave any surviving archive sealed.
-                for _, _, _, fd in os.fwalk(".", topdown=False, follow_symlinks=False,
-                                            dir_fd=unit_fd):
-                    os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) & ~0o222)
-                raise
-        finally:
-            os.close(unit_fd)
-    finally:
-        os.close(parent_fd)
-
-
-def _prune_previous_sessions(root: Path, root_fd: int) -> RetentionResult:
-    """One bounded count pass over completed previous sessions and reports."""
-    for name in (".session-selection.json", ".legacy-session-transition.json"):
-        if (root / name).exists() or (root / name).is_symlink():
-            return RetentionResult(warning="previous-session retention deferred during session selection")
-
-    warnings: list[str] = []
-    previous = _safe_path(root / "previous-sessions", root)
-    archives: list[tuple[Path, os.stat_result]] = []
-    if previous.exists():
-        if previous in _mounted_children(root):
-            return RetentionResult(warning="previous-session retention deferred: mounted previous-sessions")
-        for folder in _children(previous, warnings, str(previous)):
-            if _SESSION_ID.fullmatch(folder.name) and _safe_inventory_path(folder, root, root, warnings):
-                row = folder.stat(follow_symlinks=False)
-                if stat.S_ISDIR(row.st_mode):
-                    archives.append((folder, row))
-    reports = _safe_path(root / "session-reports", root)
-    finalized: list[tuple[Path, os.stat_result]] = []
-    if reports.exists():
-        if any(mount == reports or mount.is_relative_to(reports) for mount in _mounted_children(root)):
-            return RetentionResult(warning="previous-session retention deferred: mounted session-reports")
-        for report in _children(reports, warnings, str(reports)):
-            if report.name.endswith(".json") and _SESSION_ID.fullmatch(report.stem):
-                row = report.stat(follow_symlinks=False)
-                if stat.S_ISREG(row.st_mode):
-                    finalized.append((report, row))
-    if warnings:
-        return RetentionResult(warning="; ".join(warnings))
-
-    root_names = set(os.listdir(root))
-    reserve = "current" in root_names or bool(root_names & _LEGACY_SESSION_ENTRIES)
-    target = _MAX_PREVIOUS_SESSIONS - int(reserve)
-    excess_archives = max(0, len(archives) - target)
-    excess_reports = max(0, len(finalized) - target)
-    if not excess_archives and not excess_reports:
-        return RetentionResult()
-
-    protected: set[str] = set()
-    if archives:
-        protected.add(max(archives, key=lambda item: _session_order(*item))[0].name)
-    marker = _session_metadata(_safe_path(root / "current" / "session.json", root))
-    if marker and isinstance(marker.get("previous_session"), dict):
-        identity = marker["previous_session"].get("session_id")
-        if isinstance(identity, str):
-            protected.add(identity)
-    pending = _safe_path(reports / "pending", root)
-    if pending.exists():
-        for entry in _children(pending, warnings, str(pending)):
-            if entry.name.endswith(".json") and _SESSION_ID.fullmatch(entry.stem):
-                protected.add(entry.stem)
-    if warnings:
-        return RetentionResult(warning="; ".join(warnings))
-
-    deleted: list[str] = []
-    deleted_units = 0
-    retained_archives = {folder.name for folder, _ in archives}
-
-    def remove_report(report: Path, before: os.stat_result) -> None:
-        parent_fd = _open_relative_directory(root_fd, report.relative_to(root).parent)
-        try:
-            if (os.fstat(parent_fd).st_dev != os.fstat(root_fd).st_dev or
-                    any(mount == reports or mount.is_relative_to(reports)
-                        for mount in _mounted_children(root))):
-                raise ValueError("mounted session-reports during removal")
-            row = os.stat(report.name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISREG(row.st_mode) or (row.st_dev, row.st_ino) != (before.st_dev, before.st_ino):
-                raise ValueError("session report changed before removal")
-            os.unlink(report.name, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
-        deleted.append(str(report.relative_to(root)))
-
-    try:
-        for folder, row in sorted(archives, key=lambda item: _session_order(*item)):
-            if not excess_archives or deleted_units == _MAX_DELETIONS:
-                break
-            if folder.name in protected:
-                continue
-            _check_root_identity(root, root_fd)
-            _remove_old_session(root, root_fd, folder, row)
-            retained_archives.remove(folder.name)
-            deleted.append(str(folder.relative_to(root)))
-            deleted_units += 1
-            excess_archives -= 1
-            for report, report_row in finalized[:]:
-                if report.stem == folder.name:
-                    remove_report(report, report_row)
-                    finalized.remove((report, report_row))
-                    excess_reports = max(0, excess_reports - 1)
-                    break
-        for report, row in sorted(finalized, key=lambda item: (item[1].st_mtime_ns, item[0].name)):
-            if not excess_reports or deleted_units == _MAX_DELETIONS:
-                break
-            if report.stem in protected or report.stem in retained_archives:
-                continue
-            _check_root_identity(root, root_fd)
-            remove_report(report, row)
-            deleted_units += 1
-            excess_reports -= 1
-    except (OSError, ValueError) as error:
-        return RetentionResult(tuple(deleted), f"previous-session retention failed: {error}")
-    if excess_archives or excess_reports:
-        return RetentionResult(tuple(deleted), "previous-session retention remains above its count limit")
-    return RetentionResult(tuple(deleted))
-
-
 def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                          disk_facts: Callable[[int], DiskFacts] = _disk_facts,
                          default_roots: Path | None = None) -> RetentionResult:
@@ -711,9 +459,9 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
             raise ValueError("filesystem root is not a ManyForge state root")
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        sessions = _prune_previous_sessions(root, root_fd)
-        deleted.extend(sessions.deleted)
-        session_warning = sessions.warning
+        pruned, session_warning = run_session.prune_own_files(
+            root, root_fd, policy, reader=disk_facts, legacy_entries=_LEGACY_SESSION_ENTRIES)
+        deleted.extend(pruned)
         for _ in range(_MAX_DELETIONS + 1):
             _check_root_identity(root, root_fd)
             units, owned_bytes, seen = [], 0, set()
@@ -837,6 +585,7 @@ def main() -> int:
     parser.add_argument("--default-roots", type=Path)
     parser.add_argument("--timestamp")
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--site-settings", type=Path)
     arguments = parser.parse_args()
     if arguments.command == "prepare":
         try:
@@ -869,9 +618,11 @@ def main() -> int:
             print(f"WARNING ManyForge could not qualify retained containers: {str(error)[:300]}", file=sys.stderr)
             return 69
     try:
-        result = rotate_retained_logs(arguments.path, SiteRetentionPolicy.from_environment(os.environ), default_roots=arguments.default_roots)
-    except ValueError as error:
+        policy = run_session.read_site_disk_limits(arguments.site_settings)
+    except (OSError, ValueError) as error:
         result = RetentionResult(warning=f"invalid retention site setting: {error}")
+    else:
+        result = rotate_retained_logs(arguments.path, policy, default_roots=arguments.default_roots)
     for name in result.deleted:
         print(f"ManyForge removed oldest closed log/evidence unit: {name}", file=sys.stderr)
     if result.warning:

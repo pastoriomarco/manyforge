@@ -119,7 +119,7 @@ bool RuntimeUnitConvergencePlanRowDTO::valid() const noexcept {
 }
 
 bool ManagerApplyRuntimeConvergenceIntentDTO::valid() const noexcept {
-  return !apply_id.empty() && apply_generation.nonzero() &&
+  return apply_id.nonzero() && apply_generation.nonzero() &&
          !candidate_retained_bundle_id.empty() &&
          !candidate_graph_revision.empty() && Digest(fence_acceptance_digest) &&
          predecessor_publication_generation.nonzero() &&
@@ -168,7 +168,7 @@ bool RuntimeUnitStagedReadyEvidenceDTO::valid() const noexcept {
 }
 
 bool ManagerApplyRuntimeStagedReadyDTO::valid() const noexcept {
-  return !apply_id.empty() && apply_generation.nonzero() &&
+  return apply_id.nonzero() && apply_generation.nonzero() &&
          staged_ready_generation > 0U &&
          Digest(runtime_convergence_intent_digest) &&
          predecessor_publication_generation.nonzero() &&

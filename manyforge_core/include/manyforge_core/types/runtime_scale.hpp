@@ -70,12 +70,12 @@ struct RuntimeScaleControlRequestDTO final {
 };
 
 struct RuntimeScaleControlAcceptedDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestReplayStatusDTO replay_status;
   RuntimeScaleControlSelectorDTO selector;
   double requested_scale{1.0};
   RuntimeScaleControlGeneration control_generation;
-  std::optional<OperationId> active_operation_id;
+  std::optional<OperationNumber> active_operation_id;
   std::optional<OperationRevision> active_operation_revision;
   std::optional<RuntimeScaleGeneration> active_operation_scale_generation;
   std::int64_t accepted_at_ns{};
@@ -109,7 +109,7 @@ struct RuntimeScaleControlStatusDTO final {
   std::optional<ActiveControlConfigurationId> active_control_configuration_id;
   std::optional<ActiveControlConfigurationGeneration>
       active_control_configuration_generation;
-  std::optional<OperationId> active_operation_id;
+  std::optional<OperationNumber> active_operation_id;
   std::optional<OperationRevision> active_operation_revision;
   std::optional<RuntimeScaleGeneration> active_operation_scale_generation;
   std::optional<double> effective_scale;
@@ -149,7 +149,7 @@ struct RuntimeScaleMechanismStatusDTO final {
 
 struct RuntimeScaleRequestDTO final {
   PublicRequestContextDTO request_context;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision expected_operation_revision;
   RuntimeScaleGeneration expected_runtime_scale_generation;
   double scale{1.0};
@@ -161,9 +161,9 @@ struct RuntimeScaleRequestDTO final {
 };
 
 struct RuntimeScaleAcceptedDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestReplayStatusDTO replay_status;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   double requested_scale{1.0};
   RuntimeScaleGeneration runtime_scale_generation;
@@ -180,7 +180,6 @@ struct RuntimeScaleParticipantStatusDTO final {
   ControlBindingId control_binding_id;
   ControlBindingRevision control_binding_revision;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ControlRouteId control_route_id;
@@ -202,7 +201,7 @@ struct RuntimeScaleParticipantStatusDTO final {
 };
 
 struct RuntimeScaleStatusDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   RuntimeScaleGeneration runtime_scale_generation;
   double requested_scale{1.0};
@@ -216,7 +215,7 @@ struct RuntimeScaleStatusDTO final {
 /// callers never construct this value: the resource-addressed owner joins the
 /// active operation, retained binding, controller goal, and generation fence.
 struct ResolvedRuntimeScaleCommandDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -227,7 +226,6 @@ struct ResolvedRuntimeScaleCommandDTO final {
   ControlBindingId control_binding_id;
   ControlBindingRevision control_binding_revision;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ControlRouteId control_route_id;
@@ -248,7 +246,7 @@ struct ResolvedRuntimeScaleCommandDTO final {
 };
 
 struct ResolvedRuntimeScaleAcceptedDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -259,7 +257,6 @@ struct ResolvedRuntimeScaleAcceptedDTO final {
   ControlBindingId control_binding_id;
   ControlBindingRevision control_binding_revision;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ControlRouteId control_route_id;
@@ -278,7 +275,7 @@ struct ResolvedRuntimeScaleAcceptedDTO final {
 };
 
 struct ResolvedRuntimeScaleStatusDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -289,7 +286,6 @@ struct ResolvedRuntimeScaleStatusDTO final {
   ControlBindingId control_binding_id;
   ControlBindingRevision control_binding_revision;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ControllerTopologyId controller_topology_id;
   TopologyRevision topology_revision;
   ControlRouteId control_route_id;

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 from copy import deepcopy
 import json
+import math
 import re
 from typing import Any
 
@@ -35,6 +36,8 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "open_draft": ("POST", "/api/program/open-draft"),
         "new_draft": ("POST", "/api/program/new-draft"),
         "apply": ("POST", "/api/program/apply"),
+        # Where the Program Apply's row (its step and end) is read (OD-214).
+        "apply_status": ("GET", "/api/deployment/workspace"),
     },
     "manyforge_program_tree": {
         "read": ("GET", "/api/program/draft"),
@@ -47,6 +50,8 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
     "manyforge_cycle_control": {
         "state": ("GET", "/api/control/state"),
         "command": ("POST", "/api/control/commands"),
+        # Where a command's row (its step and end) is read (OD-214).
+        "status": ("GET", "/api/cycle/status"),
     },
     "manyforge_capabilities": {
         "environment": ("GET", "/api/node-environment"),
@@ -120,6 +125,8 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
     "manyforge_scenario": {
         "load": ("POST", "/api/scenario/load"),
         "new": ("POST", "/api/scenario/new"),
+        # Where a Load's or New's row (its step and end) is read (OD-214).
+        "status": ("GET", "/api/deployment/workspace"),
     },
     "manyforge_components": {
         "list": ("GET", "/api/components"),
@@ -143,7 +150,7 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "operation": ("GET", "/api/execution/operations/{operation_id}"),
         "reset": ("POST", "/api/execution/operations/{operation_id}/reset"),
         "stop": ("POST", "/api/execution/stops"),
-        "full_stop": ("POST", "/api/execution/full-stop"),
+        "stop_all": ("POST", "/api/execution/stop-all"),
         "scale": ("POST", "/api/execution/runtime-scale-control"),
         "read_scale": ("GET", "/api/execution/runtime-scale-control"),
     },
@@ -151,7 +158,55 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "status": ("GET", "/api/program/workspace"),
         "discard": ("POST", "/api/program/discard"),
         "revert": ("POST", "/api/program/revert"),
+        # Where the Program Revert's row (its step and end) is read (OD-214).
+        "apply_status": ("GET", "/api/deployment/workspace"),
     },
+}
+
+
+# Tools whose commands answer at acceptance (OD-214): the reply is the
+# command's row, and its outcome is that row's `end` in a status the tool
+# reads. Added to the tool's description.
+_COMMAND_OUTCOMES: dict[str, str] = {
+    "manyforge_cycle_control": (
+        " `command` returns at acceptance: the receipt "
+        "(`manyforge.execution_command_receipt.v3`) names the command's "
+        "`request_key` and, for a Program command, the runner's row in "
+        "`command`. The outcome is that row's `end` (null while it runs) in "
+        "`runner_commands` of `status`, found by `request_key`."
+    ),
+    "manyforge_intervention": (
+        " `recover`, `manual_result` and `blackboard` return at acceptance "
+        "with the runner's row (`manyforge.program_command_reply.v1`). The "
+        "outcome is that row's `end` (null while it runs) in `runner_commands` "
+        "of `state`, found by the row's `request_key`."
+    ),
+    "manyforge_deployment": (
+        " `apply` and `revert` return at acceptance with the Apply's row "
+        "(`manyforge.apply_command_reply.v1`). The outcome is that row's `end` "
+        "(null while it runs) in `apply_commands` of `workspace`, found by "
+        "`request_key`."
+    ),
+    "manyforge_program_load": (
+        " `apply` returns at acceptance with the Apply's row "
+        "(`manyforge.apply_command_reply.v1`). The outcome is that row's `end` "
+        "(null while it runs) in `apply_commands` of `apply_status`, found by "
+        "`request_key`; it ends once the Manager accepted the Apply, named by "
+        "the row's `step_source`."
+    ),
+    "manyforge_session": (
+        " `revert` returns at acceptance with the Apply's row "
+        "(`manyforge.apply_command_reply.v1`). The outcome is that row's `end` "
+        "(null while it runs) in `apply_commands` of `apply_status`, found by "
+        "`request_key`; it ends once the Manager accepted the Apply, named by "
+        "the row's `step_source`."
+    ),
+    "manyforge_scenario": (
+        " `load` and `new` return at acceptance with the Apply's row "
+        "(`manyforge.apply_command_reply.v1`). The outcome is that row's `end` "
+        "(null while it runs) in `apply_commands` of `status`, found by "
+        "`request_key`."
+    ),
 }
 
 
@@ -162,12 +217,12 @@ class ToolArguments(BaseModel):
     path: dict[str, str] = Field(default_factory=dict, max_length=4)
     query: dict[str, Any] = Field(default_factory=dict, max_length=32)
     # The route, not this transport envelope, owns payload validation. In
-    # particular a recognized Stop must reach its malformed-body handler.
+    # particular a Stop body reaches its route, which forwards it unchanged.
     body: Any = None
 
 
 def _reserved_stop(path: str, body: Any) -> bool:
-    if path in {"/api/execution/stops", "/api/execution/full-stop"}:
+    if path in {"/api/execution/stops", "/api/execution/stop-all"}:
         return True
     if path == "/api/control/commands" and isinstance(body, dict):
         envelope = body.get("command_envelope")
@@ -191,31 +246,83 @@ def _has_duplicate(value: Any) -> bool:
     return isinstance(value, list) and any(_has_duplicate(v) for v in value)
 
 
+# A NaN or Infinity constant, or a number too large for a float (`1e999`);
+# the SDK would turn it into `null`.
+_NONFINITE: Any = object()
+
+
+def _float_or_nonfinite(text: str) -> Any:
+    value = float(text)
+    return _NONFINITE if math.isinf(value) else value
+
+
+def _has_malformed(value: Any) -> bool:
+    if value is _NONFINITE:
+        return True
+    if isinstance(value, _JsonObject):
+        return value.duplicate or any(_has_malformed(v) for v in value.values())
+    return isinstance(value, list) and any(_has_malformed(v) for v in value)
+
+
 def _checked_envelope(body: bytes) -> bytes:
-    # The SDK uses last-member-wins JSON decoding. Never let that silently
-    # narrow a Stop selector or change another effect. Only an unambiguous
-    # native Stop route may forward a malformed body to its existing handler.
-    envelope = json.loads(body, object_pairs_hook=_JsonObject)
-    if not _has_duplicate(envelope):
+    # The SDK uses last-member-wins JSON decoding and turns NaN/Infinity into
+    # `null`. Never let that silently narrow a Stop selector or change another
+    # effect. An unambiguous native Stop route forwards a malformed body
+    # (as `{}`) for Headless to promote; a control-command Stop with a
+    # non-finite number in its payload is forwarded with `payload: {}`, which
+    # Headless turns into Stop all (a Halt stays a Halt). Any other tool call
+    # with a duplicate member or a non-finite number is refused (OD-232).
+    envelope = json.loads(
+        body,
+        object_pairs_hook=_JsonObject,
+        parse_constant=lambda _: _NONFINITE,
+        parse_float=_float_or_nonfinite,
+    )
+    if not _has_malformed(envelope):
         return body
-    if isinstance(envelope, dict) and envelope.get("method") == "tools/call":
-        params = envelope.get("params")
-        arguments = params.get("arguments") if isinstance(params, dict) else None
-        if isinstance(arguments, dict):
+    duplicate = _has_duplicate(envelope)
+    if not (isinstance(envelope, dict) and envelope.get("method") == "tools/call"):
+        if not duplicate:
+            return body  # not a tool call: nothing is carried out
+        raise ValueError("duplicate member or non-finite number in MCP request")
+    params = envelope.get("params")
+    arguments = params.get("arguments") if isinstance(params, dict) else None
+    if isinstance(arguments, dict):
+        name, action = params.get("name"), arguments.get("action")
+        route = (
+            TOOL_ROUTES.get(name, {}).get(action)
+            if isinstance(name, str) and isinstance(action, str)
+            else None
+        )
+        native_stop = route in {
+            ("POST", "/api/execution/stops"),
+            ("POST", "/api/execution/stop-all"),
+        }
+        if native_stop:
             arguments.pop("body", None)
-            name, action = params.get("name"), arguments.get("action")
-            route = (
-                TOOL_ROUTES.get(name, {}).get(action)
-                if isinstance(name, str) and isinstance(action, str)
-                else None
-            )
-            if route in {
-                ("POST", "/api/execution/stops"),
-                ("POST", "/api/execution/full-stop"),
-            } and not _has_duplicate(envelope):
+            if not _has_malformed(envelope):
                 arguments["body"] = None
                 return json.dumps(envelope, allow_nan=False).encode("utf-8")
-    raise ValueError("duplicate JSON members in MCP request")
+        stop_body = arguments.get("body")
+        if (
+            not duplicate
+            and route == ("POST", "/api/control/commands")
+            and _reserved_stop(route[1], stop_body)
+            and "payload" in stop_body
+        ):
+            del stop_body["payload"]
+            if not _has_malformed(envelope):
+                stop_body["payload"] = {}
+                return json.dumps(envelope, allow_nan=False).encode("utf-8")
+        if (
+            not duplicate
+            and route is not None
+            and (native_stop or _reserved_stop(route[1], arguments.get("body")))
+        ):
+            # A Stop with a non-finite number outside the parts above (e.g.
+            # in a control-command envelope) passes as it came.
+            return body
+    raise ValueError("duplicate member or non-finite number in MCP request")
 
 
 def tool_contracts(app: FastAPI) -> list[dict[str, Any]]:
@@ -272,7 +379,13 @@ def tool_contracts(app: FastAPI) -> list[dict[str, Any]]:
                         required.append(location)
             request = operation.get("requestBody", {})
             if "application/json" in request.get("content", {}):
-                properties["body"] = local_refs(request["content"]["application/json"]["schema"])
+                body = local_refs(request["content"]["application/json"]["schema"])
+                # A forwarded route documents its body as one self-contained
+                # schema (routes_headless._documented_body); its definitions
+                # join the tool's own.
+                definitions.update(body.pop("$defs", {}))
+                body.pop("$id", None)
+                properties["body"] = body
                 if request.get("required"):
                     required.append("body")
             read_only &= method == "GET" or path in {
@@ -296,6 +409,7 @@ def tool_contracts(app: FastAPI) -> list[dict[str, Any]]:
                         "Thin ManyForge API adapter. Submit once; observe owner state. "
                         "Bodies use the unchanged REST DTOs. No implicit Apply, retry, "
                         "confirmation or identity selection. See each action's schema."
+                        + _COMMAND_OUTCOMES.get(name, "")
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -340,8 +454,8 @@ class ComposerMcpAdapter:
         async def list_tools():
             return contracts
 
-        # The actual HTTP routes validate the payload, including malformed
-        # recognized Stop. Do not preempt that rule with SDK JSON-schema checks.
+        # The actual HTTP routes validate the payload; a Stop route forwards
+        # it unchanged. Do not preempt that rule with SDK JSON-schema checks.
         @server.call_tool(validate_input=False)
         async def call_tool(name: str, arguments: dict[str, Any]):
             response = await self.invoke(name, arguments)
@@ -457,7 +571,7 @@ class ComposerMcpAdapter:
                     try:
                         body = encode_body()
                     except (ValueError, TypeError):
-                        body = b"null"  # real route handles recognized malformed Stop
+                        body = b"null"  # the Stop route forwards it as `{}`
                 else:
                     body = await run_in_threadpool(encode_body)
             return await client.request(

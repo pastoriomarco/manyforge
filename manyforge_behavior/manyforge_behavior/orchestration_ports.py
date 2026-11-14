@@ -6,7 +6,6 @@ from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
-from hashlib import sha256
 from types import MappingProxyType
 from typing import Any, Callable, Final, Protocol
 
@@ -58,33 +57,37 @@ class ProgramRunScopeState(Enum):
 
 @dataclass(frozen=True, slots=True)
 class NodeAttemptIdentity:
-    program_run_id: str
+    program_run_id: int
     node_instance_id: str
-    node_attempt_id: str
-    parent_node_attempt_id: str | None = None
+    node_attempt_id: int
+    parent_node_attempt_id: int | None = None
 
     def __post_init__(self) -> None:
-        for field_name in ("program_run_id", "node_instance_id", "node_attempt_id"):
+        require_run_number(self.program_run_id)
+        if not isinstance(self.node_instance_id, str) or not self.node_instance_id:
+            raise ValueError("node_instance_id must be non-empty text")
+        if len(self.node_instance_id.encode("utf-8")) > 512:
+            raise ValueError("node_instance_id exceeds the Kernel field bound")
+        for field_name in ("node_attempt_id", "parent_node_attempt_id"):
             value = getattr(self, field_name)
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{field_name} must be non-empty text")
-            if len(value.encode("utf-8")) > 512:
-                raise ValueError(f"{field_name} exceeds the Kernel field bound")
-        if self.parent_node_attempt_id is not None and (
-            not isinstance(self.parent_node_attempt_id, str)
-            or not self.parent_node_attempt_id
-            or len(self.parent_node_attempt_id.encode("utf-8")) > 512
-        ):
-            raise ValueError(
-                "parent_node_attempt_id must be absent or bounded non-empty text"
-            )
+            if value is None and field_name == "parent_node_attempt_id":
+                continue
+            # The attempt number fills 48 bits of a Program-derived request key.
+            if type(value) is not int or not 0 < value < 1 << 48:
+                raise ValueError(f"{field_name} must be a positive attempt number")
 
 
 @dataclass(frozen=True, slots=True)
 class ProgramRunPortContext:
-    """Immutable Applied Program/Binding coordinates used by client ports."""
+    """Immutable Applied Program/Binding coordinates used by client ports.
 
-    program_run_id: str
+    ``context_kind`` names what ``program_run_id`` numbers: ``"run"`` (a run
+    number) or ``"apply"`` (the Apply number of a scene preparation that
+    belongs to no run). Scene contexts are keyed by the pair
+    (``scene_context_id``).
+    """
+
+    program_run_id: int
     applied_record_digest: str
     scenario_id: str
     source_document_digest: str
@@ -100,9 +103,13 @@ class ProgramRunPortContext:
     # Simulator entity mapping of the active Deployment links
     # ({cell_frame_id, scene_entities}); None when it has none.
     simulation_scene: Mapping[str, Any] | None = None
+    context_kind: str = "run"
 
     def __post_init__(self) -> None:
-        for field_name in ("program_run_id", "scenario_id", "program_id"):
+        require_run_number(self.program_run_id)
+        if self.context_kind not in SCENE_CONTEXT_KINDS:
+            raise ValueError("context_kind must be 'run' or 'apply'")
+        for field_name in ("scenario_id", "program_id"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{field_name} must be non-empty text")
@@ -179,7 +186,7 @@ class ProgramRunContextPort(Protocol):
 
     def bind(self, context: ProgramRunPortContext) -> None: ...
 
-    def unbind(self, program_run_id: str) -> None: ...
+    def unbind(self, program_run_id: int) -> None: ...
 
 
 class ProgramRunContextError(RuntimeError):
@@ -239,7 +246,7 @@ class CompositeProgramRunContextPort:
                 ) from bind_error
             raise
 
-    def unbind(self, program_run_id: str) -> None:
+    def unbind(self, program_run_id: int) -> None:
         errors: list[Exception] = []
         for port in reversed(self._ports):
             try:
@@ -289,7 +296,8 @@ class OwnerNodeInputs:
 
 @dataclass(frozen=True, slots=True)
 class OwnerTaskSnapshot:
-    task_id: str
+    # The Kernel operation number, or key text for a task with no operation.
+    task_id: int | str
     state: OwnerTaskState
     output: Any = None
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
@@ -303,8 +311,8 @@ class OwnerTaskSnapshot:
     details: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.task_id, str) or not self.task_id:
-            raise ValueError("owner task id must be non-empty text")
+        if not is_task_id(self.task_id):
+            raise ValueError("owner task id must be an operation number or non-empty text")
         if not isinstance(self.state, OwnerTaskState):
             raise TypeError("owner task state must be an OwnerTaskState")
         if type(self.settlement_proven) is not bool:
@@ -346,17 +354,17 @@ class OwnerTaskPort(Protocol):
         inputs: OwnerNodeInputs,
     ) -> OwnerTaskSnapshot: ...
 
-    def observe(self, task_id: str) -> OwnerTaskSnapshot: ...
+    def observe(self, task_id: int | str) -> OwnerTaskSnapshot: ...
 
     def cancel(
         self,
-        task_id: str,
+        task_id: int | str,
         identity: NodeAttemptIdentity,
     ) -> None: ...
 
     def acknowledge(
         self,
-        task_id: str,
+        task_id: int | str,
         identity: NodeAttemptIdentity,
     ) -> None: ...
 
@@ -429,11 +437,11 @@ class OwnerInvocationPendingError(RuntimeError):
 class OwnerInvocationHeldError(RuntimeError):
     """The owner proved Stop prevented admission; no effect was started."""
 
-    def __init__(self, selection_revision: int) -> None:
+    def __init__(self, hold_revision: int) -> None:
         super().__init__("Not started — held by Stop")
-        if type(selection_revision) is not int or not 0 <= selection_revision <= 9_007_199_254_740_991:
-            raise ValueError("held invocation requires an exact Stop selection revision")
-        self.selection_revision = selection_revision
+        if type(hold_revision) is not int or not 0 <= hold_revision <= 9_007_199_254_740_991:
+            raise ValueError("held invocation requires an exact hold revision")
+        self.hold_revision = hold_revision
 
 
 class OwnerInvocationRefusedByPriorityError(RuntimeError):
@@ -497,13 +505,13 @@ class MockSimulationPort(Protocol):
         pending until ``resend_unknown_ends`` gets its ACK."""
         ...
 
-    def resend_unknown_ends(self, program_run_id: str) -> tuple[Mapping[str, Any], ...]:
+    def resend_unknown_ends(self, program_run_id: int) -> tuple[Mapping[str, Any], ...]:
         """Resend the Run's pending ENDs unchanged; those still unanswered."""
         ...
 
     def set_run_paused(
         self,
-        program_run_id: str,
+        program_run_id: int,
         run_revision: int,
         paused: bool,
         held_node_instance_ids: Sequence[str] = (),
@@ -511,6 +519,17 @@ class MockSimulationPort(Protocol):
         """Decisions 135/138: the Run's snapshot at the Runner's run_revision
         (Halt state and held-node mask); never raises (an unanswered
         snapshot is resent unchanged)."""
+        ...
+
+    def record_run_paused(
+        self,
+        program_run_id: int,
+        run_revision: int,
+        paused: bool,
+        held_node_instance_ids: Sequence[str] = (),
+    ) -> None:
+        """As ``set_run_paused``, but memory only: nothing is sent here; the
+        Run's tick sends it (``resend_run_pause``)."""
         ...
 
 
@@ -623,14 +642,13 @@ class ProgramRunScopeSnapshot:
     the Program owner.
     """
 
-    program_run_id: str
+    program_run_id: int
     state: ProgramRunScopeState
     active_operation_count: int | None
     reason_code: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.program_run_id, str) or not self.program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+        require_run_number(self.program_run_id)
         if not isinstance(self.state, ProgramRunScopeState):
             raise TypeError("Program-run scope state is invalid")
         if self.active_operation_count is not None and (
@@ -661,14 +679,16 @@ class ProgramRunScopePort(Protocol):
 
     def request_stop(
         self,
-        program_run_id: str,
-        stop_request_id: str,
+        program_run_id: int,
+        stop_request_key: bytes,
         reason: str | None,
-    ) -> ProgramRunScopeSnapshot: ...
+    ) -> ProgramRunScopeSnapshot:
+        """Forced Program End: the runner's own program-run Stop."""
+        ...
 
-    def observe(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+    def observe(self, program_run_id: int) -> ProgramRunScopeSnapshot: ...
 
-    def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
+    def execution_scope(self, program_run_id: int) -> Mapping[str, Any]:
         """Read the exact Kernel capture and current indexed node holds."""
         ...
 
@@ -677,8 +697,8 @@ class ProgramRunScopePort(Protocol):
         ...
 
     def retire_held_preparations(
-        self, program_run_id: str, selected_node_ids: frozenset[str],
-        expected_selection_revision: int,
+        self, program_run_id: int, selected_node_ids: frozenset[str],
+        expected_hold_revision: int,
     ) -> None:
         """Retire exact cancelled unsent preparations before selected release.
 
@@ -688,15 +708,17 @@ class ProgramRunScopePort(Protocol):
         ...
 
     def release_selection(
-        self, request: Mapping[str, Any], expected_selection_revision: int
+        self, request: Mapping[str, Any], expected_hold_revision: int
     ) -> Mapping[str, Any]:
-        """Release only that selection after its accepted effects are retired."""
+        """Release only that selection after its accepted effects are retired;
+        return the reply's scope (its ``hold_revision`` is the revision after
+        the release). A refusal raises ProgramSelectionReleaseRejectedError."""
         ...
 
     def start_selection(
-        self, request: Mapping[str, Any], expected_selection_revision: int
+        self, request: Mapping[str, Any], expected_hold_revision: int
     ) -> Mapping[str, Any]:
-        """Release only the selected initial Ready nodes."""
+        """Release only the selected initial Ready nodes (as release_selection)."""
         ...
 
     def check_node_motion_attention(self, request: Mapping[str, Any]) -> None:
@@ -705,15 +727,17 @@ class ProgramRunScopePort(Protocol):
         so."""
         ...
 
-    def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
-        """Capture the Program Stop; None means no Program-scope fence."""
+    def release_halt(
+        self, program_run_id: int, *, expected_hold_revision: int
+    ) -> Mapping[str, Any] | None:
+        """Execute after Halt (host ``release_halt``): lower the run's frozen
+        level at exactly ``expected_hold_revision``; return the reply's scope
+        (its ``hold_revision`` is the revision after the release), or None
+        when the run is not the Kernel's current run (no effect). A refusal
+        raises ProgramSelectionReleaseRejectedError."""
         ...
 
-    def release_stop(
-        self, program_run_id: str, *, expected_stop: tuple[str, int] | None = None
-    ) -> ProgramRunScopeSnapshot: ...
-
-    def reset(self, program_run_id: str) -> ProgramRunScopeSnapshot: ...
+    def reset(self, program_run_id: int) -> ProgramRunScopeSnapshot: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,7 +749,7 @@ class ProgramInterventionSnapshot:
     message: str
     policy_parameter: str
     owner_port_name: str | None = None
-    owner_task_id: str | None = None
+    owner_task_id: int | str | None = None
     owner_assessment: Mapping[str, Any] | None = None
     # The failure's bounded details and origin; both None when the
     # intervention does not describe a failure (an operator Stop).
@@ -762,11 +786,13 @@ class ProgramInterventionSnapshot:
         ):
             raise ValueError("owner_port_name must be bounded non-empty text")
         if self.owner_task_id is not None and (
-            not isinstance(self.owner_task_id, str)
-            or not self.owner_task_id
-            or len(self.owner_task_id.encode("utf-8")) > 512
+            not is_task_id(self.owner_task_id)
+            or (
+                isinstance(self.owner_task_id, str)
+                and len(self.owner_task_id.encode("utf-8")) > 512
+            )
         ):
-            raise ValueError("owner_task_id must be bounded non-empty text")
+            raise ValueError("owner_task_id must be an operation number or bounded text")
         if self.owner_assessment is not None:
             if not isinstance(self.owner_assessment, Mapping):
                 raise TypeError("owner_assessment must be absent or a mapping")
@@ -781,7 +807,7 @@ class ProgramInterventionPort(Protocol):
     """Record and read authored intervention without owning Kernel Pause."""
 
     def register_run(
-        self, program_run_id: str, node_instance_ids: Collection[str]
+        self, program_run_id: int, node_instance_ids: Collection[str]
     ) -> None: ...
 
     def require(
@@ -792,23 +818,23 @@ class ProgramInterventionPort(Protocol):
         message: str,
         policy_parameter: str,
         owner_port_name: str | None = None,
-        owner_task_id: str | None = None,
+        owner_task_id: int | str | None = None,
         owner_assessment: Mapping[str, Any] | None = None,
         details: Mapping[str, Any] | None = None,
         origin: Mapping[str, Any] | None = None,
     ) -> ProgramInterventionSnapshot: ...
 
-    def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None: ...
+    def read(self, program_run_id: int) -> ProgramInterventionSnapshot | None: ...
 
     def read_all(
-        self, program_run_id: str
+        self, program_run_id: int
     ) -> tuple[ProgramInterventionSnapshot, ...]: ...
 
     def read_holds(
-        self, program_run_id: str
+        self, program_run_id: int
     ) -> tuple[ProgramInterventionSnapshot, ...]: ...
 
-    def has_operator_stop(self, program_run_id: str) -> bool: ...
+    def has_operator_stop(self, program_run_id: int) -> bool: ...
 
     def refresh_owner_assessment(
         self,
@@ -828,15 +854,7 @@ class ProgramInterventionPort(Protocol):
         self, identity: NodeAttemptIdentity
     ) -> tuple[str, object] | None: ...
 
-    def release(self, program_run_id: str) -> None: ...
-
-
-class PersistentValueUncertainError(RuntimeError):
-    """The register applied a change that may not survive a crash.
-
-    Unlike other register failures the change did happen, so the value store
-    shows it too; the register refuses further changes until reconciled.
-    """
+    def release(self, program_run_id: int) -> None: ...
 
 
 class PersistentKeyRegisterPort(Protocol):
@@ -881,10 +899,12 @@ class PersistentKeyRegisterPort(Protocol):
         *,
         edit: Mapping[str, Any] | None = None,
     ) -> None:
-        """Durably store one value before the write is reported; raise on failure.
+        """Store one value before the write is reported; raise on failure.
 
-        ``edit`` is the write's metadata (run, node, attempt or request
-        identity), audited with the change.
+        A node's write (``edit`` names a node instance) is written to disk
+        afterwards; any other write is in the file before it returns. ``edit`` is
+        the write's metadata (run, node, attempt or request identity),
+        audited with the change.
         """
         ...
 
@@ -951,15 +971,49 @@ def recovery_outcome(result: object) -> bool | None:
     return result["accepted"]
 
 
-def request_identity(prefix: str, *coordinates: str) -> str:
-    """A request identity that is exact for these coordinates."""
+SCENE_CONTEXT_KINDS: Final = frozenset({"run", "apply"})
 
-    digest = sha256(b"\x00".join(value.encode("utf-8") for value in coordinates))
-    return f"{prefix}:{digest.hexdigest()}"
+_JSON_INTEGER_MAX: Final = 9_007_199_254_740_991
+
+
+def require_operation_number(value: object, *, field: str = "operation_id") -> int:
+    """A Kernel operation number: a positive JSON integer."""
+
+    if type(value) is not int or not 0 < value <= _JSON_INTEGER_MAX:
+        raise ValueError(f"{field} must be a positive operation number")
+    return value
+
+
+def is_task_id(value: object) -> bool:
+    """An owner task id: the Kernel operation number of an admitted
+    operation, or the non-empty key text of a task with no operation."""
+
+    return (type(value) is int and 0 < value <= _JSON_INTEGER_MAX) or (
+        isinstance(value, str) and bool(value)
+    )
+
+
+def scene_context_id(context: ProgramRunPortContext) -> tuple[str, int]:
+    """The scene context id: (kind, number), kind "run" or "apply"."""
+
+    return context.context_kind, context.program_run_id
+
+
+def require_run_number(value: object, *, field: str = "program_run_id") -> int:
+    """A run number: the runner's positive integer cycle generation."""
+
+    if type(value) is not int or not 0 < value < 1 << 56:
+        raise ValueError(f"{field} must be a positive run number")
+    return value
 
 
 __all__ = [
     "NodeAdapterPorts",
+    "require_run_number",
+    "require_operation_number",
+    "is_task_id",
+    "scene_context_id",
+    "SCENE_CONTEXT_KINDS",
     "NodeAttemptIdentity",
     "NodeAttemptSource",
     "CompositeProgramRunContextPort",
@@ -978,7 +1032,6 @@ __all__ = [
     "MockSimulationPort",
     "MockSimulationRefusedError",
     "PersistentKeyRegisterPort",
-    "PersistentValueUncertainError",
     "OwnerInvocationPort",
     "OwnerInvocationResult",
     "OwnerInvocationPendingError",

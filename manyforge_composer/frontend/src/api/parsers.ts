@@ -28,7 +28,6 @@ export {
   parseDeploymentWorkspaceResponse,
   parseCurrentScenarioResponse,
   parseAppliedProgramSelection,
-  parseProgramWorkspaceTransitionResponse,
   parseAuthoringWorkspaceIdentity,
   parseAuthoringWorkspaceContainment,
 } from './parsers/workspace';
@@ -42,8 +41,6 @@ export {
   parseProgramRuntimeControlsSnapshot,
   parseProgramRuntimeControlProjection,
   parsePersistentKeyValues,
-  parsePersistentKeyEdit,
-  parsePersistentKeyValuesCleared,
   parseExpressionCheckResult,
   parseNodeEnvironmentResponse,
   parseRuntimeScaleControlStatus,
@@ -61,6 +58,13 @@ export {
   parseFileBrowserResponse,
   parseSceneUrdfManifest,
 } from './parsers/scene';
+export {
+  parseActivationPreparationStatus,
+  parseApplyCommandReply,
+  parseApplyCommands,
+  parseProgramCommandReply,
+  parseRunnerCommands,
+} from './parsers/commandRows';
 export {
   parseHeadlessRuntimeSnapshot,
   parseOperatorAlarmSnapshot,

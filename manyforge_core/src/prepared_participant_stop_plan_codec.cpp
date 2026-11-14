@@ -6,6 +6,7 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/stop_timing.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -548,13 +549,15 @@ struct BaseWireRows final {
   CanonicalValue::Object fields{
       {"api_version", CanonicalValue(std::string(kPreparedParticipantStopPlanApiVersion))},
       {"resolved_stop_base_plan_id", CanonicalValue(plan.resolved_stop_base_plan_id.value())},
-      {"operation_id", CanonicalValue(plan.operation_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(plan.operation_id.value()))},
       {"operation_revision", safe_unsigned(plan.operation_revision.value())},
-      {"participant_id", CanonicalValue(plan.participant_id.value())},
+      {"participant_id", OperationParticipantIdValue(plan.participant_id)},
       {"program_id", CanonicalValue(plan.program_id.value())},
       {"program_revision", CanonicalValue(plan.program_revision.value())},
       {"program_binding_id", CanonicalValue(plan.program_binding_id.value())},
-      {"program_run_id", CanonicalValue(plan.program_run_id.value())},
+      {"program_run_id", plan.program_run_id
+                             ? CanonicalValue(static_cast<double>(plan.program_run_id->value()))
+                             : CanonicalValue(nullptr)},
       {"participant_stop_profile_purpose",
        CanonicalValue(std::string(to_string(plan.participant_stop_profile_purpose)))},
       {"stage_commands", CanonicalValue(std::move(stages))}};
@@ -593,12 +596,18 @@ struct BaseWireRows final {
 }
 
 void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
-  require_identifier(context.operation_id.value(), "operation ID is invalid");
+  if (!context.operation_id.nonzero() ||
+      context.operation_id.value() > kMaximumSafeUnsignedInteger) {
+    fail("operation ID is invalid");
+  }
   if (!context.operation_revision.nonzero() ||
       context.operation_revision.value() > kMaximumSafeUnsignedInteger) {
     fail("operation revision is invalid");
   }
-  require_identifier(context.participant_id.value(), "participant ID is invalid");
+  if (!context.participant_id.nonzero() ||
+      context.participant_id.operation_id.value() > kMaximumSafeUnsignedInteger) {
+    fail("participant ID is invalid");
+  }
   require_identifier(context.program_id.value(), "program ID is invalid");
   if (!content_identity::is_sha256_digest(context.program_revision.value())) {
     fail("program revision is invalid");
@@ -606,7 +615,10 @@ void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
   if (!content_identity::is_sha256_digest(context.program_binding_id.value())) {
     fail("Program Binding ID is invalid");
   }
-  require_identifier(context.program_run_id.value(), "program run ID is invalid");
+  if (context.program_run_id && (!context.program_run_id->nonzero() ||
+                                 context.program_run_id->value() > 9'007'199'254'740'991ULL)) {
+    fail("program run ID is invalid");
+  }
   if (to_string(context.participant_stop_profile_purpose).empty()) {
     fail("participant Stop profile purpose is invalid");
   }
@@ -704,7 +716,7 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
                                         verified_base_plan.resolved_stop_base_plan_id,
                                         std::move(context.operation_id),
                                         context.operation_revision,
-                                        std::move(context.participant_id),
+                                        context.participant_id,
                                         std::move(context.program_id),
                                         std::move(context.program_revision),
                                         std::move(context.program_binding_id),

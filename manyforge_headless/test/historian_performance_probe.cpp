@@ -25,6 +25,8 @@ using namespace manyforge::headless;
 using manyforge::content_identity::canonical_json;
 using manyforge::content_identity::CanonicalValue;
 using Clock = std::chrono::steady_clock;
+/// The application start the probe's store writes for.
+constexpr std::string_view kProbeStart = "0123456789abcdef";
 
 struct Scratch final {
   std::filesystem::path path;
@@ -67,7 +69,7 @@ CanonicalValue Payload(const std::string& profile) {
   return CanonicalValue(
       CanonicalValue::Object{{"clock_owner", CanonicalValue("history-perf.1")},
                              {"message", CanonicalValue("qualification error")},
-                             {"program_run_id", CanonicalValue("run.history-perf")},
+                             {"program_run_id", CanonicalValue(1.0)},
                              {"value", std::move(data)}});
 }
 
@@ -210,9 +212,9 @@ CanonicalValue AsyncProfile() {
   std::uint64_t index = 0;
   for (const auto gap : {std::chrono::milliseconds(0), std::chrono::milliseconds(50)}) {
     Scratch scratch;
-    const auto path = scratch.path / "history.sqlite3";
+    const auto path = SqliteEventHistoryStore::DatabasePath(scratch.path);
     auto store = std::make_shared<MeasuringStore>(
-        std::make_shared<SqliteEventHistoryStore>(path, 100000U), path.string() + "-wal");
+        std::make_shared<SqliteEventHistoryStore>(scratch.path, std::string(kProbeStart), 100000U), path.string() + "-wal");
     AsyncEventHistorian historian(store, kDefaultHistorianQueueCapacity, gap);
     CanonicalValue::Object phases;
     struct Load { const char* name; std::size_t events; double rate; std::size_t error_every; };
@@ -278,7 +280,7 @@ int main(int argc, char** argv) {
     Scratch scratch;
     // The capture soak uses a 1000-row partition limit so that ordinary
     // pruning runs in both partitions alongside protected captures.
-    SqliteEventHistoryStore store(scratch.path / "history.sqlite3",
+    SqliteEventHistoryStore store(scratch.path, std::string(kProbeStart),
                                   profile == "rows" ? 1000000 : profile == "capture" ? 1000 : 100000);
     // The capture soak uses the small payload: large text makes FTS
     // trigram indexing, not capture protection, dominate the measurement.

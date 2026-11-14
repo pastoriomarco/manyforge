@@ -49,6 +49,7 @@ extract_cmake_version() {
 
 check "manyforge_core CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_core/CMakeLists.txt")"
 check "manyforge_content_identity CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_content_identity/CMakeLists.txt")"
+check "manyforge_private_stream CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_private_stream/CMakeLists.txt")"
 check "manyforge_persistence CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_persistence/CMakeLists.txt")"
 check "manyforge_scene CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_scene/CMakeLists.txt")"
 check "manyforge_component_manager CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/manyforge_component_manager/CMakeLists.txt")"

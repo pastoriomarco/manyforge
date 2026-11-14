@@ -46,7 +46,7 @@ RetainedCellRuntime::RetainedCellRuntime(
       participant_resolver_(input.kernel_config.participant_resolver) {
   if (clock_ == nullptr || scheduler_ == nullptr ||
       input.operation_journal_path.empty() ||
-      input.kernel_config.request_owner_epoch.empty() ||
+      input.kernel_config.application_start_id.value == 0U ||
       input.kernel_config.cell_id.empty()) {
     throw std::invalid_argument(
         "native cell owner has incomplete or externally owned Kernel inputs");

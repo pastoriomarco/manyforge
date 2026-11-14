@@ -18,7 +18,7 @@ inline ProjectionLeaseBindingDTO make_test_projection_binding() {
 
 inline ResolvedExecutionBindingDTO make_test_execution_binding(
     std::vector<std::string> joint_names = {"joint1", "joint2"},
-    std::string program_run_id = "run:test") {
+    std::optional<ProgramRunNumber> program_run_id = ProgramRunNumber(114U)) {
   std::vector<ResourceId> resources;
   resources.reserve(joint_names.size());
   for (const auto& joint_name : joint_names) {
@@ -29,14 +29,13 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
   const ModelInstanceId model_id("model:test");
   const ModelRevision model_revision("model-revision:test");
   ResolvedExecutionBindingDTO binding{
-      OperationId("operation:test"),
-      OperationParticipantId("participant:test"),
-      ControllerGoalId("controller-goal:test"),
-      ControllerGoalGeneration(1U),
+      OperationNumber(1001U),
+      OperationParticipantId{OperationNumber(1001U), 1U},
+      ControllerGoalId{OperationNumber(1001U), 1U, 1U},
       ProgramId("program:test"),
       ProgramRevision("program-revision:test"),
       ProgramBindingId("program-binding:test"),
-      ProgramRunId(std::move(program_run_id)),
+      program_run_id,
       component_id,
       ComponentTypeId("component-type:test"),
       ComponentTypeRevision("component-type-revision:test"),
@@ -93,9 +92,9 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
 }
 
 inline ExecuteRequestDTO make_test_execute_request(
-    std::vector<std::string> joint_names = {"joint1", "joint2"}, std::string program_run_id = "") {
-  return ExecuteRequestDTO(
-      make_test_execution_binding(std::move(joint_names), std::move(program_run_id)));
+    std::vector<std::string> joint_names = {"joint1", "joint2"},
+    std::optional<ProgramRunNumber> program_run_id = std::nullopt) {
+  return ExecuteRequestDTO(make_test_execution_binding(std::move(joint_names), program_run_id));
 }
 
 inline ControlledStateDTO make_test_controlled_state(

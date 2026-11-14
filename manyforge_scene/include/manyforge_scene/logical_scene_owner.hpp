@@ -23,16 +23,23 @@ class CanonicalEmptyRetainedBundleAdmission;
 class IVerifiedRetainedBundleSource;
 } // namespace manyforge::deployment
 
+namespace manyforge::persistence {
+class SqliteRecordWriter;
+} // namespace manyforge::persistence
+
 namespace manyforge::scene {
 
 inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.r8f2.v10";
-/// v10: provider evidence holds provider identity only (see
-/// `ConvertProviderObservationEvidence`); no schema object changed.
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 10;
+    "manyforge.internal.logical-scene.r8f2.v12";
+/// v11: Scene requests are keyed by their 16-byte request key (contract 1.4);
+/// the request owner epoch is gone; the store holds no migration-result state
+/// (every start begins with a fresh store). A store of any other version is refused,
+/// never converted. v12: metadata `records_lost`, set by the record writer when
+/// records of this start were not written.
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 12;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -40,7 +47,6 @@ inline constexpr std::int64_t kMaximumSceneStoreDatabasePageImageBytes =
     64LL * 1024LL * 1024LL;
 inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
     16LL * 1024LL * 1024LL;
-inline constexpr std::size_t kMaximumMigratedStructuralCompletions = 256U;
 inline constexpr std::size_t kMaximumNativeProjectionBindings = 256U;
 inline constexpr std::size_t kMaximumMaintenanceInitializations = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
@@ -117,7 +123,6 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   std::int64_t acceptance_row_count;
   std::int64_t rebuild_row_count;
   std::int64_t finalization_row_count;
-  std::int64_t migrated_structural_completion_count;
   std::int64_t transaction_intent_count;
   std::int64_t request_outcome_count;
   std::int64_t projection_attempt_count;
@@ -127,13 +132,10 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   CanonicalEmptySceneAccessStatus access;
 };
 
-/// Private continuation input, captured and sealed by the original Manager
-/// Apply plan before effects. Manager checks the complete plan and actual child
-/// proofs under its exact held-predecessor interlock before either owner call.
-/// Scene independently verifies the current Scene, candidate, bindings and
-/// still-held parent. This value and durable readback are never authority.
-using QualifiedSceneProductAdoptionRequest =
-    manyforge::core::QualifiedSceneProductAdoptionRequestDTO;
+/// Private continuation input, captured by the original Manager Apply before
+/// effects. Scene independently verifies the current Scene, candidate,
+/// bindings and still-held parent. This value and durable readback are never
+/// authority.
 using QualifiedSceneConfigurationAdoptionRequest =
     manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO;
 
@@ -212,6 +214,20 @@ public:
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver,
       manyforge::core::IKernelCellAdmissionPort &cell_admission);
+  /// The store's file is written afterwards through `record_writer`, which
+  /// its owner drains before Close. With nullptr the owner writes through a
+  /// writer of its own, drained by Close.
+  LogicalSceneOwner(
+      std::filesystem::path database_path,
+      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
+          &admission,
+      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
+      const manyforge::deployment::IVerifiedRetainedBundleSource
+          &retained_bundle_source,
+      const manyforge::core::IPlannerSceneProjectionResolver
+          &projection_resolver,
+      manyforge::core::IKernelCellAdmissionPort &cell_admission,
+      manyforge::persistence::SqliteRecordWriter *record_writer);
   ~LogicalSceneOwner() override;
 
   LogicalSceneOwner(LogicalSceneOwner &&) noexcept;
@@ -267,25 +283,9 @@ public:
   ReadMaintenanceInitialization(
       const manyforge::core::ProjectionMaintenanceInitializationQueryDTO
           &query) const override;
-  /// Qualifies and durably captures the exact current logical snapshot for an
-  /// already healthy changed product. No native/world effect or Scene mutation.
-  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
-  BeginQualifiedProductAdoption(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
-          &held_fence);
-  /// Completes only with the genuine current publication and still-held parent.
-  /// Exact readback uses ReadMaintenanceInitialization and never resumes work.
-  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
-  CompleteQualifiedProductAdoption(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
-      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
-          &held_fence);
   /// Only the original captured Manager operation may call these entries while
   /// retaining its operation lifetime, cell claim and configuration fence.
-  /// Remote reads detect uncertainty; they neither create a held view nor
-  /// freeze child status. A failed response must stop parent progression and
+  /// Remote reads detect uncertainty; they do not freeze child status. A failed response must stop parent progression and
   /// retain exclusions, including when this owner's commit already succeeded.
   /// Stages candidate-only native projections from the exact preserved Scene.
   /// This original-operation effect is consumed once by Manager. Accepted
@@ -294,25 +294,6 @@ public:
   /// Stage/READ use the original persisted Acquire attempt's held-presence
   /// read before candidate configurations exist. Manager must already join
   /// that attempt and its full acceptance to the original live operation.
-  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
-  StageOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
-      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
-  [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
-  ReadOriginalManagerProductAdoptionProjectionHealth(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
-      const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt);
-  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
-  BeginOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
-  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
-  CompleteOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequest &request,
-      const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
-      const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
   /// Original configuration-only Manager preservation. The producer joins the
   /// full persisted intent/direct or authoring claim and retains its lifetime;
   /// copied request/status values never authorize a replacement continuation.
@@ -335,6 +316,16 @@ public:
       const QualifiedSceneConfigurationAdoptionRequest &request,
       const manyforge::core::ActiveBundlePublicationReceiptDTO &publication,
       const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence);
+  /// Ends the adoption of an Apply that ended failed, so none outlives its
+  /// Apply. With `publication` (the current head, naming the row's target)
+  /// the adoption is completed; without, it ends without publication. A
+  /// completed or absent adoption is left as it is. Makes no Kernel, host or
+  /// native call.
+  void EndOriginalManagerConfigurationAdoption(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      const std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO>
+          &publication) override;
   [[nodiscard]] manyforge::core::ProjectionAggregateHealthDTO
   ActiveProjectionHealth() const override;
 
@@ -353,8 +344,6 @@ public:
   [[nodiscard]] manyforge::core::Result<manyforge::core::SceneCandidatePreviewDTO>
   PreviewResolvedSceneCandidate(
       const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request) const;
-  [[nodiscard]] manyforge::core::RequestOwnerEpoch
-  CurrentRequestOwnerEpoch() const override;
   [[nodiscard]] manyforge::core::ProjectionRevisionDTO
   CurrentProjectionRevision() const override;
   [[nodiscard]] std::shared_ptr<const manyforge::core::LogicalSceneSnapshotDTO>
@@ -374,43 +363,36 @@ public:
   [[nodiscard]] std::optional<manyforge::core::LogicalSceneSnapshotRoot>
   ReadActiveSnapshot() const;
   [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;
+  /// The file bytes the held rows can take, an over-count; folding and
+  /// eviction keep it within the page image less a reserve while anything
+  /// can give way.
+  [[nodiscard]] std::uint64_t record_file_bytes() const;
 
+  /// Drains an owned writer, then checkpoints and closes the file. Later
+  /// calls fail with LogicalSceneOwnerClosedError.
   void Close();
 
 private:
   template <typename Request>
   [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>
-  OriginalManagerProductAdoptionProjectionHealthImpl(
+  OriginalManagerAdoptionProjectionHealthImpl(
       const Request &request,
       const manyforge::core::IManagerKernelApplyFencePort &original_parent_fence,
       const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &original_fence_attempt,
       bool stage);
   template <typename Request>
   [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
-  BeginQualifiedProductAdoptionImpl(
+  BeginQualifiedAdoptionImpl(
       const Request &request,
-      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView *held_fence,
       const manyforge::core::IManagerKernelApplyFencePort *original_parent_fence);
   template <typename Request>
   [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
   CompleteMaintenanceInitializationImpl(
       const manyforge::core::ProjectionMaintenanceCompletionDTO &completion,
       const Request *adoption,
-      const manyforge::core::IManagerKernelApplyFencePort::HeldStatusView
-          *held_fence,
       const manyforge::core::IManagerKernelApplyFencePort *original_parent_fence);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-/// Read-only native-Kernel settlement check for an exact authored-scene
-/// claim. It never initializes, migrates, locks, checkpoints, or mutates the
-/// scene owner database.
-[[nodiscard]] manyforge::core::Result<void>
-ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::CellAdmissionClaimDTO &claim,
-    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
 
 } // namespace manyforge::scene

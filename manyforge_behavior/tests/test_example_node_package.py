@@ -28,8 +28,6 @@ from manyforge_behavior.orchestration_values import (
 from manyforge_behavior.program import Program
 from manyforge_behavior.program_runtime import ProgramRunAttemptSource
 
-# The Runner's execution transport timeout handed to owner task nodes.
-_TRANSPORT_TIMEOUT_S = 30.0
 _TARGET = {"component_id": "lite6_robot", "command_target_id": "arm"}
 _FRAME = {"component_id": "lite_gripper", "frame_id": "tcp"}
 
@@ -60,7 +58,7 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
         api_version="manyforge.program.v3",
     )
     program = Program.from_dict(document, environment.catalog)
-    context = NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    context = NodeAdapterBuildContext(
         name="height",
         node_instance_id="height",
         parameters=parameters,
@@ -69,7 +67,7 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
             catalog=environment.catalog,
             value_store=ProgramValueStore.from_program(program),
         ),
-        attempt_source=ProgramRunAttemptSource("run.extension"),
+        attempt_source=ProgramRunAttemptSource(1),
         ports=NodeAdapterPorts(model_queries=port),
     )
     row = environment.registry.record(extension.NODE_ID)

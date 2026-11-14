@@ -28,11 +28,12 @@ from manyforge_headless_api.alarm_attention import (
     OperatorAlarmAttentionPublisher,
 )
 from manyforge_headless_api.cell_admission import (
-    EXECUTION_CONTROL_SOCKET_FILE,
+    EXECUTION_COMPONENT_SOCKET_FILE,
     MAXIMUM_RESPONSE_BYTES,
     CellAdmissionClient,
 )
 from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionEventPump
+from manyforge_headless_api.manager_status_stream import ManagerStatusFollower
 from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 from manyforge_headless_api.process_tests.test_process_stack import (
     keep_failure_evidence,
@@ -55,10 +56,10 @@ _PUBLISH_COMMAND = b'"command":"cell_admission_publish_operator_alarm_attention"
 
 
 class _KernelRelay:
-    """Same-user relay in front of the real native host's control socket.
+    """Same-user relay in front of the real native host's component socket.
 
-    The attention heartbeat is published beside Stop on the control socket,
-    so that is the socket the relay serves and forwards to.
+    The attention heartbeat is published on the component socket, so that is
+    the socket the relay serves and forwards to.
 
     It forwards every packet unchanged and records, for each publication, when
     the request arrived and when the Kernel's acceptance came back. A
@@ -71,7 +72,7 @@ class _KernelRelay:
         run_root.mkdir(mode=0o700)
         self.run_root = run_root
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        path = run_root / EXECUTION_CONTROL_SOCKET_FILE
+        path = run_root / EXECUTION_COMPONENT_SOCKET_FILE
         self._listener.bind(str(path))
         os.chmod(path, 0o600)
         self._listener.listen(16)
@@ -242,31 +243,40 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
     period, deadline = PUBLICATION_PERIOD_SECONDS, PUBLICATION_DEADLINE_SECONDS
     with _native_host_stack() as stack:
         relay = _KernelRelay(
-            stack.execution_run_root / EXECUTION_CONTROL_SOCKET_FILE,
+            stack.execution_run_root / EXECUTION_COMPONENT_SOCKET_FILE,
             stack.root / "attention-relay-run",
         )
         core = NativeHeadlessCore(
             HeadlessApiConfig(
-                projection_root=stack.publication_root,
                 install_root=stack.package_root,
                 artifact_root=stack.artifact_root,
                 node_catalog_path=NODE_CATALOG,
                 node_environment_manifest_path=NODE_ENVIRONMENT_MANIFEST,
                 alarm_catalog_path=CATALOG,
-                historian_database_path=stack.history_database,
+                historian_directory=stack.history_directory,
                 manager_run_root=stack.manager_run_root,
                 execution_run_root=stack.execution_run_root,
                 cell_id=CELL_ID,
-                owner_id="headless-api.attention-qualification",
+                application_start_id=stack.application_start_id,
                 freshness_milliseconds=120_000,
             )
         )
         source = _TimedAttentionSource(core)
-        # Production composition: the event pump drives the alarm-source
-        # refresh; the publisher reaches the Kernel through the relay.
+        # Production composition: the Manager status follower keeps the
+        # core's Manager mirror current (OD-216), the event pump drives the
+        # alarm-source refresh; the publisher reaches the Kernel through the
+        # relay.
+        manager_status = ManagerStatusFollower(
+            core,
+            stack.manager_run_root,
+            silence_seconds=120.0,
+            on_control_change=lambda: None,
+            on_viewer_change=lambda: None,
+        )
         pump = ExecutionEventPump(
             core,
             ExecutionCommandClient(stack.execution_run_root, timeout_seconds=1.0),
+            application_start_id=stack.application_start_id,
             poll_seconds=0.1,
         )
         publisher = OperatorAlarmAttentionPublisher(
@@ -305,6 +315,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             return requested, accepted
 
         loaders: list[threading.Thread] = []
+        manager_status.start()
         pump.start()
         try:
             publisher.start()
@@ -360,6 +371,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             load_stop.set()
             publisher.shutdown()
             pump.shutdown()
+            manager_status.shutdown()
             core.shutdown()
             relay.close()
         counts = publisher.counts

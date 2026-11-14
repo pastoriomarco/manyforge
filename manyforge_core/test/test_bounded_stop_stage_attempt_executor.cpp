@@ -13,19 +13,29 @@ namespace {
 
 using namespace std::chrono_literals;
 
+// Participant ordinals the fake port reacts to.
+constexpr std::uint32_t kBlocked = 1U;
+constexpr std::uint32_t kCancelled = 2U;
+constexpr std::uint32_t kFast = 3U;
+constexpr std::uint32_t kFirst = 4U;
+constexpr std::uint32_t kSecond = 5U;
+constexpr std::uint32_t kOverflow = 6U;
+constexpr std::uint32_t kClosed = 7U;
+constexpr std::uint32_t kSpring = 8U;
+constexpr std::uint32_t kOrdinary = 9U;
+constexpr std::uint32_t kCaptureAge = 10U;
+
 [[nodiscard]] std::shared_ptr<const ResolvedParticipantStopStageDTO> stage(
-    std::string participant) {
-  const auto operation_id = OperationId("operation.origin");
+    std::uint32_t ordinal) {
+  const auto operation_id = OperationNumber(1001U);
   const auto operation_revision = OperationRevision(1U);
-  const auto participant_id = OperationParticipantId(std::move(participant));
+  const OperationParticipantId participant_id{operation_id, ordinal};
   return std::make_shared<ResolvedParticipantStopStageDTO>(ResolvedParticipantStopStageDTO{
-      StopId("stop.origin"),
-      StopGeneration(1U),
+      StopEventId(1000U),
       operation_id,
       operation_revision,
       participant_id,
-      ControllerGoalId("goal.origin"),
-      ControllerGoalGeneration(1U),
+      ControllerGoalId{operation_id, ordinal, 1U},
       ControllableComponentId("component.fixture"),
       CommandTargetId("target.fixture"),
       CapabilityId("capability.fixture"),
@@ -53,7 +63,7 @@ using namespace std::chrono_literals;
                                      ProgramId("program.fixture"),
                                      ProgramRevision("program.revision"),
                                      ProgramBindingId("program.binding"),
-                                     ProgramRunId("program.run"),
+                                     ProgramRunNumber(106U),
                                      std::nullopt,
                                      ParticipantStopProfilePurposeDTO::kOrdinary,
                                      std::nullopt,
@@ -64,7 +74,7 @@ using namespace std::chrono_literals;
 
 [[nodiscard]] std::shared_ptr<const RemainingStopBudgetDTO> budget() {
   return std::make_shared<RemainingStopBudgetDTO>(
-      RemainingStopBudgetDTO{StopId("stop.origin"), StopGeneration(1U), 0, std::nullopt});
+      RemainingStopBudgetDTO{StopEventId(1000U), 0, std::nullopt});
 }
 
 [[nodiscard]] ParticipantStopStageResultDTO completed(
@@ -87,12 +97,12 @@ class IsolatedPort final : public IControlDomainExecutionPort {
   ParticipantStopStageResultDTO TranslateStopStage(const ResolvedParticipantStopStageDTO& request,
                                                    const RemainingStopBudgetDTO&,
                                                    std::stop_token cancellation) override {
-    if (request.participant_id.value() == "blocked") {
+    if (request.participant_id.ordinal == kBlocked) {
       std::unique_lock lock(mutex_);
       blocked_entered_ = true;
       changed_.notify_all();
       changed_.wait(lock, [this] { return release_blocked_; });
-    } else if (request.participant_id.value() == "cancelled") {
+    } else if (request.participant_id.ordinal == kCancelled) {
       std::unique_lock lock(mutex_);
       cancelled_entered_ = true;
       changed_.notify_all();
@@ -184,22 +194,22 @@ TEST(BoundedStopStageAttemptExecutorTest,
   EXPECT_EQ(executor.prequalified_max_live_participants(), 1U);
   EXPECT_TRUE(executor.prequalified_ready());
 
-  const auto blocked = executor.TryStart({&port, stage("blocked"), budget()});
+  const auto blocked = executor.TryStart({&port, stage(kBlocked), budget()});
   EXPECT_EQ(blocked.status, StopStageAttemptStartStatus::kStarted);
   EXPECT_TRUE(blocked.handle.has_value());
   EXPECT_TRUE(port.WaitBlocked());
 
-  const auto fast = executor.TryStart({&port, stage("fast"), budget()});
+  const auto fast = executor.TryStart({&port, stage(kFast), budget()});
   EXPECT_EQ(fast.status, StopStageAttemptStartStatus::kStarted);
   EXPECT_TRUE(fast.handle.has_value());
   EXPECT_TRUE(receiver.Wait(*fast.handle));
   EXPECT_EQ(receiver.Count(*fast.handle), 1U);
   auto fast_result = WaitForResult(executor, *fast.handle);
   EXPECT_EQ(fast_result.status, StopStageAttemptTakeStatus::kCompleted);
-  EXPECT_EQ(fast_result.result->request.participant_id, OperationParticipantId("fast"));
+  EXPECT_EQ(fast_result.result->request.participant_id, (OperationParticipantId{OperationNumber(1001U), kFast}));
   EXPECT_EQ(executor.Release(*fast.handle), StopStageAttemptReleaseStatus::kReleased);
 
-  const auto cancelled = executor.TryStart({&port, stage("cancelled"), budget()});
+  const auto cancelled = executor.TryStart({&port, stage(kCancelled), budget()});
   EXPECT_EQ(cancelled.status, StopStageAttemptStartStatus::kStarted);
   EXPECT_TRUE(cancelled.handle.has_value());
   EXPECT_TRUE(port.WaitCancelled());
@@ -223,14 +233,14 @@ TEST(BoundedStopStageAttemptExecutorTest,
   IsolatedPort port;
   CompletionReceiver receiver;
   BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
-  const auto first = executor.TryStart({&port, stage("first"), budget()});
+  const auto first = executor.TryStart({&port, stage(kFirst), budget()});
   EXPECT_TRUE(first.handle.has_value());
   auto first_result = WaitForResult(executor, *first.handle);
   EXPECT_EQ(first_result.status, StopStageAttemptTakeStatus::kCompleted);
   EXPECT_EQ(executor.TryTake(*first.handle).status, StopStageAttemptTakeStatus::kAlreadyTaken);
   EXPECT_EQ(executor.Release(*first.handle), StopStageAttemptReleaseStatus::kReleased);
 
-  const auto second = executor.TryStart({&port, stage("second"), budget()});
+  const auto second = executor.TryStart({&port, stage(kSecond), budget()});
   EXPECT_TRUE(second.handle.has_value());
   EXPECT_EQ(second.handle->slot, first.handle->slot);
   EXPECT_GT(second.handle->generation, first.handle->generation);
@@ -252,14 +262,14 @@ TEST(BoundedStopStageAttemptExecutorTest, FixedCapacityExhaustionAndClosedIngres
   handles.reserve(8U);
   for (std::size_t index = 0U; index < 8U; ++index) {
     const auto started = executor.TryStart(
-        {&port, stage(index == 0U ? "blocked" : "p" + std::to_string(index)), budget()});
+        {&port, stage(index == 0U ? kBlocked : static_cast<std::uint32_t>(100U + index)), budget()});
     EXPECT_EQ(started.status, StopStageAttemptStartStatus::kStarted);
     handles.push_back(*started.handle);
   }
-  EXPECT_EQ(executor.TryStart({&port, stage("overflow"), budget()}).status,
+  EXPECT_EQ(executor.TryStart({&port, stage(kOverflow), budget()}).status,
             StopStageAttemptStartStatus::kCapacityExhausted);
   executor.CloseIngress();
-  EXPECT_EQ(executor.TryStart({&port, stage("closed"), budget()}).status,
+  EXPECT_EQ(executor.TryStart({&port, stage(kClosed), budget()}).status,
             StopStageAttemptStartStatus::kClosed);
   port.ReleaseBlocked();
   for (const auto handle : handles) {
@@ -288,7 +298,7 @@ class SpringPointPort final : public IControlDomainExecutionPort {
       const ResolvedParticipantStopStageDTO& request, const RemainingStopBudgetDTO&,
       std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override {
     SpringBackReturnPointDTO point;
-    point.source_goal = {ControllerGoalId("source.goal"), ControllerGoalGeneration(7U)};
+    point.source_goal = ControllerGoalId{OperationNumber(901U), 1U, 7U};
     point.binding_epoch = ExecutionBindingEpoch(11U);
     point.trip.source_stamp_ns = 100;
     point.initial.command_path_time_s = 2.5;
@@ -334,7 +344,7 @@ TEST(BoundedStopStageAttemptExecutorTest,
   SpringPointPort port;
   CompletionReceiver receiver;
   BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
-  const auto started = executor.TryStart({&port, stage("spring"), budget(), true});
+  const auto started = executor.TryStart({&port, stage(kSpring), budget(), true});
   ASSERT_TRUE(started.handle);
   EXPECT_TRUE(port.WaitEntered());
   EXPECT_TRUE(port.FirstAccepted());
@@ -342,8 +352,7 @@ TEST(BoundedStopStageAttemptExecutorTest,
   const auto point = executor.ReadSpringReturnPoint(*started.handle);
   EXPECT_TRUE(point);
   if (point) {
-    EXPECT_EQ(point->source_goal.controller_goal_id, ControllerGoalId("source.goal"));
-    EXPECT_EQ(point->source_goal.controller_goal_generation, ControllerGoalGeneration(7U));
+    EXPECT_EQ(point->source_goal, (ControllerGoalId{OperationNumber(901U), 1U, 7U}));
     EXPECT_EQ(point->binding_epoch, ExecutionBindingEpoch(11U));
     EXPECT_EQ(point->initial.command_path_time_s, 2.5);
     EXPECT_EQ(point->initial.spring_back_return_point.positions_rad,
@@ -360,7 +369,7 @@ TEST(BoundedStopStageAttemptExecutorTest,
   EXPECT_FALSE(executor.ReadSpringReturnPoint(*started.handle));
 
   IsolatedPort ordinary;
-  const auto next = executor.TryStart({&ordinary, stage("ordinary"), budget()});
+  const auto next = executor.TryStart({&ordinary, stage(kOrdinary), budget()});
   ASSERT_TRUE(next.handle);
   EXPECT_EQ(next.handle->slot, started.handle->slot);
   EXPECT_GT(next.handle->generation, started.handle->generation);
@@ -378,7 +387,7 @@ TEST(BoundedStopStageAttemptExecutorTest,
   IsolatedPort port;
   CompletionReceiver receiver;
   BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
-  const auto started = executor.TryStart({&port, stage("ordinary"), budget(), true});
+  const auto started = executor.TryStart({&port, stage(kOrdinary), budget(), true});
   ASSERT_TRUE(started.handle);
   const auto result = WaitForResult(executor, *started.handle);
   EXPECT_EQ(result.status, StopStageAttemptTakeStatus::kCompleted);
@@ -440,9 +449,9 @@ TEST(BoundedStopStageAttemptExecutorTest, CapturesIngressAgeAfterQueueWithoutCha
     }
   } guard{clock, executor};
   auto timing = std::make_shared<RemainingStopBudgetDTO>(
-      RemainingStopBudgetDTO{StopId("stop.origin"), StopGeneration(1U), 40'000'000, 800'000'000});
+      RemainingStopBudgetDTO{StopEventId(1000U), 40'000'000, 800'000'000});
   const auto started = executor.TryStart(
-      {&port, stage("capture.age"), timing, false, &clock, 9'000'000'000});
+      {&port, stage(kCaptureAge), timing, false, &clock, 9'000'000'000});
   ASSERT_EQ(started.status, StopStageAttemptStartStatus::kStarted);
   ASSERT_TRUE(started.handle);
   ASSERT_TRUE(clock.WaitForRead());
@@ -479,8 +488,8 @@ TEST(BoundedStopStageAttemptExecutorTest, HandlesAreUniqueAcrossExecutorsAndName
   BoundedStopStageAttemptExecutor retired(8U, 1U, receiver);
   BoundedStopStageAttemptExecutor successor(8U, 1U, receiver);
 
-  const auto first = retired.TryStart({&port, stage("fast"), budget()});
-  const auto second = successor.TryStart({&port, stage("fast"), budget()});
+  const auto first = retired.TryStart({&port, stage(kFast), budget()});
+  const auto second = successor.TryStart({&port, stage(kFast), budget()});
   ASSERT_EQ(first.status, StopStageAttemptStartStatus::kStarted);
   ASSERT_EQ(second.status, StopStageAttemptStartStatus::kStarted);
   ASSERT_TRUE(first.handle.has_value());

@@ -1,4 +1,7 @@
--- ManyForge I4 typed canonical-empty bootstrap journal, version 1.
+-- ManyForge I4 typed canonical-empty bootstrap journal, version 2.
+--
+-- Version 2: metadata records_lost, set by the record writer when records of
+-- this start were not written.
 --
 -- This schema stores a bounded append-only sequence of bootstrap intents and
 -- each optional exact scene-owner accepted target. It has no Apply row,
@@ -6,12 +9,12 @@
 -- robot semantic.
 
 PRAGMA application_id = 1296450122;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE IF NOT EXISTS bootstrap_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_bootstrap_attempts INTEGER NOT NULL
@@ -29,7 +32,9 @@ CREATE TABLE IF NOT EXISTS bootstrap_journal_metadata (
             maximum_main_database_page_image_bytes > 0
             AND maximum_main_database_page_image_bytes
                 <= 9223372036854775807
-        )
+        ),
+    -- Set by the record writer when records of this start were not written.
+    records_lost INTEGER NOT NULL DEFAULT 0 CHECK (records_lost IN (0, 1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_bootstrap_intents (
@@ -91,8 +96,18 @@ CREATE TABLE IF NOT EXISTS manager_bootstrap_accepted_targets (
         )
 ) WITHOUT ROWID, STRICT;
 
+-- Every column but records_lost is immutable.
 CREATE TRIGGER IF NOT EXISTS bootstrap_journal_metadata_no_update
-BEFORE UPDATE ON bootstrap_journal_metadata
+BEFORE UPDATE OF
+    singleton,
+    schema_id,
+    schema_version,
+    schema_artifact_digest,
+    cell_id,
+    maximum_bootstrap_attempts,
+    maximum_execution_host_bindings_per_attempt,
+    maximum_main_database_page_image_bytes
+ON bootstrap_journal_metadata
 BEGIN
     SELECT RAISE(ABORT, 'bootstrap_journal_metadata is immutable');
 END;

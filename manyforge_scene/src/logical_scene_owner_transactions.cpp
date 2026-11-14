@@ -40,6 +40,48 @@ private:
   return acquired.value();
 }
 
+// The file bytes one more Scene transaction can take, error texts aside
+// (od212): its intent with `request_bytes` of request and the largest
+// resolved operation and candidate snapshot, its owner event, its outcome,
+// and an attempt and a result for each of `projections`, every identifier
+// and code at the identifier bound.
+std::uint64_t SceneTransactionFileBytesBound(const std::size_t request_bytes,
+                                             const std::size_t projections) {
+  constexpr std::size_t kIdentifier = kMaximumSceneStoreIdentifierBytes;
+  constexpr auto kInteger = std::numeric_limits<std::int64_t>::max();
+  const auto sized = [](const std::size_t integers,
+                        const std::vector<std::size_t> &texts,
+                        const std::size_t nulls) {
+    RecordSize size;
+    for (std::size_t index = 0U; index < integers; ++index) {
+      size.Integer(kInteger);
+    }
+    for (const auto bytes : texts) {
+      size.Text(bytes);
+    }
+    for (std::size_t index = 0U; index < nulls; ++index) {
+      size.Null();
+    }
+    return size.bytes();
+  };
+  std::vector<std::size_t> intent_texts{16U, kIdentifier, request_bytes,
+                                        kMaximumLogicalSceneTransactionBytes,
+                                        kMaximumLogicalSceneTransactionBytes};
+  intent_texts.insert(intent_texts.end(), 11U, kIdentifier);
+  auto bytes = SceneRowFileBytes(sized(4U, intent_texts, 0U),
+                                 SceneTable("logical_scene_transaction_intents"));
+  bytes += SceneRowFileBytes(sized(2U, {kIdentifier}, 0U),
+                             SceneTable("logical_scene_owner_events"));
+  bytes += SceneRowFileBytes(sized(3U, {16U, kIdentifier, kIdentifier}, 3U),
+                             SceneTable("logical_scene_request_outcomes"));
+  const auto per_projection =
+      SceneRowFileBytes(sized(2U, std::vector<std::size_t>(4U, kIdentifier), 0U),
+                        SceneTable("logical_scene_projection_attempts")) +
+      SceneRowFileBytes(sized(4U, std::vector<std::size_t>(6U, kIdentifier), 3U),
+                        SceneTable("logical_scene_projection_results"));
+  return bytes + projections * per_projection;
+}
+
 } // namespace
 } // namespace manyforge::scene::logical_scene_owner_detail
 
@@ -58,11 +100,11 @@ bool ExpectedProjectionAdmitsActive(const SceneTransactionRequestDTO &request,
 }
 
 SceneCommitResultDTO
-FailedSceneResult(const RequestId &request_id,
+FailedSceneResult(const RequestKey &request_key,
                   const core::RequestReplayStatusDTO replay, ErrorDTO error,
                   const SceneProjectionCommitStatusDTO projection_status) {
   SceneCommitResultDTO result{
-      request_id,        replay,       false,
+      request_key,       replay,       false,
       std::move(error),  std::nullopt, std::nullopt,
       projection_status, std::nullopt,
   };
@@ -1128,7 +1170,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
   return candidate;
 }
 
-void InsertSceneIntent(sqlite3 *database,
+void InsertSceneIntent(SceneStoreMemory &memory,
+                       persistence::SqliteRecord &statement,
                        const SceneTransactionRequestDTO &request,
                        const ContentDigest &request_digest,
                        const std::string_view request_json,
@@ -1138,7 +1181,7 @@ void InsertSceneIntent(sqlite3 *database,
   const auto resolved_json =
       logical_scene_codec_internal::EncodeResolvedOperation(
           transaction.resolved_operation);
-  const auto snapshot_json =
+  auto snapshot_json =
       logical_scene_codec_internal::EncodeSnapshot(candidate.snapshot);
   if (request_json.size() > kMaximumLogicalSceneTransactionBytes ||
       resolved_json.size() > kMaximumLogicalSceneTransactionBytes ||
@@ -1146,10 +1189,10 @@ void InsertSceneIntent(sqlite3 *database,
     throw LogicalSceneOwnerLimitError(
         "logical-scene transaction exceeds its durable byte bound");
   }
-  Statement statement(
-      database,
+  SizedRow row(
+      statement,
       "INSERT INTO logical_scene_transaction_intents("
-      "transaction_sequence,request_owner_epoch,request_id,request_digest,"
+      "transaction_sequence,request_key,request_digest,"
       "request_json,prior_retained_bundle_id,prior_graph_revision,"
       "prior_scene_id,prior_scene_revision_id,prior_scene_content_hash,"
       "proposed_retained_bundle_id,proposed_graph_revision,"
@@ -1157,74 +1200,76 @@ void InsertSceneIntent(sqlite3 *database,
       "proposed_scene_content_hash,resolved_operation_json,"
       "resolution_evidence_digest,candidate_snapshot_json,update_status,"
       "required_projection_count) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  statement.Bind(1, CheckedSafeCounter(transaction.transaction_sequence,
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  row.Bind(1, CheckedSafeCounter(transaction.transaction_sequence,
                                        "transaction_sequence"));
-  statement.Bind(2, request.request_context.request_owner_epoch.value());
-  statement.Bind(3, request.request_context.request_id.value());
-  statement.Bind(4, request_digest.value());
-  statement.Bind(5, request_json);
-  statement.Bind(
-      6, transaction.prior_projection_revision.retained_bundle_id.value());
-  statement.Bind(7,
+  BindRequestKey(row, 2, request.request_context.request_key);
+  row.Bind(3, request_digest.value());
+  row.Bind(4, request_json);
+  row.Bind(
+      5, transaction.prior_projection_revision.retained_bundle_id.value());
+  row.Bind(6,
                  transaction.prior_projection_revision.graph_revision.value());
-  statement.Bind(
-      8, transaction.prior_projection_revision.scene_revision.scene_id.value());
-  statement.Bind(
-      9, CheckedSafeCounter(
+  row.Bind(
+      7, transaction.prior_projection_revision.scene_revision.scene_id.value());
+  row.Bind(
+      8, CheckedSafeCounter(
              transaction.prior_projection_revision.scene_revision.revision_id,
              "prior scene revision"));
-  statement.Bind(10, transaction.prior_projection_revision.scene_revision
+  row.Bind(9, transaction.prior_projection_revision.scene_revision
                          .content_hash.value());
-  statement.Bind(
-      11, transaction.proposed_projection_revision.retained_bundle_id.value());
-  statement.Bind(
-      12, transaction.proposed_projection_revision.graph_revision.value());
-  statement.Bind(
-      13,
+  row.Bind(
+      10, transaction.proposed_projection_revision.retained_bundle_id.value());
+  row.Bind(
+      11, transaction.proposed_projection_revision.graph_revision.value());
+  row.Bind(
+      12,
       transaction.proposed_projection_revision.scene_revision.scene_id.value());
-  statement.Bind(
-      14,
+  row.Bind(
+      13,
       CheckedSafeCounter(
           transaction.proposed_projection_revision.scene_revision.revision_id,
           "proposed scene revision"));
-  statement.Bind(15, transaction.proposed_projection_revision.scene_revision
+  row.Bind(14, transaction.proposed_projection_revision.scene_revision
                          .content_hash.value());
-  statement.Bind(16, resolved_json);
+  row.Bind(15, resolved_json);
   if (transaction.resolution_evidence_digest.has_value()) {
-    statement.Bind(17, transaction.resolution_evidence_digest->value());
+    row.Bind(16, transaction.resolution_evidence_digest->value());
   } else {
-    statement.BindNull(17);
+    row.BindNull(16);
   }
-  statement.Bind(18, snapshot_json);
-  statement.Bind(19, core::to_string(candidate.update_status));
-  statement.Bind(20, static_cast<std::int64_t>(required_projection_count));
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene intent insert unexpectedly returned a row");
-  }
+  row.Bind(17, snapshot_json);
+  row.Bind(18, core::to_string(candidate.update_status));
+  row.Bind(19, static_cast<std::int64_t>(required_projection_count));
+  memory.transaction_file_bytes += SceneRowFileBytes(
+      row.record_bytes(), SceneTable("logical_scene_transaction_intents"));
+  memory.transactions.push_back(SceneTransactionRecord{
+      transaction.transaction_sequence,
+      request.request_context.request_key,
+      request_digest,
+      std::string(request_json),
+      transaction.prior_projection_revision,
+      transaction.proposed_projection_revision,
+      std::move(snapshot_json),
+      candidate.update_status,
+      required_projection_count,
+      0U,
+      {},
+  });
 }
 
-std::uint64_t NextSceneOwnerEventSequence(sqlite3 *database) {
-  const auto history = ReadBoundedHistoryState(database);
-  Statement statement(
-      database, "SELECT count(*),coalesce(max(owner_event_sequence),0) FROM "
-                "logical_scene_owner_events");
-  if (!statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene owner event aggregate is missing");
+std::uint64_t NextSceneOwnerEventSequence(const SceneStoreMemory &memory) {
+  const auto &history = memory.history;
+  std::uint64_t maximum = 0U;
+  for (const auto &event : memory.owner_events) {
+    maximum = std::max(maximum, event.owner_event_sequence);
   }
-  const auto count = statement.Integer(0);
-  const auto maximum = statement.Integer(1);
-  if (statement.Step() || count < 0 ||
-      count >= static_cast<std::int64_t>(kMaximumLogicalSceneOwnerEvents) ||
-      maximum < 0) {
+  if (memory.owner_events.size() >= kMaximumLogicalSceneOwnerEvents) {
     throw LogicalSceneOwnerLimitError(
         "logical-scene owner event ledger is exhausted or invalid");
   }
   const auto watermark =
-      std::max(static_cast<std::uint64_t>(maximum),
-               history.compacted_through_owner_event_sequence);
+      std::max(maximum, history.compacted_through_owner_event_sequence);
   if (watermark >= kMaximumSafeIntegral) {
     throw LogicalSceneOwnerLimitError(
         "logical-scene owner event sequence is exhausted");
@@ -1235,20 +1280,20 @@ std::uint64_t NextSceneOwnerEventSequence(sqlite3 *database) {
 } // namespace
 
 // Compaction is transparent to callers: it prunes the resident ledger behind
-// a checkpoint of the active head and keeps the request owner epoch in force,
-// so neither the triggering request nor any other caller has to refresh.
+// a checkpoint of the active head, so neither the triggering request nor any
+// other caller has to refresh. A commit compacts a non-empty ledger when it
+// is full or the next transaction would not fit the file bytes (od212).
 // A maintenance fold runs the same compaction before the bounded maintenance
 // history evicts a completion the replay would otherwise still consume; it
-// needs only a settled head, not a full ledger or an open maintenance window.
-void CompactSceneTransactionHistory(
-    sqlite3 *database, const DurableState &durable_state,
+// needs only a settled head, not a ledger or an open maintenance window.
+PreparedSceneHistoryCompaction PrepareSceneHistoryCompaction(
+    const SceneStoreMemory &memory, const DurableState &durable_state,
     const SceneTransactionStoreState &transactions,
     const bool maintenance_fold) {
   const auto access = AccessStatus(durable_state);
   if ((!maintenance_fold &&
        (!access.scene_writes_open || !access.projection_leases_open ||
-        transactions.resident_transaction_count <
-            kMaximumLogicalSceneTransactions ||
+        transactions.resident_transaction_count == 0U ||
         transactions.next_transaction_sequence <= 1U ||
         transactions.next_owner_event_sequence <= 1U)) ||
       durable_state.projection_desynchronized ||
@@ -1258,86 +1303,95 @@ void CompactSceneTransactionHistory(
     throw LogicalSceneOwnerConflictError(
         "logical-scene history compaction requires a settled quiescent head");
   }
-  const auto history = ReadBoundedHistoryState(database);
+  const auto &history = memory.history;
   if (history.compaction_generation >= kMaximumSafeIntegral) {
     throw LogicalSceneOwnerLimitError(
         "logical-scene history compaction generation is exhausted");
   }
   const auto next_compaction_generation = history.compaction_generation + 1U;
-  // The epoch never advances here. The first compaction records the bootstrap
-  // epoch (generation 2 is the schema's first compacted generation); a store
-  // that rotated before this rule keeps its last rotated epoch.
-  const auto request_epoch_generation =
-      history.request_epoch_generation == 0U
-          ? 2U
-          : history.request_epoch_generation;
-  const auto &request_owner_epoch = transactions.request_owner_epoch;
-  const auto snapshot_json = logical_scene_codec_internal::EncodeSnapshot(
+  auto snapshot_json = logical_scene_codec_internal::EncodeSnapshot(
       transactions.active_snapshot);
   if (snapshot_json.empty() ||
       snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
     throw LogicalSceneOwnerLimitError(
         "logical-scene checkpoint exceeds its canonical byte bound");
   }
+  static_cast<void>(
+      CheckedSafeCounter(next_compaction_generation, "compaction generation"));
+  static_cast<void>(CheckedSafeCounter(
+      transactions.active_projection.scene_revision.revision_id,
+      "checkpoint scene revision"));
+  auto next = history;
+  next.compaction_generation = next_compaction_generation;
+  // A maintenance fold may run before any Scene transaction (watermark 0).
+  next.compacted_through_transaction_sequence =
+      transactions.next_transaction_sequence - 1U;
+  next.compacted_through_owner_event_sequence =
+      transactions.next_owner_event_sequence - 1U;
+  next.compacted_maintenance_completion_count =
+      static_cast<std::size_t>(std::ranges::count_if(
+          durable_state.maintenance_initializations,
+          [](const MaintenanceInitializationState &initialization) {
+            return initialization.publication_receipt.has_value();
+          }));
+  next.checkpoint_projection = transactions.active_projection;
+  // The checkpoint as the file returns it.
+  next.checkpoint_snapshot =
+      logical_scene_codec_internal::DecodeSnapshot(snapshot_json);
+  return {std::move(next), std::move(snapshot_json)};
+}
 
-  Statement update(
-      database,
+void CompactSceneTransactionHistory(
+    SceneStoreMemory &memory, persistence::SqliteRecord &update,
+    PreparedSceneHistoryCompaction compaction,
+    const DurableState &durable_state,
+    const SceneTransactionStoreState &transactions) {
+  const auto &next = compaction.history;
+  update.Statement(
       "UPDATE logical_scene_history_state SET compaction_generation=?,"
-      "request_epoch_generation=?,request_owner_epoch=?,"
       "compacted_through_transaction_sequence=?,"
       "compacted_through_owner_event_sequence=?,"
-      "compacted_structural_completion_count=?,"
       "compacted_maintenance_completion_count=?,"
       "checkpoint_retained_bundle_id=?,checkpoint_graph_revision=?,"
       "checkpoint_scene_id=?,checkpoint_scene_revision_id=?,"
       "checkpoint_scene_content_hash=?,checkpoint_snapshot_json=?,"
       "compaction_in_progress=1 WHERE singleton=1 AND "
       "compaction_in_progress=0");
-  update.Bind(1, CheckedSafeCounter(next_compaction_generation,
-                                    "compaction generation"));
-  update.Bind(2, CheckedSafeCounter(request_epoch_generation,
-                                    "request epoch generation"));
-  update.Bind(3, request_owner_epoch.value());
-  // A maintenance fold may run before any Scene transaction (watermark 0).
+  update.Bind(1, static_cast<std::int64_t>(next.compaction_generation));
+  update.Bind(2, static_cast<std::int64_t>(
+                     next.compacted_through_transaction_sequence));
+  update.Bind(3, static_cast<std::int64_t>(
+                     next.compacted_through_owner_event_sequence));
   update.Bind(4, static_cast<std::int64_t>(
-                     transactions.next_transaction_sequence - 1U));
-  update.Bind(5, static_cast<std::int64_t>(
-                     transactions.next_owner_event_sequence - 1U));
-  update.Bind(6, static_cast<std::int64_t>(
-                     durable_state.migrated_structural_completions.size()));
-  update.Bind(7, static_cast<std::int64_t>(std::ranges::count_if(
-                     durable_state.maintenance_initializations,
-                     [](const MaintenanceInitializationState &initialization) {
-                       return initialization.publication_receipt.has_value();
-                     })));
-  update.Bind(8, transactions.active_projection.retained_bundle_id.value());
-  update.Bind(9, transactions.active_projection.graph_revision.value());
-  update.Bind(10,
-              transactions.active_projection.scene_revision.scene_id.value());
-  update.Bind(11, CheckedSafeCounter(
-                      transactions.active_projection.scene_revision.revision_id,
-                      "checkpoint scene revision"));
+                     next.compacted_maintenance_completion_count));
+  update.Bind(5, next.checkpoint_projection->retained_bundle_id.value());
+  update.Bind(6, next.checkpoint_projection->graph_revision.value());
+  update.Bind(7, next.checkpoint_projection->scene_revision.scene_id.value());
+  update.Bind(8, static_cast<std::int64_t>(
+                     next.checkpoint_projection->scene_revision.revision_id));
   update.Bind(
-      12, transactions.active_projection.scene_revision.content_hash.value());
-  update.Bind(13, snapshot_json);
-  if (update.Step() || sqlite3_changes(database) != 1) {
-    throw LogicalSceneOwnerConflictError(
-        "logical-scene history compaction state changed concurrently");
-  }
+      9, next.checkpoint_projection->scene_revision.content_hash.value());
+  update.Bind(10, compaction.checkpoint_snapshot_json);
+  update.ExpectChanges(1);
+  // The delete guards admit these deletes only while the flag is set.
+  update.Statement("DELETE FROM logical_scene_projection_results");
+  update.Statement("DELETE FROM logical_scene_projection_attempts");
+  update.Statement("DELETE FROM logical_scene_request_outcomes");
+  update.Statement("DELETE FROM logical_scene_owner_events");
+  update.Statement("DELETE FROM logical_scene_transaction_intents");
+  update.Statement("UPDATE logical_scene_history_state SET "
+                   "compaction_in_progress=0 WHERE singleton=1");
 
-  Exec(database, "DELETE FROM logical_scene_projection_results");
-  Exec(database, "DELETE FROM logical_scene_projection_attempts");
-  Exec(database, "DELETE FROM logical_scene_request_outcomes");
-  Exec(database, "DELETE FROM logical_scene_owner_events");
-  Exec(database, "DELETE FROM logical_scene_transaction_intents");
-  Exec(database, "UPDATE logical_scene_history_state SET "
-                 "compaction_in_progress=0 WHERE singleton=1");
+  memory.history = std::move(compaction.history);
+  memory.transactions.clear();
+  memory.outcomes.clear();
+  memory.owner_events.clear();
+  memory.transaction_file_bytes = 0U;
 
   const auto compacted =
-      ReadSceneTransactionStoreState(database, durable_state);
+      ReadSceneTransactionStoreState(memory, durable_state);
   if (compacted.active_projection != transactions.active_projection ||
       compacted.active_snapshot != transactions.active_snapshot ||
-      compacted.request_owner_epoch != request_owner_epoch ||
       compacted.next_transaction_sequence !=
           transactions.next_transaction_sequence ||
       compacted.next_owner_event_sequence !=
@@ -1351,43 +1405,47 @@ void CompactSceneTransactionHistory(
 namespace {
 
 void InsertSceneTransactionOwnerEvent(
-    sqlite3 *database, const std::uint64_t owner_event_sequence,
+    SceneStoreMemory &memory, persistence::SqliteRecord &statement,
+    const std::uint64_t owner_event_sequence,
     const std::uint64_t transaction_sequence) {
-  Statement statement(
-      database,
+  SizedRow row(
+      statement,
       "INSERT INTO logical_scene_owner_events(owner_event_sequence,"
-      "event_kind,transaction_sequence,structural_completion_sequence) "
-      "VALUES(?,'scene_transaction_intent',?,NULL)");
-  statement.Bind(
+      "event_kind,transaction_sequence) "
+      "VALUES(?,'scene_transaction_intent',?)");
+  row.Bind(
       1, CheckedSafeCounter(owner_event_sequence, "owner_event_sequence"));
-  statement.Bind(
+  row.Bind(
       2, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "scene transaction owner event insert unexpectedly returned a row");
-  }
+  row.Literal("scene_transaction_intent");
+  memory.transaction_file_bytes += SceneRowFileBytes(
+      row.record_bytes(), SceneTable("logical_scene_owner_events"));
+  memory.owner_events.push_back(
+      SceneOwnerEventRecord{owner_event_sequence, transaction_sequence});
 }
 
+// The attempt and result rows belong to the newest resident transaction:
+// Commit holds `mutex_` from its intent to its outcome.
 void InsertProjectionAttempt(
-    sqlite3 *database, const std::uint64_t transaction_sequence,
-    const std::size_t ordinal,
+    SceneStoreMemory &memory, persistence::SqliteRecord &statement,
+    const std::uint64_t transaction_sequence, const std::size_t ordinal,
     const core::ProjectionExecutionHostBindingDTO &binding) {
-  Statement statement(
-      database, "INSERT INTO logical_scene_projection_attempts("
-                "transaction_sequence,projection_ordinal,provider_binding_id,"
-                "provider_binding_revision,runtime_unit_id,runtime_epoch) "
-                "VALUES(?,?,?,?,?,?)");
-  statement.Bind(
+  SizedRow row(
+      statement,
+      "INSERT INTO logical_scene_projection_attempts("
+      "transaction_sequence,projection_ordinal,provider_binding_id,"
+      "provider_binding_revision,runtime_unit_id,runtime_epoch) "
+      "VALUES(?,?,?,?,?,?)");
+  row.Bind(
       1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  statement.Bind(2, static_cast<std::int64_t>(ordinal));
-  statement.Bind(3, binding.provider_binding_id.value());
-  statement.Bind(4, binding.provider_binding_revision.value());
-  statement.Bind(5, binding.runtime_unit_id.value());
-  statement.Bind(6, binding.runtime_epoch.value());
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "projection attempt insert unexpectedly returned a row");
-  }
+  row.Bind(2, static_cast<std::int64_t>(ordinal));
+  row.Bind(3, binding.provider_binding_id.value());
+  row.Bind(4, binding.provider_binding_revision.value());
+  row.Bind(5, binding.runtime_unit_id.value());
+  row.Bind(6, binding.runtime_epoch.value());
+  memory.transaction_file_bytes += SceneRowFileBytes(
+      row.record_bytes(), SceneTable("logical_scene_projection_attempts"));
+  ++memory.transactions.back().projection_attempt_count;
 }
 
 std::string_view
@@ -1405,12 +1463,13 @@ ProjectionResultState(const core::ProjectionCommitResultStateDTO state) {
   return {};
 }
 
-void InsertProjectionResult(sqlite3 *database,
+void InsertProjectionResult(SceneStoreMemory &memory,
+                            persistence::SqliteRecord &statement,
                             const std::uint64_t transaction_sequence,
                             const std::size_t ordinal,
                             const core::ProjectionCommitResultDTO &result) {
-  Statement statement(
-      database,
+  SizedRow row(
+      statement,
       "INSERT INTO logical_scene_projection_results("
       "transaction_sequence,projection_ordinal,result_state,"
       "acknowledged_retained_bundle_id,acknowledged_graph_revision,"
@@ -1418,39 +1477,38 @@ void InsertProjectionResult(sqlite3 *database,
       "acknowledged_scene_content_hash,rollback_proven,"
       "resulting_health_state,error_code,error_message,error_details_json) "
       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  statement.Bind(
+  row.Bind(
       1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  statement.Bind(2, static_cast<std::int64_t>(ordinal));
-  statement.Bind(3, ProjectionResultState(result.result));
+  row.Bind(2, static_cast<std::int64_t>(ordinal));
+  row.Bind(3, ProjectionResultState(result.result));
   if (result.acknowledged_projection_revision.has_value()) {
     const auto &ack = *result.acknowledged_projection_revision;
-    statement.Bind(4, ack.retained_bundle_id.value());
-    statement.Bind(5, ack.graph_revision.value());
-    statement.Bind(6, ack.scene_revision.scene_id.value());
-    statement.Bind(7, CheckedSafeCounter(ack.scene_revision.revision_id,
+    row.Bind(4, ack.retained_bundle_id.value());
+    row.Bind(5, ack.graph_revision.value());
+    row.Bind(6, ack.scene_revision.scene_id.value());
+    row.Bind(7, CheckedSafeCounter(ack.scene_revision.revision_id,
                                          "acknowledged scene revision"));
-    statement.Bind(8, ack.scene_revision.content_hash.value());
+    row.Bind(8, ack.scene_revision.content_hash.value());
   } else {
     for (int index = 4; index <= 8; ++index) {
-      statement.BindNull(index);
+      row.BindNull(index);
     }
   }
-  statement.Bind(9, result.rollback_proven ? 1 : 0);
-  statement.Bind(10, core::to_string(result.resulting_health.state));
+  row.Bind(9, std::int64_t{result.rollback_proven ? 1 : 0});
+  row.Bind(10, core::to_string(result.resulting_health.state));
   if (result.error.has_value()) {
-    statement.Bind(11, result.error->code);
-    statement.Bind(12, result.error->message);
-    statement.Bind(13, logical_scene_codec_internal::EncodeErrorDetails(
+    row.Bind(11, result.error->code);
+    row.Bind(12, result.error->message);
+    row.Bind(13, logical_scene_codec_internal::EncodeErrorDetails(
                            result.error->details));
   } else {
-    statement.BindNull(11);
-    statement.BindNull(12);
-    statement.BindNull(13);
+    row.BindNull(11);
+    row.BindNull(12);
+    row.BindNull(13);
   }
-  if (statement.Step()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "projection result insert unexpectedly returned a row");
-  }
+  memory.transaction_file_bytes += SceneRowFileBytes(
+      row.record_bytes(), SceneTable("logical_scene_projection_results"));
+  memory.transactions.back().projection_results.push_back(result.result);
 }
 
 // The provider binding and runtime-unit identity are durable scene identity.
@@ -1852,7 +1910,7 @@ ResolveFrameForRequest(
   }
   return ResolveFrameAcrossProjections(
       *selector, request.expected_projection_revision, projections,
-      request.request_context.request_id.value());
+      core::RequestKeyText(request.request_context.request_key));
 }
 
 } // namespace
@@ -2029,15 +2087,7 @@ BuildResolvedSceneCandidatePreview(
           core::logical_scene_identity::ComputeLogicalSceneContentHash(*snapshot)) {
     return reject("invalid_request", "Candidate snapshot does not match its planning projection");
   }
-    ValidateBoundedIdentity(request.request_context.request_id.value(),
-                            "request_id");
-    ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
-                            "request_owner_epoch");
     ValidateBoundedText(request.request_context.source_label, "source_label");
-    if (request.request_context.correlation_id.has_value()) {
-      ValidateBoundedText(*request.request_context.correlation_id,
-                          "correlation_id");
-    }
     if (!request.attribution.locally_valid() ||
         !request.expected_projection_revision.valid() ||
         !preview.frame_resolution.has_value() ||
@@ -2197,28 +2247,17 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
 
 SceneCommitResultDTO
 LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
-  if (request.request_context.request_id.empty()) {
-    throw std::invalid_argument("scene request_id must be non-empty");
-  }
   const auto reject = [&](const core::RequestReplayStatusDTO replay_status,
                           const std::string_view code,
                           const std::string_view message,
                           std::map<std::string, std::string> details = {}) {
-    return FailedSceneResult(request.request_context.request_id, replay_status,
+    return FailedSceneResult(request.request_context.request_key, replay_status,
                              SceneError(code, message, std::move(details)),
                              SceneProjectionCommitStatusDTO::kNotAttempted);
   };
 
   try {
-    ValidateBoundedIdentity(request.request_context.request_id.value(),
-                            "request_id");
-    ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
-                            "request_owner_epoch");
     ValidateBoundedText(request.request_context.source_label, "source_label");
-    if (request.request_context.correlation_id.has_value()) {
-      ValidateBoundedText(*request.request_context.correlation_id,
-                          "correlation_id");
-    }
     if (!request.attribution.locally_valid()) {
       throw std::invalid_argument("request attribution is invalid");
     }
@@ -2294,7 +2333,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     // Validate native/private input before it can enter durable Scene state.
     // Reuse this exact derived intent at the single admission boundary.
     if (authored_mutation && !program_reset_mutation) {
-      claim_intent = AuthoredSceneClaimIntent(request, request_digest);
+      claim_intent = AuthoredSceneClaimIntent(request);
     }
   } catch (const std::exception &error) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
@@ -2302,17 +2341,16 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   std::lock_guard lock(impl_->mutex_);
-  auto *database = impl_->database();
+  impl_->RequireOpen();
+  auto &memory = impl_->memory_;
   DurableState observed_state;
   std::optional<SceneTransactionStoreState> observed_transactions;
   std::optional<ResolvedSceneCandidate> candidate;
-  std::int64_t external_data_version = 0;
 
   {
     const auto &cached = impl_->ReadSceneCommitState();
     observed_state = cached.durable_state;
     observed_transactions = cached.transaction_state;
-    external_data_version = cached.external_data_version;
     if (!observed_state.active_projection.has_value() ||
         !observed_state.active_scene_snapshot.has_value()) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
@@ -2323,21 +2361,13 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       throw LogicalSceneOwnerIntegrityError(
           "finalized logical scene has no reconstructed transaction state");
     }
-    const auto &owner_epoch =
-        observed_transactions->request_owner_epoch.value();
-    if (request.request_context.request_owner_epoch.value() != owner_epoch) {
-      return reject(core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch,
-                    "stale_request_owner_epoch",
-                    "scene request names a stale logical-owner epoch",
-                    {{"expected_request_owner_epoch", owner_epoch}});
-    }
     if (const auto existing = ReadOutcomeForRequest(
-            database, owner_epoch, request.request_context.request_id);
+            memory, request.request_context.request_key);
         existing.has_value()) {
       if (existing->request_digest != request_digest) {
         return reject(core::RequestReplayStatusDTO::kRequestIdConflict,
                       "request_id_conflict",
-                      "scene request ID was reused with different intent");
+                      "scene request key was reused with different intent");
       }
       if (impl_->cell_admission_ != nullptr) {
         try {
@@ -2350,7 +2380,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         }
       }
       return ResultFromStoredOutcome(
-          database, *existing, core::RequestReplayStatusDTO::kReplayedExact);
+          memory, *existing, core::RequestReplayStatusDTO::kReplayedExact);
     }
     if (authored_mutation && impl_->cell_admission_ == nullptr) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
@@ -2371,36 +2401,57 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
           core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
           "expected projection names another Deployment or Scene");
     }
+    // The file bytes the next transaction can take (od212). The resident
+    // transactions are folded first when it would not fit: a fold loses
+    // nothing.
+    const auto transaction_bytes = SceneTransactionFileBytesBound(
+        request_json.size(), ActiveExecutionHostBindings(observed_state).size());
+    const auto fits = [&] {
+      return SceneFileBytes(memory) + transaction_bytes <=
+             kSceneStoreRecordFileBytes;
+    };
     if (observed_transactions->resident_transaction_count >=
-        kMaximumLogicalSceneTransactions) {
+            kMaximumLogicalSceneTransactions ||
+        (observed_transactions->resident_transaction_count != 0U && !fits())) {
       if (impl_->cell_admission_ != nullptr) {
         // A durable Scene outcome can precede its admission release. Preserve
         // that proof until exact settlement succeeds, before pruning it.
         try {
-          SettleRecoveredAuthoredSceneClaims(database, *impl_->cell_admission_);
+          SettleRecoveredAuthoredSceneClaims(memory, *impl_->cell_admission_);
         } catch (const CellAdmissionTemporarilyUnavailable &error) {
           return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                         "kernel_owner_unavailable", error.what());
         }
       }
-      Transaction compaction(database, "BEGIN IMMEDIATE",
-                              &impl_->maintenance_snapshot_cache_);
-      // Commit is the only writer and holds the owner mutex, so another
-      // write here is a store integrity failure, not a stale request.
-      if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
-        impl_->InvalidateSceneCommitState();
-        throw LogicalSceneOwnerIntegrityError(
-            "logical-scene database changed outside its owner before history "
-            "compaction");
-      }
       impl_->InvalidateSceneCommitState();
-      CompactSceneTransactionHistory(database, observed_state,
-                                     *observed_transactions, false);
-      compaction.Commit();
+      auto compaction = PrepareSceneHistoryCompaction(
+          memory, observed_state, *observed_transactions, false);
+      persistence::SqliteRecord record;
+      CompactSceneTransactionHistory(memory, record, std::move(compaction),
+                                     observed_state, *observed_transactions);
+      impl_->Post(std::move(record));
       observed_transactions->resident_transaction_count = 0U;
-      impl_->StoreSceneCommitState(observed_state, observed_transactions,
-                                   external_data_version);
+      impl_->StoreSceneCommitState(observed_state, observed_transactions);
       // The triggering request continues below in the same epoch.
+    }
+    // Then the maintenance initializations no reader still needs give way,
+    // oldest first. When nothing can, the transaction goes on; a file write
+    // that does not fit then fails and is counted.
+    if (!fits()) {
+      const auto evictions = MaintenanceEvictions(
+          memory, observed_state,
+          memory.history.compacted_maintenance_completion_count, 0U,
+          transaction_bytes, false);
+      if (!evictions.empty()) {
+        impl_->InvalidateSceneCommitState();
+        persistence::SqliteRecord record;
+        for (const auto *row : evictions) {
+          DeleteMaintenanceInitialization(memory, record, *row);
+        }
+        impl_->Post(std::move(record));
+        observed_state = impl_->ReadStateTransaction();
+        impl_->StoreSceneCommitState(observed_state, observed_transactions);
+      }
     }
   }
 
@@ -2479,7 +2530,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   core::SceneTransactionDTO scene_transaction{
-      request.request_context.request_id,
+      request.request_context.request_key,
       request.attribution,
       observed_transactions->next_transaction_sequence,
       *observed_state.active_projection,
@@ -2508,14 +2559,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   {
-    Transaction write(database, "BEGIN IMMEDIATE",
-                            &impl_->maintenance_snapshot_cache_);
-    if (!impl_->SceneCommitStateStillCurrent(external_data_version) ||
-        NextSceneOwnerEventSequence(database) !=
+    if (NextSceneOwnerEventSequence(memory) !=
             observed_transactions->next_owner_event_sequence ||
-        ReadOutcomeForRequest(
-            database, request.request_context.request_owner_epoch.value(),
-            request.request_context.request_id)
+        ReadOutcomeForRequest(memory, request.request_context.request_key)
             .has_value()) {
       impl_->InvalidateSceneCommitState();
       throw LogicalSceneOwnerIntegrityError(
@@ -2523,12 +2569,13 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
           "acceptance");
     }
     impl_->InvalidateSceneCommitState();
-    InsertSceneIntent(database, request, request_digest, request_json,
+    persistence::SqliteRecord write;
+    InsertSceneIntent(memory, write, request, request_digest, request_json,
                       scene_transaction, *candidate, projections.size());
     InsertSceneTransactionOwnerEvent(
-        database, observed_transactions->next_owner_event_sequence,
+        memory, write, observed_transactions->next_owner_event_sequence,
         scene_transaction.transaction_sequence);
-    write.Commit();
+    impl_->Post(std::move(write));
   }
 
   std::optional<core::CellAdmissionClaimDTO> authored_claim;
@@ -2542,27 +2589,24 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       const auto rejection =
           rejected != nullptr ? rejected->error()
                               : SceneError("authoring_not_ready", error.what());
-      Transaction outcome(database, "BEGIN IMMEDIATE",
-                              &impl_->maintenance_snapshot_cache_);
+      persistence::SqliteRecord outcome;
       InsertSceneOutcome(
-          database, request.request_context.request_owner_epoch.value(),
-          request.request_context.request_id, request_digest,
-          scene_transaction.transaction_sequence, false,
+          memory, outcome, request.request_context.request_key,
+          request_digest, scene_transaction.transaction_sequence, false,
           SceneProjectionCommitStatusDTO::kNotAttempted, 0U, rejection);
-      outcome.Commit();
-      return FailedSceneResult(request.request_context.request_id,
+      impl_->Post(std::move(outcome));
+      return FailedSceneResult(request.request_context.request_key,
                                core::RequestReplayStatusDTO::kAcceptedNew,
                                rejection,
                                SceneProjectionCommitStatusDTO::kNotAttempted);
     }
   }
   if (!projections.empty()) {
-    Transaction attempt(database, "BEGIN IMMEDIATE",
-                            &impl_->maintenance_snapshot_cache_);
+    persistence::SqliteRecord attempt;
     InsertProjectionAttempt(
-        database, scene_transaction.transaction_sequence, 0U,
+        memory, attempt, scene_transaction.transaction_sequence, 0U,
         projections.front().preflight_health.execution_host_binding);
-    attempt.Commit();
+    impl_->Post(std::move(attempt));
   }
 
   bool every_attempt_rolled_back = true;
@@ -2592,11 +2636,10 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     const bool committed = projection_result.result ==
                            core::ProjectionCommitResultStateDTO::kCommitted;
 
-    Transaction result_write(database, "BEGIN IMMEDIATE",
-
-                            &impl_->maintenance_snapshot_cache_);
-    InsertProjectionResult(database, scene_transaction.transaction_sequence,
-                           ordinal, projection_result);
+    persistence::SqliteRecord result_write;
+    InsertProjectionResult(memory, result_write,
+                           scene_transaction.transaction_sequence, ordinal,
+                           projection_result);
     if (!committed) {
       const auto status =
           every_attempt_rolled_back
@@ -2609,21 +2652,19 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "scene_projection_commit_uncertain",
                     "at least one invoked native projection cannot prove the "
                     "predecessor state");
-      InsertSceneOutcome(database,
-                         request.request_context.request_owner_epoch.value(),
-                         request.request_context.request_id, request_digest,
+      InsertSceneOutcome(memory, result_write,
+                         request.request_context.request_key, request_digest,
                          scene_transaction.transaction_sequence, false, status,
                          ordinal + 1U, error);
       if (status ==
           SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
-        const auto failed_state =
-            ReadCompleteDurableState(database, impl_->fixed_query_);
+        const auto failed_state = ReadCompleteDurableState(memory);
         if (AccessStatus(failed_state).projection_leases_open) {
           throw LogicalSceneOwnerIntegrityError(
               "uncertain projection result did not close projection leases");
         }
       }
-      result_write.Commit();
+      impl_->Post(std::move(result_write));
       if (status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven) {
         if (authored_claim.has_value()) {
           ReleaseAuthoredSceneClaim(
@@ -2633,40 +2674,35 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         ++observed_transactions->next_transaction_sequence;
         ++observed_transactions->next_owner_event_sequence;
         ++observed_transactions->resident_transaction_count;
-        if (impl_->SceneCommitStateStillCurrent(external_data_version)) {
-          impl_->StoreSceneCommitState(observed_state, observed_transactions,
-                                       external_data_version);
-        }
+        impl_->StoreSceneCommitState(observed_state, observed_transactions);
       }
-      return FailedSceneResult(request.request_context.request_id,
+      return FailedSceneResult(request.request_context.request_key,
                                core::RequestReplayStatusDTO::kAcceptedNew,
                                std::move(error), status);
     }
     if (ordinal + 1U < projections.size()) {
       InsertProjectionAttempt(
-          database, scene_transaction.transaction_sequence, ordinal + 1U,
+          memory, result_write, scene_transaction.transaction_sequence,
+          ordinal + 1U,
           projections[ordinal + 1U].preflight_health.execution_host_binding);
     } else {
-      InsertSceneOutcome(database,
-                         request.request_context.request_owner_epoch.value(),
-                         request.request_context.request_id, request_digest,
+      InsertSceneOutcome(memory, result_write,
+                         request.request_context.request_key, request_digest,
                          scene_transaction.transaction_sequence, true,
                          SceneProjectionCommitStatusDTO::kCommitted,
                          projections.size(), std::nullopt);
     }
-    result_write.Commit();
+    impl_->Post(std::move(result_write));
   }
 
   if (projections.empty()) {
-    Transaction outcome(database, "BEGIN IMMEDIATE",
-                            &impl_->maintenance_snapshot_cache_);
-    InsertSceneOutcome(database,
-                       request.request_context.request_owner_epoch.value(),
-                       request.request_context.request_id, request_digest,
+    persistence::SqliteRecord outcome;
+    InsertSceneOutcome(memory, outcome, request.request_context.request_key,
+                       request_digest,
                        scene_transaction.transaction_sequence, true,
                        SceneProjectionCommitStatusDTO::kCommitted,
                        projections.size(), std::nullopt);
-    outcome.Commit();
+    impl_->Post(std::move(outcome));
   }
 
   if (authored_claim.has_value()) {
@@ -2691,16 +2727,10 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   observed_transactions->unresolved_native_attempt = false;
   observed_transactions->unresolved_transaction_sequence.reset();
   observed_transactions->latest_uncertain_transaction_sequence.reset();
-  if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
-    throw LogicalSceneOwnerIntegrityError(
-        "logical-scene database changed outside its owner while completing a "
-        "scene commit");
-  }
-  impl_->StoreSceneCommitState(observed_state, observed_transactions,
-                               external_data_version);
+  impl_->StoreSceneCommitState(observed_state, observed_transactions);
 
   SceneCommitResultDTO result{
-      request.request_context.request_id,
+      request.request_context.request_key,
       core::RequestReplayStatusDTO::kAcceptedNew,
       true,
       std::nullopt,

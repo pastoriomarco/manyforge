@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import pytest
+from contextlib import contextmanager
 
 spec = importlib.util.spec_from_file_location('export_retention', Path(__file__).parents[1] / 'scripts/lib/export_retention.py')
 assert spec and spec.loader
@@ -62,9 +63,9 @@ def test_tail_keeps_exact_last_bytes_of_arbitrarily_long_line(tmp_path):
 
 
 def test_policy_defaults_and_invalid_values():
-    assert retention.SiteRetentionPolicy.from_environment({}) == retention.SiteRetentionPolicy(10, 10_000_000_000)
+    assert retention.run_session.read_site_disk_limits(None) == retention.SiteRetentionPolicy(10, 10_000_000_000)
     with pytest.raises(ValueError):
-        retention.SiteRetentionPolicy.from_environment({'MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT': '0'})
+        retention.SiteRetentionPolicy(0, 10)
 
 
 def test_pressure_deletes_only_superseded_closed_units_oldest_first(tmp_path):
@@ -142,10 +143,10 @@ def test_default_aggregate_counts_but_never_deletes_sibling_root(tmp_path):
 def test_previous_session_journals_are_accounted_but_never_pruned_without_history_import(tmp_path, effects):
     root = tmp_path / 'runtime'
     journal(root / 'current')
-    archive = root / 'previous-sessions' / ('a' * 32)
+    archive = root / 'previous-runs' / ('a' * 32)
     archive.mkdir(parents=True)
     (archive / 'session.json').write_text(json.dumps({
-        'schema_version': 'manyforge.workbench_session.v1', 'session_id': 'a' * 32,
+        'schema_version': 'manyforge.workbench_session.v2', 'session_id': 'a' * 32,
         'disposition': 'stopped', 'shutdown': 'clean', 'effects': effects,
     }))
     # Real allocated bytes, not sparse logical length, must count toward the retention bound.
@@ -168,7 +169,7 @@ def test_previous_sessions_are_bounded_with_one_slot_reserved_for_current(tmp_pa
     journal(root / 'current')
     sources = []
     for index in range(12):
-        folder = root / 'previous-sessions' / f'{index:032x}'
+        folder = root / 'previous-runs' / f'{index:032x}'
         folder.mkdir(parents=True)
         source = folder / 'program-cycle.sqlite3'
         source.write_bytes(f'not imported safety event {index}'.encode())
@@ -181,7 +182,7 @@ def test_previous_sessions_are_bounded_with_one_slot_reserved_for_current(tmp_pa
 
 
 def _archive(root, index, *, started=None, sealed=False):
-    folder = root / 'previous-sessions' / f'{index:032x}'
+    folder = root / 'previous-runs' / f'{index:032x}'
     nested = folder / 'execution-state'
     nested.mkdir(parents=True)
     (nested / 'owner.sqlite3').write_text(f'journal {index}')
@@ -315,6 +316,8 @@ def test_mounted_session_report_container_is_never_pruned(tmp_path, monkeypatch)
     for report in files:
         report.write_text('external report')
     monkeypatch.setattr(retention, '_mounted_children', lambda _: {reports})
+    # Session reports are pruned by the shared run-session helper.
+    monkeypatch.setattr(retention.run_session, '_mounted_children', lambda _: {reports})
     result = _quiet_count_pass(root)
     assert not result.deleted
     assert all(report.read_text() == 'external report' for report in files)
@@ -328,7 +331,7 @@ def test_previous_session_symlink_does_not_delete_outside_or_any_archive(tmp_pat
     outside = tmp_path / 'outside'
     outside.mkdir()
     (outside / 'keep').write_text('external data')
-    (root / 'previous-sessions' / ('f' * 32)).symlink_to(outside, target_is_directory=True)
+    (root / 'previous-runs' / ('f' * 32)).symlink_to(outside, target_is_directory=True)
     result = _quiet_count_pass(root)
     assert not result.deleted
     assert all(folder.exists() for folder in archives)
@@ -340,12 +343,13 @@ def test_mounted_previous_sessions_container_is_never_pruned(tmp_path, monkeypat
     root = tmp_path / 'runtime'
     journal(root / 'current')
     archives = [_archive(root, index) for index in range(5)]
-    previous = root / 'previous-sessions'
-    monkeypatch.setattr(retention, '_mounted_children', lambda _: {previous})
+    previous = root / 'previous-runs'
+    # The pruning pass is the shared run selection's (run_session).
+    monkeypatch.setattr(retention.run_session, '_mounted_children', lambda _: {previous})
     result = _quiet_count_pass(root)
     assert not result.deleted
     assert all(folder.exists() for folder in archives)
-    assert 'mounted previous-sessions' in result.warning
+    assert 'mounted previous-runs' in result.warning
 
 
 def test_previous_session_mounted_child_is_preserved(tmp_path, monkeypatch):
@@ -353,7 +357,7 @@ def test_previous_session_mounted_child_is_preserved(tmp_path, monkeypatch):
     journal(root / 'current')
     archives = [_archive(root, index) for index in range(5)]
     mount = archives[0] / 'execution-state'
-    monkeypatch.setattr(retention, '_mounted_children', lambda _: {mount})
+    monkeypatch.setattr(retention.run_session, '_mounted_children', lambda _: {mount})
     result = _quiet_count_pass(root)
     assert not result.deleted
     assert all(folder.exists() for folder in archives)
@@ -988,3 +992,225 @@ def test_host_ros_protected_legacy_prefix_does_not_starve_ordered_candidates(tmp
     assert result.deleted == (str(old.relative_to(root)),)
     assert current.exists() and all((logs / str(n)).exists() for n in range(1, 1002))
     assert 'accounting incomplete (lower bound)' in result.warning
+
+
+def test_byte_cap_removes_oldest_runs_first_and_never_the_newest(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index, started=f'2026-11-1{index}T00:00:00+00:00') for index in range(3)]
+    reports = root / 'session-reports'
+    reports.mkdir()
+    for folder in archives:
+        (reports / (folder.name + '.json')).write_text('{}')
+    # Real 2 GiB archives are impractical here; the pass reads the shared cap.
+    monkeypatch.setattr(retention.run_session, 'MAXIMUM_ARCHIVE_BYTES', 1)
+    result = _quiet_count_pass(root)
+    assert not archives[0].exists() and not archives[1].exists()
+    assert archives[2].exists()
+    assert not (reports / (archives[0].name + '.json')).exists()
+    assert (reports / (archives[2].name + '.json')).exists()
+    assert 'remains above its byte limit' in result.warning
+
+
+def test_byte_cap_keeps_runs_within_the_limit(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(3)]
+    monkeypatch.setattr(retention.run_session, 'MAXIMUM_ARCHIVE_BYTES', 10**12)
+    result = _quiet_count_pass(root)
+    assert all(folder.exists() for folder in archives)
+    assert not any('previous-run' in path for path in result.deleted)
+
+
+def test_byte_cap_counts_older_history_files_and_never_the_current_one(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    history = root / 'history'
+    history.mkdir()
+    current = history / 'history.v7.sqlite3'
+    current.write_bytes(b'current history' * 4096)
+    older = [root / 'history.sqlite3', root / 'history.sqlite3-wal', history / 'history.v6.sqlite3']
+    for path in older:
+        path.write_bytes(b'earlier history' * 4096)
+    monkeypatch.setattr(retention.run_session, 'MAXIMUM_ARCHIVE_BYTES', 1)
+    result = _quiet_count_pass(root)
+    assert current.read_bytes() == b'current history' * 4096
+    assert not any(path.exists() for path in older)
+    assert {'history.sqlite3', 'history.sqlite3-wal', 'history/history.v6.sqlite3'} <= set(result.deleted)
+
+
+# Disk limits (OD-215), shared by both launchers through run_session.
+run_session = retention.run_session
+ROOMY = run_session.DiskReading(10**15, 10**15, 10**6)
+
+
+def _running_root(root):
+    """A root while a run lives: current/, its reported run, older runs."""
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(4)]
+    (root / 'current' / 'session.json').write_text(json.dumps({
+        'previous_session': {'session_id': archives[1].name}}))
+    return archives
+
+
+def test_disk_limits_have_their_starting_values():
+    limits = run_session.DiskLimits()
+    assert (limits.max_disk_percent, limits.min_free_bytes, limits.machine_minimum_bytes) == (10, 10_000_000_000, 0)
+    assert limits.floor_bytes == 10_000_000_000
+    assert run_session.read_site_disk_limits(None) == limits
+    assert run_session.DiskLimits(10, 10_000_000_000, 2_000_000_000).floor_bytes == 12_000_000_000
+    assert run_session.DISK_FLOOR_CLEAR_MARGIN_BYTES == 1_000_000_000
+    with pytest.raises(ValueError):
+        run_session.DiskLimits(10, 0, -1)
+
+
+def test_pruning_while_running_deletes_nothing_within_the_limits(tmp_path):
+    root = tmp_path / 'runtime'
+    archives = _running_root(root)
+    with closing_fd(root) as fd:
+        run_session.prune_while_running(root, fd, run_session.DiskLimits(), reader=lambda _: ROOMY)
+    assert all(folder.exists() for folder in archives)
+
+
+def test_pruning_while_running_deletes_oldest_previous_runs_only_while_over_the_limit(tmp_path, capsys):
+    root = tmp_path / 'runtime'
+    archives = _running_root(root)
+    current = {str(p.relative_to(root)): p.read_bytes() for p in (root / 'current').rglob('*') if p.is_file()}
+
+    def reader(_fd):
+        # Free space is below the minimum until the oldest run is gone.
+        return run_session.DiskReading(10**15, 10**15 if not archives[0].exists() else 0)
+
+    with closing_fd(root) as fd:
+        run_session.prune_while_running(root, fd, run_session.DiskLimits(), reader=reader)
+    assert not archives[0].exists()
+    assert all(folder.exists() for folder in archives[1:])
+    assert current == {str(p.relative_to(root)): p.read_bytes() for p in (root / 'current').rglob('*') if p.is_file()}
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [f'ManyForge removed previous-runs/{archives[0].name}: oldest first; ManyForge keeps at most 5 '
+                     'previous runs and 2 GiB of them, its files take at most 10 % of the disk and 10 GB stay free']
+
+
+def test_pruning_never_deletes_the_newest_or_the_reported_run_nor_current(tmp_path):
+    root = tmp_path / 'runtime'
+    archives = _running_root(root)
+    full = run_session.DiskReading(10**15, 0)
+    with closing_fd(root) as fd:
+        run_session.prune_while_running(root, fd, run_session.DiskLimits(), reader=lambda _: full)
+    assert not archives[0].exists() and not archives[2].exists()
+    assert archives[1].exists() and archives[3].exists()
+    assert (root / 'current/execution-state/operation-journal.sqlite3').read_bytes() == b'owner journal'
+
+
+def test_files_above_their_share_of_the_disk_are_over_the_limit(tmp_path):
+    root = tmp_path / 'runtime'
+    archives = _running_root(root)
+    # Plenty free, but the disk is so small that ManyForge's files exceed 10 %.
+    small = run_session.DiskReading(1, 10**15)
+    with closing_fd(root) as fd:
+        deleted, _warning = run_session.prune_own_files(root, fd, run_session.DiskLimits(), reader=lambda _: small,
+                                                        only_over_limit=True)
+    assert deleted == (str(archives[0].relative_to(root)), str(archives[2].relative_to(root)))
+
+
+def test_start_below_the_floor_is_refused_with_the_typed_text(tmp_path):
+    root = tmp_path / 'runtime'
+    root.mkdir()
+    limits = run_session.DiskLimits(10, 10_000_000_000, 2_000_000_000)
+    low = run_session.DiskReading(10**15, 3_270_000_000, 10**6)
+    with closing_fd(root) as fd:
+        with pytest.raises(run_session.DiskBelowFloor) as refused:
+            run_session.prepare_disk(root, fd, limits, reader=lambda _: low)
+    assert refused.value.code == 'disk_space_below_floor'
+    assert str(refused.value) == (
+        f'Not started: the disk that holds {root} has 3.2 GB free. ManyForge needs at least 12 GB free '
+        '(10 GB plus 2 GB for the machine). Free 8.8 GB and start again.')
+    assert sorted(root.iterdir()) == []
+
+
+def test_no_free_inode_counts_as_below_the_floor(tmp_path):
+    root = tmp_path / 'runtime'
+    root.mkdir()
+    no_inodes = run_session.DiskReading(10**15, 10**15, 0)
+    uncounted = run_session.DiskReading(10**15, 10**15, None)
+    with closing_fd(root) as fd:
+        with pytest.raises(run_session.DiskBelowFloor) as refused:
+            run_session.check_disk_floor(root, fd, run_session.DiskLimits(), reader=lambda _: no_inodes)
+        # A file system that counts no inodes (btrfs) is judged by space only.
+        run_session.check_disk_floor(root, fd, run_session.DiskLimits(), reader=lambda _: uncounted)
+    assert 'has 0 GB free' in str(refused.value) and 'Free 10 GB and start again.' in str(refused.value)
+
+
+def test_the_floor_reads_the_history_folder_of_the_root(tmp_path):
+    root = tmp_path / 'runtime'
+    (root / 'history').mkdir(parents=True)
+    read = []
+
+    def reader(fd):
+        read.append(os.readlink(f'/proc/self/fd/{fd}'))
+        return ROOMY
+
+    with closing_fd(root) as fd:
+        run_session.check_disk_floor(root, fd, run_session.DiskLimits(), reader=reader)
+    # One file system: read once, through the held root.
+    assert read == [str(root)]
+
+
+@contextmanager
+def closing_fd(root):
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _site(tmp_path, **members):
+    path = tmp_path / 'manyforge.site.json'
+    path.write_text(json.dumps({'schema': 'manyforge.site.v2', **members}))
+    return path
+
+
+def test_site_file_without_disk_members_uses_the_defaults(tmp_path):
+    assert run_session.read_site_disk_limits(_site(tmp_path)) == run_session.DiskLimits()
+    assert run_session.read_site_disk_limits(
+        _site(tmp_path, device_addresses={'lite6_main': '192.168.1.31'})) == run_session.DiskLimits()
+
+
+@pytest.mark.parametrize('member, value, expected', [
+    ('disk_max_percent', 25, run_session.DiskLimits(25, 10_000_000_000, 0)),
+    ('disk_always_free_bytes', 5_000_000_000, run_session.DiskLimits(10, 5_000_000_000, 0)),
+    ('disk_machine_minimum_bytes', 2_000_000_000, run_session.DiskLimits(10, 10_000_000_000, 2_000_000_000)),
+])
+def test_each_disk_member_overrides_its_default(tmp_path, member, value, expected):
+    limits = run_session.read_site_disk_limits(_site(tmp_path, **{member: value}))
+    assert limits == expected
+    assert limits.floor_bytes == expected.min_free_bytes + expected.machine_minimum_bytes
+
+
+@pytest.mark.parametrize('member, value, text', [
+    ('disk_max_percent', 0, 'disk_max_percent must be an integer from 1 to 100'),
+    ('disk_max_percent', 101, 'disk_max_percent must be an integer from 1 to 100'),
+    ('disk_max_percent', 10.5, 'disk_max_percent must be an integer from 1 to 100'),
+    ('disk_max_percent', True, 'disk_max_percent must be an integer from 1 to 100'),
+    ('disk_always_free_bytes', -1, 'disk_always_free_bytes must be an integer from 0 to 9007199254740991'),
+    ('disk_machine_minimum_bytes', '0', 'disk_machine_minimum_bytes must be an integer from 0 to 9007199254740991'),
+    ('disk_machine_minimum_bytes', 2 ** 53, 'disk_machine_minimum_bytes must be an integer from 0 to 9007199254740991'),
+])
+def test_out_of_range_disk_member_is_refused(tmp_path, member, value, text):
+    with pytest.raises(ValueError, match=text):
+        run_session.read_site_disk_limits(_site(tmp_path, **{member: value}))
+
+
+def test_version_one_site_file_is_read_with_the_defaults(tmp_path):
+    path = tmp_path / 'manyforge.site.json'
+    path.write_text(json.dumps({'schema': 'manyforge.site.v1', 'device_addresses': {}}))
+    assert run_session.read_site_disk_limits(path) == run_session.DiskLimits()
+    path.write_text(json.dumps({'schema': 'manyforge.site.v1', 'disk_max_percent': 20}))
+    with pytest.raises(ValueError) as refused:
+        run_session.read_site_disk_limits(path)
+    assert str(refused.value) == ("site settings disk_max_percent needs schema manyforge.site.v2: change the first "
+                                  "line's schema to manyforge.site.v2; no other change is needed")
+    path.write_text(json.dumps({'schema': 'manyforge.site.v3'}))
+    with pytest.raises(ValueError, match='site settings schema must be manyforge.site.v2'):
+        run_session.read_site_disk_limits(path)

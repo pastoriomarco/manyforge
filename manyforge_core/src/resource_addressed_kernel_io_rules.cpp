@@ -11,41 +11,17 @@ ErrorDTO rule_error(const char* code, const char* reason) {
       code, "Motion interrupt rule could not complete its required response", {{"reason", reason}}};
 }
 
-std::optional<std::uint64_t> successful_stop_stage(const StopCertificateDTO& certificate,
-                                                   const OperationId& operation,
-                                                   const OperationParticipantId& participant,
-                                                   const PreparedParticipantStopPlanDTO& plan) {
-  std::optional<std::uint64_t> selected;
-  for (const auto& attempt : certificate.attempted_stage_results) {
-    const auto* subject = std::get_if<StopParticipantScopeKeyDTO>(&attempt.scope_key.subject);
-    const auto& request = attempt.result.request;
-    if (!subject || subject->operation_id != operation || subject->participant_id != participant ||
-        attempt.authority != StopStageResultAuthorityDTO::kAuthoritative ||
-        attempt.result.outcome != ParticipantStopStageOutcomeDTO::kSucceeded ||
-        attempt.result.error || request.stop_id != certificate.stop_id ||
-        request.stop_generation != certificate.stop_generation ||
-        request.participant_stop_plan != plan || request.stage_index >= plan.stage_commands.size())
-      continue;
-    if (!selected || request.stage_index > *selected) selected = request.stage_index;
-  }
-  return selected;
-}
-
-// Read only actual authoritative nominal-stage evidence from the existing Stop
-// worker. A permitted natural finish is different from a braking signal trip.
-std::optional<bool> natural_completion_evidence(const StopCertificateDTO& certificate,
-                                                const OperationId& operation,
-                                                const OperationParticipantId& participant,
+// Read only actual authoritative nominal-stage evidence of the participant's
+// own Stop attempt. A permitted natural finish is different from a braking
+// signal trip.
+std::optional<bool> natural_completion_evidence(const StopParticipantWork& work,
                                                 std::uint64_t stage_index) {
   std::optional<bool> natural;
-  for (const auto& attempt : certificate.attempted_stage_results) {
-    const auto* subject = std::get_if<StopParticipantScopeKeyDTO>(&attempt.scope_key.subject);
-    if (!subject || subject->operation_id != operation || subject->participant_id != participant ||
-        attempt.authority != StopStageResultAuthorityDTO::kAuthoritative ||
-        attempt.result.request.stage_index != stage_index ||
-        attempt.result.outcome != ParticipantStopStageOutcomeDTO::kSucceeded)
+  for (const auto& retained : work.retained_results) {
+    if (!retained.authoritative || retained.result.request.stage_index != stage_index ||
+        retained.result.outcome != ParticipantStopStageOutcomeDTO::kSucceeded)
       continue;
-    for (const auto& item : attempt.result.evidence_items) {
+    for (const auto& item : retained.result.evidence_items) {
       if (!item.evidence || item.state != StopEvidenceItemStateDTO::kSatisfied) continue;
       const auto* object = std::get_if<JsonObjectDTO>(&item.evidence->value);
       if (!object) continue;
@@ -59,14 +35,27 @@ std::optional<bool> natural_completion_evidence(const StopCertificateDTO& certif
   return natural;
 }
 
+// One rule's candidate response for one participant (S9), chosen under the
+// Kernel lock; the plan is the participant's own immutable prepared plan.
+struct RuleStopCandidate final {
+  IoRuleRegistrationDTO registration;
+  IoRuleEvidenceDTO evidence;
+  const PreparedParticipantStopPlanDTO* plan{};
+  InterruptPreemptionAction action{InterruptPreemptionAction::kCompleteMoveOnSignal};
+  int priority{};
+  IoRuleStopScopeDTO stop_scope{};
+  IoRulePreparedStopEntryDTO stop_entry;
+  IoRulePreparedStopEntryDTO success_through;
+  OperationParticipantId participant_id;
+};
+
 }  // namespace
 
 bool ResourceAddressedExecutionKernel::io_rule_scope_current_locked(
     const ActiveOperation& operation, const ActiveOperationParticipant& participant,
     const IoRuleRegistrationDTO& registration) const {
   const auto* scope = std::get_if<IoOperationRuleScopeDTO>(&registration.scope);
-  if (!scope || registration.owner_epoch != config_.request_owner_epoch ||
-      participant.ownership_transferred || !participant.prepared_participant ||
+  if (!scope || participant.ownership_transferred || !participant.prepared_participant ||
       scope->operation_id != operation.state.operation_id ||
       scope->operation_revision != participant.prepared_participant->operation_revision ||
       scope->participant_id != participant.slot_owner.participant_id ||
@@ -83,8 +72,7 @@ bool ResourceAddressedExecutionKernel::io_rule_scope_current_locked(
       operation.state.participants.begin(), operation.state.participants.end(),
       [&](const auto& value) { return value.participant_id == scope->participant_id; });
   return row != operation.state.participants.end() &&
-         row->command_id == scope->controller_goal_id &&
-         row->command_generation == scope->controller_goal_generation;
+         row->command_id == scope->controller_goal_id;
 }
 
 Result<void> ResourceAddressedExecutionKernel::arm_io_rules_locked(ActiveOperation& operation) {
@@ -123,8 +111,8 @@ Result<void> ResourceAddressedExecutionKernel::arm_io_rules_locked(ActiveOperati
     if (!participant.io_rule_registrations.empty()) {
       if (participant.io_rule_registrations.size() != motion->interrupt_scopes.size() ||
           !std::all_of(participant.io_rule_registrations.begin(),
-                       participant.io_rule_registrations.end(), [&](const auto& token) {
-                         return io_rule_scope_current_locked(operation, participant, token);
+                       participant.io_rule_registrations.end(), [&](const auto& slot) {
+                         return io_rule_scope_current_locked(operation, participant, slot.token);
                        }))
         return Result<void>::Err(
             rule_error(kErrorMotionInterruptArmFailed, "io_rule_membership_stale"));
@@ -167,7 +155,6 @@ Result<void> ResourceAddressedExecutionKernel::arm_io_rules_locked(ActiveOperati
                                     row->controllable_component_id,
                                     row->command_target_id,
                                     row->command_id,
-                                    row->command_generation,
                                     participant.preparation_id,
                                     participant.prepared_participant->prepared_contract_digest,
                                     scope.scope_id};
@@ -195,10 +182,9 @@ Result<void> ResourceAddressedExecutionKernel::arm_io_rules_locked(ActiveOperati
       if (!armed.ok()) return Result<void>::Err(armed.error());
       // Retain every minted token before validation so a failed acknowledgement
       // is still retired by the shared partial-arm cleanup path.
-      participant.io_rule_registrations.push_back(armed.value());
+      participant.io_rule_registrations.push_back({armed.value()});
       if (armed.value().scope != IoRuleScopeDTO(exact) ||
-          armed.value().policy_id != scope.interrupt_policy_id ||
-          armed.value().owner_epoch != config_.request_owner_epoch)
+          armed.value().policy_id != scope.interrupt_policy_id)
         return Result<void>::Err(
             rule_error(kErrorMotionInterruptArmFailed, "io_rule_arm_identity_mismatch"));
       row->io_rule_outcomes.push_back(
@@ -217,9 +203,10 @@ Result<void> ResourceAddressedExecutionKernel::retire_participant_io_rules_locke
   auto* operation = find_active_operation_locked(participant.slot_owner.operation_id);
   if (!operation)
     operation = find_pending_motion_operation_locked(participant.slot_owner.operation_id);
-  for (const auto& registration : participant.io_rule_registrations) {
-    const auto retired = io_signal_service_->RetireRule(registration);
-    if (!retired.ok()) return Result<void>::Err(retired.error());
+  for (const auto& slot : participant.io_rule_registrations) {
+    const auto& registration = slot.token;
+    const auto evidence = io_signal_service_->RetireRule(registration);
+    if (!evidence.ok()) return Result<void>::Err(evidence.error());
     if (operation) {
       const auto row =
           std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
@@ -232,10 +219,10 @@ Result<void> ResourceAddressedExecutionKernel::retire_participant_io_rules_locke
                          [&](const auto& value) { return value.registration == registration; });
         if (outcome != row->io_rule_outcomes.end()) {
           // An already-retired retry cannot erase retained first evidence.
-          if (retired.value().trip || !retired.value().source_losses.empty() ||
-              retired.value().evaluation_error ||
+          if (evidence.value().trip || !evidence.value().source_losses.empty() ||
+              evidence.value().evaluation_error ||
               outcome->evidence.state != IoRuleRegistrationState::kRetired)
-            outcome->evidence = retired.value();
+            outcome->evidence = evidence.value();
           outcome->evidence.state = IoRuleRegistrationState::kRetired;
         }
       }
@@ -253,19 +240,27 @@ Result<void> ResourceAddressedExecutionKernel::retire_io_rules_locked(ActiveOper
   return Result<void>::Ok();
 }
 
-void ResourceAddressedExecutionKernel::retire_all_io_rules_locked() {
+std::vector<ErrorDTO> ResourceAddressedExecutionKernel::retire_all_io_rules_locked() {
+  // A failed retire is a defect: its error is kept and the teardown goes on.
+  std::vector<ErrorDTO> failures;
+  const auto keep = [&](const Result<void>& retired) {
+    if (!retired.ok()) failures.push_back(retired.error());
+  };
+  const auto retire_operation = [&](ActiveOperation& operation) {
+    for (auto& participant : operation.participants)
+      keep(retire_participant_io_rules_locked(participant));
+  };
   for (auto& [id, operation] : active_operations_) {
     (void)id;
-    if (!retire_io_rules_locked(*operation).ok()) std::terminate();
-    if (!operation->pending_motion_takeover.empty() &&
-        !retire_io_rules_locked(*operation->pending_motion_takeover.mapped()).ok())
-      std::terminate();
-    if (!operation->next_motion_takeover.empty() &&
-        !retire_io_rules_locked(*operation->next_motion_takeover.mapped()).ok())
-      std::terminate();
+    retire_operation(*operation);
+    if (!operation->pending_motion_takeover.empty())
+      retire_operation(*operation->pending_motion_takeover.mapped());
+    if (!operation->next_motion_takeover.empty())
+      retire_operation(*operation->next_motion_takeover.mapped());
   }
-  if (!retire_global_io_rules_locked().ok() || !retire_staged_global_io_rules_locked().ok())
-    std::terminate();
+  keep(retire_global_io_rules_locked());
+  keep(retire_staged_global_io_rules_locked());
+  return failures;
 }
 
 bool ResourceAddressedExecutionKernel::has_active_io_rules_locked() const {
@@ -297,6 +292,9 @@ Result<std::optional<TimePoint>> ResourceAddressedExecutionKernel::NextIoRuleExp
 }
 
 Result<void> ResourceAddressedExecutionKernel::ProcessIoRuleEvidence() {
+  // Obtained before the Kernel lock (it may allocate on this thread's first
+  // Stop); completed after each step's unlock.
+  StopHandoff& handoff = thread_stop_handoff();
   std::size_t work_bound{};
   {
     std::lock_guard lock(state_mutex_);
@@ -315,90 +313,56 @@ Result<void> ResourceAddressedExecutionKernel::ProcessIoRuleEvidence() {
     }
     work_bound += 2U * global_io_rules_.size();
   }
+  // Several rule Stops in one step all publish: the hand-off is a bit set.
   for (std::size_t step = 0; step < work_bound; ++step) {
-    StopWorkHandoff handoff;
     Result<void> processed = Result<void>::Ok();
     {
       std::lock_guard lock(state_mutex_);
       processed = process_io_rule_evidence_locked(handoff);
-      if (processed.ok() && !handoff.control && !handoff.projection)
-        processed = process_global_io_rule_evidence_locked(handoff);
+      if (processed.ok()) processed = process_global_io_rule_evidence_locked(handoff);
     }
-    publish_stop_work(handoff);
+    complete_stop_handoff(handoff);
     if (!processed.ok()) return processed;
   }
   return Result<void>::Ok();
 }
 
-ResourceAddressedExecutionKernel::StopTransaction*
-ResourceAddressedExecutionKernel::io_rule_response_owner_locked(
-    const ActiveOperation& operation, const ActiveOperationParticipant& participant) const {
-  const auto row =
-      std::find_if(operation.state.participants.begin(), operation.state.participants.end(),
-                   [&](const auto& value) {
-                     return value.participant_id == participant.slot_owner.participant_id;
-                   });
-  if (row != operation.state.participants.end()) {
-    for (const auto& outcome : row->io_rule_outcomes) {
-      if (outcome.arbitration_disposition != IoRuleArbitrationDispositionDTO::kActive ||
-          !outcome.stop_id || outcome.stop_certificate_id)
-        continue;
-      for (const auto& transaction : stop_transactions_) {
-        if (!transaction || !transaction->active || transaction->terminal ||
-            transaction->stop_id != outcome.stop_id ||
-            transaction->stop_generation != outcome.stop_generation)
-          continue;
-        if (std::any_of(
-                transaction->interrupt_winners.begin(), transaction->interrupt_winners.end(),
-                [&](const auto& winner) { return winner.registration == outcome.registration; }))
-          return transaction.get();
-      }
-    }
-  }
-  for (const auto& transaction : stop_transactions_) {
-    if (transaction && transaction->active && !transaction->terminal &&
-        transaction->stop_id == operation.state.active_stop_id &&
-        transaction->stop_generation == operation.state.active_stop_generation &&
-        std::binary_search(transaction->operations.begin(), transaction->operations.end(),
-                           operation.state.operation_id) &&
-        !scoped_global_stop_excludes_participant(*transaction, operation.state.operation_id,
-            participant.slot_owner.participant_id, participant.resources))
-      return transaction.get();
-  }
-  return nullptr;
-}
-
 Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
-    StopWorkHandoff& handoff, const OperationId* selected_operation) {
+    StopHandoff& handoff, const OperationNumber* selected_operation) {
   // Interrupt evaluation is paused while the cell is latched.
   if (cell_latched_locked()) return Result<void>::Ok();
   for (auto& [id, operation] : active_operations_) {
     if (selected_operation && id != *selected_operation) continue;
     if (terminal(operation->state.state)) continue;
-    std::optional<InterruptStopSelection> selection;
+    std::optional<RuleStopCandidate> selection;
     int selected_priority = -1;
     std::optional<RuleSourceOrder> selected_source;
     std::vector<ResourceId> selected_resources;
     std::vector<IoRuleRegistrationDTO> eligible;
-    std::vector<InterruptStopSelection> participant_selections;
+    std::vector<RuleStopCandidate> participant_selections;
+    // The winning registration's stored Stop key (its slot outlives this pass).
+    std::optional<RequestKey>* selection_stop_key = nullptr;
     for (auto& participant : operation->participants) {
       if (participant.ownership_transferred || !participant.prepared_participant) continue;
-      auto* resident = io_rule_response_owner_locked(*operation, participant);
+      // A Stop attempt already contains this participant (its own physical
+      // response is fixed by the Stop that started it).
+      const bool resident = participant.stop.phase == StopPhase::kStopping;
       const auto actual_row = std::find_if(operation->state.participants.begin(),
           operation->state.participants.end(), [&](const auto& row) {
             return row.participant_id == participant.slot_owner.participant_id;
           });
       // A sibling excluded from a scoped global Stop keeps its actual phase
-      // and executing-only node guard, including after that Stop's certificate.
+      // and executing-only node guard, including after that Stop ended.
       const bool unselected_global_sibling = global_io_rule_catalog_ &&
-          operation->state.active_stop_id && !participant.stop_owns_reconciliation() &&
+          operation->state.stop_event_id && !participant.stop_owns_reconciliation() &&
           actual_row != operation->state.participants.end() &&
           actual_row->state == OperationStateKind::kExecuting;
-      if (operation->state.active_stop_id && !resident && !unselected_global_sibling) continue;
+      if (operation->state.stop_event_id && !resident && !unselected_global_sibling) continue;
       const auto* motion =
           std::get_if<PreparedMotionExecutionDTO>(&participant.prepared_participant->payload);
       if (!motion) continue;
-      for (const auto& token : participant.io_rule_registrations) {
+      for (auto& slot : participant.io_rule_registrations) {
+        const auto& token = slot.token;
         if (!io_rule_scope_current_locked(*operation, participant, token)) {
           return Result<void>::Err(rule_error(kErrorInternalError, "io_rule_membership_stale"));
         }
@@ -451,28 +415,40 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
         // A source failure is not a desired trip and cannot be muted merely
         // because another Stop already owns containment.
         if (!source_failure && !semantics.affected_phases.contains(phase)) continue;
-        const InterruptStopSelection* active_winner = nullptr;
+        // The rule response already active on this participant (its outcome
+        // names a pending Stop event), and its priority.
+        const IoMotionRuleOutcomeDTO* active_winner = nullptr;
+        int active_priority = -1;
         if (resident) {
           const auto found = std::find_if(
-              resident->interrupt_winners.begin(), resident->interrupt_winners.end(),
-              [&](const auto& winner) {
-                const auto& owner = std::get<IoOperationRuleScopeDTO>(winner.registration.scope);
-                return owner.operation_id == id && owner.participant_id == exact.participant_id;
+              row->io_rule_outcomes.begin(), row->io_rule_outcomes.end(), [](const auto& value) {
+                return value.arbitration_disposition == IoRuleArbitrationDispositionDTO::kActive &&
+                       value.stop_event_id && !value.stop_result;
               });
-          if (found != resident->interrupt_winners.end()) active_winner = &*found;
+          if (found != row->io_rule_outcomes.end()) {
+            const auto active_policy = std::find_if(
+                participant.io_motion_rule_policies.begin(),
+                participant.io_motion_rule_policies.end(), [&](const auto& value) {
+                  return value.policy_id == found->registration.policy_id;
+                });
+            if (active_policy != participant.io_motion_rule_policies.end()) {
+              active_winner = &*found;
+              active_priority = active_policy->effective_priority;
+            }
+          }
         }
         if (resident && !source_failure) {
-          int global_priority = -1;
-          for (const auto& global : resident->global_interrupt_winners) {
-            if (std::any_of(global.participants.begin(), global.participants.end(),
-                [&](const auto& selected) {
-                  return selected.operation_id == id && selected.participant_id == exact.participant_id;
-                })) global_priority = std::max(global_priority, global.priority);
-          }
+          // A global rule's Stop already containing it, by its attribution.
+          const auto& attribution = participant.stop.attribution;
+          const int global_priority =
+              (attribution.rule_index & kStopAttributionGlobalRule) != 0U &&
+                      attribution.attribution_class != StopAttributionClass::kOperator
+                  ? attribution.rule_priority
+                  : -1;
           if (global_priority >= policy->effective_priority) continue;
         }
         if (resident && !source_failure && active_winner &&
-            policy->effective_priority <= active_winner->priority) {
+            policy->effective_priority <= active_priority) {
           const bool suppressed =
               semantics.effective_maskable &&
               std::find(semantics.maskable_by.begin(), semantics.maskable_by.end(),
@@ -485,10 +461,10 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
           continue;
         }
         if (resident && source_failure) {
-          // Join the actual containment reference; retain all first source
-          // failures even if a stronger logical fault already owns arbitration.
-          outcome->stop_id = resident->stop_id;
-          outcome->stop_generation = resident->stop_generation;
+          // Join the actual containment (the attempt's starting event); retain
+          // all first source failures even if a stronger logical fault
+          // already owns arbitration.
+          outcome->stop_event_id = participant.stop.started_by;
           continue;
         }
         if (!resident) {
@@ -519,15 +495,15 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
             semantics.preemption_action == InterruptPreemptionAction::kCompleteMoveOnSignal
                 ? scope->stop_plan
                 : participant.prepared_participant->controller().ordinary_stop_plan;
-        InterruptStopSelection candidate{token,
-                                         evidence.value(),
-                                         plan,
-                                         source->source_id,
-                                         semantics.preemption_action,
-                                         policy->effective_priority,
-                                         policy->maximum_scope->stop_scope,
-                                         *scope->stop_entry,
-                                         *scope->success_through};
+        RuleStopCandidate candidate{token,
+                                    evidence.value(),
+                                    &plan,
+                                    semantics.preemption_action,
+                                    policy->effective_priority,
+                                    policy->maximum_scope->stop_scope,
+                                    *scope->stop_entry,
+                                    *scope->success_through,
+                                    participant.slot_owner.participant_id};
         const auto independent = std::find_if(
             participant_selections.begin(), participant_selections.end(), [&](const auto& value) {
               const auto& owner = std::get<IoOperationRuleScopeDTO>(value.registration.scope);
@@ -547,6 +523,7 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
         }
         if (better) {
           selection = std::move(candidate);
+          selection_stop_key = &slot.stop_key;
           selected_priority = policy->effective_priority;
           selected_source = source;
           selected_resources = resources;
@@ -556,35 +533,48 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
     if (!selection) continue;
     std::erase_if(participant_selections,
                   [&](const auto& value) { return value.registration == selection->registration; });
-    const auto request_id = content_identity::sha256_digest(
-        config_.request_owner_epoch.value() + "\nio-rule-stop\n" + id.value() + "\n" +
-        std::to_string(selection->registration.registration_id));
     const bool source_failure = !selection->evidence.source_losses.empty();
-    StopIntentDTO intent{
-        PublicRequestContextDTO{RequestId(request_id), config_.request_owner_epoch,
-                                "kernel.io_rule", std::nullopt},
-        std::vector<StopOperationTargetDTO>{
-            {id, operation->state.operation_revision,
-             operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
-        source_failure ? "interrupt_source_unavailable"
-        : selection->action == InterruptPreemptionAction::kCompleteMoveOnSignal
-            ? "motion_interrupt_signal_trip"
-            : "interrupt_fault"};
     const bool full_cell = selection->stop_scope == IoRuleStopScopeDTO::kFullCell ||
                            std::any_of(participant_selections.begin(), participant_selections.end(),
                                        [](const auto& value) {
                                          return value.stop_scope == IoRuleStopScopeDTO::kFullCell;
                                        });
-    EmergencyStopProjectedIntentDTO projected =
-        full_cell ? EmergencyStopProjectedIntentDTO{FullStopIntentDTO{
-                        intent.request_context, cell_stop_generation_, intent.attribution}}
-                  : EmergencyStopProjectedIntentDTO{std::move(intent)};
-    const auto stopped =
-        accept_stop_locked(std::move(projected), handoff, clock_.now(), nullptr, nullptr,
-                           nullptr, &*selection, participant_selections);
-    if (!stopped.ok()) return Result<void>::Err(stopped.error());
+    // S9: the winner and each other participant's own winner, as prepared
+    // interrupt entries into the participant's own plan.
+    std::vector<StopInterruptSelection> selections;
+    selections.reserve(1U + participant_selections.size());
+    const auto add_selection = [&](const RuleStopCandidate& candidate) {
+      selections.push_back(StopInterruptSelection{
+          id, candidate.participant_id.ordinal - 1U, candidate.plan,
+          static_cast<std::uint8_t>(candidate.stop_entry.stage_index),
+          static_cast<std::uint8_t>(candidate.success_through.stage_index)});
+    };
+    add_selection(*selection);
+    for (const auto& candidate : participant_selections) add_selection(candidate);
+    // The whole operation is stopped, as today (the whole cell for a
+    // full-cell scope); the selections give its tripped robots the rule's
+    // prepared entry.
+    const StopOperationTargetDTO target{id, operation->state.operation_revision};
+    StopRequest request;
+    request.request_key = owned_kernel_request_key(*selection_stop_key);
+    request.kind = StopKind::kInterruptRule;
+    request.selector = full_cell ? StopSelectorKind::kCell : StopSelectorKind::kOperations;
+    request.operations = std::span<const StopOperationTargetDTO>(&target, 1U);
+    request.interrupt_selections = selections;
+    request.source_label = "kernel.io_rule";
+    request.reason = source_failure ? "interrupt_source_unavailable"
+                     : selection->action == InterruptPreemptionAction::kCompleteMoveOnSignal
+                         ? "motion_interrupt_signal_trip"
+                         : "interrupt_fault";
+    // A trip is the Program's own Stop (its rule's priority); a lost source
+    // is not (as today's acceptance attributed them).
+    request.attribution_rank =
+        source_failure ? StopAttribution{StopAttributionClass::kOperator, 0, 0U}
+                       : StopAttribution{StopAttributionClass::kProgramOwn, selection->priority, 0U};
+    const auto record = request_stop_locked(request, handoff);
+    const StopEventId event_id = stop_events_.records[record].event_id;
     for (auto& row : operation->state.participants) {
-      const InterruptStopSelection* row_winner =
+      const RuleStopCandidate* row_winner =
           std::get<IoOperationRuleScopeDTO>(selection->registration.scope).participant_id ==
                   row.participant_id
               ? &*selection
@@ -600,11 +590,10 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
       if (!row_winner) continue;
       for (auto& outcome : row.io_rule_outcomes) {
         if (outcome.registration != row_winner->registration) {
-          if (outcome.stop_id && !outcome.stop_certificate_id &&
+          if (outcome.stop_event_id && !outcome.stop_result &&
               outcome.arbitration_disposition == IoRuleArbitrationDispositionDTO::kActive) {
             outcome.arbitration_disposition = IoRuleArbitrationDispositionDTO::kSuperseded;
-            outcome.stop_id = stopped.value().stop_id;
-            outcome.stop_generation = stopped.value().stop_generation;
+            outcome.stop_event_id = event_id;
           }
           if (outcome.arbitration_disposition == IoRuleArbitrationDispositionDTO::kSuperseded ||
               std::find(eligible.begin(), eligible.end(), outcome.registration) == eligible.end())
@@ -630,309 +619,301 @@ Result<void> ResourceAddressedExecutionKernel::process_io_rule_evidence_locked(
                          : IoRuleArbitrationDispositionDTO::kQueued;
           continue;
         }
-        outcome.stop_id = stopped.value().stop_id;
-        outcome.stop_generation = stopped.value().stop_generation;
+        outcome.stop_event_id = event_id;
+        outcome.stop_result.reset();
         outcome.arbitration_disposition = IoRuleArbitrationDispositionDTO::kActive;
       }
     }
-    // A join needs no second worker wake or deadline. Continue bounded scans
-    // for independent operations; a new Stop uses the existing publication slot.
-    if (handoff.control || handoff.projection) return Result<void>::Ok();
+    // Continue the bounded scan for independent operations: every new Stop
+    // sets its lane bits in the same hand-off.
   }
   return Result<void>::Ok();
 }
 
-void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
-    StopTransaction& transaction, const StopCertificateDTO& certificate) {
-  for (const auto& id : stop_operation_snapshot_ids(transaction)) {
-    auto* operation = find_active_operation_locked(id);
-    if (!operation) continue;
-    for (auto& participant : operation->participants) {
-      if (scoped_global_stop_excludes_participant(transaction, id,
-              participant.slot_owner.participant_id, participant.resources))
-        continue;
-      const auto row =
-          std::find_if(operation->state.participants.begin(), operation->state.participants.end(),
-                       [&](const auto& value) {
-                         return value.participant_id == participant.slot_owner.participant_id;
+// P4 for one participant (called by the Stop lane under the Kernel lock when
+// the participant's attempt ended): every rule outcome of the participant
+// not yet finalized belongs to this attempt (the one that started it, or a
+// later event that covered it while it was stopping), so each takes this
+// attempt's result. Memory only.
+void ResourceAddressedExecutionKernel::finalize_io_rule_outcomes_locked(
+    ActiveOperation& operation, const std::size_t participant_ordinal) {
+  const auto found_participant = std::find_if(
+      operation.participants.begin(), operation.participants.end(), [&](const auto& value) {
+        // `participant_ordinal` is the index in `participants` (the Stop
+        // core's convention); the participant id's ordinal is 1 + it.
+        return value.slot_owner.participant_id.ordinal == participant_ordinal + 1U;
+      });
+  if (found_participant == operation.participants.end()) return;
+  auto& participant = *found_participant;
+  const auto& stop = participant.stop;
+  if (stop.phase != StopPhase::kStopped && stop.phase != StopPhase::kFailed) return;
+  const auto row =
+      std::find_if(operation.state.participants.begin(), operation.state.participants.end(),
+                   [&](const auto& value) {
+                     return value.participant_id == participant.slot_owner.participant_id;
+                   });
+  if (row == operation.state.participants.end()) return;
+  // The attempt ended: nothing of this participant is pending elsewhere.
+  if (!retire_participant_io_rules_locked(participant).ok()) return;
+  const auto result = stop.phase == StopPhase::kFailed ? StopEventResult::kSomeFailed
+                      : stop.escalated                 ? StopEventResult::kStoppedEscalated
+                                                       : StopEventResult::kStopped;
+  // Contained (nominal or escalated: an escalated attempt's degraded-Stop
+  // error does not make it uncontained) and the effect known.
+  const bool contained_settled =
+      stop.phase == StopPhase::kStopped && row->terminal_fact &&
+      (row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled ||
+       row->terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect);
+  const bool source_failure =
+      std::any_of(row->io_rule_outcomes.begin(), row->io_rule_outcomes.end(),
+                  [](const auto& outcome) { return !outcome.evidence.source_losses.empty(); });
+
+  // The per-operation rule whose response this participant's Stop carried:
+  // its active outcome, with the response re-read from the participant's own
+  // prepared interrupt scope.
+  const IoMotionRuleOutcomeDTO* winner = nullptr;
+  const IoMotionRulePolicyBindingDTO* winner_policy = nullptr;
+  const PreparedMotionInterruptScopeDTO* winner_scope = nullptr;
+  const auto* motion = participant.prepared_participant
+                           ? std::get_if<PreparedMotionExecutionDTO>(
+                                 &participant.prepared_participant->payload)
+                           : nullptr;
+  for (const auto& outcome : row->io_rule_outcomes) {
+    if (outcome.arbitration_disposition != IoRuleArbitrationDispositionDTO::kActive ||
+        !outcome.stop_event_id || outcome.stop_result)
+      continue;
+    const auto policy = std::find_if(
+        participant.io_motion_rule_policies.begin(), participant.io_motion_rule_policies.end(),
+        [&](const auto& value) { return value.policy_id == outcome.registration.policy_id; });
+    const auto& exact = std::get<IoOperationRuleScopeDTO>(outcome.registration.scope);
+    const auto scope =
+        motion ? std::find_if(motion->interrupt_scopes.begin(), motion->interrupt_scopes.end(),
+                              [&](const auto& value) {
+                                return value.scope_id == exact.motion_interrupt_scope_id;
+                              })
+               : std::vector<PreparedMotionInterruptScopeDTO>::const_iterator{};
+    if (policy == participant.io_motion_rule_policies.end() || !policy->semantics || !motion ||
+        scope == motion->interrupt_scopes.end() || !scope->stop_entry || !scope->success_through)
+      continue;
+    winner = &outcome;
+    winner_policy = &*policy;
+    winner_scope = &*scope;
+    break;
+  }
+  const auto winner_action = winner ? winner_policy->semantics->preemption_action
+                                    : InterruptPreemptionAction::kCompleteMoveOnSignal;
+  const PreparedParticipantStopPlanDTO* winner_plan =
+      !winner ? nullptr
+      : winner_action == InterruptPreemptionAction::kCompleteMoveOnSignal
+          ? &winner_scope->stop_plan
+          : &participant.prepared_participant->controller().ordinary_stop_plan;
+
+  // The global rule whose Stop holds this participant's attribution.
+  const auto& attribution = stop.attribution;
+  const bool global_attribution =
+      (attribution.rule_index & kStopAttributionGlobalRule) != 0U &&
+      attribution.attribution_class != StopAttributionClass::kOperator &&
+      global_io_rule_catalog_ &&
+      (attribution.rule_index & kStopAttributionRuleIndexMask) < global_io_rule_catalog_->rules.size();
+  const bool global_watch_lost =
+      global_attribution && (attribution.rule_index & kStopAttributionWatchLost) != 0U;
+  const bool global_fail_node =
+      global_attribution && !global_watch_lost &&
+      attribution.attribution_class == StopAttributionClass::kProgramOwn;
+  const bool global_fault_winner =
+      global_attribution && (!winner || attribution.rule_priority >= winner_policy->effective_priority);
+  ErrorDTO global_fault_error{};
+  if (global_fault_winner) {
+    const auto& rule_id =
+        global_io_rule_catalog_->rules[attribution.rule_index & kStopAttributionRuleIndexMask].policy_id;
+    global_fault_error = global_watch_lost
+        ? ErrorDTO{"interrupt_source_unavailable", "Global interrupt rule can't watch its signals",
+                   {{"reason", "io_global_rule_cant_watch"}, {"stopped_by", "rule"},
+                    {"rule_id", rule_id.value()}}}
+        : ErrorDTO{"interrupt_fault", "Global interrupt rule matched",
+                   {{"reason", global_fail_node ? "io_global_rule_fail_node"
+                                                : "io_global_rule_hold"},
+                    {"stopped_by", "rule"}, {"rule_id", rule_id.value()}}};
+  }
+  const bool fault_winner = winner && winner->evidence.trip &&
+                            winner_action == InterruptPreemptionAction::kPreemptTrajectory;
+  for (auto& outcome : row->io_rule_outcomes) {
+    // Finalized by an earlier attempt of this participant.
+    if (outcome.stop_result) continue;
+    const bool selected = winner && winner->registration == outcome.registration;
+    if (!outcome.stop_event_id) outcome.stop_event_id = stop.started_by;
+    outcome.stop_result = result;
+    if (global_fault_winner && !outcome.evidence.source_losses.empty()) {
+      outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+      outcome.error = rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
+      if (row->state == OperationStateKind::kStopped) {
+        row->state = OperationStateKind::kFailed;
+        row->terminal_error = outcome.error;
+      }
+    } else if (global_fault_winner) {
+      const auto policy = std::find_if(participant.io_motion_rule_policies.begin(),
+          participant.io_motion_rule_policies.end(), [&](const auto& value) {
+            return value.policy_id == outcome.registration.policy_id;
+          });
+      const bool desired = policy != participant.io_motion_rule_policies.end() &&
+          policy->semantics && policy->semantics->preemption_action ==
+              InterruptPreemptionAction::kCompleteMoveOnSignal;
+      outcome.terminal_cause = desired && contained_settled
+          ? MotionExecutionTerminalCause::kInterruptedFault
+          : MotionExecutionTerminalCause::kFailed;
+      if (desired && contained_settled) outcome.error.reset();
+      else outcome.error = row->terminal_error.value_or(global_fault_error);
+    } else if (fault_winner && selected) {
+      // Operation FaultTerminal is a real failed operation with its own
+      // diagnostic, not a cell latch or a desired-trip success.
+      const auto source = rule_source_order(winner->evidence);
+      outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+      outcome.error =
+          ErrorDTO{"interrupt_fault",
+                   "Configured operation fault rule matched",
+                   {{"reason", "io_rule_fault_terminal"},
+                    {"policy_id", winner->registration.policy_id.value()},
+                    {"source_id", source ? source->source_id.value() : std::string{}},
+                    {"registration_id", std::to_string(winner->registration.registration_id)}}};
+      if (terminal(row->state) && row->state != OperationStateKind::kInterventionRequired) {
+        row->state = OperationStateKind::kFailed;
+        row->terminal_error = outcome.error;
+      }
+    } else if (fault_winner &&
+               outcome.registration.policy_id != winner->registration.policy_id) {
+      const auto policy =
+          std::find_if(participant.io_motion_rule_policies.begin(),
+                       participant.io_motion_rule_policies.end(), [&](const auto& candidate) {
+                         return candidate.policy_id == outcome.registration.policy_id;
                        });
-      if (row == operation->state.participants.end()) continue;
-      const bool pending_elsewhere = std::any_of(
-          row->io_rule_outcomes.begin(), row->io_rule_outcomes.end(), [&](const auto& outcome) {
-            return outcome.stop_id && !outcome.stop_certificate_id &&
-                   (outcome.stop_id != certificate.stop_id ||
-                    outcome.stop_generation != certificate.stop_generation);
-          });
-      if (!pending_elsewhere) {
-        const auto retired = retire_participant_io_rules_locked(participant);
-        if (!retired.ok()) {
-          continue;
-        }
+      if (policy != participant.io_motion_rule_policies.end() && policy->semantics &&
+          policy->semantics->preemption_action ==
+              InterruptPreemptionAction::kCompleteMoveOnSignal) {
+        outcome.terminal_cause = MotionExecutionTerminalCause::kInterruptedFault;
+        outcome.error.reset();
+      } else {
+        outcome.terminal_cause = MotionExecutionTerminalCause::kStopped;
       }
-      const bool source_failure =
-          std::any_of(row->io_rule_outcomes.begin(), row->io_rule_outcomes.end(),
-                      [](const auto& outcome) { return !outcome.evidence.source_losses.empty(); });
-      const auto selected_winner = std::find_if(
-          transaction.interrupt_winners.begin(), transaction.interrupt_winners.end(),
-          [&](const auto& value) {
-            const auto& owner = std::get<IoOperationRuleScopeDTO>(value.registration.scope);
-            return owner.operation_id == id && owner.participant_id == row->participant_id;
-          });
-      const auto* winner =
-          selected_winner == transaction.interrupt_winners.end() ? nullptr : &*selected_winner;
-      const GlobalInterruptStopSelection* global_winner = nullptr;
-      for (const auto& candidate : transaction.global_interrupt_winners) {
-        const bool member = std::any_of(candidate.participants.begin(), candidate.participants.end(),
-            [&](const auto& value) {
-              return value.operation_id == id && value.participant_id == row->participant_id &&
-                     value.controller_goal_id == row->command_id &&
-                     value.controller_goal_generation == row->command_generation;
-            });
-        if (!member) continue;
-        const auto precedes = [&](const auto& left, const auto& right) {
-          if (left.priority != right.priority) return left.priority > right.priority;
-          if (left.scope_resources != right.scope_resources)
-            return left.scope_resources < right.scope_resources;
-          const auto left_source =
-              left.evidence ? rule_source_order(*left.evidence) : std::nullopt;
-          const auto right_source =
-              right.evidence ? rule_source_order(*right.evidence) : std::nullopt;
-          if (left_source && right_source) {
-            if (source_order_less(*left_source, *right_source)) return true;
-            if (source_order_less(*right_source, *left_source)) return false;
-          } else if (left_source.has_value() != right_source.has_value()) {
-            return left_source.has_value();
-          }
-          return left.policy_id < right.policy_id;
-        };
-        if (!global_winner || precedes(candidate, *global_winner)) global_winner = &candidate;
+    } else if (!outcome.evidence.source_losses.empty()) {
+      outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+      outcome.error = rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
+      if (row->state == OperationStateKind::kStopped) {
+        row->state = OperationStateKind::kFailed;
+        row->terminal_error = outcome.error;
       }
-      const bool global_fault_winner =
-          global_winner && (!winner || global_winner->priority >= winner->priority);
-      ErrorDTO global_fault_error{};
-      if (global_fault_winner) global_fault_error = global_winner->watch_lost
-          ? ErrorDTO{"interrupt_source_unavailable", "Global interrupt rule can't watch its signals",
-                     {{"reason", "io_global_rule_cant_watch"}, {"stopped_by", "rule"},
-                      {"rule_id", global_winner->policy_id.value()}}}
-          : ErrorDTO{"interrupt_fault", "Global interrupt rule matched",
-                     {{"reason", global_winner->fail_node ? "io_global_rule_fail_node"
-                                                          : "io_global_rule_hold"},
-                      {"stopped_by", "rule"}, {"rule_id", global_winner->policy_id.value()}}};
-      const bool fault_winner =
-          winner && winner->evidence.trip &&
-          winner->action == InterruptPreemptionAction::kPreemptTrajectory &&
-          std::get<IoOperationRuleScopeDTO>(winner->registration.scope).operation_id == id &&
-          std::get<IoOperationRuleScopeDTO>(winner->registration.scope).participant_id ==
-              row->participant_id;
-      for (auto& outcome : row->io_rule_outcomes) {
-        // A broader accepted Stop owns this logical response. The predecessor
-        // still owns physical cleanup, but cannot terminalize the newer fact.
-        if (outcome.stop_id && (outcome.stop_id != certificate.stop_id ||
-                                outcome.stop_generation != certificate.stop_generation))
-          continue;
-        const bool selected = winner && winner->registration == outcome.registration;
-        outcome.stop_id = certificate.stop_id;
-        outcome.stop_generation = certificate.stop_generation;
-        outcome.stop_certificate_id = certificate.stop_certificate_id;
-        outcome.stop_certificate_revision = certificate.stop_certificate_revision;
-        outcome.stop_result = certificate.result;
-        if (global_fault_winner && !outcome.evidence.source_losses.empty()) {
-          outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-          outcome.error = rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
-          if (row->state == OperationStateKind::kStopped) {
-            row->state = OperationStateKind::kFailed;
-            row->terminal_error = outcome.error;
-          }
-        } else if (global_fault_winner) {
-          const auto policy = std::find_if(participant.io_motion_rule_policies.begin(),
-              participant.io_motion_rule_policies.end(), [&](const auto& value) {
-                return value.policy_id == outcome.registration.policy_id;
-              });
-          const bool desired = policy != participant.io_motion_rule_policies.end() &&
-              policy->semantics && policy->semantics->preemption_action ==
-                  InterruptPreemptionAction::kCompleteMoveOnSignal;
-          const bool contained = (certificate.result == StopCertificateResultDTO::kSucceededNominal ||
-              certificate.result == StopCertificateResultDTO::kSucceededEscalated) &&
-              !certificate.terminal_error && row->terminal_fact &&
-              (row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled ||
-               row->terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect);
-          outcome.terminal_cause = desired && contained
-              ? MotionExecutionTerminalCause::kInterruptedFault
-              : MotionExecutionTerminalCause::kFailed;
-          if (desired && contained) outcome.error.reset();
-          else outcome.error = row->terminal_error.value_or(global_fault_error);
-        } else if (fault_winner && selected) {
-          // Operation FaultTerminal is a real failed operation with its own
-          // diagnostic, not a cell latch or a desired-trip success.
-          outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-          outcome.error =
-              ErrorDTO{"interrupt_fault",
-                       "Configured operation fault rule matched",
-                       {{"reason", "io_rule_fault_terminal"},
-                        {"policy_id", winner->registration.policy_id.value()},
-                        {"source_id", winner->source_id.value()},
-                        {"registration_id", std::to_string(winner->registration.registration_id)}}};
-          if (terminal(row->state) && row->state != OperationStateKind::kInterventionRequired) {
-            row->state = OperationStateKind::kFailed;
-            row->terminal_error = outcome.error;
-          }
-        } else if (fault_winner &&
-                   outcome.registration.policy_id != winner->registration.policy_id) {
-          const auto policy =
-              std::find_if(participant.io_motion_rule_policies.begin(),
-                           participant.io_motion_rule_policies.end(), [&](const auto& candidate) {
-                             return candidate.policy_id == outcome.registration.policy_id;
-                           });
-          if (policy != participant.io_motion_rule_policies.end() && policy->semantics &&
-              policy->semantics->preemption_action ==
-                  InterruptPreemptionAction::kCompleteMoveOnSignal) {
-            outcome.terminal_cause = MotionExecutionTerminalCause::kInterruptedFault;
-            outcome.error.reset();
-          } else {
-            outcome.terminal_cause = MotionExecutionTerminalCause::kStopped;
-          }
-        } else if (!outcome.evidence.source_losses.empty()) {
-          outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-          outcome.error =
-              rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
-          if (row->state == OperationStateKind::kStopped) {
-            row->state = OperationStateKind::kFailed;
-            row->terminal_error = outcome.error;
-          }
-        } else if (!selected) {
-          outcome.terminal_cause = MotionExecutionTerminalCause::kStopped;
-        } else if (source_failure) {
-          outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-          outcome.error =
-              rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
-          if (row->state == OperationStateKind::kStopped) {
-            row->state = OperationStateKind::kFailed;
-            row->terminal_error = outcome.error;
-          }
-        } else if ((certificate.result == StopCertificateResultDTO::kSucceededNominal ||
-                    certificate.result == StopCertificateResultDTO::kSucceededEscalated) &&
-                   !certificate.terminal_error && row->state == OperationStateKind::kStopped &&
-                   row->terminal_fact &&
-                   (row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled ||
-                    row->terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect)) {
-          const auto successful =
-              successful_stop_stage(certificate, id, row->participant_id, winner->plan);
-          const bool no_effect =
-              row->terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect;
-          const bool entry_proved =
-              VerifyPreparedIoRuleStopEntry(winner->plan, winner->stop_entry).ok();
-          const bool threshold_proved =
-              VerifyPreparedIoRuleSuccessThrough(winner->plan, winner->stop_entry,
-                                                 winner->success_through)
-                  .ok();
-          const bool response_proved =
-              entry_proved &&
-              ((successful && *successful >= winner->stop_entry.stage_index) || no_effect);
-          const bool within_success_threshold =
-              threshold_proved &&
-              (!successful || *successful <= winner->success_through.stage_index);
-          const auto actual_index = successful.value_or(winner->stop_entry.stage_index);
-          const auto* motion = participant.prepared_participant
-                                   ? std::get_if<PreparedMotionExecutionDTO>(
-                                         &participant.prepared_participant->payload)
-                                   : nullptr;
-          const auto& exact = std::get<IoOperationRuleScopeDTO>(outcome.registration.scope);
-          const auto scope =
-              motion
-                  ? std::find_if(motion->interrupt_scopes.begin(), motion->interrupt_scopes.end(),
-                                 [&](const auto& value) {
-                                   return value.scope_id == exact.motion_interrupt_scope_id;
-                                 })
-                  : std::vector<PreparedMotionInterruptScopeDTO>::const_iterator{};
-          const bool controlled_row = actual_index < winner->plan.stage_commands.size() &&
-                                      winner->plan.stage_commands[actual_index]
-                                              .resolved_stage.containment_command.command_kind ==
-                                          StopContainmentCommandKind::kMotionControlledStop;
-          const auto natural =
-              controlled_row
-                  ? natural_completion_evidence(certificate, id, row->participant_id, actual_index)
-                  : std::nullopt;
-          const bool natural_allowed = motion && scope != motion->interrupt_scopes.end() &&
-                                       scope->stop_profile &&
-                                       scope->stop_profile->allow_natural_completion_on_short_path;
-          if (!response_proved || !within_success_threshold) {
-            outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-            outcome.error = rule_error(kErrorMotionInterruptBackendStopFailed,
-                                       !response_proved ? "io_rule_requested_stop_entry_not_proved"
-                                                        : "io_rule_success_through_exceeded");
-          } else if (natural && *natural) {
-            if (natural_allowed) {
-              outcome.terminal_cause = MotionExecutionTerminalCause::kNoSignalTrip;
-            } else {
-              outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-              outcome.error = rule_error(kErrorMotionInterruptStopStateInvalid,
-                                         "io_rule_natural_completion_not_allowed");
-            }
-          } else if (controlled_row && natural_allowed && !natural &&
-                     row->terminal_fact->effect != ParticipantEffectKnowledge::kNoEffect) {
-            outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-            outcome.error = rule_error(kErrorMotionInterruptBackendStopFailed,
-                                       "io_rule_natural_completion_proof_missing");
-          } else {
-            outcome.terminal_cause = MotionExecutionTerminalCause::kSignalTrip;
-          }
+    } else if (!selected) {
+      outcome.terminal_cause = MotionExecutionTerminalCause::kStopped;
+    } else if (source_failure) {
+      outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+      outcome.error = rule_error("interrupt_source_unavailable", "io_rule_required_source_lost");
+      if (row->state == OperationStateKind::kStopped) {
+        row->state = OperationStateKind::kFailed;
+        row->terminal_error = outcome.error;
+      }
+    } else if (contained_settled && row->state == OperationStateKind::kStopped) {
+      // The containing stage of this attempt counts only when the attempt
+      // executed the winner's own plan.
+      const bool executed_winner_plan =
+          stop.plan != nullptr && (stop.plan == winner_plan || *stop.plan == *winner_plan);
+      const std::optional<std::uint64_t> successful =
+          executed_winner_plan && stop.containing_stage != kNoStopStage &&
+                  stop.containing_stage < winner_plan->stage_commands.size()
+              ? std::optional<std::uint64_t>(stop.containing_stage)
+              : std::nullopt;
+      const auto& stop_entry = *winner_scope->stop_entry;
+      const auto& success_through = *winner_scope->success_through;
+      const bool no_effect = row->terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect;
+      const bool entry_proved = VerifyPreparedIoRuleStopEntry(*winner_plan, stop_entry).ok();
+      const bool threshold_proved =
+          VerifyPreparedIoRuleSuccessThrough(*winner_plan, stop_entry, success_through).ok();
+      const bool response_proved =
+          entry_proved && ((successful && *successful >= stop_entry.stage_index) || no_effect);
+      const bool within_success_threshold =
+          threshold_proved && (!successful || *successful <= success_through.stage_index);
+      const auto actual_index = successful.value_or(stop_entry.stage_index);
+      const bool controlled_row = actual_index < winner_plan->stage_commands.size() &&
+                                  winner_plan->stage_commands[actual_index]
+                                          .resolved_stage.containment_command.command_kind ==
+                                      StopContainmentCommandKind::kMotionControlledStop;
+      const auto natural = controlled_row
+                               ? natural_completion_evidence(participant.stop_work, actual_index)
+                               : std::nullopt;
+      const bool natural_allowed = winner_scope->stop_profile &&
+                                   winner_scope->stop_profile->allow_natural_completion_on_short_path;
+      if (!response_proved || !within_success_threshold) {
+        outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+        outcome.error = rule_error(kErrorMotionInterruptBackendStopFailed,
+                                   !response_proved ? "io_rule_requested_stop_entry_not_proved"
+                                                    : "io_rule_success_through_exceeded");
+      } else if (natural && *natural) {
+        if (natural_allowed) {
+          outcome.terminal_cause = MotionExecutionTerminalCause::kNoSignalTrip;
         } else {
           outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
-          outcome.error = row->terminal_error.value_or(rule_error(
-              kErrorMotionInterruptBackendStopFailed, "io_rule_nominal_stop_not_proved"));
+          outcome.error = rule_error(kErrorMotionInterruptStopStateInvalid,
+                                     "io_rule_natural_completion_not_allowed");
         }
+      } else if (controlled_row && natural_allowed && !natural &&
+                 row->terminal_fact->effect != ParticipantEffectKnowledge::kNoEffect) {
+        outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+        outcome.error = rule_error(kErrorMotionInterruptBackendStopFailed,
+                                   "io_rule_natural_completion_proof_missing");
+      } else {
+        outcome.terminal_cause = MotionExecutionTerminalCause::kSignalTrip;
       }
-      // A Stop the Program's own configuration requested
-      // (carried object lost), settled at its first stage, is the Program's
-      // ordinary failure. The row keeps its actual Stopped outcome; an
-      // escalated, joined or uncertain Stop is relabelled Failed and held.
-      const bool this_stop = operation->state.active_stop_id == certificate.stop_id &&
-                             operation->state.active_stop_generation == certificate.stop_generation;
-      const bool ordinary_program_stop =
-          operation->program_requested_stop && this_stop &&
-          certificate.result == StopCertificateResultDTO::kSucceededNominal &&
-          !certificate.terminal_error &&
-          row->state == OperationStateKind::kStopped && row->terminal_fact &&
-          row->terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
-          row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled;
-      // A global rule's Stop: with `fail_node` the interrupted
-      // motion node fails with `interrupt_fault` and the tree handles it. Its
-      // ordinary Stop (the Program's own, settled at its first stage) keeps
-      // the row Stopped with that typed cause, as the carried-object-lost Stop
-      // keeps its own: the operation closes after its terminal cleanup, so the
-      // tree's next motion on that robot is admitted. An escalated, joined or
-      // uncertain one is relabelled Failed and held. `hold` (and a rule that
-      // can't watch) is the operator's Stop and keeps the row Stopped for
-      // Resume, its fact naming the rule (`stopped_by: rule`).
-      if (global_fault_winner && row->state == OperationStateKind::kStopped) {
-        if (global_winner->fail_node) {
-          if (!ordinary_program_stop) row->state = OperationStateKind::kFailed;
-          row->terminal_error = global_fault_error;
-        } else if (row->terminal_fact) {
-          row->terminal_fact->error = global_fault_error;
-        }
-      }
-      // The carried-object-lost Stop left its settled row Stopped with the
-      // typed cause; only its ordinary outcome stays Stopped.
-      if (this_stop && row->state == OperationStateKind::kStopped && row->terminal_error &&
-          row->terminal_error->code == "carried_object_lost" && !ordinary_program_stop)
-        row->state = OperationStateKind::kFailed;
+    } else {
+      outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
+      outcome.error = row->terminal_error.value_or(rule_error(
+          kErrorMotionInterruptBackendStopFailed, "io_rule_nominal_stop_not_proved"));
     }
-    if (operation->state.state != OperationStateKind::kInterventionRequired)
-      operation->state.state =
-          std::any_of(operation->participants.begin(), operation->participants.end(),
-                      [&](const auto& participant) {
-                        if (!participant.stop_owns_reconciliation()) return false;
-                        const auto row = std::find_if(
-                            operation->state.participants.begin(), operation->state.participants.end(),
-                            [&](const auto& state) {
-                              return state.participant_id == participant.slot_owner.participant_id;
-                            });
-                        return row == operation->state.participants.end() || !terminal(row->state);
-                      })
-              ? OperationStateKind::kStopping
-              : aggregate_participant_state(operation->state.participants);
   }
+  // A Stop the Program's own configuration requested (carried object lost,
+  // a rule trip), settled at its intended stage, is the Program's ordinary
+  // failure. The row keeps its actual Stopped outcome; an escalated or
+  // uncertain Stop, or one an operator Stop covered, is relabelled Failed and
+  // held.
+  const bool ordinary_program_stop =
+      attribution.attribution_class == StopAttributionClass::kProgramOwn &&
+      stop.phase == StopPhase::kStopped && !stop.escalated && !stop.error &&
+      row->state == OperationStateKind::kStopped && row->terminal_fact &&
+      row->terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
+      row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled;
+  // A global rule's Stop: with `fail_node` the interrupted motion node fails
+  // with `interrupt_fault` and the tree handles it. Its ordinary Stop (the
+  // Program's own, settled at its first stage) keeps the row Stopped with that
+  // typed cause, as the carried-object-lost Stop keeps its own: the operation
+  // closes after its terminal cleanup, so the tree's next motion on that
+  // robot is admitted. An escalated or uncertain one is relabelled Failed and
+  // held. `hold` (and a rule that can't watch) is the operator's Stop and
+  // keeps the row Stopped for Resume, its fact naming the rule
+  // (`stopped_by: rule`).
+  if (global_fault_winner && row->state == OperationStateKind::kStopped) {
+    if (global_fail_node) {
+      if (!ordinary_program_stop) row->state = OperationStateKind::kFailed;
+      row->terminal_error = global_fault_error;
+    } else if (row->terminal_fact) {
+      row->terminal_fact->error = global_fault_error;
+    }
+  }
+  // The carried-object-lost Stop left its settled row Stopped with the typed
+  // cause; only its ordinary outcome stays Stopped.
+  if (row->state == OperationStateKind::kStopped && row->terminal_error &&
+      row->terminal_error->code == "carried_object_lost" && !ordinary_program_stop)
+    row->state = OperationStateKind::kFailed;
+  if (operation.state.state != OperationStateKind::kInterventionRequired)
+    operation.state.state =
+        std::any_of(operation.participants.begin(), operation.participants.end(),
+                    [&](const auto& candidate) {
+                      if (!candidate.stop_owns_reconciliation()) return false;
+                      const auto state = std::find_if(
+                          operation.state.participants.begin(), operation.state.participants.end(),
+                          [&](const auto& value) {
+                            return value.participant_id == candidate.slot_owner.participant_id;
+                          });
+                      return state == operation.state.participants.end() || !terminal(state->state);
+                    })
+            ? OperationStateKind::kStopping
+            : aggregate_participant_state(operation.state.participants);
 }
 
 }  // namespace manyforge::core

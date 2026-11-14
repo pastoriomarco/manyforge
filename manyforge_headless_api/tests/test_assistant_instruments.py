@@ -24,7 +24,7 @@ def _native(tool_ids: list[str]) -> dict[str, Any]:
     return {
         "grant_policy": {"approval_mode": None, "review_policy": "required", "session_kind": None},
         "mode": "composer-assistant",
-        "schema_version": "manyforge.assistant_mode_projection.v2",
+        "schema_version": "manyforge.assistant_mode_projection.v3",
         "assistant_component_id": "assistant",
         "runs_in": ["no_program_active"],
         "skills": [],
@@ -83,7 +83,7 @@ def test_projection_digests_cover_the_generated_content() -> None:
     semantic = {key: value for key, value in projection.items() if key != "source"}
     assert projection["source"]["source_content_digest"] == framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         semantic,
     )
     assert projection["catalog_hash"] == framed_digest(
@@ -102,7 +102,7 @@ def test_projection_digests_cover_the_generated_content() -> None:
 
 def test_projection_carries_the_assistant_component_and_its_cell_states() -> None:
     projection = _assistant_mode(_native([]), [])
-    assert projection["schema_version"] == "manyforge.assistant_mode_projection.v2"
+    assert projection["schema_version"] == "manyforge.assistant_mode_projection.v3"
     assert projection["assistant_component_id"] == "assistant"
     assert projection["runs_in"] == ["no_program_active"]
     assert "provider" not in projection
@@ -149,7 +149,7 @@ def test_index_v2_passes_native_fields_and_digests_them(native: dict[str, Any]) 
     }
     index = _assistant_instruments().compose_index(raw)
     semantic = {key: value for key, value in index.items() if key != "source"}
-    assert INDEX_VERSION == "manyforge.assistant_mode_index.v2"
+    assert INDEX_VERSION == "manyforge.assistant_mode_index.v3"
     assert semantic == {
         key: value for key, value in raw.items() if key != "source"
     } | {"instrument_registry_digest": _assistant_instruments().registry_digest}

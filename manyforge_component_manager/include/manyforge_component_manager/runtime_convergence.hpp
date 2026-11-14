@@ -19,7 +19,6 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::size_t kMaximumRuntimeStagedReadySets = 4096U;
-inline constexpr std::size_t kMaximumRuntimeStagedReadySetsPerApply = 16U;
 
 enum class RuntimeUnitCandidateDisposition {
   kAdded,
@@ -74,7 +73,7 @@ using RuntimePreStartGuard = std::function<void()>;
 
 /// Complete immutable candidate-runtime convergence intent.
 ///
-/// This aggregate is persisted after fence acceptance/rehydration and before
+/// This aggregate is persisted after fence acceptance and before
 /// the first process effect. Empty runtime-unit sets are explicit and legal.
 struct ManagerApplyRuntimeConvergenceIntentDTO final {
   manyforge::core::ApplyId apply_id;
@@ -99,7 +98,7 @@ struct RuntimeUnitConvergenceApplyOwnerDTO final {
   manyforge::core::ApplyGeneration apply_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero();
+    return apply_id.nonzero() && apply_generation.nonzero();
   }
 
   friend bool operator==(const RuntimeUnitConvergenceApplyOwnerDTO &,

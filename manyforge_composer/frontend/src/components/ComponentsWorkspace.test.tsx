@@ -87,8 +87,8 @@ function deploymentController(components: JsonValue[], appliedIds: string[]) {
 const armState: ComponentState = {
   component_id: 'arm',
   lifecycle: 'fault',
-  fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'enable',
-    vendor_code: 'C2', vendor_text: 'Emergency IO', since_ns: 1 },
+  fault: { code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'enable',
+    vendor_code: 'C31', vendor_text: 'Abnormal current', since_ns: 1 },
   activity: 'idle',
   streams: [{ stream_id: 'joint_states', freshness: 'fresh', age_ns: 4_000_000 }],
   capabilities: ['reset_position', 'io_manual_write'],
@@ -116,14 +116,14 @@ describe('Components section', () => {
     const html = renderToStaticMarkup(<ComponentsWorkspace {...props()} />);
     // Left: Enable all, the list (Applied with state; Draft-only marked), Add component.
     expect(html).toContain('Enable all');
-    expect(html).toContain('Fault · Emergency stop active');
+    expect(html).toContain('Fault · Robot stopped itself');
     expect(html).toContain('Added in Draft · runs after Apply');
     expect(html).toContain('>Add component</button>');
     expect(html).toContain('Custom I/O device or AI model');
     // Right: the first component's page with its state and actions.
     expect(html).toContain('id="component-page-title">arm</h3>');
     expect(html).toContain('aria-label="arm status"');
-    expect(html).toContain('Vendor: C2 · Emergency IO');
+    expect(html).toContain('Vendor: C31 · Abnormal current');
     expect(html).toContain('Operator action: Enable');
     expect(html).toContain('>Reset position</button>');
     expect(html).not.toContain('>io manual write</button>');

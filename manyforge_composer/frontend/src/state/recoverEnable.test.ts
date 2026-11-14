@@ -39,8 +39,8 @@ describe('e-stop presentation (OD-54)', () => {
       { component_id: 'xarm', action: 'recover', outcome: 'succeeded' },
       { component_id: 'xarm.arm', action: 'enable', outcome: 'succeeded' }] })).toBe('Recover and enable succeeded');
     expect(actionResultText({ ...base, outcome: 'failed', phases: [
-      { component_id: 'xarm', action: 'recover', outcome: 'failed', error: { code: 'fault_estop', message: '' } }] }))
-      .toBe('Recover and enable stopped: Recover xarm failed: Emergency stop active');
+      { component_id: 'xarm', action: 'recover', outcome: 'failed', error: { code: 'robot_error_not_cleared', message: '' } }] }))
+      .toBe("Recover and enable stopped: Recover xarm failed: Couldn't clear the robot error");
     expect(actionResultText({ ...base, outcome: 'unknown', phases: [
       { component_id: 'xarm', action: 'recover', outcome: 'succeeded' },
       { component_id: 'xarm.arm', action: 'enable', outcome: 'unknown' }] }))

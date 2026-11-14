@@ -26,6 +26,18 @@ inline constexpr std::string_view kScenarioCompositionRefusedCode =
 /// The producer of that refusal (the execution host).
 inline constexpr std::string_view kExecutionHostProducer = "execution_host";
 
+/// The Program an Apply's prepared activation binds: the host loads these
+/// sealed products for the candidate and keeps the facts with its installed Apply.
+struct HostApplyProgramSelection final {
+  manyforge::core::ProgramId program_id;
+  manyforge::core::ProgramRevision program_revision;
+  manyforge::core::ProgramBindingId program_binding_id;
+
+  [[nodiscard]] bool valid() const noexcept;
+  friend bool operator==(const HostApplyProgramSelection &,
+                         const HostApplyProgramSelection &) = default;
+};
+
 /// The Manager's one Apply call to the execution host, made
 /// while the Apply's Kernel configuration fence is held. The host refuses
 /// `apply_requires_inactive_component` for an enabled replaced or removed
@@ -45,6 +57,9 @@ struct HostApplyRequest final {
   std::vector<manyforge::core::ControllableComponentId> removed_components;
   /// Predecessor control domains the candidate drops, sorted.
   std::vector<manyforge::core::ControlDomainId> removed_domains;
+  /// The bound Program of the Apply's prepared activation; absent when it has
+  /// no Program or a non-executable one.
+  std::optional<HostApplyProgramSelection> program;
 
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const HostApplyRequest &, const HostApplyRequest &) = default;
@@ -67,13 +82,14 @@ struct HostApplyResult final {
   friend bool operator==(const HostApplyResult &, const HostApplyResult &) = default;
 };
 
-/// Derive the request from the exact sealed bundles and the Apply's durable
-/// per-component delta.
+/// Derive the request from the exact sealed bundles, the Apply's durable
+/// per-component delta and its prepared activation's bound Program.
 [[nodiscard]] HostApplyRequest MakeHostApplyRequest(
     const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
     const manyforge::deployment::RetainedBundle &predecessor,
     const manyforge::deployment::RetainedBundle &candidate,
-    const manyforge::deployment::ApplyComponentDeltaDTO &delta);
+    const manyforge::deployment::ApplyComponentDeltaDTO &delta,
+    std::optional<HostApplyProgramSelection> program);
 
 /// Current installed-owner read; independent of any candidate component list.
 struct ManagerComponentProcessInventoryRequestDTO final {
@@ -83,7 +99,6 @@ struct ManagerComponentProcessInventoryRequestDTO final {
   manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
   manyforge::core::RuntimeUnitId runtime_unit_id;
   manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
   /// Apply-only observation; ordinary Close/process inventory is unchanged.
   bool include_component_lifecycles{false};
   [[nodiscard]] bool valid() const noexcept;
@@ -171,42 +186,6 @@ struct ManagerComponentProcessInventoryResultDTO final {
              const ManagerComponentProcessInventoryResultDTO &) = default;
 };
 
-/// Operator request for the exact predecessor launch occurrence. The existing
-/// host publication and Manager epochs authenticate the request before effects.
-struct ManagerComponentProcessStopRequestDTO final {
-  manyforge::core::PublicRequestContextDTO request_context;
-  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
-  manyforge::core::ActiveBundlePublicationGeneration expected_predecessor_publication_generation;
-  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-  manyforge::core::ControllableComponentId controllable_component_id;
-  std::string launch_identity;
-  std::int32_t leader_pid;
-
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerComponentProcessStopRequestDTO &,
-                         const ManagerComponentProcessStopRequestDTO &) = default;
-};
-
-struct ManagerComponentProcessStopReadRequestDTO final {
-  ManagerComponentProcessStopRequestDTO request;
-  [[nodiscard]] bool valid() const noexcept { return request.valid(); }
-  friend bool operator==(const ManagerComponentProcessStopReadRequestDTO &,
-                         const ManagerComponentProcessStopReadRequestDTO &) = default;
-};
-
-/// Read-only cached cleanup state from the pinned original process owner.
-/// Absent process/leader exit alone never grants kDrained.
-struct ManagerComponentProcessStopResultDTO final {
-  ManagerComponentProcessStopRequestDTO request;
-  manyforge::core::ControllerLaunchCleanupState state;
-  std::optional<manyforge::core::ControllerLaunchGroupDrainReceipt> receipt{};
-  std::optional<manyforge::core::ErrorDTO> error{};
-  [[nodiscard]] bool valid() const noexcept;
-};
-
 class IManagerSelectedRuntimeCompositionPort {
 public:
   virtual ~IManagerSelectedRuntimeCompositionPort() = default;
@@ -219,17 +198,6 @@ public:
         Err({"installed_process_inspection_unavailable",
              "installed component process inspection is not composed",
              {}});
-  }
-
-  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-  StopComponentProcess(const ManagerComponentProcessStopRequestDTO &) {
-    return manyforge::core::Result<ManagerComponentProcessStopResultDTO>::Err(
-        {"component_process_stop_unavailable", "component process Stop is not composed", {}});
-  }
-  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentProcessStopResultDTO>
-  ReadComponentProcessStop(const ManagerComponentProcessStopReadRequestDTO &) {
-    return manyforge::core::Result<ManagerComponentProcessStopResultDTO>::Err(
-        {"component_process_stop_unavailable", "component process Stop result is not composed", {}});
   }
 
   /// Send one Apply to the execution host occurrence `runtime_unit_id`. A

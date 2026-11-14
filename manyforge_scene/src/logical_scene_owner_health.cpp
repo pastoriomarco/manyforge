@@ -22,11 +22,6 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
           maintenance->apply_id, maintenance->apply_generation,
           *state.active_projection};
     }
-    if (!state.migrated_structural_completions.empty()) {
-      const auto &completion = state.migrated_structural_completions.back();
-      return MaintenanceProjectionSetSourceDTO{
-          completion.apply_id, completion.apply_generation, completion.target};
-    }
     return BootstrapProjectionSetSourceDTO{state.accepted->bootstrap_id,
                                            state.accepted->bootstrap_generation,
                                            state.accepted->target};
@@ -96,19 +91,6 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
         "active native projection set cannot form aggregate health");
   }
   return aggregate;
-}
-
-RequestOwnerEpoch LogicalSceneOwner::CurrentRequestOwnerEpoch() const {
-  std::lock_guard lock(impl_->mutex_);
-  const auto &cached = impl_->ReadSceneCommitState();
-  const auto &state = cached.durable_state;
-  if (!state.active_projection.has_value() ||
-      !state.active_scene_snapshot.has_value() ||
-      !cached.transaction_state.has_value()) {
-    throw LogicalSceneOwnerConflictError(
-        "logical-scene request owner epoch requires finalized bootstrap");
-  }
-  return cached.transaction_state->request_owner_epoch;
 }
 
 ProjectionRevisionDTO

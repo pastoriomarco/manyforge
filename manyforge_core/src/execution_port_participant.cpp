@@ -7,6 +7,7 @@
 #include <manyforge_core/execution_sample_association.hpp>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
 #include <manyforge_core/robot_at_target.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
 #include <optional>
 #include <stdexcept>
@@ -35,15 +36,30 @@ ErrorDTO fault(ErrorCode code, std::string message, const std::string& reason,
   return ErrorDTO{std::string(to_string(code)), std::move(message), std::move(details)};
 }
 
+// Only a defect hands the locked rebind steps a stage other than the one just locked.
+void report_invalid_owner_rebind_stage(const char* check) noexcept {
+  (void)std::fprintf(stderr, "manyforge_fault code=%.*s check=%s\n",
+                     static_cast<int>(error_codes::kOwnerRebindStageInvalid.size()),
+                     error_codes::kOwnerRebindStageInvalid.data(), check);
+}
+
 // One bounded diagnostic per hold transition; no per-tick logging.
-void trace_scale_hold(const char* stage, std::uint64_t owner, const ExecutionGoalKey& goal,
+void trace_scale_hold(const char* stage, std::uint64_t owner, const ControllerGoalId& goal,
                       double factor, double cursor, double rate) {
   const auto written = std::fprintf(stderr,
-                                    "manyforge_moving_scale_hold stage=%s owner=%llu goal=%.160s "
+                                    "manyforge_moving_scale_hold stage=%s owner=%llu goal=%llu/%u/%u "
                                     "factor=%.17g cursor_s=%.17g rate_per_s=%.17g\n",
                                     stage, static_cast<unsigned long long>(owner),
-                                    goal.controller_goal_id.value().c_str(), factor, cursor, rate);
+                                    static_cast<unsigned long long>(goal.operation_id.value()),
+                                    goal.ordinal, goal.generation, factor, cursor, rate);
   static_cast<void>(written);
+}
+
+// The same line from a trace captured under the locks (OD-221).
+template <typename Trace>
+void trace_scale_hold(const Trace& trace) {
+  trace_scale_hold(trace.stage, trace.owner, trace.goal, trace.factor, trace.cursor_s,
+                   trace.rate_per_s);
 }
 
 const char* refusal_name(ExecutionPortRefusal refusal) {
@@ -107,7 +123,7 @@ bool same_replacement_source(const PreparedMotionReplacementSourceDTO& a,
 }
 
 StopStageDispatchedGoalDTO stop_goal_for(const PreparedOperationParticipantDTO& participant,
-                                         const ExecutionGoalKey& key,
+                                         const ControllerGoalId& key,
                                          const TrajectoryDTO& trajectory) {
   const auto& motion = std::get<PreparedMotionExecutionDTO>(participant.payload);
   std::vector<PreparedParticipantStopPlanDTO> stop_plans{participant.controller().ordinary_stop_plan};
@@ -200,7 +216,7 @@ std::optional<ParticipantStopStageResultDTO> no_goal_containment(
 /// One dispatched goal and the policy state that follows it.
 struct ExecutionPortParticipant::Execution {
   std::uint64_t generation{};
-  ExecutionGoalKey key;
+  ControllerGoalId key;
   /// The token of this goal's send (Dispatch, or a moving replacement's
   /// DispatchReplacement); `dispatch_pending` while that send runs unlocked.
   std::shared_ptr<ExecutionDispatchToken> dispatch_token;
@@ -250,10 +266,10 @@ struct ExecutionPortParticipant::Execution {
 };
 
 struct ExecutionPortParticipant::PendingDispatch {
-  PendingDispatch(ExecutionGoalKey value, ContentDigest prepared_digest,
+  PendingDispatch(ControllerGoalId value, ContentDigest prepared_digest,
                   std::shared_ptr<ExecutionDispatchToken> dispatch_token)
       : key(std::move(value)), digest(std::move(prepared_digest)), token(std::move(dispatch_token)) {}
-  ExecutionGoalKey key;
+  ControllerGoalId key;
   ContentDigest digest;
   std::shared_ptr<ExecutionDispatchToken> token;
   std::promise<ExecutionHandle> result;
@@ -268,7 +284,7 @@ struct ExecutionPortParticipant::Replacement {
   std::shared_ptr<Execution> execution;
   std::optional<StopStageDispatchedGoalDTO> stop_goal;
   std::optional<PreparedGoalRecord> prepared_goal;
-  ExecutionGoalKey record_key;
+  ControllerGoalId record_key;
   TrajectoryDTO record_trajectory;
   std::optional<ExecutionPortCommandResultDTO> command;
   std::optional<std::int64_t> submitted_at_ns;
@@ -500,18 +516,24 @@ Result<void> ExecutionPortParticipant::LockOwnerRebind(
   }
 }
 
-bool ExecutionPortParticipant::LockedOwnerRebindNeedsMotionProof(
+std::optional<bool> ExecutionPortParticipant::LockedOwnerRebindNeedsMotionProof(
     const std::shared_ptr<OwnerRebindStage>& stage) const noexcept {
   if (!stage || stage->owner != this || !stage->participant_lock.owns_lock() ||
-      !stage->scale_lock.owns_lock()) std::terminate();
+      !stage->scale_lock.owns_lock()) {
+    report_invalid_owner_rebind_stage("motion_proof");
+    return std::nullopt;
+  }
   return stage->unknown_execution;
 }
 
-void ExecutionPortParticipant::CommitLockedOwnerRebind(
+bool ExecutionPortParticipant::CommitLockedOwnerRebind(
     const std::shared_ptr<OwnerRebindStage>& stage) noexcept {
   // The owning host must hold this guard through every companion swap.
   if (!stage || stage->owner != this || stage->committed ||
-      !stage->participant_lock.owns_lock() || !stage->scale_lock.owns_lock()) std::terminate();
+      !stage->participant_lock.owns_lock() || !stage->scale_lock.owns_lock()) {
+    report_invalid_owner_rebind_stage("commit");
+    return false;
+  }
   static_assert(std::is_nothrow_swappable_v<ExecutionLaneFactsDTO>);
   last_sent_scale_.reset();
   scale_frozen_ = false;
@@ -539,6 +561,7 @@ void ExecutionPortParticipant::CommitLockedOwnerRebind(
   swap(lane_, stage->lane);
   timing_ = {};
   stage->committed = true;
+  return true;
 }
 
 void ExecutionPortParticipant::UnlockOwnerRebind(
@@ -740,8 +763,7 @@ bool ExecutionPortParticipant::SourceMatchesLocked(
          prepared_membership_.active_execution_id() == source.execution_id &&
          execution_->generation == source.execution_generation && execution_->key == source.goal &&
          execution_->epoch == source.binding_epoch &&
-         prepared_goal_->goal_id == source.goal.controller_goal_id &&
-         prepared_goal_->generation == source.goal.controller_goal_generation &&
+         prepared_goal_->goal_id == source.goal &&
          prepared_goal_->prepared_contract_digest == source.prepared_contract_digest;
 }
 
@@ -780,7 +802,7 @@ bool ExecutionPortParticipant::ReplacementScaleCompatibleLocked(
 }
 
 Result<PreparedMotionReplacementSourceDTO> ExecutionPortParticipant::CaptureReplacementSource(
-    const std::uint64_t execution_id, const std::uint64_t generation, const ExecutionGoalKey& goal,
+    const std::uint64_t execution_id, const std::uint64_t generation, const ControllerGoalId& goal,
     const ContentDigest& digest) const {
   std::lock_guard lock(mutex_);
   const auto refuse = [] {
@@ -832,6 +854,7 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
     return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                    "Moving preparation scaling hold was refused", reason));
   };
+  std::optional<ScaleHoldTrace> settled_trace;
   {
     std::unique_lock lock(mutex_);
     if (cancellation.stop_requested() || clock_.now() >= deadline)
@@ -861,8 +884,8 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
                                 config_.progress_freshness_budget_ns);
       preparation_scale_hold_ = PreparationScaleHold{candidate_id, source.goal, *factor, settled};
       if (settled)
-        trace_scale_hold("confirmed", candidate_id, source.goal, *factor,
-                         source.controller_sample.cursor_s, ramp_->rate_per_s);
+        settled_trace = ScaleHoldTrace{"confirmed", candidate_id, source.goal, *factor,
+                                       source.controller_sample.cursor_s, ramp_->rate_per_s};
       if (!settled) {
         const auto port = port_;
         const auto sequence = port->ReserveScaleSequence();
@@ -883,10 +906,17 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
         if (ramp_) ramp_->value = *factor;
       }
     }
-    if (preparation_scale_hold_->confirmed) return Result<void>::Ok();
+    if (preparation_scale_hold_->confirmed) {
+      scale_lock.unlock();
+      lock.unlock();
+      // OD-221: printed after the locks are released.
+      if (settled_trace) trace_scale_hold(*settled_trace);
+      return Result<void>::Ok();
+    }
   }
   // Same existing observation/wait seam and preparation deadline; no new timer.
   while (!cancellation.stop_requested() && clock_.now() < deadline) {
+    std::optional<ScaleHoldTrace> confirmed_trace;
     {
       std::lock_guard lock(mutex_);
       std::lock_guard scale_lock(scale_mutex_);
@@ -905,10 +935,15 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
           sample->applied_factor == std::optional<double>(preparation_scale_hold_->factor) &&
           execution_->association->Observe(*sample, goal)) {
         preparation_scale_hold_->confirmed = true;
-        trace_scale_hold("confirmed", candidate_id, source.goal, preparation_scale_hold_->factor,
-                         sample->cursor_s, ramp_ ? ramp_->rate_per_s : 0.0);
-        return Result<void>::Ok();
+        confirmed_trace = ScaleHoldTrace{"confirmed", candidate_id, source.goal,
+                                         preparation_scale_hold_->factor, sample->cursor_s,
+                                         ramp_ ? ramp_->rate_per_s : 0.0};
       }
+    }
+    if (confirmed_trace) {
+      // OD-221: printed after the locks are released.
+      trace_scale_hold(*confirmed_trace);
+      return Result<void>::Ok();
     }
     waiter_(deadline, cancellation);
   }
@@ -917,17 +952,18 @@ Result<void> ExecutionPortParticipant::BeginReplacementPreparationScaleHold(
 
 Result<void> ExecutionPortParticipant::EndReplacementPreparationScaleHold(
     const std::uint64_t candidate_id) {
-  std::lock_guard lock(mutex_);
-  std::lock_guard scale_lock(scale_mutex_);
+  std::unique_lock lock(mutex_);
+  std::unique_lock scale_lock(scale_mutex_);
   if (!preparation_scale_hold_ || preparation_scale_hold_->candidate_id != candidate_id)
     return Result<void>::Ok();
   if (!preparation_scale_hold_->confirmed && !scale_frozen_)
     return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
                                    "Moving scale pin has no observed confirmation",
                                    "motion_replacement_scale_hold_unconfirmed"));
-  trace_scale_hold("retired", candidate_id, preparation_scale_hold_->source_goal,
-                   preparation_scale_hold_->factor, execution_ ? execution_->cursor_s : 0.0,
-                   ramp_ ? ramp_->rate_per_s : 0.0);
+  const ScaleHoldTrace retired_trace{"retired", candidate_id, preparation_scale_hold_->source_goal,
+                                     preparation_scale_hold_->factor,
+                                     execution_ ? execution_->cursor_s : 0.0,
+                                     ramp_ ? ramp_->rate_per_s : 0.0};
   preparation_scale_hold_.reset();
   if (ramp_) ramp_->target = target_scale_;
   if (!scale_frozen_ && execution_ && !execution_->terminal && !execution_->stopping &&
@@ -935,6 +971,10 @@ Result<void> ExecutionPortParticipant::EndReplacementPreparationScaleHold(
     last_ramp_tick_ = clock_.now();
     ScheduleRampTickLocked();
   }
+  scale_lock.unlock();
+  lock.unlock();
+  // OD-221: printed after the locks are released.
+  trace_scale_hold(retired_trace);
   return Result<void>::Ok();
 }
 
@@ -1015,7 +1055,7 @@ PrepareParticipantResultDTO ExecutionPortParticipant::PrepareReplacement(
 
 PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplacement(
     const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
-    const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& successor,
+    const PreparedOperationParticipantDTO& participant, const ControllerGoalId& successor,
     const std::int64_t preparation_deadline_ns, const ReplacementSendRecheck& recheck_before_send) {
   const auto reject = [](std::string reason, std::map<std::string, std::string> details = {}) {
     return PreparedMotionReplacementDispatchDTO{
@@ -1038,15 +1078,14 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       const auto& replay_goal = prepared_membership_.active_execution_id() == candidate_id
                                     ? prepared_goal_
                                     : replacement_->prepared_goal;
-      if (!replay_goal || replay_goal->goal_id != successor.controller_goal_id ||
-          replay_goal->generation != successor.controller_goal_generation)
+      if (!replay_goal || replay_goal->goal_id != successor)
         return reject("motion_replacement_goal_conflict");
       return PreparedMotionReplacementDispatchDTO{*replacement_->command, replay_goal->handle,
                                                   replacement_->submitted_at_ns};
     }
     if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
         execution_->critical_fault || stop_stages_in_flight_ != 0U || successor == source.goal ||
-        successor.controller_goal_id.empty() || !successor.controller_goal_generation.nonzero() ||
+        !successor.nonzero() ||
         !config_.stop.replacement_start_allowance_s)
       return reject("motion_replacement_source_changed");
     return std::nullopt;
@@ -1085,11 +1124,10 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
         return candidate->snapshot;
       },
       candidate->generation,
-      successor.controller_goal_id,
-      successor.controller_goal_generation,
+      successor,
       participant.prepared_contract_digest};
   pending.prepared_goal =
-      PreparedGoalRecord{successor.controller_goal_id, successor.controller_goal_generation,
+      PreparedGoalRecord{successor,
                          participant.prepared_contract_digest, handle};
   auto uncertain = ExecutionPortCommandResultDTO{
       ExecutionPortDispatch::kEffectUncertain, std::nullopt,
@@ -1235,8 +1273,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
     // Another attempt (any successor) may have staged its keys and handle
     // meanwhile; this attempt sends, so its own staging is restored.
     stage_keys();
-    pending.prepared_goal = PreparedGoalRecord{successor.controller_goal_id,
-                                               successor.controller_goal_generation,
+    pending.prepared_goal = PreparedGoalRecord{successor,
                                                participant.prepared_contract_digest, handle};
   }
   candidate->association =
@@ -1439,7 +1476,7 @@ Result<PreparedMotionReplacementObservationDTO> ExecutionPortParticipant::Observ
 Result<void> ExecutionPortParticipant::AdoptReplacement(
     const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
     const PreparedMotionReplacementCommitDTO commit) {
-  std::lock_guard lock(mutex_);
+  std::unique_lock lock(mutex_);
   if (!replacement_ || replacement_->candidate_id != candidate_id ||
       !same_replacement_source(replacement_->source, source) || !SourceMatchesLocked(source) ||
       execution_->terminal || execution_->stopping || execution_->critical_fault ||
@@ -1481,11 +1518,14 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   execution_->snapshot.timestamp_ns = now;
   ++execution_->snapshot.sequence_number;
   execution_ = replacement_->execution;
+  std::optional<ScaleHoldTrace> adopted_trace;
   {
     std::lock_guard scale_lock(scale_mutex_);
     if (preparation_scale_hold_ && preparation_scale_hold_->candidate_id == candidate_id) {
-      trace_scale_hold("adopted", candidate_id, execution_->key, preparation_scale_hold_->factor,
-                       *execution_->scale_hold_until_cursor_s, ramp_ ? ramp_->rate_per_s : 0.0);
+      adopted_trace = ScaleHoldTrace{"adopted", candidate_id, execution_->key,
+                                     preparation_scale_hold_->factor,
+                                     *execution_->scale_hold_until_cursor_s,
+                                     ramp_ ? ramp_->rate_per_s : 0.0};
       preparation_scale_hold_.reset();
     } else
       execution_->scale_hold_until_cursor_s.reset();
@@ -1503,6 +1543,10 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   execution_->RecordProgressSample(published, std::move(published_sample));
   // Legacy compatible evolving ramps continue unchanged. A prepared hold
   // stays pinned until this adopted execution observes its connector end.
+  lock.unlock();
+  // OD-221: printed after the participant's locks are released (the
+  // Kernel's commit still holds its own locks around this call).
+  if (adopted_trace) trace_scale_hold(*adopted_trace);
   return Result<void>::Ok();
 }
 
@@ -1608,7 +1652,7 @@ Result<void> ExecutionPortParticipant::RetirePreparedExecution(const std::uint64
 
 ExecutionHandle ExecutionPortParticipant::RejectedHandle(
     const PreparedOperationParticipantDTO& participant, const ControllerGoalId& goal_id,
-    const ControllerGoalGeneration generation, ErrorDTO error) const {
+    ErrorDTO error) const {
   ExecutionSnapshot snapshot;
   snapshot.timestamp_ns = clock_.now();
   snapshot.state = ExecutionState::kFailed;
@@ -1617,7 +1661,6 @@ ExecutionHandle ExecutionPortParticipant::RejectedHandle(
                          [snapshot = std::move(snapshot)] { return snapshot; },
                          0U,
                          goal_id,
-                         generation,
                          participant.prepared_contract_digest};
 }
 
@@ -1663,10 +1706,9 @@ Result<void> ExecutionPortParticipant::ApplyToolContext(
 }
 
 ExecutionHandle ExecutionPortParticipant::Dispatch(
-    const PreparedOperationParticipantDTO& participant, const ControllerGoalId& controller_goal_id,
-    const ControllerGoalGeneration controller_goal_generation) {
+    const PreparedOperationParticipantDTO& participant, const ControllerGoalId& controller_goal_id) {
   const auto rejected = [&](std::string reason, std::map<std::string, std::string> details = {}) {
-    return RejectedHandle(participant, controller_goal_id, controller_goal_generation,
+    return RejectedHandle(participant, controller_goal_id,
                           fault(ErrorCode::kExecutionRejected,
                                 "Execution port participant rejected the prepared dispatch",
                                 reason, std::move(details)));
@@ -1674,14 +1716,13 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   const bool measured = config_.stop.trip_authority == StateAuthorityClass::kMeasured;
   if (measured) AwaitFreshStartSample();
   std::unique_lock lock(mutex_);
-  if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
+  if (!controller_goal_id.nonzero()) {
     return rejected("controller_goal_identity_invalid");
   }
   // A Stop stage found this goal unsent and contained it; it never goes
   // out afterwards (also when that Stop ran during the fresh-sample wait
   // above, before this lock).
-  if (stopped_before_dispatch_ ==
-      ExecutionGoalKey{controller_goal_id, controller_goal_generation}) {
+  if (stopped_before_dispatch_ == controller_goal_id) {
     return rejected("execution_port_stop_in_flight");
   }
   if (const auto invalid = BindingFieldError(participant)) return rejected(std::string(*invalid));
@@ -1690,19 +1731,19 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   }
   if (pending_dispatch_) {
     const auto pending = pending_dispatch_;
-    if (pending->key == ExecutionGoalKey{controller_goal_id, controller_goal_generation} &&
+    if (pending->key == controller_goal_id &&
         pending->digest == participant.prepared_contract_digest) {
       lock.unlock();
       return pending->completion.get();
     }
-    if (pending->key.controller_goal_id == controller_goal_id)
+    if (pending->key.participant() == controller_goal_id.participant())
       return rejected("controller_goal_identity_conflict");
     return rejected("execution_port_execution_in_flight");
   }
   // Replay protection: an exact repetition returns the same handle and never
   // sends a second goal; any other use of the goal identity is refused.
-  if (prepared_goal_ && prepared_goal_->goal_id == controller_goal_id) {
-    if (prepared_goal_->generation == controller_goal_generation &&
+  if (prepared_goal_ && prepared_goal_->goal_id.participant() == controller_goal_id.participant()) {
+    if (prepared_goal_->goal_id.generation == controller_goal_id.generation &&
         prepared_goal_->prepared_contract_digest == participant.prepared_contract_digest) {
       return prepared_goal_->handle;
     }
@@ -1723,11 +1764,11 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   auto* port = port_.get();
   auto readiness = port->ReadReadiness();
   if (!ready(readiness)) return rejected("execution_port_not_ready");
-  const ExecutionGoalKey key{controller_goal_id, controller_goal_generation};
+  const ControllerGoalId key = controller_goal_id;
   auto baseline = port->ReadSample();
   if (measured) {
     if (auto refusal = StartStateError(baseline, readiness.binding_epoch, motion.trajectory)) {
-      return RejectedHandle(participant, controller_goal_id, controller_goal_generation,
+      return RejectedHandle(participant, controller_goal_id,
                             std::move(*refusal));
     }
   }
@@ -1769,7 +1810,6 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
       },
       generation,
       controller_goal_id,
-      controller_goal_generation,
       participant.prepared_contract_digest};
   struct CompletionGuard {
     std::shared_ptr<PendingDispatch> pending;
@@ -1806,7 +1846,13 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
     std::map<std::string, std::string> details;
     if (sent.refusal) details["port_refusal"] = refusal_name(*sent.refusal);
     if (sent.error) details["port_error"] = sent.error->message;
-    auto result = rejected("execution_port_submit_refused", std::move(details));
+    // A Stop stage fenced this pending send (it sets `stopped_before_dispatch_`
+    // to this goal under this lock only when it fenced this send's token;
+    // the check above refused an already-fenced goal before the send): the
+    // goal did not go out because of that Stop.
+    auto result = rejected(stopped_before_dispatch_ == key ? "execution_port_stop_in_flight"
+                                                           : "execution_port_submit_refused",
+                           std::move(details));
     if (execution_ == execution) execution_.reset();
     if (pending_dispatch_ == pending) pending_dispatch_.reset();
     execution->dispatch_token->Finish(sent.dispatch);
@@ -1835,7 +1881,7 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
     }
   }
 
-  prepared_goal_ = PreparedGoalRecord{controller_goal_id, controller_goal_generation,
+  prepared_goal_ = PreparedGoalRecord{controller_goal_id,
                                       participant.prepared_contract_digest, handle};
   if (pending_dispatch_ == pending) pending_dispatch_.reset();
   execution->dispatch_token->Finish(sent.dispatch);
@@ -2018,18 +2064,30 @@ ExecutionProgressHazardClaimResult ExecutionPortParticipant::claim_execution_pro
 
 bool ExecutionPortParticipant::WaitForCompletion(const std::shared_ptr<Execution>& execution,
                                                  const std::int64_t timeout_ns) {
+  // OD-221: ObserveSample's "released" line is printed after `mutex_`.
+  std::optional<ScaleHoldTrace> released;
   {
     std::unique_lock lock(mutex_);
     if (replacement_ && replacement_->execution == execution && execution_ != execution &&
         prepared_membership_.active_execution_id() != replacement_->candidate_id)
       return false;
     Evaluate(*execution, lock);
-    if (execution->terminal) return true;
+    released = std::exchange(released_scale_hold_trace_, std::nullopt);
+    if (execution->terminal) {
+      lock.unlock();
+      if (released) trace_scale_hold(*released);
+      return true;
+    }
   }
+  if (released) trace_scale_hold(*released);
   waiter_(clock_.now() + std::max<std::int64_t>(0, timeout_ns), std::stop_token{});
   std::unique_lock lock(mutex_);
   Evaluate(*execution, lock);
-  return execution->terminal;
+  released = std::exchange(released_scale_hold_trace_, std::nullopt);
+  const bool terminal = execution->terminal;
+  lock.unlock();
+  if (released) trace_scale_hold(*released);
+  return terminal;
 }
 
 void ExecutionPortParticipant::Finish(Execution& execution, const ExecutionState state,
@@ -2105,8 +2163,9 @@ void ExecutionPortParticipant::ObserveSample(Execution& execution,
       ramp_->rate_per_s = std::min(execution.trajectory.runtime_scale_bounds->max_rate_per_s,
                                    kMaxRuntimeScaleSlewPerS);
       ramp_->target = target_scale_;
-      trace_scale_hold("released", prepared_membership_.active_execution_id().value_or(0U), execution.key,
-                       ramp_->value, original_cursor_s, ramp_->rate_per_s);
+      released_scale_hold_trace_ =
+          ScaleHoldTrace{"released", prepared_membership_.active_execution_id().value_or(0U),
+                         execution.key, ramp_->value, original_cursor_s, ramp_->rate_per_s};
       if (!scale_frozen_ && !preparation_scale_hold_ && ramp_->value != ramp_->target) {
         last_ramp_tick_ = now;
         ScheduleRampTickLocked();
@@ -2323,7 +2382,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution, std::unique_lock<s
                    std::string("FollowJointTrajectory goal failed: ") + to_string(result),
                    "controller_result_failed",
                    {{"goal_result", to_string(result)},
-                    {"mechanism_goal_id", goal->mechanism_goal_id.value()}}));
+                    {"mechanism_goal_id", MechanismGoalIdHex(goal->mechanism_goal_id)}}));
       return;
     }
   }
@@ -2342,7 +2401,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution, std::unique_lock<s
                  std::string("FollowJointTrajectory goal failed: ") + to_string(result),
                  "controller_result_failed",
                  {{"goal_result", to_string(result)},
-                  {"mechanism_goal_id", goal->mechanism_goal_id.value()}}));
+                  {"mechanism_goal_id", MechanismGoalIdHex(goal->mechanism_goal_id)}}));
     return;
   }
   // Completion: kSucceeded plus `main`'s authority check. Every lane
@@ -2432,7 +2491,7 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
   {
     std::lock_guard lock(mutex_);
     execution = execution_;
-    const ExecutionGoalKey stage_goal{stage.controller_goal_id, stage.controller_goal_generation};
+    const ControllerGoalId stage_goal = stage.controller_goal_id;
     helper = execution && (!execution->terminal || execution->key == stage_goal)
                  ? execution->stop_helper : helper_;
     ++stop_stages_in_flight_;

@@ -19,9 +19,7 @@ export interface SceneOwnerFacts {
   logicalScene: LogicalSceneProjection;
   sceneRuntime: SceneRuntimeProjection;
   sourceGeneration: number;
-  sourceOwnerEpoch: string;
   runtimeSourceGeneration: number;
-  runtimeSourceOwnerEpoch: string;
 }
 
 export type SceneOwnerFactsResult =
@@ -54,7 +52,6 @@ export function sceneOwnerFacts(
     if (
       section.knownGaps.length > 0
       || section.sourceGeneration === null
-      || section.sourceOwnerEpoch === null
     ) {
       return unavailable(`The ${label} owner projection is incomplete.`);
     }
@@ -106,9 +103,7 @@ export function sceneOwnerFacts(
       logicalScene,
       sceneRuntime,
       sourceGeneration: logicalSection.sourceGeneration as number,
-      sourceOwnerEpoch: logicalSection.sourceOwnerEpoch as string,
       runtimeSourceGeneration: runtimeSection.sourceGeneration as number,
-      runtimeSourceOwnerEpoch: runtimeSection.sourceOwnerEpoch as string,
     },
   };
 }
@@ -327,6 +322,8 @@ export function candidateTcpPoseFromCell(
 
 export interface RetainedSceneOwnerPresentation {
   productIdentity: string;
+  /** The start of the admitted snapshot the facts came from. */
+  applicationStartId: string | null;
   facts: SceneOwnerFacts;
 }
 

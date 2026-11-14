@@ -43,10 +43,10 @@ class Client:
 
 
 def execution() -> dict[str, Any]:
-    return {'api_version': 'manyforge.execution_command_response.v4', 'command': 'observation',
+    return {'api_version': 'manyforge.execution_command_response.v6', 'command': 'observation',
             'ok': True, 'observation': {
-                'schema_version': 'manyforge.execution_observation.v4',
-                'owner_epoch': 'owner', 'cell_id': 'cell', 'retained_bundle_id': 'bundle',
+                'schema_version': 'manyforge.execution_observation.v5',
+                'application_start_id': 'owner', 'cell_id': 'cell', 'retained_bundle_id': 'bundle',
                 'graph_revision': 'graph', 'source_epoch': 'execution', 'source_sequence': 1,
                 'targets': [], 'measured_targets': [],
             }}
@@ -59,8 +59,8 @@ def pose(generation: int, position: float, *, graph: str = 'graph') -> dict[str,
                          'age_at_delivery_ns': 200_000_000, 'freshness_budget_ns': 1_000_000_000}]}
 
 
-def cursor(frame: dict[str, Any]) -> tuple[str, str, int, int]:
-    return (frame['owner_epoch'], frame['source_epoch'], frame['source_sequence'], frame['delivery_sequence'])
+def cursor(frame: dict[str, Any]) -> tuple[str, int, int]:
+    return (frame['source_epoch'], frame['source_sequence'], frame['delivery_sequence'])
 
 
 def test_pose_only_updates_wake_credited_viewers_and_coalesce_per_browser() -> None:

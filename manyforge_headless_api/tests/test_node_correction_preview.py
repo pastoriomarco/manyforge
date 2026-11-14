@@ -14,6 +14,7 @@ from manyforge_headless_api.program_runner_client import ProgramRunnerClientErro
 from manyforge_headless_api.models import ProgramNodeCorrectionPreviewRequest
 from manyforge_headless_api.service import TrustedAttribution
 from manyforge_headless_api.tests.test_app import (
+    _APPLICATION_START_ID,
     FakeCore,
     FakeExecution,
     FakeManager,
@@ -25,32 +26,43 @@ from manyforge_headless_api.tests.test_app import (
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
-_RUN = "program-run.7"
+_RUN = 7
+# Class 3 in byte 0 already, so the key Headless forms equals it.
+_KEY = "c0" + "11" * 15
+
+
+def _key(sequence: int) -> str:
+    return "c0" + "11" * 7 + f"{sequence:016x}"
 
 
 def _body(**changes: Any) -> dict[str, Any]:
+    """The body the runner receives (``A`` is checked by Headless only)."""
+
     return {
-        "schema_version": "manyforge.program_node_correction_preview_request.v1",
-        "request_id": "node-preview.1",
+        "schema_version": "manyforge.program_node_correction_preview_request.v2",
+        "request_key": _KEY,
         "program_run_id": _RUN,
-        "expected_owner_epoch": "program-runner.epoch.1",
         "program_id": "lite6_program",
         "program_revision": _DIGEST_A,
         "program_binding_id": _DIGEST_A,
         "node_instance_id": "move_to_pick",
-        "node_attempt_id": "attempt:1",
+        "node_attempt_id": 1,
         "proposed_inputs": [{"path": "goal", "value": [{"joint_name": "j1", "position_rad": 0.1}]}],
         **changes,
     }
 
 
+def _posted(**changes: Any) -> dict[str, Any]:
+    """The HTTP body: the runner's body plus the ``A`` it was built against."""
+
+    return {**_body(**changes), "application_start_id": _APPLICATION_START_ID}
+
+
 def _operation() -> dict[str, Any]:
     return {
         "request_context": {
-            "request_id": "node-preview.1",
-            "request_owner_epoch": "kernel.epoch.1",
+            "request_key": _KEY,
             "source_label": "manyforge_behavior",
-            "correlation_id": _RUN,
         },
         "program_id": "lite6_program",
         "program_revision": _DIGEST_A,
@@ -107,10 +119,9 @@ def _operation() -> dict[str, Any]:
 
 def _built(*, unavailable: dict[str, str] | None = None) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_node_correction_preview_intent.v2",
-        "request_id": "node-preview.1",
+        "schema_version": "manyforge.program_node_correction_preview_intent.v3",
+        "request_key": _KEY,
         "program_run_id": _RUN,
-        "program_runner_owner_epoch": "program-runner.epoch.1",
         "run_revision": 4,
         "program_id": "lite6_program",
         "program_revision": _DIGEST_A,
@@ -118,7 +129,7 @@ def _built(*, unavailable: dict[str, str] | None = None) -> dict[str, Any]:
         "retained_bundle_id": _DIGEST_B,
         "graph_revision": _DIGEST_C,
         "node_instance_id": "move_to_pick",
-        "node_attempt_id": "attempt:1",
+        "node_attempt_id": 1,
         "node_id": "motion.move_to_joint_target",
         "proposed_paths": ["goal"],
         "parameters_digest": "sha256:" + "f" * 64,
@@ -136,7 +147,7 @@ class _Runner:
         self.response = response
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def preview_node_correction(self, program_run_id: str, body: dict[str, Any]):
+    def preview_node_correction(self, program_run_id: int, body: dict[str, Any]):
         self.calls.append((program_run_id, copy.deepcopy(body)))
         if isinstance(self.response, Exception):
             raise self.response
@@ -153,15 +164,18 @@ def test_preview_sends_the_runner_intent_through_the_manual_preview_path() -> No
 
     with TestClient(app) as client:
         response = client.post(
-            f"/api/program/runs/{_RUN}/node-correction-previews", json=_body()
+            f"/api/program/runs/{_RUN}/node-correction-previews", json=_posted()
         )
 
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["schema_version"] == "manyforge.program_node_correction_preview.v2"
+    assert result["schema_version"] == "manyforge.program_node_correction_preview.v3"
+    # The reply names its run, so it carries ``A`` and the display (1.5).
+    assert result["application_start_id"] == _APPLICATION_START_ID
+    assert result["display"] == f"{_APPLICATION_START_ID[:4]}/run{_RUN}"
     assert result["preview_check"] == "trajectory_planned_and_collision_validated"
     assert result["preview"] == {"ok": True, "command": "preview_motion", "preview_receipt": {}}
-    assert result["node_attempt_id"] == "attempt:1"
+    assert result["node_attempt_id"] == 1
     assert result["target"]["component_id"] == "robot.1"
     assert "operation" not in result
     assert runner.calls == [(_RUN, _body())]
@@ -196,19 +210,22 @@ def test_unavailable_preview_names_its_reason_and_skips_the_native_owner() -> No
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda built: built.update(schema_version="manyforge.program_node_correction_preview_intent.v1"),
-        lambda built: built.update(node_attempt_id="attempt:other"),
+        lambda built: built.update(schema_version="manyforge.program_node_correction_preview_intent.v2"),
+        lambda built: built.update(node_attempt_id=2),
+        lambda built: built.update(request_key=_key(9)),
+        lambda built: built["operation"]["request_context"].update(request_key=_key(9)),
+        # The v3 intent names no runner owner epoch (contract 1.16.4).
         lambda built: built.update(program_runner_owner_epoch="program-runner.epoch.2"),
         lambda built: built.update(operation=None),
         lambda built: built["operation"]["participants"][0]["target"].update(command_target_id="other"),
         lambda built: built["target"].update(target_role_id="old"),
-        lambda built: built["operation"].update(program_run_id="program-run.8"),
+        lambda built: built["operation"].update(program_run_id=8),
         lambda built: built["operation"]["participants"][0].update(
             action_span={
                 "action_source": "program_node",
-                "action_span_id": "attempt:1",
+                "action_span_id": "1",
                 "node_instance_id": "move_to_pick",
-                "node_attempt_id": "attempt:1",
+                "node_attempt_id": 1,
             }
         ),
         lambda built: built.update(extra=True),
@@ -244,18 +261,18 @@ def test_runner_refusal_and_path_mismatch_keep_their_codes() -> None:
 
     with TestClient(app) as client:
         refused = client.post(
-            f"/api/program/runs/{_RUN}/node-correction-previews", json=_body()
+            f"/api/program/runs/{_RUN}/node-correction-previews", json=_posted()
         )
         mismatch = client.post(
-            "/api/program/runs/program-run.8/node-correction-previews", json=_body()
+            "/api/program/runs/8/node-correction-previews", json=_posted()
         )
         foreign_field = client.post(
             f"/api/program/runs/{_RUN}/node-correction-previews",
-            json={**_body(), "program_binding": {"target_role_bindings": []}},
+            json={**_posted(), "program_binding": {"target_role_bindings": []}},
         )
         duplicate = client.post(
             f"/api/program/runs/{_RUN}/node-correction-previews",
-            json=_body(
+            json=_posted(
                 proposed_inputs=[
                     {"path": "goal", "value": []},
                     {"path": "goal", "value": []},
@@ -273,7 +290,7 @@ def test_runner_refusal_and_path_mismatch_keep_their_codes() -> None:
 
 
 class _BlockingRunner:
-    """Holds the first preview of ``attempt:1`` until released."""
+    """Holds the first preview of node attempt 1 until released."""
 
     def __init__(self) -> None:
         import threading
@@ -282,16 +299,16 @@ class _BlockingRunner:
         self.release = threading.Event()
         self.calls: list[str] = []
 
-    def preview_node_correction(self, program_run_id: str, body: dict[str, Any]):
+    def preview_node_correction(self, program_run_id: int, body: dict[str, Any]):
         attempt = body["node_attempt_id"]
         self.calls.append(attempt)
-        if attempt == "attempt:1" and not self.release.is_set():
+        if attempt == 1 and not self.release.is_set():
             self.entered.set()
             assert self.release.wait(timeout=5)
         built = _built()
         built["node_attempt_id"] = attempt
-        built["request_id"] = body["request_id"]
-        built["operation"]["request_context"]["request_id"] = body["request_id"]
+        built["request_key"] = body["request_key"]
+        built["operation"]["request_context"]["request_key"] = body["request_key"]
         return built
 
 
@@ -306,21 +323,46 @@ def test_one_preview_per_node_attempt_is_in_flight_and_duplicates_are_refused() 
     path = f"/api/program/runs/{_RUN}/node-correction-previews"
 
     with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
-        first = pool.submit(client.post, path, json=_body())
+        first = pool.submit(client.post, path, json=_posted())
         assert runner.entered.wait(timeout=5)
-        duplicate = client.post(path, json=_body(request_id="node-preview.2"))
-        other_attempt = client.post(path, json=_body(node_attempt_id="attempt:2"))
+        duplicate = client.post(path, json=_posted(request_key=_key(2)))
+        other_attempt = client.post(path, json=_posted(node_attempt_id=2))
         runner.release.set()
         completed = first.result(timeout=5)
-        after = client.post(path, json=_body(request_id="node-preview.3"))
+        after = client.post(path, json=_posted(request_key=_key(3)))
 
     assert duplicate.status_code == 409
     assert duplicate.json()["detail"]["code"] == "program_node_preview_busy"
     # The refusal is pre-effect: no runner build and no native preview.
-    assert runner.calls == ["attempt:1", "attempt:2", "attempt:1"]
+    assert runner.calls == [1, 2, 1]
     assert other_attempt.status_code == 200, other_attempt.text
-    assert other_attempt.json()["node_attempt_id"] == "attempt:2"
+    assert other_attempt.json()["node_attempt_id"] == 2
     assert completed.status_code == 200, completed.text
     # The bound is released when the preview finishes, also after a refusal.
     assert after.status_code == 200, after.text
     assert [kind for kind, _request in execution.requests] == ["preview_motion"] * 3
+
+
+@pytest.mark.parametrize(
+    ("start_identity", "code", "status"),
+    [
+        (None, "start_identity_required", 400),
+        ("3f9a00000000ffff", "stale_application_start_id", 409),
+    ],
+)
+def test_preview_naming_another_or_no_start_is_refused_before_the_runner(
+    start_identity: str | None, code: str, status: int
+) -> None:
+    runner = _Runner(_built())
+    execution = FakeExecution()
+    app = create_app(
+        service=_service(FakeCore(), FakeManager(), execution, program_runner=runner)
+    )
+    body = _body()
+    if start_identity is not None:
+        body["application_start_id"] = start_identity
+    with TestClient(app) as client:
+        refused = client.post(f"/api/program/runs/{_RUN}/node-correction-previews", json=body)
+    assert refused.status_code == status
+    assert refused.json()["detail"]["code"] == code
+    assert runner.calls == [] and execution.requests == []

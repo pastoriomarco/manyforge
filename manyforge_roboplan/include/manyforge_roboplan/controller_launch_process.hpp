@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -223,7 +224,7 @@ public:
   /// Refresh the existing request identity for future diagnostics after Retain.
   /// An already captured fault reason stays unchanged.
   void update_request_context(std::string context);
-  /// Queue the existing CCLC incident identity in the bounded output once.
+  /// Queue an incident identity in the bounded output once.
   /// Forwarding is best effort; no incident identity is minted.
   [[nodiscard]] bool append_incident_correlation(const std::string &incident_id,
                                                  const std::string &context,
@@ -396,6 +397,12 @@ private:
   /// O(distinct actually launched IDs): vacant slots keep only two counters,
   /// never a process, generated artifacts or output tail. No silent eviction.
   std::map<std::string, Slot> processes_;
+  /// Components whose launch is being spawned (outside `mutex_`) and not yet
+  /// published. A same-component ensure, observe and counters read, and
+  /// host-shutdown/stop_all snapshots wait on `start_done_` until it is
+  /// published, as they waited for the map lock before.
+  std::set<std::string> starting_;
+  mutable std::condition_variable start_done_;
   bool host_shutdown_started_{false};
 };
 

@@ -12,7 +12,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kPreparedParticipantStopPlanApiVersion =
-    "manyforge.prepared_participant_stop_plan.v1";
+    "manyforge.prepared_participant_stop_plan.v2";
 inline constexpr std::string_view kParticipantStopInvocationPlanIdentityDomain =
     "participant-stop-invocation-plan-digest";
 
@@ -71,13 +71,14 @@ struct PreparedStopStageCommandDTO final {
 struct PreparedParticipantStopPlanDTO final {
   ContentDigest participant_stop_invocation_plan_digest;
   ResolvedStopBasePlanId resolved_stop_base_plan_id;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
+
   std::optional<MotionInterruptStopProfileDTO> participant_stop_profile;
   ParticipantStopProfilePurposeDTO participant_stop_profile_purpose{
       ParticipantStopProfilePurposeDTO::kOrdinary};

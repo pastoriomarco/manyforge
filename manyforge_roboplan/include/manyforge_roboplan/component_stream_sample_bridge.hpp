@@ -27,9 +27,8 @@ namespace manyforge::roboplan_backend {
 /// subscription to `/manyforge/component_stream_samples`
 /// (`diagnostic_msgs/msg/DiagnosticStatus`, reliable, depth 64). Each sample
 /// (level OK, value `stamp_ns`, `0` = arrival) is recorded into the stream the
-/// host-side adapter declared; each fault event (level ERROR, `message` =
-/// code, value `detail`) is reported on it. Malformed messages and undeclared
-/// streams are ignored.
+/// host-side adapter declared. Other levels, malformed messages and
+/// undeclared streams are ignored.
 ///
 /// The returned handle keeps the subscription alive; nullptr when `node` or
 /// `health` is null. Subscription failures throw as rclcpp does.

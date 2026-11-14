@@ -17,11 +17,15 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
 - the whole-Apply affected-scope/fence coordinator, observe-first runtime
   convergence coordinator, Scene maintenance initialization and selected-bundle
   completion coordinators;
-- closed concrete Linux/POSIX adapters for the exact qualified reference
-  and execution host products, including direct-child epoch observation and a
-  private transport-neutral scene-projection resolver; and
+- the closed concrete Linux adapter for the exact qualified execution host
+  product, including direct-child epoch observation and a private
+  transport-neutral scene-projection resolver; and
 - active-plan reconstruction plus dependency-ordered steady-state
   reconciliation and explicit reverse-order shutdown.
+
+Every application start begins with fresh stores and an empty cell; nothing
+from a previous run is recreated, adopted or resumed. An execution host that
+exits ends the application; it is never replaced in place.
 
 The adjacent ROS-free contracts in `manyforge_core` additionally define the
 bounded owner-to-owner substrate that this package will consume:
@@ -32,7 +36,7 @@ bounded owner-to-owner substrate that this package will consume:
   including the read-only pre-Begin prerequisite observation;
 - separate active-bundle publish and read-only receipt-verification
   capabilities; and
-- an Apply-only Kernel fence acquire/rehydrate/status/release capability that
+- an Apply-only Kernel fence acquire/status/release capability that
   exposes no generic Stop or robot/controller lifecycle operation.
 
 Those DTOs reject contradictory phase evidence, non-canonical transition
@@ -165,7 +169,7 @@ reconciliation query: `accepted_exact` is appended, only authoritative
 uncertain, malformed, or mismatched evidence fails closed. Acquire uncertainty
 is a distinct typed error retaining the exact recovery query and every observed
 Kernel result. One
-`(request_owner_epoch, request_id)` maps to exactly one intent; an exact
+16-byte `request_key` maps to exactly one intent; an exact
 duplicate replays the original digest, and another payload fails without
 another journal write. Reusing one `ApplyId` requires its next contiguous
 generation. The runtime records are parent-bound to the accepted fence and
@@ -174,26 +178,29 @@ foreign evidence. Later records can only advance the same transaction forward
 through the selected candidate and exact public receipt. Its resource envelope
 is at most 256 intents/fence
 attempts, 64 domains, 256 bindings, and 1,024 resources per attempt, with at
-most 4,096 staged-ready sets globally and 16 per Apply, bounded text fields,
+most 4,096 staged-ready sets globally and one per Apply, bounded text fields,
 and a 64 MiB main database page image.
 
 `ManagerApplyRuntimeConvergenceCoordinator` receives the sole Apply-local
 verified predecessor/candidate capture, derives the complete candidate runtime plan,
-rehydrates the accepted Kernel fence, persists that aggregate before a process
+persists that aggregate before a process
 effect, observes every process before any managed start, and joins fresh direct
 status with Manager-local presence, dependency, and predecessor-publication
 evidence. It journals a complete staged-ready set only when every candidate is
 serving, healthy, role-complete, command-fenced, dependency-current, and within
 the fixed receiver-local age bounds. A missing report remains pending; foreign,
 contradictory, or publication-drift evidence fails closed. The current closed
-coordinator admits only the build-qualified retained POSIX reference product;
+coordinator admits only the build-qualified retained execution host product;
 unsupported external or replacement products fail before fence or process
 effects.
 
 Scene stages the candidate's planning projections. The Manager then sends the
 execution host its one Apply call (`HostApplyRequest`): the
 host refuses an enabled replaced or removed component, stops removed and
-replaced components and installs the candidate. The Manager records the private
+replaced components and installs the candidate. The call also carries the
+Program the Apply's prepared activation binds (`program`); the host loads that
+Program's sealed products and keeps the facts with its installed Apply, without
+reading the Manager's Apply journal. The Manager records the private
 materialization, Scene begins the adoption, and
 `ManagerSelectedBundleTransitionCoordinator` verifies the selected bundle, compare-and-swap publishes the public pointer, and asks
 Scene to complete the exact initialized operation. The admitted idle
@@ -203,30 +210,6 @@ Manager-owned runtime, so no live-to-live retirement phase remains.
 and Kernel receipt before terminal success; admission is released last.
 Interrupted nonterminal operations are retained failed/unknown and are never
 automatically resumed.
-
-`RetainedPosixRuntimeUnitAdapter` is the first concrete process/progress port,
-not a generic subprocess API. It independently reloads and verifies the exact
-retained bundle, manifest, artifact, query, and host contract before mutating
-two disjoint trusted execution capabilities. The durable state root holds only
-the boot/controller-PID/runtime-PID/Linux-start-time/socket/adapter-epoch
-record. The disposable run root holds the corresponding product-subject/
-product/configuration slot, bounded cross-process lock, control socket, and
-atomically materialized 0500 script. A forked runtime cannot exec before its
-state record is durable. The controller and gated child inherit the run-slot
-lock open-file
-description. If Manager loss occurs before release, no Manager destructor can
-unlock it, so a replacement cannot report absence or start another pair until
-both unreleased processes have exited. Exact surviving state is reconciled
-before a start, fixed crash-temporary names are recoverable, and PID reuse or a
-previous boot cannot match. A private controller owns the fixed stdin/stdout
-`status`/`shutdown` channel after release. Manager disappearance leaves that
-controller, runtime, and epoch unchanged; a replacement validates the durable
-identities, reconnects, and returns only a newly received exact status record.
-Explicit `EnsureStopped` alone submits the verified fixed shutdown request and
-succeeds only after both controller and runtime are absent.
-The private-control boundary assumes stable trusted state/run roots and an
-exclusive trusted Manager service UID; the same-UID peer check is not isolation
-from a hostile process deliberately sharing that UID.
 
 `DurableManagerActiveRuntimePlanSource` reconstructs the desired runtime plan
 only from the authoritative current publication and byte-equivalent durable
@@ -274,11 +257,8 @@ command-fenced prerequisites; mints at least 128 bits of random bootstrap
 identity; and persists the exact empty-binding intent before any effectful
 external call or Begin. It then reconciles scene-owner status, repeats the
 prerequisite observation immediately before no-native-effect Begin, and
-records the exact accepted target durably. Crash replay and concurrent
-coordinators reuse the single durable winner. Before acceptance the publication
-head must be empty; after the exact accepted target is durable, an exact
-generation-1 bootstrap receipt is allowed solely as crash-recovery evidence
-and must agree with the scene-owner phase. Absence, mismatch, invalid
+records the exact accepted target durably. The bootstrap journal and the
+publication head must be empty. Absence, mismatch, invalid
 phase/publication ordering, conflicting later state before durable acceptance,
 or projection uncertainty fails closed.
 
@@ -299,16 +279,12 @@ or premature publication fails closed.
 ## Deliberate non-claims
 
 These owners have no ROS types or callbacks. The only concrete process effect
-is the closed retained-POSIX reference product above; it exposes no caller-
-selected command, path, arguments, environment, working directory, or active
-command surface. The first runtime-only named Apply is operational inside the
-bounded composition through the production logical-scene owner and durable
-public pointer. Its external-process proof covers bootstrap, Manager
-loss/replacement, Apply recovery, runtime crash/restart, and explicit shutdown.
+is the closed retained execution host product; it exposes no caller-selected
+command, path, arguments, environment, working directory, or active command
+surface.
 The headless surface does not turn this private handoff into a second
 public command API. The current checkpoint qualifies nonempty native
-projection transitions and finalized-host replacement, but does not yet
-qualify mid-transition host-loss recovery, the execution-facing lease path,
+projection transitions, but does not qualify
 controller/robot lifecycle,
 remote placement, motion effects, or the restored product lane.
 The lower-level journal still treats bundle and graph identities as opaque;

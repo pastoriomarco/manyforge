@@ -62,14 +62,11 @@ struct SelectedRuntimeCompositionRpcFailure final {
 
 using SelectedRuntimeCompositionRpcRequest =
     std::variant<HostApplyRequest,
-                 ManagerComponentProcessStopRequestDTO,
-                 ManagerComponentProcessStopReadRequestDTO,
                  ManagerComponentProcessInventoryRequestDTO>;
 
 using SelectedRuntimeCompositionRpcResponse =
     std::variant<HostApplyResult,
                  SelectedRuntimeCompositionRpcFailure,
-                 ManagerComponentProcessStopResultDTO,
                  ManagerComponentProcessInventoryResultDTO>;
 
 [[nodiscard]] bool
@@ -78,10 +75,6 @@ IsSelectedRuntimeCompositionRpcPacket(std::string_view bytes) noexcept;
 [[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
     const HostApplyRequest &request);
 
-[[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
-    const ManagerComponentProcessStopRequestDTO &request);
-[[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
-    const ManagerComponentProcessStopReadRequestDTO &request);
 [[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcRequest(
     const ManagerComponentProcessInventoryRequestDTO &request);
 [[nodiscard]] SelectedRuntimeCompositionRpcRequest

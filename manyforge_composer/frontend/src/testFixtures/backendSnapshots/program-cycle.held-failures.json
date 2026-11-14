@@ -2,22 +2,20 @@
   "allowed_commands": [
     {
       "allowed": true,
-      "command_kind": "cell_full_stop",
-      "disabled_reason": null,
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
-      "allowed": true,
       "command_kind": "execution_recovery",
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "halt",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": 1
       }
     },
     {
@@ -26,8 +24,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -36,8 +33,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -46,8 +42,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -56,28 +51,16 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
       "allowed": false,
-      "command_kind": "program_discard_full_stop",
+      "command_kind": "program_discard_halt",
       "disabled_reason": "program_run_state_intervention_required",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
-      "allowed": true,
-      "command_kind": "program_full_stop",
-      "disabled_reason": null,
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -86,8 +69,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -96,8 +78,7 @@
       "disabled_reason": "program_run_state_intervention_required",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -106,8 +87,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -116,8 +96,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -126,8 +105,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -136,18 +114,16 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
       "allowed": false,
-      "command_kind": "program_resume_full_stop",
+      "command_kind": "program_resume_halt",
       "disabled_reason": "program_run_state_intervention_required",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -156,8 +132,7 @@
       "disabled_reason": "program_cycle_state_running",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -166,18 +141,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
-      "allowed": true,
-      "command_kind": "program_stop",
-      "disabled_reason": null,
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
       }
     },
     {
@@ -186,22 +150,27 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": 1
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "stop_all",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": 1
       }
     }
   ],
-  "causal_client_sequence": null,
-  "causal_correlation_id": "request.start.1",
-  "causal_session_id": null,
+  "causal_request_key": "bc804447d8bab347227e7dc8013e393a",
   "current_command_kind": "program_run",
   "cycle_claim_generation": 1,
   "cycle_generation": 1,
   "execution_control_revision": 3,
   "failure": null,
   "node_status_revision": 2,
-  "program_run_id": "program-cycle.1",
-  "program_runner_owner_epoch": "program-runner.epoch.1",
+  "program_run_id": 1,
   "recovery_offer": {
     "actions": [
       {
@@ -232,11 +201,11 @@
       "enabled": false
     },
     "message": "No pick candidate is feasible",
-    "node_attempt_id": "attempt:00000000000000000000000000000001",
+    "node_attempt_id": 1,
     "node_instance_id": "arm_move",
     "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
     "offer_revision": 1,
-    "operation_id": "task-1",
+    "operation_id": null,
     "operation_revision": null,
     "origin": {
       "kind": "owner",
@@ -252,18 +221,14 @@
     "pose_source_apply_generation": 0,
     "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
     "program_generation": 1,
-    "program_run_id": "program-cycle.1",
+    "program_run_id": 1,
     "reason_code": "no_feasible_candidate",
     "recovery_class": "failed_validation",
     "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
     "retries_used": 0,
     "scene_admission_epoch": 1,
-    "schema_version": "manyforge.cycle_recovery_offer.v5",
-    "status": "action_required",
-    "stop_certificate_id": null,
-    "stop_certificate_revision": null,
-    "stop_generation": null,
-    "stop_id": null
+    "schema_version": "manyforge.cycle_recovery_offer.v6",
+    "status": "action_required"
   },
   "reset_options": null,
   "reset_phase": null,
@@ -300,26 +265,25 @@
       "node_policy_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000008",
       "owner_identities": [
         {
-          "owner_epoch": "kernel.epoch.1",
-          "owner_id": "kernel.cell-a",
-          "owner_role": "kernel_operations"
+          "application_start_id": "0123456789abcdef",
+          "role": "kernel_operations"
         },
         {
-          "owner_epoch": "program-runner.epoch.1",
-          "owner_id": "program-runner.cell-a",
-          "owner_role": "program_runner"
+          "application_start_id": "0123456789abcdef",
+          "role": "program_runner"
         }
       ],
       "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
       "program_id": "pick_and_place_minimal",
       "program_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
-      "program_run_id": "program-cycle.1",
+      "program_run_id": 1,
       "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
       "scenario_id": "ur5-pick-place",
-      "schema_version": "manyforge.program_run_capture.v2",
+      "schema_version": "manyforge.program_run_capture.v3",
       "source_document_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000003"
     },
     "details": null,
+    "halt": null,
     "message": "No pick candidate is feasible",
     "node_status_revision": 2,
     "node_statuses": {
@@ -333,12 +297,11 @@
           "code": "no_feasible_candidate",
           "message": "No pick candidate is feasible"
         },
-        "node_attempt_id": "attempt:00000000000000000000000000000001",
+        "node_attempt_id": 1,
         "node_instance_id": "arm_move",
         "operation": {
-          "operation_id": "op",
-          "operation_revision": 2,
-          "source_owner_epoch": "kernel.epoch.1"
+          "operation_id": 1,
+          "operation_revision": 2
         },
         "operator_facing_run_revision": 4,
         "recovery_class": "failed_validation",
@@ -357,12 +320,11 @@
           "code": "no_feasible_candidate",
           "message": "No pick candidate is feasible"
         },
-        "node_attempt_id": "attempt:00000000000000000000000000000002",
+        "node_attempt_id": 2,
         "node_instance_id": "tool_move",
         "operation": {
-          "operation_id": "op",
-          "operation_revision": 2,
-          "source_owner_epoch": "kernel.epoch.1"
+          "operation_id": 1,
+          "operation_revision": 2
         },
         "operator_facing_run_revision": 4,
         "recovery_class": "failed_validation",
@@ -382,17 +344,33 @@
       "node_instance_id": "arm_move",
       "owner_api": "kernel.operation"
     },
-    "owner_epoch": "program-runner.epoch.1",
     "owner_id": "program-runner.cell-a",
     "reason_code": "no_feasible_candidate",
     "run_end": null,
     "run_revision": 5,
-    "schema_version": "manyforge.program_run_status.v4",
+    "schema_version": "manyforge.program_run_status.v5",
     "state": "intervention_required",
     "tree_status": "running"
   },
   "run_end": null,
   "run_revision": 5,
+  "runner_commands": {
+    "ended": [
+      {
+        "accepted_at_ns": "1000000000",
+        "end": {
+          "code": null,
+          "details": null,
+          "finished_at_ns": "1000000000",
+          "outcome": "succeeded"
+        },
+        "kind": "start",
+        "request_key": "bc804447d8bab347227e7dc8013e393a",
+        "step": "starting_run"
+      }
+    ],
+    "in_progress": null
+  },
   "runtime_control_revision": 1,
   "runtime_controls": {
     "execution_selections": {
@@ -455,12 +433,11 @@
           "stop_allowed": false
         }
       ],
-      "motion_held": false,
-      "selection_revision": 1
+      "hold_revision": 1,
+      "motion_held": false
     },
-    "owner_epoch": "program-runner.epoch.1",
     "owner_id": "program-runner",
-    "program_run_id": "program-cycle.1",
+    "program_run_id": 1,
     "recovery_offer": {
       "actions": [
         {
@@ -491,11 +468,11 @@
         "enabled": false
       },
       "message": "No pick candidate is feasible",
-      "node_attempt_id": "attempt:00000000000000000000000000000001",
+      "node_attempt_id": 1,
       "node_instance_id": "arm_move",
       "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
       "offer_revision": 1,
-      "operation_id": "task-1",
+      "operation_id": null,
       "operation_revision": null,
       "origin": {
         "kind": "owner",
@@ -511,18 +488,14 @@
       "pose_source_apply_generation": 0,
       "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
       "program_generation": 1,
-      "program_run_id": "program-cycle.1",
+      "program_run_id": 1,
       "reason_code": "no_feasible_candidate",
       "recovery_class": "failed_validation",
       "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
       "retries_used": 0,
       "scene_admission_epoch": 1,
-      "schema_version": "manyforge.cycle_recovery_offer.v5",
-      "status": "action_required",
-      "stop_certificate_id": null,
-      "stop_certificate_revision": null,
-      "stop_generation": null,
-      "stop_id": null
+      "schema_version": "manyforge.cycle_recovery_offer.v6",
+      "status": "action_required"
     },
     "recovery_offers": [
       {
@@ -560,11 +533,11 @@
             "enabled": false
           },
           "message": "No pick candidate is feasible",
-          "node_attempt_id": "attempt:00000000000000000000000000000001",
+          "node_attempt_id": 1,
           "node_instance_id": "arm_move",
           "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
           "offer_revision": 1,
-          "operation_id": "task-1",
+          "operation_id": null,
           "operation_revision": null,
           "origin": {
             "kind": "owner",
@@ -580,18 +553,14 @@
           "pose_source_apply_generation": 0,
           "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
           "program_generation": 1,
-          "program_run_id": "program-cycle.1",
+          "program_run_id": 1,
           "reason_code": "no_feasible_candidate",
           "recovery_class": "failed_validation",
           "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
           "retries_used": 0,
           "scene_admission_epoch": 1,
-          "schema_version": "manyforge.cycle_recovery_offer.v5",
-          "status": "action_required",
-          "stop_certificate_id": null,
-          "stop_certificate_revision": null,
-          "stop_generation": null,
-          "stop_id": null
+          "schema_version": "manyforge.cycle_recovery_offer.v6",
+          "status": "action_required"
         }
       },
       {
@@ -629,11 +598,11 @@
             "enabled": false
           },
           "message": "No pick candidate is feasible",
-          "node_attempt_id": "attempt:00000000000000000000000000000002",
+          "node_attempt_id": 2,
           "node_instance_id": "tool_move",
           "offer_id": "sha256:0000000000000000000000000000000000000000000000000000000000000009",
           "offer_revision": 2,
-          "operation_id": "task-2",
+          "operation_id": null,
           "operation_revision": null,
           "origin": {
             "kind": "owner",
@@ -649,25 +618,21 @@
           "pose_source_apply_generation": 0,
           "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
           "program_generation": 1,
-          "program_run_id": "program-cycle.1",
+          "program_run_id": 1,
           "reason_code": "no_feasible_candidate",
           "recovery_class": "failed_validation",
           "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
           "retries_used": 0,
           "scene_admission_epoch": 1,
-          "schema_version": "manyforge.cycle_recovery_offer.v5",
-          "status": "action_required",
-          "stop_certificate_id": null,
-          "stop_certificate_revision": null,
-          "stop_generation": null,
-          "stop_id": null
+          "schema_version": "manyforge.cycle_recovery_offer.v6",
+          "status": "action_required"
         }
       }
     ],
     "run_revision": 5,
     "runtime_controls": {
       "audit": [],
-      "program_run_id": "program-cycle.1",
+      "program_run_id": 1,
       "recovery_fences": {
         "deployment_generation": 1,
         "pose_source_apply_generation": 0,
@@ -676,9 +641,9 @@
       },
       "retry_counts": {},
       "runtime_control_revision": 1,
-      "schema_version": "manyforge.program_runtime_controls.v3"
+      "schema_version": "manyforge.program_runtime_controls.v4"
     },
-    "schema_version": "manyforge.program_runtime_control_projection.v9"
+    "schema_version": "manyforge.program_runtime_control_projection.v10"
   },
   "state": "running",
   "terminal_or_settlement_reference": null

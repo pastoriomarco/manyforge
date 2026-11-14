@@ -461,6 +461,14 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         std::string("candidate operation-control lane construction failed: ") + exception.what(),
         "operation_control_reconfiguration_failed"));
   }
+  // OD-221: an in-place lane update starts its added workers here, before the
+  // state lock; the commit below only swaps lanes; the retired and any unused
+  // workers are joined right after the state lock is released. The set of
+  // lanes cannot change meanwhile: this function holds submission_mutex_ and
+  // operation_control_reconfiguration_in_progress_ throughout.
+  if (update_control_executor_in_place) {
+    operation_control_executor_->StageEngines(control_engines);
+  }
 
   std::optional<ErrorDTO> table_error;
   std::optional<ErrorDTO> control_lane_error;
@@ -497,8 +505,9 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
          (apply_scope->resources.empty() ||
           config_.operation_admission_gate->exact_fence_covers(
               *apply_fence_id, apply_scope->resources)));
-    // Swap the Stop-stage attempt pool only while no live Stop transaction
-    // owns an attempt of the current pool (its handles stay valid there).
+    // Swap the Stop-stage attempt pool only while no participant is
+    // stopping (`stopping_count_`): only a stopping participant can own an
+    // attempt of the current pool (its handles stay valid there).
     // A busy current pool that is already large enough is kept.
     bool swap_stop_pool = false;
     bool stop_pool_busy = false;
@@ -506,7 +515,7 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
       const auto current_participants =
           stop_stage_attempt_executor_->prequalified_max_live_participants();
       if (current_participants != required_stop_pool_participants) {
-        if (!stop_stage_attempts_owned_locked()) {
+        if (stopping_count_ == 0U) {
           swap_stop_pool = true;
         } else if (current_participants < required_stop_pool_participants) {
           stop_pool_busy = true;
@@ -619,6 +628,7 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
           config_.empty_runtime_graph_revision = *candidate_graph_revision;
         }
         stop_component_scope_ = std::move(candidate_stop_facts->components);
+        rebuild_stop_component_table_locked();
         if (swap_stop_pool) {
           // Pointer swap under state_mutex_, which every Stop-path user of
           // the pool holds; the retired pool drains after the locks.
@@ -630,7 +640,7 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
                                      std::make_move_iterator(added_subscriptions.begin()),
                                      std::make_move_iterator(added_subscriptions.end()));
         if (update_control_executor_in_place) {
-          const auto update = operation_control_executor_->ReconfigureEngines(control_engines);
+          const auto update = operation_control_executor_->CommitStagedEngines();
           if (update != OperationControlLaneUpdateStatus::kApplied) {
             // Inventory may already have changed. Do not publish a partial lane
             // update as a successful installation or release the Apply fence.
@@ -646,6 +656,10 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
       }
     }
     operation_control_reconfiguration_in_progress_ = false;
+  }
+  if (update_control_executor_in_place) {
+    // Same executor as staged: only holders of submission_mutex_ replace it.
+    operation_control_executor_->ReleaseLaneUpdate();
   }
   if (table_error.has_value()) {
     if (candidate_control_executor != nullptr) {
@@ -926,12 +940,6 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::component_command_refu
     const RuntimeParticipantExecutionRegistration& registration) const {
   const auto& binding = registration.binding.value();
   if (const auto global = global_io_rule_command_refusal_locked(binding)) return global;
-  if (const auto hold = component_stream_holds_.find(binding.controllable_component_id);
-      hold != component_stream_holds_.end())
-    return hold->second;
-  // A component without motion of its own (e.g. a pose source) holds new
-  // motion of every component.
-  if (!cell_stream_holds_.empty()) return cell_stream_holds_.begin()->second;
   // A component accepts commands exactly while its own
   // state reports `enabled`. A domain without route authority has no
   // component to consult; the route checks decide admission as before.
@@ -1072,21 +1080,36 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
                                    "operation_control_reconfiguration_busy"));
   }
 
+  // OD-221: lanes are staged before the state lock and the retired lane is
+  // joined after it. The set of lanes cannot change meanwhile: this function
+  // holds submission_mutex_ and operation_control_reconfiguration_in_progress_;
+  // only holders of submission_mutex_ replace operation_control_executor_.
+  BoundedOperationControlExecutor* const lane_update_executor =
+      control_engines.empty() ? nullptr : operation_control_executor_.get();
+  if (lane_update_executor != nullptr) {
+    lane_update_executor->StageEngines(control_engines);
+  }
   std::unique_ptr<BoundedOperationControlExecutor> retired_control_executor;
+  bool lane_update_failed = false;
   {
     std::lock_guard state_lock(state_mutex_);
     if (control_engines.empty()) {
       retired_control_executor = std::move(operation_control_executor_);
     } else if (operation_control_executor_ == nullptr ||
-               operation_control_executor_->ReconfigureEngines(std::move(control_engines)) !=
+               operation_control_executor_->CommitStagedEngines() !=
                    OperationControlLaneUpdateStatus::kApplied) {
-      operation_control_reconfiguration_in_progress_ = false;
-      return Result<void>::Err(error(
-          std::string(to_string(ErrorCode::kExecutionRejected)),
-          "retired engine cleanup could not retain the current operation-control lanes",
-          "operation_control_reconfiguration_failed"));
+      lane_update_failed = true;
     }
     operation_control_reconfiguration_in_progress_ = false;
+  }
+  if (lane_update_executor != nullptr) {
+    lane_update_executor->ReleaseLaneUpdate();
+  }
+  if (lane_update_failed) {
+    return Result<void>::Err(error(
+        std::string(to_string(ErrorCode::kExecutionRejected)),
+        "retired engine cleanup could not retain the current operation-control lanes",
+        "operation_control_reconfiguration_failed"));
   }
   if (retired_control_executor != nullptr) {
     retired_control_executor->CloseIngress();
@@ -1120,9 +1143,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_preview_participant(
     std::optional<ManualProgramHandoverContextDTO> expected;
     if (handover) {
       const auto& capture = handover->capture;
-      expected = ManualProgramHandoverContextDTO{capture.program_runner_owner_epoch,
-                                                 capture.program_run_id, capture.claim_generation,
-                                                 handover->selection_revision};
+      expected = ManualProgramHandoverContextDTO{capture.program_run_id, capture.claim_generation,
+                                                 handover->hold_revision};
     }
     if (expected != intent.manual_handover)
       return reject<void>("manual preview must name the current held Program context",
@@ -1137,7 +1159,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_preview_participant(
     resources.push_back(resource.resource_id);
   std::sort(resources.begin(), resources.end());
   std::lock_guard state_lock(state_mutex_);
-  if (motion_admission_closed_locked() || motion_admission_unreconciled_)
+  if (motion_admission_closed_locked())
     return reject<void>("preview is unavailable while motion admission is closed",
                         "motion_admission_closed", ErrorCode::kInvalidStateTransition);
   if (handover) {
@@ -1175,11 +1197,6 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
   if (!validation.ok()) {
     return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(validation.error());
   }
-  if (primary_motion.request_context.request_owner_epoch != config_.request_owner_epoch) {
-    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(
-        error("stale_request_owner_epoch", "preview request names a stale Kernel owner epoch",
-              "stale_request_owner_epoch"));
-  }
   if (primary_motion.participants.size() != 1U ||
       primary_motion.coordination_policy != OperationCoordinationPolicy::kIndependent ||
       !std::holds_alternative<MotionParticipantIntentDTO>(
@@ -1194,12 +1211,6 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
       return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
-    }
-    if (emergency_stop_reserve_.find(primary_motion.request_context.request_id.value())
-            .has_value()) {
-      return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Err(
-          error("request_id_conflict", "operation request ID became retained by emergency Stop",
-                "request_id_conflict"));
     }
   }
   auto resolved = resolve_registration(primary_motion, 0U);
@@ -1233,11 +1244,6 @@ ResourceAddressedExecutionKernel::preview_capability_command(const OperationInte
   auto validation = validate_operation_intent(intent);
   if (!validation.ok()) {
     return Result<CapabilityCommandPreviewResultDTO>::Err(validation.error());
-  }
-  if (intent.request_context.request_owner_epoch != config_.request_owner_epoch) {
-    return Result<CapabilityCommandPreviewResultDTO>::Err(error(
-        "stale_request_owner_epoch", "capability-command preview names a stale Kernel owner epoch",
-        "stale_request_owner_epoch"));
   }
   if (intent.participants.size() != 1U ||
       intent.coordination_policy != OperationCoordinationPolicy::kIndependent ||
@@ -1288,6 +1294,16 @@ const RuntimeParticipantExecutionRegistration* ResourceAddressedExecutionKernel:
   return found == registrations_.end() ? nullptr : &*found;
 }
 
+ProgramRunResolutionContext ResourceAddressedExecutionKernel::program_run_resolution_context(
+    const std::optional<ProgramRunNumber>& program_run_id) const {
+  std::lock_guard state_lock(state_mutex_);
+  if (!program_run_id || !program_cycle_claim_run_ ||
+      program_cycle_claim_run_->program_run_id != *program_run_id ||
+      !program_cycle_claim_run_->capture)
+    return {};
+  return program_cycle_claim_run_->capture->resolution_context;
+}
+
 Result<RuntimeParticipantExecutionRegistration>
 ResourceAddressedExecutionKernel::resolve_registration(const OperationIntentDTO& operation,
                                                        const std::size_t participant_index) const {
@@ -1310,8 +1326,12 @@ ResourceAddressedExecutionKernel::resolve_registration(const OperationIntentDTO&
           error(std::string(to_string(ErrorCode::kInternalError)),
                 "product-backed participant resolver did not return a result",
                 "runtime_participant_resolver_failed"));
+  // OD-234: work of the held run resolves from the copy verified at its
+  // capture. resolve_registration never runs under state_mutex_ (it takes it
+  // itself in bind_captured_node_io_rule); this is a pointer copy, no I/O.
+  const auto held_run = program_run_resolution_context(operation.program_run_id);
   try {
-    resolved = config_.participant_resolver(operation, participant_index);
+    resolved = config_.participant_resolver(operation, participant_index, held_run);
   } catch (const std::exception& exception) {
     return Result<RuntimeParticipantExecutionRegistration>::Err(
         error(std::string(to_string(ErrorCode::kInvariantViolation)),

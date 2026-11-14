@@ -79,9 +79,9 @@ template <typename Callback> std::string Invoke(Callback &&callback) {
   } catch (const RuntimeSnapshotError &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_runtime_snapshot_unavailable", error.what()));
-  } catch (const SourceSnapshotError &error) {
+  } catch (const ManagerStatusStreamError &error) {
     return content_identity::canonical_json(
-        ErrorValue("headless_source_snapshot_unavailable", error.what()));
+        ErrorValue(error.code(), error.what()));
   } catch (const manyforge::core::TypedError &error) {
     // A typed cause keeps its code across the Python boundary.
     return content_identity::canonical_json(
@@ -189,32 +189,28 @@ AlarmSnapshotOrdering ParseOrdering(const std::string_view ordering) {
 
 class HeadlessApiBridge final {
 public:
-  HeadlessApiBridge(std::string projection_root, std::string install_root,
+  HeadlessApiBridge(std::string install_root,
                     std::string artifact_root,
                     std::string node_catalog_path,
                     std::string node_environment_manifest_path,
                     std::string alarm_catalog_path,
-                    std::string historian_database_path, std::string cell_id,
+                    std::string historian_directory, std::string cell_id,
                     std::string owner_id,
-                    std::optional<std::string> owner_epoch,
+                    std::string application_start_id,
                     const std::uint64_t freshness_milliseconds,
                     const std::size_t historian_queue_capacity,
                     const std::size_t historian_record_retention)
       : core_(std::make_unique<HeadlessApiCore>(HeadlessApiCoreConfig{
-            std::move(projection_root),
             std::move(install_root),
             std::move(artifact_root),
             std::move(node_catalog_path),
             std::move(node_environment_manifest_path),
             std::move(alarm_catalog_path),
-            std::move(historian_database_path),
+            std::move(historian_directory),
             std::move(cell_id),
             std::move(owner_id),
-            owner_epoch.has_value() ? std::move(*owner_epoch)
-                                    : MintHeadlessOwnerEpoch("headless-api-"),
+            std::move(application_start_id),
             RuntimeSnapshotFreshnessPolicy{
-                MillisecondsToNanoseconds(freshness_milliseconds),
-                MillisecondsToNanoseconds(freshness_milliseconds),
                 MillisecondsToNanoseconds(freshness_milliseconds),
             },
             historian_queue_capacity,
@@ -224,6 +220,24 @@ public:
   std::string RuntimeSnapshot() {
     py::gil_scoped_release release;
     return Invoke([this]() { return core_->RuntimeSnapshot(); });
+  }
+
+  // OD-216: the Manager status stream's follower feeds the one mirror.
+  std::string ApplyManagerStatusFrame(const py::bytes &frame) {
+    std::string bytes = frame;
+    py::gil_scoped_release release;
+    return Invoke(
+        [this, &bytes]() { return core_->ApplyManagerStatusFrame(bytes); });
+  }
+
+  bool MarkManagerStatusDisconnected() {
+    py::gil_scoped_release release;
+    return core_->MarkManagerStatusDisconnected();
+  }
+
+  std::optional<std::pair<std::string, std::string>> ViewerPoseSources() {
+    py::gil_scoped_release release;
+    return core_->ViewerPoseSources();
   }
 
   std::string NodeEnvironmentProjection() {
@@ -330,15 +344,13 @@ public:
 
   std::string Acknowledge(
       std::string condition_id, std::string activation_id,
-      const std::uint64_t expected_record_revision, std::string request_id,
-      std::string request_owner_epoch, std::string source_label,
-      std::optional<std::string> correlation_id, std::string transport_kind,
+      const std::uint64_t expected_record_revision, std::string request_key,
+      std::string source_label, std::string transport_kind,
       std::string adapter_id, std::string assurance,
       std::optional<std::string> trusted_principal_id,
       std::optional<std::string> reason, const bool confirmed) {
     AlarmCallerAttribution caller{
-        std::move(request_id),     std::move(request_owner_epoch),
-        std::move(source_label),   std::move(correlation_id),
+        std::move(request_key),    std::move(source_label),
         std::move(transport_kind), std::move(adapter_id),
         std::move(assurance),      std::move(trusted_principal_id)};
     py::gil_scoped_release release;
@@ -356,9 +368,8 @@ public:
   std::string AcknowledgeAll(
       const std::vector<std::tuple<std::string, std::string, std::uint64_t>>
           &raw_members,
-      const std::uint64_t expected_generation, std::string request_id,
-      std::string request_owner_epoch, std::string source_label,
-      std::optional<std::string> correlation_id, std::string transport_kind,
+      const std::uint64_t expected_generation, std::string request_key,
+      std::string source_label, std::string transport_kind,
       std::string adapter_id, std::string assurance,
       std::optional<std::string> trusted_principal_id,
       std::optional<std::string> reason, const bool confirmed) {
@@ -369,8 +380,7 @@ public:
       members.push_back({condition_id, activation_id, record_revision});
     }
     AlarmCallerAttribution caller{
-        std::move(request_id),     std::move(request_owner_epoch),
-        std::move(source_label),   std::move(correlation_id),
+        std::move(request_key),    std::move(source_label),
         std::move(transport_kind), std::move(adapter_id),
         std::move(assurance),      std::move(trusted_principal_id)};
     py::gil_scoped_release release;
@@ -416,7 +426,8 @@ public:
                              const std::string &search,
                              const std::optional<std::string> &clock_owner,
                              const bool full_records,
-                             const std::optional<std::uint64_t> capture_id) {
+                             const std::optional<std::uint64_t> capture_id,
+                             const std::optional<std::string> &application_start_id) {
     HistorianQuery query{
         start_ns,
         end_ns,
@@ -424,7 +435,7 @@ public:
         std::set<std::string>(event_types.begin(), event_types.end()),
         before_sequence,
         limit, start_utc_ns, end_utc_ns, std::set<std::string>(severities.begin(), severities.end()), correlations, alarm_phase, search, clock_owner,
-        capture_id};
+        capture_id, application_start_id};
     py::gil_scoped_release release;
     return Invoke([this, query = std::move(query), full_records]() {
       return core_->HistoryQueryPage(query, full_records);
@@ -437,9 +448,10 @@ public:
     return Invoke([&] { return core_->HistoryCapturePage(before_capture_id, limit); });
   }
 
-  std::string HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit) {
+  std::string HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit,
+                               const std::optional<std::string> &application_start_id) {
     py::gil_scoped_release release;
-    return Invoke([&] { return core_->HistoryDiscovery(kind, after, limit); });
+    return Invoke([&] { return core_->HistoryDiscovery(kind, after, limit, application_start_id); });
   }
 
   std::string HistorianHealth() {
@@ -455,7 +467,8 @@ public:
 
   std::string
   RecordClientIncident(std::string incident_id, std::string incident_kind,
-                       std::string phase, std::string control_session_id,
+                       std::string phase,
+                       const std::optional<std::uint64_t> control_session_number,
                        std::string client_incarnation, std::string source_label,
                        std::string reason_code,
                        const std::uint64_t occurrence_count,
@@ -467,7 +480,7 @@ public:
     return Invoke(
         [this, incident_id = std::move(incident_id),
          incident_kind = std::move(incident_kind), phase = std::move(phase),
-         control_session_id = std::move(control_session_id),
+         control_session_number,
          client_incarnation = std::move(client_incarnation),
          source_label = std::move(source_label),
          reason_code = std::move(reason_code), occurrence_count,
@@ -475,7 +488,7 @@ public:
          causal_context = std::move(causal_context)]() mutable {
           return core_->RecordClientIncident(
               std::move(incident_id), std::move(incident_kind),
-              std::move(phase), std::move(control_session_id),
+              std::move(phase), control_session_number,
               std::move(client_incarnation), std::move(source_label),
               std::move(reason_code), occurrence_count, maximum_delay_ns,
               first_observed_ns, last_observed_ns, std::move(causal_context));
@@ -551,41 +564,21 @@ public:
     });
   }
 
-  std::string ReconcileHistorianHealth(
-      const std::uint64_t expected_generation, std::string request_id,
-      std::string request_owner_epoch, std::string source_label,
-      std::optional<std::string> correlation_id, std::string transport_kind,
-      std::string adapter_id, std::string assurance,
-      std::optional<std::string> trusted_principal_id) {
-    AlarmCallerAttribution caller{
-        std::move(request_id),     std::move(request_owner_epoch),
-        std::move(source_label),   std::move(correlation_id),
-        std::move(transport_kind), std::move(adapter_id),
-        std::move(assurance),      std::move(trusted_principal_id)};
-    py::gil_scoped_release release;
-    return Invoke(
-        [this, expected_generation, caller = std::move(caller)]() mutable {
-          return core_->ReconcileHistorianHealth(expected_generation,
-                                                 std::move(caller));
-        });
-  }
-
   std::string IngestOperationEvent(
-      std::string source_owner_epoch, const std::uint64_t source_sequence,
-      std::string record_kind, std::optional<std::string> request_id,
-      std::optional<std::string> operation_id,
+      const std::uint64_t source_sequence,
+      std::string record_kind, std::optional<std::string> request_key,
+      const std::optional<std::uint64_t> operation_id,
       const std::optional<std::uint64_t> operation_revision,
       const std::int64_t occurred_at_ns, std::string occurred_at_wall,
-      const bool effect_pending, std::string payload_json,
-      std::string payload_digest) {
+      std::string payload_json, std::string payload_digest) {
     py::gil_scoped_release release;
-    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
+    return Invoke([this,
                    source_sequence, record_kind = std::move(record_kind),
-                   request_id = std::move(request_id),
-                   operation_id = std::move(operation_id), operation_revision,
+                   request_key = std::move(request_key),
+                   operation_id, operation_revision,
                    occurred_at_ns,
                    occurred_at_wall = std::move(occurred_at_wall),
-                   effect_pending, payload_json = std::move(payload_json),
+                   payload_json = std::move(payload_json),
                    payload_digest = std::move(payload_digest)]() mutable {
       CanonicalValue payload;
       try {
@@ -602,22 +595,18 @@ public:
             "operation event payload is not canonical JSON");
       }
       return core_->IngestOperationEvent(
-          std::move(source_owner_epoch), source_sequence,
-          std::move(record_kind), std::move(request_id),
-          std::move(operation_id), operation_revision, occurred_at_ns,
-          std::move(occurred_at_wall), effect_pending, std::move(payload),
+          source_sequence, std::move(record_kind), std::move(request_key),
+          operation_id, operation_revision, occurred_at_ns,
+          std::move(occurred_at_wall), std::move(payload),
           std::move(payload_digest));
     });
   }
 
   std::string CompleteOperationEventSnapshot(
-      std::string source_owner_epoch,
       const std::uint64_t through_source_sequence) {
     py::gil_scoped_release release;
-    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
-                   through_source_sequence]() mutable {
-      return core_->CompleteOperationEventSnapshot(std::move(source_owner_epoch),
-                                                   through_source_sequence);
+    return Invoke([this, through_source_sequence]() mutable {
+      return core_->CompleteOperationEventSnapshot(through_source_sequence);
     });
   }
 
@@ -641,10 +630,9 @@ std::string ObserveProgramFailureCondition(std::string condition_json) {
   });
 }
   std::string ObserveRuntimeFaultConditions(
-      std::string source_owner_epoch, std::string current_runtime_faults_json) {
+      std::string current_runtime_faults_json) {
     py::gil_scoped_release release;
-    return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
-                   current_runtime_faults_json =
+    return Invoke([this, current_runtime_faults_json =
                        std::move(current_runtime_faults_json)]() mutable {
       CanonicalValue current_runtime_faults;
       try {
@@ -658,17 +646,71 @@ std::string ObserveProgramFailureCondition(std::string condition_json) {
             "current runtime faults are not canonical JSON: " + std::string(error.what()));
       }
       return core_->ObserveRuntimeFaultConditions(
-          std::move(source_owner_epoch), std::move(current_runtime_faults));
+          std::move(current_runtime_faults));
     });
   }
 
-  std::string MarkOperationEventSourceUnknown(std::string source_owner_epoch) {
+  std::string ObserveComponentFaults(std::string faults_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, faults_json = std::move(faults_json)]() mutable {
+      CanonicalValue faults;
+      try {
+        content_identity::CanonicalJsonParseLimits limits;
+        limits.maximum_bytes = kMaximumRuntimeFaultSnapshotBytes;
+        faults = content_identity::parse_canonical_json(faults_json, limits);
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_component_fault_invalid",
+            "component faults are not canonical JSON: " + std::string(error.what()));
+      }
+      return core_->ObserveComponentFaults(std::move(faults));
+    });
+  }
+
+  std::string ObserveOperationTable(std::string operations_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, operations_json = std::move(operations_json)]() mutable {
+      CanonicalValue operations;
+      try {
+        content_identity::CanonicalJsonParseLimits limits;
+        limits.maximum_bytes = kMaximumOperationTableBytes;
+        operations = content_identity::parse_canonical_json(operations_json, limits);
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_operation_table_invalid",
+            "operations table is not canonical JSON: " + std::string(error.what()));
+      }
+      return core_->ObserveOperationTable(std::move(operations));
+    });
+  }
+
+  // OD-215, both called only from the Headless disk check's own thread.
+  std::string HistoryDiskSignals() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->HistoryDiskSignals(); });
+  }
+
+  std::string ObserveDiskRecordsCondition(std::string condition_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, condition_json = std::move(condition_json)]() mutable {
+      CanonicalValue condition;
+      try {
+        content_identity::CanonicalJsonParseLimits limits;
+        limits.maximum_bytes = 16U * 1024U;
+        condition = content_identity::parse_canonical_json(condition_json, limits);
+      } catch (const std::exception &error) {
+        throw OperatorAlarmError(
+            "headless_disk_condition_invalid",
+            "disk condition is not canonical JSON: " + std::string(error.what()));
+      }
+      return core_->ObserveDiskRecordsCondition(std::move(condition));
+    });
+  }
+
+  std::string MarkOperationEventSourceUnknown() {
     py::gil_scoped_release release;
     return Invoke(
-        [this, source_owner_epoch = std::move(source_owner_epoch)]() mutable {
-          return core_->MarkOperationEventSourceUnknown(
-              std::move(source_owner_epoch));
-        });
+        [this]() mutable { return core_->MarkOperationEventSourceUnknown(); });
   }
 
   void Shutdown() {
@@ -1017,39 +1059,26 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
         return manyforge::headless::CompileDeploymentDraft(source);
       },
       py::arg("source"));
-  module.def(
-      "read_control_source_file_hint",
-      [](const std::string &path) {
-        return manyforge::headless::ReadControlSourceFileHint(path);
-      },
-      py::arg("path"), py::call_guard<py::gil_scoped_release>());
-  module.def(
-      "read_viewer_scene_source",
-      [](const std::string &path, const std::string &cell_id) {
-        return manyforge::headless::ReadViewerSceneSource(path, cell_id);
-      },
-      py::arg("path"), py::arg("cell_id"), py::call_guard<py::gil_scoped_release>());
-  module.def(
-      "read_viewer_pose_sessions",
-      [](const std::string &path, const std::string &cell_id) {
-        return manyforge::headless::ReadViewerPoseSessions(path, cell_id);
-      },
-      py::arg("path"), py::arg("cell_id"), py::call_guard<py::gil_scoped_release>());
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
-      .def(py::init<std::string, std::string, std::string,
+      .def(py::init<std::string, std::string,
                     std::string, std::string, std::string, std::string,
-                    std::string, std::string, std::optional<std::string>,
+                    std::string, std::string, std::string,
                     std::uint64_t, std::size_t, std::size_t>(),
-           py::arg("projection_root"), py::arg("install_root"),
+           py::arg("install_root"),
            py::arg("artifact_root"), py::arg("node_catalog_path"),
            py::arg("node_environment_manifest_path"),
-           py::arg("alarm_catalog_path"), py::arg("historian_database_path"),
+           py::arg("alarm_catalog_path"), py::arg("historian_directory"),
            py::arg("cell_id"), py::arg("owner_id"),
-           py::arg("owner_epoch") = std::nullopt,
+           py::arg("application_start_id"),
            py::arg("freshness_milliseconds") = 2000U,
            py::arg("historian_queue_capacity") = 1024U,
            py::arg("historian_record_retention") = 100000U)
       .def("runtime_snapshot", &HeadlessApiBridge::RuntimeSnapshot)
+      .def("apply_manager_status_frame",
+           &HeadlessApiBridge::ApplyManagerStatusFrame, py::arg("frame"))
+      .def("mark_manager_status_disconnected",
+           &HeadlessApiBridge::MarkManagerStatusDisconnected)
+      .def("viewer_pose_sources", &HeadlessApiBridge::ViewerPoseSources)
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)
@@ -1079,9 +1108,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("refresh_alarm_sources", &HeadlessApiBridge::RefreshAlarmSources)
       .def("acknowledge_alarm", &HeadlessApiBridge::Acknowledge,
            py::arg("condition_id"), py::arg("activation_id"),
-           py::arg("expected_record_revision"), py::arg("request_id"),
-           py::arg("request_owner_epoch"), py::arg("source_label"),
-           py::arg("correlation_id") = std::nullopt,
+           py::arg("expected_record_revision"), py::arg("request_key"),
+           py::arg("source_label"),
            py::arg("transport_kind") = "http",
            py::arg("adapter_id") = "manyforge.headless.http.v1",
            py::arg("assurance") = "unverified",
@@ -1089,8 +1117,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("reason") = std::nullopt, py::arg("confirmed") = false)
       .def("acknowledge_all", &HeadlessApiBridge::AcknowledgeAll,
            py::arg("members"), py::arg("expected_generation"),
-           py::arg("request_id"), py::arg("request_owner_epoch"),
-           py::arg("source_label"), py::arg("correlation_id") = std::nullopt,
+           py::arg("request_key"), py::arg("source_label"),
            py::arg("transport_kind") = "http",
            py::arg("adapter_id") = "manyforge.headless.http.v1",
            py::arg("assurance") = "unverified",
@@ -1113,16 +1140,18 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("alarm_phase") = std::nullopt, py::arg("search") = "",
            py::arg("clock_owner") = std::nullopt,
            py::arg("full_records") = false,
-           py::arg("capture_id") = std::nullopt)
+           py::arg("capture_id") = std::nullopt,
+           py::arg("application_start_id") = std::nullopt)
       .def("history_captures", &HeadlessApiBridge::HistoryCaptures,
            py::arg("before_capture_id") = std::nullopt, py::arg("limit") = 32U)
       .def("history_detail", &HeadlessApiBridge::HistoryDetail,
            py::arg("sequence"))
       .def("history_discovery", &HeadlessApiBridge::HistoryDiscovery,
-           py::arg("kind"), py::arg("after") = "", py::arg("limit") = 32U)
+           py::arg("kind"), py::arg("after") = "", py::arg("limit") = 32U,
+           py::arg("application_start_id") = std::nullopt)
       .def("record_client_incident", &HeadlessApiBridge::RecordClientIncident,
            py::arg("incident_id"), py::arg("incident_kind"), py::arg("phase"),
-           py::arg("control_session_id"), py::arg("client_incarnation"),
+           py::arg("control_session_number"), py::arg("client_incarnation"),
            py::arg("source_label"), py::arg("reason_code"),
            py::arg("occurrence_count"), py::arg("maximum_delay_ns"),
            py::arg("first_observed_ns"), py::arg("last_observed_ns"),
@@ -1141,33 +1170,31 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,
            py::arg("record_json"))
-      .def("reconcile_historian_health",
-           &HeadlessApiBridge::ReconcileHistorianHealth,
-           py::arg("expected_generation"), py::arg("request_id"),
-           py::arg("request_owner_epoch"), py::arg("source_label"),
-           py::arg("correlation_id") = std::nullopt,
-           py::arg("transport_kind") = "http",
-           py::arg("adapter_id") = "manyforge.headless.http.v1",
-           py::arg("assurance") = "unverified",
-           py::arg("trusted_principal_id") = std::nullopt)
       .def("ingest_operation_event", &HeadlessApiBridge::IngestOperationEvent,
-           py::arg("source_owner_epoch"), py::arg("source_sequence"),
-           py::arg("record_kind"), py::arg("request_id"),
+           py::arg("source_sequence"),
+           py::arg("record_kind"), py::arg("request_key"),
            py::arg("operation_id"), py::arg("operation_revision"),
            py::arg("occurred_at_ns"), py::arg("occurred_at_wall"),
-           py::arg("effect_pending"), py::arg("payload_json"),
+           py::arg("payload_json"),
            py::arg("payload_digest"))
       .def("complete_operation_event_snapshot",
            &HeadlessApiBridge::CompleteOperationEventSnapshot,
-           py::arg("source_owner_epoch"), py::arg("through_source_sequence"))
+           py::arg("through_source_sequence"))
       .def("mark_operation_event_source_unknown",
-           &HeadlessApiBridge::MarkOperationEventSourceUnknown,
-           py::arg("source_owner_epoch"))
+           &HeadlessApiBridge::MarkOperationEventSourceUnknown)
       .def("observe_program_failure_condition",
            &HeadlessApiBridge::ObserveProgramFailureCondition,
            py::arg("condition_json"))
       .def("observe_runtime_fault_conditions",
            &HeadlessApiBridge::ObserveRuntimeFaultConditions,
-           py::arg("source_owner_epoch"), py::arg("current_runtime_faults_json"))
+           py::arg("current_runtime_faults_json"))
+      .def("observe_operation_table", &HeadlessApiBridge::ObserveOperationTable,
+           py::arg("operations_json"))
+      .def("observe_component_faults",
+           &HeadlessApiBridge::ObserveComponentFaults, py::arg("faults_json"))
+      .def("history_disk_signals", &HeadlessApiBridge::HistoryDiskSignals)
+      .def("observe_disk_records_condition",
+           &HeadlessApiBridge::ObserveDiskRecordsCondition,
+           py::arg("condition_json"))
       .def("shutdown", &HeadlessApiBridge::Shutdown);
 }

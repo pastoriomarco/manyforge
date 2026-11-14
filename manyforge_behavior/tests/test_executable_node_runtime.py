@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from collections.abc import Mapping, Sequence
 import re
 from copy import deepcopy
@@ -64,9 +66,6 @@ from manyforge_behavior.program_runtime import (
 )
 
 from .v3_fixtures import frame, signal, target
-
-# The Runner's execution transport timeout handed to owner task nodes.
-_TRANSPORT_TIMEOUT_S = 30.0
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
@@ -163,6 +162,33 @@ class _TaskPort:
         identity: NodeAttemptIdentity,
     ) -> None:
         self.acknowledgements.append((task_id, identity))
+
+    # Pick/place planning jobs (OD-213 (1)): the job is sent, ends `done` at
+    # once, and its read maps it as `start` does.
+    def send_planning(
+        self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> Any:
+        return _PlanningJob(f"job-{node_id}-{identity.node_attempt_id}", node_id)
+
+    def planning_job_state(self, job_id: str) -> str | None:
+        return "done"
+
+    def finish_planning(
+        self, job: Any, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerTaskSnapshot | None:
+        return self.start(job.node_id, identity, inputs)
+
+    def cancel_planning(self, job_id: str) -> None:
+        raise AssertionError("no planning job is cancelled here")
+
+    def release_planning(self, job_id: str) -> None:
+        return None
+
+
+class _PlanningJob:
+    def __init__(self, job_id: str, node_id: str) -> None:
+        self.job_id = job_id
+        self.node_id = node_id
 
 
 class _InvocationPort:
@@ -287,7 +313,6 @@ def _fake_port_run(**kwargs: Any) -> ExecutableProgramRun:
     The fake ports have no robot handles: role.component/role/tcp is a test-only
     endpoint convention, not a captured deployment binding.
     """
-    kwargs.setdefault("transport_timeout_s", _TRANSPORT_TIMEOUT_S)
     kwargs.setdefault("program_binding", {"program_binding_id": kwargs["capture"].program_binding_id,
                                            "target_bindings": [], "signal_bindings": [],
                                            "frame_bindings": [], "collision_body_bindings": []})
@@ -303,7 +328,7 @@ def _fake_port_run(**kwargs: Any) -> ExecutableProgramRun:
 def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapture:
     environment = build_node_environment()
     return ProgramRunCapture(
-        program_run_id="run.test",
+        program_run_id=1,
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario.test",
         source_document_digest=_DIGEST_A,
@@ -315,9 +340,8 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
         node_environment_digest=environment.environment_digest,
         owner_identities=(
             ProgramRunOwnerIdentity(
-                owner_role="program_runner",
-                owner_id="program-runner.cell-a",
-                owner_epoch="program-runner.epoch.1",
+                role="program_runner",
+                application_start_id="0123456789abcdef",
             ),
         ),
     )
@@ -357,7 +381,7 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
         for item in dispositions
         if not item.adapter_build_qualified
     }
-    assert "kernel.full_stop" not in deferred
+    assert "kernel.cell_stop" not in deferred
     # Reads, level waits, outputs and the signal moves are qualified.
     assert "io.set_output" not in deferred
     assert "motion.move_until_signal" not in deferred and "motion.probe_search" not in deferred
@@ -465,7 +489,7 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     adapter = resolver.instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -474,7 +498,7 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
                 catalog=catalog,
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            attempt_source=ProgramRunAttemptSource(2),
             ports=NodeAdapterPorts(simulator_control=task),
         ),
     )
@@ -503,7 +527,7 @@ def test_recovery_row_uses_the_exact_control_port_and_does_not_retry(outcome) ->
     environment = build_node_environment()
     adapter = build_executable_node_resolver(environment).instantiate(
         environment.registry.record("recovery.apply_offered_action"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="recover_arm",
             node_instance_id="recover_arm",
             parameters=program.tree.parameters,
@@ -512,7 +536,7 @@ def test_recovery_row_uses_the_exact_control_port_and_does_not_retry(outcome) ->
                 catalog=catalog,
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.recovery"),
+            attempt_source=ProgramRunAttemptSource(3),
             ports=NodeAdapterPorts(kernel_controls=task),
         ),
     )
@@ -556,7 +580,7 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     task = _OneOutageTaskPort()
     adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -565,7 +589,7 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
                 catalog=catalog,
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            attempt_source=ProgramRunAttemptSource(2),
             ports=NodeAdapterPorts(simulator_control=task),
         ),
     )
@@ -608,11 +632,11 @@ def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unst
     state = OperatorMotionStopState({"action": ()})
     environment = build_node_environment()
     adapter = build_executable_node_resolver(environment).instantiate(
-        environment.registry.record("simulation.reset"), NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        environment.registry.record("simulation.reset"), NodeAdapterBuildContext(
             name="action", node_instance_id="action", parameters={},
             input_resolver=NodeAttemptInputResolver(program=program, catalog=catalog,
                 value_store=ProgramValueStore.from_program(program)),
-            attempt_source=ProgramRunAttemptSource("run.held"),
+            attempt_source=ProgramRunAttemptSource(4),
             ports=NodeAdapterPorts(simulator_control=task), operator_stop_state=state))
     list(adapter.tick())
     assert len(task.starts) == 1
@@ -673,7 +697,7 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending(
     task = _SettlingTaskPort()
     adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -682,7 +706,7 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending(
                 catalog=catalog,
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.simulation"),
+            attempt_source=ProgramRunAttemptSource(2),
             ports=NodeAdapterPorts(simulator_control=task),
         ),
     )
@@ -699,7 +723,7 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending(
     assert adapter.observe_control_state() == "active"
     assert adapter.has_active_task
     if selected_resume:
-        assert adapter.reconcile_full_stop_task(selected_resume=True) == "settled"
+        assert adapter.reconcile_halt_task(selected_resume=True) == "settled"
         assert adapter.status is py_trees.common.Status.SUCCESS
     else:
         assert adapter.update() is py_trees.common.Status.SUCCESS
@@ -741,7 +765,7 @@ def test_non_transient_and_identity_changing_observations_still_fail() -> None:
     ):
         adapter = build_executable_node_resolver(build_node_environment()).instantiate(
             build_node_environment().registry.record("simulation.reset"),
-            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+            NodeAdapterBuildContext(
                 name="reset_sim",
                 node_instance_id="reset_sim",
                 parameters={},
@@ -750,7 +774,7 @@ def test_non_transient_and_identity_changing_observations_still_fail() -> None:
                     catalog=catalog,
                     value_store=ProgramValueStore.from_program(program),
                 ),
-                attempt_source=ProgramRunAttemptSource("run.simulation"),
+                attempt_source=ProgramRunAttemptSource(2),
                 ports=NodeAdapterPorts(simulator_control=task),
             ),
         )
@@ -855,7 +879,7 @@ def test_top_level_value_source_is_one_attempt_snapshot() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     node = resolver.instantiate(
         build_node_environment().registry.record("logic.check_condition"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="check_flag",
             node_instance_id="check_flag",
             parameters=program.tree.parameters,
@@ -865,7 +889,7 @@ def test_top_level_value_source_is_one_attempt_snapshot() -> None:
                 catalog=catalog,
                 value_store=store,
             ),
-            attempt_source=ProgramRunAttemptSource("run.test"),
+            attempt_source=ProgramRunAttemptSource(1),
         ),
     )
 
@@ -1113,12 +1137,12 @@ def test_set_value_and_offset_pose_name_run_node_and_attempt_in_the_persistent_e
         strict=True,
     ):
         assert edit == {
-            "program_run_id": "run.test",
+            "program_run_id": 1,
             "node_id": node_id,
             "node_instance_id": instance_id,
             "node_attempt_id": edit["node_attempt_id"],
         }
-        assert re.fullmatch(r"attempt:[0-9a-f]{32}", edit["node_attempt_id"])
+        assert type(edit["node_attempt_id"]) is int and edit["node_attempt_id"] >= 1
     assert register.edits[0]["node_attempt_id"] != register.edits[1]["node_attempt_id"]
 
 
@@ -1386,7 +1410,7 @@ def test_model_request_preserves_nonblocking_and_atomic_bundle_semantics() -> No
     resolver = build_executable_node_resolver(build_node_environment())
     adapter = resolver.instantiate(
         build_node_environment().registry.record("assistant.query_model"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name=query.instance_id,
             node_instance_id=query.instance_id,
             parameters=query.parameters,
@@ -1396,7 +1420,7 @@ def test_model_request_preserves_nonblocking_and_atomic_bundle_semantics() -> No
                 catalog=catalog,
                 value_store=store,
             ),
-            attempt_source=ProgramRunAttemptSource("run.model"),
+            attempt_source=ProgramRunAttemptSource(5),
             ports=_ports(task),
         ),
     )
@@ -1422,7 +1446,7 @@ def test_model_request_preserves_nonblocking_and_atomic_bundle_semantics() -> No
         "node_instance_id": "choose_scene_object",
         "model_endpoint_alias": "local_pick_vlm",
         "model_version": "test-v1",
-        "program_run_id": "run.model",
+        "program_run_id": 5,
         "node_attempt_id": task.starts[0][1].node_attempt_id,
         "owner_task_id": "task-1",
     }
@@ -1444,7 +1468,7 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
         ports=_ports(task, invocation),
     )
 
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert len(task.starts) == len(task.acknowledgements) == 1
     assert task.starts[0][0] == "motion.move_to_joint_target"
     assert task.starts[0][2].parameters["target"] == target("ur5_robot", "arm")
@@ -1489,7 +1513,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
             program_clock=ProgramClock(_fast_source()),
         )
         for _tick in range(128):
-            status = run.tick_once()
+            status = _tick_answered(run)
             if status is not py_trees.common.Status.RUNNING:
                 break
         assert status is py_trees.common.Status.SUCCESS, (
@@ -1657,7 +1681,7 @@ def test_timed_nodes_require_the_runs_program_clock(node_id: str) -> None:
     with pytest.raises(ExecutableNodeResolverError, match="Program clock"):
         build_executable_node_resolver(environment).instantiate(
             environment.registry.record(node_id),
-            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+            NodeAdapterBuildContext(
                 name="leaf",
                 node_instance_id="leaf",
                 parameters={},
@@ -1666,7 +1690,7 @@ def test_timed_nodes_require_the_runs_program_clock(node_id: str) -> None:
                     catalog=_catalog(),
                     value_store=ProgramValueStore.from_program(program),
                 ),
-                attempt_source=ProgramRunAttemptSource("run.clock"),
+                attempt_source=ProgramRunAttemptSource(6),
                 ports=_ports(),
             ),
         )
@@ -1691,12 +1715,12 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
             parameters["target"] = target("ur5_robot", "arm")
         adapter = resolver.instantiate(
             disposition.row,
-            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+            NodeAdapterBuildContext(
                 name="leaf",
                 node_instance_id="leaf",
                 parameters=parameters,
                 input_resolver=input_resolver,
-                attempt_source=ProgramRunAttemptSource("run.flags"),
+                attempt_source=ProgramRunAttemptSource(7),
                 ports=_ports(),
                 program_clock=ProgramClock(),
             ),
@@ -1735,7 +1759,7 @@ def _owner_task_adapter(node_id: str, task: _TaskPort, **context: Any):
     program = Program.from_dict(_identified(_minimal_document()), _catalog())
     return build_executable_node_resolver(environment).instantiate(
         environment.registry.record(node_id),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="leaf",
             node_instance_id="leaf",
             parameters={},
@@ -1744,7 +1768,7 @@ def _owner_task_adapter(node_id: str, task: _TaskPort, **context: Any):
                 catalog=_catalog(),
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.interrupt"),
+            attempt_source=ProgramRunAttemptSource(8),
             ports=_ports(task),
             **context,
         ),
@@ -1776,7 +1800,7 @@ class _RefusingCancelPort(_TaskPort):
         raise RuntimeError("owner unreachable")
 
 
-@pytest.mark.parametrize("node_id", ["simulation.reset", "kernel.full_stop"])
+@pytest.mark.parametrize("node_id", ["simulation.reset", "kernel.cell_stop"])
 def test_refused_cancellation_reports_failure_never_interrupted(node_id: str) -> None:
     task = _RefusingCancelPort((OwnerTaskState.ACTIVE,) * 3)
     adapter = _owner_task_adapter(node_id, task)
@@ -1845,9 +1869,43 @@ def test_operator_stop_held_task_stopped_by_program_stop_reports_interrupted() -
     assert adapter.interrupted_reason_code == "program_node_interrupted"
 
 
+@pytest.mark.parametrize("stop_event_id", [None, 0, "1", 3])
+def test_operator_stopped_node_requires_its_stop_event(stop_event_id: Any) -> None:
+    metadata: dict[str, Any] = {
+        "recovery_assessment": {"recovery_class": "ordinary_operator_stop"},
+    }
+    if stop_event_id is not None:
+        metadata["stop_event_id"] = stop_event_id
+    class _StoppedPort(_TaskPort):
+        def observe(self, task_id: str) -> OwnerTaskSnapshot:
+            # An interrupted owner task always carries its reason code.
+            self.observations.append(task_id)
+            return OwnerTaskSnapshot(
+                task_id=task_id,
+                state=OwnerTaskState.INTERRUPTED,
+                metadata=self.metadata,
+                reason_code="operation_stopped",
+            )
+
+    task = _StoppedPort((OwnerTaskState.ACTIVE,))
+    task.metadata = metadata
+    state = OperatorMotionStopState(
+        {"leaf": ()}, read_scope=lambda: OperatorMotionStopSnapshot(1, frozenset({"leaf"}))
+    )
+    adapter = _owner_task_adapter("simulation.reset", task, operator_stop_state=state)
+    adapter.tick_once()
+    adapter.tick_once()
+    if stop_event_id == 3:
+        # A positive event id identifies the operator Stop; no generation.
+        assert adapter.failure_reason_code != "owner_stop_identity_missing"
+    else:
+        assert adapter.status is py_trees.common.Status.FAILURE
+        assert adapter.failure_reason_code == "owner_stop_identity_missing"
+
+
 def test_non_cancellable_running_leaf_never_reports_interrupted() -> None:
     task = _TaskPort((OwnerTaskState.ACTIVE,) * 3)
-    adapter = _owner_task_adapter("kernel.full_stop", task)
+    adapter = _owner_task_adapter("kernel.cell_stop", task)
     assert not adapter.cancellable
     adapter.tick_once()
     assert adapter.status is py_trees.common.Status.RUNNING
@@ -2271,7 +2329,7 @@ def test_wait_for_value_times_out_on_the_program_clock_and_retry_is_fresh() -> N
     store = ProgramValueStore.from_program(program)
     node = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("logic.wait_for_value"),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="wait",
             node_instance_id="wait",
             parameters=wait.parameters,
@@ -2279,7 +2337,7 @@ def test_wait_for_value_times_out_on_the_program_clock_and_retry_is_fresh() -> N
             input_resolver=NodeAttemptInputResolver(
                 program=program, catalog=_catalog(), value_store=store
             ),
-            attempt_source=ProgramRunAttemptSource("run.test"),
+            attempt_source=ProgramRunAttemptSource(1),
             program_clock=ProgramClock(lambda: now[0]),
         ),
     )
@@ -2328,7 +2386,7 @@ def _held_wait(
     state = OperatorMotionStopState({"wait": ()}, clock=clock.now)
     node = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record(node_id),
-        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+        NodeAdapterBuildContext(
             name="wait",
             node_instance_id="wait",
             parameters=wait.parameters,
@@ -2338,7 +2396,7 @@ def _held_wait(
                 catalog=_catalog(),
                 value_store=ProgramValueStore.from_program(program),
             ),
-            attempt_source=ProgramRunAttemptSource("run.test"),
+            attempt_source=ProgramRunAttemptSource(1),
             operator_stop_state=state,
             operator_stop_hold_scope="wait",
             program_clock=clock,
@@ -2482,6 +2540,34 @@ def test_wait_for_value_kept_running_by_continue_policy_keeps_counting(
     )
 
 
+def _sender_idle(run: ExecutableProgramRun) -> None:
+    """OD-213: let the run's sender answer what the ticks sent."""
+    sender = run._sender  # noqa: SLF001
+    deadline = time.monotonic() + 5.0
+    while True:
+        with sender._lock:  # noqa: SLF001
+            if not sender._queue and not sender._draining:  # noqa: SLF001
+                return
+        assert time.monotonic() < deadline, "the run's sender did not answer"
+        time.sleep(0.001)
+
+
+def _tick_answered(run: ExecutableProgramRun) -> py_trees.common.Status:
+    """Tick; while a node waits for a request on the run's sender, let the
+    sender answer and tick again (OD-213: the answer is read a tick later)."""
+    status = run.tick_once()
+    for _ in range(20):
+        waiting = any(
+            getattr(node, "_request", None) is not None
+            for node in run._sender_adapters  # noqa: SLF001
+        )
+        if status is not py_trees.common.Status.RUNNING or not waiting:
+            return status
+        _sender_idle(run)
+        status = run.tick_once()
+    return status
+
+
 def _leaf_node(run: ExecutableProgramRun, instance_id: str) -> Any:
     node = run._authored_nodes[instance_id]  # noqa: SLF001
     return node.decorated if isinstance(node, OperatorMotionStopPolicy) else node
@@ -2524,7 +2610,7 @@ def test_set_tcp_pre_admission_refusal_preserves_owner_code_and_reason() -> None
             )
 
     run = _set_tcp_stop_run(policy="continue", task=Refused())
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     leaf = _leaf_node(run, "first")
     assert leaf.failure_reason_code == "execution_rejected"
     assert leaf.failure_details["reason"] == "tcp_tool_not_mounted"
@@ -2543,7 +2629,7 @@ def test_set_tcp_rule_holds_refusal_preserves_the_kernel_code() -> None:
             )
 
     run = _set_tcp_stop_run(policy="continue", task=Refused())
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     leaf = _leaf_node(run, "first")
     assert leaf.failure_reason_code == "rule_holds"
 
@@ -2559,7 +2645,7 @@ def test_set_tcp_admitted_failure_preserves_owner_code_and_reason() -> None:
             )
 
     run = _set_tcp_stop_run(policy="continue", task=Failed())
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     leaf = _leaf_node(run, "first")
     assert leaf.failure_reason_code == "execution_rejected"
     assert leaf.failure_details["reason"] == "tcp_offset_not_applied"
@@ -2575,9 +2661,10 @@ def test_set_tcp_hold_before_send_does_not_start_owner_task() -> None:
         OperatorMotionStopSnapshot(1, frozenset({"root", "first", "second"}))
     )
     assert run.tick_once() is py_trees.common.Status.RUNNING
+    _sender_idle(run)
     assert task.starts == []
     run._operator_stop_state.publish(OperatorMotionStopSnapshot(2))  # noqa: SLF001
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert [start[0] for start in task.starts] == ["motion.set_tcp", "motion.set_tcp"]
 
 
@@ -2585,7 +2672,8 @@ def test_set_tcp_hold_before_send_does_not_start_owner_task() -> None:
 def test_set_tcp_stop_after_send_settles_before_following_action(policy: str) -> None:
     task = _TaskPort((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
     run = _set_tcp_stop_run(policy=policy, task=task)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # OD-213: the start leaves the tick; its answer is read on the next one.
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     assert len(task.starts) == 1
     run._operator_stop_state.publish(  # noqa: SLF001
         OperatorMotionStopSnapshot(1, frozenset({"root", "first", "second"}))
@@ -2595,9 +2683,12 @@ def test_set_tcp_stop_after_send_settles_before_following_action(policy: str) ->
     assert task.cancellations == []
     if policy == "hold":
         assert result is py_trees.common.Status.RUNNING
+        _sender_idle(run)
         assert len(task.starts) == 1
         run._operator_stop_state.publish(OperatorMotionStopSnapshot(2))  # noqa: SLF001
         result = run.tick_once()
+    if result is py_trees.common.Status.RUNNING:
+        result = _tick_answered(run)
     assert result is py_trees.common.Status.SUCCESS
     assert len(task.starts) == 2
 
@@ -3403,7 +3494,7 @@ def test_get_object_pose_in_another_frame_is_one_owner_transform() -> None:
         ports=NodeAdapterPorts(scene_transactions=scene, model_queries=frames),
     )
 
-    assert run.tick_once() is py_trees.common.Status.SUCCESS, run.terminal_failure()
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS, run.terminal_failure()
     assert scene.invocations == []
     [(_identity, pose, target)] = frames.transforms
     assert pose["frame_ref"] == {"kind": "scene_resource", "scene_resource_id": "table"}
@@ -3435,7 +3526,7 @@ def test_get_object_pose_writes_the_scene_port_pose_to_a_pose_key() -> None:
         ports=_ports(invocation=invocation),
     )
 
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert invocation.invocations[0][0] == "scene.get_object_pose"
     assert invocation.invocations[0][2].parameters["scene_resource_id"] == "table"
     assert run.value_store.read("part_pose") == _cell_pose()
@@ -4095,3 +4186,375 @@ def test_failed_stop_nonstopping_projection_needs_new_owner_revision(saturated):
     else:
         state.publish(failed)
         assert state.snapshot() == failed
+
+
+# ---- Pick/place planning jobs (OD-213 (1)) ---------------------------------
+
+
+class _PlanningPort(_TaskPort):
+    """The host's planning jobs as the node sees them: the state is the
+    pushed stream copy, the rest are exchanges."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sends: list[str] = []
+        self.states: dict[str, str] = {}
+        self.unavailable = False
+        self.finishes: list[str] = []
+        self.planning_cancels: list[str] = []
+        self.releases: list[str] = []
+        self.refuse_cancel = False
+        self.during_send: Any = None
+        self.during_finish: Any = None
+        # The jobs the host holds and the finished tasks the port retains.
+        self.live: set[str] = set()
+        self.retained: set[str] = set()
+        self.finish_result: OwnerTaskSnapshot | None = OwnerTaskSnapshot(
+            task_id="job", state=OwnerTaskState.FAILED,
+            reason_code="no_feasible_candidate", message="no candidate",
+            metadata={"authored_failure_policy": "condition_failure"},
+            settlement_proven=True,
+        )
+
+    def send_planning(self, node_id, identity, inputs):
+        if self.during_send is not None:
+            hook, self.during_send = self.during_send, None
+            hook()
+        self.sends.append(node_id)
+        job = _PlanningJob(f"job-{len(self.sends)}", node_id)
+        self.states[job.job_id] = "accepted"
+        self.live.add(job.job_id)
+        return job
+
+    def planning_job_state(self, job_id):
+        from manyforge_behavior.kernel_client import KernelOperationObservationUnavailableError
+
+        if self.unavailable:
+            raise KernelOperationObservationUnavailableError("stream lost")
+        return self.states.get(job_id)
+
+    def finish_planning(self, job, identity, inputs):
+        if self.during_finish is not None:
+            hook, self.during_finish = self.during_finish, None
+            hook()
+        self.finishes.append(job.job_id)
+        self.live.discard(job.job_id)  # The read releases the job.
+        if self.states.get(job.job_id) == "cancelled":
+            return None
+        self.retained.add(job.job_id)
+        return replace(self.finish_result, task_id=job.job_id)
+
+    def acknowledge(self, task_id, identity):
+        super().acknowledge(task_id, identity)
+        self.retained.discard(task_id)
+
+    def cancel_planning(self, job_id):
+        self.planning_cancels.append(job_id)
+        if self.refuse_cancel:
+            raise RuntimeError("host unreachable")
+        self.states[job_id] = "cancelled"
+
+    def release_planning(self, job_id):
+        self.releases.append(job_id)
+        self.live.discard(job_id)
+
+
+class _ManualSender:
+    """The run's sender, emptied only when the test says so."""
+
+    def __init__(self) -> None:
+        from manyforge_behavior.run_sender import RunSender
+
+        self.pending: list[Any] = []
+        self.sender = RunSender(8, spawn=lambda _name, work: self.pending.append(work))
+
+    def drain(self) -> None:
+        while self.pending:
+            self.pending.pop(0)()
+
+
+def _planning_adapter(task: _PlanningPort, sender: _ManualSender, **context: Any):
+    environment = build_node_environment()
+    program = Program.from_dict(_identified(_minimal_document()), _catalog())
+    return build_executable_node_resolver(environment).instantiate(
+        environment.registry.record("planning.plan_pick_sequence"),
+        NodeAdapterBuildContext(
+            name="leaf",
+            node_instance_id="leaf",
+            # The node's required parameters; the resolver rejects a
+            # planning node that lacks one before anything is sent.
+            parameters={
+                "target": {"component_id": "robot.1", "command_target_id": "arm"},
+                "tool_target": {"component_id": "gripper.1", "command_target_id": "gripper"},
+                "base_frame": {"component_id": "robot.1", "frame_id": "base"},
+                "carrier_frame_ref": {"component_id": "gripper.1", "frame_id": "tcp"},
+                "tcp_endpoint": {
+                    "kind": "entry",
+                    "target": {"component_id": "robot.1", "command_target_id": "arm"},
+                    "frame": {"component_id": "gripper.1", "frame_id": "tcp"},
+                },
+                "selected_object_id": "graspable",
+                "tool_position": {"kind": "named_preset", "name": "closed"},
+                "output_key": "planning.pick_plan",
+                "contact_policy_id": "grasp",
+            },
+            input_resolver=NodeAttemptInputResolver(
+                program=program,
+                catalog=_catalog(),
+                value_store=ProgramValueStore.from_program(program),
+            ),
+            attempt_source=ProgramRunAttemptSource(8),
+            ports=_ports(task),
+            run_sender=sender.sender,
+            **context,
+        ),
+    )
+
+
+def _planning_job_known(task: _PlanningPort, sender: _ManualSender, adapter: Any) -> None:
+    """Tick to a sent and accepted job, still planning."""
+
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    assert task.sends == []  # Queued on the sender, not in the tick.
+    sender.drain()
+    assert task.sends == ["planning.plan_pick_sequence"]
+    task.states["job-1"] = "planning"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+
+
+def test_planning_node_is_running_while_its_job_plans_and_reads_it_once_done() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    for _ in range(3):  # The stream copy says planning: nothing is asked.
+        assert _tick(adapter) is py_trees.common.Status.RUNNING
+    assert task.finishes == [] and not sender.pending
+    task.states["job-1"] = "done"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    assert task.finishes == []  # The read is queued on the sender.
+    sender.drain()
+    assert task.finishes == ["job-1"]
+    assert _tick(adapter) is py_trees.common.Status.FAILURE
+    assert adapter.failure_reason_code == "no_feasible_candidate"
+    assert task.planning_cancels == []
+
+
+def test_planning_failure_reaches_the_tree_with_the_hosts_typed_code() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    task.finish_result = OwnerTaskSnapshot(
+        task_id="job-1", state=OwnerTaskState.FAILED,
+        reason_code="pick_planning_cancelled", message="pick planning was cancelled",
+        settlement_proven=True,
+    )
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    task.states["job-1"] = "failed"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert _tick(adapter) is py_trees.common.Status.FAILURE
+    assert adapter.failure_reason_code == "pick_planning_cancelled"
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_planning_node_stays_running_while_the_stream_copy_cannot_show_its_job(
+    listed: bool,
+) -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    if listed:
+        task.unavailable = True  # The stream is lost.
+    else:
+        del task.states["job-1"]  # Not pushed yet.
+    for _ in range(3):
+        assert _tick(adapter) is py_trees.common.Status.RUNNING
+    assert task.finishes == [] and not sender.pending
+    task.unavailable = False
+    task.states["job-1"] = "done"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert _tick(adapter) is py_trees.common.Status.FAILURE
+
+
+def test_halting_a_queued_plan_withdraws_it_and_reports_interrupted() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    adapter.stop(py_trees.common.Status.INVALID)
+    sender.drain()
+    assert task.sends == [] and task.planning_cancels == []
+    assert adapter.outcome == "interrupted"
+    assert adapter.settle_abandoned_request() is True
+
+
+def test_halting_a_sent_plan_cancels_its_job_once_the_host_accepted_it() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    # The tree stops the node while its send is with the host.
+    task.during_send = lambda: adapter.stop(py_trees.common.Status.INVALID)
+    sender.drain()
+    assert adapter.outcome == "interrupted"
+    # Forced Program End waits for the acceptance, then cancels this job only.
+    assert adapter.settle_abandoned_request() is True
+    assert task.planning_cancels == ["job-1"]
+    assert adapter.settle_abandoned_request() is True
+
+
+def test_halting_a_planning_node_cancels_its_job_only() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    adapter.stop(py_trees.common.Status.INVALID)
+    assert task.planning_cancels == ["job-1"]
+    assert adapter.outcome == "interrupted"
+    assert adapter.failure_reason_code is None
+    # Re-entered at once: it plans only after its cancelled job is released.
+    assert adapter.has_pending_drain
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    assert not sender.pending
+    _follow_to_end(adapter, sender)
+    assert task.releases == ["job-1"] and task.live == set()
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert task.sends == ["planning.plan_pick_sequence"] * 2
+
+
+def test_a_refused_planning_cancel_reports_failure_never_interrupted() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    task.refuse_cancel = True
+    adapter.stop(py_trees.common.Status.INVALID)
+    assert adapter.outcome == "failure"
+    assert adapter.failure_reason_code == "owner_cancellation_failed"
+
+
+def test_halting_a_finished_plan_whose_read_is_queued_cancels_nothing() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    task.states["job-1"] = "done"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING  # read queued
+    adapter.stop(py_trees.common.Status.INVALID)
+    sender.drain()
+    assert task.finishes == [] and task.planning_cancels == []
+    assert adapter.outcome == "interrupted"
+    # The run's tick releases the ended job.
+    _follow_to_end(adapter, sender)
+    assert task.releases == ["job-1"] and task.live == set()
+
+
+@pytest.mark.parametrize("freeze", ["halt", "hold"])
+def test_a_run_halt_or_a_stop_hold_cancels_the_job_and_plans_again_after(freeze: str) -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    _planning_job_known(task, sender, adapter)
+    if freeze == "halt":
+        assert adapter.reconcile_halt_task() == "unaffected"  # No physical effect.
+    else:
+        adapter.observe_while_operator_stop_held()
+    assert task.planning_cancels == ["job-1"]
+    # Repeated reconciliation asks the host only once.
+    adapter.observe_while_operator_stop_held()
+    assert task.planning_cancels == ["job-1"]
+    # Execute / Run: ticked again, the node waits for its cancelled job to
+    # end, releases it and plans again from the start.
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert task.releases == ["job-1"]
+    assert task.sends == ["planning.plan_pick_sequence"] * 2
+    assert task.finishes == []
+    task.states["job-2"] = "done"
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert task.finishes == ["job-2"]
+    assert _tick(adapter) is py_trees.common.Status.FAILURE
+
+
+def test_a_halt_while_the_plan_is_queued_sends_it_after_execute() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.sender.withdraw_queued()  # The run's Halt.
+    assert adapter.reconcile_halt_task() == "unaffected"
+    sender.drain()
+    assert task.sends == [] and task.planning_cancels == []
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert task.sends == ["planning.plan_pick_sequence"]
+
+
+def test_a_halt_while_the_plan_is_with_the_host_waits_for_its_acceptance() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    states: list[str] = []
+    task.during_send = lambda: states.append(adapter.reconcile_halt_task())
+    sender.drain()
+    assert states == ["active"]  # Sent, not answered: the job is not known yet.
+    assert adapter.reconcile_halt_task() == "unaffected"
+    assert task.planning_cancels == ["job-1"]
+
+
+def _follow_to_end(adapter: Any, sender: _ManualSender) -> None:
+    """What the run's tick does after each tree tick (`drain_invalidated`),
+    with the sender answering in between."""
+
+    for _ in range(10):
+        if not adapter.has_pending_drain:
+            return
+        adapter.drain_invalidated()
+        sender.drain()
+    raise AssertionError("the stopped attempt's follow-up did not end")
+
+
+def test_a_branch_halted_while_its_plan_is_with_the_host_leaves_no_job() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    assert _tick(adapter) is py_trees.common.Status.RUNNING
+    task.during_send = lambda: adapter.stop(py_trees.common.Status.INVALID)
+    sender.drain()  # Sent; the branch is halted; then the host accepts it.
+    assert adapter.outcome == "interrupted"
+    assert task.live == {"job-1"}
+    # The run goes on: its tick cancels the job, then releases it once ended.
+    _follow_to_end(adapter, sender)
+    assert task.planning_cancels == ["job-1"]
+    assert task.releases == ["job-1"]
+    assert task.live == set() and task.retained == set()
+
+
+def test_twenty_branch_halts_in_one_run_never_grow_the_hosts_job_table() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    for _ in range(20):
+        assert _tick(adapter) is py_trees.common.Status.RUNNING
+        task.during_send = lambda: adapter.stop(py_trees.common.Status.INVALID)
+        sender.drain()
+        assert len(task.live) <= 1  # One job per node at most.
+        assert _tick(adapter) is py_trees.common.Status.RUNNING  # Re-entered.
+        assert not sender.pending  # It waits for its previous job.
+        _follow_to_end(adapter, sender)
+        assert task.live == set()
+    assert len(task.sends) == 20 and len(task.releases) == 20
+    assert task.retained == set()
+
+
+def test_twenty_stops_during_the_read_leave_no_job_and_no_port_task() -> None:
+    task, sender = _PlanningPort(), _ManualSender()
+    adapter = _planning_adapter(task, sender)
+    for round_ in range(1, 21):
+        assert _tick(adapter) is py_trees.common.Status.RUNNING  # Plan queued.
+        sender.drain()
+        job_id = f"job-{round_}"
+        assert task.sends == ["planning.plan_pick_sequence"] * round_
+        task.states[job_id] = "done"
+        assert _tick(adapter) is py_trees.common.Status.RUNNING  # Read queued.
+        task.during_finish = lambda: adapter.stop(py_trees.common.Status.INVALID)
+        sender.drain()  # The read is with the host; the node is stopped.
+        assert adapter.outcome == "interrupted"
+        assert task.retained == {job_id}
+        _follow_to_end(adapter, sender)
+        # The read released the job; the follow-up acknowledged its task.
+        assert task.live == set() and task.retained == set()
+        assert task.planning_cancels == []

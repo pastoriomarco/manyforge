@@ -311,10 +311,6 @@ class VerifiedRetainedRuntimeUnitProduct final {
   retrieval_contract_revision() const noexcept {
     return retrieval_contract_revision_;
   }
-  [[nodiscard]] const std::optional<core::ManagerLivenessPolicyDTO>&
-  manager_liveness_policy() const noexcept {
-    return manager_liveness_policy_;
-  }
 
  private:
   VerifiedRetainedRuntimeUnitProduct(
@@ -334,8 +330,7 @@ class VerifiedRetainedRuntimeUnitProduct final {
       std::string process_adapter_contract_id,
       std::string process_adapter_contract_revision,
       std::string retrieval_contract_id,
-      std::string retrieval_contract_revision,
-      std::optional<core::ManagerLivenessPolicyDTO> manager_liveness_policy)
+      std::string retrieval_contract_revision)
       : retained_bundle_id_(std::move(retained_bundle_id)),
         runtime_unit_id_(std::move(runtime_unit_id)),
         product_id_(std::move(product_id)),
@@ -358,8 +353,7 @@ class VerifiedRetainedRuntimeUnitProduct final {
         process_adapter_contract_revision_(
             std::move(process_adapter_contract_revision)),
         retrieval_contract_id_(std::move(retrieval_contract_id)),
-        retrieval_contract_revision_(std::move(retrieval_contract_revision)),
-        manager_liveness_policy_(std::move(manager_liveness_policy)) {}
+        retrieval_contract_revision_(std::move(retrieval_contract_revision)) {}
 
   core::RetainedBundleId retained_bundle_id_;
   core::RuntimeUnitId runtime_unit_id_;
@@ -381,12 +375,7 @@ class VerifiedRetainedRuntimeUnitProduct final {
   std::string process_adapter_contract_revision_;
   std::string retrieval_contract_id_;
   std::string retrieval_contract_revision_;
-  std::optional<core::ManagerLivenessPolicyDTO> manager_liveness_policy_;
 
-  friend std::optional<VerifiedRetainedRuntimeUnitProduct>
-  verify_reference_runtime_unit_product(
-      const RetainedBundle &, const core::RuntimeUnitId &,
-      const IVerifiedRetainedProductArtifactSource &);
   friend std::optional<VerifiedRetainedRuntimeUnitProduct>
   verify_runtime_unit_product(const RetainedBundle &,
                               const core::RuntimeUnitId &,
@@ -402,16 +391,6 @@ class VerifiedRetainedRuntimeUnitProduct final {
 verify_runtime_unit_product(
     const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
     const IVerifiedRetainedProductArtifactSource &artifact_source);
-
-/// Verify one exact reference runtime product for a runtime consumer.
-///
-/// Missing runtime-unit coordinates return no value. A present bundle,
-/// product, manifest, or launchable artifact that fails any exact contract,
-/// subject, provenance, or cross-artifact check fails closed.
-[[nodiscard]] std::optional<VerifiedRetainedRuntimeUnitProduct>
-verify_reference_runtime_unit_product(
-    const RetainedBundle& bundle, const core::RuntimeUnitId& runtime_unit_id,
-    const IVerifiedRetainedProductArtifactSource& artifact_source);
 
 /// Exact coordinates for the generic composed-model map retained beside one
 /// planning model. Product kind and artifact role are fixed by this typed

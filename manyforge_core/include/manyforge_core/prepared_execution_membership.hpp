@@ -114,7 +114,7 @@ class PreparedExecutionMembership final {
  private:
   struct Entry {
     std::uint64_t execution_id;
-    OperationId operation_id;
+    OperationNumber operation_id;
     OperationParticipantId participant_id;
     OperationRevision revision;
     ContentDigest digest;

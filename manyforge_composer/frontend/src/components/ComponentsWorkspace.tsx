@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { SourceModelProjection } from '../types/api';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
@@ -50,6 +51,8 @@ import {
  */
 export interface ComponentsWorkspaceProps {
   enabled: boolean;
+  /** The current application start; recover-enable names it (null: unknown). */
+  applicationStartId?: ApplicationStartId | null;
   controller: DeploymentWorkspaceController;
   /** The pushed component states. */
   cellState: CellState;
@@ -85,6 +88,7 @@ export function ComponentsWorkspace({
   robotControlIds,
   onOpenRobotControl,
   onOpenDeployment,
+  applicationStartId = null,
 }: ComponentsWorkspaceProps) {
   const sceneChoices = useMemo(() => sceneResourceChoices(programSceneIds, sceneResourceIds),
     [programSceneIds, sceneResourceIds]);
@@ -107,6 +111,7 @@ export function ComponentsWorkspace({
   const pageProps = (pageRow: ComponentManagerRow) => ({
     row: pageRow,
     enabled,
+    applicationStartId,
     controller,
     state: states[pageRow.componentId] ?? null,
     states: cellState.components ?? [],
@@ -171,6 +176,7 @@ export function ComponentsWorkspace({
                 controller={controller}
                 states={cellState.components}
                 enabled={enabled}
+                applicationStartId={applicationStartId}
                 selectedId={row.componentId}
                 onSelect={setSelected}
                 onRemoved={() => setSelected(null)}
@@ -191,12 +197,13 @@ export function ComponentsWorkspace({
  * machine member's page follows its machine card, which shows its status.
  */
 function ComponentPage({
-  row, enabled, controller, state, states, statesKnown, sourceModel, profileFacts, profiles, motionDescriptors,
+  row, enabled, applicationStartId, controller, state, states, statesKnown, sourceModel, profileFacts, profiles, motionDescriptors,
   gripperDescriptors, programSceneIds, sceneResourceIds, robotControl, onOpenRobotControl, onOpenDeployment, onRemoved,
   member = false,
 }: {
   row: ComponentManagerRow;
   enabled: boolean;
+  applicationStartId: ApplicationStartId | null;
   controller: DeploymentWorkspaceController;
   /** Its pushed state; null while it is not in the cell. */
   state: ComponentState | null;
@@ -265,7 +272,7 @@ function ComponentPage({
         </section>
       ) : (
         <>
-          <ComponentStatePanel state={state} enabled={enabled} states={states} />
+          <ComponentStatePanel state={state} enabled={enabled} states={states} applicationStartId={applicationStartId} />
           <ComponentDetailsCard state={state} />
         </>
       )}

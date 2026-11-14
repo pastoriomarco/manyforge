@@ -3,12 +3,17 @@
 #include "ros_host_composition.hpp"
 
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_roboplan/retained_cell_runtime.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <future>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -21,8 +26,7 @@ class HostRuleEvidenceWakeupTest : public ::testing::Test {
 protected:
   void SetUp() override {
     // A real BB-only service needs no physical provider or invented sample.
-    runtime = HostIoSignalRuntime::Create(
-        core::RequestOwnerEpoch("host"), 1U, {}, clock, scheduler, 1U);
+    runtime = HostIoSignalRuntime::Create(1U, {}, clock, scheduler, 1U);
   }
   void Advance() {
     scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
@@ -117,6 +121,65 @@ TEST_F(HostRuleEvidenceWakeupTest, CallbackBorrowsActualAccessWithoutRetainingIt
   EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety), 0U);
 }
 
+TEST_F(HostRuleEvidenceWakeupTest,
+       EvidenceAndTheNextRuntimeSafetyTaskRunWhileApplyHoldsTheLockExclusively) {
+  const auto journal =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-rule-evidence-" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+       ".sqlite");
+  {
+    // The real stable cell Kernel, as the host installs it in the access owner.
+    const auto graph = core::GraphRevision("graph.rule-evidence");
+    core::ResourceAddressedExecutionKernelConfig config{
+        core::kTestApplicationStartId, core::CellId("cell.rule-evidence"), 32U, {},
+        nullptr, graph};
+    config.empty_runtime_retained_bundle_id =
+        core::RetainedBundleId("bundle.rule-evidence");
+    config.empty_runtime_graph_revision = graph;
+    RetainedCellRuntime cell(RetainedCellRuntimeInput{
+        .clock = std::make_shared<WallClock>(),
+        .scheduler = std::make_shared<SimpleScheduler>(),
+        .operation_journal_path = journal,
+        .participant_registrations = {},
+        .kernel_config = std::move(config)});
+    auto access = std::make_shared<ExecutionCompositionAccess>();
+    access->addressed_kernel.store(&cell.addressed_kernel(), std::memory_order_release);
+    ExecutionProduct product(nullptr, nullptr, nullptr, {},
+                             core::ActiveBundlePublicationGeneration(1U));
+    product.io_signal_runtime = runtime;
+    BindHostIoRuleEvidenceProcessor(product, access);
+    runtime->Start();
+    runtime->RequestRuleEvidenceProcessing();
+    // Stands for a collision-monitor tick queued on the same lane behind it.
+    std::atomic<bool> tick_ran{false};
+    const auto now = clock->now();
+    scheduler->schedule(now, [&] { tick_ran.store(true); },
+                        core::SchedulerPriority::RuntimeSafety);
+    ASSERT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety), 2U);
+    {
+      // Apply's exclusive section holds the composition lock meanwhile.
+      std::unique_lock exclusive(access->mutex);
+      auto lane = std::async(std::launch::async, [&] {
+        scheduler->advance_to(now, core::SchedulerPriority::RuntimeSafety);
+      });
+      // Only a regression bound: the lane needs no composition lock.
+      const bool finished_during_hold =
+          lane.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+      EXPECT_TRUE(finished_during_hold);
+      EXPECT_TRUE(tick_ran.load());
+      exclusive.unlock();
+      lane.get();
+    }
+    EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety), 0U);
+    EXPECT_FALSE(cell.addressed_kernel().get_internal_fault().has_value());
+    access->detach_addressed_owner();
+  }
+  std::error_code ignored;
+  for (const auto *suffix : {"", "-wal", "-shm"})
+    std::filesystem::remove(journal.string() + suffix, ignored);
+}
+
 deployment::RetainedIoSignalConfiguration
 SystemRow(const std::string &component, const std::string &target) {
   core::IoSignalDescriptorDTO descriptor{
@@ -155,8 +218,7 @@ TEST_F(HostRuleEvidenceWakeupTest, CarriedObjectLostSignalFollowsTheHostStore) {
   const core::CommandTargetId gripper("gripper");
   const auto signal = HostCarriedObjectLostSignals::SignalId(robot, gripper);
   const auto make = [&](std::uint64_t generation) {
-    return HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"),
-                                       generation, {}, clock, scheduler, 0U,
+    return HostIoSignalRuntime::Create(generation, {}, clock, scheduler, 0U,
                                        {SystemRow("robot.g1", "gripper")});
   };
   auto system = make(1U);
@@ -215,7 +277,7 @@ TEST_F(HostRuleEvidenceWakeupTest, CarriedObjectLostSignalFollowsTheHostStore) {
 // sample it reports must count as fresh before any loss.
 TEST_F(HostRuleEvidenceWakeupTest, ASystemSignalSampleIsFreshForReadiness) {
   const auto row = SystemRow("robot.g2", "gripper");
-  auto system = HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
+  auto system = HostIoSignalRuntime::Create(1U,
                                             {}, clock, scheduler, 0U, {row});
   system->Start();
   system->AdoptCarriedObjectLostSignals();
@@ -240,8 +302,7 @@ TEST_F(HostRuleEvidenceWakeupTest, ARefusedApplyCandidateLeavesTheRowsAndTheSink
   const core::CommandTargetId gripper("gripper"), other("other");
   const auto signal = HostCarriedObjectLostSignals::SignalId(robot, gripper);
   const auto make = [&](std::uint64_t generation, const char *target) {
-    return HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"),
-                                       generation, {}, clock, scheduler, 0U,
+    return HostIoSignalRuntime::Create(generation, {}, clock, scheduler, 0U,
                                        {SystemRow("robot.g1", target)});
   };
   auto active = make(1U, "gripper");

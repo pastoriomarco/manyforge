@@ -25,7 +25,7 @@ export function applyMayHaveActed(state: ManagerApplyStatus['state'] | null | un
 }
 
 export interface ManagerApplyIdentity {
-  applyId: string;
+  applyId: number;
   applyGeneration: number;
 }
 
@@ -40,13 +40,27 @@ export function selectManagerApplyInventoryIdentity(
   attention.sort((left, right) => (
     Number(right.incomplete) - Number(left.incomplete)
     || right.applyGeneration - left.applyGeneration
-    || right.applyId.localeCompare(left.applyId)
+    || right.applyId - left.applyId
   ));
   const selected = attention[0];
   return selected === undefined ? null : {
     applyId: selected.applyId,
     applyGeneration: selected.applyGeneration,
   };
+}
+
+/**
+ * The newest Manager Apply ended `failed` or `unknown_effect` (a timed-out
+ * or failed progression included), whatever its fence state, publication or
+ * earlier release attempt. New clears such an Apply, so the authoring
+ * admission it keeps closed does not gate New or Load.
+ */
+export function newCanClearLatestFailedApply(records: readonly ManagerApplyRecord[]): boolean {
+  const latest = [...records].sort((left, right) => (
+    right.applyGeneration - left.applyGeneration || right.applyId - left.applyId
+  ))[0];
+  return latest !== undefined
+    && (latest.terminalState === 'failed' || latest.terminalState === 'unknown_effect');
 }
 
 export function sameManagerApply(

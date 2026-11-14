@@ -31,7 +31,7 @@ from manyforge_program_runner.execution_transport import (
 from manyforge_program_runner.liveness import ProgramRunnerLivenessError
 from manyforge_program_runner.runtime import ProgramRuntime
 
-from manyforge_program_runner.tests.test_liveness import _expected_status_digest, _heartbeat, _receiver
+from manyforge_program_runner.tests.test_liveness import _heartbeat, _receiver
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CATALOG = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
@@ -103,12 +103,11 @@ class _Host:
         if self.fail_with is not None:
             raise self.fail_with
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "publish_program_bbkeys",
             "ok": True,
             "status": "accepted",
-            "owner_epoch": request["owner_epoch"],
-            "program_binding_id": request["program_binding_id"],
+                "program_binding_id": request["program_binding_id"],
             "active_publication_generation": request["active_publication_generation"],
             "cycle_generation": request["cycle_generation"],
             "program_run_id": request["program_run_id"],
@@ -127,10 +126,8 @@ def _publisher(
     events = [] if events is None else events
     return ProgramBlackboardKeyPublisher(
         ProgramBlackboardPublicationScope(
-            owner_epoch="kernel-owner",
-            program_runner_owner_epoch="runner-owner",
             claim_generation=None if between_runs else 3,
-            program_run_id=None if between_runs else "run-1",
+            program_run_id=None if between_runs else 1,
             program_binding_id="sha256:" + "d" * 64,
             active_publication_generation=5,
             cycle_generation=7,
@@ -189,7 +186,7 @@ def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
         key: host.frames[0][key]
         for key in ("claim_generation", "kind", "active_publication_generation")
     } == {"claim_generation": 3, "kind": "baseline", "active_publication_generation": 5}
-    assert all(len(frame) == 12 for frame in host.frames)
+    assert all(len(frame) == 10 for frame in host.frames)
     assert publisher.fault is None
 
 
@@ -224,7 +221,7 @@ def test_operator_write_then_tree_write_are_both_forwarded_in_order() -> None:
     host.during = hold_operator_frame
     operator = threading.Thread(target=lambda: store.write(
         "door_open", True,
-        metadata={"program_run_id": "run-1", "request_id": "r-1",
+        metadata={"program_run_id": 1, "request_key": "r-1",
                   "value_source": "runtime_control"},
     ))
     operator.start()
@@ -284,14 +281,14 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     # makes the Kernel's source unavailable (exact-sender gap) before the
     # write returns, so its rules can't watch and hold their scope; then the
     # Run's Program Stop, then the fault fences liveness. No resend.
-    receiver, _rclock, _reconciliations = _receiver(tmp_path)
+    receiver = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     events: list[Any] = []
     store = _store()
     host, queue = _Host(), _Queue()
     publisher = ProgramBlackboardKeyPublisher(
         ProgramBlackboardPublicationScope(
-            "kernel-owner", "runner-owner", 3, "run-1", "sha256:" + "d" * 64, 5, 7
+            3, 1, "sha256:" + "d" * 64, 5, 7
         ),
         publish=host,
         submit=queue,
@@ -313,9 +310,9 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     store.write("count", 2)
     assert len(host.frames) == 3  # Nothing is sent after the fault.
     queue.run()  # Containment, off the store lock.
-    assert events == [("stop", "run-1"), ("fault", FAULT_CODE)]
+    assert events == [("stop", 1), ("fault", FAULT_CODE)]
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert len(acknowledgement) == 24
+    assert len(acknowledgement) == 18
     assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
     assert acknowledgement["publisher_fault"]["details"] == {}
     assert acknowledgement["state"] == "current"
@@ -324,9 +321,6 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
         acknowledgement["publisher_fault"]
     )
     assert acknowledgement["last_accepted_heartbeat_sequence"] == 2
-    assert acknowledgement["receiver_status_digest"] == _expected_status_digest(
-        acknowledgement
-    )
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
 
@@ -372,14 +366,14 @@ def test_writes_before_the_source_exists_are_carried_by_its_baseline() -> None:
 def test_reconciliation_and_later_heartbeats_never_clear_the_latch(
     tmp_path: Path,
 ) -> None:
-    receiver, _clock, _reconciliations = _receiver(tmp_path)
+    receiver = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     probe = receiver._handle(  # noqa: SLF001
         {"api_version": _heartbeat()["api_version"], "cell_id": "cell", "kind": "probe"}
     )
-    assert len(probe) == 10
+    assert len(probe) == 8
     healthy = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert healthy["publisher_fault"] is None and len(healthy) == 24
+    assert healthy["publisher_fault"] is None and len(healthy) == 18
     receiver.latch_publisher_fault(
         {"code": FAULT_CODE, "message": "lost", "details": {}}, "sha256:" + "e" * 64
     )
@@ -552,11 +546,9 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
     transport._attribution_transport = "internal"  # noqa: SLF001
     sent: list[dict[str, Any]] = []
     frame = {
-        "schema_version": "manyforge.program_bbkey_publication.v1",
-        "owner_epoch": "kernel-owner",
-        "program_runner_owner_epoch": "runner-owner",
+        "schema_version": "manyforge.program_bbkey_publication.v2",
         "claim_generation": 3,
-        "program_run_id": "run-1",
+        "program_run_id": 1,
         "program_binding_id": "sha256:" + "d" * 64,
         "active_publication_generation": 5,
         "cycle_generation": 7,
@@ -566,15 +558,14 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
         "values": [{"name": "count", "value_type": "int64", "value": "-4"}],
     }
     reply = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "publish_program_bbkeys",
         "ok": True,
         "status": "accepted",
-        "owner_epoch": "kernel-owner",
         "program_binding_id": "sha256:" + "d" * 64,
         "active_publication_generation": 5,
         "cycle_generation": 7,
-        "program_run_id": "run-1",
+        "program_run_id": 1,
         "source_epoch": "source-1",
         "accepted_sequence": "2",
     }
@@ -583,7 +574,7 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
     assert transport.publish_program_bbkeys(frame)["accepted_sequence"] == "2"
     assert sent[0]["command"] == "publish_program_bbkeys"
     assert sent[0]["request"] == frame
-    assert len(sent[0]["request"]) == 12  # The closed request.
+    assert len(sent[0]["request"]) == 10  # The closed request.
     for bad_reply in (
         {k: v for k, v in reply.items() if k != "status"},
         {k: v for k, v in reply.items() if k != "cycle_generation"},
@@ -598,7 +589,7 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
             transport.publish_program_bbkeys(frame)
     # The owner's ErrorDTO keeps its code (a transient retry).
     transport._exchange = lambda command: {  # type: ignore[method-assign]  # noqa: SLF001
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "publish_program_bbkeys",
         "ok": False,
         "error": {"code": "bb_source_not_ready", "message": "installing", "details": {}},
@@ -667,11 +658,10 @@ def _superseded(request: dict[str, Any]) -> dict[str, Any]:
     """The actual reply: the installed replacement, no sequence."""
 
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "publish_program_bbkeys",
         "ok": True,
         "status": "superseded",
-        "owner_epoch": request["owner_epoch"],
         "program_binding_id": request["program_binding_id"],
         "active_publication_generation": request["active_publication_generation"],
         "cycle_generation": request["cycle_generation"] + 1,
@@ -699,7 +689,7 @@ def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     tmp_path: Path,
 ) -> None:
     # A between-Runs start failure changes no source and never fences.
-    receiver, _clock, _reconciliations = _receiver(tmp_path)
+    receiver = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     runtime = object.__new__(ProgramRuntime)
     runtime._liveness = receiver  # noqa: SLF001
@@ -809,7 +799,6 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
     runtime._bbkey_fence_lock = threading.Lock()  # noqa: SLF001
     runtime._bbkey_open_losses = {}  # noqa: SLF001
     runtime._bbkey_fence_reference = None  # noqa: SLF001
-    runtime._bbkey_fence_permanent = False  # noqa: SLF001
     runtime._bbkey_source_ordinals = itertools.count(1)  # noqa: SLF001
     runtime._interrupt_state_mirror = None  # noqa: SLF001
     runtime._interrupt_state_run_id = None  # noqa: SLF001
@@ -824,8 +813,7 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
     runtime._kernel = applied  # type: ignore[assignment]  # noqa: SLF001
     runtime._host = _Pool()  # type: ignore[assignment]  # noqa: SLF001
     runtime._environment = type("Env", (), {"catalog": _CATALOG})()  # type: ignore[assignment]  # noqa: SLF001
-    runtime.owner_epoch = "runner-owner"
-    runtime._current_kernel_owner_epoch = lambda: "kernel-owner"  # type: ignore[method-assign]  # noqa: SLF001
+    runtime.application_start_id = "runner-owner"
 
     def new_publisher(scope: ProgramBlackboardPublicationScope) -> ProgramBlackboardKeyPublisher:
         host = _Host()
@@ -929,16 +917,16 @@ def test_runtime_reset_retires_the_run_sender_without_a_frame() -> None:
     host = _Host()
     publisher = _publisher_for(
         ProgramBlackboardPublicationScope(
-            "kernel-owner", "runner-owner", 3, "run-1", "sha256:" + "d" * 64, 5, 7
+            3, 1, "sha256:" + "d" * 64, 5, 7
         ),
         host,
     )
     store = _store()
     publisher.start(store, ("count",))
-    runtime._bbkey_publishers["run-1"] = publisher  # noqa: SLF001
-    runtime._reset_bbkey_publication("run-1")  # noqa: SLF001
+    runtime._bbkey_publishers[1] = publisher  # noqa: SLF001
+    runtime._reset_bbkey_publication(1)  # noqa: SLF001
     store.write("count", 3)
-    assert "run-1" not in runtime._bbkey_publishers  # noqa: SLF001
+    assert 1 not in runtime._bbkey_publishers  # noqa: SLF001
     assert [frame["kind"] for frame in host.frames] == ["baseline"]
 
 
@@ -957,7 +945,7 @@ def _fencing_runtime(
 ) -> tuple[ProgramRuntime, _Applied, _Journal, Any, list[str]]:
     """The real publisher wiring (`_new_bbkey_publisher`) on a live receiver."""
 
-    receiver, _clock, _reconciliations = _receiver(tmp_path)
+    receiver = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     applied, journal = _Applied(), _Journal()
     runtime, _hosts = _runtime(applied, journal)
@@ -1241,12 +1229,12 @@ def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) 
     runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
     publisher = runtime._new_bbkey_publisher(  # noqa: SLF001
         ProgramBlackboardPublicationScope(
-            "kernel-owner", "runner-owner", 3, "run-1", "sha256:" + "d" * 64, 5, 7
+            3, 1, "sha256:" + "d" * 64, 5, 7
         )
     )
-    runtime._bbkey_publishers["run-1"] = publisher  # noqa: SLF001
+    runtime._bbkey_publishers[1] = publisher  # noqa: SLF001
     publisher.start(_store(), ("count",))
-    assert stops == ["run-1"]
+    assert stops == [1]
     assert publisher.fault is not None
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
@@ -1254,6 +1242,72 @@ def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) 
     assert acknowledgement["command_fenced"] is True
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
+
+
+def _run_publisher(
+    runtime: ProgramRuntime, store: ProgramValueStore
+) -> ProgramBlackboardKeyPublisher:
+    publisher = runtime._new_bbkey_publisher(  # noqa: SLF001
+        ProgramBlackboardPublicationScope(3, 1, "sha256:" + "d" * 64, 5, 7)
+    )
+    runtime._bbkey_publishers[1] = publisher  # noqa: SLF001
+    publisher.start(store, ("count",))
+    return publisher
+
+
+def test_a_run_source_fault_ends_once_the_kernel_confirms_its_loss(tmp_path: Path) -> None:
+    # A write the Kernel refuses during a Runner loss: the Kernel answers the
+    # write and the declaration with its typed loss, the Run is stopped, the
+    # fault ends with the Run, and Reset's Runner gate and source handoff work.
+    host = _Host()
+    runtime, _applied, journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    store = _store()
+    publisher = _run_publisher(runtime, store)
+    assert publisher.baseline_accepted
+    host.fail_with = _SEQUENCE_GAP
+    store.write("count", 3)
+    assert [(f["kind"], f["message_sequence"]) for f in host.frames] == [
+        ("baseline", "1"), ("update", "2"), ("update", _LOSS_SEQUENCE),
+    ]
+    assert stops == [1]
+    assert publisher.fault is not None and publisher.loss_confirmed
+    assert runtime._bbkey_open_losses == {}  # noqa: SLF001
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["command_fenced"] is False
+    receiver.require_current()
+
+    # Reset: the Run's sender retires and the next cycle's source installs.
+    host.fail_with = None
+    runtime._reset_bbkey_publication(1)  # noqa: SLF001
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    journal.cycle_generation = 8
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    fresh = runtime._bbkey_publishers[None]  # noqa: SLF001
+    assert fresh.baseline_accepted and fresh.fault is None
+    assert host.frames[-1]["cycle_generation"] == 8
+    assert receiver._handle(_heartbeat(sequence=3))["publisher_fault"] is None  # noqa: SLF001
+    receiver.require_current()
+
+
+def test_a_contact_loss_without_a_refused_value_leaves_the_run_publishing(
+    tmp_path: Path,
+) -> None:
+    # The Manager's missed exchanges change nothing in the Runner: when it is
+    # heard again no fault is latched and the Run's writes are still forwarded.
+    host = _Host()
+    runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    store = _store()
+    publisher = _run_publisher(runtime, store)
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["command_fenced"] is False
+    receiver.require_current()
+    store.write("count", 4)
+    assert [(f["kind"], f["message_sequence"]) for f in host.frames] == [
+        ("baseline", "1"), ("update", "2"),
+    ]
+    assert publisher.fault is None and stops == []
 
 
 def test_a_source_not_ready_starts_later_from_the_values_committed_meanwhile(

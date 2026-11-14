@@ -99,7 +99,7 @@ using namespace manyforge::core;
       .planning_timeout_s = 4.5,
       .planning_attempt_index = 7U,
       .action_span =
-          ActionSpanDTO{ActionSource::kProgramNode, "span-a", "run-a",
+          ActionSpanDTO{ActionSource::kProgramNode, "span-a", core::ProgramRunNumber(149U),
                         "node-a", "attempt-a", "parent-a"}};
 }
 
@@ -303,7 +303,7 @@ TEST(RoboPlanWorkerProtocolTest, PlanAndIkRequestsCarryContactAllowedPairs) {
 }
 
 TEST(RoboPlanWorkerProtocolTest, DiagnosticV13RoundTripsQualifiedTargetAndDeadline) {
-  EXPECT_EQ(kProtocolVersion, 13U);
+  EXPECT_EQ(kProtocolVersion, 14U);
   auto input = candidate_request();
   input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
   input.diagnostic_qualified_target = state();
@@ -361,8 +361,7 @@ TEST(RoboPlanWorkerProtocolTest,
   suffix_seed.positions = {AngularPositionDTO{0.8}, LinearPositionDTO{0.03}};
   suffix_seed.velocities.reset();
   input.moving_replacement = MovingReplacementInputDTO{
-      ExecutionGoalKey{ControllerGoalId("source-goal-a"),
-                       ControllerGoalGeneration(17U)},
+      ControllerGoalId{OperationNumber(901U), 1U, 17U},
       ExecutionBindingEpoch(23U),
       2.75,
       TrajectoryDTO{binding().resources,

@@ -1,5 +1,6 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 #include "admission_timing_internal.hpp"
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/types/program_io_condition.hpp>
@@ -7,16 +8,6 @@
 #include <cstdio>
 
 namespace manyforge::core {
-
-Result<std::unique_ptr<ICellCloseAdmissionLease>>
-ResourceAddressedExecutionKernel::AcquireCellCloseAdmissionLease() {
-  // Ordinary Execute admission already takes this same lock before state
-  // (the pending/admitted publication barrier). No submission/state lock or
-  // callback is retained over the caller's journal transaction.
-  std::unique_ptr<ICellCloseAdmissionLease> lease =
-      std::make_unique<CellCloseAdmissionLease>(*this);
-  return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Ok(std::move(lease));
-}
 
 AuthoringAdmissionDTO ResourceAddressedExecutionKernel::GetAuthoringAdmission() const {
   return cell_admission_owner_->GetAuthoringAdmission();
@@ -29,7 +20,7 @@ Result<void> ResourceAddressedExecutionKernel::SetRouteRecoveryPending(bool pend
 }
 
 void ResourceAddressedExecutionKernel::mark_motion_retry_run_end_locked(
-    const ProgramRunId& run_id) {
+    const ProgramRunNumber& run_id) {
   retire_program_io_watches_locked(run_id);
   for (auto& [id, operation] : active_operations_) {
     static_cast<void>(id);
@@ -43,9 +34,9 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
     const CellAdmissionReadinessSnapshotDTO& snapshot,
     std::shared_ptr<IIoSignalService>* actual_retired_service) {
   if (actual_retired_service) actual_retired_service->reset();  // Destroy outside Core locks.
-  // A newly latched Runner loss names the run whose motion is stopped below,
-  // after every Core lock is released.
-  std::optional<ProgramRunId> lost_runner_run;
+  // A Runner loss that follows a report without one names the run whose
+  // motion is stopped below, after every Core lock is released.
+  std::optional<ProgramRunNumber> lost_runner_run;
   auto updated = [&] {
     std::lock_guard admission_lock(*admission_mutex_);
     if (snapshot.program_runner_loss) {
@@ -61,27 +52,29 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
       const bool exact_replay = program_runner_loss_ == snapshot.program_runner_loss;
       if (!exact_replay &&
           (!program_cycle_claim_run_ ||
-           program_cycle_claim_run_->program_runner_owner_epoch !=
-               cycle.program_runner_owner_epoch ||
            program_cycle_claim_run_->program_run_id != cycle.program_run_id ||
            program_cycle_claim_run_->claim_generation != cycle.cycle_claim_generation)) {
         return reject<AuthoringAdmissionDTO>("Runner loss does not name the held Program owner",
                                              "program_runner_contact_loss_stale",
                                              ErrorCode::kInvalidRequest);
       }
-      // The first owner-issued fault remains observable even if advancing
-      // ordinary readiness fails its journal write. This grants no recovery.
+      // The current loss stays observable even if advancing ordinary
+      // readiness fails its journal write. The host's rule pass re-evaluates
+      // the rules that read Program values.
       if (!program_runner_loss_) {
-        program_runner_loss_ = snapshot.program_runner_loss;
         lost_runner_run = cycle.program_run_id;
+        if (actual_retired_service) *actual_retired_service = io_signal_service_;
       }
-      const auto bb_retired = retire_program_blackboard_source_locked(actual_retired_service);
-      if (!bb_retired.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_retired.error());
-      if (cycle.program_run_id) retire_program_io_watches_locked(*cycle.program_run_id);
+      program_runner_loss_ = snapshot.program_runner_loss;
     }
     auto result = cell_admission_owner_->UpdateCellAdmissionReadiness(snapshot);
     if (result.ok()) {
       std::lock_guard state_lock(state_mutex_);
+      // An accepted report without a loss ends it; the rule pass watches again.
+      if (!snapshot.program_runner_loss && program_runner_loss_) {
+        program_runner_loss_.reset();
+        if (actual_retired_service) *actual_retired_service = io_signal_service_;
+      }
       const auto bb_current = reconcile_program_blackboard_cycle_locked(
           snapshot.program_cycle_status, actual_retired_service);
       if (!bb_current.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_current.error());
@@ -92,8 +85,7 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
       if (program_cycle_claim_run_ && snapshot.program_cycle_status) {
         const auto& run = *program_cycle_claim_run_;
         const auto& status = *snapshot.program_cycle_status;
-        const bool exact = status.program_runner_owner_epoch == run.program_runner_owner_epoch &&
-                           status.program_run_id == run.program_run_id &&
+        const bool exact = status.program_run_id == run.program_run_id &&
                            status.cycle_claim_generation == run.claim_generation;
         if (snapshot.program_cycle_status_current && exact &&
             (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset ||
@@ -107,32 +99,6 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
   return updated;
 }
 
-// The Runner owns Program Stop and Halt, so with a silent Runner nobody else
-// could stop the Program's motion. Stop that run's operations once per loss
-// through the ordinary Stop path; nothing else in the cell is stopped. A
-// refused Stop leaves the latch and the closed readiness unchanged.
-void ResourceAddressedExecutionKernel::stop_program_run_after_runner_loss(
-    const ProgramRunId& program_run_id) noexcept {
-  try {
-    const auto material = config_.request_owner_epoch.value() + "\nprogram-runner-loss\n" +
-                          program_run_id.value();
-    const StopIntentDTO intent{
-        PublicRequestContextDTO{RequestId(content_identity::sha256_digest(material)),
-                                config_.request_owner_epoch, "kernel.program_runner_loss",
-                                program_run_id.value()},
-        std::vector<StopProgramRunTargetDTO>{StopProgramRunTargetDTO{program_run_id}},
-        std::string("program_runner_loss"),
-        RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
-                              std::nullopt}};
-    const auto stopped = stop(intent);
-    if (!stopped.ok())
-      (void)std::fprintf(stderr, "manyforge_fault code=program_runner_loss_stop_refused "
-                                 "program_run_id=%s error=%s\n",
-                         program_run_id.value().c_str(), stopped.error().code.c_str());
-  } catch (...) {
-  }
-}
-
 std::optional<ProgramRunnerContactLossDTO>
 ResourceAddressedExecutionKernel::get_program_runner_loss() const {
   std::lock_guard state_lock(state_mutex_);
@@ -141,31 +107,35 @@ ResourceAddressedExecutionKernel::get_program_runner_loss() const {
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
-  return acquire_cell_admission_claim(intent);
+  return acquire_cell_admission_claim(intent, nullptr);
+}
+
+Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireProgramResetClaim(
+    const CellAdmissionClaimIntentDTO& intent, const ProgramCycleStatusDTO& program_cycle_status) {
+  return acquire_cell_admission_claim(intent, &program_cycle_status);
 }
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_admission_claim(
-    const CellAdmissionClaimIntentDTO& intent) {
-  detail::AdmissionTiming timing(false, intent.request_id.value());
+    const CellAdmissionClaimIntentDTO& intent, const ProgramCycleStatusDTO* program_reset_status) {
+  detail::AdmissionTiming timing(false, {});
   if (intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation) {
     return reject<CellAdmissionClaimDTO>(
         "manual claims are minted only by exact Kernel operation admission",
         "manual_operation_claim_requires_execute", ErrorCode::kInvalidRequest);
   }
-  std::optional<KernelCellAdmissionOwner::PreparedProgramResetStatus> reset_proof;
-  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
-    auto prepared = cell_admission_owner_->PrepareProgramResetStatus(
-        ProgramResetJournalReadPurpose::kAcquire, intent);
-    if (!prepared.ok()) return Result<CellAdmissionClaimDTO>::Err(prepared.error());
-    reset_proof.emplace(std::move(prepared).value());
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset && program_reset_status) {
+    // The run to clean up comes from the carried status, in memory (OD-139).
+    const auto run =
+        cell_admission_owner_->ProgramResetRunForCleanup(intent, *program_reset_status);
+    if (!run.ok()) return Result<CellAdmissionClaimDTO>::Err(run.error());
     // A preempted Runner task has already ended. Join its existing motion-free
     // cleanup before the whole-cell work check, without holding admission or
     // submission locks over participant calls. Actual in-flight work still
     // refuses this claim and remains available for a later explicit retry.
     const auto retired = retire_preempted_motion_operations();
     if (!retired.ok()) return Result<CellAdmissionClaimDTO>::Err(retired.error());
-    if (const auto run = cell_admission_owner_->ProgramResetRunForCleanup(intent, *reset_proof)) {
-      const auto rebuilt = retire_rebuilt_motion_operations_for_program_reset(*run);
+    if (run.value()) {
+      const auto rebuilt = retire_rebuilt_motion_operations_for_program_reset(*run.value());
       if (!rebuilt.ok()) return Result<CellAdmissionClaimDTO>::Err(rebuilt.error());
     }
   }
@@ -196,8 +166,6 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
     if (pending_program_run_admission_.has_value()) blocking.emplace_back("program_run_admission_pending");
     if (!active_operations_.empty()) blocking.emplace_back("operations_active");
     if (operation_control_reconfiguration_busy_locked()) blocking.emplace_back("operation_control_busy");
-    if (motion_admission_unreconciled_) blocking.emplace_back("motion_admission_unreconciled");
-    if (manager_liveness_motion_inhibited_) blocking.emplace_back("manager_liveness_inhibited");
     std::vector<std::string> busy_resources;
     for (const auto& slot : resource_slots_->snapshot()) {
       if (slot.state != ResourceSlotState::kFree || slot.owner.has_value()) {
@@ -217,7 +185,7 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
       std::vector<std::string> operations;
       for (const auto& [operation_id, operation] : active_operations_) {
         static_cast<void>(operation);
-        operations.push_back(operation_id.value());
+        operations.push_back(std::to_string(operation_id.value()));
       }
       auto rejected = reject<CellAdmissionClaimDTO>(
           intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset
@@ -235,15 +203,17 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
   }
-  auto acquired = reset_proof
-      ? cell_admission_owner_->AcquirePreparedProgramResetClaim(intent, *reset_proof)
+  auto acquired = program_reset_status
+      ? cell_admission_owner_->AcquireProgramResetClaim(intent, *program_reset_status)
       : cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+  bool fence_facts_changed = false;
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
     const auto refresh_start = detail::AdmissionTiming::Clock::now();
-    refresh_execution_claims();
+    fence_facts_changed = refresh_execution_claims();
     timing.record->refresh += detail::AdmissionTiming::Clock::now() - refresh_start;
   }
   admission_lock.unlock();
+  if (fence_facts_changed) execution_event_change_signal().Notify();
   return acquired;
 }
 
@@ -268,44 +238,43 @@ ResourceAddressedExecutionKernel::ReleaseTerminalApplyClaimsAfterSuccess(
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
-  detail::AdmissionTiming timing(true, release.request_id.value());
+  detail::AdmissionTiming timing(true, {});
   const auto wait_start = detail::AdmissionTiming::Clock::now();
   std::unique_lock admission_lock(*admission_mutex_);
   timing.record->admission_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto released = cell_admission_owner_->ReleaseCellAdmissionClaim(release);
+  bool fence_facts_changed = false;
   if (released.ok()) {
     const auto refresh_start = detail::AdmissionTiming::Clock::now();
-    refresh_execution_claims();
+    fence_facts_changed = refresh_execution_claims();
     timing.record->refresh += detail::AdmissionTiming::Clock::now() - refresh_start;
   }
   admission_lock.unlock();
+  if (fence_facts_changed) execution_event_change_signal().Notify();
   return released;
 }
 
-Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReconcileCellAdmissionClaims(
-    const CellAdmissionReconcileDTO& reconcile) {
-  std::unique_lock admission_lock(*admission_mutex_);
-  auto reconciled = cell_admission_owner_->ReconcileCellAdmissionClaims(reconcile);
-  if (reconciled.ok()) {
-    refresh_execution_claims();
-  }
-  admission_lock.unlock();
-  return reconciled;
-}
-
-void ResourceAddressedExecutionKernel::refresh_execution_claims() {
-  // Read actual remaining authority, not a pre-reconciliation request or a
-  // replayed receipt. Do not acquire the inner owner lock under state_mutex_.
+bool ResourceAddressedExecutionKernel::refresh_execution_claims() {
+  // Read actual remaining authority, not a replayed receipt. Do not acquire the inner owner lock under state_mutex_.
   const auto claim = cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kProgramCycle);
   auto manual = cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kManualOperation);
+  // The retired claim and its hold state are destroyed after state_lock,
+  // outside Stop's critical section.
   std::optional<ProgramCycleClaimRun> retired;
-  std::optional<ProgramRunStopFence> retired_fence;
+  bool fence_facts_changed = false;
   std::lock_guard state_lock(state_mutex_);
   manual_operation_claim_.swap(manual);
   if (!claim.has_value()) {
-    if (program_cycle_claim_run_) mark_motion_retry_run_end_locked(program_cycle_claim_run_->program_run_id);
-    retired = std::move(program_cycle_claim_run_);
-    program_cycle_claim_run_.reset();
+    // L4 claim retire: the claim and its hold state are dropped (Program
+    // Reset admits only with no resident operation, so nothing of the run
+    // is stopping and its uncontained marks went with its operations).
+    if (program_cycle_claim_run_) {
+      mark_motion_retry_run_end_locked(program_cycle_claim_run_->program_run_id);
+      retired = std::move(program_cycle_claim_run_);
+      program_cycle_claim_run_.reset();
+      ++hold_revision_;
+      fence_facts_changed = true;
+    }
   } else if (!program_cycle_claim_run_.has_value() ||
              program_cycle_claim_run_->claim_generation != claim->claim_generation) {
     // A new held Run changes dispatch authority immediately, but the previous
@@ -313,40 +282,37 @@ void ResourceAddressedExecutionKernel::refresh_execution_claims() {
     // Exact Run-bound consumers cannot borrow that predecessor occurrence.
     if (program_cycle_claim_run_) mark_motion_retry_run_end_locked(program_cycle_claim_run_->program_run_id);
     retired = std::move(program_cycle_claim_run_);
+    // A Program-cycle claim's owner transaction is its run number: the claim
+    // is admitted only equal to the starting cycle's run.
+    // L7: a new hold state (not frozen, nothing held) and the highest run
+    // started (PD-13 as decided).
     program_cycle_claim_run_ = ProgramCycleClaimRun{
-        ProgramRunId(claim->intent.owner_transaction_id), claim->claim_generation,
-        claim->intent.owner_epoch, claim->intent.program_cycle_evidence->applied_program_revision};
+        std::get<ProgramRunNumber>(*claim->intent.owner_transaction_id), claim->claim_generation,
+        claim->intent.program_cycle_evidence->applied_program_revision};
+    if (program_cycle_claim_run_->program_run_id.value() > highest_program_run_started_.value())
+      highest_program_run_started_ = program_cycle_claim_run_->program_run_id;
+    ++hold_revision_;
+    fence_facts_changed = true;  // the facts now describe the new claim run
   }
   // An exact still-held claim retains its immutable capture and all holds.
-  if (retired.has_value()) {
-    const auto fence = program_run_stop_fences_.find(retired->program_run_id);
-    if (fence != program_run_stop_fences_.end()) {
-      retired_fence = std::move(*fence);
-      program_run_stop_fences_.erase(fence);
-    }
-    stop_replay_ledger_.erase_if([&](const auto& row) {
-      const auto* selection = std::get_if<ProgramExecutionSelectionRequestDTO>(&row.intent);
-      return selection != nullptr && selection->program_run_id == retired->program_run_id;
-    });
-  }
-  // retired is destroyed after state_lock, outside Stop's critical section.
+  return fence_facts_changed;
 }
 
 Result<std::optional<CellAdmissionSettlementEvidenceDTO>>
 ResourceAddressedExecutionKernel::manual_operation_settlement_locked(
     const CellAdmissionClaimDTO& claim) const {
   using Evidence = std::optional<CellAdmissionSettlementEvidenceDTO>;
-  const bool predecessor = claim.intent.owner_epoch != config_.request_owner_epoch;
-  const OperationId operation_id(claim.intent.owner_transaction_id);
+  const auto parsed_operation_id = manual_claim_operation(claim.intent.owner_transaction_id);
+  if (!parsed_operation_id) {
+    return reject<Evidence>("manual claim names no operation number", "claim_identity_invalid",
+                            ErrorCode::kInvalidRequest);
+  }
+  const auto operation_id = *parsed_operation_id;
   if (pending_program_run_admission_.has_value() || active_operations_.contains(operation_id)) {
     return Result<Evidence>::Ok(std::nullopt);
   }
-  // A predecessor claim's authority ended with its owner epoch. Motion stays
-  // refused by motion_admission_unreconciled_ and the orphan slots until the
-  // cell settles, so the claim reconciles at once.
   const auto slots = resource_slots_->snapshot();
   for (const auto& resource : claim.intent.scope.resources) {
-    if (predecessor) break;
     const auto slot = std::find_if(slots.begin(), slots.end(),
                                    [&](const auto& row) { return row.resource_id == resource; });
     if (slot == slots.end() || slot->state != ResourceSlotState::kFree) {
@@ -356,19 +322,16 @@ ResourceAddressedExecutionKernel::manual_operation_settlement_locked(
   const auto operation =
       historical_operations_.find(operation_id);
   const bool no_effect = operation == historical_operations_.end();
-  // Absence is proof only within this still-live Kernel incarnation. Its
-  // admission guard runs after the pending Execute drains, and a held claim
-  // protects any accepted operation from diagnostic-history eviction.
-  // A successor never infers no effect from a cache miss. Its complete orphan
-  // inventory must first pass the existing fresh native settlement checks.
-  const auto kind = predecessor ? CellAdmissionSettlementKindDTO::kReconciled
-                    : no_effect ? CellAdmissionSettlementKindDTO::kProvenNoEffect
-                                : CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
+  // Absence is proof within this Kernel: its admission guard runs after the
+  // pending Execute drains, and a held claim protects any accepted operation
+  // from diagnostic-history eviction.
+  const auto kind = no_effect ? CellAdmissionSettlementKindDTO::kProvenNoEffect
+                              : CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
   using content_identity::CanonicalValue;
   const auto digest = content_identity::sha256_digest(
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
           {"schema", CanonicalValue("manyforge.manual_operation_settlement.v1")},
-          {"operation_id", CanonicalValue(operation_id.value())},
+          {"operation_id", CanonicalValue(std::to_string(operation_id.value()))},
           {"claim_generation", CanonicalValue(std::to_string(claim.claim_generation.value()))},
           {"settlement", CanonicalValue(std::string(to_string(kind)))},
           {"operation_revision",
@@ -384,8 +347,7 @@ ResourceAddressedExecutionKernel::manual_operation_settlement_locked(
 Result<void> ResourceAddressedExecutionKernel::validate_manual_operation_settlement(
     const CellAdmissionClaimDTO& claim, const CellAdmissionClaimReleaseDTO& release) const {
   std::lock_guard state_lock(state_mutex_);
-  if (!manual_operation_claim_.has_value() || *manual_operation_claim_ != claim ||
-      claim.intent.owner_epoch != config_.request_owner_epoch) {
+  if (!manual_operation_claim_.has_value() || *manual_operation_claim_ != claim) {
     return reject<void>("manual claim differs from current Kernel authority",
                         "manual_operation_claim_stale");
   }
@@ -398,58 +360,19 @@ Result<void> ResourceAddressedExecutionKernel::validate_manual_operation_settlem
   return Result<void>::Ok();
 }
 
-Result<CellAdmissionReconcileValidationDTO>
-ResourceAddressedExecutionKernel::validate_manual_owner_reconciliation(
-    const std::vector<CellAdmissionClaimDTO>& held,
-    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current,
-    const CellAdmissionReconcileDTO& request) const {
-  constexpr auto role = CellAdmissionOwnerRoleDTO::kManualOperationOwner;
-  auto expected = current;
-  const auto owner = std::find_if(expected.begin(), expected.end(),
-                                  [](const auto& row) { return row.owner_role == role; });
-  if (owner == expected.end() || owner->owner_epoch == config_.request_owner_epoch)
-    return reject<CellAdmissionReconcileValidationDTO>("manual predecessor owner is not exact",
-                                                       "manual_owner_reconciliation_not_exact");
-  owner->owner_epoch = config_.request_owner_epoch;
-  const auto digest =
-      CellAdmissionOwnerEpochReconciliationEvidenceDigest(role, config_.request_owner_epoch);
-  if (!digest.ok() || request.kernel_owner_epoch != config_.request_owner_epoch ||
-      request.current_owner_epochs != expected || request.retained_claims != held ||
-      request.reconciliation_evidence_digest != digest.value())
-    return reject<CellAdmissionReconcileValidationDTO>(
-        "manual reconciliation changes unrelated authority",
-        "manual_owner_reconciliation_not_exact");
-  CellAdmissionReconcileValidationDTO validation{std::move(expected), {}};
-  std::lock_guard state_lock(state_mutex_);
-  for (const auto& claim : held) {
-    if (claim.intent.owner_role != role) continue;
-    if (claim.intent.claim_kind != CellAdmissionClaimKindDTO::kManualOperation ||
-        !manual_operation_claim_.has_value() || *manual_operation_claim_ != claim)
-      return reject<CellAdmissionReconcileValidationDTO>(
-          "manual claim differs from Kernel authority", "manual_operation_claim_stale");
-    const auto settlement = manual_operation_settlement_locked(claim);
-    if (!settlement.ok())
-      return Result<CellAdmissionReconcileValidationDTO>::Err(settlement.error());
-    if (!settlement.value().has_value() ||
-        settlement.value()->settlement_kind != CellAdmissionSettlementKindDTO::kReconciled)
-      return reject<CellAdmissionReconcileValidationDTO>("predecessor resources are not reconciled",
-                                                         "manual_operation_settlement_not_proven");
-    validation.settlements.push_back({claim, role, config_.request_owner_epoch,
-                                      CellAdmissionSettlementKindDTO::kReconciled, digest.value()});
-  }
-  return Result<CellAdmissionReconcileValidationDTO>::Ok(std::move(validation));
-}
-
 Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admission() {
   std::unique_lock submission_lock(submission_mutex_, std::try_to_lock);
   if (!submission_lock.owns_lock()) return Result<void>::Ok();
   std::optional<OperationStateDTO> terminal;
+  RequestKey settlement_key;
   std::vector<std::pair<IResolvedParticipantExecutionEngine*, std::string>> cancelled_commands;
   {
     std::lock_guard state_lock(state_mutex_);
     if (manual_operation_claim_.has_value()) {
-      const auto* operation = find_active_operation_locked(
-          OperationId(manual_operation_claim_->intent.owner_transaction_id));
+      const auto manual_operation_id =
+          manual_claim_operation(manual_operation_claim_->intent.owner_transaction_id);
+      auto* operation =
+          manual_operation_id ? find_active_operation_locked(*manual_operation_id) : nullptr;
       if (operation != nullptr &&
           (operation->state.state == OperationStateKind::kCompleted ||
            operation->state.state == OperationStateKind::kStopped ||
@@ -457,6 +380,8 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
         // This is only a candidate. Clean-terminal eligibility is decided
         // once, inside apply_control's operation commit/state guard.
         terminal = operation->state;
+        settlement_key = owned_kernel_request_key(operation->manual_settlement_key,
+                                                  operation->state.operation_revision);
         if (terminal->state == OperationStateKind::kStopped) {
           for (const auto& participant : operation->participants)
             if (participant.payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
@@ -473,13 +398,8 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
   for (const auto& [engine, target] : cancelled_commands)
     if (engine->get_gripper_status(target).cancellation_pending) return Result<void>::Ok();
   if (terminal.has_value()) {
-    const auto request_id = content_identity::sha256_digest(
-        config_.request_owner_epoch.value() + "\nmanual-settlement\n" +
-        terminal->operation_id.value() + "\n" +
-        std::to_string(terminal->operation_revision.value()));
     const OperationControlRequestDTO request{
-        {RequestId(request_id), config_.request_owner_epoch, "kernel.manual_settlement",
-         terminal->operation_id.value()},
+        {settlement_key, "kernel.manual_settlement"},
         terminal->operation_id,
         terminal->operation_revision,
         "retire owner-confirmed clean terminal manual operation",
@@ -508,14 +428,6 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
 
 Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admission_locked() {
   std::lock_guard admission_lock(*admission_mutex_);
-  const auto replacement = cell_admission_owner_->manual_owner_reconciliation_request();
-  if (!replacement.ok()) return Result<void>::Err(replacement.error());
-  if (replacement.value().has_value()) {
-    const auto reconciled =
-        cell_admission_owner_->ReconcileCellAdmissionClaims(*replacement.value());
-    if (!reconciled.ok()) return Result<void>::Err(reconciled.error());
-    refresh_execution_claims();
-  }
   std::optional<CellAdmissionClaimDTO> claim;
   std::optional<CellAdmissionSettlementEvidenceDTO> evidence;
   {
@@ -528,11 +440,14 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
   }
   if (!evidence.has_value()) return Result<void>::Ok();
   const auto released = cell_admission_owner_->ReleaseCellAdmissionClaim(
-      {claim->intent.owner_role, claim->intent.owner_epoch, claim->intent.owner_transaction_id,
-       claim->intent.request_id, claim->intent.request_payload_digest,
+      {claim->intent.owner_role, claim->intent.owner_transaction_id,
+       claim->intent.request_key,
        claim->acquired_admission_generation, claim->claim_generation, *evidence});
   if (!released.ok()) return Result<void>::Err(released.error());
-  refresh_execution_claims();
+  // A manual claim release leaves the Program claim as recorded: every
+  // Program-cycle claim change refreshes itself (Acquire/Release above), so no
+  // Program-run fence fact changes here.
+  static_cast<void>(refresh_execution_claims());
   return Result<void>::Ok();
 }
 
@@ -543,7 +458,8 @@ ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaim(
 }
 
 std::optional<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::ReadHeldCellAdmissionClaim(
-    const CellAdmissionClaimKindDTO kind, const std::string& owner_transaction_id) const {
+    const CellAdmissionClaimKindDTO kind,
+    const CellAdmissionOwnerTransactionId& owner_transaction_id) const {
   return cell_admission_owner_->held_claim(kind, owner_transaction_id);
 }
 
@@ -560,24 +476,18 @@ ResourceAddressedExecutionKernel::GetCellAdmissionRecoveryReceipt(
 
 Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) const {
-  auto proof = cell_admission_owner_->PrepareProgramResetSceneAuthorization(authorization);
-  if (!proof.ok()) return Result<void>::Err(proof.error());
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->ValidatePreparedProgramResetSceneAuthorization(authorization,
-                                                                            proof.value());
+  return cell_admission_owner_->ValidateProgramResetSceneAuthorization(authorization);
 }
 
 Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetPositionAuthorization(
     const ProgramResetPositionAuthorizationDTO& authorization) const {
-  auto proof = cell_admission_owner_->PrepareProgramResetPositionAuthorization(authorization);
-  if (!proof.ok()) return Result<void>::Err(proof.error());
   std::lock_guard submission_lock(submission_mutex_);
   std::lock_guard admission_lock(*admission_mutex_);
   {
     std::lock_guard state_lock(state_mutex_);
     if (pending_program_run_admission_ || !active_operations_.empty() ||
-        operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
-        manager_liveness_motion_inhibited_)
+        operation_control_reconfiguration_busy_locked())
       return reject<void>("Program Reset position effect requires settled work",
                           "program_reset_effects_not_settled");
     for (const auto& slot : resource_slots_->snapshot()) {
@@ -585,9 +495,18 @@ Result<void> ResourceAddressedExecutionKernel::ValidateProgramResetPositionAutho
         return reject<void>("Program Reset position effect requires free resources",
                             "program_reset_resources_not_settled");
     }
+    // OD-215 (decided 1.i): the move back is motion; refused while the disk
+    // cannot keep ManyForge's records. A Reset without it is unaffected.
+    if (auto refusal = program_reset_position_disk_refusal_locked())
+      return Result<void>::Err(std::move(*refusal));
   }
-  return cell_admission_owner_->ValidatePreparedProgramResetPositionAuthorization(authorization,
-                                                                                proof.value());
+  return cell_admission_owner_->ValidateProgramResetPositionAuthorization(authorization);
+}
+
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::program_reset_position_disk_refusal()
+    const {
+  std::lock_guard state_lock(state_mutex_);
+  return program_reset_position_disk_refusal_locked();
 }
 
 Result<void> ResourceAddressedExecutionKernel::notify_io_rule_evidence_processing(
@@ -613,11 +532,7 @@ Result<void> ResourceAddressedExecutionKernel::Publish(
     const ScopeExit notify([&] {
       notification = notify_io_rule_evidence_processing(affected_service);
     });
-    // Outside `manager_liveness_mutex_`: a publication blocked in the owner
-    // must not hold off the receiver's loss containment (`LatchAndContain`).
-    auto published = cell_admission_owner_->Publish(observation, &affected_service);
-    refresh_manager_liveness_inhibition();
-    return published;
+    return cell_admission_owner_->Publish(observation, &affected_service);
   }();
   if (!notification.ok()) {
     if (result.ok()) return notification;
@@ -640,9 +555,8 @@ ResourceAddressedExecutionKernel::PublishOperatorAlarmAttention(
               "operator-alarm attention projection names another cell",
               "operator_alarm_attention_cell_mismatch"));
   }
-  // Single-host precondition: owner incarnations are
-  // CLOCK_BOOTTIME stamps, comparable only within the Kernel's own host boot.
-  // A projection from another host or boot is refused, never compared.
+  // Single-host precondition: a projection from another host or boot is
+  // refused.
   if (config_.operator_alarm_attention.has_value() &&
       snapshot.owner_host_boot_id != config_.operator_alarm_attention->host_boot_id) {
     return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
@@ -653,52 +567,30 @@ ResourceAddressedExecutionKernel::PublishOperatorAlarmAttention(
   // A small bounded copy under the state lock that admission reads; Stop
   // acceptance never waits on any I/O here.
   //
-  // Fencing contract. Owner epochs are ordered by their
-  // incarnation alone, so the Kernel keeps no list of replaced epochs: a new
-  // epoch is accepted only with a strictly greater incarnation than the
-  // retained one; an equal incarnation under another epoch, or a smaller one,
-  // is refused. Within one epoch the incarnation is fixed, generations are
-  // monotonic, and one generation names exactly one content: identical
-  // content is the heartbeat that refreshes the receipt time, while different
-  // content under the same generation is refused.
+  // Fencing contract. The one Headless sender lives exactly as long as this
+  // Kernel (one application start), so its publications form one series:
+  // generations are monotonic, and one generation names exactly one content:
+  // identical content is the heartbeat that refreshes the receipt time, while
+  // different content under the same generation is refused.
   std::lock_guard state_lock(state_mutex_);
   if (operator_alarm_attention_.has_value()) {
     const auto& retained = operator_alarm_attention_->snapshot;
-    if (retained.owner_epoch == snapshot.owner_epoch) {
-      if (snapshot.owner_host_boot_id != retained.owner_host_boot_id ||
-          snapshot.owner_incarnation_us != retained.owner_incarnation_us) {
-        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
-            error("operator_alarm_attention_conflict",
-                  "operator-alarm owner epoch was republished with another incarnation",
-                  "operator_alarm_attention_owner_incarnation_conflict"));
-      }
-      if (snapshot.generation < retained.generation) {
-        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
-            error("operator_alarm_attention_stale",
-                  "operator-alarm attention generation precedes the retained one",
-                  "operator_alarm_attention_generation_stale"));
-      }
-      if (snapshot.generation == retained.generation && snapshot != retained) {
-        return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
-            error("operator_alarm_attention_conflict",
-                  "operator-alarm attention generation was republished with different content",
-                  "operator_alarm_attention_generation_conflict"));
-      }
-    } else if (snapshot.owner_incarnation_us == retained.owner_incarnation_us) {
-      return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
-          error("operator_alarm_attention_conflict",
-                "another operator-alarm owner epoch claims the retained incarnation",
-                "operator_alarm_attention_owner_incarnation_conflict"));
-    } else if (snapshot.owner_incarnation_us < retained.owner_incarnation_us) {
+    if (snapshot.generation < retained.generation) {
       return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
           error("operator_alarm_attention_stale",
-                "operator-alarm attention names an older owner incarnation",
-                "operator_alarm_attention_owner_incarnation_stale"));
+                "operator-alarm attention generation precedes the retained one",
+                "operator_alarm_attention_generation_stale"));
+    }
+    if (snapshot.generation == retained.generation && snapshot != retained) {
+      return Result<OperatorAlarmAttentionAcceptedDTO>::Err(
+          error("operator_alarm_attention_conflict",
+                "operator-alarm attention generation was republished with different content",
+                "operator_alarm_attention_generation_conflict"));
     }
   }
   operator_alarm_attention_ = RetainedOperatorAlarmAttentionDTO{snapshot, clock_.now()};
   return Result<OperatorAlarmAttentionAcceptedDTO>::Ok(
-      OperatorAlarmAttentionAcceptedDTO{snapshot.owner_epoch, snapshot.generation});
+      OperatorAlarmAttentionAcceptedDTO{snapshot.generation});
 }
 
 std::optional<ErrorDTO> ResourceAddressedExecutionKernel::operator_alarm_attention_refusal_locked(
@@ -714,10 +606,27 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::operator_alarm_attenti
       active_configuration, clock_.now(), reserved_resources);
 }
 
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::disk_cannot_keep_records_refusal_locked(
+    const std::string_view reason, std::string message) const {
+  if (!config_.operator_alarm_attention.has_value()) return std::nullopt;
+  return evaluate_disk_cannot_keep_records_refusal(operator_alarm_attention_,
+                                                   *config_.operator_alarm_attention,
+                                                   config_.cell_id, clock_.now(), reason,
+                                                   std::move(message));
+}
+
+std::optional<ErrorDTO>
+ResourceAddressedExecutionKernel::program_reset_position_disk_refusal_locked() const {
+  return disk_cannot_keep_records_refusal_locked(
+      kResetPositionDiskCannotKeepRecordsReason,
+      "the Reset's move back to the start position is refused while the disk "
+      "cannot keep ManyForge's records");
+}
+
 std::vector<ResourceId> ResourceAddressedExecutionKernel::program_selection_resources_locked(
     const std::vector<std::uint32_t>& node_indices) const {
   std::set<ResourceId> resources;
-  if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+  if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture ||
       !program_cycle_claim_run_->capture->table || !program_cycle_claim_run_->capture->binding) {
     return {};
   }
@@ -742,12 +651,9 @@ std::vector<ResourceId> ResourceAddressedExecutionKernel::program_selection_reso
 Result<void> ResourceAddressedExecutionKernel::check_program_node_motion_attention(
     const ProgramNodeMotionAttentionCheckDTO& request) const {
   std::lock_guard state_lock(state_mutex_);
-  if (request.request_context.request_owner_epoch != config_.request_owner_epoch ||
-      !program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+  if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture ||
       !program_cycle_claim_run_->capture->table ||
-      request.program_run_id != program_cycle_claim_run_->program_run_id ||
-      request.program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
-      request.claim_generation != program_cycle_claim_run_->claim_generation) {
+      request.program_run_id != program_cycle_claim_run_->program_run_id) {
     return reject<void>("Program node check does not name the current captured owner/claim",
                         "program_selection_stale", ErrorCode::kInvalidStateTransition);
   }
@@ -767,7 +673,7 @@ Result<void> ResourceAddressedExecutionKernel::check_program_node_motion_attenti
 }
 
 void ResourceAddressedExecutionKernel::retire_program_io_watches_locked(
-    const ProgramRunId& run_id) {
+    const ProgramRunNumber& run_id) {
   if (!program_cycle_claim_run_ || program_cycle_claim_run_->program_run_id != run_id ||
       program_cycle_claim_run_->io_watches_retired)
     return;
@@ -778,7 +684,7 @@ void ResourceAddressedExecutionKernel::retire_program_io_watches_locked(
   if (io_signal_service_) {
     // The installed service must accept an exact owner/run previously accepted
     // by RegisterLevelWatch. An over-bound identity cannot own any such watch.
-    (void)io_signal_service_->ReleaseRunWatches(run.program_runner_owner_epoch, run.program_run_id);
+    (void)io_signal_service_->ReleaseRunWatches(run.program_run_id);
   }
 }
 
@@ -817,10 +723,9 @@ Result<void> ResourceAddressedExecutionKernel::InstallProgramIoSignalService(
 
 Result<void> ResourceAddressedExecutionKernel::validate_current_program_io_run_scope_locked(
     const ProgramRunMockSimulationScopeDTO& request) const {
-  if (request.request_owner_epoch != config_.request_owner_epoch || !program_cycle_claim_run_ ||
+  if (!program_cycle_claim_run_ ||
       !program_cycle_claim_run_->capture || !program_cycle_claim_run_->capture->binding ||
       !program_cycle_claim_run_->capture->table ||
-      request.program_runner_owner_epoch != program_cycle_claim_run_->program_runner_owner_epoch ||
       request.program_run_id != program_cycle_claim_run_->program_run_id ||
       request.claim_generation != program_cycle_claim_run_->claim_generation ||
       request.program_binding_id != program_cycle_claim_run_->capture->program_binding_id) {
@@ -833,8 +738,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_current_program_io_run_s
 Result<void> ResourceAddressedExecutionKernel::validate_current_program_io_node_scope_locked(
     const ProgramIoWatchScopeReleaseRequestDTO& request) const {
   const auto current = validate_current_program_io_run_scope_locked(
-      {request.request_owner_epoch, request.program_binding_id, request.program_runner_owner_epoch,
-       request.claim_generation, request.program_run_id});
+      {request.program_binding_id, request.claim_generation, request.program_run_id});
   if (!current.ok()) return current;
   if (!valid_program_node_execution_scope(request.node)) {
     return reject<void>("I/O watch node scope is malformed", "io_watch_scope_invalid",
@@ -900,8 +804,7 @@ Result<void> ResourceAddressedExecutionKernel::EndProgramNodeMockSimulation(
     const ProgramNodeMockSimulationScopeDTO& scope) {
   std::lock_guard state_lock(state_mutex_);
   const auto current = validate_current_program_io_node_scope_locked(
-      {scope.request_owner_epoch, scope.program_binding_id, scope.program_runner_owner_epoch,
-       scope.claim_generation, scope.program_run_id, scope.node});
+      {scope.program_binding_id, scope.claim_generation, scope.program_run_id, scope.node});
   if (!current.ok()) return current;
   if (scope.node_start_index == 0U)
     return reject<void>("Mock simulation end is unnumbered", "mock_simulation_invalid", ErrorCode::kInvalidRequest);
@@ -912,8 +815,7 @@ Result<void> ResourceAddressedExecutionKernel::EndProgramNodeMockSimulation(
     // Only this already owner-retired, still-exact captured Run can obtain
     // its cleanup receipt here. Retry the SAME service with retained IDs:
     // the retired flag alone is not proof of successful cancellation.
-    return io_signal_service_->ReleaseRunWatches(
-        run.program_runner_owner_epoch, run.program_run_id);
+    return io_signal_service_->ReleaseRunWatches(run.program_run_id);
   }
   return io_signal_service_->EndProgramNodeMockSimulation(scope, run.capture->table->nodes.size());
 }
@@ -927,8 +829,7 @@ ResourceAddressedExecutionKernel::StartProgramNodeMockSimulation(
   std::lock_guard state_lock(state_mutex_);
   const auto& scope = request.scope;
   const auto current = validate_current_program_io_node_scope_locked(
-      {scope.request_owner_epoch, scope.program_binding_id, scope.program_runner_owner_epoch,
-       scope.claim_generation, scope.program_run_id, scope.node});
+      {scope.program_binding_id, scope.claim_generation, scope.program_run_id, scope.node});
   if (!current.ok()) return Reply::Err(current.error());
   if (scope.node_start_index == 0U || request.signals.empty())
     return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
@@ -985,8 +886,7 @@ ResourceAddressedExecutionKernel::StartProgramNodeMockSimulation(
     if (!observation.ok()) return Reply::Err(observation.error());
     const auto digest = ComputeIoSignalDescriptorDigest(observation.value().descriptor);
     if (!digest.ok()) return Reply::Err(digest.error());
-    if (observation.value().cursor.owner_epoch != config_.request_owner_epoch ||
-        observation.value().cursor.catalog_generation == 0U || digest.value() != signal->signal_descriptor_digest)
+    if (observation.value().cursor.catalog_generation == 0U || digest.value() != signal->signal_descriptor_digest)
       return reject<ProgramNodeMockSimulationAcknowledgementDTO>(
           "Mock simulation source differs from the sealed binding", "io_signal_descriptor_stale", ErrorCode::kStaleGeneration);
     resolved.push_back({id, digest.value(), observation.value().cursor.catalog_generation,
@@ -999,8 +899,7 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
     const ProgramIoWatchRequestDTO& request) {
   std::lock_guard state_lock(state_mutex_);
   const auto scope_valid = validate_program_io_watch_scope_locked(
-      {request.request_owner_epoch, request.program_binding_id, request.program_runner_owner_epoch,
-       request.claim_generation, request.program_run_id, request.node});
+      {request.program_binding_id, request.claim_generation, request.program_run_id, request.node});
   if (!scope_valid.ok()) return Result<IoWatchRegistrationDTO>::Err(scope_valid.error());
   if (program_cycle_claim_run_->io_watches_retired) {
     return reject<IoWatchRegistrationDTO>("Program watch registration has retired",
@@ -1079,8 +978,7 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
   if (!observation.ok()) return Result<IoWatchRegistrationDTO>::Err(observation.error());
   const auto digest = ComputeIoSignalDescriptorDigest(observation.value().descriptor);
   if (!digest.ok()) return Result<IoWatchRegistrationDTO>::Err(digest.error());
-  if (observation.value().cursor.owner_epoch != config_.request_owner_epoch ||
-      digest.value() != signal->signal_descriptor_digest) {
+  if (digest.value() != signal->signal_descriptor_digest) {
     return reject<IoWatchRegistrationDTO>(
         "Installed I/O descriptor differs from the sealed binding", "io_signal_descriptor_stale",
         ErrorCode::kStaleGeneration);
@@ -1095,7 +993,7 @@ Result<IoWatchRegistrationDTO> ResourceAddressedExecutionKernel::RegisterProgram
   // answer. A known failed registration has no effect and releases its slot.
   run.io_watch_scopes.push_back({request.node, std::nullopt});
   const auto registered = io_signal_service_->RegisterLevelWatch(
-      {{request.program_runner_owner_epoch, request.program_run_id, request.node},
+      {{request.program_run_id, request.node},
        id,
        request.expected_value});
   if (registered.ok()) {
@@ -1174,7 +1072,7 @@ Result<void> ResourceAddressedExecutionKernel::ReleaseProgramIoWatchScope(
     }
   }
   const auto released = io_signal_service_->ReleaseNodeWatches(
-      {request.program_runner_owner_epoch, request.program_run_id, request.node});
+      {request.program_run_id, request.node});
   if (!released.ok()) return released;
   if (exhausted) {
     // Report the actual fault/fence instead of a false clean-cancel ACK.
@@ -1188,143 +1086,34 @@ Result<void> ResourceAddressedExecutionKernel::ReleaseProgramIoWatchScope(
   return Result<void>::Ok();
 }
 
-void ResourceAddressedExecutionKernel::LatchAndContain(
-    const ManagerLivenessLossIntentDTO& intent) noexcept {
-  std::shared_ptr<IIoSignalService> affected_service;
-  // This guard runs after mandatory containment has been attempted and every
-  // owner/state scope has unwound, including an invalidation/storage error.
-  const ScopeExit notify([&] {
-    try {
-      static_cast<void>(notify_io_rule_evidence_processing(affected_service));
-    } catch (...) {
-      // The void fail-safe boundary cannot report queue allocation failure;
-      // actual source unavailability and mandatory containment remain intact.
-    }
-  });
-  try {
-    std::optional<ErrorDTO> source_invalidation_error;
-    std::unique_lock liveness_lock(manager_liveness_mutex_);
-    if (!cell_admission_owner_->LatchManagerLivenessLoss(
-            intent, &source_invalidation_error, &affected_service)) {
-      return;
-    }
-    StopGeneration expected_stop_generation(0U);
-    {
-      std::lock_guard state_lock(state_mutex_);
-      // This mirrors the owner's loss and is deliberately set before Stop
-      // I/O; it lifts when the Manager is alive again (readiness reason
-      // `manager_unavailable` meanwhile).
-      manager_liveness_motion_inhibited_ = true;
-      // The owner hook already invalidated the exact source before unlocking.
-      // A failed loss append stays visible in Source.error/rule loss evidence;
-      // it creates no forensic record or proof and cannot suppress Full Stop.
-      expected_stop_generation = cell_stop_generation_;
-    }
-    liveness_lock.unlock();
-    const auto material = config_.request_owner_epoch.value() + "\nmanager-liveness-loss\n" +
-                          intent.cell_id.value() + "\n" + intent.receiver_runtime_unit_id.value() +
-                          "\n" + intent.receiver_runtime_epoch.value() + "\n" +
-                          std::to_string(intent.receiver_status_sequence);
-    FullStopIntentDTO containment{
-        PublicRequestContextDTO{RequestId(manyforge::content_identity::sha256_digest(material)),
-                                config_.request_owner_epoch, "kernel.manager_liveness",
-                                intent.receiver_runtime_unit_id.value()},
-        expected_stop_generation,
-        RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
-                              std::nullopt}};
-    auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)});
-    if (!stopped.ok()) {
-      std::lock_guard state_lock(state_mutex_);
-      manager_liveness_motion_inhibited_ = true;
-    }
-  } catch (...) {
-    try {
-      std::lock_guard state_lock(state_mutex_);
-      manager_liveness_motion_inhibited_ = true;
-    } catch (...) {
-    }
-  }
-}
-
 void ResourceAddressedExecutionKernel::ContainInternalFault(
     const std::string_view reason_code) noexcept {
-  bool claimed = false;
-  bool contained = false;
-  std::string stop_error;
   try {
-    StopGeneration expected_stop_generation(0U);
     {
       std::lock_guard state_lock(state_mutex_);
       // One fault per runtime: a repeating throw only counts, so it requests
-      // no further Full Stop (no journal growth per event).
+      // no further Halt (no journal growth per event).
       if (internal_fault_) {
         ++internal_fault_->later_count;
         return;
       }
-      internal_fault_ = KernelInternalFaultDTO{config_.request_owner_epoch,
-                                               std::string(reason_code), false, std::nullopt, 0U};
-      claimed = true;
-      expected_stop_generation = cell_stop_generation_;
+      internal_fault_ = KernelInternalFaultDTO{std::string(reason_code), 0U};
     }
-    const auto material = config_.request_owner_epoch.value() + "\ninternal-fault\n" +
-                          std::string(reason_code) + "\n" +
-                          std::to_string(expected_stop_generation.value());
-    FullStopIntentDTO containment{
-        PublicRequestContextDTO{RequestId(manyforge::content_identity::sha256_digest(material)),
-                                config_.request_owner_epoch, "kernel.internal_fault",
-                                std::string(reason_code)},
-        expected_stop_generation,
-        RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
-                              std::nullopt}};
-    // A resident Stop is joined. The Stop fence revokes the lookahead permits
-    // of every active motion participant (an idle cell has none).
-    const auto accepted = accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)});
-    contained = accepted.ok();
-    if (!contained) stop_error = accepted.error().details.contains("reason")
-                                     ? accepted.error().details.at("reason")
-                                     : accepted.error().code;
+    // S11: the internal fault is a Halt (APPROVED): Stop all's hold and
+    // scope, the claimed run frozen; operator class, internal transport. A
+    // Stop is never refused.
+    StopRequest request;
+    request.request_key = mint_kernel_request_key();
+    request.kind = StopKind::kInternalFault;
+    request.selector = StopSelectorKind::kCell;
+    request.source_label = "kernel.internal_fault";
+    request.reason = reason_code;
+    request.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+    (void)submit_stop(request);
   } catch (...) {
-    stop_error = "containment_stop_exception";
   }
-  // The fault record, its runtime-fault fact and its alarm name the outcome.
-  if (claimed) {
-    try {
-      std::lock_guard state_lock(state_mutex_);
-      internal_fault_->stop_accepted = contained;
-      if (!contained) internal_fault_->stop_refusal_code = stop_error;
-    } catch (...) {
-    }
-  }
-  (void)std::fprintf(stderr, "manyforge_fault code=%.*s state=%s%s%s\n",
-                     static_cast<int>(reason_code.size()), reason_code.data(),
-                     contained ? "contained" : "containment_failed",
-                     contained ? "" : " error=", stop_error.c_str());
-}
-
-Result<void> ResourceAddressedExecutionKernel::PublishComponentStreamHold(
-    const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
-    const bool cell_wide) {
-  // Same order as readiness publication: readers hold either mutex.
-  std::lock_guard admission_lock(*admission_mutex_);
-  std::lock_guard state_lock(state_mutex_);
-  component_stream_holds_.erase(component);
-  cell_stream_holds_.erase(component);
-  if (hold) {
-    (cell_wide ? cell_stream_holds_ : component_stream_holds_)
-        .insert_or_assign(component, *hold);
-  }
-  return Result<void>::Ok();
-}
-
-// The Kernel's mirror of the owner's Manager-liveness loss (derived: no
-// owner call under the state lock). `manager_liveness_mutex_` makes the read
-// and the write one step against `LatchAndContain`, so a stale read never
-// overwrites a newer loss.
-void ResourceAddressedExecutionKernel::refresh_manager_liveness_inhibition() {
-  std::lock_guard liveness_lock(manager_liveness_mutex_);
-  const bool lost = cell_admission_owner_->manager_liveness_lost();
-  std::lock_guard state_lock(state_mutex_);
-  manager_liveness_motion_inhibited_ = lost;
+  (void)std::fprintf(stderr, "manyforge_fault code=%.*s state=contained\n",
+                     static_cast<int>(reason_code.size()), reason_code.data());
 }
 
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReplaceManagerLivenessRequiredSet(
@@ -1335,10 +1124,8 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReplaceManagerLi
     const ScopeExit notify([&] {
       notification = notify_io_rule_evidence_processing(affected_service);
     });
-    auto replaced =
-        cell_admission_owner_->ReplaceManagerLivenessRequiredSet(required_set, &affected_service);
-    refresh_manager_liveness_inhibition();
-    return replaced;
+    return cell_admission_owner_->ReplaceManagerLivenessRequiredSet(required_set,
+                                                                    &affected_service);
   }();
   if (!notification.ok()) {
     if (result.ok()) return Result<AuthoringAdmissionDTO>::Err(notification.error());

@@ -57,11 +57,10 @@ NOT_RUNNABLE = {
     "mock_ur5_vision_bin_pick",
     "mock_ur5_vision_pose_pick",
 }
-ACTIVE_RUN = {"starting", "running", "intervention_required", "stopping", "full_stopping"}
+ACTIVE_RUN = {"starting", "running", "intervention_required", "stopping", "halting"}
 
 BASE = "http://127.0.0.1:3000"
 HEADLESS = "http://127.0.0.1:9010"
-EPOCH = "load-soak-" + uuid.uuid4().hex[:12]
 
 
 class StepFailed(Exception):
@@ -103,7 +102,10 @@ def rid(prefix: str) -> str:
 
 
 def err(js: Any) -> Any:
-    """The typed error of a response: {code, message} where present."""
+    """The typed error of a response: {code, message} where present; of an
+    ended command row (OD-214): its end's {outcome, code, details}."""
+    if isinstance(js, dict) and isinstance(js.get("end"), dict):
+        return {k: js["end"].get(k) for k in ("outcome", "code", "details")}
     if isinstance(js, dict) and isinstance(js.get("error"), dict):
         return js["error"]
     d = js.get("detail", js) if isinstance(js, dict) else js
@@ -113,9 +115,46 @@ def err(js: Any) -> Any:
 
 
 def attribution(prefix: str) -> dict[str, Any]:
-    r = rid(prefix)
-    return {"request_id": r, "request_owner_epoch": EPOCH, "source_label": "operator_ui",
-            "correlation_id": r}
+    # The request context is `{request_key, source_label}`; the key is the
+    # client's 32-hex HTTP key (Headless forms the owned key from it).
+    del prefix
+    return {"request_key": uuid.uuid4().hex, "source_label": "operator_ui"}
+
+
+def command(path: str, body: dict[str, Any], status_path: str, member: str,
+            timeout: float) -> tuple[int, Any, Any]:
+    """Send one command answered at acceptance with its row (OD-214) and
+    follow the row (same ``request_key``) in ``status_path``'s ``member``
+    to its end. Returns ``(http, ended row, status that showed it)``, or
+    ``(http, reply, None)`` for a refusal before acceptance."""
+    st, js = post(path, body)
+    if st != 200 or not isinstance(js, dict) or not isinstance(js.get("command"), dict):
+        return st, js, None
+    row = js["command"]
+    t0 = time.time()
+    while True:
+        sst, status = get(status_path)
+        rows = status.get(member) if sst == 200 and isinstance(status, dict) else None
+        if isinstance(rows, dict):
+            found = next((r for r in (rows.get("in_progress"), *(rows.get("ended") or ()))
+                          if isinstance(r, dict) and r.get("request_key") == row["request_key"]), None)
+            if found is not None:
+                row = found
+                if row.get("end") is not None:
+                    return st, row, status
+        if time.time() - t0 > timeout:
+            raise StepFailed(f"{row.get('kind')}_end", {"timeout_s": timeout, "row": row,
+                                                        "status_http": sst})
+        time.sleep(0.2)
+
+
+def runner_command(path: str, body: dict[str, Any], timeout: float = 120) -> tuple[int, Any, Any]:
+    """A Program runner command, followed in the cycle status."""
+    return command(path, body, "/api/cycle/status", "runner_commands", timeout)
+
+
+def succeeded(st: int, row: Any) -> bool:
+    return st == 200 and isinstance(row, dict) and (row.get("end") or {}).get("outcome") == "succeeded"
 
 
 # ---------------------------------------------------------------- cell steps
@@ -137,28 +176,37 @@ def snapshot() -> dict[str, Any]:
     return out
 
 
+def apply_command(path: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+    """Apply, Revert, Load or New (OD-214): answered at acceptance, the row
+    followed in the Deployment workspace's ``apply_commands`` to its end."""
+    st, js, _ = command(path, {**body, "request_key": uuid.uuid4().hex},
+                        "/api/deployment/workspace", "apply_commands", timeout)
+    return st, js
+
+
 def load_outcome(step: str, st: int, js: Any) -> None:
-    if st == 200 and isinstance(js, dict) and js.get("outcome") == "succeeded":
+    """``js`` is the ended Apply-level row (or the refusal before acceptance)."""
+    if succeeded(st, js):
         return
-    failed = []
-    if isinstance(js, dict):
-        failed = [{k: c.get(k) for k in ("component_id", "outcome", "error", "disposition")}
-                  for c in js.get("components", []) if c.get("outcome") not in (None, "succeeded")]
-    raise StepFailed(step, {"http": st, "outcome": js.get("outcome") if isinstance(js, dict) else None,
+    end = js.get("end") if isinstance(js, dict) and isinstance(js.get("end"), dict) else {}
+    failed = [{k: c.get(k) for k in ("component_id", "outcome", "error", "disposition")}
+              for c in (end.get("details") or {}).get("components", [])
+              if c.get("outcome") not in (None, "succeeded")]
+    raise StepFailed(step, {"http": st, "outcome": end.get("outcome"),
                             "error": err(js), "failed_components": failed,
                             "body": json.dumps(js, default=str)[:3000]})
 
 
 def do_new(step: str = "new") -> None:
     with teardown():
-        st, js = post("/api/scenario/new", {"discard_unsaved": True}, timeout=300)
+        st, js = apply_command("/api/scenario/new", {"discard_unsaved": True}, timeout=300)
     LAST["new"] = time.time()
     load_outcome(step, st, js)
 
 
 def do_load(scenario: str, step: str = "load") -> None:
     with teardown():
-        st, js = post("/api/scenario/load", {
+        st, js = apply_command("/api/scenario/load", {
             "path": f"/workspace/examples/{scenario}.scenario", "discard_unsaved": True}, timeout=400)
     LAST["load"] = time.time()
     load_outcome(step, st, js)
@@ -216,11 +264,12 @@ def start_run() -> str:
             "source_document_digest": ap["source_document_digest"],
             "expected_applied_record_digest": ap["source"]["record_digest"],
             "draft_program_revision": ws["draft"]["programRevision"]}
-    st, js = post("/api/program/runs", body, timeout=120)
+    st, js, cy = runner_command("/api/program/runs", body, timeout=120)
     LAST["execute"] = time.time()
-    if st != 200:
+    if not succeeded(st, js):
         raise StepFailed("execute", {"http": st, "error": err(js)})
-    return js["capture"]["program_run_id"]
+    # The run Execute started is the cycle's run once its row ended succeeded.
+    return cy["program_run_id"]
 
 
 # When the last Load/New returned, Enable finished, Reset finished, Execute
@@ -234,11 +283,12 @@ def controls(rn: str) -> dict[str, Any] | None:
 
 
 def motion_start(rn: str, cc: dict[str, Any], gids: list[str]) -> tuple[int, Any]:
-    return post(f"/api/program/runs/{rn}/motion-start", {
-        **attribution("soak-start"), "program_run_id": rn, "expected_owner_epoch": cc["owner_epoch"],
+    st, js, _ = runner_command(f"/api/program/runs/{rn}/motion-start", {
+        **attribution("soak-start"), "program_run_id": rn,
         "group_ids": gids,
-        "expected_selection_revision": cc["execution_selections"]["selection_revision"],
+        "expected_hold_revision": cc["execution_selections"]["hold_revision"],
         "reason": "operator start-motion"})
+    return st, js
 
 
 def drive_run(rn: str, scenario: str, timeout: float,
@@ -262,7 +312,7 @@ def drive_run(rn: str, scenario: str, timeout: float,
                   if g.get("start_allowed") and g.get("state") == "ready" and g["group_id"] not in started]
             if gs:
                 sst, sjs = motion_start(rn, cc, gs)
-                if sst == 200:
+                if succeeded(sst, sjs):
                     started.update(gs)
                 elif (err(sjs) or {}).get("code") != "program_runtime_control_stale":
                     now = time.time()
@@ -275,13 +325,13 @@ def drive_run(rn: str, scenario: str, timeout: float,
     raise StepFailed("run_timeout", {"state": r.get("state"), "node_statuses": r.get("node_statuses")})
 
 
-def full_stop(rn: str) -> None:
+def halt(rn: str) -> None:
     st, r = get(f"/api/program/runs/{rn}")
     if r.get("state") not in ACTIVE_RUN:
         return
-    post(f"/api/program/runs/{rn}/full-stop", {
-        **attribution("soak-halt"), "program_run_id": rn, "expected_owner_epoch": r["owner_epoch"],
-        "reason": "load soak cleanup"})
+    # Halt names no run: every operation stops and the Program is frozen.
+    post("/api/execution/halt", {
+        "request_context": {"request_key": uuid.uuid4().hex, "source_label": "operator_ui"}})
     for _ in range(60):
         time.sleep(1)
         st, r = get(f"/api/program/runs/{rn}")
@@ -311,9 +361,8 @@ def run_then_stop(scenario: str, timeout: float) -> dict[str, Any]:
     r = drive_run(rn, scenario, timeout, until=moving)
     if r.get("state") not in ACTIVE_RUN:
         return {"run_id": rn, "state": r.get("state"), "note": "run ended before Stop"}
-    cc = controls(rn) or {}
     st, js = post(f"/api/program/runs/{rn}/motion-stop", {
-        **attribution("soak-stop"), "program_run_id": rn, "expected_owner_epoch": cc["owner_epoch"],
+        **attribution("soak-stop"), "program_run_id": rn,
         "group_ids": ["all"], "reason": "operator motion Stop"})
     if st != 200:
         raise StepFailed("motion_stop", {"http": st, "error": err(js)})
@@ -332,14 +381,13 @@ def reset_cycle() -> None:
     if cy.get("state") == "idle_after_reset" and cy.get("program_run_id") is None:
         return
     body = {**attribution("soak-reset"), "program_run_id": cy["program_run_id"],
-            "expected_owner_epoch": cy["program_runner_owner_epoch"],
             "expected_cycle_generation": cy["cycle_generation"],
             "expected_claim_generation": cy["cycle_claim_generation"],
             "terminal_reference": cy["terminal_or_settlement_reference"],
             "settlement_evidence_digest": cy["terminal_or_settlement_reference"],
             "reload_initial_scene": False, "reset_robot_position": False}
-    st, js = post("/api/program/cycle/reset", body, timeout=120)
-    if st != 200:
+    st, js, _ = runner_command("/api/program/cycle/reset", body, timeout=120)
+    if not succeeded(st, js):
         raise StepFailed("reset", {"http": st, "error": err(js), "cycle": cy.get("state")})
     for _ in range(120):
         st, cy = get("/api/cycle/status")
@@ -390,12 +438,13 @@ def provoke_failed_apply() -> dict[str, Any]:
 
     hanger = threading.Thread(target=hang_new_node, daemon=True)
     hanger.start()
-    st, ap = post("/api/deployment/apply", {"scope": pv["scope"]}, timeout=400)
+    st, ap = apply_command("/api/deployment/apply", {"scope": pv["scope"]}, timeout=400)
     done.set()
     hanger.join()
     result = {"arm": arm, "stopped_pids": stopped, "apply_http": st,
-              "apply_outcome": ap.get("outcome") if isinstance(ap, dict) else None, "apply_error": err(ap)}
-    if st == 200 and ap.get("outcome") == "succeeded":
+              "apply_outcome": (ap.get("end") or {}).get("outcome") if isinstance(ap, dict) else None,
+              "apply_error": err(ap)}
+    if succeeded(st, ap):
         raise StepFailed("e_unavailable", {"note": "edited Apply succeeded despite the hung node", **result})
     return result
 
@@ -409,7 +458,7 @@ def mutate(path: list[Any], value: Any) -> None:
         adm = json.loads(r.read())
     body = {"draftId": ws["draft"]["id"], "expectedDraftRevision": ws["draft"]["revision"],
             "expectedAdmissionGeneration": adm.get("admission_generation"),
-            "requestOwnerEpoch": EPOCH, "requestId": rid("soak-dep"),
+            "requestId": rid("soak-dep"),
             "expectedWorkspaceEpoch": aw["workspaceEpoch"], "expectedWorkspaceRevision": aw["workspaceRevision"],
             "path": path, "operation": "set", "value": value}
     st, js = post("/api/deployment/draft/mutations", body)
@@ -429,8 +478,10 @@ def h_continue(rn: str, r: dict[str, Any], cc: dict[str, Any], acted: set[Any]) 
         if not any(a.get("action_id") == "continue_with_failure" and a.get("enabled") for a in o.get("actions", [])):
             continue
         acted.add(key)
-        post("/api/cycle/recovery-actions", {
-            **attribution("soak-recovery"), "expected_owner_epoch": cc["owner_epoch"],
+        # Followed to its end, as the reply once waited: the next command
+        # would meet the runner busy.
+        runner_command("/api/cycle/recovery-actions", {
+            **attribution("soak-recovery"),
             "offer_id": o["offer_id"], "offer_revision": o["offer_revision"],
             "action_id": "continue_with_failure", "reason": "operator-selected recovery action"})
 
@@ -439,8 +490,8 @@ def h_part_lost(rn: str, r: dict[str, Any], cc: dict[str, Any], acted: set[Any])
     ns = r.get("node_statuses", {})
     if "w" not in acted and "running" in (ns.get("pick_retreat"), ns.get("move_to_drop_approach")):
         acted.add("w")
-        post(f"/api/program/runs/{rn}/blackboard-values", {
-            **attribution("soak-bb"), "program_run_id": rn, "expected_owner_epoch": cc["owner_epoch"],
+        runner_command(f"/api/program/runs/{rn}/blackboard-values", {
+            **attribution("soak-bb"), "program_run_id": rn,
             "expected_run_revision": cc["run_revision"], "key": "part_lost", "value": True})
 
 
@@ -457,20 +508,31 @@ def _find(o: Any, pred: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | No
     return None
 
 
-def set_mock(resource: str, value: Any) -> None:
+def set_mock(signal_name: str, value: Any) -> None:
+    # `targets.io_signal_bindings` rows name each bound signal by
+    # `reference: {component_id, signal_name}`.
     st, t = get("/api/execution/targets")
-    found = _find(t, lambda d: "program_binding_id" in d and any(
-        b.get("resource_role_id") == resource for b in d.get("signal_role_bindings", [])))
+    reference: dict[str, Any] = {}
+
+    def binds(d: dict[str, Any]) -> bool:
+        for s in d.get("signals", []):
+            ref = s.get("reference") if isinstance(s, dict) else None
+            if isinstance(ref, dict) and ref.get("signal_name") == signal_name:
+                reference.update(ref)
+                return True
+        return False
+
+    found = _find(t, lambda d: "program_binding_id" in d and binds(d))
     if found is None:
         return
-    owner = (_find(t, lambda d: "owner_epoch" in d) or {}).get("owner_epoch")
-    sel = {"owner_epoch": found.get("owner_epoch", owner), "program_binding_id": found["program_binding_id"],
-           "target_role_id": found["target_role_id"], "resource_role_id": resource}
+    sel = {"program_binding_id": found["program_binding_id"],
+           "signal": {"component_id": reference["component_id"],
+                      "signal_name": reference["signal_name"]}}
     st, rd = post("/api/execution/io-signals/read", {
-        "schema_version": "manyforge.target_observation_query.v1", "kind": "io_signal", **sel})
+        "schema_version": "manyforge.target_observation_query.v3", "kind": "io_signal", **sel})
     epoch = (_find(rd, lambda d: "source_epoch" in d) or {}).get("source_epoch")
     post("/api/execution/io-signals/mock-input", {
-        "schema_version": "manyforge.mock_io_input_request.v1", **sel,
+        "schema_version": "manyforge.mock_io_input_request.v3", **sel,
         "expected_source_epoch": epoch, "value": value})
 
 
@@ -479,12 +541,12 @@ def resume_held(rn: str, cc: dict[str, Any]) -> bool:
           if g.get("resume_allowed") and g.get("state") not in ("ready", "running", "unavailable")]
     if not gs:
         return False
-    st, js = post(f"/api/program/runs/{rn}/resume-motion", {
-        **attribution("soak-resume"), "program_run_id": rn, "expected_owner_epoch": cc["owner_epoch"],
+    st, js, _ = runner_command(f"/api/program/runs/{rn}/resume-motion", {
+        **attribution("soak-resume"), "program_run_id": rn,
         "group_ids": gs,
-        "expected_selection_revision": cc["execution_selections"]["selection_revision"],
+        "expected_hold_revision": cc["execution_selections"]["hold_revision"],
         "reason": "operator resume-motion"})
-    return st == 200
+    return succeeded(st, js)
 
 
 def h_curtain(rn: str, r: dict[str, Any], cc: dict[str, Any], acted: set[Any]) -> None:
@@ -1004,7 +1066,7 @@ class Soak:
         st, cy = get("/api/cycle/status")
         rn = cy.get("program_run_id") if isinstance(cy, dict) else None
         if rn:
-            full_stop(rn)
+            halt(rn)
         try:
             do_new("recover_new")
             row["recovered"] = True

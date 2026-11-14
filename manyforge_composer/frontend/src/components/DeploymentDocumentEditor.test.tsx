@@ -13,7 +13,8 @@ import { ScenarioActionControls } from './ScenarioActionControls';
 function controller(): DeploymentWorkspaceController {
   return {
     workspace: {
-      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+      applyCommands: { inProgress: null, ended: [] },
       authoringWorkspace: {
         workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
         programDraftId: 'draft-1', programDraftRevision: 1,

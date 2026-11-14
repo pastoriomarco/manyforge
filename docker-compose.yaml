@@ -52,7 +52,10 @@ services:
       MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
       MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
-    command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
+    # Debug profile outside the Manager: nothing hands Composer the
+    # application-start identity, so mint one per container start (16 hex,
+    # contract 1.1).
+    command: ["bash", "-lc", "exec python -m manyforge_composer --host 0.0.0.0 --port 9000 --application-start-id $$(od -An -N8 -tx8 /dev/urandom | tr -d ' \\n')"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/api/health >/dev/null || exit 1"]
       interval: 30s
@@ -82,7 +85,10 @@ services:
       MANYFORGE_CORS_ORIGINS: ${MANYFORGE_CORS_ORIGINS:-http://localhost:3000}
       MANYFORGE_FS_ROOTS: ${MANYFORGE_FS_ROOTS:-/workspace}
     working_dir: /workspace
-    command: ["bash", "-lc", "python -m manyforge_composer --host 0.0.0.0 --port 9000"]
+    # Debug profile outside the Manager: nothing hands Composer the
+    # application-start identity, so mint one per container start (16 hex,
+    # contract 1.1).
+    command: ["bash", "-lc", "exec python -m manyforge_composer --host 0.0.0.0 --port 9000 --application-start-id $$(od -An -N8 -tx8 /dev/urandom | tr -d ' \\n')"]
     profiles:
       - dev-composer
 

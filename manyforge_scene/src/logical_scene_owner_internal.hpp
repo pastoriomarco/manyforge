@@ -18,6 +18,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 
 #include "embedded_canonical_empty_scene_schema.hpp"
 #include "logical_scene_codec_internal.hpp"
@@ -138,9 +139,7 @@ using core::ProjectionRevisionDTO;
 
 using core::ProjectionStageGeneration;
 
-using core::RequestId;
-
-using core::RequestOwnerEpoch;
+using core::RequestKey;
 
 using core::RetainedBundleDTO;
 
@@ -178,8 +177,9 @@ constexpr std::int64_t kNativeProjectionHandoffStoreSchemaVersion = 5;
 
 constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
 
+// One owner event per resident Scene transaction intent.
 constexpr std::size_t kMaximumLogicalSceneOwnerEvents =
-    kMaximumLogicalSceneTransactions + kMaximumMigratedStructuralCompletions;
+    kMaximumLogicalSceneTransactions;
 
 class CellAdmissionTemporarilyUnavailable final : public std::runtime_error {
 public:
@@ -283,6 +283,15 @@ public:
     Check(database_, sqlite3_bind_null(statement_, index), "bind SQLite null");
   }
 
+  /// A request key is stored as its 16 bytes.
+  void Bind(const int index, const RequestKey &key) {
+    Check(database_,
+          sqlite3_bind_blob(statement_, index, key.bytes.data(),
+                            static_cast<int>(key.bytes.size()),
+                            SQLITE_TRANSIENT),
+          "bind SQLite request key");
+  }
+
   [[nodiscard]] bool Step() {
     const auto result = sqlite3_step(statement_);
     if (result == SQLITE_ROW) {
@@ -318,8 +327,35 @@ public:
     return sqlite3_column_int64(statement_, column);
   }
 
+  [[nodiscard]] RequestKey Key(const int column) const {
+    RequestKey key;
+    if (sqlite3_column_type(statement_, column) != SQLITE_BLOB ||
+        sqlite3_column_bytes(statement_, column) !=
+            static_cast<int>(key.bytes.size())) {
+      throw LogicalSceneOwnerIntegrityError(
+          "stored logical-scene request key is not 16 bytes");
+    }
+    const auto *bytes = static_cast<const std::uint8_t *>(
+        sqlite3_column_blob(statement_, column));
+    std::copy(bytes, bytes + key.bytes.size(), key.bytes.begin());
+    return key;
+  }
+
   [[nodiscard]] bool IsNull(const int column) const noexcept {
     return sqlite3_column_type(statement_, column) == SQLITE_NULL;
+  }
+
+  [[nodiscard]] int Columns() const noexcept {
+    return sqlite3_column_count(statement_);
+  }
+
+  [[nodiscard]] int Type(const int column) const noexcept {
+    return sqlite3_column_type(statement_, column);
+  }
+
+  /// The stored length of a text or blob column.
+  [[nodiscard]] std::size_t Bytes(const int column) const noexcept {
+    return static_cast<std::size_t>(sqlite3_column_bytes(statement_, column));
   }
 
 private:
@@ -408,10 +444,6 @@ std::int64_t ScalarInteger(sqlite3 *database, const std::string_view sql,
 void ValidateBoundedIdentity(const std::string_view value,
                              const std::string_view label);
 
-RequestOwnerEpoch
-CompactedRequestOwnerEpoch(const SceneId &scene_id,
-                           const std::uint64_t request_epoch_generation);
-
 std::int64_t CheckedSafeCounter(const std::uint64_t value,
                                 const std::string_view label);
 
@@ -433,13 +465,6 @@ struct AcceptedState final {
   LogicalSceneSnapshotDTO snapshot;
 };
 
-struct MigratedStructuralCompletionState final {
-  std::uint64_t completion_sequence;
-  ApplyId apply_id;
-  ApplyGeneration apply_generation;
-  ProjectionRevisionDTO target;
-};
-
 struct MaintenanceInitializationState final {
   std::uint64_t initialization_sequence{};
   ApplyId apply_id;
@@ -457,18 +482,16 @@ struct MaintenanceInitializationState final {
   bool initial_baseline_installed{true};
   std::optional<ErrorDTO> initial_baseline_error;
   bool initial_baseline_effects_unknown{};
+  // A baseline intent row exists for this initialization.
+  bool initial_baseline_intent_recorded{};
 };
 
 struct DurableState final {
   std::optional<AcceptedState> accepted;
   bool rebuilt{};
   std::optional<ActiveBundlePublicationReceiptDTO> finalization_receipt;
-  std::vector<MigratedStructuralCompletionState> migrated_structural_completions;
   std::optional<ProjectionRevisionDTO> active_projection;
   std::optional<LogicalSceneSnapshotDTO> active_scene_snapshot;
-  std::vector<core::ProjectionExecutionHostBindingDTO>
-      active_execution_host_bindings;
-  bool legacy_native_effects_uncertain{};
   std::vector<MaintenanceInitializationState> maintenance_initializations;
   bool projection_desynchronized{};
   bool unresolved_scene_transaction{};
@@ -498,15 +521,13 @@ struct DurableState final {
 [[nodiscard]] CanonicalEmptySceneAccessStatus
 AccessStatus(const DurableState &state);
 
-/// Returns the exact Scene-owned current native binding set. A maintenance
-/// completion supplies the complete set; only a pre-UA4 store falls back to
-/// its immutable migration snapshot.
+/// Returns the exact Scene-owned current native binding set: the one of the
+/// latest published maintenance completion, else none.
 [[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
 ActiveExecutionHostBindings(const DurableState &state);
 
 struct StoredSceneOutcome final {
-  std::string request_owner_epoch;
-  RequestId request_id;
+  RequestKey request_key;
   ContentDigest request_digest;
   std::optional<std::uint64_t> transaction_sequence;
   bool success;
@@ -531,8 +552,7 @@ DecodeProjectionStatus(std::string_view value);
     const ProjectionRevisionDTO &active);
 
 [[nodiscard]] core::CellAdmissionClaimIntentDTO AuthoredSceneClaimIntent(
-    const SceneTransactionRequestDTO &request,
-    const ContentDigest &request_digest);
+    const SceneTransactionRequestDTO &request);
 
 void ReleaseAuthoredSceneClaim(
     core::IKernelCellAdmissionPort &admission,
@@ -546,13 +566,14 @@ void SettleAuthoredSceneClaimIfHeld(
     const ContentDigest &request_digest, const bool success,
     const SceneProjectionCommitStatusDTO projection_status);
 
+struct SceneStoreMemory;
+
 void SettleRecoveredAuthoredSceneClaims(
-    sqlite3 *database, core::IKernelCellAdmissionPort &admission);
+    const SceneStoreMemory &memory, core::IKernelCellAdmissionPort &admission);
 
 struct SceneTransactionStoreState final {
   ProjectionRevisionDTO active_projection;
   LogicalSceneSnapshotDTO active_snapshot;
-  RequestOwnerEpoch request_owner_epoch;
   std::uint64_t next_transaction_sequence;
   std::uint64_t next_owner_event_sequence;
   std::size_t resident_transaction_count;
@@ -562,32 +583,67 @@ struct SceneTransactionStoreState final {
   std::optional<std::uint64_t> latest_uncertain_transaction_sequence;
 };
 
-/// Process-local acceleration for the ordinary scene-commit path.
-///
-/// Startup and every structural/recovery mutation still reconstruct and
-/// validate the complete durable history. Between those boundaries this owner
-/// is the sole writer and holds `Impl::mutex_`, so replaying all resident
-/// transaction JSON before every edit is both redundant and quadratic. The
-/// SQLite `data_version` value fences writes made through another connection;
-/// any such change discards this cache and forces a complete reconstruction.
+/// The replayed Scene state for the ordinary commit path, derived from
+/// `SceneStoreMemory`. Commit keeps it current; every other mutation drops it
+/// and the next read replays the memory rows again.
 struct SceneCommitStateCache final {
   DurableState durable_state;
   std::optional<SceneTransactionStoreState> transaction_state;
-  std::int64_t external_data_version{};
 };
 
 struct BoundedHistoryState final {
   std::uint64_t compaction_generation{};
-  std::uint64_t request_epoch_generation{};
-  std::optional<RequestOwnerEpoch> request_owner_epoch;
   std::uint64_t compacted_through_transaction_sequence{};
   std::uint64_t compacted_through_owner_event_sequence{};
-  std::size_t compacted_structural_completion_count{};
   std::size_t compacted_maintenance_completion_count{};
   std::uint64_t recovered_through_transaction_sequence{};
   std::optional<ProjectionRevisionDTO> checkpoint_projection;
   std::optional<LogicalSceneSnapshotDTO> checkpoint_snapshot;
 };
+
+/// One resident Scene transaction: its intent row, the count of its attempt
+/// rows and the states of its result rows, in ordinal order.
+struct SceneTransactionRecord final {
+  std::uint64_t transaction_sequence;
+  RequestKey request_key;
+  ContentDigest request_digest;
+  std::string request_json;
+  ProjectionRevisionDTO prior;
+  ProjectionRevisionDTO proposed;
+  std::string candidate_snapshot_json;
+  SceneUpdateStatusDTO update_status;
+  std::size_t required_projection_count;
+  std::size_t projection_attempt_count;
+  std::vector<core::ProjectionCommitResultStateDTO> projection_results;
+};
+
+struct SceneOwnerEventRecord final {
+  std::uint64_t owner_event_sequence;
+  std::uint64_t transaction_sequence;
+};
+
+/// The store's rows, held in memory. This is the authority every read and
+/// every write decision uses; the file receives the same rows afterwards.
+struct SceneStoreMemory final {
+  std::optional<AcceptedState> accepted;
+  bool rebuilt{};
+  std::optional<ActiveBundlePublicationReceiptDTO> finalization_receipt;
+  std::vector<MaintenanceInitializationState> maintenance_initializations;
+  BoundedHistoryState history;
+  std::vector<SceneTransactionRecord> transactions;
+  std::map<RequestKey, StoredSceneOutcome> outcomes;
+  std::vector<SceneOwnerEventRecord> owner_events;
+  // The file bytes of the rows (SceneRowFileBytes, od212): of every Scene
+  // transaction row, and of each maintenance initialization's rows by
+  // initialization sequence.
+  std::uint64_t transaction_file_bytes{};
+  std::map<std::uint64_t, std::uint64_t> maintenance_file_bytes;
+};
+
+/// Start only: reads the rows of an already validated store.
+[[nodiscard]] SceneStoreMemory LoadSceneStoreMemory(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query);
 
 [[nodiscard]] BoundedHistoryState ReadBoundedHistoryState(sqlite3 *database);
 
@@ -595,25 +651,44 @@ SceneProjectionCommitStatusDTO
 DecodeProjectionStatus(const std::string_view value);
 
 std::optional<StoredSceneOutcome>
-ReadOutcomeForRequest(sqlite3 *database,
-                      const std::string_view request_owner_epoch,
-                      const RequestId &request_id);
+ReadOutcomeForRequest(sqlite3 *database, const RequestKey &request_key);
+
+std::optional<StoredSceneOutcome>
+ReadOutcomeForRequest(const SceneStoreMemory &memory,
+                      const RequestKey &request_key);
 
 SceneTransactionStoreState
 ReadSceneTransactionStoreState(sqlite3 *database,
                                const DurableState &durable_state);
 
-/// Prunes the resident Scene ledger behind a checkpoint of the settled head.
-/// `maintenance_fold` admits a non-full ledger and a closed maintenance window.
-void CompactSceneTransactionHistory(
-    sqlite3 *database, const DurableState &durable_state,
+SceneTransactionStoreState
+ReadSceneTransactionStoreState(const SceneStoreMemory &memory,
+                               const DurableState &durable_state);
+
+struct PreparedSceneHistoryCompaction final {
+  BoundedHistoryState history;
+  std::string checkpoint_snapshot_json;
+};
+
+/// Checks a compaction of the resident Scene ledger behind a checkpoint of
+/// the settled head. `maintenance_fold` admits an empty ledger and a closed
+/// maintenance window.
+[[nodiscard]] PreparedSceneHistoryCompaction PrepareSceneHistoryCompaction(
+    const SceneStoreMemory &memory, const DurableState &durable_state,
     const SceneTransactionStoreState &transactions, bool maintenance_fold);
+
+/// Applies a prepared compaction to memory and appends its statements.
+void CompactSceneTransactionHistory(
+    SceneStoreMemory &memory, persistence::SqliteRecord &record,
+    PreparedSceneHistoryCompaction compaction,
+    const DurableState &durable_state,
+    const SceneTransactionStoreState &transactions);
 
 ErrorDTO SceneError(const std::string_view code, const std::string_view message,
                     std::map<std::string, std::string> details = {});
 
 SceneCommitResultDTO
-FailedSceneResult(const RequestId &request_id,
+FailedSceneResult(const RequestKey &request_key,
                   const core::RequestReplayStatusDTO replay, ErrorDTO error,
                   const SceneProjectionCommitStatusDTO projection_status);
 
@@ -646,9 +721,10 @@ NormalizeScenePose(const core::SceneTransactionFrameRefDTO &frame_ref,
                    const std::optional<core::SceneFrameResolutionReceiptDTO>
                        &frame_resolution);
 
-void InsertSceneOutcome(sqlite3 *database,
-                        const std::string_view request_owner_epoch,
-                        const RequestId &request_id,
+/// Records one outcome row in memory and appends its insert.
+void InsertSceneOutcome(SceneStoreMemory &memory,
+                        persistence::SqliteRecord &record,
+                        const RequestKey &request_key,
                         const ContentDigest &request_digest,
                         const std::optional<std::uint64_t> transaction_sequence,
                         const bool success,
@@ -657,8 +733,13 @@ void InsertSceneOutcome(sqlite3 *database,
                         const std::optional<ErrorDTO> &error);
 
 SceneCommitResultDTO
-ResultFromStoredOutcome(sqlite3 *database, const StoredSceneOutcome &outcome,
+ResultFromStoredOutcome(const SceneStoreMemory &memory,
+                        const StoredSceneOutcome &outcome,
                         const core::RequestReplayStatusDTO replay_status);
+
+/// Binds a request key as its 16 bytes.
+void BindRequestKey(persistence::SqliteRecord &record, int index,
+                    const RequestKey &key);
 
 struct RequiredSceneProjection final {
   std::shared_ptr<core::IPlannerSceneProjection> projection;
@@ -681,57 +762,14 @@ ResolveFrameAcrossProjections(
     const LogicalSceneSnapshotDTO &candidate,
     const std::vector<RequiredSceneProjection> &projections);
 
-bool SettleInterruptedMaintenanceInitializations(sqlite3 *database);
+DurableState ReadCompleteDurableState(const SceneStoreMemory &memory);
 
-DurableState ReadCompleteDurableState(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    MaintenanceSnapshotCache *cache = nullptr,
-    PersistentStatementCache *statements = nullptr);
-
-bool RecoverIncompleteSceneTransaction(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query);
-
-void ValidateBaseDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
-void ValidateTransactionDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
-void ValidateNativeHandoffDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
-void ValidateBoundedHistoryDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
+/// Refuses any store whose application id or schema version is not the
+/// current one; an older store is never converted.
 void ValidateDatabase(
     sqlite3 *database,
     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
     const ContentDigest &admission_digest);
-
-void ValidateMaintenanceDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
-/// Schema and metadata of a v9 store, without decoding its content: v9
-/// documents fail current decoding until `ConvertProviderObservationEvidence`.
-void ValidateInitialSceneBaselineDatabase(
-    sqlite3 *database,
-    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
-    const ContentDigest &admission_digest);
-
-/// One-time v9 -> v10 conversion inside the caller's write transaction.
-void ConvertProviderObservationEvidence(sqlite3 *database);
 
 void InsertMetadata(sqlite3 *database,
                     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
@@ -756,6 +794,197 @@ bool IsExactUninitializedDatabase(sqlite3 *database);
 void FsyncDatabaseDirectory(const std::filesystem::path &database_path);
 
 CanonicalEmptySceneAccessStatus AccessStatus(const DurableState &state);
+
+// The store's file bytes (od212) ---------------------------------------------
+
+/// The size of one row's SQLite record (file format 2.1): a header of serial
+/// types, then the values.
+class RecordSize final {
+public:
+  void Integer(const std::int64_t value) {
+    const auto magnitude =
+        static_cast<std::uint64_t>(value < 0 ? ~value : value);
+    std::uint64_t size = 8U;
+    if (value == 0 || value == 1) {
+      size = 0U;
+    } else if (magnitude <= 0x7FU) {
+      size = 1U;
+    } else if (magnitude <= 0x7FFFU) {
+      size = 2U;
+    } else if (magnitude <= 0x7FFFFFU) {
+      size = 3U;
+    } else if (magnitude <= 0x7FFFFFFFU) {
+      size = 4U;
+    } else if (magnitude <= 0x7FFFFFFFFFFFU) {
+      size = 6U;
+    }
+    header_ += 1U;
+    body_ += size;
+  }
+  /// A text or blob value of `bytes` bytes.
+  void Text(const std::size_t bytes) {
+    header_ += VarintLength(2U * bytes + 13U);
+    body_ += bytes;
+  }
+  void Null() { header_ += 1U; }
+  [[nodiscard]] std::uint64_t bytes() const {
+    auto header = header_;
+    if (header <= 126U) {
+      header += 1U;
+    } else {
+      const auto length = VarintLength(header);
+      header += length;
+      if (length < VarintLength(header)) {
+        ++header;
+      }
+    }
+    return header + body_;
+  }
+
+private:
+  static std::uint64_t VarintLength(std::uint64_t value) {
+    std::uint64_t length = 1U;
+    while (value > 0x7FU && length < 9U) {
+      value >>= 7U;
+      ++length;
+    }
+    return length;
+  }
+  std::uint64_t header_{};
+  std::uint64_t body_{};
+};
+
+/// One inserted row: binds its values into `record` and sizes its record.
+class SizedRow final {
+public:
+  SizedRow(persistence::SqliteRecord &record, std::string sql)
+      : record_(record) {
+    record_.Statement(std::move(sql));
+  }
+  void Bind(const int index, const std::int64_t value) {
+    record_.Bind(index, value);
+    size_.Integer(value);
+  }
+  void Bind(const int index, const std::string_view text) {
+    record_.Bind(index, text);
+    size_.Text(text.size());
+  }
+  void BindBlob(const int index, const std::string_view bytes) {
+    record_.BindBlob(index, bytes);
+    size_.Text(bytes.size());
+  }
+  void BindNull(const int index) {
+    record_.BindNull(index);
+    size_.Null();
+  }
+  /// A text column whose value the statement's SQL carries.
+  void Literal(const std::string_view text) { size_.Text(text.size()); }
+  [[nodiscard]] std::uint64_t record_bytes() const { return size_.bytes(); }
+
+private:
+  persistence::SqliteRecord &record_;
+  RecordSize size_;
+};
+
+/// Binds a request key as its 16 bytes and sizes it.
+void BindRequestKey(SizedRow &row, int index, const RequestKey &key);
+
+/// A table of Scene transaction or maintenance-initialization rows: its
+/// b-tree kind and its number of UNIQUE indexes. No other table grows.
+struct SceneRowTable final {
+  std::string_view name;
+  bool rowid;
+  std::uint64_t unique_indexes;
+  bool maintenance;
+};
+
+inline constexpr std::array<SceneRowTable, 12> kSceneRowTables{{
+    {"logical_scene_transaction_intents", true, 1U, false},
+    {"logical_scene_owner_events", true, 1U, false},
+    {"logical_scene_request_outcomes", false, 0U, false},
+    {"logical_scene_projection_attempts", false, 0U, false},
+    {"logical_scene_projection_results", false, 0U, false},
+    {"logical_scene_maintenance_initialization_intents", true, 1U, true},
+    {"logical_scene_maintenance_initialization_bindings", false, 0U, true},
+    {"logical_scene_maintenance_initialization_results", true, 0U, true},
+    {"logical_scene_maintenance_initialization_completions", true, 0U, true},
+    {"logical_scene_initial_baseline_requests", true, 0U, true},
+    {"logical_scene_initial_baseline_intents", true, 0U, true},
+    {"logical_scene_initial_baseline_results", true, 0U, true},
+}};
+
+consteval const SceneRowTable &SceneTable(const std::string_view name) {
+  for (const auto &table : kSceneRowTables) {
+    if (table.name == name) {
+      return table;
+    }
+  }
+  throw "not a Scene row table";
+}
+
+/// The part of the page image the rows may take: the rest holds the schema
+/// (59 pages with the root page of each of its 28 b-trees), the singleton
+/// rows with the history checkpoint twice while it is replaced (at most 2 x
+/// 34 pages), and at most 17 free-list trunk pages, with room to spare.
+inline constexpr std::uint64_t kSceneStoreReservedFileBytes = 1024U * 1024U;
+inline constexpr std::uint64_t kSceneStorePageBytes = 4096U;
+inline constexpr std::uint64_t kSceneStoreRecordFileBytes =
+    static_cast<std::uint64_t>(kMaximumSceneStoreDatabasePageImageBytes) -
+    kSceneStoreReservedFileBytes;
+
+/// The file bytes one row of `record` bytes and its UNIQUE index entries can
+/// take on the store's 4096-byte pages (SQLite file format): an over-count.
+///  - A cell of P bytes stays in its page when P <= X (index b-tree, which
+///    holds WITHOUT ROWID rows: X = 1002; rowid table: X = 4061); otherwise
+///    M = 489 to X bytes stay and the rest goes to at most
+///    ceil((P-M)/4092) overflow pages. Counting M bytes and that many whole
+///    pages counts one page more whenever more than M bytes stay.
+///  - A cell takes at most 13 more bytes in an index b-tree (2-byte pointer,
+///    3-byte size, child and overflow page numbers) and at most 33 in a
+///    rowid table (pointer, size, 9-byte rowid, overflow page number, and
+///    the 15-byte interior cell of its leaf page).
+///  - The in-page bytes count three times: SQLite rebalances a page that is
+///    less than one third full.
+///  - An index entry (a request key, sequence or Apply identity with the
+///    rowid) is at most 300 bytes.
+[[nodiscard]] inline std::uint64_t
+SceneRowFileBytes(const std::uint64_t record, const SceneRowTable &table) {
+  constexpr std::uint64_t kPageFill = 3U;
+  constexpr std::uint64_t kIndexCellOverhead = 13U;
+  constexpr std::uint64_t kMaximumIndexEntryBytes = 300U;
+  constexpr auto kUsable = kSceneStorePageBytes;
+  const auto overhead = table.rowid ? 33U : kIndexCellOverhead;
+  const auto in_page = table.rowid ? kUsable - 35U
+                                   : (kUsable - 12U) * 64U / 255U - 23U;
+  const auto minimum_in_page = (kUsable - 12U) * 32U / 255U - 23U;
+  const auto per_overflow_page = kUsable - 4U;
+  const auto row =
+      record <= in_page
+          ? kPageFill * (record + overhead)
+          : kPageFill * (minimum_in_page + overhead) +
+                kUsable * ((record - minimum_in_page + per_overflow_page - 1U) /
+                           per_overflow_page);
+  return row + table.unique_indexes * kPageFill *
+                   (kMaximumIndexEntryBytes + kIndexCellOverhead);
+}
+
+/// The file bytes every held row takes.
+[[nodiscard]] std::uint64_t SceneFileBytes(const SceneStoreMemory &memory);
+
+/// The initializations the eviction rule gives up, one after the other, so
+/// that `bytes` more fit the store's file bytes once `freed` bytes are given
+/// up, with `folded` completions folded into the history checkpoint; also
+/// at least one when `one` (the count limit). Changes nothing; the rows are
+/// `state`'s.
+[[nodiscard]] std::vector<const MaintenanceInitializationState *>
+MaintenanceEvictions(const SceneStoreMemory &memory, const DurableState &state,
+                     std::size_t folded, std::uint64_t freed,
+                     std::uint64_t bytes, bool one);
+
+/// Deletes one initialization and its rows in memory and appends the deletes.
+void DeleteMaintenanceInitialization(SceneStoreMemory &memory,
+                                     persistence::SqliteRecord &record,
+                                     const MaintenanceInitializationState &row);
 
 [[nodiscard]] const SceneObjectSnapshotDTO *
 FindSceneObject(const LogicalSceneSnapshotDTO &snapshot,

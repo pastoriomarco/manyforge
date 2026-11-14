@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -44,9 +45,30 @@ using ExecutionBindingEpoch = StrongCounter<ExecutionBindingEpochTag>;
 /// recorded by the adapter with the goal key at every send. Opaque to Core:
 /// used for traceability only, never parsed or compared across mechanisms.
 /// May be empty while the goal is pending or after it was rejected (the
-/// mechanism has not assigned or reported one).
-struct MechanismGoalIdTag final {};
-using MechanismGoalId = StrongString<MechanismGoalIdTag>;
+/// mechanism has not assigned or reported one): all bytes zero.
+struct MechanismGoalId final {
+  std::array<std::uint8_t, 16> bytes{};
+
+  [[nodiscard]] bool empty() const noexcept {
+    for (const auto byte : bytes) {
+      if (byte != 0U) return false;
+    }
+    return true;
+  }
+  friend bool operator==(const MechanismGoalId&, const MechanismGoalId&) = default;
+};
+
+/// Lowercase hex of a mechanism goal id, for diagnostics only (logs, error
+/// details); never on a time-critical path.
+[[nodiscard]] inline std::string MechanismGoalIdHex(const MechanismGoalId& id) {
+  constexpr char kDigits[] = "0123456789abcdef";
+  std::string text(32U, '0');
+  for (std::size_t index = 0; index < id.bytes.size(); ++index) {
+    text[2U * index] = kDigits[id.bytes[index] >> 4U];
+    text[2U * index + 1U] = kDigits[id.bytes[index] & 0x0FU];
+  }
+  return text;
+}
 
 /// The adapter's local receipt counter for one sample stream. Bookkeeping
 /// only: it cannot reveal messages lost before receipt (`controller_state`
@@ -54,22 +76,11 @@ using MechanismGoalId = StrongString<MechanismGoalIdTag>;
 struct ExecutionReceiptCountTag final {};
 using ExecutionReceiptCount = StrongCounter<ExecutionReceiptCountTag>;
 
-/// Core's per-goal identity on the port.
-///
-/// Reuses the Kernel-minted pair already carried by dispatch bindings,
-/// participant state and Stop stages (`ResolvedExecutionBindingDTO`,
-/// `OperationParticipantStateDTO`): `controller_goal_id` names the operation
-/// participant's goal and `controller_goal_generation` advances on every
-/// replacement of it (Stop ramp, spring-back), so `Replace` always names two
-/// distinct keys. Binding identity is deliberately not part of the key: every
-/// observation carries the binding epoch instead.
-struct ExecutionGoalKey final {
-  ControllerGoalId controller_goal_id{std::string{}};
-  ControllerGoalGeneration controller_goal_generation{0U};
-
-  friend bool operator==(const ExecutionGoalKey&, const ExecutionGoalKey&) = default;
-  friend auto operator<=>(const ExecutionGoalKey&, const ExecutionGoalKey&) = default;
-};
+/// Core's per-goal identity on the port is the Kernel-minted `ControllerGoalId`
+/// (`strong_id.hpp`): the operation participant and a generation that advances
+/// on every replacement of its goal (Stop ramp, spring-back), so `Replace`
+/// always names two distinct goals. Binding identity is deliberately not part
+/// of it: every observation carries the binding epoch instead.
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -291,15 +302,15 @@ inline constexpr std::size_t kExecutionGoalRecordCapacity = 2;
 
 /// Goal-scoped facts for one key.
 struct ExecutionGoalObservationDTO final {
-  ExecutionGoalKey key;
-  MechanismGoalId mechanism_goal_id{std::string{}};
+  ControllerGoalId key;
+  MechanismGoalId mechanism_goal_id{};
   /// Binding epoch the goal was sent on.
   ExecutionBindingEpoch binding_epoch{0U};
   ExecutionGoalPhase phase{ExecutionGoalPhase::kPending};
   /// Set only in `kTerminal`.
   std::optional<ExecutionGoalResult> result{};
   /// Set only with `ExecutionGoalResult::kPreemptedBy`.
-  std::optional<ExecutionGoalKey> preempted_by{};
+  std::optional<ControllerGoalId> preempted_by{};
   /// Local monotonic time at which the acceptance was received.
   std::optional<TimePoint> accepted_stamp_ns{};
   /// Latest action feedback of this goal; absent before the first one.
@@ -489,7 +500,7 @@ class IExecutionPort {
   /// Start a goal. Waypoint times are path time; positions, velocities and
   /// accelerations are required (Core's sampler fills them). The joint set is
   /// that of `ReadLaneFacts().joint_names`; the adapter maps by name.
-  virtual ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
+  virtual ExecutionPortCommandResultDTO Submit(const ControllerGoalId& key,
                                                const TrajectoryDTO& trajectory,
                                                std::shared_ptr<ExecutionDispatchToken> token = {}) = 0;
 
@@ -504,14 +515,14 @@ class IExecutionPort {
   /// Every goal, a Stop's included, gets the lane's goal check (a Stop
   /// trajectory has the same arrival tolerance and `goal_time` as a motion). A cancel-type Stop sends no goal.
   virtual ExecutionPortCommandResultDTO Replace(
-      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const ControllerGoalId& active_key, const ControllerGoalId& next_key,
       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) = 0;
 
   /// Same identity/prefix contract as Replace, with its time-zero anchored to
   /// the named binding's controller clock. Refusal is explicit; silently
   /// falling back to an immediate send would change the chosen curve origin.
   virtual ExecutionPortCommandResultDTO ReplaceScheduled(
-      const ExecutionGoalKey& /*active_key*/, const ExecutionGoalKey& /*next_key*/,
+      const ControllerGoalId& /*active_key*/, const ControllerGoalId& /*next_key*/,
       const TrajectoryDTO& /*trajectory*/, const ExecutionReplacementStartDTO& /*start*/,
       std::shared_ptr<ExecutionDispatchToken> /*token*/ = {}) {
     return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
@@ -525,7 +536,7 @@ class IExecutionPort {
   /// on acceptance, returning `kEffectUncertain` meanwhile. A refused or
   /// unsent cancel is never containment evidence.
   virtual ExecutionPortCommandResultDTO Cancel(
-      const ExecutionGoalKey& key,
+      const ControllerGoalId& key,
       std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) = 0;
 
   /// Publish one speed factor in [0, 1]. Values apply in send order on
@@ -557,7 +568,7 @@ class IExecutionPort {
   /// Goal-scoped facts; nullopt for a key never sent through this port or
   /// whose record left the ring (`kExecutionGoalRecordCapacity`).
   virtual std::optional<ExecutionGoalObservationDTO> ReadGoal(
-      const ExecutionGoalKey& key) const = 0;
+      const ControllerGoalId& key) const = 0;
 
   /// Latest controller-wide sample; nullopt before the first one on the
   /// current binding.

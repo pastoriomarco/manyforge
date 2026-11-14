@@ -23,9 +23,9 @@ class ManagerLivenessRpcRejection final : public std::invalid_argument {
 };
 
 inline constexpr std::string_view kManagerLivenessRequestTag =
-    "manyforge.manager-liveness.request.v2";
+    "manyforge.manager-liveness.request.v3";
 inline constexpr std::string_view kManagerLivenessResponseTag =
-    "manyforge.manager-liveness.response.v2";
+    "manyforge.manager-liveness.response.v3";
 inline constexpr std::string_view kManagerLivenessRejectionTag =
     "manyforge.manager-liveness.rejected.v1";
 inline constexpr std::size_t kMaximumManagerLivenessRpcPacketBytes = 16U * 1024U;
@@ -34,14 +34,14 @@ inline constexpr std::size_t kMaximumManagerLivenessRpcPacketBytes = 16U * 1024U
 // proves servicing; only changed real phase/milestone facts prove progress.
 inline constexpr std::string_view kNativeShutdownRequestTag =
     "manyforge.native-shutdown.request.v1";
+// v3 (OD-187 (3)): status is served from the start of the shutdown, and the
+// planned Halt is a phase.
 inline constexpr std::string_view kNativeShutdownResponseTag =
-    "manyforge.native-shutdown.response.v1";
+    "manyforge.native-shutdown.response.v3";
 enum class NativeShutdownPhase : unsigned {
   kRunning,
   kGroupRetirement,
   kExecutionDrain,
-  kCurrentBuilderDrain,
-  kManagedBuilderDrain,
   kProjectionDrain,
   kKernelDestruction,
   kPreparedCompositionDestruction,
@@ -52,7 +52,9 @@ enum class NativeShutdownPhase : unsigned {
   kLivenessReceiverDestruction,
   kSchedulerOwnerRelease,
   kFenceOwnerDestruction,
-  kServicingLaneDrain
+  kServicingLaneDrain,
+  // The host's planned Halt, its first shutdown step.
+  kPlannedHalt
 };
 struct NativeShutdownProgress final {
   std::string runtime_epoch;
@@ -143,21 +145,12 @@ enum class ManagerLivenessCommandClass {
   kReadOnly,
 };
 
-/// Child-local, initially closed ordinary-command admission.  A generation
-/// snapshot prevents a reconciliation racing a loss callback from reopening
-/// ingress after the callback has synchronously closed it.
+/// Child-local, initially closed ordinary-command admission.
 class ManagerLivenessCommandAdmission final {
  public:
-  [[nodiscard]] std::uint64_t generation() const {
+  void Open() {
     std::lock_guard lock(mutex_);
-    return generation_;
-  }
-
-  void OpenIfUnchanged(const std::uint64_t expected_generation) {
-    std::lock_guard lock(mutex_);
-    if (generation_ == expected_generation) {
-      open_ = true;
-    }
+    open_ = true;
   }
 
   [[nodiscard]] bool open() const {
@@ -172,63 +165,24 @@ class ManagerLivenessCommandAdmission final {
   void CloseForRequiredSetRebind() {
     std::lock_guard lock(mutex_);
     open_ = false;
-    ++generation_;
-  }
-
-  [[nodiscard]] manyforge::core::ContentDigest CloseAndAttest(
-      const manyforge::core::ManagerLivenessLossIntentDTO& intent) {
-    std::lock_guard lock(mutex_);
-    open_ = false;
-    ++generation_;
-    std::string material(
-        "manyforge.native-execution.manager-loss-local-admission-close.v2");
-    for (const auto& value :
-         {intent.cell_id.value(), intent.active_bundle_id.value(),
-          intent.required_runtime_set_digest.value(),
-          intent.receiver_runtime_unit_id.value(),
-          intent.receiver_runtime_epoch.value(), intent.runtime_policy_id.value(),
-          intent.runtime_policy_revision.value(),
-          intent.lost_manager_runtime_unit_id.value(),
-          intent.lost_manager_runtime_epoch.value(),
-          intent.lost_manager_owner_epoch.value()}) {
-      material.push_back('\0');
-      material.append(value);
-    }
-    material.push_back('\0');
-    material.append(std::to_string(intent.receiver_status_sequence));
-    return manyforge::core::ContentDigest(
-        manyforge::content_identity::sha256_digest(material));
   }
 
  private:
   mutable std::mutex mutex_;
   bool open_{};
-  std::uint64_t generation_{};
 };
 
-/// Owns the receiver's clock for the full managed-child lifetime. Member
-/// order destroys the receiver before its clock.
+/// Owns the receiver for the full managed-child lifetime.
 class ChildOwnedManagerLivenessReceiver final {
  public:
-  explicit ChildOwnedManagerLivenessReceiver(
-      std::shared_ptr<manyforge::core::IClock> clock)
-      : clock_(std::move(clock)) {
-    if (clock_ == nullptr) {
-      throw std::invalid_argument("child-owned Manager liveness clock is absent");
-    }
-  }
-
   void Install(
       manyforge::core::ManagerLivenessReceiverConfig config,
-      manyforge::core::ManagerLossLocalSafeCallback local_safe_callback,
-      manyforge::core::IManagerLivenessFailSafePort& fail_safe_port,
       manyforge::core::IManagerLivenessObservationPort& observation_port) {
     if (receiver_ != nullptr) {
       throw std::logic_error("Manager liveness receiver is already installed");
     }
     receiver_ = std::make_unique<manyforge::core::ManagerLivenessReceiver>(
-        std::move(config), *clock_, std::move(local_safe_callback),
-        fail_safe_port, observation_port);
+        std::move(config), observation_port);
   }
 
   [[nodiscard]] manyforge::core::ManagerLivenessReceiver* get() noexcept {
@@ -236,7 +190,6 @@ class ChildOwnedManagerLivenessReceiver final {
   }
 
  private:
-  std::shared_ptr<manyforge::core::IClock> clock_;
   std::unique_ptr<manyforge::core::ManagerLivenessReceiver> receiver_;
 };
 

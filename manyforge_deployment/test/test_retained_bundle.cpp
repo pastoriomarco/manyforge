@@ -213,7 +213,7 @@ TEST(ProductContractRegistryTest,
      QualifiesExactFlattenedViewerControlRuntimeAndSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 6U);
+  ASSERT_EQ(contracts.size(), 5U);
   const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
@@ -340,32 +340,6 @@ TEST(ProductContractRegistryTest,
     EXPECT_EQ(role.cardinality,
               ProductArtifactCardinality::kOptionalAtMostOne);
   }
-
-  const auto runtime = std::find_if(
-      contracts.begin(), contracts.end(), [](const auto &candidate) {
-        return candidate.product_contract_id().value() ==
-               "manyforge.reference_runtime_unit";
-      });
-  ASSERT_NE(runtime, contracts.end());
-  EXPECT_EQ(runtime->product_kind(),
-            core::RetainedProductKind::kRuntimeUnitConfiguration);
-  EXPECT_EQ(runtime->placement(), ProductPlacement::kRuntimeUnit);
-  ASSERT_EQ(runtime->artifact_roles().size(), 2U);
-  EXPECT_EQ(runtime->artifact_roles()[0].artifact_role_id.value(),
-            "launchable_script");
-  EXPECT_EQ(runtime->artifact_roles()[0].media_type,
-            "application/x-sh");
-  EXPECT_EQ(runtime->artifact_roles()[1].artifact_role_id.value(),
-            "runtime_manifest");
-  EXPECT_EQ(runtime->artifact_roles()[1].media_type,
-            "application/vnd.manyforge.runtime-manifest+json");
-  for (const auto &role : runtime->artifact_roles()) {
-    EXPECT_EQ(role.cardinality,
-              ProductArtifactCardinality::kRequiredExactlyOne);
-  }
-  EXPECT_EQ(registry.find(runtime->product_contract_id(),
-                          runtime->product_contract_revision()),
-            &*runtime);
 
   // The native execution runtime product contract was retired; only the
   // ros2_control runtime contract remains.

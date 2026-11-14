@@ -1,4 +1,4 @@
-"""One bounded read-only v2 control client used by the headless process tests.
+"""One bounded read-only v4 control client used by the headless process tests.
 
 This is test transport, not an execution owner. It answers server heartbeats
 and credits consumed state while the caller performs other in-scope checks.
@@ -14,7 +14,7 @@ from websockets.sync.client import connect
 
 @contextmanager
 def composer_snapshot_stream(composer_url: str, *, client_id: str):
-    protocol = "manyforge.execution_control.v2"
+    protocol = "manyforge.execution_control.v4"
     url = composer_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
     with connect(
         url.rstrip("/") + "/ws/control",
@@ -36,8 +36,8 @@ def composer_snapshot_stream(composer_url: str, *, client_id: str):
         )
         hello = json.loads(websocket.recv(timeout=2))
         if hello.get("schema_version") != protocol or hello.get("message_kind") != "server_hello":
-            raise RuntimeError("Composer did not accept the v2 session")
-        session = hello["control_session_id"]
+            raise RuntimeError("Composer did not accept the v4 session")
+        session = hello["control_session_number"]
         stopped = Event()
         pending = Queue(maxsize=1)
 
@@ -59,7 +59,7 @@ def composer_snapshot_stream(composer_url: str, *, client_id: str):
                         continue
                     if (
                         message.get("schema_version") != protocol
-                        or message.get("control_session_id") != session
+                        or message.get("control_session_number") != session
                     ):
                         raise RuntimeError("control message crossed protocol/session")
                     kind = message["message_kind"]
@@ -70,7 +70,7 @@ def composer_snapshot_stream(composer_url: str, *, client_id: str):
                                 {
                                     "schema_version": protocol,
                                     "message_kind": "heartbeat_echo",
-                                    "control_session_id": session,
+                                    "control_session_number": session,
                                     "client_sequence": str(client_sequence),
                                     "challenge_sequence": message["challenge_sequence"],
                                 }
@@ -96,14 +96,12 @@ def composer_snapshot_stream(composer_url: str, *, client_id: str):
                                     {
                                         "schema_version": protocol,
                                         "message_kind": "state_applied",
-                                        "control_session_id": session,
+                                        "control_session_number": session,
                                         "state_sequence": message["state_sequence"],
                                     }
                                 )
                             )
                         publish(dict(shell))
-                    elif kind == "resync_required":
-                        raise RuntimeError("qualification owner/session was replaced")
             except Exception as error:
                 if not stopped.is_set():
                     publish(error)

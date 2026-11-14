@@ -175,7 +175,8 @@ std::vector<std::string> ExecutionHostUnitAdmission::launch_arguments(
       std::to_string(inherited_channel_fd),
       "--runtime-unit-id",
       product_.runtime_unit_id().value(),
-      "--runtime-epoch",
+      // The 16-hex application-start identity (contract 1.1).
+      "--application-start-id",
       runtime_epoch.value(),
       "--product-identity",
       product_.product_identity().value(),

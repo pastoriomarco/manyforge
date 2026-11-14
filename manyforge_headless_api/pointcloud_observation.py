@@ -14,7 +14,7 @@ from typing import Final, Sequence
 POINTCLOUD_OBSERVATION_MAGIC: Final = b"MFOB"
 POINTCLOUD_OBSERVATION_VERSION: Final = 1
 POINTCLOUD_PROTOCOL_ID: Final = "manyforge.pointcloud_observation.v1"
-POINTCLOUD_STATUS_SCHEMA: Final = "manyforge.viewer_pointcloud_status.v2"
+POINTCLOUD_STATUS_SCHEMA: Final = "manyforge.viewer_pointcloud_status.v3"
 POINTCLOUD_RECEIPT_SCHEMA: Final = "manyforge.pointcloud_observation_receipt.v1"
 # The one point-cloud sender the Composer accepts unless
 # MANYFORGE_POINTCLOUD_OWNER_ID names another (the same setting on both sides).

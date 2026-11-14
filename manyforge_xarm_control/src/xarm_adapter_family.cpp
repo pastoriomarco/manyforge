@@ -245,10 +245,13 @@ std::shared_ptr<xarm::XArmArmAdapter> make_arm(const ComponentAdapterContext &co
                                  context.lifecycle_command_timeout},
       xarm::XArmArmAdapterPorts{
           machine.parts.robot_states, machine.parts.driver, context.lane_adapter,
-          [handle = context.ros2_control](const bool active, const std::stop_token stop) {
+          [handle = context.ros2_control](
+              const bool active,
+              const std::optional<std::chrono::steady_clock::time_point> step_deadline,
+              const std::stop_token stop) {
             return manyforge::roboplan_backend::ros2_control_action_result(
                 active ? core::ComponentAction::kEnable : core::ComponentAction::kDisable,
-                handle->SwitchArmHardware(active, stop));
+                handle->SwitchArmHardware(active, step_deadline, stop));
           },
           [handle = context.ros2_control] { return handle->arm_activity().hardware_active; },
           // The poll of the waits after a re-arm and a TCP offset send.

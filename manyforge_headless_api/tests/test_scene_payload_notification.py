@@ -56,7 +56,7 @@ def request(kind):
 def test_committed_scene_and_exact_receipt_do_not_call_execution_bridge(kind, program_node):
     manager = Manager()
     execution = Execution(manager)
-    service = HeadlessService(object(), manager, execution)
+    service = HeadlessService(object(), manager, execution, application_start_id="3f9a0000000000a1")
     item = request(kind)
     if program_node:
         item.program_node_evidence = object()
@@ -70,7 +70,7 @@ def test_commit_does_not_use_the_execution_owner():
     manager = Manager()
     execution = Execution(manager)
     execution.fail = True
-    service = HeadlessService(object(), manager, execution)
+    service = HeadlessService(object(), manager, execution, application_start_id="3f9a0000000000a1")
     assert service.scene_commit(request("attach_carried_object"), TrustedAttribution()) is COMMITTED
     assert execution.calls == []
 
@@ -79,7 +79,7 @@ def test_uncommitted_result_does_not_notify():
     manager = Manager()
     manager.result = {"ok": False, "projection_status": "not_attempted"}
     execution = Execution(manager)
-    service = HeadlessService(object(), manager, execution)
+    service = HeadlessService(object(), manager, execution, application_start_id="3f9a0000000000a1")
     service.scene_commit(request("attach_carried_object"), TrustedAttribution())
     assert execution.calls == []
 
@@ -89,7 +89,7 @@ def test_unresolved_or_failed_receipt_does_not_notify(result):
     manager = Manager()
     manager.result = result
     execution = Execution(manager)
-    service = HeadlessService(object(), manager, execution)
+    service = HeadlessService(object(), manager, execution, application_start_id="3f9a0000000000a1")
     response = service.scene_transaction_status(request("detach_carried_object"))
     assert response["result"] == result
     assert execution.calls == []

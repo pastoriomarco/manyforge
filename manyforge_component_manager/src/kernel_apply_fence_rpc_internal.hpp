@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -15,7 +17,6 @@ using KernelApplyFenceRpcRequest = std::variant<
     manyforge::core::ConfigurationFenceAdmissionQueryDTO,
     manyforge::core::ApplyConfigurationFenceIntentDTO,
     manyforge::core::ApplyFenceAcquireAttemptQueryDTO,
-    manyforge::core::ApplyFenceRehydrateDTO,
     manyforge::core::ConfigurationFenceStatusQueryDTO,
     manyforge::core::ConfigurationFenceReleaseDTO>;
 
@@ -27,7 +28,6 @@ using KernelApplyFenceRpcResponse = std::variant<
     manyforge::core::ConfigurationFenceAdmissionSnapshotDTO,
     manyforge::core::ConfigurationFenceAcceptedDTO,
     manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO,
-    manyforge::core::ApplyFenceReconcileResultDTO,
     manyforge::core::ConfigurationFenceStatusDTO,
     manyforge::core::ConfigurationFenceReleasedDTO, KernelApplyFenceRpcFailure>;
 
@@ -41,10 +41,27 @@ using KernelApplyFenceRpcResponse = std::variant<
 [[nodiscard]] manyforge::core::ConfigurationFenceScopeDTO
 DecodeConfigurationFenceScopeRecord(std::string_view bytes);
 
+/// The record encoding of one request, as the fence ledger stores it.
 [[nodiscard]] std::string
 EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request);
 [[nodiscard]] KernelApplyFenceRpcRequest
 DecodeKernelApplyFenceRpcRequest(std::string_view bytes);
+
+/// One request on the Manager-child channel: the request record, then the
+/// Manager's current publication, carried by every request except Release.
+struct KernelApplyFenceRpcPacket final {
+  KernelApplyFenceRpcRequest request;
+  std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO>
+      active_publication;
+
+  friend bool operator==(const KernelApplyFenceRpcPacket &,
+                         const KernelApplyFenceRpcPacket &) = default;
+};
+
+[[nodiscard]] std::string
+EncodeKernelApplyFenceRpcPacket(const KernelApplyFenceRpcPacket &packet);
+[[nodiscard]] KernelApplyFenceRpcPacket
+DecodeKernelApplyFenceRpcPacket(std::string_view bytes);
 
 [[nodiscard]] std::string
 EncodeKernelApplyFenceRpcResponse(const KernelApplyFenceRpcResponse &response);

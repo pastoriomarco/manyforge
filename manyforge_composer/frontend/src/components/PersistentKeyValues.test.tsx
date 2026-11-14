@@ -8,7 +8,11 @@ import {
   persistentKeyResetRows,
 } from './PersistentKeyValues';
 
-function values(programRunId: string | null = null): PersistentKeyValues {
+const START = '3f9a000000000001';
+/** An earlier application start: its run numbers are another start's. */
+const EARLIER_START = 'b07c000000000002';
+
+function values(programRunId: number | null = null): PersistentKeyValues {
   return {
     scenarioId: 'cell-pick',
     projectPath: '/projects/cell-pick.scenario',
@@ -27,24 +31,28 @@ function values(programRunId: string | null = null): PersistentKeyValues {
     ],
     edits: [
       {
-        sequence: 4, key: 'layer', action: 'set', requestId: 'request.1', sourceLabel: 'operator_ui',
-        programRunId: null, nodeInstanceId: null, nodeAttemptId: null, reason: null, detail: null,
+        sequence: 4, key: 'layer', action: 'set', applicationStartId: START,
+        requestKey: 'a'.repeat(32), sourceLabel: 'operator_ui', programRunId: null, nodeInstanceId: null, nodeAttemptId: null, reason: null, detail: null,
       },
       {
-        sequence: 5, key: 'layer', action: 'set', requestId: null, sourceLabel: 'program_node',
-        programRunId: 'program-cycle.3', nodeInstanceId: 'set_layer', nodeAttemptId: null,
+        sequence: 5, key: 'layer', action: 'set', applicationStartId: START,
+        requestKey: null, sourceLabel: 'program_node', programRunId: 3, nodeInstanceId: 'set_layer', nodeAttemptId: 2,
         reason: null, detail: null,
       },
     ],
-    storageFault: null,
     applyObservationFault: null,
   };
 }
 
-function render(current: PersistentKeyValues, error: string | null = null) {
+function render(
+  current: PersistentKeyValues,
+  error: string | null = null,
+  applicationStartId: string | null = START,
+) {
   return renderToStaticMarkup(
     <PersistentKeyValuesView
       values={current}
+      applicationStartId={applicationStartId}
       sceneResourceIds={[]}
       pending={false}
       error={error}
@@ -74,16 +82,32 @@ describe('stored persistent values', () => {
     expect(markup).toMatch(/<button type="button">Clear stored values<\/button>/);
     expect(markup).toContain('Recent stored-value edits (2)');
     expect(markup).toContain('<code>4</code> set layer · operator_ui</li>');
-    // A node write names the node and run that made it.
+    // A node write names the node and run that made it, the run in the
+    // display form of the start that wrote it (D4).
     expect(markup).toContain(
-      '<code>5</code> set layer · program_node · node <code>set_layer</code> · run <code>program-cycle.3</code>',
+      '<code>5</code> set layer · program_node · node <code>set_layer</code> · run <code>3f9a/run3</code>',
     );
+    // The run is the edit's own start's, also while the current one is unknown.
+    expect(render(values(), null, null)).toContain(' · run <code>3f9a/run3</code>');
+  });
+
+  it('shows a value written under an earlier start with that start, not the current one', () => {
+    const current = values();
+    const markup = render({
+      ...current,
+      edits: [{ ...current.edits[1], applicationStartId: EARLIER_START }],
+    });
+
+    expect(markup).toContain(
+      '<code>5</code> set layer · program_node · node <code>set_layer</code> · run <code>b07c/run3</code>',
+    );
+    expect(markup).not.toContain('3f9a/run3');
   });
 
   it('routes edits through a live run and keeps Clear for after the run', () => {
-    const markup = render(values('program-cycle.3'), 'persistent_key_run_conflict: refused');
+    const markup = render(values(3), 'persistent_key_run_conflict: refused');
 
-    expect(markup).toContain('Run <code>program-cycle.3</code> holds these values; edits go through it.');
+    expect(markup).toContain('Run <code>3f9a/run3</code> holds these values; edits go through it.');
     expect(markup).toContain('role="alert">persistent_key_run_conflict: refused</p>');
     // A writable key's Reset goes through the live run.
     expect(markup).toMatch(/data-stored-key="layer".*?<button type="button">Reset to initial<\/button>/);
@@ -123,26 +147,21 @@ describe('stored persistent values', () => {
     expect(markup).toContain(`<code> ${missed}</code>`);
   });
 
-  it('names dropped values and a cleanup that could not be stored', () => {
+  it('names dropped values', () => {
     const current = values();
     const markup = render({
       ...current,
       keys: current.keys.map((row) => ({ ...row, stored: false, value: null, sequence: null })),
       edits: [{
-        sequence: 6, key: null, action: 'dropped', requestId: null, sourceLabel: 'committed_apply',
+        sequence: 6, key: null, action: 'dropped', applicationStartId: START,
+        requestKey: null, sourceLabel: 'committed_apply',
         programRunId: null, nodeInstanceId: null, nodeAttemptId: null,
         reason: 'applied_program_not_observed', detail: null,
       }],
-      storageFault: {
-        code: 'persistent_key_storage_unavailable', message: 'read-only file system',
-      },
     });
 
     expect(markup).toContain(
       '<code>6</code> dropped all keys · committed_apply · <code>applied_program_not_observed</code>',
-    );
-    expect(markup).toMatch(
-      /role="alert">Stored values could not follow the last committed Apply\s*\(persistent_key_storage_unavailable\); none are shown or restored until they can\. read-only file system<\/p>/,
     );
   });
 });

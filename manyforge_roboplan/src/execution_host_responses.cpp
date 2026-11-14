@@ -3,6 +3,7 @@
 #include "execution_host_posix.hpp"
 #include "cell_admission_command_codec.hpp"
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_roboplan/controller_launch_process.hpp>
@@ -61,8 +62,7 @@ ErrorResponse(std::string code, std::string message,
 }
 
 [[nodiscard]] CanonicalValue ExecutionOwnerNotReadyIdentityResponse(
-    const core::ResourceAddressedExecutionKernel &owner,
-    const core::RequestOwnerEpoch &owner_epoch) {
+    const core::ResourceAddressedExecutionKernel &owner) {
   const auto admission = owner.GetAuthoringAdmission();
   return CanonicalValue(CanonicalValue::Object{
       {"admission_generation", CanonicalValue(static_cast<double>(
@@ -72,7 +72,7 @@ ErrorResponse(std::string code, std::string message,
        ErrorValue(core::ErrorDTO{
            "execution_owner_not_ready",
            "the managed execution owner has no active physical product",
-           {{"owner_epoch", owner_epoch.value()}}}, "kernel")},
+           {}}, "kernel")},
       {"ok", CanonicalValue(false)},
   });
 }
@@ -224,7 +224,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
     const core::RuntimeParticipantBindingDTO &direct_control_binding,
-    const core::RequestOwnerEpoch &owner_epoch,
     const CanonicalValue &path_preview) {
   const auto &binding = direct_control_binding;
   const auto &final_state = preview.final_controlled_state;
@@ -285,9 +284,8 @@ SceneRevisionValue(const core::SceneRevision &value) {
        CanonicalValue(binding.program_binding_id.value())},
       {"program_id", CanonicalValue(binding.program_id.value())},
       {"program_revision", CanonicalValue(binding.program_revision.value())},
-      {"program_run_id", CanonicalValue(intent.program_run_id.value())},
-      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
-      {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"program_run_id", RunValue(intent.program_run_id)},
+      {"request_key", CanonicalValue(RequestKeyText(intent.request_context.request_key))},
       {"required_capability_id",
        CanonicalValue(
            intent.participants.front().required_capability_id.value())},
@@ -297,7 +295,7 @@ SceneRevisionValue(const core::SceneRevision &value) {
        SceneRevisionValue(
            preview.projection_binding.projection_revision.scene_revision)},
       {"schema_version",
-       CanonicalValue("manyforge.direct_control_motion_preview.v4")},
+       CanonicalValue("manyforge.direct_control_motion_preview.v5")},
       {"resolved_tcp", CanonicalValue(CanonicalValue::Object{
           {"entry", CanonicalValue(CanonicalValue::Object{
               {"target", CanonicalValue(CanonicalValue::Object{
@@ -309,7 +307,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
           {"source", CanonicalValue(
               tcp.source == core::PreviewTcpCaptureSource::kJointFlangeFallback ? "joint_flange_fallback" :
               tcp.source == core::PreviewTcpCaptureSource::kExplicitEntry ? "explicit_entry" : "active_tcp")},
-          {"owner_epoch", CanonicalValue(owner_epoch.value())},
           {"registration_generation", CanonicalValue(static_cast<double>(tcp.registration_generation))},
           {"sequence", CanonicalValue(static_cast<double>(tcp.sequence))}})},
       {"path_preview", path_preview},
@@ -330,8 +327,7 @@ SceneRevisionValue(const core::SceneRevision &value) {
     const core::CapabilityCommandPreviewResultDTO &preview,
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
-    const std::optional<RetainedGripperPositionLimits> &limits,
-    const core::RequestOwnerEpoch &owner_epoch) {
+    const std::optional<RetainedGripperPositionLimits> &limits) {
   const auto &binding = preview.binding;
   Require(binding.resources.size() == 1U,
           "capability-command preview has no exact scalar resource");
@@ -379,9 +375,8 @@ SceneRevisionValue(const core::SceneRevision &value) {
        CanonicalValue(binding.program_binding_id.value())},
       {"program_id", CanonicalValue(binding.program_id.value())},
       {"program_revision", CanonicalValue(binding.program_revision.value())},
-      {"program_run_id", CanonicalValue(intent.program_run_id.value())},
-      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
-      {"request_owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"program_run_id", RunValue(intent.program_run_id)},
+      {"request_key", CanonicalValue(RequestKeyText(intent.request_context.request_key))},
       {"required_capability_id",
        CanonicalValue(
            intent.participants.front().required_capability_id.value())},
@@ -389,7 +384,7 @@ SceneRevisionValue(const core::SceneRevision &value) {
        CanonicalValue(binding.retained_bundle_id.value())},
       {"schema_version",
        CanonicalValue(
-           "manyforge.direct_control_capability_command_preview.v2")},
+           "manyforge.direct_control_capability_command_preview.v3")},
       {"source_coordinate_name", CanonicalValue(source_coordinate_name)},
       {"source_kind",
        CanonicalValue(model_backed ? "model_role" : "component_local")},
@@ -618,19 +613,19 @@ AcceptedValue(const core::OperationAcceptedDTO &value) {
     assignments.emplace_back(CanonicalValue::Object{
         {"input_index",
          CanonicalValue(static_cast<double>(assignment.input_index))},
-        {"participant_id", CanonicalValue(assignment.participant_id.value())},
+        {"participant_id", core::OperationParticipantIdValue(assignment.participant_id)},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
                              value.accepted_at_ns)},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
       {"operation_revision",
        CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participant_assignments", CanonicalValue(std::move(assignments))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
-      {"request_id", CanonicalValue(value.request_id.value())},
+      {"request_key", CanonicalValue(RequestKeyText(value.request_key))},
   });
 }
 
@@ -653,204 +648,74 @@ ControlAcceptedValue(const core::OperationControlAcceptedDTO &value) {
       {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
                              value.accepted_at_ns)},
       {"control", CanonicalValue(std::string(ControlName(value.control)))},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
       {"operation_revision_after_acceptance",
        CanonicalValue(static_cast<double>(
            value.operation_revision_after_acceptance.value()))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
-      {"request_id", CanonicalValue(value.request_id.value())},
+      {"request_key", CanonicalValue(RequestKeyText(value.request_key))},
   });
 }
 
 [[nodiscard]] CanonicalValue
 StopAcceptedValue(const core::StopAcceptedDTO &value) {
-  const auto diagnostic_target = [](const auto &target) {
-    return std::visit(
-        [](const auto &selected) -> CanonicalValue {
-          using Target = std::decay_t<decltype(selected)>;
-          if constexpr (std::is_same_v<Target, std::monostate>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("cell")},
-                {"value", CanonicalValue(nullptr)},
-            });
-          } else if constexpr (std::is_same_v<Target, core::OperationId>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("operation_id")},
-                {"value", CanonicalValue(selected.value())},
-            });
-          } else if constexpr (std::is_same_v<Target,
-                                              core::ControllableComponentId>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("controllable_component_id")},
-                {"value", CanonicalValue(selected.value())},
-            });
-          } else {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("resource_id")},
-                {"value", CanonicalValue(selected.value())},
-            });
-          }
-        },
-        target);
-  };
-  const auto diagnostic_value = [](const auto &candidate) {
-    return std::visit(
-        [](const auto &selected) -> CanonicalValue {
-          using Value = std::decay_t<decltype(selected)>;
-          if constexpr (std::is_same_v<Value, std::uint64_t>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("unsigned_integer")},
-                {"value", CanonicalValue(static_cast<double>(selected))},
-            });
-          } else if constexpr (std::is_same_v<Value, core::RequestOwnerEpoch>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("request_owner_epoch")},
-                {"value", CanonicalValue(selected.value())},
-            });
-          } else if constexpr (std::is_same_v<Value, core::GraphRevision>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("graph_revision")},
-                {"value", CanonicalValue(selected.value())},
-            });
-          } else if constexpr (std::is_same_v<Value, core::OperationRevision>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("operation_revision")},
-                {"value",
-                 CanonicalValue(static_cast<double>(selected.value()))},
-            });
-          } else if constexpr (std::is_same_v<
-                                   Value, core::ComponentLifecycleGeneration>) {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("component_lifecycle_generation")},
-                {"value",
-                 CanonicalValue(static_cast<double>(selected.value()))},
-            });
-          } else {
-            return CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("stop_generation")},
-                {"value",
-                 CanonicalValue(static_cast<double>(selected.value()))},
-            });
-          }
-        },
-        candidate);
-  };
-
-  CanonicalValue::Array stale_diagnostics;
-  stale_diagnostics.reserve(value.stale_diagnostics.size());
+  CanonicalValue::Array covered;
+  covered.reserve(value.covered.size());
+  for (const auto &participant : value.covered) {
+    covered.emplace_back(CanonicalValue::Object{
+        {"operation_id",
+         CanonicalValue(static_cast<double>(participant.operation_id.value()))},
+        {"participant_ordinal",
+         CanonicalValue(static_cast<double>(participant.participant_ordinal))},
+        {"started", CanonicalValue(participant.started)},
+    });
+  }
+  CanonicalValue::Array stale;
+  stale.reserve(value.stale_diagnostics.size());
   for (const auto &diagnostic : value.stale_diagnostics) {
-    stale_diagnostics.emplace_back(CanonicalValue::Object{
-        {"current", diagnostic_value(diagnostic.current)},
-        {"expected", diagnostic_value(diagnostic.expected)},
-        {"field",
-         CanonicalValue(std::string(core::to_string(diagnostic.field)))},
-        {"target", diagnostic_target(diagnostic.target)},
-    });
-  }
-
-  CanonicalValue::Array affected_operations;
-  affected_operations.reserve(value.affected_operation_revisions.size());
-  for (const auto &operation : value.affected_operation_revisions) {
-    affected_operations.emplace_back(CanonicalValue::Object{
-        {"operation_id", CanonicalValue(operation.operation_id.value())},
-        {"operation_revision_after_acceptance",
+    stale.emplace_back(CanonicalValue::Object{
+        {"current_operation_revision",
          CanonicalValue(static_cast<double>(
-             operation.operation_revision_after_acceptance.value()))},
-    });
-  }
-
-  CanonicalValue::Array predecessors;
-  predecessors.reserve(value.joined_predecessor_stops.size());
-  for (const auto &predecessor : value.joined_predecessor_stops) {
-    predecessors.emplace_back(CanonicalValue::Object{
-        {"captured_scope_digest",
-         CanonicalValue(predecessor.captured_scope_digest.value())},
-        {"predecessor_stop_generation",
+             diagnostic.current_operation_revision.value()))},
+        {"expected_operation_revision",
          CanonicalValue(static_cast<double>(
-             predecessor.predecessor_stop_generation.value()))},
-        {"predecessor_stop_id",
-         CanonicalValue(predecessor.predecessor_stop_id.value())},
+             diagnostic.expected_operation_revision.value()))},
+        {"operation_id",
+         CanonicalValue(static_cast<double>(diagnostic.operation_id.value()))},
     });
   }
-
   return CanonicalValue(CanonicalValue::Object{
       {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
                              value.accepted_at_ns)},
-      {"affected_operation_revisions",
-       CanonicalValue(std::move(affected_operations))},
-      {"captured_scope_digest",
-       CanonicalValue(value.captured_scope_digest.value())},
-      {"joined_predecessor_stops", CanonicalValue(std::move(predecessors))},
+      {"applied", CanonicalValue(std::string(core::to_string(value.applied)))},
+      {"covered", CanonicalValue(std::move(covered))},
+      {"event_id", CanonicalValue(static_cast<double>(value.event_id.value()))},
+      {"hold_revision", CanonicalValue(static_cast<double>(value.hold_revision))},
+      {"program_run_id", RunValue(value.program_run_id)},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
-      {"request_id", CanonicalValue(value.request_id.value())},
-      {"requested_selector_digest",
-       CanonicalValue(value.requested_selector_digest.value())},
-      {"resolution_disposition", CanonicalValue(std::string(core::to_string(
-                                     value.resolution_disposition)))},
-      {"resolution_reason",
-       CanonicalValue(std::string(core::to_string(value.resolution_reason)))},
-      {"stale_diagnostics", CanonicalValue(std::move(stale_diagnostics))},
-      {"stop_generation",
-       CanonicalValue(static_cast<double>(value.stop_generation.value()))},
-      {"stop_id", CanonicalValue(value.stop_id.value())},
+      {"request_key", CanonicalValue(RequestKeyText(value.request_key))},
+      {"requested",
+       CanonicalValue(std::string(core::to_string(value.requested)))},
+      {"stale_diagnostics", CanonicalValue(std::move(stale))},
+      {"stale_total", CanonicalValue(static_cast<double>(value.stale_total))},
+      {"widen_reason",
+       CanonicalValue(std::string(core::to_string(value.widen_reason)))},
   });
-}
-
-[[nodiscard]] std::string_view StopProjectionStateName(
-    const core::StopDurableProjectionStateDTO state) noexcept {
-  switch (state) {
-  case core::StopDurableProjectionStateDTO::kNotApplicable:
-    return "not_applicable";
-  case core::StopDurableProjectionStateDTO::kPending:
-    return "pending";
-  case core::StopDurableProjectionStateDTO::kRecorded:
-    return "recorded";
-  case core::StopDurableProjectionStateDTO::kFailed:
-    return "failed";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view
-StopStatusStateName(const core::StopStatusStateDTO state) noexcept {
-  switch (state) {
-  case core::StopStatusStateDTO::kAccepted:
-    return "accepted";
-  case core::StopStatusStateDTO::kStopping:
-    return "stopping";
-  case core::StopStatusStateDTO::kCertifying:
-    return "certifying";
-  case core::StopStatusStateDTO::kSucceeded:
-    return "succeeded";
-  case core::StopStatusStateDTO::kPartial:
-    return "partial";
-  case core::StopStatusStateDTO::kFailed:
-    return "failed";
-  }
-  return "unknown";
 }
 
 [[nodiscard]] CanonicalValue
-StopCertificateRefValue(const core::StopCertificateRefDTO &value) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"stop_certificate_id",
-       CanonicalValue(value.stop_certificate_id.value())},
-      {"stop_certificate_revision",
-       CanonicalValue(
-           static_cast<double>(value.stop_certificate_revision.value()))},
-      {"stop_generation",
-       CanonicalValue(static_cast<double>(value.stop_generation.value()))},
-      {"stop_id", CanonicalValue(value.stop_id.value())},
-  });
+StopEventIdValue(const std::optional<core::StopEventId> &value) {
+  return value ? CanonicalValue(static_cast<double>(value->value()))
+               : CanonicalValue(nullptr);
 }
 
 [[nodiscard]] CanonicalValue
 ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
   // Group sparse node indices by state. Repeating field names for each of
   // 100,000 captured nodes exceeds the bounded native response envelope.
-  CanonicalValue::Array ready, held, stopping, faulted, pending;
+  CanonicalValue::Array ready, held, stopping, faulted;
   for (const auto &node : value.held_nodes) {
     auto *indices =
         node.state == core::ProgramNodeHoldStateDTO::kReady      ? &ready
@@ -861,32 +726,17 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
     if (indices != nullptr)
       indices->emplace_back(static_cast<double>(node.node_index));
   }
-  for (const auto &effect : value.pending_effects) {
-    pending.emplace_back(CanonicalValue::Object{
-        {"node_index", CanonicalValue(static_cast<double>(effect.node_index))},
-        {"operation_id", CanonicalValue(effect.operation_id.value())},
-        {"participant_id", CanonicalValue(effect.participant_id.value())},
-        {"stop_id", CanonicalValue(effect.stop_id.value())},
-        {"stop_generation",
-         CanonicalValue(static_cast<double>(effect.stop_generation.value()))}});
-  }
   return CanonicalValue(CanonicalValue::Object{
       {"schema_version",
-       CanonicalValue("manyforge.program_execution_scope.v2")},
-      {"request_owner_epoch",
-       CanonicalValue(value.request_owner_epoch.value())},
-      {"program_runner_owner_epoch",
-       CanonicalValue(value.program_runner_owner_epoch.value())},
+       CanonicalValue(std::string(core::kProgramExecutionScopeSchema))},
       {"claim_generation",
        CanonicalValue(static_cast<double>(value.claim_generation.value()))},
-      {"program_run_id", CanonicalValue(value.program_run_id.value())},
-      {"selection_revision",
-       CanonicalValue(static_cast<double>(value.selection_revision))},
+      {"program_run_id", CanonicalValue(static_cast<double>(value.program_run_id.value()))},
+      {"hold_revision", CanonicalValue(static_cast<double>(value.hold_revision))},
       {"ready_node_indices", CanonicalValue(std::move(ready))},
       {"held_node_indices", CanonicalValue(std::move(held))},
       {"stopping_node_indices", CanonicalValue(std::move(stopping))},
       {"faulted_node_indices", CanonicalValue(std::move(faulted))},
-      {"pending_effects", CanonicalValue(std::move(pending))},
       {"selection_release_block_reason",
        value.selection_release_block_reason.has_value()
            ? CanonicalValue(std::string(
@@ -896,7 +746,161 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
       // A rule's `hold` held the run (stopped_by: rule).
       {"stopped_by", value.stopped_by_rule_id ? CanonicalValue("rule") : CanonicalValue(nullptr)},
       {"rule_id", value.stopped_by_rule_id ? CanonicalValue(*value.stopped_by_rule_id)
-                                           : CanonicalValue(nullptr)}});
+                                           : CanonicalValue(nullptr)},
+      {"frozen", CanonicalValue(std::string(core::to_string(value.frozen)))},
+      {"frozen_by", StopEventIdValue(value.frozen_by)},
+      {"all_groups_held", CanonicalValue(value.all_groups_held)}});
+}
+
+[[nodiscard]] CanonicalValue
+ProgramRunHoldValue(const std::optional<core::ProgramRunHoldFactsDTO> &value) {
+  if (!value) return CanonicalValue(nullptr);
+  const auto &hold = *value;
+  return CanonicalValue(CanonicalValue::Object{
+      {"program_run_id", CanonicalValue(static_cast<double>(hold.program_run_id.value()))},
+      {"hold_revision", CanonicalValue(static_cast<double>(hold.hold_revision))},
+      {"frozen", CanonicalValue(std::string(core::to_string(hold.frozen)))},
+      {"frozen_by", StopEventIdValue(hold.frozen_by)},
+      {"all_groups_held", CanonicalValue(hold.all_groups_held)},
+      {"held_by_rule", hold.held_by_rule ? CanonicalValue(hold.held_by_rule->value())
+                                         : CanonicalValue(nullptr)},
+      // The freezing event's requested kind and source label (null when not
+      // frozen or its record is no longer resident).
+      {"frozen_kind", hold.frozen_kind
+                          ? CanonicalValue(std::string(core::to_string(*hold.frozen_kind)))
+                          : CanonicalValue(nullptr)},
+      {"frozen_source_label", hold.frozen_source_label
+                                  ? CanonicalValue(*hold.frozen_source_label)
+                                  : CanonicalValue(nullptr)}});
+}
+
+void AppendStopStreamFacts(CanonicalValue::Object &state,
+                           const core::StopStreamFactsDTO &facts) {
+  state.emplace_back("program_run_hold", ProgramRunHoldValue(facts.program_run_hold));
+  state.emplace_back("last_stop_event_id", StopEventIdValue(facts.last_stop_event_id));
+  state.emplace_back("stop_progress_sequence",
+                     CanonicalValue(static_cast<double>(facts.stop_progress_sequence)));
+}
+
+namespace {
+
+[[nodiscard]] CanonicalValue OptionalText(const std::optional<std::string> &text) {
+  return text ? CanonicalValue(*text) : CanonicalValue(nullptr);
+}
+
+[[nodiscard]] std::string_view FactErrorName(const core::OperationTableFactError error) {
+  switch (error) {
+  case core::OperationTableFactError::kNone:
+    return "none";
+  case core::OperationTableFactError::kSameAsTerminalError:
+    return "same";
+  case core::OperationTableFactError::kDifferent:
+    return "different";
+  }
+  return "different";
+}
+
+[[nodiscard]] CanonicalValue
+OperationTableEntryValue(const core::OperationTableEntryDTO &entry) {
+  CanonicalValue monitor_stop(nullptr);
+  if (entry.runtime_monitor_stop) {
+    const auto &stop = *entry.runtime_monitor_stop;
+    monitor_stop = CanonicalValue(CanonicalValue::Object{
+        {"reason", CanonicalValue(std::string(stop.reason.view()))},
+        {"request_key", CanonicalValue(core::RequestKeyText(stop.request_key))},
+        {"source_label", CanonicalValue(std::string(stop.source_label.view()))},
+    });
+  }
+  CanonicalValue::Object value{
+      {"complete", CanonicalValue(entry.complete)},
+      {"operation_id", CanonicalValue(static_cast<double>(entry.operation_id.value()))},
+      {"operation_revision",
+       CanonicalValue(static_cast<double>(entry.operation_revision.value()))},
+      {"pending_control",
+       entry.pending_control
+           ? CanonicalValue(std::string(ControlName(*entry.pending_control)))
+           : CanonicalValue(nullptr)},
+      {"runtime_monitor_stop", std::move(monitor_stop)},
+      {"state", CanonicalValue(std::string(StateName(entry.state)))},
+      {"stop_event_id", StopEventIdValue(entry.stop_event_id)},
+  };
+  if (!entry.complete) return CanonicalValue(std::move(value));
+  CanonicalValue::Array resources;
+  for (const auto &resource : entry.resources) resources.emplace_back(resource.value());
+  CanonicalValue::Array participants;
+  for (const auto &participant : entry.participants) {
+    CanonicalValue fact(nullptr);
+    if (participant.terminal_fact) {
+      fact = CanonicalValue(CanonicalValue::Object{
+          {"effect", CanonicalValue(core::to_string(participant.terminal_fact->effect))},
+          {"error",
+           CanonicalValue(std::string(FactErrorName(participant.terminal_fact->error)))},
+          {"kind", CanonicalValue(core::to_string(participant.terminal_fact->kind))},
+      });
+    }
+    participants.emplace_back(CanonicalValue::Object{
+        {"execution_scope", CanonicalValue(participant.execution_scope)},
+        {"state", CanonicalValue(std::string(StateName(participant.state)))},
+        {"terminal_error",
+         participant.terminal_error
+             ? CanonicalValue(CanonicalValue::Object{
+                   {"reason", OptionalText(participant.terminal_error_reason)}})
+             : CanonicalValue(nullptr)},
+        {"terminal_fact", std::move(fact)},
+    });
+  }
+  CanonicalValue error(nullptr);
+  if (entry.terminal_error) {
+    error = CanonicalValue(CanonicalValue::Object{
+        {"code", CanonicalValue(entry.terminal_error->code)},
+        {"message", CanonicalValue(entry.terminal_error->message)},
+        {"message_truncated", CanonicalValue(entry.terminal_error->message_truncated)},
+        {"reason", OptionalText(entry.terminal_error->reason)},
+    });
+  }
+  value.emplace_back("participants", CanonicalValue(std::move(participants)));
+  value.emplace_back("program_binding_id", CanonicalValue(entry.program_binding_id));
+  value.emplace_back("program_run_id", RunValue(entry.program_run_id));
+  value.emplace_back("resource_total",
+                     CanonicalValue(static_cast<double>(entry.resource_total)));
+  value.emplace_back("resources", CanonicalValue(std::move(resources)));
+  value.emplace_back("terminal_error", std::move(error));
+  return CanonicalValue(std::move(value));
+}
+
+} // namespace
+
+CanonicalValue OperationTableValue(const core::OperationTableDTO &table) {
+  CanonicalValue::Array faulted;
+  faulted.reserve(table.faulted.size());
+  for (const auto &entry : table.faulted)
+    faulted.push_back(OperationTableEntryValue(entry));
+  // OD-213: every resident operation with the `read` reply's members but
+  // `resident` (true for each) and `active_tcp` (the state's own baseline).
+  CanonicalValue::Array resident;
+  resident.reserve(table.resident.size());
+  for (const auto &projection : table.resident) {
+    auto operation = OperationTableStateValue(projection.operation);
+    if (content_identity::canonical_json(operation).size() >
+        core::kOperationTableMaximumResidentOperationBytes)
+      operation = CanonicalValue(nullptr);
+    resident.emplace_back(CanonicalValue::Object{
+        {"control_pending", CanonicalValue(projection.control_pending)},
+        {"last_control", projection.last_control.has_value()
+                             ? ControlAcceptedValue(*projection.last_control)
+                             : CanonicalValue(nullptr)},
+        {"operation", std::move(operation)},
+        {"operation_id",
+         CanonicalValue(static_cast<double>(projection.operation.operation_id.value()))},
+    });
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"change", CanonicalValue(static_cast<double>(table.change))},
+      {"faulted", CanonicalValue(std::move(faulted))},
+      {"faulted_total", CanonicalValue(static_cast<double>(table.faulted_total))},
+      {"resident", CanonicalValue(std::move(resident))},
+      {"resident_total", CanonicalValue(static_cast<double>(table.resident_total))},
+  });
 }
 
 [[nodiscard]] CanonicalValue ProgramSelectionAcceptedValue(
@@ -911,864 +915,77 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
       result.emplace_back(static_cast<double>(index));
     return CanonicalValue(std::move(result));
   };
-  CanonicalValue containment(nullptr);
-  if (value.fresh_containment.has_value()) {
-    const auto &stop = *value.fresh_containment;
-    // Existing operation/Stop queries own recovery evidence. This result
-    // identifies physical work without duplicating its budget/certificate.
-    containment = CanonicalValue(CanonicalValue::Object{
-        {"stop_id", CanonicalValue(stop.stop_id.value())},
-        {"stop_generation",
-         CanonicalValue(static_cast<double>(stop.stop_generation.value()))},
-        {"resolution_disposition", CanonicalValue(std::string(core::to_string(
-                                       stop.resolution_disposition)))}});
-  }
   return CanonicalValue(CanonicalValue::Object{
+      {"schema_version",
+       CanonicalValue(std::string(core::kProgramExecutionSelectionSchema))},
       {"state", value.state.has_value()
                     ? ProgramExecutionScopeValue(*value.state)
                     : CanonicalValue(nullptr)},
       {"group_ids", CanonicalValue(std::move(groups))},
+      {"selected_node_indices", indices(value.selected_node_indices)},
       {"widened_node_indices", indices(value.widened_node_indices)},
-      {"fresh_containment", std::move(containment)},
-      {"selection_error", value.selection_error.has_value()
-                              ? ErrorValue(*value.selection_error)
-                              : CanonicalValue(nullptr)},
-      {"replay_status",
-       CanonicalValue(value.replay_status ==
-                              core::RequestReplayStatusDTO::kReplayedExact
-                          ? "replayed_exact"
-                          : "accepted_new")}});
+      {"stop", StopAcceptedValue(value.stop)}});
 }
 
 [[nodiscard]] CanonicalValue
-StopStatusSummaryValue(const core::StopStatusDTO &value) {
-  const auto terminal_projection = StopProjectionStateName(value.terminal_projection.state);
-  Require(terminal_projection == "pending" || terminal_projection == "recorded" ||
-              terminal_projection == "failed",
-          "Stop terminal projection status is invalid");
-  return CanonicalValue(CanonicalValue::Object{
-      {"request_id", CanonicalValue(value.accepted.request_id.value())},
-      {"schema_version", CanonicalValue("manyforge.execution_stop_status.v1")},
-      {"state", CanonicalValue(std::string(StopStatusStateName(value.state)))},
-      {"stop_generation", CanonicalValue(static_cast<double>(
-                              value.accepted.stop_generation.value()))},
-      {"stop_id", CanonicalValue(value.accepted.stop_id.value())},
-      {"terminal_projection", CanonicalValue(std::string(terminal_projection))},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-StopProjectionStatusValue(const core::StopDurableProjectionStatusDTO &value) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"error", value.error.has_value() ? ErrorValue(*value.error)
+StopEventStatusValue(const core::StopEventStatusDTO &value) {
+  CanonicalValue::Array covered;
+  covered.reserve(value.covered.size());
+  for (const auto &entry : value.covered) {
+    covered.emplace_back(CanonicalValue::Object{
+        {"operation_id", CanonicalValue(static_cast<double>(entry.operation_id.value()))},
+        {"participant_ordinal",
+         CanonicalValue(static_cast<double>(entry.participant_ordinal))},
+        {"started", CanonicalValue(entry.started)},
+        {"done", CanonicalValue(entry.done)},
+        {"phase", CanonicalValue(std::string(core::to_string(entry.phase)))},
+        {"containing_stage_index",
+         entry.containing_stage_index
+             ? CanonicalValue(static_cast<double>(*entry.containing_stage_index))
+             : CanonicalValue(nullptr)},
+        {"escalated", CanonicalValue(entry.escalated)},
+        {"stop_path_collision", CanonicalValue(entry.stop_path_collision)},
+        {"error_code", entry.error_code ? CanonicalValue(*entry.error_code)
                                         : CanonicalValue(nullptr)},
-      {"retry_generation",
-       value.retry_generation.has_value()
-           ? CanonicalValue(static_cast<double>(*value.retry_generation))
-           : CanonicalValue(nullptr)},
-      {"state",
-       CanonicalValue(std::string(StopProjectionStateName(value.state)))},
-  });
-}
-
-[[nodiscard]] std::string_view
-StopCertificateResultName(core::StopCertificateResultDTO result) noexcept {
-  switch (result) {
-  case core::StopCertificateResultDTO::kSucceededNominal:
-    return "succeeded_nominal";
-  case core::StopCertificateResultDTO::kSucceededEscalated:
-    return "succeeded_escalated";
-  case core::StopCertificateResultDTO::kPartial:
-    return "partial";
-  case core::StopCertificateResultDTO::kFailedUncontained:
-    return "failed_uncontained";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view
-StopStageOutcomeName(core::ParticipantStopStageOutcomeDTO outcome) noexcept {
-  switch (outcome) {
-  case core::ParticipantStopStageOutcomeDTO::kSucceeded:
-    return "succeeded";
-  case core::ParticipantStopStageOutcomeDTO::kPartial:
-    return "partial";
-  case core::ParticipantStopStageOutcomeDTO::kFailed:
-    return "failed";
-  case core::ParticipantStopStageOutcomeDTO::kSupersededNoEffect:
-    return "superseded_no_effect";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view StopAttemptDispositionName(
-    const core::StopStageAttemptDispositionDTO disposition) noexcept {
-  switch (disposition) {
-  case core::StopStageAttemptDispositionDTO::kNotDispatched:
-    return "not_dispatched";
-  case core::StopStageAttemptDispositionDTO::kDispatched:
-    return "dispatched";
-  case core::StopStageAttemptDispositionDTO::kEffectUncertain:
-    return "effect_uncertain";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view
-StopEvidenceStateName(const core::StopEvidenceItemStateDTO state) noexcept {
-  switch (state) {
-  case core::StopEvidenceItemStateDTO::kRequiredPending:
-    return "required_pending";
-  case core::StopEvidenceItemStateDTO::kSatisfied:
-    return "satisfied";
-  case core::StopEvidenceItemStateDTO::kMissing:
-    return "missing";
-  case core::StopEvidenceItemStateDTO::kFailed:
-    return "failed";
-  case core::StopEvidenceItemStateDTO::kInapplicable:
-    return "inapplicable";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view StopStageAuthorityName(
-    const core::StopStageResultAuthorityDTO authority) noexcept {
-  switch (authority) {
-  case core::StopStageResultAuthorityDTO::kAuthoritative:
-    return "authoritative";
-  case core::StopStageResultAuthorityDTO::kSupersededLate:
-    return "superseded_late";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view StopParticipantSettlementName(
-    const core::StopParticipantScopeFactsDTO::TerminalSettlementState
-        settlement) noexcept {
-  using State = core::StopParticipantScopeFactsDTO::TerminalSettlementState;
-  switch (settlement) {
-  case State::kNotRequired:
-    return "not_required";
-  case State::kPending:
-    return "pending";
-  case State::kSettled:
-    return "settled";
-  case State::kContainedUnsettled:
-    return "contained_unsettled";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view
-StopSelectorKindName(const core::StopRequestedSelectorKindDTO kind) noexcept {
-  switch (kind) {
-  case core::StopRequestedSelectorKindDTO::kOrdinaryOperations:
-    return "ordinary_operations";
-  case core::StopRequestedSelectorKindDTO::kOrdinaryComponents:
-    return "ordinary_components";
-  case core::StopRequestedSelectorKindDTO::kOrdinaryResources:
-    return "ordinary_resources";
-  case core::StopRequestedSelectorKindDTO::kExplicitFull:
-    return "explicit_full";
-  case core::StopRequestedSelectorKindDTO::kMalformedIngress:
-    return "malformed_ingress";
-  case core::StopRequestedSelectorKindDTO::kInternalProgramRun:
-    return "internal_program_run";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] std::string_view
-MotionInterruptStopModeName(const core::MotionInterruptStopMode mode) noexcept {
-  switch (mode) {
-  case core::MotionInterruptStopMode::kSoftOnPath:
-    return "soft_on_path";
-  case core::MotionInterruptStopMode::kSpringBackHold:
-    return "spring_back_hold";
-  case core::MotionInterruptStopMode::kHardDeceleration:
-    return "hard_deceleration";
-  case core::MotionInterruptStopMode::kSpringBackFast:
-    return "spring_back_fast";
-  }
-  return "unknown";
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryJsonValue(const core::JsonValueDTO &value) {
-  return std::visit(
-      [](const auto &current) -> CanonicalValue {
-        using Value = std::decay_t<decltype(current)>;
-        if constexpr (std::is_same_v<Value, std::nullptr_t>) {
-          return CanonicalValue(nullptr);
-        } else if constexpr (std::is_same_v<Value, bool> ||
-                             std::is_same_v<Value, double> ||
-                             std::is_same_v<Value, std::string>) {
-          return CanonicalValue(current);
-        } else if constexpr (std::is_same_v<Value, core::JsonValueDTO::Array>) {
-          CanonicalValue::Array projected;
-          projected.reserve(current.size());
-          for (const auto &item : current) {
-            projected.emplace_back(StopHistoryJsonValue(item));
-          }
-          return CanonicalValue(std::move(projected));
-        } else {
-          CanonicalValue::Object projected;
-          projected.reserve(current.size());
-          for (const auto &[name, item] : current) {
-            projected.emplace_back(name, StopHistoryJsonValue(item));
-          }
-          return CanonicalValue(std::move(projected));
-        }
-      },
-      value.value);
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryStructuredValue(const core::InterruptStructuredValue &value) {
-  CanonicalValue::Object projected;
-  projected.reserve(value.size());
-  for (const auto &[name, item] : value) {
-    projected.emplace_back(
-        name,
-        std::visit([](const auto &typed) { return CanonicalValue(typed); },
-                   item));
-  }
-  return CanonicalValue(std::move(projected));
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryAccelerationValue(const core::CoordinateAccelerationDTO &value) {
-  return std::visit(
-      [](const auto &typed) -> CanonicalValue {
-        using Acceleration = std::decay_t<decltype(typed)>;
-        if constexpr (std::is_same_v<Acceleration,
-                                     core::AngularAccelerationDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("angular")},
-              {"value_rad_s2", CanonicalValue(typed.value_rad_s2)},
-          });
-        } else {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("linear")},
-              {"value_m_s2", CanonicalValue(typed.value_m_s2)},
-          });
-        }
-      },
-      value);
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryVelocityValue(const core::CoordinateVelocityDTO &value) {
-  return std::visit(
-      [](const auto &typed) -> CanonicalValue {
-        using Velocity = std::decay_t<decltype(typed)>;
-        if constexpr (std::is_same_v<Velocity, core::AngularVelocityDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("angular")},
-              {"value_rad_s", CanonicalValue(typed.value_rad_s)},
-          });
-        } else {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("linear")},
-              {"value_m_s", CanonicalValue(typed.value_m_s)},
-          });
-        }
-      },
-      value);
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryScopeKeyValue(const core::StopScopeEntryKeyDTO &key) {
-  const auto subject = std::visit(
-      [](const auto &typed) -> CanonicalValue {
-        using Subject = std::decay_t<decltype(typed)>;
-        if constexpr (std::is_same_v<Subject,
-                                     core::StopParticipantScopeKeyDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("participant")},
-              {"operation_id", CanonicalValue(typed.operation_id.value())},
-              {"participant_id", CanonicalValue(typed.participant_id.value())},
-          });
-        } else {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("resource")},
-              {"resource_id", CanonicalValue(typed.value())},
-          });
-        }
-      },
-      key.subject);
-  return CanonicalValue(CanonicalValue::Object{
-      {"origin_stop_generation",
-       CanonicalValue(static_cast<double>(key.origin_stop_generation.value()))},
-      {"origin_stop_id", CanonicalValue(key.origin_stop_id.value())},
-      {"subject", subject},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryScopeKeyArray(const std::vector<core::StopScopeEntryKeyDTO> &keys) {
-  CanonicalValue::Array values;
-  values.reserve(keys.size());
-  for (const auto &key : keys) {
-    values.emplace_back(StopHistoryScopeKeyValue(key));
-  }
-  return CanonicalValue(std::move(values));
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryProfileValue(const core::MotionInterruptStopProfileDTO &profile) {
-  CanonicalValue::Object jerk;
-  for (const auto &[joint, limit] : profile.per_joint_max_jerk) {
-    jerk.emplace_back(
-        joint,
-        std::visit(
-            [](const auto &value) -> CanonicalValue {
-              if constexpr (requires { value.value_rad_s3; })
-                return CanonicalValue(CanonicalValue::Object{
-                    {"coordinate_kind", CanonicalValue("angular_rad_s3")},
-                    {"value_rad_s3", CanonicalValue(value.value_rad_s3)}});
-              else
-                return CanonicalValue(CanonicalValue::Object{
-                    {"coordinate_kind", CanonicalValue("linear_m_s3")},
-                    {"value_m_s3", CanonicalValue(value.value_m_s3)}});
-            },
-            limit));
-  }
-  CanonicalValue::Object deceleration;
-  deceleration.reserve(profile.per_joint_max_deceleration.size());
-  for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {
-    deceleration.emplace_back(joint, StopHistoryAccelerationValue(limit));
-  }
-  CanonicalValue settle(nullptr);
-  if (profile.per_joint_settle_velocity_threshold.has_value()) {
-    CanonicalValue::Object thresholds;
-    thresholds.reserve(profile.per_joint_settle_velocity_threshold->size());
-    for (const auto &[joint, limit] :
-         *profile.per_joint_settle_velocity_threshold) {
-      thresholds.emplace_back(joint, StopHistoryVelocityValue(limit));
-    }
-    settle = CanonicalValue(std::move(thresholds));
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"allow_natural_completion_on_short_path",
-       CanonicalValue(profile.allow_natural_completion_on_short_path)},
-      {"deceleration_time_s", profile.deceleration_time_s.has_value()
-                                  ? CanonicalValue(*profile.deceleration_time_s)
-                                  : CanonicalValue(nullptr)},
-      {"diagnostics", StopHistoryStructuredValue(profile.diagnostics)},
-      {"jerk_limits_enabled", profile.jerk_limits_enabled.has_value()
-                                  ? CanonicalValue(*profile.jerk_limits_enabled)
-                                  : CanonicalValue(nullptr)},
-      {"per_joint_max_jerk", CanonicalValue(std::move(jerk))},
-      {"per_joint_max_deceleration", CanonicalValue(std::move(deceleration))},
-      {"per_joint_settle_velocity_threshold", std::move(settle)},
-      {"profile_id", CanonicalValue(profile.profile_id)},
-      {"fallback_stop_modes",
-       [&] {
-         CanonicalValue::Array modes;
-         for (const auto mode : profile.fallback_stop_modes)
-           modes.emplace_back(std::string(MotionInterruptStopModeName(mode)));
-         return CanonicalValue(std::move(modes));
-       }()},
-      {"require_backend_confirmation",
-       CanonicalValue(profile.require_backend_confirmation)},
-      {"stop_mode", CanonicalValue(std::string(
-                        MotionInterruptStopModeName(profile.stop_mode)))},
-  });
-}
-
-[[nodiscard]] CanonicalValue StopHistoryEvidenceSourceValue(
-    const core::ResolvedStopEvidenceSourceDTO &source) {
-  const auto &target = source.runtime_target;
-  CanonicalValue contract(nullptr);
-  if (source.provider_contract_ref.has_value()) {
-    contract = CanonicalValue(CanonicalValue::Object{
-        {"contract_schema_id",
-         CanonicalValue(
-             source.provider_contract_ref->contract_schema_id.value())},
-        {"contract_schema_revision",
-         CanonicalValue(
-             source.provider_contract_ref->contract_schema_revision.value())},
-        {"provider_contract_role_id",
-         CanonicalValue(
-             source.provider_contract_ref->provider_contract_role_id.value())},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"provider_contract", std::move(contract)},
-      {"runtime_target",
-       CanonicalValue(CanonicalValue::Object{
-           {"content_digest", CanonicalValue(target.content_digest.value())},
-           {"endpoint_role_id",
-            target.endpoint_role_id.has_value()
-                ? CanonicalValue(target.endpoint_role_id->value())
-                : CanonicalValue(nullptr)},
-           {"provider_instance_id",
-            CanonicalValue(target.provider_instance_id.value())},
-           {"provider_manifest_id",
-            CanonicalValue(target.provider_manifest_id.value())},
-           {"provider_manifest_revision",
-            CanonicalValue(target.provider_manifest_revision.value())},
-           {"provider_runtime_epoch",
-            CanonicalValue(target.provider_runtime_epoch.value())},
-           {"runtime_unit_epoch",
-            CanonicalValue(target.runtime_unit_epoch.value())},
-           {"runtime_unit_id", CanonicalValue(target.runtime_unit_id.value())},
-       })},
-      {"source_kind",
-       CanonicalValue(std::string(core::to_string(source.source_kind)))},
-      {"state_authority_class",
-       source.state_authority_class.has_value()
-           ? CanonicalValue(
-                 std::string(core::to_string(*source.state_authority_class)))
-           : CanonicalValue(nullptr)},
-      {"state_authority_id",
-       source.state_authority_id.has_value()
-           ? CanonicalValue(source.state_authority_id->value())
-           : CanonicalValue(nullptr)},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryEvidenceItemValue(const core::StopEvidenceItemDTO &item) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"error", item.error.has_value() ? ErrorValue(*item.error)
-                                       : CanonicalValue(nullptr)},
-      {"evidence", item.evidence.has_value()
-                       ? StopHistoryJsonValue(*item.evidence)
-                       : CanonicalValue(nullptr)},
-      {"evidence_item_id", CanonicalValue(item.evidence_item_id.value())},
-      {"required_class",
-       CanonicalValue(std::string(core::to_string(item.required_class)))},
-      {"resolved_source", StopHistoryEvidenceSourceValue(item.resolved_source)},
-      {"source_age_at_evaluation_ns",
-       item.source_age_at_evaluation_ns.has_value()
-           ? CanonicalValue(
-                 static_cast<double>(*item.source_age_at_evaluation_ns))
-           : CanonicalValue(nullptr)},
-      {"source_epoch", item.source_epoch.has_value()
-                           ? CanonicalValue(item.source_epoch->value())
-                           : CanonicalValue(nullptr)},
-      {"source_sequence",
-       item.source_sequence.has_value()
-           ? CanonicalValue(static_cast<double>(*item.source_sequence))
-           : CanonicalValue(nullptr)},
-      {"state", CanonicalValue(std::string(StopEvidenceStateName(item.state)))},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-StopHistoryAttemptValue(const core::StopAttemptedStageResultDTO &attempt,
-                        const std::int64_t accepted_at_ns) {
-  const auto &result = attempt.result;
-  const auto &request = result.request;
-  Require(request.stage_index <
-              request.participant_stop_plan.stage_commands.size(),
-          "terminal Stop stage has no matching prepared command");
-  const auto &prepared =
-      request.participant_stop_plan.stage_commands[request.stage_index];
-  const auto &stage = prepared.resolved_stage;
-  CanonicalValue::Array resources;
-  resources.reserve(request.resources.size());
-  for (const auto &resource : request.resources) {
-    resources.emplace_back(resource.value());
-  }
-  CanonicalValue::Array evidence;
-  evidence.reserve(result.evidence_items.size());
-  for (const auto &item : result.evidence_items) {
-    evidence.emplace_back(StopHistoryEvidenceItemValue(item));
-  }
-  const auto acceptance_latency =
-      attempt.completed_at_ns >= accepted_at_ns
-          ? CanonicalValue(
-                static_cast<double>(attempt.completed_at_ns - accepted_at_ns))
-          : CanonicalValue(nullptr);
-  return CanonicalValue(CanonicalValue::Object{
-      {"acceptance_to_stage_latency_ns", acceptance_latency},
-      {"actual_stop_mode", result.actual_provider_contract_mode.has_value()
-                               ? CanonicalValue(std::string(core::to_string(
-                                     *result.actual_provider_contract_mode)))
-                               : CanonicalValue(nullptr)},
-      {"attempt_disposition",
-       CanonicalValue(std::string(
-           StopAttemptDispositionName(result.attempt_disposition)))},
-      {"authority",
-       CanonicalValue(std::string(StopStageAuthorityName(attempt.authority)))},
-      {"completed_at_ns", manyforge::content_identity::nonnegative_int64_value(
-                              attempt.completed_at_ns)},
-      {"controller_acknowledgement_sequence",
-       result.controller_acknowledgement_sequence.has_value()
-           ? CanonicalValue(static_cast<double>(
-                 *result.controller_acknowledgement_sequence))
-           : CanonicalValue(nullptr)},
-      {"error", result.error.has_value() ? ErrorValue(*result.error)
-                                         : CanonicalValue(nullptr)},
-      {"evidence_items", CanonicalValue(std::move(evidence))},
-      {"operation_id", CanonicalValue(request.operation_id.value())},
-      {"operation_revision",
-       CanonicalValue(static_cast<double>(request.operation_revision.value()))},
-      {"outcome",
-       CanonicalValue(std::string(StopStageOutcomeName(result.outcome)))},
-      {"participant_id", CanonicalValue(request.participant_id.value())},
-      {"participant_stop_invocation_plan_digest",
-       CanonicalValue(request.participant_stop_plan
-                          .participant_stop_invocation_plan_digest.value())},
-      {"profile",
-       request.participant_stop_plan.participant_stop_profile.has_value()
-           ? StopHistoryProfileValue(
-                 *request.participant_stop_plan.participant_stop_profile)
-           : CanonicalValue(nullptr)},
-      {"profile_purpose",
-       CanonicalValue(std::string(core::to_string(
-           request.participant_stop_plan.participant_stop_profile_purpose)))},
-      {"profile_source", prepared.parameter_source.has_value()
-                             ? CanonicalValue(std::string(
-                                   core::to_string(*prepared.parameter_source)))
-                             : CanonicalValue(nullptr)},
-      {"provider_runtime_epoch",
-       CanonicalValue(request.provider_runtime_epoch.value())},
-      {"receiver_elapsed_duration_ns",
-       CanonicalValue(
-           static_cast<double>(result.receiver_elapsed_duration_ns))},
-      {"recoverable_substitution_reason",
-       result.recoverable_substitution_reason.has_value()
-           ? CanonicalValue(*result.recoverable_substitution_reason)
-           : CanonicalValue(nullptr)},
-      {"resolved_stop_base_plan_id",
-       CanonicalValue(
-           request.participant_stop_plan.resolved_stop_base_plan_id.value())},
-      {"resolved_stop_scope_policy_digest",
-       CanonicalValue(request.resolved_stop_scope_policy_digest.value())},
-      {"resources", CanonicalValue(std::move(resources))},
-      {"result_sequence",
-       CanonicalValue(static_cast<double>(attempt.result_sequence))},
-      {"source_epoch", result.source_epoch.has_value()
-                           ? CanonicalValue(result.source_epoch->value())
-                           : CanonicalValue(nullptr)},
-      {"source_sequence",
-       result.source_sequence.has_value()
-           ? CanonicalValue(static_cast<double>(*result.source_sequence))
-           : CanonicalValue(nullptr)},
-      {"stage",
-       CanonicalValue(CanonicalValue::Object{
-           {"action_class",
-            CanonicalValue(std::string(core::to_string(
-                stage.command_qualification.stop_action_class)))},
-           {"command_kind", CanonicalValue(std::string(core::to_string(
-                                stage.containment_command.command_kind)))},
-           {"default_contract_parameters",
-            stage.default_contract_parameters.has_value()
-                ? StopHistoryJsonValue(
-                      core::JsonValueDTO{*stage.default_contract_parameters})
-                : CanonicalValue(nullptr)},
-           {"stage_id", CanonicalValue(stage.stop_escalation_stage_id.value())},
-           {"stage_index",
-            CanonicalValue(static_cast<double>(stage.stage_index))},
-           {"stage_kind",
-            CanonicalValue(std::string(core::to_string(stage.stage_kind)))},
-           {"validated_contract_parameters",
-            prepared.validated_contract_parameters.has_value()
-                ? StopHistoryJsonValue(core::JsonValueDTO{
-                      *prepared.validated_contract_parameters})
-                : CanonicalValue(nullptr)},
-       })},
-      {"stop_evidence_policy_id",
-       CanonicalValue(request.stop_evidence_policy_id.value())},
-      {"stop_evidence_policy_revision",
-       CanonicalValue(request.stop_evidence_policy_revision.value())},
-      {"scope_key", StopHistoryScopeKeyValue(attempt.scope_key)},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-StopHistorySettlementValue(const core::StopScopeEntryDTO &entry) {
-  CanonicalValue facts = std::visit(
-      [](const auto &typed) -> CanonicalValue {
-        using Facts = std::decay_t<decltype(typed)>;
-        if constexpr (std::is_same_v<Facts,
-                                     core::StopParticipantScopeFactsDTO>) {
-          CanonicalValue::Array resources;
-          resources.reserve(typed.resources.size());
-          for (const auto &resource : typed.resources) {
-            resources.emplace_back(resource.value());
-          }
-          return CanonicalValue(CanonicalValue::Object{
-              {"command_target_id",
-               CanonicalValue(typed.command_target_id.value())},
-              {"controllable_component_id",
-               CanonicalValue(typed.controllable_component_id.value())},
-              {"controller_goal_generation",
-               CanonicalValue(static_cast<double>(
-                   typed.controller_goal_generation.value()))},
-              {"controller_goal_id",
-               CanonicalValue(typed.controller_goal_id.value())},
-              {"kind", CanonicalValue("participant")},
-              {"provider_runtime_epoch",
-               CanonicalValue(typed.provider_runtime_epoch.value())},
-              {"resources", CanonicalValue(std::move(resources))},
-              {"terminal_settlement",
-               CanonicalValue(std::string(
-                   StopParticipantSettlementName(typed.terminal_settlement)))},
-          });
-        } else {
-          return CanonicalValue(CanonicalValue::Object{
-              {"kind", CanonicalValue("resource")},
-              {"resource_id", CanonicalValue(typed.value())},
-              {"terminal_settlement", CanonicalValue("not_required")},
-          });
-        }
-      },
-      entry.facts);
-  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue(std::string(core::kExecutionStopStatusSchema))},
+      {"event_id", CanonicalValue(static_cast<double>(value.event_id.value()))},
+      {"request_key", CanonicalValue(RequestKeyText(value.request_key))},
+      {"requested", CanonicalValue(std::string(core::to_string(value.requested)))},
+      {"applied", CanonicalValue(std::string(core::to_string(value.applied)))},
+      {"widen_reason", CanonicalValue(std::string(core::to_string(value.widen_reason)))},
+      {"state", CanonicalValue(value.complete ? "complete" : "pending")},
+      {"result", CanonicalValue(std::string(core::to_string(value.result)))},
+      {"covered", CanonicalValue(std::move(covered))},
       {"accepted_at_ns", manyforge::content_identity::nonnegative_int64_value(
-                             entry.accepted_at_ns)},
-      {"dispatch_state",
-       CanonicalValue(static_cast<double>(entry.dispatch_state))},
-      {"facts", std::move(facts)},
-      {"participant_stop_invocation_plan_digest",
-       entry.participant_stop_invocation_plan_digest.has_value()
-           ? CanonicalValue(
-                 entry.participant_stop_invocation_plan_digest->value())
-           : CanonicalValue(nullptr)},
-      {"scope_key", StopHistoryScopeKeyValue(entry.key)},
-      {"stop_evidence_policy_id",
-       entry.stop_evidence_policy_id.has_value()
-           ? CanonicalValue(entry.stop_evidence_policy_id->value())
-           : CanonicalValue(nullptr)},
-      {"stop_evidence_policy_revision",
-       entry.stop_evidence_policy_revision.has_value()
-           ? CanonicalValue(entry.stop_evidence_policy_revision->value())
+                             value.accepted_at_ns)},
+      {"completed_at_ns",
+       value.completed_at_ns
+           ? manyforge::content_identity::nonnegative_int64_value(*value.completed_at_ns)
            : CanonicalValue(nullptr)},
   });
-}
-
-[[nodiscard]] CanonicalValue StopTerminalHistoryProjectionValue(
-    const core::StopJournalTerminalProjectionDTO &projection,
-    const std::string_view source_owner_epoch,
-    const std::string_view durable_projection_digest,
-    const bool include_details) {
-  const auto &status = projection.stop_status;
-  const auto &certificate = projection.certificate;
-  CanonicalValue::Array attempted_stages;
-  CanonicalValue::Array participant_settlement;
-  CanonicalValue::Array certificate_evidence;
-  CanonicalValue::Array predecessor_certificates;
-  if (include_details) {
-    attempted_stages.reserve(certificate.attempted_stage_results.size());
-    for (const auto &attempt : certificate.attempted_stage_results) {
-      attempted_stages.emplace_back(
-          StopHistoryAttemptValue(attempt, status.accepted.accepted_at_ns));
-    }
-    participant_settlement.reserve(certificate.scope_entries.size());
-    for (const auto &entry : certificate.scope_entries) {
-      participant_settlement.emplace_back(StopHistorySettlementValue(entry));
-    }
-    certificate_evidence.reserve(certificate.evidence_items.size());
-    for (const auto &item : certificate.evidence_items) {
-      certificate_evidence.emplace_back(CanonicalValue::Object{
-          {"evidence_item_id",
-           CanonicalValue(item.evidence_item.evidence_item_id.value())},
-          {"required_class", CanonicalValue(std::string(core::to_string(
-                                 item.evidence_item.required_class)))},
-          {"result_sequence",
-           CanonicalValue(static_cast<double>(item.result_sequence))},
-          {"scope_key", StopHistoryScopeKeyValue(item.scope_key)},
-          {"stage_id", CanonicalValue(item.stage_id.value())},
-          {"stage_index",
-           CanonicalValue(static_cast<double>(item.stage_index))},
-          {"state", CanonicalValue(std::string(
-                        StopEvidenceStateName(item.evidence_item.state)))},
-      });
-    }
-    predecessor_certificates.reserve(
-        certificate.predecessor_certificates.size());
-    for (const auto &reference : certificate.predecessor_certificates) {
-      predecessor_certificates.emplace_back(StopCertificateRefValue(reference));
-    }
-  }
-  const auto duration =
-      certificate.completed_at_ns >= status.accepted.accepted_at_ns
-          ? CanonicalValue(static_cast<double>(certificate.completed_at_ns -
-                                               status.accepted.accepted_at_ns))
-          : CanonicalValue(nullptr);
-  const bool escalated =
-      certificate.result == core::StopCertificateResultDTO::kSucceededEscalated;
-  const bool hard_stop_floor_used = std::any_of(
-      certificate.attempted_stage_results.begin(),
-      certificate.attempted_stage_results.end(), [](const auto &attempt) {
-        const auto &request = attempt.result.request;
-        return request.stage_index <
-                   request.participant_stop_plan.stage_commands.size() &&
-               request.participant_stop_plan.stage_commands[request.stage_index]
-                       .resolved_stage.command_qualification
-                       .stop_action_class != core::StopActionClass::kControlled;
-      });
-  const auto acceptance =
-      include_details
-          ? StopAcceptedValue(status.accepted)
-          : CanonicalValue(CanonicalValue::Object{
-                {"accepted_at_ns",
-                 manyforge::content_identity::nonnegative_int64_value(
-                     status.accepted.accepted_at_ns)},
-                {"request_id",
-                 CanonicalValue(status.accepted.request_id.value())},
-                {"stop_generation",
-                 CanonicalValue(static_cast<double>(
-                     status.accepted.stop_generation.value()))},
-                {"stop_id", CanonicalValue(status.accepted.stop_id.value())},
-            });
-  return CanonicalValue(CanonicalValue::Object{
-      {"acceptance", acceptance},
-      {"acceptance_to_terminal_latency_ns", duration},
-      {"api_version", CanonicalValue("manyforge.stop_terminal_projection.v1")},
-      {"attempted_stage_count",
-       CanonicalValue(
-           static_cast<double>(certificate.attempted_stage_results.size()))},
-      {"attempted_stages", CanonicalValue(std::move(attempted_stages))},
-      {"certificate_evidence", CanonicalValue(std::move(certificate_evidence))},
-      {"certificate_evidence_count",
-       CanonicalValue(static_cast<double>(certificate.evidence_items.size()))},
-      {"completed_at_ns", manyforge::content_identity::nonnegative_int64_value(
-                              certificate.completed_at_ns)},
-      {"details_truncated", CanonicalValue(!include_details)},
-      {"dispatched_stopped",
-       include_details
-           ? StopHistoryScopeKeyArray(certificate.dispatched_stopped)
-           : CanonicalValue(CanonicalValue::Array{})},
-      {"dispatched_stopped_count", CanonicalValue(static_cast<double>(
-                                       certificate.dispatched_stopped.size()))},
-      {"durable_projection_digest",
-       CanonicalValue(std::string(durable_projection_digest))},
-      {"escalated", CanonicalValue(escalated)},
-      {"failed", include_details ? StopHistoryScopeKeyArray(certificate.failed)
-                                 : CanonicalValue(CanonicalValue::Array{})},
-      {"failed_count",
-       CanonicalValue(static_cast<double>(certificate.failed.size()))},
-      {"hard_stop_floor_used", CanonicalValue(hard_stop_floor_used)},
-      {"owner_epoch", CanonicalValue(std::string(source_owner_epoch))},
-      {"participant_settlement",
-       CanonicalValue(std::move(participant_settlement))},
-      {"participant_settlement_count",
-       CanonicalValue(static_cast<double>(certificate.scope_entries.size()))},
-      {"pre_dispatch_cancelled",
-       include_details
-           ? StopHistoryScopeKeyArray(certificate.pre_dispatch_cancelled)
-           : CanonicalValue(CanonicalValue::Array{})},
-      {"pre_dispatch_cancelled_count",
-       CanonicalValue(
-           static_cast<double>(certificate.pre_dispatch_cancelled.size()))},
-      {"predecessor_certificates",
-       CanonicalValue(std::move(predecessor_certificates))},
-      {"predecessor_certificate_count",
-       CanonicalValue(
-           static_cast<double>(certificate.predecessor_certificates.size()))},
-      {"record_kind", CanonicalValue("stop_terminal_projected")},
-      {"request_id", CanonicalValue(status.accepted.request_id.value())},
-      {"requested_selector",
-       CanonicalValue(CanonicalValue::Object{
-           {"kind", CanonicalValue(std::string(StopSelectorKindName(
-                        certificate.requested_selector.kind)))},
-           {"malformed_ingress_reason",
-            certificate.requested_selector.malformed_ingress_reason.has_value()
-                ? CanonicalValue(
-                      *certificate.requested_selector.malformed_ingress_reason)
-                : CanonicalValue(nullptr)},
-           {"requested_selector_digest",
-            CanonicalValue(certificate.requested_selector
-                               .requested_selector_digest.value())},
-       })},
-      {"resolution_disposition", CanonicalValue(std::string(core::to_string(
-                                     certificate.resolution_disposition)))},
-      {"resolution_reason", CanonicalValue(std::string(core::to_string(
-                                certificate.resolution_reason)))},
-      {"result", CanonicalValue(std::string(
-                     StopCertificateResultName(certificate.result)))},
-      {"scope_entry_count",
-       CanonicalValue(static_cast<double>(certificate.scope_entries.size()))},
-      {"state", CanonicalValue(std::string(StopStatusStateName(status.state)))},
-      {"stop_certificate_id",
-       CanonicalValue(certificate.stop_certificate_id.value())},
-      {"stop_certificate_revision",
-       CanonicalValue(
-           static_cast<double>(certificate.stop_certificate_revision.value()))},
-      {"stop_generation", CanonicalValue(static_cast<double>(
-                              certificate.stop_generation.value()))},
-      {"stop_id", CanonicalValue(certificate.stop_id.value())},
-      {"terminal_error", certificate.terminal_error.has_value()
-                             ? ErrorValue(*certificate.terminal_error)
-                             : CanonicalValue(nullptr)},
-      {"terminal_projection",
-       StopProjectionStatusValue(status.terminal_projection)},
-      {"unsettled", include_details
-                        ? StopHistoryScopeKeyArray(certificate.unsettled)
-                        : CanonicalValue(CanonicalValue::Array{})},
-      {"unsettled_count",
-       CanonicalValue(static_cast<double>(certificate.unsettled.size()))},
-  });
-}
-
-[[nodiscard]] CanonicalValue BoundedStopTerminalHistoryProjectionValue(
-    const core::StopJournalTerminalProjectionDTO &projection,
-    const std::string_view source_owner_epoch,
-    const std::string_view durable_projection_digest) {
-  auto detailed = StopTerminalHistoryProjectionValue(
-      projection, source_owner_epoch, durable_projection_digest, true);
-  if (content_identity::canonical_json(detailed).size() <=
-      kMaximumStopHistoryProjectionBytes) {
-    return detailed;
-  }
-  auto bounded = StopTerminalHistoryProjectionValue(
-      projection, source_owner_epoch, durable_projection_digest, false);
-  Require(content_identity::canonical_json(bounded).size() <=
-              kMaximumStopHistoryProjectionBytes,
-          "bounded terminal Stop history projection exceeds its byte limit");
-  return bounded;
 }
 
 [[nodiscard]] CanonicalValue
 CellStopActionValue(const core::CellStopActionProjectionDTO &value) {
-  CanonicalValue terminal(nullptr);
-  if (value.latest_terminal.has_value()) {
-    CanonicalValue::Array stages;
-    stages.reserve(value.latest_terminal->executed_stages.size());
-    for (const auto &stage : value.latest_terminal->executed_stages) {
-      stages.emplace_back(CanonicalValue::Object{
-          {"action_class",
-           CanonicalValue(std::string(core::to_string(stage.action_class)))},
-          {"executed_mode", stage.executed_mode.has_value()
-                                ? CanonicalValue(std::string(
-                                      core::to_string(*stage.executed_mode)))
-                                : CanonicalValue(nullptr)},
-          {"operation_id", CanonicalValue(stage.operation_id.value())},
-          {"outcome",
-           CanonicalValue(std::string(StopStageOutcomeName(stage.outcome)))},
-          {"participant_id", CanonicalValue(stage.participant_id.value())},
-          {"stage_id", CanonicalValue(stage.stage_id.value())},
-          {"stage_index",
-           CanonicalValue(static_cast<double>(stage.stage_index))},
-          {"substitution_reason",
-           stage.substitution_reason.has_value()
-               ? CanonicalValue(*stage.substitution_reason)
-               : CanonicalValue(nullptr)},
-      });
-    }
-    terminal = CanonicalValue(CanonicalValue::Object{
-        {"certificate",
-         StopCertificateRefValue(value.latest_terminal->certificate)},
-        {"escalated", CanonicalValue(value.latest_terminal->escalated)},
-        {"executed_stages", CanonicalValue(std::move(stages))},
-        {"hard_stop_floor_used",
-         CanonicalValue(value.latest_terminal->hard_stop_floor_used)},
-        {"result", CanonicalValue(std::string(StopCertificateResultName(
-                       value.latest_terminal->result)))},
+  CanonicalValue completed(nullptr);
+  if (value.last_completed.has_value()) {
+    const auto &last = *value.last_completed;
+    completed = CanonicalValue(CanonicalValue::Object{
+        {"event_id", CanonicalValue(static_cast<double>(last.event_id.value()))},
+        {"applied", CanonicalValue(std::string(core::to_string(last.applied)))},
+        {"result", CanonicalValue(std::string(core::to_string(last.result)))},
+        {"escalated", CanonicalValue(last.escalated)},
+        {"completed_at_ns",
+         manyforge::content_identity::nonnegative_int64_value(last.completed_at_ns)},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"available", CanonicalValue(true)},
-      {"expected_stop_generation",
-       CanonicalValue(
-           static_cast<double>(value.expected_stop_generation.value()))},
-      {"latest_terminal", std::move(terminal)},
+      {"last_event_id", StopEventIdValue(value.last_event_id)},
+      {"last_completed", std::move(completed)},
       {"unavailable_reason", CanonicalValue(nullptr)},
   });
 }
@@ -1837,12 +1054,10 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
       {"source_id", CanonicalValue(value.source_id)},
       {"status", CanonicalValue(std::string(
                      core::recovery_assessment_status_name(value.status)))},
-      {"stop_certificate_id", CanonicalValue(value.stop_certificate_id)},
-      {"stop_certificate_revision",
-       CanonicalValue(static_cast<double>(value.stop_certificate_revision))},
+      {"stop_event_id", CanonicalValue(static_cast<double>(value.stop_event_id))},
+      {"stop_phase", CanonicalValue(value.stop_phase)},
+      {"containing_stage_id", CanonicalValue(value.containing_stage_id)},
       {"stop_owner_active", CanonicalValue(value.stop_owner_active)},
-      {"stop_owner_generation",
-       CanonicalValue(static_cast<double>(value.stop_owner_generation))},
       {"stronger_authority_active",
        CanonicalValue(value.stronger_authority_active)},
   });
@@ -1876,7 +1091,7 @@ RecoveryAssessmentValue(const core::KernelRecoveryAssessmentDTO &value) {
         {"control_domain_id", CanonicalValue(value.control_domain_id.value())},
         {"control_route_id", CanonicalValue(value.control_route_id.value())},
         {"operation_participant_id",
-         CanonicalValue(value.operation_participant_id.value())},
+         core::OperationParticipantIdValue(value.operation_participant_id)},
         {"resource_ids", CanonicalValue(std::move(resources))},
     });
   }
@@ -1891,7 +1106,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
        CanonicalValue(std::string(core::recovery_action_name(value.action)))},
       {"error", value.error.has_value() ? ErrorValue(*value.error)
                                         : CanonicalValue(nullptr)},
-      {"request_id", CanonicalValue(value.request_id)},
+      {"request_key", CanonicalValue(core::RequestKeyText(value.request_key))},
       {"resulting_assessment",
        RecoveryAssessmentValue(value.resulting_assessment)},
   });
@@ -1928,7 +1143,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
                              value.accepted_at_ns)},
       {"active_operation_id",
        value.active_operation_id.has_value()
-           ? CanonicalValue(value.active_operation_id->value())
+           ? CanonicalValue(static_cast<double>(value.active_operation_id->value()))
            : CanonicalValue(nullptr)},
       {"active_operation_revision",
        value.active_operation_revision.has_value()
@@ -1944,7 +1159,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
        CanonicalValue(static_cast<double>(value.control_generation.value()))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(value.replay_status)))},
-      {"request_id", CanonicalValue(value.request_id.value())},
+      {"request_key", CanonicalValue(RequestKeyText(value.request_key))},
       {"requested_scale", CanonicalValue(value.requested_scale)},
       {"selector", RuntimeScaleControlSelectorValue(value.selector)},
   });
@@ -1987,7 +1202,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
            : CanonicalValue(nullptr)},
       {"active_operation_id",
        value.active_operation_id.has_value()
-           ? CanonicalValue(value.active_operation_id->value())
+           ? CanonicalValue(static_cast<double>(value.active_operation_id->value()))
            : CanonicalValue(nullptr)},
       {"active_operation_revision",
        value.active_operation_revision.has_value()
@@ -2043,22 +1258,49 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 }
 
 [[nodiscard]] CanonicalValue
-OperationStateValue(const core::OperationStateDTO &value) {
+ParticipantStopObservationValue(const core::ParticipantStopObservationDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"phase", CanonicalValue(std::string(core::to_string(value.phase)))},
+      {"attempt", CanonicalValue(static_cast<double>(value.attempt))},
+      {"stop_event_id", CanonicalValue(static_cast<double>(value.stop_event_id.value()))},
+      {"mode", CanonicalValue(std::string(core::to_string(value.mode)))},
+      {"attribution_class",
+       CanonicalValue(std::string(core::to_string(value.attribution_class)))},
+      {"plan_digest", value.plan_digest ? CanonicalValue(value.plan_digest->value())
+                                        : CanonicalValue(nullptr)},
+      {"containing_stage_id", value.containing_stage_id
+                                  ? CanonicalValue(value.containing_stage_id->value())
+                                  : CanonicalValue(nullptr)},
+      {"containing_stage_index",
+       value.containing_stage_index
+           ? CanonicalValue(static_cast<double>(*value.containing_stage_index))
+           : CanonicalValue(nullptr)},
+      {"escalated", CanonicalValue(value.escalated)},
+  });
+}
+
+namespace {
+
+// `for_table`: the event stream's operations table (OD-213) leaves out what
+// changes at every progress sample (participants' `progress`, the update
+// time) and the collision log line (written by `read` replies only).
+[[nodiscard]] CanonicalValue
+EncodeOperationState(const core::OperationStateDTO &value, const bool for_table) {
   CanonicalValue::Array participants;
   participants.reserve(value.participants.size());
   for (const auto &participant : value.participants) {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
     // Durable operation details remain authoritative. This status-observed
     // notice is best-effort; one last key suppresses consecutive repeats only.
-    if (participant.terminal_error &&
+    if (!for_table && participant.terminal_error &&
         participant.terminal_error->details.contains("runtime_collision_reason")) {
       try {
         const auto notice = content_identity::canonical_json(
             CanonicalValue(CanonicalValue::Object{
-                {"operation_id", CanonicalValue(value.operation_id.value())},
+                {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
                 {"operation_revision", CanonicalValue(static_cast<double>(
                                            value.operation_revision.value()))},
-                {"participant_id", CanonicalValue(participant.participant_id.value())},
+                {"participant_id", core::OperationParticipantIdValue(participant.participant_id)},
                 {"error", ErrorValue(*participant.terminal_error)},
             }));
         const auto key = content_identity::sha256_digest(notice);
@@ -2069,9 +1311,10 @@ OperationStateValue(const core::OperationStateDTO &value) {
           last_notice_key = key;
           // Keep identity and decisive cause before context: enqueue caps the line.
           host_controller_launch_supervisor().enqueue_host_log(
-              "ERROR manyforge runtime collision: operation=" + value.operation_id.value() +
+              "ERROR manyforge runtime collision: operation=" +
+                  std::to_string(value.operation_id.value()) +
               " revision=" + std::to_string(value.operation_revision.value()) +
-              " participant=" + participant.participant_id.value() +
+              " participant=" + std::to_string(participant.participant_id.ordinal) +
               " reason=" + participant.terminal_error->details.at("runtime_collision_reason") +
               " context=" + notice);
         }
@@ -2112,24 +1355,24 @@ OperationStateValue(const core::OperationStateDTO &value) {
         {"control_domain_revision",
          CanonicalValue(
              participant.binding_identity.control_domain_revision.value())},
-        {"command_generation",
-         CanonicalValue(static_cast<double>(
-             participant.command_generation.value()))},
         {"command_id",
-         CanonicalValue(participant.command_id.value())},
-        {"participant_id", CanonicalValue(participant.participant_id.value())},
+         core::ControllerGoalIdValue(participant.command_id)},
+        {"participant_id", core::OperationParticipantIdValue(participant.participant_id)},
         {"payload_kind",
          CanonicalValue(participant.payload_kind ==
                                 core::OperationParticipantPayloadKind::kMotion
                             ? "motion"
                             : "capability_command")},
-        {"progress", CanonicalValue(participant.progress)},
         {"resources", CanonicalValue(std::move(resources))},
         {"state", CanonicalValue(std::string(StateName(participant.state)))},
         {"terminal_error", participant.terminal_error.has_value()
                                ? ErrorValue(*participant.terminal_error)
                                : CanonicalValue(nullptr)},
+        {"stop", participant.stop ? ParticipantStopObservationValue(*participant.stop)
+                                  : CanonicalValue(nullptr)},
     };
+    if (!for_table)
+      participant_value.emplace_back("progress", CanonicalValue(participant.progress));
     if (participant.terminal_fact) {
       const auto &fact = *participant.terminal_fact;
       participant_value.emplace_back(
@@ -2148,7 +1391,8 @@ OperationStateValue(const core::OperationStateDTO &value) {
                CanonicalValue(
                    participant.execution_scope->node_instance_id.value())},
               {"node_attempt_id",
-               CanonicalValue(participant.execution_scope->node_attempt_id)}}));
+               CanonicalValue(static_cast<double>(
+                   participant.execution_scope->node_attempt_id.value()))}}));
     }
     if (!participant.io_rule_outcomes.empty()) {
       const auto qualified = core::ValidateIoRuleOutcomeParticipant(
@@ -2162,42 +1406,37 @@ OperationStateValue(const core::OperationStateDTO &value) {
     participants.emplace_back(std::move(participant_value));
   }
   CanonicalValue::Object operation_value{
-      {"active_stop_generation",
-       value.active_stop_generation.has_value()
-           ? CanonicalValue(
-                 static_cast<double>(value.active_stop_generation->value()))
-           : CanonicalValue(nullptr)},
-      {"active_stop_id", value.active_stop_id.has_value()
-                             ? CanonicalValue(value.active_stop_id->value())
-                             : CanonicalValue(nullptr)},
+      {"stop_event_id", StopEventIdValue(value.stop_event_id)},
       {"coordination_policy",
        CanonicalValue(value.coordination_policy ==
                               core::OperationCoordinationPolicy::kCoordinatedAll
                           ? "coordinated_all"
                           : "independent")},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
       {"operation_revision",
        CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participants", CanonicalValue(std::move(participants))},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
-      {"program_run_id", CanonicalValue(value.program_run_id.value())},
+      {"program_run_id", RunValue(value.program_run_id)},
       {"runtime_scale_generation",
        value.runtime_scale_generation.has_value()
            ? CanonicalValue(
                  static_cast<double>(value.runtime_scale_generation->value()))
            : CanonicalValue(nullptr)},
       {"state", CanonicalValue(std::string(StateName(value.state)))},
-      {"updated_at_ns", manyforge::content_identity::nonnegative_int64_value(
-                            value.updated_at_ns)},
   };
+  if (!for_table)
+    operation_value.emplace_back(
+        "updated_at_ns", manyforge::content_identity::nonnegative_int64_value(value.updated_at_ns));
   if (value.preemption) {
     const auto& fact = *value.preemption;
     operation_value.emplace_back("preemption", CanonicalValue(CanonicalValue::Object{
         {"kind", CanonicalValue(std::string(core::to_string(fact.kind)))},
         {"by", CanonicalValue(CanonicalValue::Object{
-            {"operation_id", CanonicalValue(fact.by.operation_id.value())},
+            {"operation_id", CanonicalValue(static_cast<double>(fact.by.operation_id.value()))},
             {"node_instance_id", CanonicalValue(fact.by.node_instance_id.value())},
-            {"node_attempt_id", CanonicalValue(fact.by.node_attempt_id)}})}}));
+            {"node_attempt_id",
+             CanonicalValue(static_cast<double>(fact.by.node_attempt_id.value()))}})}}));
   }
   if (value.motion_takeover) {
     const auto &decision = *value.motion_takeover;
@@ -2205,7 +1444,7 @@ OperationStateValue(const core::OperationStateDTO &value) {
         "motion_takeover",
         CanonicalValue(CanonicalValue::Object{
             {"incumbent_operation_id",
-             CanonicalValue(decision.incumbent_operation_id.value())},
+             CanonicalValue(static_cast<double>(decision.incumbent_operation_id.value()))},
             {"path", CanonicalValue(std::string(core::to_string(decision.path)))},
             {"cause", decision.cause ? ErrorValue(*decision.cause)
                                      : CanonicalValue(nullptr)},
@@ -2218,13 +1457,22 @@ OperationStateValue(const core::OperationStateDTO &value) {
                                           decision.preparation_budget_ns)},
             {"planning_budget_ns", content_identity::nonnegative_int64_value(
                                        decision.planning_budget_ns)},
-            {"stop_certificate",
-             decision.stop_certificate
-                 ? StopCertificateRefValue(*decision.stop_certificate)
-                 : CanonicalValue(nullptr)},
+            {"stop_event_id", StopEventIdValue(decision.stop_event_id)},
         }));
   }
   return CanonicalValue(std::move(operation_value));
+}
+
+} // namespace
+
+[[nodiscard]] CanonicalValue
+OperationStateValue(const core::OperationStateDTO &value) {
+  return EncodeOperationState(value, false);
+}
+
+[[nodiscard]] CanonicalValue
+OperationTableStateValue(const core::OperationStateDTO &value) {
+  return EncodeOperationState(value, true);
 }
 
 [[nodiscard]] CanonicalValue RuntimeFaultsValue(
@@ -2236,42 +1484,53 @@ OperationStateValue(const core::OperationStateDTO &value) {
   if (journal_fault) {
     const auto &fault = *journal_fault;
     journal_value = CanonicalValue(CanonicalValue::Object{
-        {"request_owner_epoch", CanonicalValue(fault.request_owner_epoch.value())},
         {"write_kind", CanonicalValue(fault.write_kind)},
         {"error", ErrorValue(fault.error)},
         {"operation_id", fault.operation_id
-             ? CanonicalValue(fault.operation_id->value()) : CanonicalValue(nullptr)},
+             ? CanonicalValue(static_cast<double>(fault.operation_id->value())) : CanonicalValue(nullptr)},
         {"operation_revision", fault.operation_revision
              ? CanonicalValue(static_cast<double>(fault.operation_revision->value()))
              : CanonicalValue(nullptr)},
-        {"request_id", fault.request_id
-             ? CanonicalValue(fault.request_id->value()) : CanonicalValue(nullptr)},
-        {"program_run_id", fault.program_run_id
-             ? CanonicalValue(fault.program_run_id->value()) : CanonicalValue(nullptr)},
+        {"request_key", fault.request_key
+             ? CanonicalValue(RequestKeyText(*fault.request_key)) : CanonicalValue(nullptr)},
+        {"program_run_id", RunValue(fault.program_run_id)},
         {"execution_scope", fault.execution_scope
              ? CanonicalValue(CanonicalValue::Object{
                    {"node_instance_id", CanonicalValue(fault.execution_scope->node_instance_id.value())},
-                   {"node_attempt_id", CanonicalValue(fault.execution_scope->node_attempt_id)}})
+                   {"node_attempt_id", CanonicalValue(static_cast<double>(
+                                           fault.execution_scope->node_attempt_id.value()))}})
              : CanonicalValue(nullptr)},
+        // OD-215: the journal queue's "full" level for the Headless disk check.
+        {"queue_full", CanonicalValue(fault.queue_full)},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
       {"operation_journal_write_fault", std::move(journal_value)},
       {"program_runner_loss", runner_loss
-           ? detail::ProgramRunnerLossValue(*runner_loss, owner.request_owner_epoch())
+           ? detail::ProgramRunnerLossValue(*runner_loss, owner.application_start_id())
            : CanonicalValue(nullptr)},
       {"kernel_internal_fault", internal_fault
            ? CanonicalValue(CanonicalValue::Object{
-                 {"request_owner_epoch",
-                  CanonicalValue(internal_fault->request_owner_epoch.value())},
                  {"reason_code", CanonicalValue(internal_fault->reason_code)},
-                 {"stop_accepted", CanonicalValue(internal_fault->stop_accepted)},
-                 {"stop_refusal_code", internal_fault->stop_refusal_code
-                      ? CanonicalValue(*internal_fault->stop_refusal_code)
-                      : CanonicalValue(nullptr)},
                  {"later_count",
                   CanonicalValue(static_cast<double>(internal_fault->later_count))}})
            : CanonicalValue(nullptr)},
+  });
+}
+
+[[nodiscard]] CanonicalValue RuntimeCollisionChecksRowValue(
+    const std::string_view controllable_component_id,
+    const core::RuntimeCollisionMonitorTimingMetrics &timing,
+    const core::Duration check_period_ns) {
+  // A late check is one that ended one or more whole periods after its
+  // deadline; the periods it overran are skipped, never caught up.
+  return CanonicalValue(CanonicalValue::Object{
+      {"check_period_ns", CanonicalValue(static_cast<double>(check_period_ns))},
+      {"checks_late", CanonicalValue(static_cast<double>(timing.late_periods))},
+      {"checks_run", CanonicalValue(static_cast<double>(timing.callbacks_started))},
+      {"controllable_component_id",
+       CanonicalValue(std::string(controllable_component_id))},
+      {"periods_skipped", CanonicalValue(static_cast<double>(timing.missed_periods))},
   });
 }
 
@@ -2280,47 +1539,35 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
   CanonicalValue::Array events;
   events.reserve(page.events.size());
   for (const auto &event : page.events) {
+    // Stop event rows (`stop_event_accepted`/`stop_event_completed`) carry
+    // their `manyforge.stop_event.v1` payload unchanged, like every row.
     CanonicalValue payload;
     std::string payload_digest = event.payload_digest;
-    if (event.record_kind == "stop_terminal_projected") {
-      const auto terminal =
-          core::DecodeStopJournalTerminalProjection(event.payload_json);
-      Require(terminal.ok(),
-              "durable terminal Stop projection could not be decoded: " +
-                  (terminal.ok() ? std::string{} : terminal.error().message));
-      payload = BoundedStopTerminalHistoryProjectionValue(
-          terminal.value(), event.owner_epoch.value(), event.payload_digest);
-      payload_digest = content_identity::sha256_digest(
-          content_identity::canonical_json(payload));
-    } else {
-      try {
-        payload =
-            deployment::parse_strict_json_model_yaml(event.payload_json).root();
-      } catch (const std::exception &error) {
-        Fail("durable operation event payload is not strict JSON: " +
-             std::string(error.what()));
-      }
-      Require(content_identity::canonical_json(payload) == event.payload_json,
-              "durable operation event payload is not canonical JSON");
+    try {
+      payload =
+          deployment::parse_strict_json_model_yaml(event.payload_json).root();
+    } catch (const std::exception &error) {
+      Fail("durable operation event payload is not strict JSON: " +
+           std::string(error.what()));
     }
+    Require(content_identity::canonical_json(payload) == event.payload_json,
+            "durable operation event payload is not canonical JSON");
     events.emplace_back(CanonicalValue::Object{
-        {"effect_pending", CanonicalValue(event.effect_pending)},
         {"occurred_at_ns", manyforge::content_identity::nonnegative_int64_value(
                                event.occurred_at_ns)},
         {"occurred_at_wall", CanonicalValue(event.occurred_at_wall)},
         {"operation_id", event.operation_id.has_value()
-                             ? CanonicalValue(event.operation_id->value())
+                             ? CanonicalValue(static_cast<double>(event.operation_id->value()))
                              : CanonicalValue(nullptr)},
         {"operation_revision", event.operation_revision.has_value()
                                    ? CanonicalValue(static_cast<double>(
                                          event.operation_revision->value()))
                                    : CanonicalValue(nullptr)},
-        {"owner_epoch", CanonicalValue(event.owner_epoch.value())},
         {"payload", std::move(payload)},
         {"payload_digest", CanonicalValue(std::move(payload_digest))},
         {"record_kind", CanonicalValue(event.record_kind)},
-        {"request_id", event.request_id.has_value()
-                           ? CanonicalValue(event.request_id->value())
+        {"request_key", event.request_key.has_value()
+                           ? CanonicalValue(RequestKeyText(*event.request_key))
                            : CanonicalValue(nullptr)},
         {"sequence", CanonicalValue(static_cast<double>(event.sequence))},
     });
@@ -2330,8 +1577,7 @@ OperationEventPageValue(const core::OperationJournalEventPageDTO &page) {
       {"has_more", CanonicalValue(page.has_more)},
       {"next_after_sequence",
        CanonicalValue(static_cast<double>(page.next_after_sequence))},
-      {"owner_epoch", CanonicalValue(page.owner_epoch.value())},
-      {"schema_version", CanonicalValue("manyforge.execution_event_page.v2")},
+      {"schema_version", CanonicalValue("manyforge.execution_event_page.v3")},
   });
 }
 
@@ -2380,7 +1626,6 @@ CanonicalValue IoMatchedSampleValue(const core::IoSignalSampleDTO& sample) {
 
 CanonicalValue IoSourceCursorValue(const core::IoSourceCursorDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"owner_epoch", CanonicalValue(value.owner_epoch.value())},
       {"catalog_generation",
        CanonicalValue(std::to_string(value.catalog_generation))},
       {"source_id", CanonicalValue(value.source_id.value())},
@@ -2442,15 +1687,14 @@ CanonicalValue IoSignalObservationValue(const core::IoSignalObservationDTO& valu
 
 CanonicalValue IoWatchRegistrationValue(const core::IoWatchRegistrationDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
-      {"owner_epoch", CanonicalValue(value.owner_epoch.value())},
       {"catalog_generation", CanonicalValue(std::to_string(value.catalog_generation))},
       {"registration_id", CanonicalValue(std::to_string(value.registration_id))},
       {"scope", CanonicalValue(CanonicalValue::Object{
-          {"program_runner_owner_epoch", CanonicalValue(value.scope.program_runner_owner_epoch.value())},
-          {"program_run_id", CanonicalValue(value.scope.program_run_id.value())},
+          {"program_run_id", CanonicalValue(static_cast<double>(value.scope.program_run_id.value()))},
           {"node", CanonicalValue(CanonicalValue::Object{
               {"node_instance_id", CanonicalValue(value.scope.node.node_instance_id.value())},
-              {"node_attempt_id", CanonicalValue(value.scope.node.node_attempt_id)}})}})}});
+              {"node_attempt_id",
+               CanonicalValue(static_cast<double>(value.scope.node.node_attempt_id.value()))}})}})}});
 }
 
 CanonicalValue IoWatchResultValue(const core::IoWatchResultDTO& value) {
@@ -2475,7 +1719,6 @@ CanonicalValue GlobalRuleContextValue(const core::IoRuleStateContextDTO &context
   Require(!core::io_rule_state_context_field_error(context),
           "global rule context is invalid");
   return CanonicalValue(CanonicalValue::Object{
-      {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
       {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
       {"active_publication_generation", CanonicalValue(static_cast<double>(
           context.active_publication_generation.value()))},
@@ -2506,8 +1749,7 @@ CanonicalValue GlobalRuleStateValue(const core::IoRuleStateContextDTO &context,
 } // namespace
 
 CanonicalValue::Object InterruptRuleEventMetadataFields(
-    const std::optional<core::IoRuleStateProjectionDTO> &actual,
-    const core::RequestOwnerEpoch &owner_epoch) {
+    const std::optional<core::IoRuleStateProjectionDTO> &actual) {
   if (!actual) return {{"interrupt_rule_catalog", CanonicalValue(nullptr)},
                        {"interrupt_rule_state_baseline", CanonicalValue(nullptr)}};
   const auto applied_fields = [&](const core::IoRuleAppliedContextDTO &context,
@@ -2515,8 +1757,7 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
     const auto identity = [](const auto &id) {
       return !id.empty() && id.value().find('\0') == std::string::npos;
     };
-    Require(identity(context.owner_epoch) && context.owner_epoch == owner_epoch &&
-                identity(context.retained_bundle_id) &&
+    Require(identity(context.retained_bundle_id) &&
                 identity(context.graph_revision) &&
                 context.active_publication_generation.nonzero() &&
                 context.active_publication_generation.value() <=
@@ -2524,7 +1765,6 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
             "rule metadata has no exact successful Applied context");
     return CanonicalValue::Object{
         {"status", CanonicalValue(std::string(status))},
-        {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
         {"active_publication_generation",
          CanonicalValue(static_cast<double>(
              context.active_publication_generation.value()))},
@@ -2533,7 +1773,6 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
   };
   const auto rule_fields = [](const auto &rules, bool waiting_only) {
     CanonicalValue::Array ids;
-    CanonicalValue::Array notify_ids;
     CanonicalValue::Array waiting;
     std::optional<core::InterruptPolicyId> previous;
     for (const auto &rule : rules) {
@@ -2542,8 +1781,6 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
                   (!previous || *previous < rule.policy_id),
               "rule catalog IDs are not canonical");
       ids.emplace_back(rule.policy_id.value());
-      if (rule.on_trip == core::IoRuleOnTripDTO::kNotify)
-        notify_ids.emplace_back(rule.policy_id.value());
       previous = rule.policy_id;
       Require(!waiting_only ||
                   (!rule.waiting_for_program_keys.empty() &&
@@ -2569,8 +1806,6 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
         {"rule_ids", CanonicalValue(std::move(ids))}};
     if (!waiting.empty())
       fields.emplace_back("waiting_for_program", CanonicalValue(std::move(waiting)));
-    if (!notify_ids.empty())
-      fields.emplace_back("notify_rule_ids", CanonicalValue(std::move(notify_ids)));
     return fields;
   };
   if (actual->waiting_for_program) {
@@ -2589,24 +1824,19 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
   }
   if (actual->verified_empty) {
     const auto &context = *actual->verified_empty;
-    Require((actual->status == core::IoRuleStateProjectionStatusDTO::kReady ||
-             actual->status == core::IoRuleStateProjectionStatusDTO::kPending) &&
+    Require(actual->status == core::IoRuleStateProjectionStatusDTO::kReady &&
                 !actual->catalog && !actual->baseline,
             "verified-empty rule projection has no exact successful Applied "
             "context");
     return {{"interrupt_rule_catalog",
              CanonicalValue(applied_fields(context, "verified_empty"))},
-            {"interrupt_rule_state_baseline",
-             actual->status == core::IoRuleStateProjectionStatusDTO::kPending
-                 ? CanonicalValue(CanonicalValue::Object{
-                       {"status", CanonicalValue("projection_pending")}})
-                 : CanonicalValue(nullptr)}};
+            {"interrupt_rule_state_baseline", CanonicalValue(nullptr)}};
   }
   Require(actual->catalog != nullptr, "rule projection has no actual catalog");
   const auto &catalog = *actual->catalog;
   const auto &context = catalog.context;
-  Require(!core::io_rule_state_context_field_error(context) && context.owner_epoch == owner_epoch,
-          "rule catalog context differs from the actual event owner");
+  Require(!core::io_rule_state_context_field_error(context),
+          "rule catalog context is invalid");
   auto rules = rule_fields(catalog.rules, false);
   const bool waiting = std::any_of(
       catalog.rules.begin(), catalog.rules.end(),
@@ -2636,7 +1866,7 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
     Require(actual->status == core::IoRuleStateProjectionStatusDTO::kReady && actual->baseline &&
                 actual->baseline->context == context &&
                 !core::io_rule_state_baseline_field_error(*actual->baseline),
-            "ready rule baseline has no exact same-catalog cut");
+            "ready rule baseline does not match its catalog");
     const auto &snapshot = *actual->baseline;
     Require(snapshot.states.size() == catalog.rules.size(), "rule baseline omits actual catalog rows");
     CanonicalValue::Array states;
@@ -2648,12 +1878,10 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
     baseline = CanonicalValue(CanonicalValue::Object{
         {"status", CanonicalValue("ready")},
         {"snapshot", CanonicalValue(CanonicalValue::Object{
-            {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
             {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
             {"active_publication_generation", CanonicalValue(static_cast<double>(context.active_publication_generation.value()))},
             {"retained_bundle_id", CanonicalValue(context.retained_bundle_id.value())},
             {"graph_revision", CanonicalValue(context.graph_revision.value())},
-            {"through_sequence", CanonicalValue(static_cast<double>(snapshot.through_sequence))},
             {"states", CanonicalValue(std::move(states))}})}});
   }
   return {{"interrupt_rule_catalog", std::move(metadata)},
@@ -2797,6 +2025,11 @@ CanonicalValue CellLatchValue(const core::CellLatch &latch) {
                                {"kind", Text(core::to_string(cause.kind))}};
     if (cause.fault) row.emplace_back("fault", FaultValue(*cause.fault));
     if (cause.stop) row.emplace_back("stop", ComponentStopValue(*cause.stop));
+    row.emplace_back("reason", cause.reason
+                                   ? CanonicalValue(CanonicalValue::Object{
+                                         {"code", CanonicalValue(cause.reason->code)},
+                                         {"message", CanonicalValue(cause.reason->message)}})
+                                   : CanonicalValue(nullptr));
     causes.emplace_back(std::move(row));
   }
   return CanonicalValue(CanonicalValue::Object{{"causes", CanonicalValue(std::move(causes))},

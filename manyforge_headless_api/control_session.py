@@ -10,7 +10,6 @@ import json
 import logging
 import time
 from typing import Any, Callable
-import uuid
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -24,11 +23,11 @@ from .control_protocol import (
     CONTROL_MAXIMUM_SNAPSHOT_BYTES,
     CONTROL_PROTOCOL_VERSION,
     MAXIMUM_U64,
+    STOP_COMMAND_FRAME,
     ControlClientHelloDTO,
     ControlClientIncidentDTO,
     ControlHeartbeatChallengeDTO,
     ControlHeartbeatEchoDTO,
-    ControlResyncRequiredDTO,
     ControlServerHelloDTO,
     ControlStateAppliedDTO,
     ExecutionCommandReceiptMessageDTO,
@@ -147,7 +146,7 @@ class ExecutionControlSession:
         self._ingress = ingress
         self._enrich = shell_enricher or (lambda value: value)
         self._clock_ns = clock_ns
-        self._session_id = f"control-session.{uuid.uuid4().hex}"
+        self._session_number = ingress.next_control_session_number()
         self._server_sequence = 0
         self._state_sequence = 0
         self._state_inflight: int | None = None
@@ -167,7 +166,6 @@ class ExecutionControlSession:
         self._subscription: ControlStateSubscription | None = None
         self._latest_frame: ControlStateFrame | None = None
         self._snapshot_sent = False
-        self._resync_required = False
         self._client_incarnation = "unknown-client"
         self._source_label = "unknown-client"
         self._server_incidents: dict[str, _DelayEpisode] = {}
@@ -214,7 +212,7 @@ class ExecutionControlSession:
         return ExecutionControlSnapshotDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="snapshot",
-            control_session_id=self._session_id,
+            control_session_number=self._session_number,
             server_sequence="1",
             state_sequence="1",
             received_client_sequence=(
@@ -276,7 +274,7 @@ class ExecutionControlSession:
         return ExecutionControlDeltaDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="delta",
-            control_session_id=self._session_id,
+            control_session_number=self._session_number,
             server_sequence="1",
             state_sequence="1",
             received_client_sequence=(
@@ -380,8 +378,8 @@ class ExecutionControlSession:
         hello_response = ControlServerHelloDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="server_hello",
-            receiver_incarnation=self._ingress.receiver_incarnation,
-            control_session_id=self._session_id,
+            application_start_id=self._ingress.application_start_id,
+            control_session_number=self._session_number,
             heartbeat_period_ns=CONTROL_HEARTBEAT_PERIOD_NS,
             heartbeat_delayed_ns=CONTROL_HEARTBEAT_DELAYED_NS,
             heartbeat_stale_ns=CONTROL_HEARTBEAT_STALE_NS,
@@ -416,25 +414,6 @@ class ExecutionControlSession:
             if not self._snapshot_sent:
                 self._put_state(self._snapshot_message(frame))
                 continue
-            if previous is not None and (
-                previous.control.receiver_incarnation
-                != frame.control.receiver_incarnation
-                or previous.control.semantic_owner_epoch
-                != frame.control.semantic_owner_epoch
-            ):
-                self._resync_required = True
-                self._put_state(
-                    ControlResyncRequiredDTO(
-                        schema_version=CONTROL_PROTOCOL_VERSION,
-                        message_kind="resync_required",
-                        control_session_id=self._session_id,
-                        server_sequence="1",
-                        reason_code="control_owner_replaced",
-                    )
-                )
-                continue
-            if self._resync_required:
-                continue
             self._put_state(self._delta_message(frame, previous))
 
     def _record_incident(
@@ -453,7 +432,7 @@ class ExecutionControlSession:
             incident_id=incident_id,
             incident_kind=incident_kind,
             phase=phase,
-            control_session_id=self._session_id,
+            control_session_number=self._session_number,
             client_incarnation=self._client_incarnation,
             source_label=self._source_label,
             reason_code=reason_code,
@@ -484,7 +463,7 @@ class ExecutionControlSession:
                 episode.maximum_delay_ns = max(episode.maximum_delay_ns, elapsed)
                 continue
             episode = _DelayEpisode(
-                f"{self._session_id}.{kind}.{self._challenge_sequence}",
+                f"s{self._session_number}.{kind}.{self._challenge_sequence}",
                 observed, observed, maximum_delay_ns=elapsed,
             )
             self._server_incidents[kind] = episode
@@ -550,18 +529,16 @@ class ExecutionControlSession:
         semantic = self._source.semantic_context()
         freshness = None
         if semantic.status == "current":
-            assert semantic.semantic_owner_epoch is not None
             assert semantic.execution_control_revision is not None
             freshness = self._ingress.freshness_for(
-                semantic.semantic_owner_epoch,
-                semantic.execution_control_revision,
+                semantic.execution_control_revision
             )
         self._challenge_sequence += 1
         self._challenge_issued_ns = now_ns
         return ControlHeartbeatChallengeDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="heartbeat_challenge",
-            control_session_id=self._session_id,
+            control_session_number=self._session_number,
             server_sequence="1",
             challenge_sequence=str(self._challenge_sequence),
             received_client_sequence=(
@@ -611,8 +588,9 @@ class ExecutionControlSession:
             # no run history entry. Retain the owner message with the request
             # identity instead of leaving only the receipt's coarse code.
             _LOGGER.warning(
-                "Execution control command failed: correlation_id=%s command=%s code=%s message=%r",
-                request.command.command_envelope.correlation_id,
+                "Execution control command failed: session=%s client_sequence=%s command=%s code=%s message=%r",
+                self._session_number,
+                request.client_sequence,
                 kind,
                 getattr(error, "code", "execution_control_delivery_uncertain"),
                 str(error)[:2048],
@@ -620,18 +598,16 @@ class ExecutionControlSession:
             receipt = self._ingress.rejection_receipt(
                 request.command,
                 code=getattr(error, "code", "execution_control_delivery_uncertain"),
-                semantic_owner_epoch=request.command.command_envelope.expected_semantic_owner_epoch,
                 execution_control_revision=request.command.command_envelope.expected_execution_control_revision,
             )
             result = {
                 "code": getattr(error, "code", "execution_control_delivery_uncertain"),
                 "message": str(error)[:2048],
-                "correlation_id": request.command.command_envelope.correlation_id,
             }
         message = ExecutionCommandReceiptMessageDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="command_receipt",
-            control_session_id=self._session_id,
+            control_session_number=self._session_number,
             server_sequence="1",
             received_client_sequence=request.client_sequence,
             emitted_monotonic_ns=str(self._clock_ns()),
@@ -662,14 +638,13 @@ class ExecutionControlSession:
                         if runtime_scale
                         else "control_session_ordinary_command_pending"
                     ),
-                    semantic_owner_epoch=message.command.command_envelope.expected_semantic_owner_epoch,
                     execution_control_revision=message.command.command_envelope.expected_execution_control_revision,
                 )
                 self._slots.put_receipt(
                     ExecutionCommandReceiptMessageDTO(
                         schema_version=CONTROL_PROTOCOL_VERSION,
                         message_kind="command_receipt",
-                        control_session_id=self._session_id,
+                        control_session_number=self._session_number,
                         server_sequence="1",
                         received_client_sequence=message.client_sequence,
                         emitted_monotonic_ns=str(self._clock_ns()),
@@ -687,14 +662,13 @@ class ExecutionControlSession:
             receipt = self._ingress.rejection_receipt(
                 message.command,
                 code="execution_control_ingress_busy",
-                semantic_owner_epoch=message.command.command_envelope.expected_semantic_owner_epoch,
                 execution_control_revision=message.command.command_envelope.expected_execution_control_revision,
             )
             self._slots.put_receipt(
                 ExecutionCommandReceiptMessageDTO(
                     schema_version=CONTROL_PROTOCOL_VERSION,
                     message_kind="command_receipt",
-                    control_session_id=self._session_id,
+                    control_session_number=self._session_number,
                     server_sequence="1",
                     received_client_sequence=message.client_sequence,
                     emitted_monotonic_ns=str(self._clock_ns()),
@@ -709,19 +683,49 @@ class ExecutionControlSession:
             self._ordinary_pending = future
         future.add_done_callback(lambda done: self._receipt_done(message, done))
 
+    def _stop_command(self, raw: str) -> ExecutionControlCommandDTO | None:
+        """A strict Stop command of this session, or None (PD-6).
+
+        Anything else, a Stop frame that is not a valid command of this
+        session included, takes the ordinary path below, which refuses it
+        exactly as before.
+        """
+
+        if STOP_COMMAND_FRAME.search(raw) is None:
+            return None
+        try:
+            message = ExecutionControlCommandDTO.model_validate(json.loads(raw))
+        except ValueError:
+            return None
+        if (
+            message.control_session_number != self._session_number
+            or not is_stop_command(message.command.command_envelope.command_kind)
+        ):
+            return None
+        return message
+
     async def _receiver(self) -> None:
         while not self._closed:
             raw = await self._websocket.receive_text()
+            # PD-6: a Stop goes to the Stop lane before the session's size,
+            # rate and sequence checks; the Kernel recognizes a repeated
+            # request key. The checks then apply to the frame as before.
+            stop = self._stop_command(raw)
+            if stop is not None:
+                self._receive_command(stop)
             if len(raw.encode("utf-8")) > CONTROL_MAXIMUM_MESSAGE_BYTES:
                 raise ValueError("control client message is oversized")
             self._admit_rate()
+            if stop is not None:
+                self._admit_client_sequence(stop.client_sequence)
+                continue
             value = json.loads(raw)
             if not isinstance(value, dict):
                 raise ValueError("control client message must be an object")
             kind = value.get("message_kind")
             if kind == "heartbeat_echo":
                 message = ControlHeartbeatEchoDTO.model_validate(value)
-                if message.control_session_id != self._session_id:
+                if message.control_session_number != self._session_number:
                     raise ValueError("control heartbeat names another session")
                 self._admit_client_sequence(message.client_sequence)
                 challenge = int(message.challenge_sequence)
@@ -744,7 +748,7 @@ class ExecutionControlSession:
                 self._last_heartbeat_ns = now_ns
             elif kind == "state_applied":
                 message = ControlStateAppliedDTO.model_validate(value)
-                if message.control_session_id != self._session_id:
+                if message.control_session_number != self._session_number:
                     raise ValueError("control state credit names another session")
                 applied = int(message.state_sequence)
                 if self._state_inflight is None or applied != self._state_inflight:
@@ -753,13 +757,13 @@ class ExecutionControlSession:
                 self._slots.wake.set()
             elif kind == "command":
                 message = ExecutionControlCommandDTO.model_validate(value)
-                if message.control_session_id != self._session_id:
+                if message.control_session_number != self._session_number:
                     raise ValueError("control command names another session")
                 self._admit_client_sequence(message.client_sequence)
                 self._receive_command(message)
             elif kind == "client_incident":
                 message = ControlClientIncidentDTO.model_validate(value)
-                if message.control_session_id != self._session_id:
+                if message.control_session_number != self._session_number:
                     raise ValueError("client incident names another session")
                 self._admit_client_sequence(message.client_sequence)
                 self._admit_client_incident()
@@ -768,7 +772,7 @@ class ExecutionControlSession:
                     incident_id=message.incident_id,
                     incident_kind=message.incident_kind,
                     phase=message.phase,
-                    control_session_id=self._session_id,
+                    control_session_number=self._session_number,
                     source_label=self._source_label,
                     occurrence_count=message.occurrence_count,
                     maximum_delay_ns=message.maximum_delay_ns,
@@ -809,7 +813,7 @@ class ExecutionControlSession:
         ) as error:
             _LOGGER.warning(
                 "control session %s closed fail-closed: %s: %s",
-                self._session_id,
+                self._session_number,
                 type(error).__name__,
                 error,
             )

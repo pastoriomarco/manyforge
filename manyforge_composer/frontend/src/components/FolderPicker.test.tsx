@@ -121,7 +121,7 @@ it('explains project folder locations when no host mappings are available', asyn
   expect(help).toContain('bundled Examples');
   expect(help).toContain('project_folders in the site settings file');
   expect(help).toContain('/projects/<folder name>');
-  expect(help).toContain('Stop and Start');
+  expect(help).toContain('stop and start ManyForge');
   expect(help).toContain('Pasting a host path is not supported');
 });
 

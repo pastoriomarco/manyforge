@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <charconv>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <tuple>
@@ -24,22 +25,18 @@ template <typename Value>
   return content_identity::is_sha256_digest(value.value());
 }
 
-[[nodiscard]] bool ResetCallerIdentity(std::string_view value) noexcept {
-  return !value.empty() && value.size() <= kMaximumProgramResetCallerIdentityBytes;
-}
-
 [[nodiscard]] std::size_t BinaryString(std::string_view value) {
   return sizeof(std::uint64_t) + value.size();
 }
 
+// An optional transaction id: one presence byte and one number.
+constexpr std::size_t kBinaryTransactionIdBytes = 1U + sizeof(std::uint64_t);
+
 [[nodiscard]] std::size_t BinaryIntent(
     const CellAdmissionClaimIntentDTO& intent) {
   std::size_t result =
-      3U * sizeof(std::uint64_t) +
-      BinaryString(intent.owner_epoch.value()) +
-      BinaryString(intent.owner_transaction_id) +
-      BinaryString(intent.request_id.value()) +
-      BinaryString(intent.request_payload_digest.value()) +
+      3U * sizeof(std::uint64_t) + kBinaryTransactionIdBytes +
+      sizeof(RequestKey) +
       2U * sizeof(std::uint64_t);
   for (const auto& resource : intent.scope.resources) {
     result += BinaryString(resource.value());
@@ -58,9 +55,7 @@ template <typename Value>
   }
   if (intent.intervention_evidence.has_value()) {
     const auto& evidence = *intent.intervention_evidence;
-    result += sizeof(std::uint64_t) +
-              BinaryString(evidence.offering_owner_epoch.value()) +
-              BinaryString(evidence.offer_transaction_id) +
+    result += sizeof(std::uint64_t) + kBinaryTransactionIdBytes +
               BinaryString(evidence.offer_digest.value()) + 1U;
     if (evidence.parent_program_cycle_claim_generation.has_value()) {
       result += sizeof(std::uint64_t);
@@ -68,9 +63,8 @@ template <typename Value>
   }
   if (intent.program_node_evidence.has_value()) {
     const auto& evidence = *intent.program_node_evidence;
-    result += BinaryString(evidence.program_runner_owner_epoch.value()) +
-              BinaryString(evidence.program_run_id.value()) + sizeof(std::uint64_t) +
-              BinaryString(evidence.node_instance_id) + BinaryString(evidence.node_attempt_id) +
+    result += 2U * sizeof(std::uint64_t) +
+              BinaryString(evidence.node_instance_id) + sizeof(std::uint64_t) +
               BinaryString(evidence.owner_api);
   }
   return result;
@@ -82,25 +76,9 @@ template <typename Value>
 
 [[nodiscard]] std::size_t BinaryRelease(
     const CellAdmissionClaimReleaseDTO& release) {
-  return 4U * sizeof(std::uint64_t) +
-         BinaryString(release.owner_epoch.value()) +
-         BinaryString(release.owner_transaction_id) +
-         BinaryString(release.request_id.value()) +
-         BinaryString(release.request_payload_digest.value()) +
+  return 4U * sizeof(std::uint64_t) + kBinaryTransactionIdBytes +
+         sizeof(RequestKey) +
          BinaryString(release.settlement.evidence_digest.value());
-}
-
-[[nodiscard]] std::size_t BinaryOwner(
-    const CellAdmissionCurrentOwnerEpochDTO& owner) {
-  return sizeof(std::uint64_t) + BinaryString(owner.owner_epoch.value());
-}
-
-[[nodiscard]] std::size_t BinaryReconcileSettlement(
-    const CellAdmissionReconcileSettlementDTO& settlement) {
-  return BinaryClaim(settlement.predecessor_claim) +
-         2U * sizeof(std::uint64_t) +
-         BinaryString(settlement.successor_owner_epoch.value()) +
-         BinaryString(settlement.reconciliation_evidence_digest.value());
 }
 
 constexpr std::size_t kRecoveryCommandEnvelopeBinaryBytes =
@@ -116,23 +94,46 @@ constexpr std::size_t kJsonStructuralAllowanceBytes = 16U * 1024U;
 }
 
 [[nodiscard]] bool OwnerMatchesKind(CellAdmissionClaimKindDTO kind,
-                                    CellAdmissionOwnerRoleDTO role) noexcept {
+                                    ApplicationRole role) noexcept {
   switch (kind) {
     case CellAdmissionClaimKindDTO::kProgramCycle:
     case CellAdmissionClaimKindDTO::kProgramReset:
-      return role == CellAdmissionOwnerRoleDTO::kProgramRunner;
+      return role == ApplicationRole::kProgramRunner;
     case CellAdmissionClaimKindDTO::kAuthoringMutation:
-      return role == CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+      return role == ApplicationRole::kAuthoringOwner;
     case CellAdmissionClaimKindDTO::kManagerApply:
-      return role == CellAdmissionOwnerRoleDTO::kManager;
+      return role == ApplicationRole::kManager;
     case CellAdmissionClaimKindDTO::kAuthoredScene:
-      return role == CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
+      return role == ApplicationRole::kAuthoredSceneOwner;
     case CellAdmissionClaimKindDTO::kManualOperation:
-      return role == CellAdmissionOwnerRoleDTO::kManualOperationOwner;
+      return role == ApplicationRole::kManualOperationOwner;
     case CellAdmissionClaimKindDTO::kInterventionOrRecovery:
-      return role == CellAdmissionOwnerRoleDTO::kInterventionOrRecoveryOwner;
+      return role == ApplicationRole::kInterventionOrRecoveryOwner;
   }
   return false;
+}
+
+// A present id has the type of `role` and a nonzero number within the JSON bound.
+[[nodiscard]] bool TransactionIdFits(
+    ApplicationRole role, const std::optional<CellAdmissionOwnerTransactionId>& id) noexcept {
+  if (!id) return true;
+  const auto number = CellAdmissionOwnerTransactionNumber(*id);
+  const auto expected = CellAdmissionOwnerTransactionIdFor(role, number);
+  return expected && expected->index() == id->index() && number != 0U &&
+         number <= kMaximumSafeCounter;
+}
+
+// The claim kinds whose owner has its own transaction number.
+[[nodiscard]] bool KindCarriesTransactionId(CellAdmissionClaimKindDTO kind) noexcept {
+  return kind == CellAdmissionClaimKindDTO::kProgramCycle ||
+         kind == CellAdmissionClaimKindDTO::kManagerApply ||
+         kind == CellAdmissionClaimKindDTO::kManualOperation;
+}
+
+[[nodiscard]] CanonicalValue TransactionIdValue(
+    const std::optional<CellAdmissionOwnerTransactionId>& id) {
+  return id ? CanonicalValue(static_cast<double>(CellAdmissionOwnerTransactionNumber(*id)))
+            : CanonicalValue(nullptr);
 }
 
 [[nodiscard]] CanonicalValue ScopeValue(const CellAdmissionScopeDTO& scope) {
@@ -180,22 +181,37 @@ std::string_view to_string(CellAdmissionClaimKindDTO value) noexcept {
   return {};
 }
 
-std::string_view to_string(CellAdmissionOwnerRoleDTO value) noexcept {
-  switch (value) {
-    case CellAdmissionOwnerRoleDTO::kProgramRunner:
-      return "program_runner";
-    case CellAdmissionOwnerRoleDTO::kAuthoringOwner:
-      return "authoring_owner";
-    case CellAdmissionOwnerRoleDTO::kManager:
-      return "manager";
-    case CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner:
-      return "authored_scene_owner";
-    case CellAdmissionOwnerRoleDTO::kManualOperationOwner:
-      return "manual_operation_owner";
-    case CellAdmissionOwnerRoleDTO::kInterventionOrRecoveryOwner:
-      return "intervention_or_recovery_owner";
+bool IsCellAdmissionOwnerRole(const ApplicationRole role) noexcept {
+  switch (role) {
+    case ApplicationRole::kProgramRunner:
+    case ApplicationRole::kAuthoringOwner:
+    case ApplicationRole::kManager:
+    case ApplicationRole::kAuthoredSceneOwner:
+    case ApplicationRole::kManualOperationOwner:
+    case ApplicationRole::kInterventionOrRecoveryOwner:
+      return true;
+    default:
+      return false;
   }
-  return {};
+}
+
+std::optional<CellAdmissionOwnerTransactionId> CellAdmissionOwnerTransactionIdFor(
+    const ApplicationRole role, const std::uint64_t value) noexcept {
+  switch (role) {
+    case ApplicationRole::kProgramRunner:
+      return CellAdmissionOwnerTransactionId(ProgramRunNumber(value));
+    case ApplicationRole::kManager:
+      return CellAdmissionOwnerTransactionId(ApplyId(value));
+    case ApplicationRole::kManualOperationOwner:
+      return CellAdmissionOwnerTransactionId(OperationNumber(value));
+    default:
+      return std::nullopt;
+  }
+}
+
+std::uint64_t CellAdmissionOwnerTransactionNumber(
+    const CellAdmissionOwnerTransactionId& value) noexcept {
+  return std::visit([](const auto& number) { return number.value(); }, value);
 }
 
 std::string_view to_string(ProgramCycleStateDTO value) noexcept {
@@ -230,8 +246,6 @@ std::string_view to_string(CellAdmissionSettlementKindDTO value) noexcept {
       return "terminal_effects_settled";
     case CellAdmissionSettlementKindDTO::kExplicitReset:
       return "explicit_reset";
-    case CellAdmissionSettlementKindDTO::kReconciled:
-      return "reconciled";
   }
   return {};
 }
@@ -246,8 +260,6 @@ std::string_view to_string(CellAdmissionRecoveryReceiptStatusDTO value) noexcept
       return "held_exact";
     case CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact:
       return "released_exact";
-    case CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact:
-      return "reconciled_exact";
   }
   return {};
 }
@@ -284,23 +296,20 @@ Result<void> ValidateCellAdmissionScope(const CellAdmissionScopeDTO& scope) {
 }
 
 bool ProgramNodeAdmissionEvidenceDTO::locally_valid() const noexcept {
-  return BoundedIdentity(program_runner_owner_epoch.value()) &&
-         BoundedIdentity(program_run_id.value()) &&
+  return program_run_id.nonzero() && program_run_id.value() <= kMaximumSafeCounter &&
          parent_program_cycle_claim_generation.nonzero() &&
          parent_program_cycle_claim_generation.value() <= kMaximumSafeCounter &&
-         BoundedIdentity(node_instance_id) && !node_attempt_id.empty() &&
-         node_attempt_id.size() <= 512U && node_instance_id.find('\0') == std::string::npos &&
-         node_attempt_id.find('\0') == std::string::npos &&
-         (owner_api == "scene.transaction" || owner_api == "scene.carried_attachment" ||
-          owner_api == "cclc.lifecycle" || owner_api == "cclc.control_route");
+         BoundedIdentity(node_instance_id) && node_attempt_id.nonzero() &&
+         node_attempt_id.value() <= kMaximumSafeCounter &&
+         node_instance_id.find('\0') == std::string::npos &&
+         (owner_api == "scene.transaction" || owner_api == "scene.carried_attachment");
 }
 
 Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO& intent) {
-  if (to_string(intent.claim_kind).empty() || to_string(intent.owner_role).empty() ||
+  if (to_string(intent.claim_kind).empty() ||
       !OwnerMatchesKind(intent.claim_kind, intent.owner_role) ||
-      !BoundedIdentity(intent.owner_epoch.value()) ||
-      !BoundedIdentity(intent.owner_transaction_id) ||
-      !BoundedIdentity(intent.request_id.value()) || !Digest(intent.request_payload_digest) ||
+      KindCarriesTransactionId(intent.claim_kind) != intent.owner_transaction_id.has_value() ||
+      !TransactionIdFits(intent.owner_role, intent.owner_transaction_id) ||
       !intent.expected_admission_generation.nonzero() ||
       intent.expected_admission_generation.value() > kMaximumSafeCounter) {
     return Invalid<void>("claim_identity_invalid");
@@ -332,16 +341,15 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
   }
   if (intent.intervention_evidence.has_value()) {
     const auto& evidence = *intent.intervention_evidence;
-    if (to_string(evidence.offering_owner_role).empty() ||
-        !BoundedIdentity(evidence.offering_owner_epoch.value()) ||
-        !BoundedIdentity(evidence.offer_transaction_id) || !Digest(evidence.offer_digest) ||
+    if (!IsCellAdmissionOwnerRole(evidence.offering_owner_role) ||
+        !TransactionIdFits(evidence.offering_owner_role, evidence.offer_transaction_id) ||
+        !Digest(evidence.offer_digest) ||
         (evidence.parent_program_cycle_claim_generation.has_value() &&
          !evidence.parent_program_cycle_claim_generation->nonzero())) {
       return Invalid<void>("intervention_evidence_invalid");
     }
     if (held_manual &&
-        (evidence.offering_owner_role != CellAdmissionOwnerRoleDTO::kManualOperationOwner ||
-         evidence.offering_owner_epoch != intent.owner_epoch ||
+        (evidence.offering_owner_role != ApplicationRole::kManualOperationOwner ||
          evidence.offer_transaction_id != intent.owner_transaction_id ||
          !evidence.parent_program_cycle_claim_generation || intent.scope.resources.empty())) {
       return Invalid<void>("manual_handover_evidence_invalid");
@@ -361,9 +369,8 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
 }
 
 Result<void> ValidateCellAdmissionClaimRelease(const CellAdmissionClaimReleaseDTO& release) {
-  if (to_string(release.owner_role).empty() || !BoundedIdentity(release.owner_epoch.value()) ||
-      !BoundedIdentity(release.owner_transaction_id) ||
-      !BoundedIdentity(release.request_id.value()) || !Digest(release.request_payload_digest) ||
+  if (!IsCellAdmissionOwnerRole(release.owner_role) ||
+      !TransactionIdFits(release.owner_role, release.owner_transaction_id) ||
       !release.acquired_admission_generation.nonzero() || !release.claim_generation.nonzero() ||
       release.acquired_admission_generation.value() > kMaximumSafeCounter ||
       release.claim_generation.value() > kMaximumSafeCounter ||
@@ -395,10 +402,7 @@ Result<void> ValidateCellAdmissionRecoveryReceiptQuery(
     const auto& claim = *query.expected_claim;
     const auto& release = *query.expected_release;
     if (claim.intent.owner_role != release.owner_role ||
-        claim.intent.owner_epoch != release.owner_epoch ||
         claim.intent.owner_transaction_id != release.owner_transaction_id ||
-        claim.intent.request_id != release.request_id ||
-        claim.intent.request_payload_digest != release.request_payload_digest ||
         claim.acquired_admission_generation !=
             release.acquired_admission_generation ||
         claim.claim_generation != release.claim_generation) {
@@ -410,10 +414,9 @@ Result<void> ValidateCellAdmissionRecoveryReceiptQuery(
 
 Result<void> ValidateCellAdmissionRecoveryReceipt(
     const CellAdmissionRecoveryReceiptDTO& receipt) {
-  if (to_string(receipt.status).empty() || receipt.kernel_owner_epoch.empty() ||
+  if (to_string(receipt.status).empty() ||
       !receipt.admission_generation.nonzero() ||
       receipt.held_claims.size() > kMaximumCellAdmissionClaims ||
-      receipt.current_owner_epochs.size() > kMaximumCellAdmissionClaims ||
       !std::is_sorted(receipt.held_claims.begin(), receipt.held_claims.end(),
                       [](const auto& left, const auto& right) {
                         return left.claim_generation < right.claim_generation;
@@ -421,17 +424,7 @@ Result<void> ValidateCellAdmissionRecoveryReceipt(
       std::adjacent_find(receipt.held_claims.begin(), receipt.held_claims.end(),
                          [](const auto& left, const auto& right) {
                            return left.claim_generation == right.claim_generation;
-                         }) != receipt.held_claims.end() ||
-      !std::is_sorted(receipt.current_owner_epochs.begin(),
-                      receipt.current_owner_epochs.end(),
-                      [](const auto& left, const auto& right) {
-                        return left.owner_role < right.owner_role;
-                      }) ||
-      std::adjacent_find(receipt.current_owner_epochs.begin(),
-                         receipt.current_owner_epochs.end(),
-                         [](const auto& left, const auto& right) {
-                           return left.owner_role == right.owner_role;
-                         }) != receipt.current_owner_epochs.end()) {
+                         }) != receipt.held_claims.end()) {
     return Invalid<void>("recovery_receipt_inventory_invalid");
   }
   for (const auto& claim : receipt.held_claims) {
@@ -442,28 +435,13 @@ Result<void> ValidateCellAdmissionRecoveryReceipt(
       return Invalid<void>("recovery_receipt_held_claim_invalid");
     }
   }
-  if (std::any_of(receipt.current_owner_epochs.begin(),
-                  receipt.current_owner_epochs.end(), [](const auto& owner) {
-                    return to_string(owner.owner_role).empty() ||
-                           owner.owner_epoch.empty();
-                  })) {
-    return Invalid<void>("recovery_receipt_owner_invalid");
-  }
   const bool exact =
       receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact ||
-      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact ||
-      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact;
+      receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact;
   if (exact != receipt.matched_claim.has_value() ||
       (receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact) !=
           receipt.matched_release.has_value() ||
-      (receipt.status ==
-       CellAdmissionRecoveryReceiptStatusDTO::kReconciledExact) !=
-          receipt.matched_reconcile_settlement.has_value() ||
-      (receipt.status == CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-       (receipt.matched_release.has_value() ||
-        receipt.matched_reconcile_settlement.has_value())) ||
-      (!exact && (receipt.matched_release.has_value() ||
-                  receipt.matched_reconcile_settlement.has_value()))) {
+      (!exact && receipt.matched_release.has_value())) {
     return Invalid<void>("recovery_receipt_status_shape_invalid");
   }
   if (receipt.matched_claim.has_value() &&
@@ -493,34 +471,15 @@ Result<void> ValidateCellAdmissionRecoveryReceipt(
            .ok()) {
     return Invalid<void>("recovery_receipt_release_not_exact");
   }
-  if (receipt.matched_reconcile_settlement.has_value()) {
-    const auto& settlement = *receipt.matched_reconcile_settlement;
-    if (!receipt.matched_claim.has_value() ||
-        settlement.predecessor_claim != *receipt.matched_claim ||
-        settlement.successor_owner_role !=
-            settlement.predecessor_claim.intent.owner_role ||
-        settlement.successor_owner_epoch.empty() ||
-        settlement.successor_owner_epoch ==
-            settlement.predecessor_claim.intent.owner_epoch ||
-        settlement.settlement_predicate !=
-            CellAdmissionSettlementKindDTO::kReconciled ||
-        !Digest(settlement.reconciliation_evidence_digest)) {
-      return Invalid<void>("recovery_receipt_reconcile_invalid");
-    }
-  }
   return Result<void>::Ok();
 }
 
 Result<CellAdmissionRecoveryFootprintDTO>
 ComputeCellAdmissionRecoveryFootprint(
-    const RequestOwnerEpoch& kernel_owner_epoch,
     AdmissionGeneration admission_generation,
-    const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries,
-    const std::vector<CellAdmissionCurrentOwnerEpochDTO>& current_owner_epochs) {
-  if (!BoundedIdentity(kernel_owner_epoch.value()) ||
-      !admission_generation.nonzero() ||
-      entries.size() > kMaximumCellAdmissionClaims ||
-      current_owner_epochs.size() > kMaximumCellAdmissionClaims) {
+    const std::vector<CellAdmissionRecoveryLedgerEntryDTO>& entries) {
+  if (!admission_generation.nonzero() ||
+      entries.size() > kMaximumCellAdmissionClaims) {
     return Invalid<CellAdmissionRecoveryFootprintDTO>(
         "recovery_footprint_input_invalid");
   }
@@ -531,44 +490,22 @@ ComputeCellAdmissionRecoveryFootprint(
         !entry.claim.acquired_admission_generation.nonzero() ||
         entry.claim.accepted_at_ns < 0 ||
         (entry.release.has_value() &&
-         entry.reconcile_settlement.has_value()) ||
-        (entry.release.has_value() &&
          (!ValidateCellAdmissionClaimRelease(*entry.release).ok() ||
-          entry.release->claim_generation != entry.claim.claim_generation)) ||
-        (entry.reconcile_settlement.has_value() &&
-         entry.reconcile_settlement->predecessor_claim != entry.claim)) {
+          entry.release->claim_generation != entry.claim.claim_generation))) {
       return Invalid<CellAdmissionRecoveryFootprintDTO>(
           "recovery_footprint_entry_invalid");
     }
-    if (!entry.release.has_value() &&
-        !entry.reconcile_settlement.has_value()) {
+    if (!entry.release.has_value()) {
       held_inventory_binary += BinaryClaim(entry.claim);
     }
-  }
-  std::size_t owner_inventory_binary = sizeof(std::uint64_t);
-  for (const auto& owner : current_owner_epochs) {
-    if (to_string(owner.owner_role).empty() ||
-        !BoundedIdentity(owner.owner_epoch.value())) {
-      return Invalid<CellAdmissionRecoveryFootprintDTO>(
-          "recovery_footprint_owner_invalid");
-    }
-    owner_inventory_binary += BinaryOwner(owner);
   }
 
   CellAdmissionRecoveryFootprintDTO result;
   for (const auto& entry : entries) {
     const auto claim_bytes = BinaryClaim(entry.claim);
     const auto future_release_bytes =
-        4U * sizeof(std::uint64_t) +
-        BinaryString(entry.claim.intent.owner_epoch.value()) +
-        BinaryString(entry.claim.intent.owner_transaction_id) +
-        BinaryString(entry.claim.intent.request_id.value()) +
-        BinaryString(entry.claim.intent.request_payload_digest.value()) +
-        BinaryString(std::string_view(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"));
-    const auto future_reconcile_bytes =
-        claim_bytes + 2U * sizeof(std::uint64_t) +
-        sizeof(std::uint64_t) + kMaximumCellAdmissionIdentityBytes +
+        4U * sizeof(std::uint64_t) + kBinaryTransactionIdBytes +
+        sizeof(RequestKey) +
         BinaryString(std::string_view(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000"));
     std::size_t query =
@@ -576,24 +513,18 @@ ComputeCellAdmissionRecoveryFootprint(
         2U + claim_bytes;
     if (entry.release.has_value()) {
       query += BinaryRelease(*entry.release);
-    } else if (!entry.reconcile_settlement.has_value()) {
+    } else {
       query += future_release_bytes;
     }
 
     std::size_t receipt =
         kRecoveryCommandEnvelopeBinaryBytes + 1U + sizeof(std::uint64_t) +
-        BinaryString(kernel_owner_epoch.value()) + sizeof(std::uint64_t) +
-        3U + claim_bytes + held_inventory_binary + owner_inventory_binary;
+        2U + claim_bytes + held_inventory_binary;
     if (entry.release.has_value()) {
       receipt += BinaryRelease(*entry.release);
-    } else if (entry.reconcile_settlement.has_value()) {
-      receipt +=
-          BinaryReconcileSettlement(*entry.reconcile_settlement);
     } else {
       receipt =
           std::max(receipt, receipt - claim_bytes + future_release_bytes);
-      receipt =
-          std::max(receipt, receipt - claim_bytes + future_reconcile_bytes);
     }
     result.maximum_binary_request_bytes =
         std::max(result.maximum_binary_request_bytes, query);
@@ -612,9 +543,7 @@ Result<void> ValidateProgramRunnerContactLoss(const ProgramRunnerContactLossDTO&
   const bool active = cycle.state == ProgramCycleStateDTO::kStarting ||
                       cycle.state == ProgramCycleStateDTO::kRunning ||
                       cycle.state == ProgramCycleStateDTO::kStopping;
-  if (!BoundedIdentity(loss.manager_owner_epoch.value()) ||
-      !BoundedIdentity(loss.manager_runtime_epoch.value()) ||
-      !ValidateProgramCycleStatus(cycle).ok() || !active || !cycle.program_run_id ||
+  if (!ValidateProgramCycleStatus(cycle).ok() || !active || !cycle.program_run_id ||
       !cycle.cycle_claim_generation || cycle.accepted_reset ||
       cycle.terminal_or_settlement_reference ||
       (loss.failure_predicate != "program_runner_liveness_probe" &&
@@ -628,8 +557,7 @@ Result<void> ValidateProgramRunnerContactLoss(const ProgramRunnerContactLossDTO&
 }
 
 Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
-  if (!BoundedIdentity(status.program_runner_owner_epoch.value()) ||
-      status.cycle_generation == 0U || status.cycle_generation > kMaximumSafeCounter ||
+  if (status.cycle_generation == 0U || status.cycle_generation > kMaximumSafeCounter ||
       to_string(status.state).empty()) {
     return Invalid<void>("program_cycle_status_identity_invalid");
   }
@@ -640,8 +568,7 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   if (status.accepted_reset) {
     const auto& reset = *status.accepted_reset;
     if ((status.state != ProgramCycleStateDTO::kResetting && !recovery) ||
-        !ResetCallerIdentity(reset.request_owner_epoch.value()) ||
-        !ResetCallerIdentity(reset.request_id.value()) || !Digest(reset.request_payload_digest) ||
+        !Digest(reset.request_payload_digest) ||
         (reset.reset_claim_generation &&
          (!reset.reset_claim_generation->nonzero() ||
           reset.reset_claim_generation->value() > kMaximumSafeCounter ||
@@ -654,6 +581,10 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   }
   const bool reset_claim = status.state == ProgramCycleStateDTO::kResetting &&
                           !status.program_run_id && status.accepted_reset;
+  // The start window: the run number is announced only after the Kernel
+  // claim (K-6; contract 1.15.5), so `starting` may name no run and no claim.
+  const bool unannounced_start = status.state == ProgramCycleStateDTO::kStarting &&
+                                 !status.program_run_id && !status.cycle_claim_generation;
   const bool pending_acquire =
       (status.state == ProgramCycleStateDTO::kStarting ||
        status.state == ProgramCycleStateDTO::kStopping ||
@@ -661,15 +592,14 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
        (status.state == ProgramCycleStateDTO::kTerminalAwaitingReset &&
         status.terminal_or_settlement_reference.has_value())) &&
       !status.cycle_claim_generation.has_value();
-  if ((idle && (status.program_run_id.has_value() ||
+  if ((status.program_run_id && (!status.program_run_id->nonzero() ||
+                                 status.program_run_id->value() > kMaximumSafeCounter)) ||
+      (idle && (status.program_run_id.has_value() ||
                 status.cycle_claim_generation.has_value() ||
                 status.terminal_or_settlement_reference.has_value())) ||
       (!idle &&
-       ((!recovery && !reset_claim && (!status.program_run_id.has_value() ||
-                       status.program_run_id->empty())) ||
-        (status.cycle_claim_generation.has_value() &&
-         (!status.program_run_id.has_value() ||
-          status.program_run_id->empty())) ||
+       ((!recovery && !reset_claim && !unannounced_start && !status.program_run_id.has_value()) ||
+        (status.cycle_claim_generation.has_value() && !status.program_run_id.has_value()) ||
         (!pending_acquire &&
          (!status.cycle_claim_generation.has_value() ||
           !status.cycle_claim_generation->nonzero() ||
@@ -683,40 +613,31 @@ Result<void> ValidateProgramCycleStatus(const ProgramCycleStatusDTO& status) {
   return Result<void>::Ok();
 }
 
-Result<RequestId> ProgramResetClaimRequestId(const ProgramCycleStatusDTO& status) {
+Result<RequestKey> ProgramResetClaimRequestKey(const ProgramCycleStatusDTO& status) {
   if (!ValidateProgramCycleStatus(status).ok() || !status.accepted_reset ||
       status.cycle_claim_generation) {
-    return Invalid<RequestId>("program_reset_claim_context_invalid");
+    return Invalid<RequestKey>("program_reset_claim_context_invalid");
   }
-  const auto& reset = *status.accepted_reset;
-  const auto encoded = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"cycle_generation", CanonicalValue(static_cast<double>(status.cycle_generation))},
-      {"request_owner_epoch", CanonicalValue(reset.request_owner_epoch.value())},
-      {"request_id", CanonicalValue(reset.request_id.value())},
-      {"request_payload_digest", CanonicalValue(reset.request_payload_digest.value())},
-  }));
-  return Result<RequestId>::Ok(RequestId(
-      "program-reset." + content_identity::sha256_digest(encoded).substr(7U)));
+  // The Reset's claim is the Reset request's part 2 (contract 1.4, 1.15.2).
+  return Result<RequestKey>::Ok(status.accepted_reset->request_key.WithPart(2U));
 }
 
 Result<void> ValidateProgramResetSceneAuthorization(
     const ProgramResetSceneAuthorizationDTO& authorization) {
   if (authorization.reset_claim) {
     const auto& reset = *authorization.reset_claim;
-    if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
-        !authorization.program_run_id.empty() || authorization.cycle_claim_generation.nonzero() ||
+    if (authorization.program_run_id.nonzero() || authorization.cycle_claim_generation.nonzero() ||
         !authorization.terminal_or_settlement_reference.empty() ||
         reset.cycle_generation == 0U || reset.cycle_generation > kMaximumSafeCounter ||
-        !ResetCallerIdentity(reset.request_owner_epoch.value()) ||
-        !ResetCallerIdentity(reset.request_id.value()) || !Digest(reset.request_payload_digest) ||
+        !Digest(reset.request_payload_digest) ||
         !reset.reset_claim_generation.nonzero() ||
         reset.reset_claim_generation.value() > kMaximumSafeCounter) {
       return Invalid<void>("program_reset_scene_authorization_invalid");
     }
     return Result<void>::Ok();
   }
-  if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
-      !BoundedIdentity(authorization.program_run_id.value()) ||
+  if (!authorization.program_run_id.nonzero() ||
+      authorization.program_run_id.value() > kMaximumSafeCounter ||
       !authorization.cycle_claim_generation.nonzero() ||
       authorization.cycle_claim_generation.value() > kMaximumSafeCounter ||
       !Digest(authorization.terminal_or_settlement_reference)) {
@@ -730,20 +651,16 @@ Result<void> ValidateProgramResetPositionAuthorization(
   const auto counter = [](const auto& value) {
     return value && value->nonzero() && value->value() <= kMaximumSafeCounter;
   };
-  if (!BoundedIdentity(authorization.program_runner_owner_epoch.value()) ||
-      authorization.cycle_generation == 0U || authorization.cycle_generation > kMaximumSafeCounter ||
-      !ResetCallerIdentity(authorization.request_owner_epoch.value()) ||
-      !ResetCallerIdentity(authorization.request_id.value()) ||
+  if (authorization.cycle_generation == 0U || authorization.cycle_generation > kMaximumSafeCounter ||
       !Digest(authorization.request_payload_digest) ||
       (authorization.reset_claim_generation
           ? (!counter(authorization.reset_claim_generation) || authorization.cycle_claim_generation ||
              (authorization.program_run_id
-                 ? (!BoundedIdentity(authorization.program_run_id->value()) ||
+                 ? (!counter(authorization.program_run_id) ||
                     !authorization.terminal_or_settlement_reference ||
                     !Digest(*authorization.terminal_or_settlement_reference))
                  : authorization.terminal_or_settlement_reference.has_value()))
-          : (!authorization.program_run_id ||
-             !BoundedIdentity(authorization.program_run_id->value()) ||
+          : (!counter(authorization.program_run_id) ||
              !counter(authorization.cycle_claim_generation) ||
              !authorization.terminal_or_settlement_reference ||
              !Digest(*authorization.terminal_or_settlement_reference)))) {
@@ -762,9 +679,9 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
     const auto& evidence = *intent.intervention_evidence;
     intervention = CanonicalValue(CanonicalValue::Object{
         {"offer_digest", CanonicalValue(evidence.offer_digest.value())},
-        {"offer_transaction_id", CanonicalValue(evidence.offer_transaction_id)},
-        {"offering_owner_epoch", CanonicalValue(evidence.offering_owner_epoch.value())},
-        {"offering_owner_role", CanonicalValue(std::string(to_string(evidence.offering_owner_role)))},
+        {"offer_transaction_id", TransactionIdValue(evidence.offer_transaction_id)},
+        {"offering_owner_role",
+         CanonicalValue(std::string(ApplicationRoleText(evidence.offering_owner_role)))},
         {"parent_program_cycle_claim_generation",
          evidence.parent_program_cycle_claim_generation.has_value()
              ? CanonicalValue(static_cast<double>(
@@ -786,12 +703,10 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
       {"expected_admission_generation",
        CanonicalValue(static_cast<double>(intent.expected_admission_generation.value()))},
       {"intervention_evidence", std::move(intervention)},
-      {"owner_epoch", CanonicalValue(intent.owner_epoch.value())},
-      {"owner_role", CanonicalValue(std::string(to_string(intent.owner_role)))},
-      {"owner_transaction_id", CanonicalValue(intent.owner_transaction_id)},
+      {"owner_role", CanonicalValue(std::string(ApplicationRoleText(intent.owner_role)))},
+      {"owner_transaction_id", TransactionIdValue(intent.owner_transaction_id)},
       {"program_cycle_evidence", std::move(program_cycle)},
-      {"request_id", CanonicalValue(intent.request_id.value())},
-      {"request_payload_digest", CanonicalValue(intent.request_payload_digest.value())},
+      {"request_key", CanonicalValue(RequestKeyText(intent.request_key))},
       {"scope", ScopeValue(intent.scope)},
   };
   // Preserve existing claim identities on journal migration. New attribution
@@ -800,36 +715,20 @@ Result<ContentDigest> CellAdmissionClaimIntentDigest(const CellAdmissionClaimInt
     const auto& evidence = *intent.program_node_evidence;
     fields.emplace_back("program_node_evidence",
                         CanonicalValue(CanonicalValue::Object{
-                            {"program_runner_owner_epoch",
-                             CanonicalValue(evidence.program_runner_owner_epoch.value())},
-                            {"program_run_id", CanonicalValue(evidence.program_run_id.value())},
+                            {"program_run_id", CanonicalValue(static_cast<double>(
+                                                   evidence.program_run_id.value()))},
                             {"parent_program_cycle_claim_generation",
                              CanonicalValue(static_cast<double>(
                                  evidence.parent_program_cycle_claim_generation.value()))},
                             {"node_instance_id", CanonicalValue(evidence.node_instance_id)},
-                            {"node_attempt_id", CanonicalValue(evidence.node_attempt_id)},
+                            {"node_attempt_id",
+                             CanonicalValue(static_cast<double>(evidence.node_attempt_id.value()))},
                             {"owner_api", CanonicalValue(evidence.owner_api)},
                         }));
   }
   const CanonicalValue value(std::move(fields));
   return Result<ContentDigest>::Ok(ContentDigest(content_identity::framed_sha256(
-      "cell-admission-claim-intent-digest", "1.0", value)));
-}
-
-Result<ContentDigest> CellAdmissionOwnerEpochReconciliationEvidenceDigest(
-    CellAdmissionOwnerRoleDTO owner_role,
-    const RequestOwnerEpoch& owner_epoch) {
-  if (to_string(owner_role).empty() ||
-      !BoundedIdentity(owner_epoch.value())) {
-    return Invalid<ContentDigest>(
-        "owner_epoch_reconciliation_identity_invalid");
-  }
-  const CanonicalValue value(CanonicalValue::Object{
-      {"owner_epoch", CanonicalValue(owner_epoch.value())},
-      {"owner_role", CanonicalValue(std::string(to_string(owner_role)))},
-  });
-  return Result<ContentDigest>::Ok(ContentDigest(content_identity::framed_sha256(
-      "cell-admission-owner-epoch-reconciliation-evidence", "1.0", value)));
+      "cell-admission-claim-intent-digest", "2.0", value)));
 }
 
 }  // namespace manyforge::core

@@ -54,8 +54,8 @@ TEST(ManagerPackageGeneration, UnchangedRootAndManifestRemainCurrent) {
   EXPECT_TRUE(std::filesystem::is_directory(descriptor_root));
   EXPECT_NE(descriptor_root.generic_string().find("/proc/self/fd/"),
             std::string::npos);
-  EXPECT_NO_THROW(generation.RequireCurrent(manifest));
-  EXPECT_NO_THROW(generation.RequireCurrent(manifest));
+  EXPECT_NO_THROW(generation.RequireCurrent());
+  EXPECT_NO_THROW(generation.RequireCurrent());
 }
 
 TEST(ManagerPackageGeneration, RootReplacementLatchesRestartRequired) {
@@ -70,7 +70,7 @@ TEST(ManagerPackageGeneration, RootReplacementLatchesRestartRequired) {
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     try {
-      generation.RequireCurrent(manifest);
+      generation.RequireCurrent();
       FAIL() << "replacement must require a full stack restart";
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       EXPECT_EQ(error.error().code, "full_stack_restart_required");
@@ -81,25 +81,6 @@ TEST(ManagerPackageGeneration, RootReplacementLatchesRestartRequired) {
                 "complete_stack_stop_start");
     }
   }
-}
-
-TEST(ManagerPackageGeneration, ManifestMismatchLatchesObservedIdentity) {
-  TemporaryRoot root;
-  const auto expected = Manifest("manyforge.test.runtime");
-  const auto observed = Manifest("manyforge.test.other-runtime");
-  ManagerPackageGeneration generation(root.path(), expected);
-  try {
-    generation.RequireCurrent(observed);
-    FAIL() << "manifest mismatch must require a full stack restart";
-  } catch (const ManagerPackageGenerationRestartRequired &error) {
-    EXPECT_EQ(error.error().details.at("reason"), "manifest_set_mismatch");
-    EXPECT_EQ(error.error().details.at("expected_manifest_set_digest"),
-              expected.manifest_set_digest.value());
-    EXPECT_EQ(error.error().details.at("observed_manifest_set_digest"),
-              observed.manifest_set_digest.value());
-  }
-  EXPECT_THROW(generation.RequireCurrent(expected),
-               ManagerPackageGenerationRestartRequired);
 }
 
 } // namespace

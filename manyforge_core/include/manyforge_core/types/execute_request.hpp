@@ -31,14 +31,15 @@ namespace manyforge::core {
 /// private motion engine. The subordinate engine may use generated names only
 /// through this owner-produced value; it cannot select a robot or group.
 struct ResolvedExecutionBindingDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  /// Absent exactly for intrinsic direct-control (manual) work.
+  std::optional<ProgramRunNumber> program_run_id;
+
   ControllableComponentId controllable_component_id;
   ComponentTypeId component_type_id;
   ComponentTypeRevision component_type_revision;
@@ -138,7 +139,7 @@ struct ProgramFrameResolutionContextDTO final {
   [[nodiscard]] bool valid() const noexcept {
     const bool envelope_valid =
         !binding.program_id.empty() && !binding.program_revision.empty() &&
-        !binding.program_binding_id.empty() && !binding.program_run_id.empty() &&
+        !binding.program_binding_id.empty() &&
         !binding.retained_bundle_id.empty() && !binding.graph_revision.empty() &&
         !binding.target.component_id.empty() && !binding.target.command_target_id.empty() &&
         !binding.controllable_component_id.empty() &&

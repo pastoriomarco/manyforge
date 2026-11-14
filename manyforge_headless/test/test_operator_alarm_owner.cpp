@@ -57,12 +57,12 @@ protected:
   MakeOwner(std::set<std::string> required_domains = {"scene"},
             const std::size_t terminal_retention = 4096U,
             const std::size_t condition_capacity = 8192U,
-            std::string owner_epoch = "alarm.owner.epoch.1",
+            std::string application_start_id = "alarm.owner.epoch.1",
             const std::size_t live_alarm_capacity = kDefaultLiveAlarmCapacity) {
     auto owner = std::make_unique<AlarmLifecycleOwner>(
         OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
-        std::string(kCellId), "alarm.owner", std::move(owner_epoch),
-        manyforge::core::HostBootStamp{"boot.test", 7U},
+        std::string(kCellId), "alarm.owner", std::move(application_start_id),
+        "boot.test",
         [this]() { return ++monotonic_ns_; },
         [this]() {
           return "2026-08-05T00:00:" + std::to_string(monotonic_ns_ % 60) + "Z";
@@ -171,10 +171,8 @@ protected:
   }
 
   static AlarmCallerAttribution Caller() {
-    return {"request.1",
-            "api.epoch.1",
+    return {"0123456789abcdef0123456789abcdef",
             "operator_ui",
-            "correlation.1",
             "test",
             "manyforge.test.alarm",
             "authenticated:test",
@@ -357,16 +355,14 @@ TEST_F(AlarmOwnerTest, AcknowledgementsAreExactlyRevisionAndMembershipFenced) {
   ExpectAlarmError(
       [&]() {
         static_cast<void>(owner->AcknowledgeAll(
-            original.unacknowledged_membership, original.owner_epoch,
-            original.generation, Caller(), std::nullopt, true));
+            original.unacknowledged_membership, original.generation, Caller(), std::nullopt, true));
       },
       "operator_alarm_owner_generation_stale");
   EXPECT_EQ(owner->Snapshot().unacknowledged_count, 2U);
 
   const auto current = owner->Snapshot();
   const auto acknowledged = owner->AcknowledgeAll(
-      current.unacknowledged_membership, current.owner_epoch,
-      current.generation, Caller(), "reviewed", true);
+      current.unacknowledged_membership, current.generation, Caller(), "reviewed", true);
   EXPECT_EQ(acknowledged.status, "acknowledged_all");
   EXPECT_EQ(acknowledged.records.size(), 2U);
   ASSERT_FALSE(acknowledged.lifecycle_facts.empty());
@@ -422,16 +418,19 @@ TEST_F(AlarmOwnerTest,
   // The Kernel evaluates this exact projection; Headless only publishes it.
   auto projection = *owner->MotionAttentionProjection();
   EXPECT_EQ(projection.cell_id, kCellId);
-  EXPECT_EQ(projection.owner_epoch, "alarm.owner.epoch.1");
-  EXPECT_EQ(projection.owner_incarnation.boot_id, "boot.test");
-  EXPECT_EQ(projection.owner_incarnation.boottime_us, 7U);
+  EXPECT_EQ(projection.owner_host_boot_id, "boot.test");
   EXPECT_EQ(projection.generation, owner->Snapshot().generation);
   EXPECT_TRUE(projection.reconciled);
   const auto wire = content_identity::canonical_json(
       OperatorAlarmMotionAttentionValue(projection));
   EXPECT_NE(wire.find("\"owner_host_boot_id\":\"boot.test\""), std::string::npos);
-  EXPECT_NE(wire.find("\"owner_incarnation_us\":7"), std::string::npos);
-  EXPECT_NE(wire.find("manyforge.operator_alarm_motion_attention.v3"),
+  // OD-215: no disk check alarm is a member.
+  EXPECT_FALSE(projection.disk_cannot_keep_records);
+  EXPECT_NE(wire.find("\"disk_cannot_keep_records\":false"), std::string::npos);
+  // The start is named once, by the enclosing message, not per projection.
+  EXPECT_EQ(wire.find("owner_epoch"), std::string::npos);
+  EXPECT_EQ(wire.find("owner_incarnation_us"), std::string::npos);
+  EXPECT_NE(wire.find("manyforge.operator_alarm_motion_attention.v4"),
             std::string::npos);
   // V2-5: acknowledgement never gates work, so neither unacknowledged
   // alarm (scoped or cell-global) is a motion-attention member.
@@ -517,7 +516,7 @@ TEST_F(AlarmOwnerTest,
   EXPECT_EQ(owner->Snapshot().generation, marked.generation);
   EXPECT_EQ(owner->MotionAttentionProjection()->generation, marked.generation);
   const auto acknowledged = owner->AcknowledgeAll(
-      marked.unacknowledged_membership, marked.owner_epoch, marked.generation,
+      marked.unacknowledged_membership, marked.generation,
       Caller(), std::nullopt, true);
   EXPECT_EQ(acknowledged.status, "acknowledged_all");
 
@@ -621,8 +620,7 @@ TEST_F(AlarmOwnerTest,
        ResourceScopeFollowsTheActiveConfigurationAndRetainsReplacedAlarms) {
   auto owner = std::make_unique<AlarmLifecycleOwner>(
       OperatorAlarmCatalog::Load(MANYFORGE_HEADLESS_TEST_ALARM_CATALOG),
-      std::string(kCellId), "alarm.owner", "alarm.owner.epoch.1",
-      manyforge::core::HostBootStamp{"boot.test", 7U},
+      std::string(kCellId), "alarm.owner", "alarm.owner.epoch.1", "boot.test",
       [this]() { return ++monotonic_ns_; },
       [this]() { return "2026-08-05T00:00:00Z"; },
       std::set<std::string>{"motion"});
@@ -771,8 +769,7 @@ TEST_F(AlarmOwnerTest, BulkAcknowledgementCardinalityIsBounded) {
                                  "activation.1", 1U});
   ExpectAlarmError(
       [&]() {
-        static_cast<void>(owner->AcknowledgeAll(std::move(members),
-                                                "alarm.owner.epoch.1", 1U,
+        static_cast<void>(owner->AcknowledgeAll(std::move(members), 1U,
                                                 Caller(), std::nullopt, true));
       },
       "operator_alarm_acknowledge_all_members_invalid");
@@ -938,7 +935,7 @@ TEST_F(AlarmOwnerTest,
   EXPECT_EQ(metrics.acknowledgement_latency_ns.count, 1U);
   const auto encoded =
       content_identity::canonical_json(OperatorAlarmMetricsValue(metrics));
-  EXPECT_NE(encoded.find("manyforge.operator_alarm_metrics.v1"),
+  EXPECT_NE(encoded.find("manyforge.operator_alarm_metrics.v2"),
             std::string::npos);
   EXPECT_NE(encoded.find("engineering_assessment_not_safety_limit"),
             std::string::npos);
@@ -982,7 +979,7 @@ TEST_F(AlarmOwnerTest, BoundedCanonicalInputsAndSnapshotShapeAreEnforced) {
   const auto encoded = content_identity::canonical_json(
       OperatorAlarmSnapshotValue(owner->Snapshot()));
   EXPECT_NE(encoded.find(
-                "\"schema_version\":\"manyforge.operator_alarm_snapshot.v2\""),
+                "\"schema_version\":\"manyforge.operator_alarm_snapshot.v3\""),
             std::string::npos);
   EXPECT_NE(encoded.find(record.condition_id), std::string::npos);
   EXPECT_NE(encoded.find("\"motion_attention_membership\""), std::string::npos);

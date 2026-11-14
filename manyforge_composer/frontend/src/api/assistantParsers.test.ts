@@ -11,16 +11,13 @@ function source() {
     freshness: 'fresh',
     known_gaps: [],
     projection_generation: 1,
-    projection_owner_epoch: 'headless.1',
     receiver_age_ns: 1,
     selection_projection_generation: 1,
     selection_source_content_digest: `sha256:${'1'.repeat(64)}`,
     selection_source_generation: 1,
-    selection_source_owner_epoch: 'manager.1',
     selection_source_owner_id: 'manager',
     source_content_digest: `sha256:${'2'.repeat(64)}`,
     source_generation: 1,
-    source_owner_epoch: 'headless.1',
     source_owner_id: 'headless.assistant-mode-index',
     source_owner_kind: 'assistant_mode_index',
   };
@@ -38,7 +35,7 @@ function nodeEnvironment() {
 describe('assistant wire parsers', () => {
   it('accepts the exact owner-issued enabled-mode index', () => {
     const parsed = parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v2',
+      schema_version: 'manyforge.assistant_mode_index.v3',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
@@ -66,7 +63,7 @@ describe('assistant wire parsers', () => {
 
   it('accepts the empty index of a Deployment without assistant settings', () => {
     const parsed = parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v2',
+      schema_version: 'manyforge.assistant_mode_index.v3',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: null,
@@ -84,7 +81,7 @@ describe('assistant wire parsers', () => {
 
   it('rejects a mode without runs_in and the v1 index', () => {
     const index = {
-      schema_version: 'manyforge.assistant_mode_index.v2',
+      schema_version: 'manyforge.assistant_mode_index.v3',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
@@ -109,7 +106,7 @@ describe('assistant wire parsers', () => {
     const stale = source();
     stale.freshness = 'stale';
     expect(() => parseAssistantModeIndex({
-      schema_version: 'manyforge.assistant_mode_index.v2',
+      schema_version: 'manyforge.assistant_mode_index.v3',
       retained_bundle_id: 'bundle.1',
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,

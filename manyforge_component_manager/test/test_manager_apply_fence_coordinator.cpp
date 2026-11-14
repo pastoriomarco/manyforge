@@ -121,19 +121,20 @@ private:
 }
 
 [[nodiscard]] ManagerApplyIntentDTO
-ApplyIntent(std::string apply_id = "apply-1",
+ApplyIntent(const std::uint64_t apply_id = 1U,
             const std::uint64_t apply_generation = 1U,
-            std::string request_id = "request-1") {
+            const std::uint64_t request_sequence = 1U) {
   const auto &bundle = TestBundle();
   const auto &graph = bundle.value().cell_graph;
   return ManagerApplyIntentDTO{
       PublicRequestContextDTO{
-          RequestId(std::move(request_id)),
-          RequestOwnerEpoch("manager-owner-epoch-1"),
+          RequestKey::Make(
+              RequestKeyClass::kInternal, 0U,
+              static_cast<std::uint64_t>(RequestKeyMinter::kManager),
+              request_sequence),
           "component-manager-test",
-          std::optional<std::string>("correlation-1"),
       },
-      ApplyId(std::move(apply_id)),
+      ApplyId(apply_id),
       ApplyGeneration(apply_generation),
       graph.cell_id,
       ProjectionRevisionDTO{
@@ -222,7 +223,6 @@ AcceptedFence(ConfigurationFenceScopeDTO scope = {},
   return ExecutionHostEpochDTO{
       RuntimeUnitId("runtime.kernel"),
       RuntimeEpoch("kernel-runtime-2"),
-      RequestOwnerEpoch("kernel-owner-epoch-2"),
       ContentDigest(std::string(kEvidenceDigest)),
       ActiveBundlePublicationGeneration(3U),
   };
@@ -297,7 +297,8 @@ public:
 
     auto echoed_query = query;
     if (mismatch_reconcile_query) {
-      echoed_query.manager_runtime_epoch = RuntimeEpoch("wrong-manager-epoch");
+      echoed_query.persisted_attempt_digest = ContentDigest(
+          "sha256:9999999999999999999999999999999999999999999999999999999999999999");
     }
 
     auto state = ApplyFenceAcquireAttemptReconcileState::kNotSeen;
@@ -341,42 +342,6 @@ public:
     };
   }
 
-  [[nodiscard]] ApplyFenceReconcileResultDTO
-  Rehydrate(const ApplyFenceRehydrateDTO &request) override {
-    rehydrate_calls.fetch_add(1, std::memory_order_relaxed);
-    {
-      std::lock_guard lock(observation_mutex_);
-      last_rehydrate_ = request;
-    }
-    if (throw_on_rehydrate) {
-      throw std::runtime_error("simulated rehydration transport failure");
-    }
-    auto entry = ApplyFenceReconcileEntryDTO{
-        request.persisted_configuration_fence_id,
-        request.persisted_configuration_fence_generation,
-        recreate_on_rehydrate ? ApplyFenceReconcileState::kRecreated
-                              : ApplyFenceReconcileState::kMatched,
-        recreate_on_rehydrate
-            ? std::optional(ConfigurationFenceId("fence-recreated"))
-            : std::nullopt,
-        recreate_on_rehydrate ? std::optional(ConfigurationFenceGeneration(2U))
-                              : std::nullopt,
-    };
-    if (mismatch_rehydrate_response) {
-      entry.persisted_configuration_fence_id =
-          ConfigurationFenceId("different-fence");
-    }
-    return ApplyFenceReconcileResultDTO{
-        ExecutionHostEpoch(),
-        {entry},
-        false,
-        "",
-        invalid_rehydrate_result ? ContentDigest("")
-                                 : ContentDigest(std::string(kEvidenceDigest)),
-        std::nullopt,
-    };
-  }
-
   [[nodiscard]] ConfigurationFenceStatusDTO QueryStatus(
       const ConfigurationFenceStatusQueryDTO&) const override {
     throw std::runtime_error("release status is outside this fixture");
@@ -399,23 +364,13 @@ public:
     return last_query_;
   }
 
-  [[nodiscard]] std::optional<ApplyFenceRehydrateDTO> last_rehydrate() const {
-    std::lock_guard lock(observation_mutex_);
-    return last_rehydrate_;
-  }
-
   mutable std::atomic<int> reconcile_calls{0};
   std::atomic<int> acquire_calls{0};
-  std::atomic<int> rehydrate_calls{0};
   std::atomic<bool> saw_exact_durable_intent_and_attempt_before_acquire{false};
   bool throw_on_acquire{false};
   bool throw_on_reconcile{false};
   bool mismatch_reconcile_query{false};
   bool invalid_reconcile_result{false};
-  bool throw_on_rehydrate{false};
-  bool mismatch_rehydrate_response{false};
-  bool invalid_rehydrate_result{false};
-  bool recreate_on_rehydrate{false};
   ReconcileScript reconcile_script{ReconcileScript::kNotSeen};
   ConfigurationFenceAcceptedDTO acquire_response;
   ConfigurationFenceAcceptedDTO reconcile_acceptance;
@@ -427,7 +382,6 @@ private:
   mutable std::mutex observation_mutex_;
   mutable std::optional<ApplyConfigurationFenceIntentDTO> last_acquire_;
   mutable std::optional<ApplyFenceAcquireAttemptQueryDTO> last_query_;
-  mutable std::optional<ApplyFenceRehydrateDTO> last_rehydrate_;
 };
 
 [[nodiscard]] PersistedManagerApplyFenceAttempt
@@ -464,11 +418,10 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto apply_intent = ApplyIntent();
   ScriptedFencePort kernel(independent_reader, apply_intent);
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
   const auto first = RunAdmission(coordinator, apply_intent);
 
@@ -495,7 +448,6 @@ TEST(ManagerApplyFenceCoordinator,
   EXPECT_FALSE(delta.shared_scene_projection_changed);
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
   EXPECT_EQ(kernel.reconcile_calls.load(), 0);
-  EXPECT_EQ(kernel.rehydrate_calls.load(), 1);
   EXPECT_TRUE(
       kernel.saw_exact_durable_intent_and_attempt_before_acquire.load());
 
@@ -508,7 +460,6 @@ TEST(ManagerApplyFenceCoordinator,
   EXPECT_FALSE(replay.durable_acceptance.inserted);
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
   EXPECT_EQ(kernel.reconcile_calls.load(), 0);
-  EXPECT_EQ(kernel.rehydrate_calls.load(), 2);
 }
 
 TEST(ManagerApplyFenceCoordinator,
@@ -516,12 +467,11 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto apply_intent = ApplyIntent();
   ScriptedFencePort kernel(independent_reader, apply_intent);
   kernel.throw_on_acquire = true;
-  ManagerApplyFenceCoordinator first_coordinator(
-      writer, kernel, RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceCoordinator first_coordinator(writer, kernel);
 
   try {
     static_cast<void>(RunAdmission(first_coordinator, apply_intent));
@@ -543,8 +493,7 @@ TEST(ManagerApplyFenceCoordinator,
   kernel.throw_on_acquire = false;
   kernel.reconcile_script = ReconcileScript::kAcceptedExact;
   kernel.reconcile_acceptance = AcceptedFence();
-  ManagerApplyFenceCoordinator recovered_coordinator(
-      writer, kernel, RuntimeEpoch("manager-runtime-2"));
+  ManagerApplyFenceCoordinator recovered_coordinator(writer, kernel);
   const auto recovered = RunAdmission(recovered_coordinator, apply_intent);
 
   EXPECT_EQ(recovered.path,
@@ -552,68 +501,7 @@ TEST(ManagerApplyFenceCoordinator,
   EXPECT_TRUE(recovered.durable_acceptance.inserted);
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
   EXPECT_EQ(kernel.reconcile_calls.load(), 1);
-  EXPECT_EQ(kernel.rehydrate_calls.load(), 1);
   ASSERT_TRUE(kernel.last_query().has_value());
-  EXPECT_EQ(kernel.last_query()->manager_runtime_epoch,
-            RuntimeEpoch("manager-runtime-2"));
-}
-
-TEST(ManagerApplyFenceCoordinator,
-     AcceptedFenceMustRehydrateBeforeTheBoundaryReturns) {
-  for (const int script : {0, 1, 2}) {
-    SCOPED_TRACE(script);
-    TemporaryDirectory directory;
-    const auto path = directory.path() / "apply.sqlite3";
-    SqliteManagerApplyJournal writer(path, TestCellId());
-    SqliteManagerApplyJournal independent_reader(path, TestCellId());
-    const auto apply_intent = ApplyIntent();
-    ScriptedFencePort kernel(independent_reader, apply_intent);
-    kernel.throw_on_rehydrate = script == 0;
-    kernel.mismatch_rehydrate_response = script == 1;
-    kernel.invalid_rehydrate_result = script == 2;
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-1"));
-
-    try {
-      static_cast<void>(RunAdmission(coordinator, apply_intent));
-      FAIL() << "expected rehydration uncertainty";
-    } catch (const ManagerApplyFenceEffectUncertainError &error) {
-      EXPECT_EQ(error.phase(),
-                script == 0
-                    ? ManagerApplyFenceUncertaintyPhase::kRehydrateCall
-                    : ManagerApplyFenceUncertaintyPhase::kRehydrateResponse);
-      EXPECT_TRUE(error.acquire_invoked_in_this_call());
-      EXPECT_TRUE(error.observed_acceptance().has_value());
-      EXPECT_EQ(error.observed_rehydration().has_value(), script != 0);
-    }
-    EXPECT_EQ(kernel.acquire_calls.load(), 1);
-    EXPECT_EQ(kernel.rehydrate_calls.load(), 1);
-    EXPECT_TRUE(independent_reader
-                    .ReadFenceAcceptance(apply_intent.apply_id,
-                                         apply_intent.apply_generation)
-                    .has_value());
-  }
-}
-
-TEST(ManagerApplyFenceCoordinator,
-     FreshKernelMayReturnOneExactRecreatedFenceMapping) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "apply.sqlite3";
-  SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
-  const auto apply_intent = ApplyIntent();
-  ScriptedFencePort kernel(independent_reader, apply_intent);
-  kernel.recreate_on_rehydrate = true;
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-1"));
-
-  const auto result = RunAdmission(coordinator, apply_intent);
-  ASSERT_EQ(result.rehydration.fence_results.size(), 1U);
-  EXPECT_EQ(result.rehydration.fence_results.front().state,
-            ApplyFenceReconcileState::kRecreated);
-  EXPECT_EQ(result.rehydration.fence_results.front()
-                .reconciled_configuration_fence_id,
-            ConfigurationFenceId("fence-recreated"));
 }
 
 TEST(ManagerApplyFenceCoordinator,
@@ -621,13 +509,12 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto apply_intent = ApplyIntent();
   const auto attempt = SeedAttempt(writer, apply_intent);
   ScriptedFencePort kernel(independent_reader, apply_intent);
   kernel.reconcile_script = ReconcileScript::kNotSeen;
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-2"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
   const auto result = RunAdmission(coordinator, apply_intent);
 
@@ -658,8 +545,7 @@ TEST(ManagerApplyFenceCoordinator,
     static_cast<void>(SeedAttempt(writer, apply_intent));
     ScriptedFencePort kernel(independent_reader, apply_intent);
     kernel.reconcile_script = script;
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-2"));
+    ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
     try {
       static_cast<void>(RunAdmission(coordinator, apply_intent));
@@ -694,8 +580,7 @@ TEST(ManagerApplyFenceCoordinator,
     kernel.reconcile_script = ReconcileScript::kNotSeen;
     kernel.mismatch_reconcile_query = mismatch_query;
     kernel.invalid_reconcile_result = !mismatch_query;
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-2"));
+    ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
     try {
       static_cast<void>(RunAdmission(coordinator, apply_intent));
@@ -724,8 +609,7 @@ TEST(ManagerApplyFenceCoordinator,
   const auto attempt = SeedAttempt(writer, apply_intent);
   ScriptedFencePort kernel(independent_reader, apply_intent);
   kernel.throw_on_reconcile = true;
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-2"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
   try {
     static_cast<void>(RunAdmission(coordinator, apply_intent));
@@ -757,12 +641,11 @@ TEST(ManagerApplyFenceCoordinator,
     TemporaryDirectory directory;
     const auto path = directory.path() / "apply.sqlite3";
     SqliteManagerApplyJournal writer(path, TestCellId());
-    SqliteManagerApplyJournal independent_reader(path, TestCellId());
+    auto &independent_reader = writer;
     const auto apply_intent = ApplyIntent();
     ScriptedFencePort kernel(independent_reader, apply_intent);
     kernel.acquire_response = bad_response;
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-1"));
+    ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
     try {
       static_cast<void>(RunAdmission(coordinator, apply_intent));
@@ -787,12 +670,11 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto apply_intent = ApplyIntent();
   ScriptedFencePort kernel(independent_reader, apply_intent);
   kernel.acquire_hook = [&writer]() { writer.Close(); };
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
   try {
     static_cast<void>(RunAdmission(coordinator, apply_intent));
@@ -805,11 +687,12 @@ TEST(ManagerApplyFenceCoordinator,
     EXPECT_EQ(*error.observed_acceptance(), AcceptedFence());
   }
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
-  EXPECT_TRUE(independent_reader
+  SqliteManagerApplyJournal reopened(path, TestCellId());
+  EXPECT_TRUE(reopened
                   .ReadFenceAttempt(apply_intent.apply_id,
                                     apply_intent.apply_generation)
                   .has_value());
-  EXPECT_FALSE(independent_reader
+  EXPECT_FALSE(reopened
                    .ReadFenceAcceptance(apply_intent.apply_id,
                                         apply_intent.apply_generation)
                    .has_value());
@@ -827,8 +710,7 @@ TEST(ManagerApplyFenceCoordinator,
     expectation.expected_fence_generation =
         ConfigurationFenceGeneration(std::numeric_limits<std::uint64_t>::max());
     ScriptedFencePort kernel(independent_reader, apply_intent);
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-1"));
+    ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
     EXPECT_THROW(
         static_cast<void>(RunAdmission(coordinator, apply_intent, expectation)),
@@ -849,8 +731,7 @@ TEST(ManagerApplyFenceCoordinator,
     auto conflicting = ApplyIntent();
     conflicting.request_context.source_label = "different-source";
     ScriptedFencePort kernel(independent_reader, conflicting);
-    ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                             RuntimeEpoch("manager-runtime-1"));
+    ManagerApplyFenceCoordinator coordinator(writer, kernel);
 
     EXPECT_THROW(static_cast<void>(RunAdmission(coordinator, conflicting)),
                  ManagerApplyJournalConflictError);
@@ -864,11 +745,10 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto apply_intent = ApplyIntent();
   ScriptedFencePort kernel(independent_reader, apply_intent);
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
   std::promise<void> start_promise;
   const auto start = start_promise.get_future().share();
   const auto invoke = [&]() {
@@ -883,7 +763,6 @@ TEST(ManagerApplyFenceCoordinator,
   const auto second = second_future.get();
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
   EXPECT_EQ(kernel.reconcile_calls.load(), 0);
-  EXPECT_EQ(kernel.rehydrate_calls.load(), 2);
   EXPECT_EQ(first.durable_acceptance.record.accepted_fence,
             second.durable_acceptance.record.accepted_fence);
   const bool paths_are_one_new_one_replay =
@@ -899,7 +778,7 @@ TEST(ManagerApplyFenceCoordinator,
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   SqliteManagerApplyJournal writer(path, TestCellId());
-  SqliteManagerApplyJournal independent_reader(path, TestCellId());
+  auto &independent_reader = writer;
   const auto intent = ApplyIntent();
   auto actual_scope = NonemptyFenceScope();
   actual_scope.domains.front().predecessor_control_domain_revision.reset();
@@ -909,8 +788,7 @@ TEST(ManagerApplyFenceCoordinator,
   expectation.actual_scope = actual_scope;
   ScriptedFencePort kernel(independent_reader, intent);
   kernel.acquire_response = AcceptedFence(actual_scope);
-  ManagerApplyFenceCoordinator coordinator(writer, kernel,
-                                           RuntimeEpoch("manager-runtime-1"));
+  ManagerApplyFenceCoordinator coordinator(writer, kernel);
   const auto accepted = RunAdmission(coordinator, intent, expectation);
   EXPECT_EQ(accepted.durable_attempt.record.fence_intent.scope, actual_scope);
   EXPECT_EQ(

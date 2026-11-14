@@ -2,14 +2,16 @@
 Load, New and Close, used alike by the GUI, REST and MCP.
 
 For each ``replace``/``remove`` component: ``disable`` → Apply → (``replace``
-and ``add``) ``prepare``. Retained components are untouched. A component in
+and ``add``) ``prepare``. Retained components are untouched, except one whose
+process had exited: the host starts it again in the Apply, and it is
+``prepared`` like a replaced one. A component in
 ``fault`` or ``offline`` (faulted, or its process is gone) is not disabled:
 the host removes it by stopping its processes. Afterwards the affected
 components are ``prepared``, never enabled. Machines: owners are
-prepared before their members, and members are disabled first. Each step is
-bounded by the component's lifecycle timeout; a ``prepare`` of an arriving
-component is bounded as the host bounds it, by the launch bound
-(:func:`launch_settle_bound_s`) plus its lifecycle timeout. One Apply at a time. Refused
+prepared before their members, and members are disabled first. Each step
+waits for the component's ``last_action`` (its adapter bounds the action; the
+wait has no limit of its own) or its owner-stall fault, which ends the step
+``component_owner_stalled``. One Apply at a time. Refused
 while a Program run's motion is executing or stopping; a finished run awaiting
 Reset, or a run with all its motion held, is reset first; allowed
 during a cell latch. Every
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
@@ -29,14 +32,11 @@ import threading
 from typing import Any, Protocol, TypeVar
 
 from manyforge_headless_api.component_model import (
-    DEFAULT_LIFECYCLE_TIMEOUT_S,
-    HOST_COMPONENT_STOP_GRACE_S,
     ActionResult,
     ComponentState,
-    action_wait_s,
-    launch_settle_bound_s as host_launch_settle_bound_s,
     wait_for_action,
 )
+from manyforge_headless_api.command_rows import CommandRowTable
 
 # The Runner cycle state in which no Program run is in progress.
 _IDLE_CYCLE_STATE = "idle_after_reset"
@@ -50,9 +50,13 @@ _APPLY_SLOT = threading.Lock()
 class ApplyRefused(Exception):
     """Refused before any effect (HTTP 409)."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, details: dict[str, str] | None = None
+    ) -> None:
         super().__init__(message)
         self.code = code
+        # The refusal's structured details (e.g. the busy component), if any.
+        self.details = details
 
 
 class ApplyStepFailed(Exception):
@@ -122,6 +126,10 @@ class ApplyPorts(Protocol):
         """The running run has all its motion stopped and held, nothing can
         start (the published held-run rule)."""
 
+    def manual_operations_settled(self) -> bool:
+        """Every manual operation is affirmatively settled (the held-run
+        rule's manual part): no manual move executes or is being stopped."""
+
     def reset_cycle(self) -> None:
         """Reset the finished or held run and return once the cycle is idle
         (raise :class:`ApplyStepFailed` otherwise)."""
@@ -131,8 +139,6 @@ class ApplyPorts(Protocol):
     def components(self) -> list[ComponentState]: ...
 
     def component_action(self, component_id: str, action: str) -> None: ...
-
-    def lifecycle_timeout_s(self, component_id: str) -> float: ...
 
     def apply(self) -> None:
         """Submit the Manager Apply and return once it is terminal and
@@ -202,36 +208,6 @@ def preview_view(preview: Preview, scope: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def lifecycle_timeouts(deployment: dict[str, Any] | None) -> dict[str, float]:
-    """Each Deployment component's authored lifecycle timeout, in seconds."""
-
-    timeouts: dict[str, float] = {}
-    for row in (deployment or {}).get("components") or ():
-        configuration = row.get("configuration") if isinstance(row, dict) else None
-        value = (
-            configuration.get("lifecycle_command_timeout_s")
-            if isinstance(configuration, dict)
-            else None
-        )
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            timeouts[str(row.get("component_id"))] = float(value)
-    return timeouts
-
-
-def launch_settle_bound_s(ports: ApplyPorts, rows: tuple[ComponentImpact, ...]) -> float:
-    """The host's launch bound for this Apply (the bring-up bound,
-    `LaunchSettleBound`): the sum of the lifecycle timeouts of the components
-    it adds, replaces or removes, one default when it changes none. A
-    just-launched component's ``prepare`` first waits up to this for its
-    launch to settle, then up to its own lifecycle timeout."""
-
-    return host_launch_settle_bound_s(
-        ports.lifecycle_timeout_s(row.component_id)
-        for row in rows
-        if row.disposition != "retain"
-    )
-
-
 def require_no_run(ports: ApplyPorts) -> bool:
     """Refuse while a run's motion is executing or stopping; True when a
     finished or held run is to be Reset first."""
@@ -249,12 +225,42 @@ def require_no_run(ports: ApplyPorts) -> bool:
     return False
 
 
+def require_no_motion(ports: ApplyPorts) -> None:
+    """New's own check, before it releases or changes anything: refused while
+    a Program run's motion is executing or stopping (:func:`require_no_run`)
+    or a manual move is executing or being stopped. The operator stops motion
+    first (maintainer, 2026-11-13). Then no component action may be running
+    (:func:`require_no_component_action`)."""
+
+    require_no_run(ports)
+    if not ports.manual_operations_settled():
+        raise ApplyRefused(
+            "authoring_not_ready",
+            "A manual move is in progress; stop motion first",
+        )
+    require_no_component_action(ports)
+
+
+def require_no_component_action(ports: ApplyPorts) -> None:
+    """New (and Load's New step) is refused, before it releases or disables
+    anything, while any component has an action running (OD-194): with the
+    host's own code and details, naming the first busy component."""
+
+    for row in ports.components():
+        running = row.get("action")
+        if running is not None:
+            raise ApplyRefused(
+                "component_action_in_progress",
+                "Another action of this component is still running",
+                {"component_id": row["component_id"], "action": running["action"]},
+            )
+
+
 def _run_action(
     ports: ApplyPorts,
     states: list[ComponentState],
     component_id: str,
     action: str,
-    timeout_s: float,
 ) -> None:
     previous: ActionResult | None = next(
         (row.get("last_action") for row in states if row["component_id"] == component_id),
@@ -266,7 +272,6 @@ def _run_action(
         component_id,
         action,  # type: ignore[arg-type]
         previous,
-        timeout_s=timeout_s,
     )
     if result["outcome"] != "succeeded":
         error = result.get("error")
@@ -276,6 +281,13 @@ def _run_action(
             if error
             else f"{action} of {component_id} ended {result['outcome']}",
         )
+
+
+def _process_exited(state: ComponentState) -> bool:
+    """The component's own process ended by itself (its fault says so)."""
+
+    fault = state.get("fault")
+    return fault is not None and fault["code"] == "fault_process_exited"
 
 
 def _members_last(states: list[ComponentState]) -> list[ComponentState]:
@@ -297,7 +309,8 @@ def run_apply(
     would be refused by the host, so the Apply isn't submitted; one whose
     Disable failed is stopped by the host's Apply (the failure stays on
     its row). Once installed, the Apply stays; every arriving
-    component is prepared, owners before members, and a member whose owner's
+    component (added, replaced, or retained whose exited process the Apply
+    started again) is prepared, owners before members, and a member whose owner's
     prepare failed is reported ``owner_not_prepared`` without being tried.
     ``error`` is the first failure. ``error_code`` maps a port's own exception
     to ``(code, message)``; an exception it doesn't map propagates. Removed
@@ -318,14 +331,18 @@ def run_apply(
     # Reset first. A momentarily closed admission (it reopens a moment after
     # a Reset) is waited for by the preparation itself (Headless).
     try:
-        if require_no_run(ports):
+        reset_first = require_no_run(ports)
+        # Every check that refuses before any effect has passed (OD-214).
+        apply_accepted()
+        if reset_first:
+            apply_step("resetting_cycle")
             ports.reset_cycle()
     except ApplyRefused:
         raise
     except Exception as failure:  # noqa: BLE001 - the Apply's result
         return {"outcome": "failed", "components": [], "error": failed(failure)}
+    apply_step("previewing")
     rows = ports.preview().components
-    launch_bound_s = launch_settle_bound_s(ports, rows)
     disposition = {row.component_id: row.disposition for row in rows}
     errors: dict[str, dict[str, str]] = {}
     first: list[dict[str, str]] = []
@@ -337,15 +354,12 @@ def run_apply(
             first.append(error)
 
     def step(states: list[ComponentState], component_id: str, action: str) -> bool:
-        # Arriving components are prepared right after their launch.
-        timeout_s = action_wait_s(
-            action,
-            ports.lifecycle_timeout_s(component_id),
-            launch_bound_s,
-            launch_settled=False,
+        apply_step(
+            "disabling" if action == "disable" else "preparing_components",
+            {"status": "component_action", "component_id": component_id},
         )
         try:
-            _run_action(ports, states, component_id, action, timeout_s)
+            _run_action(ports, states, component_id, action)
             return True
         except Exception as failure:  # noqa: BLE001 - reported on the row
             record(component_id, failed(failure))
@@ -391,10 +405,23 @@ def run_apply(
                         "message": f"{component_id} is still enabled",
                     })
         else:
+            # A retained component whose process had exited is rebuilt by
+            # the host's Apply with a new process: the exit fault is gone
+            # afterwards. It is prepared like a replaced component.
+            exited = {
+                state["component_id"]
+                for state in states
+                if disposition.get(state["component_id"]) == "retain" and _process_exited(state)
+            }
+            apply_step("applying")
             ports.apply()
             states = ports.components()
             arriving = {
                 row.component_id for row in rows if row.disposition in ("replace", "add")
+            } | {
+                state["component_id"]
+                for state in states
+                if state["component_id"] in exited and not _process_exited(state)
             }
             unprepared_owners: set[str] = set()
             for state in _members_last(states):
@@ -480,6 +507,288 @@ def recorded_apply(client: Any, apply_kind: str, run: Callable[[], _T]) -> _T:
         raise
     _record_apply(client, apply_kind, _apply_terminal(result))
     return result
+
+
+# OD-214: Apply, Load, New and Revert answer at acceptance; their row
+# carries the step and the end.
+APPLY_COMMAND_REPLY_SCHEMA = "manyforge.apply_command_reply.v1"
+# Bound of the component rows an ended row's details carry (as History).
+_MAXIMUM_ROW_COMPONENTS = 256
+_INTERRUPTED_CODE = "component_action_interrupted_by_stop"
+_UNKNOWN_CODE = "manager_apply_unknown_effect"
+
+
+class ApplyCommand:
+    """The progress of the one Apply command run in this thread.
+
+    It is accepted once its before-effect checks passed (:func:`apply_accepted`,
+    called where the first effect follows); until then it has no row in
+    progress. Steps and their sources are published on its row.
+    """
+
+    def __init__(self, rows: CommandRowTable, kind: str, request_key: str) -> None:
+        self._rows = rows
+        self.kind = kind
+        self.request_key = request_key
+        self.accepted = False
+        # Set at acceptance, or at the end of a command never accepted.
+        self.decided = threading.Event()
+        # The step its row takes at acceptance (Load: ``emptying``).
+        self.accept_step: str | None = None
+        self.hidden = 0
+        self.effect_unknown = False
+        self._step: str | None = None
+
+    def accept(self) -> None:
+        if self.accepted:
+            return
+        self._rows.accept(
+            self.kind, self.request_key, step=self.accept_step, step_source=None
+        )
+        self._step = self.accept_step
+        self.accepted = True
+        self.decided.set()
+
+    def step(self, token: str, source: dict[str, Any] | None = None) -> None:
+        if not self.accepted or self.hidden:
+            return
+        self._step = token
+        self._rows.step(self.request_key, token, step_source=deepcopy(source))
+
+    def step_source(self, token: str, source: dict[str, Any]) -> None:
+        if self.accepted and not self.hidden and self._step == token:
+            self._rows.update(self.request_key, step_source=deepcopy(source))
+
+
+_COMMAND: ContextVar[ApplyCommand | None] = ContextVar(
+    "manyforge_apply_command", default=None
+)
+
+
+def apply_command() -> ApplyCommand | None:
+    """The Apply command of this thread, if one runs (none in a Preview)."""
+
+    return _COMMAND.get()
+
+
+def apply_accepted() -> None:
+    """The command's before-effect checks passed: answer its caller now."""
+
+    command = _COMMAND.get()
+    if command is not None:
+        command.accept()
+
+
+def apply_step(token: str, source: dict[str, Any] | None = None) -> None:
+    command = _COMMAND.get()
+    if command is not None:
+        command.step(token, source)
+
+
+def apply_step_source(token: str, source: dict[str, Any]) -> None:
+    """Name the status of the current step ``token`` once it is known."""
+
+    command = _COMMAND.get()
+    if command is not None:
+        command.step_source(token, source)
+
+
+def apply_effect_unknown() -> None:
+    """The Manager's Apply ended ``unknown_effect``: a failed end is unknown."""
+
+    command = _COMMAND.get()
+    if command is not None:
+        command.effect_unknown = True
+
+
+@contextmanager
+def apply_steps_hidden() -> Iterator[None]:
+    """A nested Apply (Load's New) keeps the outer step on the row."""
+
+    command = _COMMAND.get()
+    if command is not None:
+        command.hidden += 1
+    try:
+        yield
+    finally:
+        if command is not None:
+            command.hidden -= 1
+
+
+def apply_command_reply(row: dict[str, Any]) -> dict[str, Any]:
+    return {"schema_version": APPLY_COMMAND_REPLY_SCHEMA, "command": row}
+
+
+def _row_end(
+    terminal: dict[str, Any], error_details: Any, effect_unknown: bool
+) -> tuple[str, str | None, dict[str, Any] | None]:
+    """A History terminal as a row's ``(outcome, code, details)`` (§3.1)."""
+
+    outcome = terminal.get("outcome")
+    details: dict[str, Any] = {}
+    components = terminal.get("components")
+    if isinstance(components, list):
+        details["components"] = deepcopy(components[:_MAXIMUM_ROW_COMPONENTS])
+    if outcome in ("succeeded", "accepted"):
+        # A Program Apply/Revert ends once the Manager accepted its Apply
+        # (History: `accepted`); the ended row's `step_source` names that
+        # Manager Apply. A succeeded row keeps its component rows.
+        return "succeeded", None, details or None
+    error = terminal.get("error") if isinstance(terminal.get("error"), dict) else {}
+    code = str(error.get("code") or "composer_internal_failure")
+    if isinstance(error_details, dict):
+        details = {**deepcopy(error_details), **details}
+    if outcome == "refused":
+        return "refused", code, details or None
+    if code == _INTERRUPTED_CODE:
+        return "interrupted", code, details or None
+    if code == _UNKNOWN_CODE or effect_unknown:
+        return "unknown", code, details or None
+    return "failed", code, details or None
+
+
+_UNTYPED_CODE = "program_runtime_control_outcome_unknown"
+
+
+def _typed(error: BaseException) -> bool:
+    """Whether a failure carries its typed code (else its effect is unknown)."""
+
+    detail = getattr(error, "detail", None)
+    code = detail.get("code") if isinstance(detail, dict) else getattr(error, "code", None)
+    return isinstance(code, str) and bool(code)
+
+
+def _untyped_details(kind: str, error: BaseException) -> dict[str, Any]:
+    return {"command_kind": kind, "cause_code": type(error).__name__}
+
+
+def _error_details(error: BaseException) -> Any:
+    detail = getattr(error, "detail", None)
+    if isinstance(detail, dict):
+        return detail.get("details")
+    return getattr(error, "details", None)
+
+
+class ApplyCommands:
+    """The Apply-level rows (OD-214) of the one Apply slot, in memory.
+
+    Each Apply, Revert, Load and New is run by :meth:`run` in a thread of its
+    own; its caller is answered once it is accepted (or refused) with
+    ``manyforge.apply_command_reply.v1``. The row ends when the run ends; the
+    History record is written then, as before.
+    """
+
+    def __init__(self) -> None:
+        self.rows = CommandRowTable()
+        self._lock = threading.Lock()
+        # The refusal replied for each kept refused row (replayed as is).
+        self._refusals: dict[str, BaseException] = {}
+        # The thread of the command run last (one Apply slot).
+        self._worker: tuple[str, threading.Thread] | None = None
+
+    def set_observer(self, observer: Callable[[], None] | None) -> None:
+        self.rows.set_observer(observer)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.rows.snapshot()
+
+    def _refused(self, command: ApplyCommand, error: BaseException) -> None:
+        if _typed(error):
+            code = _apply_failure(error)["error"]["code"]
+            details = _error_details(error)
+            self.rows.refuse(
+                command.kind,
+                command.request_key,
+                code,
+                details if isinstance(details, dict) else None,
+                step_source=None,
+            )
+        else:
+            # An untyped failure before acceptance: unknown, with no step.
+            self.rows.refuse(
+                command.kind,
+                command.request_key,
+                _UNTYPED_CODE,
+                _untyped_details(command.kind, error),
+                outcome="unknown",
+                step_source=None,
+            )
+        kept = {
+            row["request_key"] for row in self.rows.snapshot()["ended"]
+        }
+        with self._lock:
+            self._refusals[command.request_key] = error
+            for key in tuple(self._refusals):
+                if key not in kept:
+                    del self._refusals[key]
+
+    def run(
+        self, client: Any, apply_kind: str, request_key: str, run: Callable[[], Any]
+    ) -> dict[str, Any]:
+        kept = self.rows.find(request_key)
+        if kept is not None:
+            # The same request again: its row as it now stands, nothing runs;
+            # a request refused at once gets its refusal again.
+            with self._lock:
+                refusal = self._refusals.get(request_key)
+            if kept["accepted_at_ns"] is None and refusal is not None:
+                raise refusal
+            return apply_command_reply(kept)
+        command = ApplyCommand(self.rows, apply_kind, request_key)
+        failure: list[BaseException] = []
+
+        def worker() -> None:
+            _COMMAND.set(command)
+            try:
+                result = recorded_apply(client, apply_kind, run)
+            except BaseException as error:  # noqa: BLE001 - the row's end
+                if command.accepted and not _typed(error):
+                    self.rows.end(
+                        request_key, "unknown", _UNTYPED_CODE,
+                        _untyped_details(apply_kind, error),
+                    )
+                elif command.accepted:
+                    outcome, code, details = _row_end(
+                        _apply_failure(error), _error_details(error),
+                        command.effect_unknown,
+                    )
+                    self.rows.end(request_key, outcome, code, details)  # type: ignore[arg-type]
+                else:
+                    failure.append(error)
+                    self._refused(command, error)
+                if not isinstance(error, Exception):
+                    raise
+            else:
+                command.accept()
+                outcome, code, details = _row_end(
+                    _apply_terminal(result), None, command.effect_unknown
+                )
+                self.rows.end(request_key, outcome, code, details)  # type: ignore[arg-type]
+            finally:
+                command.decided.set()
+
+        thread = threading.Thread(
+            target=worker, name=f"manyforge_{apply_kind}", daemon=True
+        )
+        with self._lock:
+            self._worker = (request_key, thread)
+        thread.start()
+        command.decided.wait()
+        if failure:
+            raise failure[0]
+        row = self.rows.find(request_key)
+        assert row is not None
+        return apply_command_reply(row)
+
+    def ended_row(self, request_key: str) -> dict[str, Any] | None:
+        """The row of this key once its command ended (an in-process caller
+        that acts on the end, the startup Load)."""
+
+        with self._lock:
+            worker = self._worker
+        if worker is not None and worker[0] == request_key:
+            worker[1].join()
+        return self.rows.find(request_key)
 
 
 def _record_apply(client: Any, apply_kind: str, terminal: dict[str, Any]) -> None:

@@ -44,7 +44,7 @@ std::unique_ptr<Composition> View(const std::string &component) {
 // An empty-runtime Kernel must carry its exact bootstrap graph identity.
 inline core::ResourceAddressedExecutionKernelConfig retirement_kernel_config() {
   core::ResourceAddressedExecutionKernelConfig config{
-      core::RequestOwnerEpoch("retired-test-epoch"), core::CellId("retired-test"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("retired-test"), 16U};
   config.empty_runtime_retained_bundle_id = core::RetainedBundleId("retired-test-bundle");
   config.empty_runtime_graph_revision = core::GraphRevision("retired-test-graph");
   return config;

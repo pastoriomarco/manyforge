@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -21,11 +23,11 @@
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/stop_timing.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
-#include <manyforge_core/stop_terminal_reducer.hpp>
-#include "stop_terminal_reducer_internal.hpp"
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/error_catalog.generated.hpp>
 #include <numeric>
+#include <pthread.h>
+#include <sched.h>
 #include <set>
 #include <stdexcept>
 #include <stop_token>
@@ -53,27 +55,30 @@ class ScopeExit final {
 template <typename Function>
 ScopeExit(Function) -> ScopeExit<Function>;
 
+// A manual-operation claim names its operation by the operation number in
+// `owner_transaction_id`; any other transaction id names none (nullopt).
+[[nodiscard]] inline std::optional<OperationNumber> manual_claim_operation(
+    const std::optional<CellAdmissionOwnerTransactionId>& transaction) noexcept {
+  const auto* const number =
+      transaction ? std::get_if<OperationNumber>(&*transaction) : nullptr;
+  return number ? std::optional<OperationNumber>(*number) : std::nullopt;
+}
+
 [[nodiscard]] inline ErrorDTO error(std::string code, std::string message, std::string reason) {
   return ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}};
+}
+
+/// The journal write fault's error for records not written without a write
+/// error of their own (a full queue, a reused Stop ring slot).
+[[nodiscard]] inline ErrorDTO journal_records_lost_error() {
+  return ErrorDTO{"operation_journal_records_lost",
+                  "operation records were dropped before they could be written", {}};
 }
 
 template <typename T>
 [[nodiscard]] inline Result<T> reject(std::string message, std::string reason,
                                ErrorCode code = ErrorCode::kExecutionRejected) {
   return Result<T>::Err(error(std::string(to_string(code)), std::move(message), std::move(reason)));
-}
-
-template <typename Writer>
-[[nodiscard]] inline Result<std::uint64_t> attempt_journal_write(Writer&& write) {
-  try {
-    return write();
-  } catch (const std::exception& exception) {
-    return Result<std::uint64_t>::Err(
-        error("operation_journal_exception", exception.what(), "operation_journal_exception"));
-  } catch (...) {
-    return Result<std::uint64_t>::Err(
-        error("operation_journal_exception", "journal write threw", "operation_journal_exception"));
-  }
 }
 
 [[nodiscard]] inline std::vector<RuntimeParticipantBinding> extract_bindings(
@@ -693,9 +698,8 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
 [[nodiscard]] inline Result<ExecuteRequestDTO> build_motion_request(
     const OperationIntentDTO& operation, const OperationParticipantIntentDTO& participant,
     const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding,
-    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationNumber& operation_id, OperationRevision operation_revision,
     const OperationParticipantId& participant_id, const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation,
     const RuntimeParticipantExecutionRegistration& registration,
     const double initial_runtime_scale, const std::uint64_t initial_runtime_scale_sequence = 0U) {
   const auto& participant_policy = *registration.participant_policy;
@@ -780,7 +784,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       operation_id,
       participant_id,
       controller_goal_id,
-      controller_goal_generation,
       binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
@@ -900,7 +903,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
                                        control.control_binding_id,
                                        control.control_binding_revision,
                                        controller_goal_id,
-                                       controller_goal_generation,
                                        control.controller_topology_id,
                                        control.topology_revision,
                                        control.control_route_id,
@@ -1098,10 +1100,11 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     const std::optional<MotionInterruptStopProfileDTO>& profile,
     const RuntimeParticipantBindingDTO& binding,
     std::span<const HardStopResourceLimitDTO> retained_default_stop_limits,
-    const MotionInterruptNodeCategory node_category, const OperationId& operation_id,
+    const MotionInterruptNodeCategory node_category, const OperationNumber& operation_id,
     const OperationRevision operation_revision, const OperationParticipantId& participant_id,
     const ProgramId& program_id, const ProgramRevision& program_revision,
-    const ProgramBindingId& program_binding_id, const ProgramRunId& program_run_id) {
+    const ProgramBindingId& program_binding_id,
+    const std::optional<ProgramRunNumber>& program_run_id) {
   if (!profile.has_value()) {
     return Result<std::optional<PreparedParticipantStopPlanDTO>>::Ok(std::nullopt);
   }
@@ -1117,6 +1120,25 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     return Result<std::optional<PreparedParticipantStopPlanDTO>>::Err(prepared.error());
   }
   return Result<std::optional<PreparedParticipantStopPlanDTO>>::Ok(std::move(prepared.value()));
+}
+
+/// OD-235: the engine takes the Stop plans it is handed as they are. A
+/// take-over hands over a preparation retained since its admission, not one
+/// built in this call, so its plans are verified against their referents here
+/// before the hand-over, with the result the engine gave before.
+[[nodiscard]] inline Result<void> verify_retained_preparation_stop_plans(
+    const ResolvedPreparedMotionExecutionRequestDTO& request) {
+  // A missing ordinary plan is refused by the engine (`ordinary_stop_plan_missing`).
+  if (!request.ordinary_stop_plan) return Result<void>::Ok();
+  const auto& base = request.stop_readiness.value().resolved_stop_base_plan;
+  const auto& resources = request.binding.value().resources;
+  auto ordinary = VerifyPreparedParticipantStopPlan(base, *request.ordinary_stop_plan, resources,
+                                                    request.retained_default_stop_limits,
+                                                    request.stop_node_category);
+  if (!ordinary.ok() || !request.fault_stop_plan) return ordinary;
+  return VerifyPreparedParticipantStopPlan(base, *request.fault_stop_plan, resources,
+                                           request.retained_default_stop_limits,
+                                           request.stop_node_category);
 }
 
 [[nodiscard]] inline bool prepared_fault_stop_plan_matches(
@@ -1150,7 +1172,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     const RuntimeParticipantBinding& sealed_binding,
     const RuntimeParticipantStopReadiness& readiness,
     std::span<const HardStopResourceLimitDTO> retained_default_stop_limits,
-    const MotionInterruptNodeCategory stop_node_category, const OperationId& operation_id,
+    const MotionInterruptNodeCategory stop_node_category, const OperationNumber& operation_id,
     const OperationRevision operation_revision, const OperationParticipantId& participant_id,
     const PreparedParticipantStopPlanDTO& ordinary_stop_plan) {
   const auto& binding = sealed_binding.value();
@@ -1255,7 +1277,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
 /// The addressed Kernel's outcome for one participant execution that ended
 /// outside an active Stop, derived from the participant's reported fact. This
 /// is the single place that commits these participant outcomes; an active
-/// Stop commits its own Stopped/InterventionRequired from its certificate.
+/// Stop commits its own Stopped/InterventionRequired at P4.
 [[nodiscard]] inline OperationStateKind participant_outcome(
     const ParticipantExecutionFact& fact) noexcept {
   switch (fact.kind) {
@@ -1374,7 +1396,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
           command.control_binding_id,
           command.control_binding_revision,
           command.controller_goal_id,
-          command.controller_goal_generation,
           command.controller_topology_id,
           command.topology_revision,
           command.control_route_id,
@@ -1481,26 +1502,6 @@ struct ResourceAddressedExecutionKernel::ReplayEntry final {
 struct ResourceAddressedExecutionKernel::ControlReplayEntry final {
   OperationControlRequestDTO request;
   OperationControlAcceptedDTO accepted;
-  bool durable{};
-};
-
-struct ResourceAddressedExecutionKernel::StopReplayEntry final {
-  struct SelectionReceipt final {
-    std::vector<std::uint32_t> widened_node_indices;
-    std::optional<StopAcceptedDTO> fresh_containment;
-  };
-  std::variant<StopIntentDTO, ProgramExecutionSelectionRequestDTO> intent;
-  std::variant<StopAcceptedDTO, SelectionReceipt> accepted;
-
-  const RequestId& request_id() const {
-    return std::visit(
-        [](const auto& value) -> const RequestId& { return value.request_context.request_id; },
-        intent);
-  }
-  bool matches(const StopIntentDTO& value) const {
-    const auto* physical = std::get_if<StopIntentDTO>(&intent);
-    return physical != nullptr && *physical == value;
-  }
 };
 
 struct ResourceAddressedExecutionKernel::RuntimeScaleControlResolution final {
@@ -1551,44 +1552,33 @@ struct ResourceAddressedExecutionKernel::RuntimeScaleControlReplayEntry final {
   RuntimeScaleControlScope scope;
 };
 
-inline const RequestId& ResourceAddressedExecutionKernel::ReplayRequestIndex::key(
+inline const RequestKey& ResourceAddressedExecutionKernel::ReplayRequestIndex::key(
     const ReplayEntry& entry) {
-  return entry.intent.request_context.request_id;
+  return entry.intent.request_context.request_key;
 }
 
-inline const RequestId& ResourceAddressedExecutionKernel::ControlReplayRequestIndex::key(
+inline const RequestKey& ResourceAddressedExecutionKernel::ControlReplayRequestIndex::key(
     const ControlReplayEntry& entry) {
-  return entry.request.request_context.request_id;
+  return entry.request.request_context.request_key;
 }
 
-inline const RequestId& ResourceAddressedExecutionKernel::StopReplayRequestIndex::key(
-    const StopReplayEntry& entry) {
-  return entry.request_id();
-}
-
-inline const RequestId&
+inline const RequestKey&
 ResourceAddressedExecutionKernel::RuntimeScaleControlReplayRequestIndex::key(
     const RuntimeScaleControlReplayEntry& entry) {
-  return entry.request.request_context.request_id;
+  return entry.request.request_context.request_key;
 }
 
 struct ResourceAddressedExecutionKernel::OperationRecoveryReplayEntry final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision{0U};
   KernelRecoveryActionRequestDTO request;
   KernelRecoveryActionResultDTO result;
   bool outcome_unresolved{false};
 };
 
-struct ResourceAddressedExecutionKernel::PartialDispatchStopScope final {
-  OperationId operation_id;
-  OperationRevision operation_revision{0U};
-  std::vector<OperationParticipantId> participant_ids;
-};
-
 struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuation final {
   ProgramNodeExecutionScopeDTO origin;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   ContentDigest prepared_contract_digest;
   RuntimeParticipantBinding binding;
@@ -1626,17 +1616,6 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
           reason->second == "observed_state_incomplete");
 }
 
-/// The Kernel's own containment Stop for a runtime monitor fact: a collision
-/// or lost measured robot state.
-[[nodiscard]] inline bool runtime_monitor_containment_stop(const StopIntentDTO* stop) {
-  if (stop == nullptr || stop->request_context.source_label != "kernel.runtime_collision" ||
-      !stop->reason.has_value()) {
-    return false;
-  }
-  return *stop->reason == "runtime_collision_fault" ||
-         *stop->reason == error_codes::kRuntimeMonitorObservationLost;
-}
-
 [[nodiscard]] inline std::optional<std::int64_t> motion_takeover_budget_ns(
     const std::optional<double> seconds) noexcept {
   if (!seconds || !std::isfinite(*seconds) || *seconds <= 0.0) return std::nullopt;
@@ -1666,11 +1645,222 @@ inline void bind_recovery_request(KernelRecoveryActionRequestDTO& request,
   request.expected_assessment_revision = assessment.assessment_revision;
   request.expected_control_command_epoch = assessment.control_command_epoch;
   request.expected_execution_id = assessment.execution_id;
-  request.expected_stop_certificate_id = assessment.stop_certificate_id;
-  request.expected_stop_owner_generation = assessment.stop_owner_generation;
   // Freshness is authorized and consumed by the addressed owner. Its local
   // stopped participant does not own aggregate collision provenance.
   request.fresh_motion_attempt = false;
+}
+
+/// One armed rule token and the key of the Stop its trip makes: minted on the
+/// first trip and reused while this registration stands (contract 1.4).
+struct IoRuleRegistrationSlot final {
+  IoRuleRegistrationDTO token;
+  std::optional<RequestKey> stop_key{};
+};
+
+/// One retained stage-attempt result of a participant's Stop (§3.3 P2).
+/// `authoritative` is false for a late result of a superseded attempt.
+struct StopRetainedStageResult final {
+  std::uint64_t result_sequence{};
+  std::int64_t completed_at_ns{};
+  bool authoritative{true};
+  ParticipantStopStageResultDTO result;
+};
+
+struct StopParticipantAttempt final {
+  bool started{};
+  bool superseded{};
+  bool result_consumed{};
+  std::optional<StopStageAttemptHandle> handle;
+  std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
+  std::shared_ptr<const RemainingStopBudgetDTO> budget;
+  /// The Kernel's own watchdog: a controlled stage's own deadline, and the
+  /// software-hard stage's deadline (P7, F4); absent for a gripper cancel.
+  std::optional<std::int64_t> stage_deadline_ns;
+};
+
+/// The working data of one participant's Stop attempt (§2.2): member
+/// `stop_work` of `ActiveOperationParticipant`, created with the participant
+/// at admission (`retained_results` reserved then) and reset in place by G4
+/// when an attempt starts; a Stop never allocates it. Everything the attempt
+/// reads that the participant already holds (binding, readiness, resources,
+/// port, engines, the executed plan through `stop.plan`) is read there, never
+/// copied. Its per-participant progress logic is today's `ProgressStop`.
+struct StopParticipantWork final {
+  StopParticipantWork() { retained_results.reserve(kMaxStopEscalationStages * 2U); }
+
+  /// The operation revision after this attempt's acceptance (E4).
+  OperationRevision accepted_operation_revision{0U};
+  /// The participant's payload kind, fixed at G4 (an enum, not a copy).
+  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
+  /// The starting event's acceptance time: stage deadlines run from it.
+  std::int64_t accepted_at_ns{};
+  std::uint64_t prepared_execution_id{};
+  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
+  IResolvedParticipantExecutionEngine* execution_engine{};
+  /// What today's transaction held for this participant, fixed at G4.
+  bool runtime_collision_containment{};
+  bool carried_object_lost{};
+  /// Operation Reset or hold timeout: neither is a degraded Stop.
+  bool internal_control_stop{};
+  /// The attempt's mode is spring return (S12 with `force_spring_return`):
+  /// stage 0 runs with the spring-return flag.
+  bool force_spring_return{};
+  /// S12 started this attempt: its spring-return point is handed to the
+  /// takeover fallback waiting for this event, and each pass wakes the
+  /// takeover.
+  bool takeover_stop{};
+  /// A `kStopFailedHalt` started this attempt: its failure raises no further
+  /// Halt (F1 recursion bound).
+  bool started_by_failure_halt{};
+  bool cancelled_pre_dispatch{};
+  bool prepared_cancel_requested{};
+  bool prepared_cancel_complete{};
+  bool prepared_cancel_terminal_observed{};
+  bool terminal{};
+  bool contained{};
+  /// ProgressStop runs at most once at a time per participant.
+  bool progress_in_flight{};
+  std::size_t current_stage_index{};
+  std::uint64_t next_result_sequence{1U};
+  std::optional<ErrorDTO> terminal_error;
+  std::array<StopParticipantAttempt, kMaxStopEscalationStages> attempts;
+  std::vector<StopRetainedStageResult> retained_results;
+  bool participant_settlement_requested{};
+  bool participant_settlement_complete{};
+  std::optional<ErrorDTO> participant_settlement_error;
+  bool terminal_projection_complete{};
+  /// The participant's own prepared owner reported kPreparationFailed for
+  /// this exact execution: nothing was dispatched, no effect crossed the
+  /// barrier, and the owner already committed its own failure terminal,
+  /// which this Stop neither settles nor rewrites.
+  bool preparation_failed{};
+  /// A non-Stopped motion terminal for this never-dispatched execution. An
+  /// already-failed preparation publishes the same failure terminal as a
+  /// failed cancellation; only the prepared owner's exact snapshot, read once
+  /// on demand outside the owner lock, classifies it.
+  std::optional<ErrorDTO> unclassified_prepared_terminal;
+  bool prepared_classification_requested{};
+  /// A runtime-collision fact arrived for this dispatched participant while
+  /// its Stop was containing it. The Stop lane consumes it as escalation
+  /// input under the existing cascade rule (strongest authorized stage).
+  bool collision_escalation_pending{};
+  std::optional<ErrorDTO> collision_escalation_error;
+  /// First collision observed on this participant's Stop path. Containment
+  /// with a collision on the Stop path ends InterventionRequired carrying it.
+  std::optional<ErrorDTO> stop_path_collision;
+  /// Why a weaker stage did not contain this participant before a stronger
+  /// (fallback hard) stage did. A contained participant with this cause ends
+  /// Stopped with a degraded-Stop error (as `main`).
+  std::optional<ErrorDTO> escalation_cause{};
+  /// The Stop ramp ended but the controller reported the robot outside its
+  /// goal tolerance (`main`'s confirmed-but-not-settled case): the
+  /// participant ends InterventionRequired and no further Stop command is
+  /// issued.
+  bool controlled_stop_unsettled{};
+  /// The hard stop is this participant's intended Stop: requested directly
+  /// (it then starts at the strongest stage) or chosen by the Stop
+  /// planner. Its strongest stage is then not an escalation.
+  bool lane_hard_stop_requested{};
+  /// The never-dispatched participant was closed after its prepared
+  /// cancellation was accepted but before that cancellation's terminal
+  /// returned. Its exact settlement is deferred to that terminal.
+  bool cancel_terminal_deferred{};
+  /// An interrupt-selected response follows its qualified suffix
+  /// sequentially. Ordinary/operator and collision strongest jumps stay intact.
+  bool selected_interrupt_suffix{};
+  bool participant_failure_preserved{};
+
+  /// No subordinate terminal handoff exists for a never-dispatched participant
+  /// that either never received an execution identity or whose preparation
+  /// failed in its own owner before dispatch.
+  [[nodiscard]] bool settlement_not_required() const noexcept {
+    return cancelled_pre_dispatch && (prepared_execution_id == 0U || preparation_failed);
+  }
+
+  /// G4: reset in place for a new attempt. Frees what the previous attempt
+  /// held (results, errors, stage pointers); allocates nothing (the result
+  /// vector keeps its capacity).
+  void reset_for_attempt() noexcept {
+    accepted_operation_revision = OperationRevision(0U);
+    payload_kind = OperationParticipantPayloadKind::kMotion;
+    accepted_at_ns = 0;
+    prepared_execution_id = 0U;
+    prepared_motion_engine = nullptr;
+    execution_engine = nullptr;
+    runtime_collision_containment = false;
+    carried_object_lost = false;
+    internal_control_stop = false;
+    force_spring_return = false;
+    takeover_stop = false;
+    started_by_failure_halt = false;
+    cancelled_pre_dispatch = false;
+    prepared_cancel_requested = false;
+    prepared_cancel_complete = false;
+    prepared_cancel_terminal_observed = false;
+    terminal = false;
+    contained = false;
+    progress_in_flight = false;
+    current_stage_index = 0U;
+    next_result_sequence = 1U;
+    terminal_error.reset();
+    for (auto& attempt : attempts) attempt = StopParticipantAttempt{};
+    retained_results.clear();
+    participant_settlement_requested = false;
+    participant_settlement_complete = false;
+    participant_settlement_error.reset();
+    terminal_projection_complete = false;
+    preparation_failed = false;
+    unclassified_prepared_terminal.reset();
+    prepared_classification_requested = false;
+    collision_escalation_pending = false;
+    collision_escalation_error.reset();
+    stop_path_collision.reset();
+    escalation_cause.reset();
+    controlled_stop_unsettled = false;
+    lane_hard_stop_requested = false;
+    cancel_terminal_deferred = false;
+    selected_interrupt_suffix = false;
+    participant_failure_preserved = false;
+  }
+};
+
+inline void fail_prepared_cancellation(StopParticipantWork& work, ErrorDTO failure) {
+  if (work.terminal) return;
+  work.terminal = true;
+  work.contained = false;
+  work.terminal_error = std::move(failure);
+}
+
+inline void observe_prepared_cancellation_terminal(StopParticipantWork& work,
+                                                   const std::uint64_t execution_id,
+                                                   const OperationStateKind state,
+                                                   std::optional<ErrorDTO> failure) {
+  if (!work.cancelled_pre_dispatch || work.prepared_execution_id != execution_id ||
+      !terminal(state) || work.terminal)
+    return;
+  if (state == OperationStateKind::kStopped) {
+    work.prepared_cancel_terminal_observed = true;
+    return;
+  }
+  auto terminal_failure =
+      failure.value_or(error(std::string(to_string(ErrorCode::kExecutionAborted)),
+                             "prepared participant failed while settling pre-dispatch cancellation",
+                             "prepared_cancel_terminal_failed"));
+  if (work.payload_kind == OperationParticipantPayloadKind::kMotion) {
+    if (!work.unclassified_prepared_terminal.has_value())
+      work.unclassified_prepared_terminal = std::move(terminal_failure);
+    return;
+  }
+  fail_prepared_cancellation(work, std::move(terminal_failure));
+}
+
+inline void settle_failed_preparation(StopParticipantWork& work, ErrorDTO failure) {
+  if (work.terminal) return;
+  work.preparation_failed = true;
+  work.prepared_cancel_terminal_observed = true;
+  work.contained = true;
+  work.terminal = true;
+  work.terminal_error = std::move(failure);
 }
 
 struct ActiveOperationParticipant final {
@@ -1712,6 +1902,15 @@ struct ActiveOperationParticipant final {
   /// A Stop that did not wait for this command's still-returning dispatch
   /// leaves its exact local settlement here; the dispatch return performs it.
   std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_stop_settlement{};
+  /// Motion: the execution whose committed send was still in flight when a
+  /// Stop fenced it (fence call (1) `send_outcome_pending`), 0 = none. The
+  /// Stop's settlement waits until the participant reports the send's outcome
+  /// (`kParticipantDispatchOutcome`), which clears it and wakes the Stop lane.
+  std::uint64_t motion_send_outcome_awaited{};
+  /// Motion: the execution whose committed send the participant reported as
+  /// not sent because the Stop came first (cancelled before dispatch, no
+  /// effect), 0 = none. Its Stop then settles as a pre-dispatch cancellation.
+  std::uint64_t motion_send_refused_by_stop{};
   /// A Stop that closed without waiting for this never-dispatched
   /// participant's prepared cancellation to return leaves its exact local
   /// settlement here. The cancellation's own terminal hands it to the Stop
@@ -1776,8 +1975,18 @@ struct ActiveOperationParticipant final {
            deferred_cancel_settlement.has_value();
   }
   /// Tokens only; the shared signal module owns predicate/source state.
-  std::vector<IoRuleRegistrationDTO> io_rule_registrations{};
+  std::vector<IoRuleRegistrationSlot> io_rule_registrations{};
   std::vector<IoMotionRulePolicyBindingDTO> io_motion_rule_policies{};
+  /// Keys of this participant's own containment Stops, per operation
+  /// revision (contract 1.4; `owned_kernel_request_key`).
+  RevisionRequestKeySlot runtime_collision_stop_key{};
+  RevisionRequestKeySlot zero_speed_hold_stop_key{};
+  /// §2.1: this participant's stop state (phase, attempt, mode, outcome,
+  /// attribution, executed plan, Stop lane index). Created with the
+  /// participant; a Stop never allocates it.
+  ParticipantStopState stop{};
+  /// §2.2: the working data of its current Stop attempt.
+  StopParticipantWork stop_work{};
 };
 
 /// Exact reserved resource set of one operation: the union over its
@@ -1816,7 +2025,6 @@ struct PendingOperationControl final {
   std::size_t expected_effects{};
   std::size_t completed_effects{};
   std::optional<ErrorDTO> first_failure;
-  bool durable{};
   bool superseded_by_stop{};
   bool effects_dispatched{};
   std::optional<ProgramNodeExecutionScopeDTO> execution_scope;
@@ -1825,13 +2033,14 @@ struct PendingOperationControl final {
 /// The accepted candidate's immutable link to the sole physical Stop owner.
 /// Stop/candidate phases are read from their existing owners, never duplicated.
 struct MotionTakeoverSpringFallbackDTO final {
-  StopId stop_id;
-  StopGeneration stop_generation;
+  /// The incumbent's Stop event this fallback waits for (S12); its settled
+  /// identity is the incumbent participant's attempt started by this event
+  /// (K11).
+  StopEventId stop_event_id{0U};
   std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
   std::shared_ptr<const SpringBackReturnPointDTO> return_point;
   ErrorDTO smooth_failure;
   std::uint64_t abandoned_preparation_id{};
-  std::shared_ptr<const StopCertificateDTO> certificate{};
 };
 
 struct ResourceAddressedExecutionKernel::ActiveOperation final {
@@ -1841,12 +2050,10 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   OperationStateDTO state;
   std::optional<PendingOperationControl> pending_control;
   bool stop_effect_in_flight{};
-  bool ordinary_acceptance_pending{};
-  bool ordinary_acceptance_durable{};
   bool coordinated_dispatch_barrier_released{};
   std::optional<RuntimeScaleStatusDTO> runtime_scale_status;
-  /// A refused or mismatched engine acknowledgement, recorded by a later
-  /// bookkeeping unit.
+  /// A refused or mismatched engine acknowledgement, recorded by the host's
+  /// next reconcile pass (run_runtime_scale_step).
   struct PendingRuntimeScaleFailure final {
     IResolvedParticipantExecutionEngine* engine{};
     OperationRevision revision;
@@ -1854,49 +2061,35 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
     ErrorDTO error;
     const char* reason{};
   };
-  /// Per-operation speed bookkeeping written behind the stored value by the
-  /// StopProjectionWorker (latest value wins: a newer value overwrites the
+  /// Per-operation speed step behind the stored value (OD-149): run on the
+  /// speed-scale thread, or by the host's next reconcile pass when the commit
+  /// guard was busy (latest value wins: a newer value overwrites the
   /// request). `request` is empty when only a failure is left to record.
   struct PendingRuntimeScale final {
     std::optional<RuntimeScaleRequestDTO> request;
     std::uint64_t value_sequence{};
-    std::optional<RequestId> control_request_id_if_sole;
+    std::optional<RequestKey> control_request_id_if_sole;
     std::optional<PendingRuntimeScaleFailure> failure;
   };
   std::optional<PendingRuntimeScale> pending_runtime_scale{};
-  // Ordinary captures serialize only capture/write/publication, never provider
+  // Ordinary observers serialize capture and publication, never provider
   // work. Stop has its own authoritative linearization and bypasses this gate.
   std::shared_ptr<std::mutex> commit_mutex{std::make_shared<std::mutex>()};
   bool ordinary_commit_in_flight{};
   bool recovery_effect_in_flight{};
   bool coordinated_cancellation_in_flight{};
   std::uint64_t last_capture_order{};
-  struct SettledStop final {
-    StopId stop_id;
-    StopGeneration generation;
-    StopCertificateResultDTO result;
-    std::optional<StopCertificateRefDTO> certificate;
-    bool requested_controlled_stop_succeeded{false};
-  };
-  // One current settlement fact, not a pin on rotating diagnostic history.
-  // A newer Stop cannot borrow its predecessor's result.
-  std::optional<SettledStop> settled_stop{};
   std::shared_ptr<const ResolvedManualProgramHandover> manual_handover{};
   // Manual Robot Control identity, fixed at admission from the binding's
   // intrinsic direct control. Attention and fencing gate ordinary
   // Run/Resume and motion-producing recovery; they never gate a manual
   // operation, whether or not a manual cell-admission claim still names it.
   bool manual{};
-  // The current Stop (`state.active_stop_id`) was requested by the Program's
-  // own configuration (`is_program_requested_stop`) and no other requester
-  // joined it. Its settled first-stage outcome is the Program's ordinary
-  // failure, not an operator hold.
-  bool program_requested_stop{};
   bool retry_run_ended{false};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
   mutable std::uint64_t recovery_assessment_revision{};
   mutable std::optional<KernelRecoveryAssessmentDTO> published_recovery_assessment{};
-  using OperationNode = std::map<OperationId, std::unique_ptr<ActiveOperation>>::node_type;
+  using OperationNode = std::map<OperationNumber, std::unique_ptr<ActiveOperation>>::node_type;
   /// Source-owned accepted metadata; neither node presents duplicate physical
   /// ownership to Stop. The next slot is overwritten, never a waiting queue.
   OperationNode pending_motion_takeover{};
@@ -1904,20 +2097,64 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::optional<PreparedMotionReplacementSourceDTO> takeover_source{};
   bool takeover_advance_in_flight{};
   std::optional<MotionTakeoverSpringFallbackDTO> motion_takeover_spring_fallback{};
+  /// E13: a Stop covered this operation while it had a pending or queued
+  /// takeover candidate, and was not that takeover's own forced Stop (S12).
+  /// The candidates lose their right to commit (K11).
+  bool takeover_cancelled{};
+  /// The Stop event whose stopping state was last queued for the journal.
+  StopEventId journaled_stop_event_id{0U};
+  /// Latest-wins ticket: queue generation and index of this operation's
+  /// unwritten state record (generation 0: none).
+  std::uint64_t journal_state_generation{};
+  std::size_t journal_state_index{};
 
 
-  [[nodiscard]] std::optional<StopCertificateResultDTO> terminal_stop_result() const noexcept {
-    if (settled_stop.has_value() && state.active_stop_id == settled_stop->stop_id &&
-        state.active_stop_generation == settled_stop->generation)
-      return settled_stop->result;
-    return std::nullopt;
+  /// The settled outcome of the operation's Stop, derived from its
+  /// participants' stop phases (§2.1): absent while no Stop owns the
+  /// operation or a participant is still stopping; `kNoEffect` when the Stop
+  /// owned it without stopping any participant; else `kSomeFailed` when a
+  /// covered participant ended uncontained, `kStoppedEscalated` when one was
+  /// contained by a stronger stage than intended, else `kStopped`.
+  [[nodiscard]] std::optional<StopEventResult> terminal_stop_result() const noexcept {
+    if (!state.stop_event_id.has_value()) return std::nullopt;
+    bool covered = false;
+    bool failed = false;
+    bool escalated = false;
+    for (const auto& participant : participants) {
+      switch (participant.stop.phase) {
+        case StopPhase::kRunning:
+          break;
+        case StopPhase::kStopping:
+          return std::nullopt;
+        case StopPhase::kStopped:
+          covered = true;
+          escalated = escalated || participant.stop.escalated;
+          break;
+        case StopPhase::kFailed:
+          covered = true;
+          failed = true;
+          break;
+      }
+    }
+    // A Stop that owned the operation without stopping any participant (all
+    // non-motion transactions, base revision-only scope): settled, no effect
+    // (the base's empty nominal certificate).
+    if (!covered) return StopEventResult::kNoEffect;
+    if (failed) return StopEventResult::kSomeFailed;
+    return escalated ? StopEventResult::kStoppedEscalated : StopEventResult::kStopped;
   }
 
-  /// The Program's ordinary failure from its own Stop: that Stop alone,
-  /// settled at its first stage, left the operation Stopped.
+  /// The Program's ordinary failure from its own Stop: every stopped
+  /// participant carries Program-own attribution and was contained at its
+  /// intended stage, and the operation ended Stopped.
   [[nodiscard]] bool ordinary_program_stop() const noexcept {
-    return program_requested_stop && state.state == OperationStateKind::kStopped &&
-           terminal_stop_result() == StopCertificateResultDTO::kSucceededNominal;
+    if (state.state != OperationStateKind::kStopped ||
+        terminal_stop_result() != StopEventResult::kStopped)
+      return false;
+    return std::all_of(participants.begin(), participants.end(), [](const auto& participant) {
+      return participant.stop.phase == StopPhase::kRunning ||
+             participant.stop.attribution.attribution_class == StopAttributionClass::kProgramOwn;
+    });
   }
 
   [[nodiscard]] bool cancelled_pneumatic_preparation_shape() const noexcept {
@@ -1968,17 +2205,17 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
     return std::any_of(state.participants.begin(), state.participants.end(), [](const auto& row) {
       return std::any_of(row.io_rule_outcomes.begin(), row.io_rule_outcomes.end(),
                          [](const auto& outcome) {
-                           return outcome.stop_id && !outcome.stop_certificate_id;
+                           return outcome.stop_event_id && !outcome.stop_result;
                          });
     });
   }
 
   [[nodiscard]] bool stop_allows_retirement() const noexcept {
     if (has_pending_io_rule_response()) return false;
-    if (!state.active_stop_id.has_value()) return true;
+    if (!state.stop_event_id.has_value()) return true;
     const auto outcome = terminal_stop_result();
-    return outcome == StopCertificateResultDTO::kSucceededNominal ||
-           outcome == StopCertificateResultDTO::kSucceededEscalated;
+    return outcome == StopEventResult::kStopped || outcome == StopEventResult::kStoppedEscalated ||
+           outcome == StopEventResult::kNoEffect;
   }
 
   [[nodiscard]] ActiveOperationParticipant* participant_for(
@@ -2016,7 +2253,7 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   /// cancellation, reconciliation, control, recovery or Stop borrow is still
   /// open. Progress values and observed poses are never part of this proof.
   [[nodiscard]] bool never_dispatched_and_quiescent() const noexcept {
-    return !state.active_stop_id.has_value() && !stop_effect_in_flight &&
+    return !state.stop_event_id.has_value() && !stop_effect_in_flight &&
            !recovery_effect_in_flight && !coordinated_cancellation_in_flight &&
            !coordinated_dispatch_barrier_released && !pending_control.has_value() &&
            std::all_of(participants.begin(), participants.end(), [](const auto& participant) {
@@ -2042,11 +2279,57 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
            (state.state == OperationStateKind::kInterventionRequired &&
             !held_without_physical_effect());
   }
+
+  /// Keys of the requests the Kernel itself makes for this operation, stored
+  /// here so a repeated trigger of the same cause replays exactly (contract
+  /// 1.4; `owned_kernel_request_key`).
+  std::optional<RequestKey> admission_closed_stop_key{};
+  std::optional<RequestKey> partial_dispatch_stop_key{};
+  RevisionRequestKeySlot prepared_dispatch_stop_key{};
+  RevisionRequestKeySlot manual_settlement_key{};
+  /// Kernel closes of this operation: at (operation revision, assessment
+  /// revision); a pending takeover candidate's close at its preparation id;
+  /// the unsent incumbent's close.
+  RevisionRequestKeySlot recovery_close_key{};
+  RevisionRequestKeySlot takeover_close_key{};
+  std::optional<RequestKey> unsent_takeover_close_key{};
 };
+
+/// §6.3.1, contract C4: the participant `stop` objects of an operation's
+/// published state, filled from the participants' stop state when the state
+/// is read or captured (never at acceptance: digest and stage id are text).
+inline void fill_participant_stop_observations(
+    const std::vector<ActiveOperationParticipant>& participants, OperationStateDTO& state) {
+  for (std::size_t index = 0U; index < participants.size() && index < state.participants.size();
+       ++index) {
+    const auto& stop = participants[index].stop;
+    auto& row = state.participants[index];
+    if (stop.attempt == 0U) {
+      row.stop.reset();
+      continue;
+    }
+    ParticipantStopObservationDTO observation;
+    observation.phase = stop.phase;
+    observation.attempt = stop.attempt;
+    observation.stop_event_id = stop.started_by;
+    observation.mode = stop.mode;
+    observation.attribution_class = stop.attribution.attribution_class;
+    if (stop.plan != nullptr) {
+      observation.plan_digest = stop.plan->participant_stop_invocation_plan_digest;
+      if (stop.containing_stage != kNoStopStage &&
+          stop.containing_stage < stop.plan->stage_commands.size())
+        observation.containing_stage_id =
+            stop.plan->stage_commands[stop.containing_stage].resolved_stage.stop_escalation_stage_id;
+    }
+    if (stop.containing_stage != kNoStopStage) observation.containing_stage_index = stop.containing_stage;
+    observation.escalated = stop.escalated;
+    row.stop = std::move(observation);
+  }
+}
 
 class ResourceAddressedExecutionKernel::OperationCommitGuard final {
  public:
-  OperationCommitGuard(ResourceAddressedExecutionKernel& owner, const OperationId& id)
+  OperationCommitGuard(ResourceAddressedExecutionKernel& owner, const OperationNumber& id)
       : owner_(owner), id_(id) {
     {
       std::lock_guard state_lock(owner_.state_mutex_);
@@ -2058,8 +2341,9 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
     claim();
   }
   /// Never waits: `claimed()` is false when another writer holds the gate.
-  /// That writer's release() republishes pending speed bookkeeping.
-  OperationCommitGuard(ResourceAddressedExecutionKernel& owner, const OperationId& id,
+  /// A speed step that meets a held gate stays pending for the host's next
+  /// reconcile pass (OD-149).
+  OperationCommitGuard(ResourceAddressedExecutionKernel& owner, const OperationNumber& id,
                        std::try_to_lock_t)
       : owner_(owner), id_(id) {
     {
@@ -2086,7 +2370,7 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
   }
 
   ResourceAddressedExecutionKernel& owner_;
-  OperationId id_;
+  OperationNumber id_;
   std::shared_ptr<std::mutex> mutex_;
   std::unique_lock<std::mutex> lock_;
   bool claimed_{};
@@ -2210,40 +2494,6 @@ inline constexpr std::string_view kOperationResetStopReason = "operation_reset";
 inline constexpr std::string_view kZeroSpeedHoldStopSource = "kernel.zero_speed_hold";
 inline constexpr std::string_view kZeroSpeedHoldStopReason = "zero_speed_hold_timeout";
 
-enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
-
-/// A Stop the Program's own configuration requested, by authoritative
-/// provenance, never by a caller's labels: a node or global interrupt rule's
-/// trip (the Kernel's own rule selection, not a lost source), or the
-/// Manager's carried-object-lost response (internal owner transport; the
-/// public Stop route always stamps its own transport). Every other Stop,
-/// including any public Stop whatever its context says, is an operator Stop.
-[[nodiscard]] inline bool is_program_requested_stop(const StopIntentDTO* intent,
-                                                    bool kernel_rule_selection) noexcept {
-  if (intent == nullptr || !intent->reason.has_value()) return false;
-  const auto& reason = *intent->reason;
-  if (kernel_rule_selection)
-    return reason == "interrupt_fault" || reason == "motion_interrupt_signal_trip";
-  return intent->attribution.transport == RequestTransportDTO::kInternal &&
-         intent->request_context.source_label == "manager.carried_object_lost" &&
-         reason == "carried_object_lost";
-}
-
-/// Internal Stops with their own Stop choice: Reset while busy runs the
-/// deployment's operator Stop profile and issues the lane's hard stop only
-/// on its timeout or when no profile is configured (as `main`); the
-/// zero-speed hold timeout issues the lane's hard stop
-/// directly. Neither is a degraded Stop.
-[[nodiscard]] inline InternalStopKind internal_stop_kind(const StopIntentDTO* intent) noexcept {
-  if (intent == nullptr || !intent->reason.has_value()) return InternalStopKind::kNone;
-  const auto& source = intent->request_context.source_label;
-  if (source == kOperationControlStopSource && *intent->reason == kOperationResetStopReason)
-    return InternalStopKind::kReset;
-  if (source == kZeroSpeedHoldStopSource && *intent->reason == kZeroSpeedHoldStopReason)
-    return InternalStopKind::kZeroSpeedHold;
-  return InternalStopKind::kNone;
-}
-
 /// `main`'s degraded-Stop error: the controlled Stop did not contain the
 /// motion and the fallback hard stop did. The operation still ends
 /// Stopped; this error explains the downgrade.
@@ -2305,7 +2555,7 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
 }
 
 [[nodiscard]] inline Result<std::vector<OperationControlEffectRequest>> reset_effect_requests(
-    const OperationId& operation_id, const std::vector<ActiveOperationParticipant>& participants,
+    const OperationNumber& operation_id, const std::vector<ActiveOperationParticipant>& participants,
     const OperationRevision operation_revision) {
   std::vector<OperationControlEffectRequest> requests;
   requests.reserve(participants.size());
@@ -2351,157 +2601,12 @@ enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
   return Result<std::vector<OperationControlEffectRequest>>::Ok(std::move(requests));
 }
 
-struct StopParticipantAttempt final {
-  bool started{};
-  bool superseded{};
-  bool result_consumed{};
-  std::optional<StopStageAttemptHandle> handle;
-  std::shared_ptr<const ResolvedParticipantStopStageDTO> stage;
-  std::shared_ptr<const RemainingStopBudgetDTO> budget;
-  /// The Kernel's own watchdog: only a controlled stage's own deadline;
-  /// absent for a hard stage and a gripper cancel.
-  std::optional<std::int64_t> stage_deadline_ns;
-};
-
-struct StopParticipantWork final {
-  OperationId operation_id;
-  OperationRevision accepted_operation_revision{0U};
-  OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
-  ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation{0U};
-  RuntimeParticipantBinding binding;
-  RuntimeParticipantStopReadiness readiness;
-  std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
-  MotionInterruptNodeCategory node_category{MotionInterruptNodeCategory::kGeneric};
-  PreparedParticipantStopPlanDTO plan;
-  std::vector<ResourceId> resources;
-  IControlDomainExecutionPort* port{};
-  IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
-  IResolvedParticipantExecutionEngine* execution_engine{};
-  std::uint64_t prepared_execution_id{};
-  bool cancelled_pre_dispatch{};
-  bool prepared_cancel_requested{};
-  bool prepared_cancel_complete{};
-  bool prepared_cancel_terminal_observed{};
-  bool terminal{};
-  bool contained{};
-  std::size_t current_stage_index{};
-  std::uint64_t next_result_sequence{1U};
-  std::optional<ErrorDTO> terminal_error;
-  std::array<StopParticipantAttempt, kMaxStopEscalationStages> attempts;
-  std::vector<StopAttemptedStageResultDTO> retained_results;
-  bool participant_settlement_requested{};
-  bool participant_settlement_complete{};
-  std::optional<ErrorDTO> participant_settlement_error;
-  bool terminal_projection_complete{};
-  /// The participant's own prepared owner reported kPreparationFailed for
-  /// this exact execution: nothing was dispatched, no effect crossed the
-  /// barrier, and the owner already committed its own failure terminal,
-  /// which this Stop neither settles nor rewrites.
-  bool preparation_failed{};
-  /// A non-Stopped motion terminal for this never-dispatched execution. An
-  /// already-failed preparation publishes the same failure terminal as a
-  /// failed cancellation; only the prepared owner's exact snapshot, read once
-  /// on demand outside the owner lock, classifies it.
-  std::optional<ErrorDTO> unclassified_prepared_terminal;
-  bool prepared_classification_requested{};
-  /// A runtime-collision fact arrived for this dispatched participant while
-  /// this Stop was containing it. The Stop lane consumes it as escalation
-  /// input under the existing cascade rule (strongest authorized stage).
-  bool collision_escalation_pending{};
-  std::optional<ErrorDTO> collision_escalation_error;
-  /// First collision observed on this participant's Stop path. Containment
-  /// with a collision on the Stop path ends InterventionRequired carrying it.
-  std::optional<ErrorDTO> stop_path_collision;
-  /// Why a weaker stage did not contain this participant before a stronger
-  /// (fallback hard) stage did. A contained participant with this cause ends
-  /// Stopped with a degraded-Stop error (as `main`).
-  std::optional<ErrorDTO> escalation_cause{};
-  /// The Stop ramp ended but the controller reported the robot outside its
-  /// goal tolerance (`main`'s confirmed-but-not-settled case): the
-  /// participant ends InterventionRequired and no further Stop command is
-  /// issued.
-  bool controlled_stop_unsettled{};
-  /// The hard stop is this participant's intended Stop: requested directly
-  /// (it then starts at the strongest stage) or chosen by the Stop
-  /// planner. Its strongest stage is then not an escalation.
-  bool lane_hard_stop_requested{};
-  /// The never-dispatched participant was closed after its prepared
-  /// cancellation was accepted but before that cancellation's terminal
-  /// returned. Its exact settlement is deferred to that terminal.
-  bool cancel_terminal_deferred{};
-  GripperActuationKind gripper_actuation{GripperActuationKind::kPositionCommanded};
-  /// An interrupt-selected response follows its qualified suffix
-  /// sequentially. Ordinary/operator and collision strongest jumps stay intact.
-  bool selected_interrupt_suffix{};
-  bool participant_failure_preserved{};
-
-  /// No subordinate terminal handoff exists for a never-dispatched participant
-  /// that either never received an execution identity or whose preparation
-  /// failed in its own owner before dispatch.
-  [[nodiscard]] bool settlement_not_required() const noexcept {
-    return cancelled_pre_dispatch && (prepared_execution_id == 0U || preparation_failed);
-  }
-};
-
-inline void fail_prepared_cancellation(StopParticipantWork& work, ErrorDTO failure) {
-  if (work.terminal) return;
-  work.terminal = true;
-  work.contained = false;
-  work.terminal_error = std::move(failure);
-}
-
-inline void observe_prepared_cancellation_terminal(StopParticipantWork& work,
-                                                   const std::uint64_t execution_id,
-                                                   const OperationStateKind state,
-                                                   std::optional<ErrorDTO> failure) {
-  if (!work.cancelled_pre_dispatch || work.prepared_execution_id != execution_id ||
-      !terminal(state) || work.terminal)
-    return;
-  if (state == OperationStateKind::kStopped) {
-    work.prepared_cancel_terminal_observed = true;
-    return;
-  }
-  auto terminal_failure =
-      failure.value_or(error(std::string(to_string(ErrorCode::kExecutionAborted)),
-                             "prepared participant failed while settling pre-dispatch cancellation",
-                             "prepared_cancel_terminal_failed"));
-  if (work.payload_kind == OperationParticipantPayloadKind::kMotion) {
-    if (!work.unclassified_prepared_terminal.has_value())
-      work.unclassified_prepared_terminal = std::move(terminal_failure);
-    return;
-  }
-  fail_prepared_cancellation(work, std::move(terminal_failure));
-}
-
-inline void settle_failed_preparation(StopParticipantWork& work, ErrorDTO failure) {
-  if (work.terminal) return;
-  work.preparation_failed = true;
-  work.prepared_cancel_terminal_observed = true;
-  work.contained = true;
-  work.terminal = true;
-  work.terminal_error = std::move(failure);
-}
-
-struct ResourceAddressedExecutionKernel::InterruptStopSelection final {
-  IoRuleRegistrationDTO registration;
-  IoRuleEvidenceDTO evidence;
-  PreparedParticipantStopPlanDTO plan;
-  InterruptSourceId source_id;
-  InterruptPreemptionAction action;
-  int priority;
-  IoRuleStopScopeDTO stop_scope;
-  IoRulePreparedStopEntryDTO stop_entry;
-  IoRulePreparedStopEntryDTO success_through;
-};
-
 struct ResourceAddressedExecutionKernel::GlobalInterruptStopParticipant final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   std::uint64_t preparation_id;
   ContentDigest prepared_contract_digest;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   PreparedParticipantStopPlanDTO plan;
   IoRulePreparedStopEntryDTO stop_entry;
 };
@@ -2523,120 +2628,9 @@ struct ResourceAddressedExecutionKernel::GlobalInterruptStopSelection final {
   std::vector<ResourceId> scope_resources;
 };
 
-struct ResourceAddressedExecutionKernel::StopTransaction final {
-  bool active{};
-  StopControlWorkToken token;
-  std::optional<StopId> stop_id;
-  StopGeneration stop_generation{0U};
-  bool full_stop{};
-  EmergencyStopProjectionStateDTO acceptance_projection_state{
-      EmergencyStopProjectionStateDTO::kPending};
-  bool progress_in_flight{};
-  bool fresh_scope_complete{};
-  bool terminal{};
-  std::optional<StopAcceptedDTO> accepted;
-  EmergencyStopProjectedIntentDTO projected_intent;
-  std::vector<StopAffectedOperationRevisionDTO> newly_fenced_operation_revisions;
-  std::vector<ResourceId> newly_captured_resources;
-  /// Only scope first fenced by this transaction. Predecessor operations keep
-  /// progressing under their original work tokens and are never redispatched.
-  std::vector<OperationId> operations;
-  /// Empty means the complete participant closure of `operations`. A nonempty
-  /// set is reserved for the Kernel-generated partial-dispatch containment
-  /// path and names exactly the physical dispatch calls already released.
-  std::vector<OperationParticipantId> participant_ids;
-  std::vector<ResourceId> resources;
-  std::vector<StopControlWorkToken> predecessor_tokens;
-  std::vector<StopCertificateDTO> predecessor_certificates;
-  bool participant_work_initialized{};
-  std::vector<StopParticipantWork> participants;
-  std::optional<StopCertificateDTO> certificate;
-  std::optional<StopControlWorkToken> terminal_projection_token;
-  std::optional<std::string> malformed_ingress_reason;
-  /// Stop-path collision facts that arrived before participant work existed;
-  /// consumed when the work is initialized.
-  std::vector<std::tuple<OperationId, OperationParticipantId, ErrorDTO>>
-      pending_stop_path_collisions;
-  std::optional<OperationId> motion_takeover_candidate_id{};
-  bool force_spring_return{};
-  std::optional<InterruptStopSelection> interrupt_selection{};
-  std::vector<InterruptStopSelection> disjoint_interrupt_selections{};
-  /// Logical arbitration never changes the immutable initial physical plan,
-  /// stage attempts, or deadline. A higher-priority fault owns its own fact.
-  std::vector<InterruptStopSelection> interrupt_winners{};
-  /// Immutable physical selection. Later global logical winners join the
-  /// existing transaction without changing this plan, membership or budget.
-  std::optional<GlobalInterruptStopSelection> global_interrupt_selection{};
-  std::vector<GlobalInterruptStopSelection> global_interrupt_winners{};
-  std::vector<internal::StopProofPredecessorScope> proof_predecessor_scopes{};
-};
-
-// A scoped global Stop owns only its captured physical/logical participants.
-// Sharing an enclosing operation does not transfer a sibling's guard or result.
-template <typename Transaction>
-[[nodiscard]] inline bool scoped_global_stop_excludes_participant(
-    const Transaction& transaction, const OperationId& operation,
-    const OperationParticipantId& participant, const std::vector<ResourceId>& resources) {
-  if (transaction.full_stop || transaction.global_interrupt_winners.empty()) return false;
-  for (const auto& winner : transaction.global_interrupt_winners)
-    for (const auto& selected : winner.participants)
-      if (selected.operation_id == operation && selected.participant_id == participant) return false;
-  for (const auto& winner : transaction.interrupt_winners) {
-    const auto& scope = std::get<IoOperationRuleScopeDTO>(winner.registration.scope);
-    if (scope.operation_id == operation && scope.participant_id == participant) return false;
-  }
-  if (transaction.global_interrupt_selection &&
-      !transaction.global_interrupt_selection->everything)
-    return true;  // Initial addressed selection is an exact participant set.
-  return !std::all_of(resources.begin(), resources.end(), [&](const auto& resource) {
-    return std::binary_search(transaction.resources.begin(), transaction.resources.end(), resource);
-  });
-}
-
-/// Snapshot/result ownership includes logical responses on inherited operations.
-/// Physical command ownership remains exclusively transaction.operations.
-template <typename Transaction>
-[[nodiscard]] inline std::vector<OperationId> stop_operation_snapshot_ids(
-    const Transaction& transaction) {
-  auto ids = transaction.operations;
-  for (const auto& winner : transaction.interrupt_winners)
-    ids.push_back(std::get<IoOperationRuleScopeDTO>(winner.registration.scope).operation_id);
-  for (const auto& winner : transaction.global_interrupt_winners)
-    for (const auto& participant : winner.participants) ids.push_back(participant.operation_id);
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-  return ids;
-}
-
-struct ResourceAddressedExecutionKernel::StopTerminalRecord final {
-  StopStatusDTO status;
-  StopCertificateDTO certificate;
-  std::optional<StopControlWorkToken> terminal_projection_token;
-  std::optional<StopAcceptedDTO> accepted{};
-};
-
-struct ResourceAddressedExecutionKernel::StopProjectionJob final {
-  StopControlWorkToken token;
-  bool active{};
-  std::optional<EmergencyStopAcceptanceRecordDTO> acceptance;
-  std::optional<EmergencyStopProjectedIntentDTO> intent;
-  std::optional<StopAcceptedDTO> accepted;
-  std::optional<EmergencyStopAffectedStateSnapshotDTO> affected_state;
-  std::optional<StopStatusDTO> terminal_status;
-  std::optional<StopCertificateDTO> terminal_certificate;
-  std::vector<OperationStateDTO> terminal_operation_states;
-};
-
 namespace resource_addressed_kernel_detail {
 
 inline constexpr std::uint64_t kMaximumKernelJsonInteger = 9'007'199'254'740'991ULL;
-inline constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
-// Recognized Stop authority is already linearized, and containment never
-// depends on this sole non-critical projection worker. Each Stop projection is
-// one journal attempt: the journal hands its writer to a waiting Stop
-// projection right after the one write in progress, so a failed attempt is a
-// genuine storage fault; it is recorded and logged. The status records that single attempt as its retry generation.
-inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] inline std::int64_t checked_deadline(std::int64_t now, std::int64_t duration) noexcept {
   if (now < 0 || duration <= 0 || duration > kMaximumStopDurationNs ||
@@ -2665,11 +2659,10 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 /// The per-robot Stop-time values handed with one stage: no shared
 /// cell-wide budget.
 [[nodiscard]] inline RemainingStopBudgetDTO remaining_stop_budget(
-    const PreparedStopStageCommandDTO& command, const StopId& stop_id,
-    const StopGeneration stop_generation, const std::int64_t now,
-    const std::int64_t accepted_at_ns) {
-  RemainingStopBudgetDTO budget{stop_id, stop_generation,
-                                std::max<std::int64_t>(0, now - accepted_at_ns), std::nullopt};
+    const PreparedStopStageCommandDTO& command, const StopEventId stop_event_id,
+    const std::int64_t now, const std::int64_t accepted_at_ns) {
+  RemainingStopBudgetDTO budget{stop_event_id, std::max<std::int64_t>(0, now - accepted_at_ns),
+                                std::nullopt};
   if (const auto deadline = controlled_stage_deadline_ns(command)) {
     budget.remaining_controlled_deadline_ns =
         std::max<std::int64_t>(0, *deadline - budget.elapsed_since_stop_ns);
@@ -2677,12 +2670,12 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return budget;
 }
 
-/// The Kernel's own watchdog for one stage: only a controlled stage's, from
-/// the Stop request its controlled deadline plus a normal motion's no-report
-/// bound for a Stop trajectory as long as that deadline (a
-/// dispatched Stop trajectory finishes like a normal motion,
-/// `controlled_stage_watchdog_ns`). The Kernel arms no watchdog of its own for
-/// a hard stage or a gripper cancel.
+/// The Kernel's own watchdog for one controlled stage: from the Stop request
+/// its controlled deadline plus a normal motion's no-report bound for a Stop
+/// trajectory as long as that deadline (a dispatched Stop trajectory
+/// finishes like a normal motion, `controlled_stage_watchdog_ns`). The
+/// software-hard stage has its own (`hard_stage_watchdog_deadline`); a
+/// gripper cancel has none.
 [[nodiscard]] inline std::optional<std::int64_t> stage_watchdog_deadline(
     const RemainingStopBudgetDTO& budget, const std::int64_t now) noexcept {
   if (!budget.remaining_controlled_deadline_ns.has_value()) {
@@ -2695,12 +2688,33 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return deadline < 0 ? std::nullopt : std::optional(deadline);
 }
 
+/// P7 (F4): the Kernel's watchdog of the software-hard stage, stage start +
+/// `controlled_stage_watchdog_ns(hard_stop_completion_timeout_ns)`: just past
+/// the stage helper's own failure at the lane timeout, so it fires only when
+/// the port never reports. None when the lane has no hard-stop timeout (C20).
+[[nodiscard]] inline std::optional<std::int64_t> hard_stage_watchdog_deadline(
+    const PreparedStopStageCommandDTO& command, const Duration hard_stop_completion_timeout_ns,
+    const std::int64_t now) noexcept {
+  if (command.resolved_stage.command_qualification.stop_action_class ==
+          StopActionClass::kControlled ||
+      hard_stop_completion_timeout_ns <= 0)
+    return std::nullopt;
+  const auto deadline =
+      checked_deadline(now, controlled_stage_watchdog_ns(hard_stop_completion_timeout_ns));
+  return deadline < 0 ? std::nullopt : std::optional(deadline);
+}
+
+/// One stage of a participant's Stop attempt, resolved from the participant's
+/// own binding, readiness and executed plan (`stop.plan`). Called on the Stop
+/// lane (never at acceptance).
 [[nodiscard]] inline Result<ResolvedParticipantStopStageDTO> resolve_participant_stop_stage(
-    const StopParticipantWork& item, const StopId& stop_id, const StopGeneration stop_generation,
-    const std::size_t stage_index, const RemainingStopBudgetDTO& budget) {
+    const ActiveOperationParticipant& item, const OperationNumber& operation_id,
+    const ControllerGoalId& controller_goal_id, const std::size_t stage_index,
+    const RemainingStopBudgetDTO& budget) {
+  const auto& plan = *item.stop.plan;
   const auto& binding = item.binding.value();
   const auto& path = *binding.control_path;
-  const auto& selected = item.plan.stage_commands[stage_index].resolved_stage;
+  const auto& selected = plan.stage_commands[stage_index].resolved_stage;
   std::optional<CapabilityProviderBindingId> provider_binding_id;
   std::optional<CapabilityProviderBindingRevision> provider_binding_revision;
   const auto provider_matches = [&](const RuntimeCapabilityProviderPathDTO& provider) {
@@ -2750,13 +2764,11 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
       break;
   }
 
-  ResolvedParticipantStopStageDTO candidate{stop_id,
-                                            stop_generation,
-                                            item.operation_id,
-                                            item.plan.operation_revision,
-                                            item.plan.participant_id,
-                                            item.controller_goal_id,
-                                            item.controller_goal_generation,
+  ResolvedParticipantStopStageDTO candidate{item.stop.started_by,
+                                            operation_id,
+                                            plan.operation_revision,
+                                            plan.participant_id,
+                                            controller_goal_id,
                                             binding.controllable_component_id,
                                             binding.command_target_id,
                                             binding.capability_id,
@@ -2776,119 +2788,12 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
                                             selected.containment_granularity,
                                             path.stop_evidence_policy_id,
                                             path.stop_evidence_policy_revision,
-                                            item.plan,
+                                            plan,
                                             stage_index,
                                             ContentDigest("pending")};
   return MakeResolvedParticipantStopStage(
-      std::move(candidate), budget, item.readiness.value().resolved_stop_base_plan, item.binding,
-      item.retained_default_stop_limits, item.node_category, item.resources);
-}
-
-[[nodiscard]] inline StopRequestedSelectorSnapshotDTO requested_selector_snapshot(
-    const EmergencyStopProjectedIntentDTO& intent, const ContentDigest& digest,
-    const std::optional<std::string>& malformed_reason) {
-  if (const auto* ordinary = std::get_if<StopIntentDTO>(&intent)) {
-    const auto kind = std::visit(
-        [](const auto& rows) {
-          using Rows = std::decay_t<decltype(rows)>;
-          if constexpr (std::is_same_v<Rows, std::vector<StopOperationTargetDTO>>) {
-            return StopRequestedSelectorKindDTO::kOrdinaryOperations;
-          } else if constexpr (std::is_same_v<Rows, std::vector<StopComponentTargetDTO>>) {
-            return StopRequestedSelectorKindDTO::kOrdinaryComponents;
-          } else if constexpr (std::is_same_v<Rows, std::vector<StopResourceTargetDTO>>) {
-            return StopRequestedSelectorKindDTO::kOrdinaryResources;
-          } else {
-            return StopRequestedSelectorKindDTO::kInternalProgramRun;
-          }
-        },
-        ordinary->selector);
-    return StopRequestedSelectorSnapshotDTO{kind, digest, ordinary->selector, std::nullopt};
-  }
-  if (std::holds_alternative<FullStopIntentDTO>(intent)) {
-    return StopRequestedSelectorSnapshotDTO{StopRequestedSelectorKindDTO::kExplicitFull, digest,
-                                            std::nullopt, std::nullopt};
-  }
-  return StopRequestedSelectorSnapshotDTO{StopRequestedSelectorKindDTO::kMalformedIngress, digest,
-                                          std::nullopt, malformed_reason};
-}
-
-[[nodiscard]] inline StopParticipantScopeFactsDTO participant_scope_facts(
-    const StopParticipantWork& item) {
-  const auto& binding = item.binding.value();
-  const auto& path = *binding.control_path;
-  const auto terminal_settlement = [&] {
-    using State = StopParticipantScopeFactsDTO::TerminalSettlementState;
-    if (item.settlement_not_required() && item.contained) {
-      return State::kNotRequired;
-    }
-    if (item.cancelled_pre_dispatch &&
-        (item.terminal_error.has_value() || item.participant_settlement_error.has_value())) {
-      return State::kContainedUnsettled;
-    }
-    if (!item.contained) {
-      return State::kNotRequired;
-    }
-    if (!item.participant_settlement_complete) {
-      return State::kPending;
-    }
-    return item.participant_settlement_error.has_value() ? State::kContainedUnsettled
-                                                         : State::kSettled;
-  }();
-  return StopParticipantScopeFactsDTO{
-      item.accepted_operation_revision,
-      binding.controllable_component_id,
-      binding.command_target_id,
-      binding.capability_id,
-      path.control_domain_id,
-      path.control_domain_revision,
-      path.control_binding_id,
-      path.control_binding_revision,
-      item.controller_goal_id,
-      item.controller_goal_generation,
-      path.active_control_configuration_id,
-      path.active_control_configuration_generation,
-      path.controller_topology_id,
-      path.topology_revision,
-      path.control_route_id,
-      path.provider_runtime_epoch,
-      item.resources,
-      item.readiness.value().resolved_stop_base_plan.containment_granularity,
-      terminal_settlement};
-}
-
-[[nodiscard]] inline StopScopeEntryDTO participant_scope_entry(
-    const StopParticipantWork& item, const StopId& stop_id, const StopGeneration stop_generation,
-    const std::int64_t accepted_at_ns) {
-  return StopScopeEntryDTO{
-      StopScopeEntryKeyDTO{stop_id, stop_generation,
-                           StopParticipantScopeKeyDTO{item.operation_id, item.plan.participant_id}},
-      participant_scope_facts(item),
-      StopScopeEntryDispositionDTO::kStoppable,
-      item.cancelled_pre_dispatch ? StopScopeDispatchStateDTO::kNeverDispatchedCancelled
-                                  : StopScopeDispatchStateDTO::kDispatched,
-      item.readiness.value().resolved_stop_base_plan.stop_evidence_policy_id,
-      item.readiness.value().resolved_stop_base_plan.stop_evidence_policy_revision,
-      item.plan.participant_stop_invocation_plan_digest,
-      accepted_at_ns};
-}
-
-[[nodiscard]] inline bool stop_scope_entry_key_less(const StopScopeEntryKeyDTO& left,
-                                             const StopScopeEntryKeyDTO& right) noexcept {
-  if (left.origin_stop_id != right.origin_stop_id) {
-    return left.origin_stop_id < right.origin_stop_id;
-  }
-  if (left.origin_stop_generation != right.origin_stop_generation) {
-    return left.origin_stop_generation < right.origin_stop_generation;
-  }
-  if (left.subject.index() != right.subject.index()) {
-    return left.subject.index() < right.subject.index();
-  }
-  if (const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&left.subject)) {
-    const auto& other = std::get<StopParticipantScopeKeyDTO>(right.subject);
-    return std::tie(participant->operation_id, participant->participant_id) <
-           std::tie(other.operation_id, other.participant_id);
-  }
-  return std::get<ResourceId>(left.subject) < std::get<ResourceId>(right.subject);
+      std::move(candidate), budget, item.stop_readiness->value().resolved_stop_base_plan,
+      item.binding, item.retained_default_stop_limits, item.stop_node_category, item.resources);
 }
 
 }  // namespace resource_addressed_kernel_detail
@@ -2896,8 +2801,7 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 namespace resource_addressed_kernel_detail {
 inline bool global_rule_registration_matches(const IoRuleRegistrationDTO& token,
     const IoRuleStateContextDTO& context, const InterruptPolicyId& policy) {
-  return token.owner_epoch == context.owner_epoch &&
-         token.catalog_generation == context.catalog_generation && token.registration_id != 0U &&
+  return token.catalog_generation == context.catalog_generation && token.registration_id != 0U &&
          token.policy_id == policy && token.scope == IoRuleScopeDTO{IoActivationRuleScopeDTO{
              context.retained_bundle_id, context.graph_revision}};
 }
@@ -2915,9 +2819,6 @@ struct ResourceAddressedExecutionKernel::GlobalIoRuleRuntime final {
   std::optional<ErrorDTO> qualification_error;
   bool active{};
   bool trip_consumed{};
-  // A `stop`/`hold` trip holds the Program run like the operator's
-  // Stop; set at the trip, cleared once the run's hold is issued.
-  bool hold_run{};
   // Watched at least once since Load or activation: a missing Program key
   // baseline before that is not a loss (the run publishes its keys first).
   bool watched{};
@@ -2933,20 +2834,22 @@ struct ResourceAddressedExecutionKernel::StagedGlobalIoRuleCatalog final {
   std::shared_ptr<const IoRuleWaitingForProgramCatalogDTO> waiting_for_program{};
 };
 
-class ResourceAddressedExecutionKernel::StopProjectionWorker final {
+/// The journal writer queue: 4,096 places, plus 194 that only Stop rows use.
+inline constexpr std::size_t kJournalQueueCapacity = 4096U;
+inline constexpr std::size_t kJournalQueueStopReserve = 194U;
+
+/// The one journal writer: an ordinary thread that takes the posted records
+/// in action order and writes them. It only writes (OD-149).
+class ResourceAddressedExecutionKernel::JournalWriter final {
  public:
-  StopProjectionWorker(const std::size_t capacity, ResourceAddressedExecutionKernel& owner)
-      : capacity_(capacity),
-        owner_(owner),
-        requested_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
-        delivered_(std::make_unique<std::atomic_uint64_t[]>(capacity)),
-        worker_([this](std::stop_token token) noexcept { Run(token); }) {
+  explicit JournalWriter(ResourceAddressedExecutionKernel& owner)
+      : owner_(owner), worker_([this](std::stop_token token) noexcept { Run(token); }) {
     while (!ready_.load(std::memory_order_acquire)) {
       ready_.wait(false, std::memory_order_acquire);
     }
   }
 
-  ~StopProjectionWorker() {
+  ~JournalWriter() {
     Close();
     worker_.request_stop();
     Wake();
@@ -2955,126 +2858,78 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
     }
   }
 
-  void Publish(const StopControlWorkToken token) noexcept {
-    api_calls_in_flight_.fetch_add(1U, std::memory_order_acq_rel);
-    if (!accepting_.load(std::memory_order_acquire) || token.slot >= capacity_ ||
-        !token.locally_valid()) {
-      api_calls_in_flight_.fetch_sub(1U, std::memory_order_acq_rel);
-      NotifyDrainState();
-      return;
-    }
-    auto retained = requested_[token.slot].load(std::memory_order_relaxed);
-    bool published = false;
-    while (token.generation > retained) {
-      if (requested_[token.slot].compare_exchange_weak(
-              retained, token.generation, std::memory_order_release, std::memory_order_relaxed)) {
-        published = true;
-        break;
-      }
-    }
-    if (published) {
-      Wake();
-    }
-    api_calls_in_flight_.fetch_sub(1U, std::memory_order_acq_rel);
-    NotifyDrainState();
+  /// Records were posted. Allocation-free and wait-free for the caller.
+  void Wake() noexcept {
+    wake_sequence_.fetch_add(1U, std::memory_order_release);
+    wake_sequence_.notify_one();
   }
 
-  void PublishGlobalRuleStates() noexcept {
-    if (!accepting_.load(std::memory_order_acquire)) return;
-    global_requested_.store(true, std::memory_order_release);
-    Wake();
-  }
-
-  /// Latest-wins trigger for per-operation speed bookkeeping; runs only in a
-  /// pass where no Stop slot and no global rule flag made progress.
-  void PublishRuntimeScale() noexcept {
-    if (!accepting_.load(std::memory_order_acquire)) return;
-    runtime_scale_requested_.store(true, std::memory_order_release);
-    Wake();
-  }
-
+  /// Shutdown: posts are still taken and written until the drain ends.
   void Close() noexcept {
     accepting_.store(false, std::memory_order_release);
     Wake();
     NotifyDrainState();
   }
 
+  /// Shutdown, when the drain starts: one line with the records still to be
+  /// written, so the count is in the log before anything outside can end
+  /// the process (OD-187 (3)). Atomic reads only.
+  void ReportQueuedAtDrain() const noexcept {
+    const auto posted = owner_.journal_posted_count_.load(std::memory_order_acquire);
+    const auto written = written_count_.load(std::memory_order_acquire);
+    (void)std::fprintf(stderr, "manyforge_journal_drain queued=%llu\n",
+                       static_cast<unsigned long long>(posted - written));
+    (void)std::fflush(stderr);
+  }
+
   [[nodiscard]] bool DrainFor(const std::chrono::nanoseconds timeout) noexcept {
+    bool drained = false;
     try {
       std::unique_lock lock(drain_mutex_);
-      return drain_changed_.wait_for(lock, timeout, [this] {
-        if (callback_in_flight_.load(std::memory_order_acquire) ||
-            global_requested_.load(std::memory_order_acquire) ||
-            runtime_scale_requested_.load(std::memory_order_acquire)) {
-          return false;
-        }
-        if (api_calls_in_flight_.load(std::memory_order_acquire) != 0U) {
-          return false;
-        }
-        for (std::size_t index = 0U; index < capacity_; ++index) {
-          if (requested_[index].load(std::memory_order_acquire) !=
-              delivered_[index].load(std::memory_order_acquire)) {
-            return false;
-          }
-        }
-        return true;
+      drained = drain_changed_.wait_for(lock, timeout, [this] {
+        return written_count_.load(std::memory_order_acquire) ==
+               owner_.journal_posted_count_.load(std::memory_order_acquire);
       });
     } catch (...) {
-      return false;
     }
+    if (!drained) ReportUndrained();
+    return drained;
+  }
+
+  /// Every record posted up to `posted_through` was handed to the journal.
+  void MarkWritten(const std::uint64_t posted_through) noexcept {
+    written_count_.store(posted_through, std::memory_order_release);
+  }
+
+  /// Shutdown: the one line with the records not written in this start,
+  /// printed once (after the drain, or when its bound first passes).
+  void ReportShutdown() noexcept {
+    if (accepting_.load(std::memory_order_acquire) || shutdown_reported_.exchange(true)) return;
+    const auto posted = owner_.journal_posted_count_.load(std::memory_order_acquire);
+    const auto written = written_count_.load(std::memory_order_acquire);
+    owner_.report_journal_records_not_written(posted - written);
   }
 
  private:
-  void Wake() noexcept {
-    wake_sequence_.fetch_add(1U, std::memory_order_release);
-    wake_sequence_.notify_one();
-  }
-
   void NotifyDrainState() noexcept {
     std::lock_guard lock(drain_mutex_);
     drain_changed_.notify_all();
   }
 
+  /// The drain bound passed with records still unwritten; `WaitForDrain`
+  /// logs `drain_stuck` as for every other lane.
+  void ReportUndrained() noexcept { ReportShutdown(); }
+
   void Run(const std::stop_token stop_token) noexcept {
+    // Never inherit a real-time class from the constructing thread.
+    const sched_param ordinary{};
+    static_cast<void>(pthread_setschedparam(pthread_self(), SCHED_OTHER, &ordinary));
+    taken_.reserve(kJournalQueueCapacity + kJournalQueueStopReserve);
     ready_.store(true, std::memory_order_release);
     ready_.notify_all();
     auto observed_wake = wake_sequence_.load(std::memory_order_acquire);
     while (!stop_token.stop_requested()) {
-      bool progressed = false;
-      for (std::size_t index = 0U; index < capacity_; ++index) {
-        const auto requested = requested_[index].load(std::memory_order_acquire);
-        if (requested <= delivered_[index].load(std::memory_order_acquire)) {
-          continue;
-        }
-        callback_in_flight_.store(true, std::memory_order_release);
-        owner_.ProjectStop(
-            StopControlWorkToken{static_cast<StopControlSlotIndex>(index), requested});
-        callback_in_flight_.store(false, std::memory_order_release);
-        delivered_[index].store(requested, std::memory_order_release);
-        progressed = true;
-        if (!accepting_.load(std::memory_order_acquire)) {
-          NotifyDrainState();
-        }
-      }
-      if (global_requested_.exchange(false, std::memory_order_acq_rel)) {
-        callback_in_flight_.store(true, std::memory_order_release);
-        owner_.ProjectGlobalIoRuleStates();
-        callback_in_flight_.store(false, std::memory_order_release);
-        progressed = true;
-        NotifyDrainState();
-      }
-      if (progressed) {
-        continue;
-      }
-      // Extension rule: a later trigger gets one atomic flag and one owner
-      // callback doing one bounded unit that returns whether more is ready,
-      // placed here after the Stop slots in a fixed order, with `continue`
-      // after each unit so the Stop slots are checked again.
-      if (runtime_scale_requested_.exchange(false, std::memory_order_acq_rel)) {
-        callback_in_flight_.store(true, std::memory_order_release);
-        const bool more = owner_.ProjectRuntimeScale();
-        callback_in_flight_.store(false, std::memory_order_release);
-        if (more) runtime_scale_requested_.store(true, std::memory_order_release);
+      if (owner_.write_journal_batch(taken_)) {
         NotifyDrainState();
         continue;
       }
@@ -3089,34 +2944,30 @@ class ResourceAddressedExecutionKernel::StopProjectionWorker final {
     NotifyDrainState();
   }
 
-  std::size_t capacity_{};
   ResourceAddressedExecutionKernel& owner_;
-  std::unique_ptr<std::atomic_uint64_t[]> requested_;
-  std::unique_ptr<std::atomic_uint64_t[]> delivered_;
   std::atomic_bool accepting_{true};
   std::atomic_bool ready_{};
-  std::atomic_bool callback_in_flight_{};
-  std::atomic_bool global_requested_{};
-  std::atomic_bool runtime_scale_requested_{};
-  std::atomic_size_t api_calls_in_flight_{};
   std::atomic_uint64_t wake_sequence_{};
+  std::atomic_uint64_t written_count_{};
+  std::atomic_bool shutdown_reported_{};
+  /// The writer's half of the double buffer, swapped with the Kernel's queue.
+  std::vector<JournalRecord> taken_;
   std::mutex drain_mutex_;
   std::condition_variable drain_changed_;
   std::jthread worker_;
 };
 
-// Defined after StopProjectionWorker: release() republishes speed bookkeeping.
+// A pending speed step is not handed on here: the host's next reconcile pass
+// runs it (OD-149).
 inline void ResourceAddressedExecutionKernel::OperationCommitGuard::release() noexcept {
   if (!lock_.owns_lock()) return;
-  bool runtime_scale_pending = false;
   try {
     std::lock_guard state_lock(owner_.state_mutex_);
     auto* operation = owner_.find_active_operation_locked(id_);
     if (claimed_ && operation != nullptr && operation->commit_mutex == mutex_) {
       operation->ordinary_commit_in_flight = false;
-      runtime_scale_pending = operation->pending_runtime_scale.has_value();
-      // A cleanup callback may have completed during durable I/O. Retire
-      // only after the last ordinary writer no longer references its row.
+      // A cleanup callback may have completed while the gate was held across
+      // an engine status call. Retire only after the gate is released.
       owner_.settle_completed_control_locked(id_);
     }
   } catch (...) {
@@ -3124,7 +2975,6 @@ inline void ResourceAddressedExecutionKernel::OperationCommitGuard::release() no
     // unwinding. No provider call or storage retry belongs in this guard.
   }
   lock_.unlock();
-  if (runtime_scale_pending) owner_.stop_projection_worker_->PublishRuntimeScale();
 }
 
 struct ResourceAddressedExecutionKernel::EngineSubscription final {
@@ -3193,48 +3043,6 @@ struct ResourceAddressedExecutionKernel::EngineEventIngress final
   std::size_t entered{};
 };
 
-class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
-    : public ICellCloseAdmissionLease {
- public:
-  explicit CellCloseAdmissionLease(ResourceAddressedExecutionKernel& owner)
-      : owner_(owner), admission_lock_(*owner.admission_mutex_) {}
-
-  [[nodiscard]] Result<void> ValidatePrerequisites() const override {
-    // Inspect actual Kernel facts under the existing admission
-    // lease and a brief state lock. Neither state nor submission spans SQL;
-    // Stop remains recognizable, and callers recheck immediately precommit.
-    // The cell latch never blocks Close.
-    std::lock_guard state_lock(owner_.state_mutex_);
-    for (const auto& [id, operation] : owner_.active_operations_) {
-      if (operation->containment_effect_uncertain())
-        return Result<void>::Err(ErrorDTO{"cell_close_containment_uncertain", "Close cannot infer rest from an uncertain terminal", {{"operation_id", id.value()}}});
-      switch (operation->state.state) {
-        case OperationStateKind::kQueued:
-        case OperationStateKind::kResolving:
-        case OperationStateKind::kPlanning:
-        case OperationStateKind::kValidating:
-        case OperationStateKind::kPrepared:
-        case OperationStateKind::kDispatching:
-        case OperationStateKind::kExecuting:
-        case OperationStateKind::kStopping:
-          return Result<void>::Err(ErrorDTO{"cell_close_operation_nonterminal", "Close requires ordinary Stop before nonterminal work can retire", {{"operation_id", id.value()}}});
-        case OperationStateKind::kCompleted:
-        case OperationStateKind::kStopped:
-        case OperationStateKind::kFailed:
-        case OperationStateKind::kInterrupted:
-        case OperationStateKind::kInterventionRequired:
-        case OperationStateKind::kCancelledPreDispatch:
-          break;
-      }
-    }
-    return Result<void>::Ok();
-  }
-
- private:
-  ResourceAddressedExecutionKernel& owner_;
-  std::unique_lock<std::recursive_mutex> admission_lock_;
-};
-
 
 struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotionPreviewSession {
   PreviewSession(ResourceAddressedExecutionKernel& owner, RuntimeParticipantBinding primary_binding,
@@ -3261,11 +3069,6 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     auto validation = validate_operation_intent(intent);
     if (!validation.ok()) {
       return Result<RuntimeParticipantExecutionRegistration>::Err(validation.error());
-    }
-    if (intent.request_context.request_owner_epoch != owner_.config_.request_owner_epoch) {
-      return Result<RuntimeParticipantExecutionRegistration>::Err(
-          error("stale_request_owner_epoch", "preview request names a stale Kernel owner epoch",
-                "stale_request_owner_epoch"));
     }
     if (intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
@@ -3317,17 +3120,19 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
                                        "motion_preview_id_exhausted", ErrorCode::kInternalError);
     }
 
-    const std::string prefix = "preview:" + owner_.config_.request_owner_epoch.value() + ":" +
-                               std::to_string(next_preview_id_++);
-    const OperationId operation_id(prefix);
-    const OperationParticipantId participant_id(prefix + ":participant:1");
-    const ControllerGoalId controller_goal_id(prefix + ":controller-goal:1");
+    const PreviewNumber preview(next_preview_id_++);
+    // A preview is not an operation. Its request carries the preview number
+    // in the operation field (and so in its participant and goal), which only
+    // the planner's presence check reads.
+    const OperationNumber operation_id(preview.value());
+    const OperationParticipantId participant_id{operation_id, 1U};
+    const ControllerGoalId controller_goal_id{operation_id, 1U, 1U};
     preview_tcp_capture_ = resolved.value().preview_tcp_capture;
     return build_motion_request(
         intent, intent.participants.front(),
         std::get<MotionParticipantIntentDTO>(intent.participants.front().payload),
         resolved.value().binding.value(), operation_id, OperationRevision(1U), participant_id,
-        controller_goal_id, ControllerGoalGeneration(1U), resolved.value(), 1.0);
+        controller_goal_id, resolved.value(), 1.0);
   }
 
   [[nodiscard]] Result<RobotStateDTO> current_state() const override {

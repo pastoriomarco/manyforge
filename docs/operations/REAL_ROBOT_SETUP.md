@@ -27,13 +27,16 @@ Scenario. It lives in the site settings file, a JSON document:
 
 ```json
 {
-  "schema": "manyforge.site.v1",
+  "schema": "manyforge.site.v2",
   "device_addresses": { "lite6_main": "192.168.1.31" },
   "project_folders": ["/home/USER/Projects"]
 }
 ```
 
-- `schema` must be `manyforge.site.v1`; no other fields are accepted.
+- `schema` must be `manyforge.site.v2` (a `manyforge.site.v1` file is still
+  accepted and uses the default disk limits). Besides the members below, only
+  the optional [disk limits](DEVELOPMENT_WORKBENCH.md#site-settings) are
+  accepted.
 - `device_addresses` maps a key to a host name or IP address. Use lower-case
   keys (letters, digits, `.`, `_`, `-`, starting with a letter): the machine
   card accepts only those. Scenarios name the key, never the address.
@@ -124,7 +127,8 @@ comes back, the e-stop is still active.
    Load (and Prepare if needed).
 4. On the machine card, read **Controller status**: expect `error` none and
    the motors off (typically `state` 4). A leftover error (e.g. C2 after an
-   e-stop) shows here and as the machine's fault: **Recover** the machine.
+   e-stop) shows here and as the machine's **E-stop** (other errors as its
+   fault): **Recover** the machine.
 5. Check that the arm in the Scene matches the real pose (measured joints).
 6. **Enable** the arm: **the motors switch on** and hold the pose (expect
    `mode` 1, `state` 2, `motors_enabled` 6); nothing moves. Then open
@@ -151,8 +155,10 @@ first; the values in the files are illustrative):
 | `site_device_address_ref_unknown` | The machine card's address key isn't in `device_addresses`. | Fix the key on the machine card, or add it to the site file and restart. |
 | `xarm_status_unavailable` (Prepare fails), machine fault `fault_communication` | The controller sends no status report: unreachable, off, or the wrong address. | `ping` the address from the host; check power, cable, the address in the site file; then Prepare/Recover the machine. |
 | `fault_process_exited` | The machine's driver process exited. | Prepare the machine (restarts it). |
+| `fault_ros_transport_failed` | The component's ROS connection inside ManyForge failed. | Recover the component (rebuilds the connection). |
 | `robot_controller_unresponsive`, `robot_controller_call_failed` | A controller call got no answer, or was refused. | Check the controller and its network link, then Recover. |
-| `fault_estop` (C1/C2/C3), `robot_error_not_cleared` | The e-stop is active, or the error stayed after `clean_error`. | Release the e-stop, Recover the machine, Enable the arm. |
+| The machine shows **E-stop**, "Emergency stop reported by the robot controller" (C1/C2/C3); its members show **Stopped by e-stop** | The e-stop is pressed, or it was released and the controller still holds the error. This is a stop, not a fault: the arm can't be enabled or moved until the error is cleared. | Release the e-stop, Recover the machine, Enable the arm (or **Enable all**). |
+| `robot_error_not_cleared` (Recover fails) | The controller error stayed after `clean_error`, for example because the e-stop is still pressed. | Release the e-stop, Recover the machine, Enable the arm. |
 | `fault_drive` (C10–C17) | Servo/drive error. | Power-cycle the robot at the control box, then Prepare. |
 | `fault_external_control` | Studio or the pendant changed the mode/state. | Close the other client, Recover the machine, Enable the arm. |
 | `xarm_not_ready`, `xarm_measured_joints_disagree`, `xarm_joint_angles_unavailable` (Enable fails) | The robot isn't ready, or measured and reported joints disagree. | Recover the machine, then Enable the arm again. |

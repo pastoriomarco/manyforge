@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <optional>
 #include <string>
 
@@ -16,7 +17,7 @@ struct ProgramResetPositionCapability final {
 /// Scene revision deliberately advances independently when Scene reload runs.
 struct ProgramResetPositionRequest final {
   core::ProgramResetPositionAuthorizationDTO authorization;
-  core::RequestOwnerEpoch owner_epoch;
+  core::ApplicationStartId application_start_id;
   core::ActiveBundlePublicationGeneration active_publication_generation;
   core::RetainedBundleId retained_bundle_id;
   core::GraphRevision graph_revision;

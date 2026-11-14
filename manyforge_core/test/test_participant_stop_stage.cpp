@@ -133,10 +133,10 @@ namespace {
   const auto plan = MakePreparedParticipantStopPlan(
       base,
       PreparedParticipantStopPlanContextDTO{
-          OperationId("operation.1"), OperationRevision(4U),
-          OperationParticipantId("participant.1"), binding.value().program_id,
+          OperationNumber(1U), OperationRevision(4U),
+          OperationParticipantId{OperationNumber(1U), 1U}, binding.value().program_id,
           binding.value().program_revision, binding.value().program_binding_id,
-          ProgramRunId("program-run.1"), profile,
+          ProgramRunNumber(101U), profile,
           profile ? ParticipantStopProfilePurposeDTO::kMotionInterruptScope
                   : ParticipantStopProfilePurposeDTO::kOrdinary,
           profile ? std::optional<std::string>("scope.selected") : std::nullopt,
@@ -156,7 +156,7 @@ namespace {
 // a controlled-Stop command.
 [[nodiscard]] RemainingStopBudgetDTO Budget(const ResolvedParticipantStopStageDTO& stage,
                                             std::int64_t elapsed = 0) {
-  RemainingStopBudgetDTO result{stage.stop_id, stage.stop_generation, elapsed, std::nullopt};
+  RemainingStopBudgetDTO result{stage.stop_event_id, elapsed, std::nullopt};
   if (ControlledCommand(stage)) {
     result.remaining_controlled_deadline_ns = 1'000'000'000LL - elapsed;
   }
@@ -189,13 +189,11 @@ struct ExactFixture final {
   auto binding = Binding(base);
   auto plan = Plan(base, binding, std::move(profile));
   const auto& selected = plan.stage_commands.at(stage_index).resolved_stage;
-  ResolvedParticipantStopStageDTO stage{StopId("stop.1"),
-                                        StopGeneration(7U),
+  ResolvedParticipantStopStageDTO stage{StopEventId(1U),
                                         plan.operation_id,
                                         plan.operation_revision,
                                         plan.participant_id,
-                                        ControllerGoalId("goal.1"),
-                                        ControllerGoalGeneration(3U),
+                                        ControllerGoalId{OperationNumber(901U), 1U, 3U},
                                         binding.value().controllable_component_id,
                                         binding.value().command_target_id,
                                         binding.value().capability_id,
@@ -320,7 +318,7 @@ TEST(ParticipantStopStageTest, RejectsForeignOrExtendedBudgetAndExpandedScope) {
   const auto fixture = Fixture();
   ASSERT_TRUE(ControlledCommand(fixture.stage));
   auto foreign = Budget(fixture.stage);
-  foreign.stop_generation = StopGeneration(fixture.stage.stop_generation.value() + 1U);
+  foreign.stop_event_id = StopEventId(fixture.stage.stop_event_id.value() + 1U);
   EXPECT_FALSE(ValidateStage(fixture, fixture.stage, foreign).ok());
   auto negative = Budget(fixture.stage);
   negative.remaining_controlled_deadline_ns = -1;

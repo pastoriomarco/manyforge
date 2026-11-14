@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.node_environment_projection.v2"
+_PROJECTION_VERSION = "manyforge.node_environment_projection.v3"
 _PROJECTION_FIELDS = {
     "availability",
     "catalog",
@@ -137,8 +137,6 @@ def _validate_source(value: Any) -> None:
             "the active node environment source is incomplete",
         )
     for field in (
-        "projection_owner_epoch",
-        "source_owner_epoch",
         "source_owner_id",
         "source_content_digest",
     ):

@@ -12,12 +12,14 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from threading import Lock
 import time
 from typing import Annotated, Any, Callable, Literal, Mapping, Optional
 import unicodedata
-import uuid
+
+from .identity import parse_application_start_id
 
 from pydantic import (
     BaseModel,
@@ -29,10 +31,10 @@ from pydantic import (
 )
 
 
-CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v2"
-EXECUTION_COMMAND_SCHEMA = "manyforge.execution_command.v1"
-EXECUTION_COMMAND_RECEIPT_SCHEMA = "manyforge.execution_command_receipt.v1"
-EXECUTION_CONTROL_PROJECTION_SCHEMA = "manyforge.execution_control_projection.v1"
+CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v4"
+EXECUTION_COMMAND_SCHEMA = "manyforge.execution_command.v2"
+EXECUTION_COMMAND_RECEIPT_SCHEMA = "manyforge.execution_command_receipt.v3"
+EXECUTION_CONTROL_PROJECTION_SCHEMA = "manyforge.execution_control_projection.v2"
 
 # One product profile, deliberately not runtime-tunable.
 CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000
@@ -51,16 +53,18 @@ MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 MAXIMUM_IDENTITY_BYTES = 256
 MAXIMUM_SOURCE_LABEL_BYTES = 128
 
+# A control session number: a counter on Headless's event loop, from 1 per
+# start (contract 1.4 class 0 origin; JSON integer within the safe bound).
+ControlSessionNumber = Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+
 ExecutionCommandKind = Literal[
     "program_run",
     "program_motion_start",
     "program_motion_stop",
     "program_motion_resume",
-    "program_full_stop",
-    "program_stop",
     "program_reset",
-    "program_resume_full_stop",
-    "program_discard_full_stop",
+    "program_resume_halt",
+    "program_discard_halt",
     "program_runtime_blackboard_write",
     "program_manual_result_stage",
     "program_manual_handover",
@@ -68,7 +72,8 @@ ExecutionCommandKind = Literal[
     "operation_stop",
     "operation_reset",
     "operation_acknowledge_completed",
-    "cell_full_stop",
+    "stop_all",
+    "halt",
     "execution_recovery",
     "runtime_scale",
 ]
@@ -83,7 +88,6 @@ ProgramCycleState = Literal[
     "idle_after_reset",
     "starting",
     "running",
-    "stopping",
     "resetting",
     "terminal_awaiting_reset",
     "recovery_required",
@@ -105,11 +109,18 @@ ControlClientIncidentKind = Literal[
 _STOP_KINDS = frozenset(
     {
         "program_motion_stop",
-        "program_full_stop",
-        "program_stop",
         "operation_stop",
-        "cell_full_stop",
+        "stop_all",
+        "halt",
     }
+)
+# A WebSocket command frame naming a Stop kind (PD-6): recognized on the raw
+# frame so it reaches the Stop lane before the session's size, rate and
+# sequence checks; the strict DTO still decides whether it is a command.
+STOP_COMMAND_FRAME = re.compile(
+    r'"command_kind"\s*:\s*"(?:'
+    + "|".join(sorted(_STOP_KINDS))
+    + r')"'
 )
 
 
@@ -136,13 +147,11 @@ class _StrictDTO(BaseModel):
 
 class ControlFreshnessContextDTO(_StrictDTO):
     context_id: str
-    receiver_incarnation: str
-    semantic_owner_epoch: str
     execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     issued_server_sequence: str
     valid_for_ns: Literal[CONTROL_FRESHNESS_VALID_FOR_NS]
 
-    @field_validator("context_id", "receiver_incarnation", "semantic_owner_epoch")
+    @field_validator("context_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -158,30 +167,15 @@ class ControlFreshnessContextDTO(_StrictDTO):
 
 
 class ExecutionCommandEnvelopeDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_command.v1"]
+    schema_version: Literal["manyforge.execution_command.v2"]
     command_kind: ExecutionCommandKind
-    correlation_id: str
     source_label: str
-    control_session_id: str | None = None
+    control_session_number: ControlSessionNumber | None = None
     client_sequence: str | None = None
     freshness: ControlFreshnessContextDTO
-    expected_semantic_owner_epoch: str
     expected_execution_control_revision: Annotated[
         int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)
     ]
-
-    @field_validator(
-        "correlation_id", "control_session_id", "expected_semantic_owner_epoch"
-    )
-    @classmethod
-    def validate_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
 
     @field_validator("source_label")
     @classmethod
@@ -201,10 +195,10 @@ class ExecutionCommandEnvelopeDTO(_StrictDTO):
 
     @model_validator(mode="after")
     def paired_session_sequence(self) -> "ExecutionCommandEnvelopeDTO":
-        if (self.control_session_id is None) != (self.client_sequence is None):
-            raise ValueError("control_session_id and client_sequence must be paired")
-        if self.freshness.semantic_owner_epoch != self.expected_semantic_owner_epoch:
-            raise ValueError("freshness owner does not match expected owner")
+        if (self.control_session_number is None) != (self.client_sequence is None):
+            raise ValueError(
+                "control_session_number and client_sequence must be paired"
+            )
         if (
             self.freshness.execution_control_revision
             != self.expected_execution_control_revision
@@ -234,26 +228,26 @@ class ExecutionCommandRequestDTO(_StrictDTO):
 
 
 class ExecutionCommandReceiptDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_command_receipt.v1"]
-    correlation_id: str
-    control_session_id: str | None
+    schema_version: Literal["manyforge.execution_command_receipt.v3"]
+    control_session_number: ControlSessionNumber | None
     client_sequence: str | None
-    receiver_incarnation: str
     received_server_sequence: str
     received_monotonic_ns: str
     disposition: ExecutionCommandDisposition
     code: str
-    semantic_owner_epoch: str
     execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     current_identity: dict[str, Any] | None = None
+    # The key Headless formed for a command it forwarded to an owner (HTTP:
+    # from the client's key; WebSocket: from its session and client
+    # sequence), so every client finds the command's row (OD-214). Null for
+    # a command refused before it was forwarded.
+    request_key: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")] | None = None
+    # A runner command's row as the runner answered it at acceptance (or a
+    # replay); its step and end are then read from the cycle status
+    # (`runner_commands`). Null for every other command.
+    command: dict[str, Any] | None = None
 
-    @field_validator(
-        "correlation_id",
-        "control_session_id",
-        "receiver_incarnation",
-        "code",
-        "semantic_owner_epoch",
-    )
+    @field_validator("code")
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -275,15 +269,15 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
 
     @model_validator(mode="after")
     def paired_session_sequence(self) -> "ExecutionCommandReceiptDTO":
-        if (self.control_session_id is None) != (self.client_sequence is None):
+        if (self.control_session_number is None) != (self.client_sequence is None):
             raise ValueError("receipt session and client sequence must be paired")
         return self
 
 
 class ControlClientHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["client_hello"]
-    supported_versions: tuple[Literal["manyforge.execution_control.v2"]]
+    supported_versions: tuple[Literal["manyforge.execution_control.v4"]]
     client_incarnation: str
     source_label: str
 
@@ -307,20 +301,11 @@ class ControlClientHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatEchoDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["heartbeat_echo"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     client_sequence: str
     challenge_sequence: str
-
-    @field_validator("control_session_id")
-    @classmethod
-    def validate_heartbeat_session(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="control_session_id",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
 
     @field_validator("client_sequence", "challenge_sequence")
     @classmethod
@@ -331,19 +316,10 @@ class ControlHeartbeatEchoDTO(_StrictDTO):
 class ControlStateAppliedDTO(_StrictDTO):
     """Browser credit for one consumed replaceable state value."""
 
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["state_applied"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     state_sequence: str
-
-    @field_validator("control_session_id")
-    @classmethod
-    def validate_state_session(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="control_session_id",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
 
     @field_validator("state_sequence")
     @classmethod
@@ -354,9 +330,9 @@ class ControlStateAppliedDTO(_StrictDTO):
 class ControlClientIncidentDTO(_StrictDTO):
     """Strict non-authoritative browser-only incident transition."""
 
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["client_incident"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     client_sequence: str
     incident_id: str
     incident_kind: ControlClientIncidentKind
@@ -365,7 +341,7 @@ class ControlClientIncidentDTO(_StrictDTO):
     maximum_delay_ns: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)] | None
     reason_code: str
 
-    @field_validator("control_session_id", "incident_id")
+    @field_validator("incident_id")
     @classmethod
     def validate_incident_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -386,20 +362,11 @@ class ControlClientIncidentDTO(_StrictDTO):
 
 
 class ExecutionControlCommandDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["command"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     client_sequence: str
     command: ExecutionCommandRequestDTO
-
-    @field_validator("control_session_id")
-    @classmethod
-    def validate_command_session(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="control_session_id",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
 
     @field_validator("client_sequence")
     @classmethod
@@ -410,7 +377,7 @@ class ExecutionControlCommandDTO(_StrictDTO):
     def exact_command_session(self) -> "ExecutionControlCommandDTO":
         envelope = self.command.command_envelope
         if (
-            envelope.control_session_id != self.control_session_id
+            envelope.control_session_number != self.control_session_number
             or envelope.client_sequence != self.client_sequence
         ):
             raise ValueError("command envelope does not match its control session")
@@ -418,10 +385,10 @@ class ExecutionControlCommandDTO(_StrictDTO):
 
 
 class ControlServerHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["server_hello"]
-    receiver_incarnation: str
-    control_session_id: str
+    application_start_id: str
+    control_session_number: ControlSessionNumber
     heartbeat_period_ns: Literal[250_000_000]
     heartbeat_delayed_ns: Literal[500_000_000]
     heartbeat_stale_ns: Literal[1_000_000_000]
@@ -430,9 +397,9 @@ class ControlServerHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatChallengeDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["heartbeat_challenge"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     server_sequence: str
     challenge_sequence: str
     received_client_sequence: str | None
@@ -457,9 +424,9 @@ class ControlHeartbeatChallengeDTO(_StrictDTO):
 
 
 class ExecutionControlSnapshotDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["snapshot"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     server_sequence: str
     state_sequence: str
     received_client_sequence: str | None
@@ -469,9 +436,9 @@ class ExecutionControlSnapshotDTO(_StrictDTO):
 
 
 class ExecutionControlDeltaDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["delta"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     server_sequence: str
     state_sequence: str | None = None
     received_client_sequence: str | None = None
@@ -516,9 +483,9 @@ class ExecutionControlDeltaDTO(_StrictDTO):
 
 
 class ExecutionCommandReceiptMessageDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
+    schema_version: Literal["manyforge.execution_control.v4"]
     message_kind: Literal["command_receipt"]
-    control_session_id: str
+    control_session_number: ControlSessionNumber
     server_sequence: str
     received_client_sequence: str
     emitted_monotonic_ns: str
@@ -528,7 +495,7 @@ class ExecutionCommandReceiptMessageDTO(_StrictDTO):
     @model_validator(mode="after")
     def cumulative_receive_watermark(self) -> "ExecutionCommandReceiptMessageDTO":
         _u64_text(self.received_client_sequence, label="received_client_sequence")
-        if self.control_session_id != self.receipt.control_session_id or int(
+        if self.control_session_number != self.receipt.control_session_number or int(
             self.received_client_sequence
         ) < int(self.receipt.client_sequence):
             raise ValueError("receipt must name its session and a covered command")
@@ -538,14 +505,6 @@ class ExecutionCommandReceiptMessageDTO(_StrictDTO):
     @classmethod
     def validate_emitted_time(cls, value: str) -> str:
         return _u64_text(value, label="emitted_monotonic_ns")
-
-
-class ControlResyncRequiredDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v2"]
-    message_kind: Literal["resync_required"]
-    control_session_id: str
-    server_sequence: str
-    reason_code: str
 
 
 class AllowedExecutionCommandDTO(_StrictDTO):
@@ -570,55 +529,29 @@ class AllowedExecutionCommandDTO(_StrictDTO):
 
 
 class ExecutionControlProjectionDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control_projection.v1"]
-    receiver_incarnation: str
-    semantic_owner_epoch: str
+    schema_version: Literal["manyforge.execution_control_projection.v2"]
+    application_start_id: str
     execution_control_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     cycle_state: ProgramCycleState
     cycle_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
-    program_run_id: str | None
+    program_run_id: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)] | None
     run_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)] | None
     allowed_commands: list[AllowedExecutionCommandDTO]
-    causal_correlation_id: str | None
-    causal_session_id: str | None
-    causal_client_sequence: str | None
+    causal_request_key: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")] | None
+    causal_display: str | None
     current_rejection: dict[str, Any] | None
     current_failure: dict[str, Any] | None
     recovery_required: bool
     freshness: ControlFreshnessContextDTO
 
-    @field_validator(
-        "receiver_incarnation",
-        "semantic_owner_epoch",
-        "program_run_id",
-        "causal_correlation_id",
-        "causal_session_id",
-    )
+    @field_validator("application_start_id")
     @classmethod
-    def validate_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
-
-    @field_validator("causal_client_sequence")
-    @classmethod
-    def validate_sequence(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _u64_text(value, label="causal_client_sequence")
+    def validate_application_start_id(cls, value: str) -> str:
+        parse_application_start_id(value)
+        return value
 
     @model_validator(mode="after")
     def exact_shape(self) -> "ExecutionControlProjectionDTO":
-        if (self.causal_session_id is None) != (self.causal_client_sequence is None):
-            raise ValueError("causal session and client sequence must be paired")
-        if self.freshness.receiver_incarnation != self.receiver_incarnation:
-            raise ValueError("projection freshness receiver differs")
-        if self.freshness.semantic_owner_epoch != self.semantic_owner_epoch:
-            raise ValueError("projection freshness owner differs")
         if self.freshness.execution_control_revision != self.execution_control_revision:
             raise ValueError("projection freshness revision differs")
         kinds = [item.command_kind for item in self.allowed_commands]
@@ -630,7 +563,6 @@ class ExecutionControlProjectionDTO(_StrictDTO):
 @dataclass(frozen=True, slots=True)
 class ExecutionIngressStamp:
     transport_kind: Literal["rest", "websocket", "ros2", "local"]
-    receiver_incarnation: str
     received_server_sequence: int
     received_monotonic_ns: int
     trusted_principal_id: str | None = None
@@ -644,9 +576,12 @@ class ExecutionIngressStamp:
 class ExecutionIngressResult:
     disposition: ExecutionCommandDisposition
     code: str
-    semantic_owner_epoch: str
     execution_control_revision: int
     current_identity: Mapping[str, Any] | None = None
+    # The key Headless formed for a command it forwarded to an owner.
+    request_key: str | None = None
+    # A runner command's row from the runner's reply (OD-214).
+    command: Mapping[str, Any] | None = None
 
 
 class ControlProtocolError(RuntimeError):
@@ -662,32 +597,14 @@ class ControlFreshnessAuthority:
         self,
         *,
         clock_ns: Callable[[], int] = time.monotonic_ns,
-        receiver_incarnation: str | None = None,
         secret: bytes | None = None,
     ) -> None:
         self._clock_ns = clock_ns
         self._secret = secret or secrets.token_bytes(32)
         if len(self._secret) < 32:
             raise ValueError("freshness signing secret must contain at least 32 bytes")
-        self._receiver_incarnation = receiver_incarnation or (
-            f"control-receiver.{uuid.uuid4().hex}"
-        )
-        _bounded_nfc(
-            self._receiver_incarnation,
-            label="receiver_incarnation",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
         self._sequence = 0
         self._lock = Lock()
-
-    @property
-    def receiver_incarnation(self) -> str:
-        return self._receiver_incarnation
-
-    @property
-    def rollover_required(self) -> bool:
-        with self._lock:
-            return self._sequence >= MAXIMUM_U64
 
     @property
     def sequence(self) -> int:
@@ -696,8 +613,6 @@ class ControlFreshnessAuthority:
     @staticmethod
     def _canonical_claims(
         *,
-        receiver_incarnation: str,
-        semantic_owner_epoch: str,
         execution_control_revision: int,
         issued_server_sequence: int,
         issued_at_ns: int,
@@ -708,8 +623,6 @@ class ControlFreshnessAuthority:
                 "execution_control_revision": execution_control_revision,
                 "issued_at_ns": str(issued_at_ns),
                 "issued_server_sequence": str(issued_server_sequence),
-                "receiver_incarnation": receiver_incarnation,
-                "semantic_owner_epoch": semantic_owner_epoch,
                 "valid_for_ns": valid_for_ns,
             },
             ensure_ascii=False,
@@ -720,25 +633,14 @@ class ControlFreshnessAuthority:
     def issue(
         self,
         *,
-        semantic_owner_epoch: str,
         execution_control_revision: int,
         valid_for_ns: int = CONTROL_FRESHNESS_VALID_FOR_NS,
     ) -> ControlFreshnessContextDTO:
-        _bounded_nfc(
-            semantic_owner_epoch,
-            label="semantic_owner_epoch",
-            maximum_bytes=MAXIMUM_IDENTITY_BYTES,
-        )
         if not 1 <= execution_control_revision <= MAXIMUM_SAFE_INTEGER:
             raise ValueError("execution_control_revision is outside its bound")
         if not 1 <= valid_for_ns <= CONTROL_FRESHNESS_VALID_FOR_NS:
             raise ValueError("valid_for_ns exceeds the frozen product profile")
         with self._lock:
-            if self._sequence >= MAXIMUM_U64:
-                raise ControlProtocolError(
-                    "control_sequence_rollover_required",
-                    "control receiver must rotate at a quiescent boundary",
-                )
             self._sequence += 1
             issued_server_sequence = self._sequence
             issued_at_ns = self._clock_ns()
@@ -748,8 +650,6 @@ class ControlFreshnessAuthority:
                 "backend monotonic clock is outside uint64",
             )
         claims = self._canonical_claims(
-            receiver_incarnation=self._receiver_incarnation,
-            semantic_owner_epoch=semantic_owner_epoch,
             execution_control_revision=execution_control_revision,
             issued_server_sequence=issued_server_sequence,
             issued_at_ns=issued_at_ns,
@@ -763,8 +663,6 @@ class ControlFreshnessAuthority:
         )
         return ControlFreshnessContextDTO(
             context_id=context_id,
-            receiver_incarnation=self._receiver_incarnation,
-            semantic_owner_epoch=semantic_owner_epoch,
             execution_control_revision=execution_control_revision,
             issued_server_sequence=str(issued_server_sequence),
             valid_for_ns=valid_for_ns,
@@ -774,7 +672,6 @@ class ControlFreshnessAuthority:
         self,
         context: ControlFreshnessContextDTO,
         *,
-        current_owner_epoch: str,
         current_control_revision: int,
     ) -> int:
         now_ns = self._clock_ns()
@@ -788,8 +685,6 @@ class ControlFreshnessAuthority:
                 "freshness context is malformed",
             ) from error
         claims = self._canonical_claims(
-            receiver_incarnation=context.receiver_incarnation,
-            semantic_owner_epoch=context.semantic_owner_epoch,
             execution_control_revision=context.execution_control_revision,
             issued_server_sequence=sequence,
             issued_at_ns=issued_at_ns,
@@ -805,18 +700,10 @@ class ControlFreshnessAuthority:
                 "control_freshness_invalid",
                 "freshness context signature is invalid",
             )
-        if context.receiver_incarnation != self._receiver_incarnation:
-            raise ControlProtocolError(
-                "control_receiver_replaced",
-                "control receiver incarnation changed",
-            )
-        if (
-            context.semantic_owner_epoch != current_owner_epoch
-            or context.execution_control_revision != current_control_revision
-        ):
+        if context.execution_control_revision != current_control_revision:
             raise ControlProtocolError(
                 "control_projection_stale",
-                "semantic owner or control revision changed",
+                "control revision changed",
             )
         elapsed = now_ns - issued_at_ns
         if elapsed < 0 or elapsed > context.valid_for_ns:
@@ -825,17 +712,6 @@ class ControlFreshnessAuthority:
                 "freshness context expired before command admission",
             )
         return issued_at_ns + context.valid_for_ns
-
-    def rotate_quiescent(self, *, active_sessions: int, inflight_commands: int) -> None:
-        if active_sessions or inflight_commands:
-            raise ControlProtocolError(
-                "control_sequence_rollover_busy",
-                "control receiver can rotate only while quiescent",
-            )
-        with self._lock:
-            self._receiver_incarnation = f"control-receiver.{uuid.uuid4().hex}"
-            self._sequence = 0
-            self._secret = secrets.token_bytes(32)
 
 
 def is_stop_command(kind: ExecutionCommandKind) -> bool:
@@ -863,7 +739,6 @@ __all__ = [
     "ControlHeartbeatChallengeDTO",
     "ControlHeartbeatEchoDTO",
     "ControlProtocolError",
-    "ControlResyncRequiredDTO",
     "ControlServerHelloDTO",
     "ControlStateAppliedDTO",
     "ControlSemanticStatus",
@@ -882,5 +757,6 @@ __all__ = [
     "ExecutionIngressStamp",
     "MAXIMUM_U64",
     "ProgramCycleState",
+    "STOP_COMMAND_FRAME",
     "is_stop_command",
 ]

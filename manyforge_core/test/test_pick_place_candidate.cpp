@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -185,7 +186,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
           ErrorDTO{"invalid_request", "fixture requires motion", {}});
     }
     auto request =
-        testing::make_test_execute_request({"joint1", "joint2"}, operation.program_run_id.value());
+        testing::make_test_execute_request({"joint1", "joint2"}, operation.program_run_id);
     const auto binding = motion_binding_ ? *motion_binding_ : arm_runtime_binding();
     if (!binding.motion_endpoint) {
       return Result<ExecuteRequestDTO>::Err(
@@ -334,13 +335,11 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
     const std::optional<ContactPolicyId>& contact_policy = std::nullopt,
     std::vector<RuntimeObjectReferenceBindingDTO> runtime_objects = {}) {
   return OperationIntentDTO{
-      PublicRequestContextDTO{RequestId(std::move(request_id)),
-                              RequestOwnerEpoch("kernel.epoch:test"), "pick_candidate_test",
-                              std::nullopt},
+      PublicRequestContextDTO{TestRequestKey(std::move(request_id)), "pick_candidate_test"},
       ProgramId("program:test"),
       ProgramRevision("program-revision:test"),
       ProgramBindingId("program-binding:test"),
-      ProgramRunId("run:test"),
+      ProgramRunNumber(114U),
       GraphRevision("graph:test"),
       RetainedBundleId("bundle:test"),
       testing::make_test_projection_binding().projection_revision.scene_revision,
@@ -450,10 +449,6 @@ class FakeSceneCandidatePreview final : public ISceneCandidatePreview, public IS
   SceneCommitResultDTO Commit(const SceneTransactionRequestDTO&) override {
     ++commit_count;
     throw std::logic_error("fixture scene commit must not be called");
-  }
-
-  RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
-    return RequestOwnerEpoch("scene.owner.epoch:test");
   }
 
   ProjectionRevisionDTO CurrentProjectionRevision() const override {
@@ -682,9 +677,7 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
       predecessor,
       ResolvedSceneCandidatePreviewRequestDTO{
           SceneTransactionRequestDTO{
-              PublicRequestContextDTO{RequestId("pick.candidate.attach"),
-                                      RequestOwnerEpoch("pick.owner.epoch"), "pick_candidate_test",
-                                      std::nullopt},
+              PublicRequestContextDTO{TestRequestKey("pick.candidate.attach"), "pick_candidate_test"},
               {},
               predecessor.projection_binding.projection_revision,
               AttachCarriedObjectRequestDTO{CarriedObjectAttachmentId("attachment:workpiece"),
@@ -720,9 +713,8 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
       RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}},
       predecessor,
       ResolvedSceneCandidatePreviewRequestDTO{
-          SceneTransactionRequestDTO{PublicRequestContextDTO{RequestId("place.candidate.detach"),
-                                                             RequestOwnerEpoch("place.owner.epoch"),
-                                                             "place_candidate_test", std::nullopt},
+          SceneTransactionRequestDTO{PublicRequestContextDTO{TestRequestKey("place.candidate.detach"),
+                                                             "place_candidate_test"},
                                      {},
                                      predecessor.projection_binding.projection_revision,
                                      DetachCarriedObjectRequestDTO{
