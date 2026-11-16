@@ -40,7 +40,6 @@ function values(programRunId: number | null = null): PersistentKeyValues {
         reason: null, detail: null,
       },
     ],
-    applyObservationFault: null,
   };
 }
 
@@ -134,19 +133,6 @@ describe('stored persistent values', () => {
     );
   });
 
-  it('shows a committed Apply the runner never observed as a fault, values kept', () => {
-    const missed = `sha256:${'b'.repeat(64)}`;
-    const markup = render({
-      ...values(),
-      applyObservationFault: { code: 'applied_program_not_observed', recordDigests: [missed] },
-    });
-    expect(markup).toContain('<code>layer</code> · int64 · stored <strong>3</strong>');
-    expect(markup).toMatch(
-      /role="alert">A committed Apply of this Scenario was never observed by the Program runner\s*\(applied_program_not_observed\)/,
-    );
-    expect(markup).toContain(`<code> ${missed}</code>`);
-  });
-
   it('names dropped values', () => {
     const current = values();
     const markup = render({
@@ -156,12 +142,12 @@ describe('stored persistent values', () => {
         sequence: 6, key: null, action: 'dropped', applicationStartId: START,
         requestKey: null, sourceLabel: 'committed_apply',
         programRunId: null, nodeInstanceId: null, nodeAttemptId: null,
-        reason: 'applied_program_not_observed', detail: null,
+        reason: 'key_not_declared_persistent', detail: null,
       }],
     });
 
     expect(markup).toContain(
-      '<code>6</code> dropped all keys · committed_apply · <code>applied_program_not_observed</code>',
+      '<code>6</code> dropped all keys · committed_apply · <code>key_not_declared_persistent</code>',
     );
   });
 });

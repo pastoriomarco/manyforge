@@ -92,7 +92,6 @@ inline constexpr std::string_view kApiContractLimitExceeded{"api_contract_limit_
 inline constexpr std::string_view kApiVersionMismatch{"api_version_mismatch"};
 inline constexpr std::string_view kApplicationExited{"application_exited"};
 inline constexpr std::string_view kApplicationStopIncomplete{"application_stop_incomplete"};
-inline constexpr std::string_view kAppliedProgramNotObserved{"applied_program_not_observed"};
 inline constexpr std::string_view kAppliedProgramProjectionInvalid{"applied_program_projection_invalid"};
 inline constexpr std::string_view kApplyAcknowledgementOutcomeUnknown{"apply_acknowledgement_outcome_unknown"};
 inline constexpr std::string_view kApplyAdmissionFailed{"apply_admission_failed"};
@@ -3599,7 +3598,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 3589> kSortedCodes{
+inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -3684,7 +3683,6 @@ inline constexpr std::array<std::string_view, 3589> kSortedCodes{
     kApiVersionMismatch,
     kApplicationExited,
     kApplicationStopIncomplete,
-    kAppliedProgramNotObserved,
     kAppliedProgramProjectionInvalid,
     kApplyAcknowledgementOutcomeUnknown,
     kApplyAdmissionFailed,

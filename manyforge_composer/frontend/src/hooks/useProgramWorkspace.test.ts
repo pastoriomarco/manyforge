@@ -778,6 +778,43 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       + 'The current Scenario could not be read: NetworkError when attempting to fetch resource. Nothing was retried.');
   });
 
+  it('a Load refused as an incomplete Scenario document names the missing member and its cause', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    const incomplete = (details: Record<string, unknown>) => new ApiError('refused', 409, { detail: {
+      code: 'scenario_activation_incomplete',
+      message: 'only a complete v2 Scenario document can be loaded',
+      effect: 'none',
+      details,
+    } });
+    let refusal: string | null = null;
+    const load = async (error: ApiError) => {
+      apiMock.cellApply.load.mockRejectedValueOnce(error);
+      await act(async () => {
+        await latest?.loadScenarioDocument('/workspace/cell', (message) => { refusal = message; });
+      });
+      return refusal;
+    };
+    expect(await load(incomplete({
+      member: 'program.yaml', cause_code: 'authoring_forest_root_count', path: 'forest', diagnostic_count: 1,
+    }))).toBe('Scenario Load refused: Scenario document is incomplete (program.yaml, forest). '
+      + 'The Program needs exactly one top-level node, and the Draft has none or several. '
+      + 'Keep exactly one top-level node and put the others under it.');
+    expect(await load(incomplete({
+      member: 'program.yaml', cause_code: 'authoring_parameter_required',
+      path: 'forest[0].parameters.speed', diagnostic_count: 3,
+    }))).toBe('Scenario Load refused: Scenario document is incomplete (program.yaml, forest[0].parameters.speed). '
+      + 'A required parameter of a Program node has no value. Enter a value or choose a value source for it in the Draft. '
+      + '2 more problems in program.yaml.');
+    expect(await load(incomplete({ member: 'deployment.yaml', diagnostic_count: 0 })))
+      .toBe('Scenario Load refused: Scenario document is incomplete: deployment.yaml is empty.');
+    expect(await load(incomplete({
+      member: 'program.yaml', cause_code: 'unlisted_cause', path: 'forest', diagnostic_count: 1,
+    }))).toBe('Scenario Load refused: Scenario document is incomplete (program.yaml, forest: unlisted_cause).');
+    expect(scenarioOpened).not.toHaveBeenCalled();
+  });
+
   it('shows a written-but-not-adopted Scenario Save with its path and refreshes once', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(

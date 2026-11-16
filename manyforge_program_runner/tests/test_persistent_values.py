@@ -109,14 +109,10 @@ _REVISION = _DOCUMENT["program_revision"]
 class _Headless(_Transport):
     """Manager's committed Applies, as Headless projects the current one."""
 
-    def __init__(
-        self, history: str = "manager-state.1", retain: int | None = None
-    ) -> None:
+    def __init__(self, history: str = "manager-state.1") -> None:
         super().__init__()
         # Manager state: a restart with new state is a new history.
         self.history = history
-        # Manager's journal keeps the newest `retain` committed Applies.
-        self.retain = retain
         self.applies: list[dict[str, Any]] = []
         self.current: dict[str, Any] | Exception = {}
         self.apply(_DOCUMENT)
@@ -160,7 +156,7 @@ class _Headless(_Transport):
         # As the Headless client hands it to the runner: validated.
         return validate_committed_scenario_activation(
             {
-                "schema_version": "manyforge.committed_scenario_activation.v5",
+                "schema_version": "manyforge.committed_scenario_activation.v6",
                 "publication_generation": len(self.applies) + 1,
                 **deepcopy(self.current),
                 "program_binding_id": "sha256:" + "b" * 64 if executable else None,
@@ -176,10 +172,6 @@ class _Headless(_Transport):
                         "components": [],
                         "frames": [],
                     }
-                ),
-                "committed_applies": sorted(
-                    deepcopy(self.applies[-(self.retain or len(self.applies)):]),
-                    key=lambda row: row["record_digest"],
                 ),
             }
         )
@@ -368,7 +360,7 @@ def test_values_are_listed_set_reset_and_cleared_without_a_run(tmp_path) -> None
     runtime, _headless = _runtime(tmp_path)
 
     listed = runtime.read_persistent_values()
-    assert listed["schema_version"] == "manyforge.persistent_key_values.v2"
+    assert listed["schema_version"] == "manyforge.persistent_key_values.v3"
     assert listed["program_revision"] == _REVISION
     assert listed["program_run_id"] is None
     # Only persistent keys; run keys are not stored between runs.
@@ -735,7 +727,7 @@ def test_without_a_run_a_value_is_written_only_when_it_changes(tmp_path) -> None
     runtime, _headless = _runtime(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
-    path = tmp_path / "persistent-keys.v4.json"
+    path = tmp_path / "persistent-keys.v5.json"
 
     # No stored row is never equal to `initial:`: setting it stores a row.
     runtime.set_persistent_value(_set(runtime, "layer", 0, request_id="request.initial")
@@ -849,37 +841,22 @@ def test_a_program_without_persistent_keys_still_drops_the_scenarios_rows(
     assert _rows(runtime.read_persistent_values())["layer"]["stored"] is False
 
 
-@pytest.mark.parametrize(
-    "defect",
-    [
-        "duplicate", "missing_current", "unknown_kind", "mixed_fields", "extra_field",
-        "more_than_published",
-    ],
-)
-def test_full_typed_history_is_validated_before_reconciliation(tmp_path, monkeypatch, defect):
+@pytest.mark.parametrize("defect", ["unknown_kind", "mixed_fields", "extra_field"])
+def test_the_activation_is_validated_before_reconciliation(tmp_path, monkeypatch, defect):
     runtime, headless = _runtime(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     assert register.wait_written(5.0)
     original = register.path.read_bytes()
     projection = headless.committed_scenario_activation()
-    if defect == "duplicate":
-        projection["committed_applies"].append(deepcopy(projection["committed_applies"][0]))
-        projection["publication_generation"] += 1
-    elif defect == "missing_current":
-        projection["record_digest"] = "sha256:" + "e" * 64
-    elif defect == "more_than_published":
-        # More committed Applies than Apply publications: never explained by
-        # eviction, which only ever removes Applies.
-        projection["publication_generation"] = len(projection["committed_applies"])
-    elif defect == "unknown_kind":
+    if defect == "unknown_kind":
         projection["origin"]["kind"] = "unrecognized"
     elif defect == "mixed_fields":
         projection["origin"]["cell_id"] = "cell.test"
     else:
         projection["unexpected_field"] = True
     # A fake transport bypasses its validator; the runtime must still reject
-    # the complete history before branching or touching its register.
+    # the activation before branching or touching its register.
     monkeypatch.setattr(headless, "committed_scenario_activation", lambda: projection)
     assert _refusal(
         runtime.reconcile_persistent_values
@@ -908,6 +885,7 @@ def test_unreadable_scenario_program_keeps_precedence_over_stale_record(tmp_path
     "manyforge.committed_scenario_activation.v1",
     "manyforge.committed_scenario_activation.v3",
     "manyforge.committed_scenario_activation.v4",
+    "manyforge.committed_scenario_activation.v5",
 ])
 def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
     tmp_path, monkeypatch, schema
@@ -936,60 +914,57 @@ def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
     assert register.path.read_bytes() == original
 
 
-@pytest.mark.parametrize("extra", [0, 1])
-def test_complete_history_bound_counts_every_apply(tmp_path, extra):
-    runtime, headless = _runtime(tmp_path)
-    runtime.set_persistent_value(_set(runtime, "layer", 9))
-    register = runtime._persistent_keys  # noqa: SLF001
-    assert register is not None
-    assert register.wait_written(5.0)
-    original = register.path.read_bytes()
-    count = persistent_keys.MAX_RECONCILED_APPLIES + extra
-    for _ in range(count - 1):
-        headless.apply(_DOCUMENT)
-    assert len(headless.committed_scenario_activation()["committed_applies"]) == count
-    if extra:
-        assert _refusal(
-            runtime.reconcile_persistent_values
-        ) == "persistent_key_activation_unavailable"
-        assert register.wait_written(5.0)
-        assert register.path.read_bytes() == original
-    else:
-        assert runtime.reconcile_persistent_values()["outcome"] == "reconciled"
-    assert register.values(_PROJECT)["layer"]["value"] == 9
-
-
-@pytest.mark.parametrize("observed", [True, False])
-def test_manager_eviction_keeps_execute_admission_and_values(tmp_path, observed):
-    """F7: more Applies than Manager's journal retains never block the
-    persistent-key activation (Execute admission reads it)."""
+@pytest.mark.parametrize("woken", [True, False])
+def test_many_applies_keep_execute_admission_and_values(tmp_path, woken):
+    """Many Applies in one start never block the persistent-key activation
+    (Execute admission reads it); values follow the activation the runner
+    reconciles, whether or not it was woken for each Apply."""
 
     runtime, headless = _runtime(tmp_path)
-    headless.retain = 256
     runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     for _ in range(300):
         headless.apply(_DOCUMENT)
-        if observed:
-            result = runtime.reconcile_persistent_values()
-            assert (result["outcome"], result["history_changed"]) == ("reconciled", False)
-            assert result["unobserved_applies"] == []
-    projection = headless.committed_scenario_activation()
-    assert projection["publication_generation"] == 302
-    assert len(projection["committed_applies"]) == 256
+        if woken:
+            assert runtime.reconcile_persistent_values()["outcome"] == "reconciled"
+    assert headless.committed_scenario_activation()["publication_generation"] == 302
     result = runtime.reconcile_persistent_values()
-    if observed:
-        assert result["outcome"] == "duplicate"
-    else:
-        # The register lagged past the retained window: continuity is lost,
-        # the retained Applies it never saw are named, values that fit stay.
-        assert result["history_changed"] is True
-        assert len(result["unobserved_applies"]) == 255
+    assert result["outcome"] == ("duplicate" if woken else "reconciled")
+    assert set(result) == {
+        "schema_version", "outcome", "record_digest", "project_path", "dropped",
+    }
     listed = runtime.read_persistent_values()
     assert {row["key"]: row["value"] for row in listed["keys"]}["layer"] == 9
     assert register.values(_PROJECT)["layer"]["value"] == 9
-    assert (listed["apply_observation_fault"] is None) is observed
+    assert "apply_observation_fault" not in listed
+
+
+def test_an_interleaved_older_read_never_moves_the_values_back(tmp_path):
+    """Two callers read the committed activation outside the register lock:
+    X reads N-1, Y reads N and reconciles it, then X reconciles N-1. The
+    register stays on N and keeps the values only N declares."""
+
+    runtime, headless = _runtime(tmp_path)
+    register = runtime._persistent_keys  # noqa: SLF001
+    assert register is not None
+    older = runtime._committed_projection()  # noqa: SLF001 - X reads N-1
+    wider = _program(*_DOCUMENT["blackboard"]["keys"], _key("extra"))
+    newer_digest = headless.apply(wider)
+    newer = runtime._committed_projection()  # noqa: SLF001 - Y reads N
+    _activation, _program_n, reconciled = runtime._reconcile_persistent_keys(  # noqa: SLF001
+        register, projection=newer
+    )
+    assert reconciled.outcome == "reconciled"
+    register.commit(_PROJECT, _activation.declarations["extra"], 5)
+
+    _activation, _program_x, late = runtime._reconcile_persistent_keys(  # noqa: SLF001
+        register, projection=older
+    )
+
+    assert late.outcome == "stale"
+    assert register.activation["record_digest"] == newer_digest
+    assert register.values(_PROJECT)["extra"]["value"] == 5
 
 
 def test_distinct_scenario_b_keeps_a_values(tmp_path):
@@ -1003,7 +978,6 @@ def test_distinct_scenario_b_keeps_a_values(tmp_path):
     assert result["project_path"] == "/projects/cell-other.scenario"
     assert result["record_digest"] == current
     assert result["dropped"] == []
-    assert result["unobserved_applies"] == []
     assert register.values(_PROJECT)["layer"]["value"] == 9
     assert register.activation["project_path"] == "/projects/cell-other.scenario"
     assert _refusal(

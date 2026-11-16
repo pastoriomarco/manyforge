@@ -133,11 +133,31 @@ struct SubscriberPoolOptions final {
   /// The bound and send deadline used for the "full" error frame.
   std::size_t max_frame_bytes{};
   std::chrono::milliseconds send_deadline{};
+  /// Zero: a refused client is sent the "full" error at once. Nonzero, for a
+  /// stream whose client sends a packet right after connecting: its one
+  /// queued packet is read and discarded first, waiting at most this long
+  /// for it, so the close does not reset the connection and lose the error.
+  std::chrono::milliseconds refusal_read_deadline{};
 };
+
+/// Reads and discards one packet of `fd`, waiting at most `deadline` for it.
+inline void DiscardOnePacket(const int fd,
+                             const std::chrono::milliseconds deadline) noexcept {
+  pollfd inbound{fd, POLLIN, 0};
+  int ready = -1;
+  do {
+    ready = ::poll(&inbound, 1, static_cast<int>(deadline.count()));
+  } while (ready < 0 && errno == EINTR);
+  if (ready <= 0 || (inbound.revents & POLLIN) == 0)
+    return;
+  // SEQPACKET: a one-byte read with MSG_TRUNC dequeues the whole packet.
+  char byte = 0;
+  static_cast<void>(::recv(fd, &byte, sizeof(byte), MSG_DONTWAIT | MSG_TRUNC));
+}
 
 /// The subscribers of one stream: at most `max_subscribers` writer threads,
 /// one per connection. `Admit` and the destructor are called by one thread
-/// only (the stream's acceptor or adopter); thread creation and the reaping
+/// only (the stream's acceptor); thread creation and the reaping
 /// of finished writers happen there.
 class SubscriberPool final {
 public:
@@ -156,11 +176,14 @@ public:
   ~SubscriberPool() { writers_.clear(); }
 
   /// Reaps finished writers, then either starts `serve` on its own thread
-  /// for `client` or, at the cap, sends the "full" error (`stop` ends that
-  /// send early) and closes `client`.
+  /// for `client` or, at the cap, discards `client`'s queued packet when
+  /// `refusal_read_deadline` is nonzero, sends the "full" error (`stop` ends
+  /// that send early) and closes `client`.
   void Admit(Fd client, Serve serve, const std::stop_token stop) {
     writers_.remove_if([](const Writer &writer) { return writer.done->load(); });
     if (writers_.size() >= options_.max_subscribers) {
+      if (options_.refusal_read_deadline.count() > 0)
+        DiscardOnePacket(client.get(), options_.refusal_read_deadline);
       static_cast<void>(SendFrame(
           client.get(),
           ErrorFrame(options_.api_version, options_.full_code,

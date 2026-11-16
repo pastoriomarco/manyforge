@@ -1316,11 +1316,11 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
 
 } // namespace
 
-TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
+TEST(HeadlessApiCore, CommittedActivationNamesTheActiveApply) {
   TemporaryDirectory directory;
   const auto activation = CommittedActivationCore(directory, 3.0, 1U);
   EXPECT_EQ(Text(activation, "schema_version"),
-            "manyforge.committed_scenario_activation.v5");
+            "manyforge.committed_scenario_activation.v6");
   EXPECT_EQ(Text(activation, "scene_initialization"), "initialize");
   EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
   EXPECT_EQ(std::get<double>(Member(activation, "apply_id").storage()), 3.0);
@@ -1335,47 +1335,8 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   EXPECT_TRUE(Member(activation, "program_frame_facts").is_null());
   EXPECT_FALSE(Text(activation, "retained_bundle_id").empty());
   EXPECT_FALSE(Text(activation, "graph_revision").empty());
-  // Only Applies that published a configuration, in digest order, each
-  // named by its Apply identity; a refused Apply never published one and is
-  // not part of the history.
-  const auto &committed = Array(activation, "committed_applies");
-  ASSERT_EQ(committed.size(), 2U);
-  EXPECT_EQ(Text(committed[0], "record_digest"), Digest('c'));
-  EXPECT_EQ(Text(Member(committed[0], "origin"), "scenario_id"), "other_cell");
-  EXPECT_EQ(std::get<double>(Member(committed[0], "apply_id").storage()), 4.0);
-  EXPECT_EQ(std::get<double>(Member(committed[0], "apply_generation").storage()),
-            1.0);
-  EXPECT_EQ(Text(committed[1], "record_digest"), Digest('d'));
-  EXPECT_EQ(Text(Member(committed[1], "origin"), "scenario_id"), "cell_pick");
-  EXPECT_EQ(std::get<double>(Member(committed[1], "apply_id").storage()), 3.0);
-  EXPECT_EQ(std::get<double>(Member(committed[1], "apply_generation").storage()),
-            1.0);
-  EXPECT_EQ(committed[0].as_object().size(), 5U);
-  EXPECT_EQ(committed[1].as_object().size(), 5U);
-}
-
-TEST(HeadlessApiCore, CommittedActivationFollowsTheRetainedHistoryAfterEviction) {
-  // After more Applies than the Manager journal retains (256), the
-  // evicted older Applies are gone; the retained ones are the history.
-  TemporaryDirectory directory;
-  const auto activation = CommittedActivationCore(directory, 400.0, 255U);
-  EXPECT_EQ(std::get<double>(Member(activation, "publication_generation").storage()),
-            400.0);
-  EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
-  EXPECT_EQ(Array(activation, "committed_applies").size(), 256U);
-}
-
-TEST(HeadlessApiCore, CommittedActivationRefusesMoreAppliesThanPublications) {
-  // Eviction only removes Applies: more committed Applies than Apply
-  // publications pairs the publication with a newer journal.
-  TemporaryDirectory directory;
-  try {
-    // Two publications (bootstrap and one Apply) but two committed Applies.
-    static_cast<void>(CommittedActivationCore(directory, 2.0, 1U));
-    FAIL() << "a history newer than its publication was reported";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "program_activation_history_incomplete");
-  }
+  // Only the active Apply: older Applies are not part of the activation.
+  EXPECT_EQ(activation.find_object_member("committed_applies"), nullptr);
 }
 
 /// A monotonic clock that parks one chosen thread inside its read. A parked

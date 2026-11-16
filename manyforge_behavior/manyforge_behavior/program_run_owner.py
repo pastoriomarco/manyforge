@@ -2860,7 +2860,9 @@ class ProgramRunOwner:
         the next tick to send); a freeze the Kernel no longer holds returns
         a Halting or Halted run to Running. Returns True when the facts
         changed since the last ones applied, so the caller re-reads the
-        scope.
+        scope. An ended run (stopped, succeeded, failed) re-reads nothing:
+        its tree no longer ticks, its context was released at its end and
+        its terminal snapshot stays as it ended.
         """
 
         if facts is None:
@@ -2933,11 +2935,16 @@ class ProgramRunOwner:
             ):
                 # The published cause of the Halt changed.
                 entry.revision += 1
+            ended = entry.state in {
+                ProgramRunState.STOPPED,
+                ProgramRunState.SUCCEEDED,
+                ProgramRunState.FAILED,
+            }
         if notify is not None:
             self._notify_mock_run_paused(
                 program_run_id, *notify, record_only=record_only
             )
-        return changed
+        return changed and not ended
 
     def _complete_halting(
         self, program_run_id: int, *, expected_revision: int, stop_failed: bool

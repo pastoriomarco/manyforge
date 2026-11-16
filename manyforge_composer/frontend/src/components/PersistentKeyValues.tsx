@@ -114,16 +114,6 @@ export function PersistentKeyValuesView({
         </p>
       )}
       {error !== null && <p className="inline-message severity-error" role="alert">{error}</p>}
-      {values.applyObservationFault !== null && (
-        <p className="inline-message severity-error" role="alert">
-          A committed Apply of this Scenario was never observed by the Program runner
-          ({values.applyObservationFault.code}): stored values were kept and checked against
-          the current Program. Find and fix the missed notification.
-          {values.applyObservationFault.recordDigests.map((digest) => (
-            <code key={digest}> {digest}</code>
-          ))}
-        </p>
-      )}
       {values.keys.map((row) => {
         const editing = confirmation?.kind === 'edit' && confirmation.key === row.key
           ? confirmation : null;

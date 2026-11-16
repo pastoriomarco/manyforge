@@ -3547,9 +3547,6 @@ def test_duplicate_apply_notification_does_not_replace_deliberate_scene_edits():
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
     core.committed_activation["apply_id"] = 3
     core.committed_activation["apply_generation"] = 2
-    core.committed_activation["committed_applies"][-1].update(
-        apply_id=3, apply_generation=2
-    )
     service.notify_committed_apply()
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
 
@@ -3717,8 +3714,6 @@ def test_new_apply_does_not_mark_an_in_flight_clear_settled():
         current["apply_id"] = 3
         current["apply_generation"] = 2
         current["scene_initialization"] = "preserve"
-        current["committed_applies"][-1].update(
-            apply_id=3, apply_generation=2, scene_initialization="preserve")
         service.notify_committed_apply()
         assert service.program_cycle_status(include_scene_clear=True)["scene_clear"]["state"] == "pending"
     finally:
@@ -3762,8 +3757,6 @@ def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
         current = core.committed_activation
         current.update(apply_id=3, apply_generation=2,
                        record_digest="sha256:" + "f" * 64)
-        current["committed_applies"][-1].update(
-            apply_id=3, apply_generation=2, record_digest=current["record_digest"])
         normal_status["record_digest"] = current["record_digest"]
         core.applied_program_status_projection = normal_status
         _set_applied_record_digest(core.applied_program, current["record_digest"])
@@ -4106,7 +4099,7 @@ def test_direct_clear_rejects_nonempty_or_changed_publication_before_runner_call
 
 def _committed_activation(apply_id: int = 2) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.committed_scenario_activation.v5",
+        "schema_version": "manyforge.committed_scenario_activation.v6",
         "scene_initialization": "initialize",
         "apply_id": apply_id,
         "apply_generation": 1,
@@ -4119,28 +4112,10 @@ def _committed_activation(apply_id: int = 2) -> dict[str, Any]:
         "program_binding_id": None,
         "retained_bundle_id": "sha256:" + "1" * 64,
         "graph_revision": "sha256:" + "2" * 64,
-        "committed_applies": [
-            {
-                "scene_initialization": "initialize",
-                "apply_id": 1,
-                "apply_generation": 1,
-                "record_digest": "sha256:" + "c" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64,
-                           "project_path": "/projects/scenario.2.scenario"},
-            },
-            {
-                "scene_initialization": "initialize",
-                "apply_id": apply_id,
-                "apply_generation": 1,
-                "record_digest": "sha256:" + "d" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64,
-                           "project_path": "/projects/scenario.1.scenario"},
-            },
-        ],
     }
 
 
-def test_committed_activation_projects_every_committed_apply_of_the_history() -> None:
+def test_committed_activation_projects_the_current_apply() -> None:
     core = FakeCore()
     core.committed_activation = _committed_activation()  # type: ignore[attr-defined]
     with TestClient(create_app(service=_service(core, FakeManager()))) as client:
@@ -4148,29 +4123,12 @@ def test_committed_activation_projects_every_committed_apply_of_the_history() ->
         assert response.status_code == 200
         assert response.json() == _committed_activation()
 
-        # Manager's journal evicts older committed Applies: a retained window
-        # shorter than the publication history is the current history.
-        evicted = {**_committed_activation(), "publication_generation": 300}
-        core.committed_activation = evicted  # type: ignore[attr-defined]
-        response = client.get("/api/program/committed-activation")
-        assert response.status_code == 200
-        assert response.json() == evicted
-
-        # More committed Applies than Apply publications is refused.
-        core.committed_activation = {  # type: ignore[attr-defined]
-            **_committed_activation(),
-            "publication_generation": 2,
-        }
-        refused = client.get("/api/program/committed-activation")
-        assert refused.json()["detail"]["code"] == "program_activation_invalid"
-
-        # Every committed Apply is named by its Apply identity; the current
-        # one by the same identity it is current under.
+        # The current Apply is named by its Apply identity, and the record
+        # is closed: the former Apply history is refused.
         anonymous = _committed_activation()
-        del anonymous["committed_applies"][0]["apply_id"]
-        renamed = _committed_activation()
-        renamed["committed_applies"][1]["apply_generation"] = 2
-        for invalid in (anonymous, renamed):
+        del anonymous["apply_id"]
+        with_history = {**_committed_activation(), "committed_applies": []}
+        for invalid in (anonymous, with_history):
             core.committed_activation = invalid  # type: ignore[attr-defined]
             refused = client.get("/api/program/committed-activation")
             assert refused.json()["detail"]["code"] == "program_activation_invalid"
@@ -5879,7 +5837,6 @@ def test_program_only_apply_preserves_scene_and_still_reconciles_values():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.committed_activation["scene_initialization"] = "preserve"
-    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
     service.notify_committed_apply()
     service.notify_committed_apply()
     assert runner.reconciliations == 2
@@ -6079,10 +6036,6 @@ def test_apply_scene_retry_stops_when_new_apply_is_committed():
         core.committed_activation["apply_id"] = 3
         core.committed_activation["apply_generation"] = 2
         core.committed_activation["record_digest"] = "sha256:" + "f" * 64
-        core.committed_activation["committed_applies"][-1].update(
-            apply_id=3, apply_generation=2,
-            record_digest=core.committed_activation["record_digest"],
-        )
         core.applied_program_status_projection["record_digest"] = core.committed_activation["record_digest"]
         _set_applied_record_digest(core.applied_program, core.committed_activation["record_digest"])
 
@@ -6230,7 +6183,6 @@ def test_initial_scene_failure_status_is_apply_scoped_and_runner_independent():
     assert failure["apply_id"] == 2
     core.committed_activation["apply_id"] = 3
     core.committed_activation["apply_generation"] = 2
-    core.committed_activation["committed_applies"][-1].update(apply_id=3, apply_generation=2)
     assert service.initial_scene_status()["initial_scene_failure"] is None
 
 
@@ -6394,7 +6346,6 @@ def test_preserve_apply_does_not_read_applied_status_or_create_scene_failure():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.committed_activation["scene_initialization"] = "preserve"
-    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
     reads = []
     def failed_status():
         reads.append(True)

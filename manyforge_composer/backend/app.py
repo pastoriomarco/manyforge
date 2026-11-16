@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -39,7 +38,6 @@ from .routes_scenario_documents import create_scenario_document_router
 from .routes_urdf import create_urdf_router
 from .routes_viewer import create_viewer_router
 from .security import SecurityConfig
-from .workbench_session import previous_session_notice
 from .state import (
     RUNTIME_UNAVAILABLE_MESSAGE,
     RUNTIME_UNAVAILABLE_REASON_CODE,
@@ -298,7 +296,6 @@ def create_app(
     effect route is caught before it can create a process or mutate robot state.
     """
 
-    session_notice = previous_session_notice(os.environ.get("MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"))
     security = security or SecurityConfig()
     state.allowed_fs_roots = list(security.allowed_fs_roots)
     state.allowed_program_write_roots = (
@@ -500,7 +497,6 @@ def create_app(
                 headless = state.headless_client.health()
                 return {
                     "status": headless.get("status", "degraded"),
-                    "workbench_session_notice": session_notice,
                     "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
@@ -523,7 +519,6 @@ def create_app(
             except HeadlessClientError as error:
                 return {
                     "status": "degraded",
-                    "workbench_session_notice": session_notice,
                     "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
@@ -550,7 +545,6 @@ def create_app(
                 }
         return {
             "status": "degraded",
-            "workbench_session_notice": session_notice,
             "startup_scenario_notice": state.startup_scenario_notice,
             "mode": "structural_only",
             "components": {

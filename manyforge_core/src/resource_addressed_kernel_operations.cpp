@@ -2495,19 +2495,15 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     } else if (control == OperationControlKind::kAcknowledgeCompleted && targets.empty()) {
       settle_without_effect = true;
     }
-    if (!defer_effects_to_stop && !reset_stop.has_value() && !settle_without_effect) {
+    // A control without effects has dispatched all (none) of them: releasing
+    // the commit guard settles it, or the end of the work still in flight does.
+    if (!defer_effects_to_stop && !reset_stop.has_value()) {
       active_operation->pending_control->effects_dispatched = true;
     }
   }
 
   commit.release();
-  if (defer_effects_to_stop) {
-    return Result<OperationControlAcceptedDTO>::Ok(accepted);
-  }
-
-  if (settle_without_effect) {
-    std::lock_guard state_lock(state_mutex_);
-    (void)settle_control_operation_locked(request.operation_id, control);
+  if (defer_effects_to_stop || settle_without_effect) {
     return Result<OperationControlAcceptedDTO>::Ok(accepted);
   }
   if (reset_stop.has_value()) {

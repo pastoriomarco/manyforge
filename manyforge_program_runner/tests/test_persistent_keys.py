@@ -51,11 +51,9 @@ def _declaration(
 class _Manager:
     """Committed Scenario Applies of one Manager publication history."""
 
-    def __init__(self, history: str = "h", retain: int | None = None) -> None:
+    def __init__(self, history: str = "h") -> None:
         self.history = history
         self.applies: dict[str, str] = {}
-        # Manager's journal keeps the newest `retain` committed Applies.
-        self.retain = retain
 
     def apply(
         self, project_path: str, *declarations: BlackboardKeyDeclaration
@@ -71,9 +69,7 @@ class _Manager:
             record_digest=digest,
             project_path=self.applies[digest],
             declarations={row.key: row for row in declarations},
-            committed_applies=dict(
-                list(self.applies.items())[-(self.retain or len(self.applies)):]
-            ),
+            apply_id=list(self.applies).index(digest) + 1,
         )
 
 
@@ -98,7 +94,7 @@ def _reopened(register: PersistentKeyRegister, start: str = _A) -> PersistentKey
 def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "state" / "persistent-keys.v4.json"
+    path = tmp_path / "state" / "persistent-keys.v5.json"
     register = PersistentKeyRegister(path.parent, application_start_id=_A)
     manager = _Manager()
     _reconciled(register, manager, "/cells/b/cell.scenario", _declaration("index"))
@@ -114,12 +110,14 @@ def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
     assert reopened.restore("/cells/b/cell.scenario", {"index": _declaration("index")}) == {}
     assert reopened.values("/cells/b/cell.scenario")["index"]["value"] == 9
     document = json.loads(path.read_text())
-    assert document["schema_version"] == "manyforge.persistent_key_register.v4"
+    assert document["schema_version"] == "manyforge.persistent_key_register.v5"
     assert document["activation"] == {
         "record_digest": "h.apply.2",
         "project_path": "/cells/a/cell.scenario",
+        "application_start_id": _A,
+        "apply_id": 2,
     }
-    assert document["reconciled_applies"] == ["h.apply.1", "h.apply.2"]
+    assert set(document) == {"schema_version", "sequence", "rows", "edits", "activation"}
 
 
 def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
@@ -208,10 +206,12 @@ def test_an_observed_delete_apply_drops_the_value_for_good(tmp_path: Path) -> No
 
     assert register.restore("/cells/a/cell.scenario", deleted.declarations) == {"layer": 2}
     assert register.restore("/cells/a/cell.scenario", readded.declarations) == {"layer": 2}
-    assert register.unobserved_applies("/cells/a/cell.scenario") == ()
 
 
-def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> None:
+def test_an_apply_the_runner_never_activated_has_no_effect(tmp_path: Path) -> None:
+    """Values follow the Program the runner actually activates: an Apply a
+    later one superseded before the runner woke changes nothing."""
+
     register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     pallet = _declaration("pallet_index")
@@ -219,23 +219,16 @@ def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> No
     register.commit("/cells/a/cell.scenario", pallet, 9)
     register.commit("/cells/a/cell.scenario", _declaration("layer"), 2)
 
-    missed = manager.apply("/cells/a/cell.scenario", _declaration("layer"))  # never observed
+    manager.apply("/cells/a/cell.scenario", _declaration("layer"))  # never activated
     readded = manager.apply("/cells/a/cell.scenario", pallet, _declaration("layer"))
     result = register.reconcile(readded)  # e.g. at Run start
 
-    # Nothing is dropped for what cannot be proven; the missed Apply is a
-    # named, persistent fault instead.
-    assert result.dropped == ()
-    assert result.unobserved == ((missed.record_digest, "/cells/a/cell.scenario"),)
+    assert (result.outcome, result.dropped) == ("reconciled", ())
     assert register.restore("/cells/a/cell.scenario", readded.declarations) == {
         "pallet_index": 9,
         "layer": 2,
     }
-    reopened = _reopened(register)
-    assert reopened.unobserved_applies("/cells/a/cell.scenario") == (missed.record_digest,)
-    (fault,) = [e for e in reopened.edits("/cells/a/cell.scenario") if e["action"] == "fault"]
-    assert fault["reason"] == "applied_program_not_observed"
-    assert missed.record_digest in fault["detail"]
+    assert register.edits("/cells/a/cell.scenario") == []  # nothing recorded
     # The current declarations still decide: a key it does not declare goes.
     narrowed = manager.apply("/cells/a/cell.scenario", _declaration("layer"))
     assert register.reconcile(narrowed).dropped == (
@@ -243,7 +236,7 @@ def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> No
     )
 
 
-def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
+def test_the_current_activation_again_changes_nothing(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     manager = _Manager()
     narrow = _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("x"))
@@ -254,16 +247,17 @@ def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
     register.commit("/cells/a/cell.scenario", _declaration("y"), 7)
     sequence = register.sequence
 
-    # A repeated notification is a no-op ...
+    # A repeated wake is a no-op ...
     assert register.reconcile(wide).outcome == "duplicate"
-    # ... and a late one never cleans up against its outdated declarations.
+    # ... and a late read of an older activation of this start never cleans
+    # up against its outdated declarations.
     late = manager.current(narrow.record_digest, (_declaration("x"),))
     assert register.reconcile(late).outcome == "stale"
     assert register.sequence == sequence
     assert register.restore("/cells/a/cell.scenario", wide.declarations) == {"y": 7}
 
 
-def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> None:
+def test_a_new_start_keeps_rows_that_still_fit(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path, application_start_id=_A)
     first = _Manager("first")
     _reconciled(register, first, "/cells/b/cell.scenario", _declaration("count"))
@@ -271,61 +265,32 @@ def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> 
     _reconciled(register, first, "/cells/a/cell.scenario", _declaration("index"), _declaration("gone"))
     register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
     register.commit("/cells/a/cell.scenario", _declaration("gone"), 3)
-    first.apply("/cells/a/cell.scenario", _declaration("index"))  # missed before the restart
-    register.reconcile(first.apply("/cells/a/cell.scenario", _declaration("index"), _declaration("gone")))
-    assert register.unobserved_applies("/cells/a/cell.scenario") == ("first.apply.3",)
 
-    # Manager restarted with new state (a workbench stop/start).
+    # A new application start: the Manager mints a new start and counts its
+    # Apply numbers from 1 again; the new start's activation is the later one.
+    register = _reopened(register, _B)
     again = _Manager("second").apply("/cells/a/cell.scenario", _declaration("index"))
     result = register.reconcile(again)
 
-    assert result.history_changed is True
+    assert result.outcome == "reconciled"
+
     assert result.dropped == (
         PersistentKeyNotice("/cells/a/cell.scenario", "gone", "key_not_declared_persistent"),
     )
     assert register.restore("/cells/a/cell.scenario", again.declarations) == {"index": 2}
     assert register.values("/cells/b/cell.scenario")["count"]["value"] == 1
-    # Faults named Applies of the previous history; its audit stays.
-    assert register.unobserved_applies("/cells/a/cell.scenario") == ()
-    assert [e["action"] for e in register.edits("/cells/a/cell.scenario")].count("fault") == 1
 
 
-def test_manager_eviction_continues_the_history(tmp_path: Path) -> None:
+def test_many_applies_in_one_start_keep_the_values(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path, application_start_id=_A)
-    manager = _Manager(retain=4)
+    manager = _Manager()
     index = _declaration("index")
     _reconciled(register, manager, "/cells/a/cell.scenario", index)
     register.commit("/cells/a/cell.scenario", index, 7)
-    # Far more Applies than Manager retains, each observed: one history.
-    for _ in range(10):
-        result = register.reconcile(manager.apply("/cells/a/cell.scenario", index))
-        assert (result.outcome, result.history_changed, result.unobserved) == (
-            "reconciled", False, ()
-        )
+    for _ in range(300):
+        _reconciled(register, manager, "/cells/a/cell.scenario", index)
     assert register.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
-
-    # A retained Apply the register never observed is still the named fault ...
-    missed = manager.apply("/cells/b/cell.scenario")
-    result = register.reconcile(manager.apply("/cells/a/cell.scenario", index))
-    assert result.history_changed is False
-    assert result.unobserved == ((missed.record_digest, "/cells/b/cell.scenario"),)
-    assert register.unobserved_applies("/cells/b/cell.scenario") == (missed.record_digest,)
-    # ... until Manager evicts the Apply it names (its audit stays).
-    for _ in range(4):
-        register.reconcile(manager.apply("/cells/a/cell.scenario", index))
-    assert register.unobserved_applies("/cells/b/cell.scenario") == ()
-    assert [e["action"] for e in register.edits("/cells/b/cell.scenario")].count("fault") == 1
     reopened = _reopened(register)
-    assert reopened.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
-
-    # A register that lagged until its last activation was evicted cannot
-    # follow the history: accepted as a new one, the retained Applies it
-    # never saw are named, and rows that fit stay.
-    for _ in range(5):
-        manager.apply("/cells/b/cell.scenario")
-    result = reopened.reconcile(manager.apply("/cells/a/cell.scenario", index))
-    assert result.history_changed is True
-    assert len(result.unobserved) == 3
     assert reopened.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
 
 
@@ -339,7 +304,7 @@ def test_nothing_is_restored_before_the_scenario_is_reconciled(tmp_path: Path) -
     manager.apply("/cells/a/cell.scenario", _declaration("index"))
     activation = manager.apply("/cells/a/cell.scenario", _declaration("index"))
     result = register.reconcile(activation)
-    assert (result.dropped, result.unobserved) == ((), ())
+    assert result.dropped == ()
     assert register.restore("/cells/a/cell.scenario", activation.declarations) == {"index": 3}
 
 
@@ -527,10 +492,10 @@ def test_remove_and_clear_forget_only_the_named_scenario(tmp_path: Path) -> None
 
 def test_malformed_register_is_refused_not_replaced(tmp_path: Path) -> None:
     path = tmp_path / REGISTER_FILE_NAME
-    path.write_text('{"schema_version": "manyforge.persistent_key_register.v4"}')
+    path.write_text('{"schema_version": "manyforge.persistent_key_register.v5"}')
     with pytest.raises(PersistentKeyRegisterError, match="unsupported layout"):
         PersistentKeyRegister(path.parent, application_start_id=_A)
-    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v4"}'
+    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v5"}'
 
 
 def test_another_register_version_is_refused_by_name_and_left_untouched(
@@ -554,8 +519,8 @@ def test_another_register_version_is_refused_by_name_and_left_untouched(
 
 
 def test_the_register_file_is_named_by_its_format_version() -> None:
-    assert REGISTER_FILE_NAME == "persistent-keys.v4.json"
-    assert persistent_keys.SCHEMA_VERSION == "manyforge.persistent_key_register.v4"
+    assert REGISTER_FILE_NAME == "persistent-keys.v5.json"
+    assert persistent_keys.SCHEMA_VERSION == "manyforge.persistent_key_register.v5"
 
 
 @pytest.mark.parametrize(
@@ -564,6 +529,7 @@ def test_the_register_file_is_named_by_its_format_version() -> None:
         ("persistent-keys.json", "manyforge.persistent_key_register.v4"),
         ("persistent-keys.json", "manyforge.persistent_key_register.v2"),
         ("persistent-keys.v3.json", "manyforge.persistent_key_register.v3"),
+        ("persistent-keys.v4.json", "manyforge.persistent_key_register.v4"),
     ],
 )
 def test_an_older_register_file_is_left_in_place_and_named_once(
@@ -612,7 +578,7 @@ def test_no_older_register_file_logs_nothing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A newer or unrelated name is not an older register file.
-    (tmp_path / "persistent-keys.v5.json").write_text("{}")
+    (tmp_path / "persistent-keys.v6.json").write_text("{}")
     (tmp_path / "persistent-keys.json.bak").write_text("{}")
     with caplog.at_level("DEBUG", logger=persistent_keys.__name__):
         PersistentKeyRegister(tmp_path, application_start_id=_A)
@@ -777,7 +743,7 @@ def test_a_change_keeps_the_application_start_that_wrote_it(tmp_path: Path) -> N
     )
     assert register.wait_written(5.0)
     document = json.loads(path.read_text())
-    assert document["schema_version"] == "manyforge.persistent_key_register.v4"
+    assert document["schema_version"] == "manyforge.persistent_key_register.v5"
     assert [edit["application_start_id"] for edit in document["edits"]] == [_A]
 
     # A later start reads the change with the start that wrote it, and its
@@ -803,14 +769,14 @@ def test_the_register_requires_the_application_start_in_its_text_form(
         PersistentKeyRegister(tmp_path, application_start_id=start)  # type: ignore[arg-type]
 
 
-def test_a_v3_register_is_refused_by_name_and_left_untouched(tmp_path: Path) -> None:
+def test_a_v4_register_is_refused_by_name_and_left_untouched(tmp_path: Path) -> None:
     """The current-format file naming another format can only be damaged or
     hand-edited: it is refused by name and left untouched."""
 
     path = tmp_path / REGISTER_FILE_NAME
     earlier = json.dumps(
         {
-            "schema_version": "manyforge.persistent_key_register.v3",
+            "schema_version": "manyforge.persistent_key_register.v4",
             "sequence": 1,
             "rows": [
                 {"project_path": "/cells/a/cell.scenario", "key": "index",

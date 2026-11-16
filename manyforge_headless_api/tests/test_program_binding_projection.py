@@ -16,68 +16,39 @@ def _origin(scenario_id="scenario_a"):
 
 
 def _publication(scenario_id="scenario_b"):
-    rows = [{"apply_id": 1, "apply_generation": 1,
-             "scene_initialization": "initialize",
-             "record_digest": "sha256:" + "a" * 64, "origin": _origin()},
-            {"apply_id": 2, "apply_generation": 2,
-             "scene_initialization": "preserve",
-             "record_digest": "sha256:" + "b" * 64, "origin": _origin(scenario_id)}]
-    return {"schema_version": "manyforge.committed_scenario_activation.v5", **deepcopy(rows[-1]),
+    return {"schema_version": "manyforge.committed_scenario_activation.v6",
+            "apply_id": 2, "apply_generation": 2, "scene_initialization": "preserve",
+            "record_digest": "sha256:" + "b" * 64, "origin": _origin(scenario_id),
             "publication_generation": 3, "program": None, "program_frame_facts": None,
             "program_binding_id": None, "retained_bundle_id": "sha256:" + "c" * 64,
-            "graph_revision": "sha256:" + "d" * 64, "committed_applies": rows}
+            "graph_revision": "sha256:" + "d" * 64}
 
 
-def test_typed_history_keeps_every_apply_and_returns_exact_source_without_mutation():
+def test_activation_returns_exact_source_without_mutation():
     value = _publication()
     original = deepcopy(value)
     assert validate_committed_scenario_activation(value) is value
     assert value == original
-    assert len(value["committed_applies"]) + 1 == value["publication_generation"]
     assert value["origin"]["scenario_id"] == "scenario_b"
-    later = _publication("scenario_a")
-    later["committed_applies"].insert(1, value["committed_applies"][1])
-    later["committed_applies"][-1].update({"apply_id": 3, "apply_generation": 3,
-                                         "record_digest": "sha256:" + "c" * 64})
-    later.update({"apply_id": 3, "apply_generation": 3,
-                  "record_digest": "sha256:" + "c" * 64, "publication_generation": 4})
-    assert validate_committed_scenario_activation(later) is later
-    assert [row["origin"]["scenario_id"] for row in later["committed_applies"]] == [
-        "scenario_a", "scenario_b", "scenario_a"]
-    # Manager's journal evicted the older Applies: the retained ones remain
-    # the history (F7: more Applies than the journal retains).
-    evicted = _publication()
-    evicted["committed_applies"].pop(0)
-    evicted["publication_generation"] = 400
-    assert validate_committed_scenario_activation(evicted) is evicted
 
 
-@pytest.mark.parametrize("mutation", ["omit_current", "more_than_published", "current_foreign_origin", "duplicate",
-    "unsorted", "v1", "old_scenario_key", "foreign_current_id", "text_current_id", "foreign_current_generation"])
-def test_typed_history_rejects_incomplete_or_mismatched_publication(mutation):
+@pytest.mark.parametrize("mutation", ["with_history", "v5", "old_scenario_key", "text_current_id"])
+def test_activation_rejects_a_mismatched_record(mutation):
     value = _publication()
-    if mutation == "omit_current": value["committed_applies"].pop()
-    elif mutation == "more_than_published": value["publication_generation"] = 2
-    elif mutation == "current_foreign_origin": value["origin"]["scenario_id"] = "foreign"
-    elif mutation == "duplicate": value["committed_applies"][0] = deepcopy(value["committed_applies"][1])
-    elif mutation == "unsorted": value["committed_applies"].reverse()
-    elif mutation == "v1": value["schema_version"] = "manyforge.committed_scenario_activation.v1"
+    if mutation == "with_history": value["committed_applies"] = []
+    elif mutation == "v5": value["schema_version"] = "manyforge.committed_scenario_activation.v5"
     elif mutation == "old_scenario_key": value["scenario_id"] = "fake"
-    elif mutation == "foreign_current_id": value["apply_id"] = 99
     # An Apply is named by its integer Apply number (1.16.1).
-    elif mutation == "text_current_id":
-        value["apply_id"] = "2"
-        value["committed_applies"][-1]["apply_id"] = "2"
-    elif mutation == "foreign_current_generation": value["apply_generation"] = 3
+    elif mutation == "text_current_id": value["apply_id"] = "2"
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
 
 @pytest.mark.parametrize("change", [{"kind": "unknown"}, {"scenario_id": "s" * 257},
     {"cell_id": "cell_a"}, {"source_document_digest": None}, {"project_path": "relative"}])
-def test_typed_history_validates_every_row(change):
+def test_activation_validates_its_origin(change):
     value = _publication()
-    value["committed_applies"][0]["origin"] = {**_origin(), **change}
+    value["origin"] = {**_origin(), **change}
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
@@ -90,17 +61,9 @@ def test_committed_scene_initialization_rejects_untyped_purpose(purpose):
         validate_committed_scenario_activation(value)
 
 
-def test_committed_scene_initialization_is_joined_to_exact_current_history():
-    value = _publication()
-    value["scene_initialization"] = "initialize"
-    with pytest.raises(ProgramBindingTransportError):
-        validate_committed_scenario_activation(value)
-
-
 def test_an_apply_can_request_scene_initialization():
     value = _publication()
     value["scene_initialization"] = "initialize"
-    value["committed_applies"][-1]["scene_initialization"] = "initialize"
     validate_committed_scenario_activation(value)
 
 

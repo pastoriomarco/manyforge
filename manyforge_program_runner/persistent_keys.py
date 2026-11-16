@@ -8,18 +8,12 @@ never share values, and a moved or renamed folder starts with none. The file
 lives with the installation, so copying or exporting a Scenario never carries
 machine state.
 
-Stored values follow Manager's committed Scenario activations. Every
-publication after the canonical-empty bootstrap is one committed named Apply,
-and Manager lists the ones its bounded journal still retains (older ones are
-evicted). A stored value is kept unless an observed committed Apply no longer
-declares its key persistent with the same structure. The register remembers
-which retained committed Applies it has accounted for: a repeated or late
-notification changes nothing, and a retained committed Apply it never
-observed is reported as the named fault `applied_program_not_observed` (the
-values are kept and reconciled against the current Program). A new
-publication history (Manager restarted with new state), or one whose
-last-reconciled activation Manager already evicted, is accepted the same way:
-rows that fit the current Program stay.
+Stored values follow the Program the runner actually activates: on every
+wake it reads Manager's current committed Scenario activation and reconciles
+the rows to it. A stored value is kept unless that activation's Program no
+longer declares its key persistent with the same structure. Applies the runner
+never activated (a later one superseded them first) have no effect, and a
+repeated wake, or a late read of an older activation, changes nothing.
 """
 
 from __future__ import annotations
@@ -39,7 +33,7 @@ from manyforge_behavior.program import BlackboardKeyDeclaration
 
 _LOGGER = logging.getLogger(__name__)
 
-FORMAT_VERSION: Final = 4
+FORMAT_VERSION: Final = 5
 SCHEMA_VERSION: Final = f"manyforge.persistent_key_register.v{FORMAT_VERSION}"
 # The register file is named by its format version, and only that file is
 # opened or created. Files of an earlier format (the unversioned name or a
@@ -49,8 +43,6 @@ _OLDER_FILE_NAME: Final = re.compile(r"persistent-keys(?:\.v([1-9][0-9]{0,8}))?\
 MAX_ROWS: Final = 4_096
 MAX_VALUE_BYTES: Final = 65_536
 MAX_EDITS: Final = 256
-# Manager's journal retains at most 256 named Applies (older ones are evicted).
-MAX_RECONCILED_APPLIES: Final = 1_024
 # Declared access that lets the operator change a key's value (Set, Reset, Clear).
 OPERATOR_WRITABLE_ACCESS: Final = frozenset({"write", "read_write"})
 _MAX_ID_BYTES: Final = 256
@@ -83,8 +75,6 @@ _DOCUMENT_FIELDS: Final = frozenset(
         "rows",
         "edits",
         "activation",
-        "reconciled_applies",
-        "unobserved_applies",
     }
 )
 
@@ -92,9 +82,11 @@ _DOCUMENT_FIELDS: Final = frozenset(
 REASON_NOT_DECLARED: Final = "key_not_declared_persistent"
 REASON_DECLARATION_CHANGED: Final = "key_declaration_changed"
 REASON_VALUE_INVALID: Final = "value_invalid"
-# The named fault for a committed Apply the register never observed; it
-# drops nothing but stays visible (register audit, values page, run audit).
-FAULT_APPLY_NOT_OBSERVED: Final = "applied_program_not_observed"
+# The stored activation: which committed Apply the rows follow, and its order
+# (application start, Apply number).
+_ACTIVATION_FIELDS: Final = frozenset(
+    {"record_digest", "project_path", "application_start_id", "apply_id"}
+)
 
 
 class PersistentKeyRegisterError(RuntimeError):
@@ -122,44 +114,32 @@ class PersistentKeyNotice:
 class CommittedActivation:
     """Manager's current committed Scenario activation.
 
-    ``committed_applies`` maps every committed Apply record Manager retains
-    of the current publication history, this one included, to its Scenario
-    project folder.
+    ``apply_id`` is its Manager Apply number, counted from 1 in each
+    application start (contract 1.16.1): within one start a higher number is a
+    later activation.
     """
 
     record_digest: str
     project_path: str
     declarations: Mapping[str, BlackboardKeyDeclaration]
-    committed_applies: Mapping[str, str]
+    apply_id: int
 
     def __post_init__(self) -> None:
         _require_id(self.record_digest, field="record_digest")
         _require_project(self.project_path)
-        if (
-            len(self.committed_applies) > MAX_RECONCILED_APPLIES
-            or self.committed_applies.get(self.record_digest) != self.project_path
-        ):
-            raise PersistentKeyRegisterError(
-                "committed activation must be one of its history's committed Applies"
-            )
+        _require_number(self.apply_id, field="apply_id")
 
 
 @dataclass(frozen=True, slots=True)
 class PersistentKeyReconciliation:
     """``reconciled``: rows now follow this activation. ``duplicate``: it is the
-    activation already reconciled. ``stale``: a newer one was reconciled
-    already. Only ``reconciled`` changes anything.
-
-    ``unobserved`` names committed Applies (record digest, project folder) this
-    reconciliation found that the register never observed;
-    ``history_changed`` says the activation starts a new publication history
-    (or one whose last-reconciled activation Manager already evicted).
+    activation already reconciled. ``stale``: a later activation of this
+    application start was reconciled already. Only ``reconciled`` changes
+    anything.
     """
 
     outcome: str
     dropped: tuple[PersistentKeyNotice, ...] = field(default=())
-    unobserved: tuple[tuple[str, str], ...] = field(default=())
-    history_changed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,19 +285,6 @@ def _audit(
     return record
 
 
-def _fault_audit(record_digest: str, project_path: str) -> dict[str, Any]:
-    record = _audit(
-        _RECONCILIATION_EDIT,
-        "fault",
-        project_path,
-        None,
-        reason=FAULT_APPLY_NOT_OBSERVED,
-        detail=f"committed Apply {record_digest} was not observed",
-    )
-    assert record is not None
-    return record
-
-
 def _drop_audit(notice: PersistentKeyNotice, edit: PersistentKeyEdit) -> dict[str, Any]:
     record = _audit(
         edit,
@@ -370,13 +337,8 @@ class PersistentKeyRegister:
         # Recent attributed changes, oldest first, written with the change.
         # Only an audit list: the cycle journal refuses a resent request.
         self._edits: list[dict[str, Any]] = []
-        # The committed activation the rows follow, and every committed Apply
-        # of its publication history the register has accounted for.
+        # The committed activation the rows follow.
         self._activation: dict[str, str] | None = None
-        self._reconciled: frozenset[str] = frozenset()
-        # Committed Applies of the current history never observed, with their
-        # Scenario: the `applied_program_not_observed` fault.
-        self._unobserved: dict[str, str] = {}
         # Values a run start dropped, for that run's audit (see take_notices).
         self._notices: list[PersistentKeyNotice] = []
         self._load()
@@ -452,8 +414,6 @@ class PersistentKeyRegister:
                 self._edits,
                 self._sequence,
                 self._activation,
-                self._reconciled,
-                self._unobserved,
             )
         try:
             self._replace_file(self._encode(*state))
@@ -513,8 +473,6 @@ class PersistentKeyRegister:
                 "register."
             )
         activation = document.get("activation")
-        reconciled = document.get("reconciled_applies")
-        unobserved = document.get("unobserved_applies")
         if (
             set(document) != _DOCUMENT_FIELDS
             or type(document.get("sequence")) is not int
@@ -526,17 +484,8 @@ class PersistentKeyRegister:
                 activation is None
                 or (
                     type(activation) is dict
-                    and set(activation) == {"record_digest", "project_path"}
+                    and set(activation) == _ACTIVATION_FIELDS
                 )
-            )
-            or type(reconciled) is not list
-            or len(reconciled) > MAX_RECONCILED_APPLIES
-            or reconciled != sorted(set(reconciled))
-            or type(unobserved) is not list
-            or len(unobserved) > MAX_RECONCILED_APPLIES
-            or any(
-                type(row) is not dict or set(row) != {"record_digest", "project_path"}
-                for row in unobserved
             )
         ):
             raise PersistentKeyRegisterError(
@@ -575,26 +524,12 @@ class PersistentKeyRegister:
         if activation is not None:
             _require_id(activation["record_digest"], field="record_digest")
             _require_project(activation["project_path"])
-            if activation["record_digest"] not in reconciled:
-                raise PersistentKeyRegisterError(
-                    "persistent-key register activation is not reconciled"
-                )
-        for digest in reconciled:
-            _require_id(digest, field="record_digest")
-        unobserved_applies = {
-            _require_id(row["record_digest"], field="record_digest"): _require_project(row["project_path"])
-            for row in unobserved
-        }
-        if not set(unobserved_applies) <= set(reconciled):
-            raise PersistentKeyRegisterError(
-                "persistent-key register reports an Apply it never accounted for"
-            )
+            _require_start_id(activation["application_start_id"])
+            _require_number(activation["apply_id"], field="apply_id")
         self._rows = rows
         self._edits = document["edits"]
         self._sequence = document["sequence"]
         self._activation = None if activation is None else dict(activation)
-        self._reconciled = frozenset(reconciled)
-        self._unobserved = unobserved_applies
 
     def _write(
         self,
@@ -603,8 +538,6 @@ class PersistentKeyRegister:
         audits: list[dict[str, Any]] | dict[str, Any] | None = None,
         *,
         activation: dict[str, str] | None = None,
-        reconciled: frozenset[str] | None = None,
-        unobserved: dict[str, str] | None = None,
     ) -> None:
         """Change memory (caller holds _lock) and wake the writer thread,
         which writes the file afterwards."""
@@ -625,14 +558,10 @@ class PersistentKeyRegister:
                 ),
             ][-MAX_EDITS:]
         activation = self._activation if activation is None else activation
-        reconciled = self._reconciled if reconciled is None else reconciled
-        unobserved = self._unobserved if unobserved is None else unobserved
         self._rows = rows
         self._edits = edits
         self._sequence = sequence
         self._activation = None if activation is None else dict(activation)
-        self._reconciled = reconciled
-        self._unobserved = dict(unobserved)
         self._generation += 1
         with self._writer_cv:
             self._writer_wanted = True
@@ -644,8 +573,6 @@ class PersistentKeyRegister:
         edits: list[dict[str, Any]],
         sequence: int,
         activation: dict[str, str] | None,
-        reconciled: frozenset[str],
-        unobserved: dict[str, str],
     ) -> str:
         document = {
             "schema_version": SCHEMA_VERSION,
@@ -656,11 +583,6 @@ class PersistentKeyRegister:
             ],
             "edits": edits,
             "activation": activation,
-            "reconciled_applies": sorted(reconciled),
-            "unobserved_applies": [
-                {"record_digest": digest, "project_path": project}
-                for digest, project in sorted(unobserved.items())
-            ],
         }
         return json.dumps(document, sort_keys=True, indent=1, allow_nan=False)
 
@@ -692,60 +614,25 @@ class PersistentKeyRegister:
 
         The activation's Scenario keeps every row its Program still declares
         persistent with the same structure; the others are dropped with a
-        notice. Nothing is dropped because a notification was missed: a
-        retained committed Apply of this history the register never observed
-        is recorded as the `applied_program_not_observed` fault instead, and a
-        new publication history is accepted. Manager evicts old committed
-        Applies, so the history continues while the last reconciled activation
-        is still retained; faults naming evicted Applies go with them. All
-        changes are made in one
-        step. An activation already accounted for changes nothing, so
-        repeated or late notifications are harmless.
+        notice. All changes are made in one step. Activations are ordered by
+        application start and Apply number: the Manager mints the start and
+        counts Apply numbers from 1 in it, and every start follows the earlier
+        ones. The activation already reconciled, or one ordered before it (a
+        late read), changes nothing, so repeated or late wakes are harmless.
         """
 
         if not isinstance(activation, CommittedActivation):
             raise TypeError("reconcile requires one CommittedActivation")
         with self._lock:
-            if activation.record_digest in self._reconciled:
-                current = self._activation
-                return PersistentKeyReconciliation(
-                    "duplicate"
-                    if current is not None
-                    and current["record_digest"] == activation.record_digest
-                    else "stale"
-                )
-            committed = dict(activation.committed_applies)
-            # Eviction drops the oldest Applies of the same history; only a
-            # lost last-reconciled activation breaks continuity (a restarted
-            # Manager, or one that evicted it while the register lagged).
-            history_changed = (
-                self._activation is not None
-                and self._activation["record_digest"] not in committed
-            )
-            if history_changed:
-                # The faults named Applies of the previous history.
-                seen: frozenset[str] = frozenset()
-                unobserved: dict[str, str] = {}
-            else:
-                seen = self._reconciled
-                unobserved = {
-                    digest: project
-                    for digest, project in self._unobserved.items()
-                    if digest in committed
-                }
-            missed = (
-                ()
-                if self._activation is None and not history_changed
-                # A register that never followed any activation has nothing
-                # it could have missed.
-                else tuple(
-                    sorted(
-                        (digest, committed[digest])
-                        for digest in set(committed) - seen - {activation.record_digest}
-                    )
-                )
-            )
-            unobserved.update(missed)
+            current = self._activation
+            if current is not None and current["record_digest"] == activation.record_digest:
+                return PersistentKeyReconciliation("duplicate")
+            if (
+                current is not None
+                and current["application_start_id"] == self._application_start_id
+                and activation.apply_id < current["apply_id"]
+            ):
+                return PersistentKeyReconciliation("stale")
             rows = dict(self._rows)
             notices: list[PersistentKeyNotice] = []
             for (row_project, key), row in sorted(rows.items()):
@@ -763,32 +650,15 @@ class PersistentKeyRegister:
             self._write(
                 rows,
                 self._sequence + 1,
-                [
-                    *(_fault_audit(digest, scenario) for digest, scenario in missed),
-                    *(_drop_audit(notice, _RECONCILIATION_EDIT) for notice in notices),
-                ],
+                [_drop_audit(notice, _RECONCILIATION_EDIT) for notice in notices],
                 activation={
                     "record_digest": activation.record_digest,
                     "project_path": activation.project_path,
+                    "application_start_id": self._application_start_id,
+                    "apply_id": activation.apply_id,
                 },
-                reconciled=frozenset(committed),
-                unobserved=unobserved,
             )
-            return PersistentKeyReconciliation(
-                "reconciled", tuple(notices), missed, history_changed
-            )
-
-    def unobserved_applies(self, project_path: str) -> tuple[str, ...]:
-        """Record digests of this history's committed Applies of the project
-        that were never observed (the `applied_program_not_observed` fault)."""
-
-        _require_project(project_path)
-        with self._lock:
-            return tuple(
-                digest
-                for digest, project in sorted(self._unobserved.items())
-                if project == project_path
-            )
+            return PersistentKeyReconciliation("reconciled", tuple(notices))
 
     def restore(
         self,
@@ -1073,7 +943,6 @@ class PersistentKeyRegister:
 __all__ = [
     "CommittedActivation",
     "MAX_EDITS",
-    "MAX_RECONCILED_APPLIES",
     "MAX_ROWS",
     "MAX_VALUE_BYTES",
     "PersistentKeyEdit",
@@ -1083,7 +952,6 @@ __all__ = [
     "PersistentKeyRegisterError",
     "PersistentKeyRegisterVersionError",
     "REGISTER_FILE_NAME",
-    "FAULT_APPLY_NOT_OBSERVED",
     "REASON_DECLARATION_CHANGED",
     "REASON_NOT_DECLARED",
     "REASON_VALUE_INVALID",

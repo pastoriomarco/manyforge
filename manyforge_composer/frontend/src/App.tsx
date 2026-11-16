@@ -107,7 +107,6 @@ import { DocumentStateLetters } from './components/DocumentStateLetters';
 import { ScenarioActionControls } from './components/ScenarioActionControls';
 import { useComposerSettingsNotices } from './components/ComposerSettingsPanel';
 import {
-  previousSessionAlarmHandoff,
   activeViewerIncidentKinds,
   classifyWorkbenchNotices,
   useTransitionScope,
@@ -1001,33 +1000,6 @@ export default function App() {
     manualOperationAdmission,
   ]);
   const publishedNotices = usePublishedWorkbenchNotices();
-  const sessionNotice = health.status === 'ready'
-    ? health.data.workbenchSessionNotice ?? null
-    : null;
-  const [registeredSessionNotice, setRegisteredSessionNotice] = useState<string | null>(null);
-  const sessionRegistration = health.status === 'ready'
-    ? health.data.headless?.workbench_previous_session_registration
-    : null;
-  const sessionNoticeHandoff = previousSessionAlarmHandoff(
-    sessionNotice?.sessionId ?? null, registeredSessionNotice, sessionRegistration,
-  );
-  useEffect(() => {
-    setRegisteredSessionNotice(sessionNoticeHandoff);
-  }, [sessionNoticeHandoff]);
-  // A completed native startup registers this exact predecessor with the
-  // existing alarm owner (or proves its persisted acknowledgement). Keep the
-  // handoff through transport loss and removal of the acknowledged alarm.
-  const sessionNoticeOwnedByAlarms = sessionNotice !== null
-    && sessionNoticeHandoff === sessionNotice.sessionId;
-  const sessionNotices = useMemo<WorkbenchNotice[]>(() => sessionNotice === null
-    || sessionNoticeOwnedByAlarms ? [] : [{
-    id: `cold-session.${sessionNotice.sessionId}`,
-    severity: 'warning',
-    domain: 'recovery',
-    title: 'ManyForge did not close correctly last time.',
-    message: 'The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.',
-    details: `Failure time unavailable. Session: ${sessionNotice.sessionId}. Archive: ${sessionNotice.archiveRelativePath}. Journal families: ${sessionNotice.journalFamilies.join(', ')}. History coverage: ${sessionNotice.historyCoverage}. ${sessionNotice.message}`,
-  }], [sessionNotice, sessionNoticeOwnedByAlarms]);
   // A refused startup project (health is read once per page).
   const startupNotice = health.status === 'ready'
     ? health.data.startupScenarioNotice ?? null
@@ -1070,7 +1042,6 @@ export default function App() {
     ...activationNotices,
     ...publishedNotices,
     ...operationNotices,
-    ...sessionNotices,
     ...startupNotices,
     ...submissionNotices,
     ...(robotPreviewNotice === null ? [] : [robotPreviewNotice]),
@@ -1092,7 +1063,6 @@ export default function App() {
     operationNotices,
     programMessage,
     publishedNotices,
-    sessionNotices,
     startupNotices,
     submissionNotices,
     authoringAdmissionOpen,

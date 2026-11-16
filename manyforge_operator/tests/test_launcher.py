@@ -183,9 +183,7 @@ def test_native_commands_pass_the_previous_run_report(tmp_path: Path, journald):
         config.instance_root / "session-reports"
     )
     assert headless[headless.index("--workbench-previous-session-id") + 1] == "a" * 32
-    assert processes[2].environment["MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"] == str(
-        config.instance_root / "session-reports" / ("a" * 32 + ".json")
-    )
+    assert "MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT" not in processes[2].environment
 
 
 def test_native_commands_pass_the_disk_floor_margin_and_record_folders(tmp_path: Path, journald):

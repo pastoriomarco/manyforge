@@ -182,6 +182,11 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
 [[nodiscard]] bool stopped_awaiting_terminal_cleanup(
     const KernelRecoveryAssessmentDTO& assessment) noexcept;
 
+/// A failed execution not admitted to retry, now or once its terminal
+/// cleanup ends: a retryable failure still awaiting its cleanup is not one.
+[[nodiscard]] bool failed_not_retry_admissible(
+    const KernelRecoveryAssessmentDTO& assessment) noexcept;
+
 /// True when two assessments differ in identity, authority, actionability,
 /// status, allowed actions, or reason — i.e. when publication must advance
 /// the revision. Equal admissibility facts do not churn.

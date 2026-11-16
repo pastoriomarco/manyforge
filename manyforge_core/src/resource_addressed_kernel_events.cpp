@@ -1060,16 +1060,21 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         // evaluated only here, in the same lock hold that transitions the
         // slots and releases dispatch: an alarm published or a projection
         // aged out at any earlier instant is observed. Dispatch none; the
-        // shared pre-dispatch path cancels every prepared participant.
+        // shared pre-dispatch path cancels every prepared participant. Every
+        // refusal here ends this advance's borrow first, so the failure is
+        // not kept resident behind it (OD-258).
+        const auto refuse_before_dispatch = [&](ErrorDTO refusal) {
+          participant = operation->participant_for(engine);
+          if (participant != nullptr) participant->prepared_advance_in_flight = false;
+          state_lock.unlock();
+          commit.release();
+          return fail_pre_dispatch(operation_id, nullptr, std::move(refusal));
+        };
         if (!operation->manual) {
           if (auto refusal = operator_alarm_attention_refusal_locked(
                   operation_resources(operation->participants))) {
             operation->state = std::move(prepared_state);
-            participant = operation->participant_for(engine);
-            if (participant != nullptr) participant->prepared_advance_in_flight = false;
-            state_lock.unlock();
-            commit.release();
-            return fail_pre_dispatch(operation_id, nullptr, std::move(*refusal));
+            return refuse_before_dispatch(std::move(*refusal));
           }
         }
 
@@ -1082,9 +1087,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           for (const auto& candidate : operation->participants) {
             if (const auto refusal =
                     global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
-              state_lock.unlock();
-              commit.release();
-              return fail_pre_dispatch(operation_id, nullptr, *refusal);
+              return refuse_before_dispatch(*refusal);
             }
           }
         }
@@ -1094,9 +1097,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           if (!retired.ok()) {
             return retired;
           }
-          state_lock.unlock();
-          commit.release();
-          return fail_pre_dispatch(operation_id, nullptr, armed.error());
+          return refuse_before_dispatch(armed.error());
         }
         auto response = process_io_rule_evidence_locked(io_stop_handoff, &operation_id);
         if (response.ok())
@@ -1107,9 +1108,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         if (operation->state.stop_event_id) return Result<void>::Ok();
         for (const auto& candidate : operation->participants) {
           if (const auto refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
-            state_lock.unlock();
-            commit.release();
-            return fail_pre_dispatch(operation_id, nullptr, *refusal);
+            return refuse_before_dispatch(*refusal);
           }
         }
         // The durable Prepared copy predates arm/evidence evaluation. Preserve

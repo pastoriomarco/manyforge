@@ -4142,6 +4142,141 @@ TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureIsRetryableWithoutBack
   EXPECT_EQ(execution.execute_count, 0);
 }
 
+// OD-257: holds the execute worker right after it settled its execution
+// (its kParticipantSettled event, on the worker thread), before its terminal
+// cleanup ends, and reports the worker thread's exit (after
+// `finish_execute_worker`) through a thread_local destructor.
+class HeldTerminalCleanup final {
+ public:
+  explicit HeldTerminalCleanup(ExecutionKernel& kernel)
+      : kernel_(kernel),
+        test_thread_(std::this_thread::get_id()),
+        handle_(kernel.subscribe_events([this](const KernelEvent& event) {
+          if (event.type != KernelEventType::kParticipantSettled ||
+              std::this_thread::get_id() == test_thread_)
+            return;
+          struct ExitSignal {
+            HeldTerminalCleanup* owner{};
+            ~ExitSignal() {
+              if (owner != nullptr) owner->set(owner->exited_);
+            }
+          };
+          thread_local ExitSignal exit_signal;
+          exit_signal.owner = this;
+          std::unique_lock lock(mutex_);
+          held_ = true;
+          changed_.notify_all();
+          changed_.wait(lock, [this] { return released_; });
+        })) {}
+  ~HeldTerminalCleanup() {
+    Release();
+    WaitWorkerExited();
+    kernel_.unsubscribe_events(handle_);
+  }
+  bool WaitHeld() { return wait(held_); }
+  void Release() { set(released_); }
+  bool WaitWorkerExited() { return wait(exited_); }
+
+ private:
+  void set(bool& flag) {
+    std::lock_guard lock(mutex_);
+    flag = true;
+    changed_.notify_all();
+  }
+  bool wait(const bool& flag) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(5), [&] { return flag; });
+  }
+
+  ExecutionKernel& kernel_;
+  std::thread::id test_thread_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool held_{};
+  bool released_{};
+  bool exited_{};
+  SubscriptionHandle handle_;
+};
+
+void fail_preparation_retryably(MockPlanner& planner) {
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                            "RoboPlan could not resolve the pose goal",
+                            {{"reason", "native_ik_no_solution"}}};
+  planner.next_result = plan_err;
+}
+
+// OD-257: a failed execution, like a stopped one, is not decided while its
+// execute worker's terminal cleanup still runs: waiting
+// (`terminal_cleanup_pending`), never retry_ready without close permission.
+TEST_F(ExecutionKernelTest, FailedExecutionWaitsForTerminalCleanupThenIsRetryReadyAndCloseEligible) {
+  fail_preparation_retryably(planner);
+  HeldTerminalCleanup cleanup(kernel);
+  const auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request("ik")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(cleanup.WaitHeld());
+  scheduler.advance_to(clock.now());
+
+  const auto pending = kernel.get_recovery_assessment();
+  EXPECT_EQ(pending.execution_state, ExecutionState::kFailed);
+  EXPECT_EQ(pending.recovery_class, RecoveryClass::kFailedValidation);
+  EXPECT_EQ(pending.status, RecoveryAssessmentStatus::kWaiting);
+  EXPECT_EQ(pending.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
+  EXPECT_FALSE(pending.retry_admissible);
+  EXPECT_FALSE(pending.eligible_close);
+  EXPECT_FALSE(stopped_awaiting_terminal_cleanup(pending));
+
+  cleanup.Release();
+  ASSERT_TRUE(cleanup.WaitWorkerExited());
+  scheduler.advance_to(clock.now());
+  const auto decided = kernel.get_recovery_assessment();
+  EXPECT_EQ(decided.execution_state, ExecutionState::kFailed);
+  EXPECT_EQ(decided.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_EQ(decided.reason_code, reason_codes::kRecoveryFailedValidationRetryable);
+  EXPECT_TRUE(decided.retry_admissible);
+  EXPECT_TRUE(decided.eligible_close);
+}
+
+// OD-257: the cleanup's completion while a refresh runs (captured before the
+// completion, its scheduled flag not yet cleared) is not lost: the coalesced
+// refresh re-runs and publishes the decided assessment.
+TEST_F(ExecutionKernelTest, TerminalCleanupCompletionDuringRunningRefreshIsRepublished) {
+  fail_preparation_retryably(planner);
+  HeldTerminalCleanup cleanup(kernel);
+  const auto test_thread = std::this_thread::get_id();
+  std::atomic<bool> armed{false};
+  bool completed_inside_refresh = false;
+  const auto inside_refresh = kernel.subscribe_events([&](const KernelEvent& event) {
+    // Dispatched by the running refresh after its capture, before it clears
+    // its scheduled flag: the worker ends its cleanup exactly here.
+    if (event.type != KernelEventType::kRecoveryAssessmentChanged ||
+        std::this_thread::get_id() != test_thread || !armed.load() || completed_inside_refresh)
+      return;
+    completed_inside_refresh = true;
+    cleanup.Release();
+    EXPECT_TRUE(cleanup.WaitWorkerExited());
+  });
+  struct Unsubscribe {
+    ExecutionKernel& kernel;
+    SubscriptionHandle handle;
+    ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+  } unsubscribe{kernel, inside_refresh};
+  const auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request("ik")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(cleanup.WaitHeld());
+  armed.store(true);
+
+  scheduler.advance_to(clock.now());  // The refresh captured the pending cleanup.
+  ASSERT_TRUE(completed_inside_refresh);
+  EXPECT_FALSE(kernel.get_recovery_assessment().eligible_close);
+
+  scheduler.advance_to(clock.now());  // The coalesced refresh.
+  const auto decided = kernel.get_recovery_assessment();
+  EXPECT_EQ(decided.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_TRUE(decided.retry_admissible);
+  EXPECT_TRUE(decided.eligible_close);
+}
+
 TEST_F(ExecutionKernelTest, AutomaticPlanningRetryUsesExactPreparedFailureCause) {
   for (const auto* code :
        {kErrorPlanningFailed, kErrorPlanningTimeout, kErrorIkFailed, kErrorCartesianIncomplete,

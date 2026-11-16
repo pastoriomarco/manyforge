@@ -446,6 +446,64 @@ TEST(ManagerSourcePublication,
 }
 
 TEST(ManagerSourcePublication,
+     ManyAppliesInOneStartCarryAtMostThreeRecordsUnderTheFrameBound) {
+  // OD-256: the status message once carried every Apply the journal kept;
+  // after some 40 Loads in one start it outgrew the status frame and Load,
+  // New and Execute were refused until restart. 80 Applies of a realistic
+  // ~8.5 KB record: only the running one, the one that installed the active
+  // configuration and the newest finished one are carried.
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  auto applied = ApplyIntent(admission);
+  applied.prepared_activation.canonical_receipt_json =
+      R"({"padding":")" + std::string(8000U, 'p') +
+      R"(","schema_version":"test.prepared_activation_receipt.v1"})";
+  static_cast<void>(journal.EnsureIntent(applied));
+  const auto stored = journal.ReadStatusInventory();
+  ASSERT_EQ(stored.size(), 1U);
+  std::vector<component_manager::PersistedManagerApplyStatus> inventory;
+  for (std::uint64_t apply_id = 1U; apply_id <= 81U; ++apply_id) {
+    auto status = stored.front();
+    status.intent.intent.apply_id = core::ApplyId(apply_id);
+    if (apply_id <= 80U) {
+      status.terminal_outcome = component_manager::PersistedManagerApplyTerminalOutcome{
+          component_manager::ManagerApplyTerminalOutcomeDTO{
+              core::ApplyId(apply_id), core::ApplyGeneration(1U), std::nullopt,
+              std::nullopt, std::nullopt, std::nullopt,
+              apply_id == 40U
+                  ? component_manager::ManagerApplyTerminalOutcomeState::kSucceeded
+                  : component_manager::ManagerApplyTerminalOutcomeState::kFailed,
+              std::nullopt},
+          core::ContentDigest(std::string(kDigestOne))};
+    }
+    inventory.push_back(std::move(status));
+  }
+  auto runtime = Runtime(admission);
+  runtime.plan.active_publication.request.transaction_ref =
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(40U), core::ApplyGeneration(1U)};
+  runtime.plan.active_publication.request.expected_previous_publication_generation =
+      core::ActiveBundlePublicationGeneration(1U);
+  runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
+  runtime.plan.runtime_convergence_intent_digest = core::ContentDigest(std::string(kDigestOne));
+  ASSERT_TRUE(runtime.plan.valid());
+
+  const auto payload = BuildManagerSourcePayload(
+      admission.retained_bundle(), admission, runtime, journal, inventory,
+      ManagerApplyMutationAvailability::kAvailable);
+  const auto &records =
+      payload.find_object_member("apply")->find_object_member("records")->as_array();
+  std::vector<double> carried;
+  for (const auto &record : records) {
+    carried.push_back(record.find_object_member("apply_id")->as_number());
+  }
+  EXPECT_EQ(carried, (std::vector<double>{40.0, 80.0, 81.0}));
+  // ManagerStatusStream::kMaximumFrameBytes (manager_status_stream.hpp).
+  EXPECT_LT(content_identity::canonical_json(payload).size(), 409'600U);
+}
+
+TEST(ManagerSourcePublication,
      RefusesARuntimeThatPredatesACommittedApplyPublication) {
   // The live race: the Apply progression lane published a transition value
   // from the last runtime observed before the Apply (active publication N)

@@ -1310,6 +1310,93 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **A `hold` rule that trips while a move is being planned holds that move
+  (OD-263).** The rule's Stop now also covers the held run's motion in its
+  scope that is not sent yet, as the operator's Stop does: the move is
+  stopped before sending (no effect), its node holds, and once the rule
+  clears Resume plans it again. Before, the move was refused at its send
+  with `rule_holds` and its node failed.
+- **A held failure of a move that never started offers Continue, Retry and a
+  manual result (OD-263).** When the failed operation was already retired
+  (for example a `fail_node` rule or an alarm refusing the move before
+  sending), the hold kept the retired operation as its owner task, so
+  Continue, Retry and the manual result stayed disabled and only Halt ended
+  the run. The hold now has no owner task and its offers follow the node's
+  recovery policy.
+- **A Stop during a motion take-over keeps the run held (OD-264).** A
+  take-over newcomer that the Stop ended before it was sent (no effect)
+  failed its node with `operation_stopped`, and the run then failed with
+  `program_terminal_scope_not_settled`. Its node now holds as for any motion
+  the Stop prevented, and Resume makes a fresh attempt. A newcomer whose
+  effect is uncertain (`motion_takeover_cleanup_unsettled`) still fails.
+- **The Deployment workspace read no longer fails while an Apply publishes
+  (OD-265).** `GET /api/deployment/workspace` reads the Manager publication
+  once. When that read was not ready it read the execution-ready Scenario as
+  well; if the Apply finished between the two reads, that second shape
+  made the reply a 500 `composer_internal_failure`. The read now shows the
+  publication as not ready, and the next poll shows it.
+- **The simulated PLC no longer aborts at exit on a loaded machine (OD-259).**
+  `sim_plc` ran its ROS executor on a daemon thread and waited at most 2 s for
+  it at exit; when that ran out, Python ended the thread inside rclpy's wait
+  and the process aborted. It now stops the executor and waits for the thread
+  to end, with no time limit.
+- **The Manager's start-up warning names its cause (OD-261).** Instead of
+  "socket is not an exact same-user socket" for every case, it says
+  "socket does not exist yet (the process has not started or is not ready)"
+  when the socket is missing, which is normal at start, and "socket is not a
+  socket owned by this user" otherwise.
+- **A Load refused as an incomplete Scenario document names the cause
+  (OD-260).** The refusal `scenario_activation_incomplete` now carries flat
+  `details`: `member` (`program.yaml` or `deployment.yaml`), and for a Program
+  that cannot be built `cause_code` and `path` of its first diagnostic plus
+  `diagnostic_count`. The Load dialog shows them, for example "Scenario
+  document is incomplete (program.yaml, forest). The Program needs exactly one
+  top-level node, …", or "…: deployment.yaml is empty."; before, it showed
+  only "Scenario document is incomplete".
+- **A refused execution event subscriber is told why (OD-254).** When the
+  execution host already served its 8 event-stream subscribers, a ninth saw
+  its connection reset ("Connection reset by peer") instead of
+  `execution_event_subscribers_full`, because the host closed it without
+  reading the subscription it had already sent. The host now reads that
+  request first, waiting at most its 100 ms subscribe limit, then sends the
+  refusal. The client still logs it and retries with backoff.
+- **Load, New and Execute keep working after many Loads in one start
+  (OD-256).** Manager's status carried every Apply its journal kept, and after
+  some 35 to 40 Loads it grew past its size limit, so Load, New and Execute
+  were refused (`manager_projection_unavailable`,
+  `program_applied_selection_unavailable`) until restart. It now carries at
+  most three Apply records: the running one, the one that installed the active
+  configuration and the newest finished one. Older Applies stay readable one
+  at a time through `apply_status` and in History; the Deployment panel lists
+  the three. A Load whose reply was lost is matched automatically while its
+  Apply is among them, otherwise by Recheck. Persistent blackboard values now
+  follow the Program the Program runner actually activates; the
+  `applied_program_not_observed` fault is gone (the stored-values page loses
+  `apply_observation_fault`, `manyforge.persistent_key_values.v3`), the
+  committed activation loses `committed_applies`
+  (`manyforge.committed_scenario_activation.v6`), and the register file is
+  now `persistent-keys.v5.json`: stored values start empty once.
+- **A move refused by a global I/O rule just before it starts no longer
+  blocks the robot (OD-258).** The move failed with no effect, but its
+  operation stayed held until New, so the robot's next move (for example a
+  recovery branch) was refused. It now ends at once and the run goes on, as
+  for a move refused by an operator alarm.
+- **A failed motion is retried automatically again, and its hold offers
+  Continue (OD-257).** The Kernel reported a failed execution as
+  `retry_ready` (or `reset_required`) while its terminal cleanup still ran,
+  before it could be closed, so the Program node took that as final: no
+  automatic retry, and a held failure offered Retry but never Continue. A
+  failed execution now reports `waiting` (`terminal_cleanup_pending`) until
+  its cleanup ends, as a stopped one already did, and the cleanup's end is
+  always republished. The Program node waits for a decided assessment, failed
+  or stopped, without its former limit of 100 rereads.
+- **Starting after an unclean shutdown no longer ends the application (OD-255).**
+  Composer read the previous-session report itself and, when Headless had not
+  yet filed it, exited, so the Manager ended the application with status 72.
+  The warning now comes only from Headless's alarm "ManyForge did not close
+  correctly last time", shown once Headless has filed the report; Composer's
+  health no longer has `workbench_session_notice` and Headless's health no
+  longer has `workbench_previous_session_registration`.
 - **A request, in particular a Stop, is no longer dropped when its sender is
   slow to send it.** The execution host closed a connection unread when its
   request did not arrive within 100 ms of the connection being taken (1 s for

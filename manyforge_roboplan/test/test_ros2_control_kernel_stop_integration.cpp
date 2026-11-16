@@ -1673,6 +1673,20 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     ASSERT_TRUE(dispatched.has_value());
     EXPECT_EQ(dispatched->binding_epoch, core::ExecutionBindingEpoch(2U));
     EXPECT_FALSE(first->ReadGoal(second_key).has_value());
+    // A mid-motion Stop, as in the Stop tests above: the new epoch's goal has
+    // advanced on its own evidence, so the cancel's cursor restart can be
+    // associated with it and the cancel contains it without escalation. A
+    // Stop before the goal's first anchored sample cannot prove the cancel
+    // finish and escalates by design (Q35/Q50).
+    core::ExecutionSampleAssociation association(core::ExecutionBindingEpoch(2U), std::nullopt,
+                                                 0);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto goal = second->ReadGoal(second_key);
+      const auto sample = second->ReadSample();
+      return goal.has_value() && goal->latest_feedback.has_value() &&
+             goal->latest_feedback->cursor_s > 0.2 && sample.has_value() &&
+             association.Observe(*sample, goal) && sample->cursor_s > 0.2;
+    })) << "the new epoch's goal never advanced beyond 0.2 s on its own evidence";
     StopAndWaitStopped(kernel, second_operation, "stop.epoch2");
   }
   RemoveJournalFiles(journal_path);

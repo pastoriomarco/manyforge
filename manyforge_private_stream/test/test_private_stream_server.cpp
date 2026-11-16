@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -181,6 +182,62 @@ TEST(SubscriberPool, RefusesAboveTheCapWithTheCodePassedIn) {
   EXPECT_EQ(error->find_object_member("error")->find_object_member("code")->as_string(),
             "example_subscribers_full");
   EXPECT_FALSE(Receive(refused.client.get(), 200ms).has_value());  // Closed.
+}
+
+SubscriberPoolOptions Options(const std::size_t cap,
+                              const std::chrono::milliseconds refusal_read_deadline) {
+  auto options = Options(cap);
+  options.refusal_read_deadline = refusal_read_deadline;
+  return options;
+}
+
+void SendSubscribe(const int fd) {
+  const std::string request = R"({"command":"subscribe"})";
+  ASSERT_EQ(::send(fd, request.data(), request.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(request.size()));
+}
+
+TEST(SubscriberPool, ARefusedClientsQueuedPacketIsReadSoTheFullErrorArrives) {
+  std::atomic<int> finished{0};
+  SubscriberPool pool(Options(0, 1000ms));
+  auto refused = MakePair();
+  SendSubscribe(refused.client.get());
+  pool.Admit(std::move(refused.server), Holding(finished), {});
+  const auto error = Receive(refused.client.get());
+  ASSERT_TRUE(error.has_value());  // Not a reset.
+  EXPECT_EQ(error->find_object_member("error")->find_object_member("code")->as_string(),
+            "example_subscribers_full");
+  EXPECT_FALSE(Receive(refused.client.get(), 200ms).has_value());  // Closed.
+  EXPECT_EQ(finished.load(), 0);
+}
+
+TEST(SubscriberPool, TheRefusalReadWaitsAtMostItsDeadlineForASilentClient) {
+  std::atomic<int> finished{0};
+  SubscriberPool pool(Options(0, 300ms));
+  auto refused = MakePair();
+  const auto started = std::chrono::steady_clock::now();
+  pool.Admit(std::move(refused.server), Holding(finished), {});
+  const auto waited = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(waited, 300ms);
+  EXPECT_LT(waited, 300ms + 200ms);
+  const auto error = Receive(refused.client.get());
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(error->find_object_member("error")->find_object_member("code")->as_string(),
+            "example_subscribers_full");
+}
+
+TEST(SubscriberPool, WithoutARefusalReadTheQueuedPacketStaysUnreadAsBefore) {
+  std::atomic<int> finished{0};
+  SubscriberPool pool(Options(0));
+  auto refused = MakePair();
+  SendSubscribe(refused.client.get());
+  const auto started = std::chrono::steady_clock::now();
+  pool.Admit(std::move(refused.server), Holding(finished), {});
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 100ms);
+  char buffer[256];
+  errno = 0;
+  EXPECT_LT(::recv(refused.client.get(), buffer, sizeof(buffer), MSG_DONTWAIT), 0);
+  EXPECT_EQ(errno, ECONNRESET);  // The kernel reset; the error frame is lost.
 }
 
 TEST(SubscriberPool, ReapsFinishedWritersBeforeTheCapCheck) {

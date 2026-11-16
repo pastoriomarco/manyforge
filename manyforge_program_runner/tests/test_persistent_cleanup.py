@@ -82,14 +82,17 @@ class _StoreHost(_Host):
 
 
 def _runtime(
-    tmp_path: Path, headless: _Headless, name: str
+    tmp_path: Path,
+    headless: _Headless,
+    name: str,
+    application_start_id: int = 0x3F9A00000000002A,
 ) -> tuple[ProgramRuntime, _StoreHost]:
     """One Program-runner process; the register file outlives it."""
 
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
             headless_url="http://headless.test",
-            application_start_id=0x3F9A00000000002A,
+            application_start_id=application_start_id,
             persistent_key_register_directory=tmp_path,
         ),
         headless_client=headless,  # type: ignore[arg-type]
@@ -167,32 +170,21 @@ def _pallet_after_rerun(tmp_path: Path, headless: _Headless, name: str) -> Any:
 
 
 @pytest.mark.usefixtures("_no_scene")
-def test_a_missed_delete_apply_keeps_the_value_and_reports_the_fault(
+def test_a_delete_apply_the_runner_never_activated_has_no_effect(
     tmp_path: Path,
 ) -> None:
     headless, _first = _store_pallet_nine(tmp_path)
-    missed = headless.apply(_WITHOUT_PALLET)  # committed; nobody woke the runner
+    headless.apply(_WITHOUT_PALLET)  # committed; superseded before any wake
     headless.apply(_PALLET)  # pallet_index re-added with initial: 0
 
     pallet, runtime, run = _pallet_after_rerun(tmp_path, headless, "second")
 
-    # Preserved, never dropped for what cannot be proven ...
+    # Values follow the Program the runner activates: the value stays.
     assert pallet == 9
-    # ... and the missed Apply is a named fault in the run and on the page.
-    assert {
-        "kind": "persistent_key_apply_not_observed",
-        "project_path": _PROJECT,
-        "code": "applied_program_not_observed",
-        "record_digest": missed,
-    } in _audit(runtime, run)
-    page, _host = _runtime(tmp_path, headless, "page")
-    try:
-        assert page.read_persistent_values()["apply_observation_fault"] == {
-            "code": "applied_program_not_observed",
-            "record_digests": [missed],
-        }
-    finally:
-        page.shutdown()
+    assert not [
+        row for row in _audit(runtime, run)
+        if row.get("kind") == "persistent_key_value_dropped"
+    ]
 
 
 @pytest.mark.usefixtures("_no_scene")
@@ -204,22 +196,15 @@ def test_values_survive_a_workbench_restart_when_the_program_still_declares_them
     restarted = _Headless(history="manager-state.2")
     restarted.apply(_WITHOUT_PALLET)
 
-    runtime, host = _runtime(tmp_path, restarted, "restarted")
+    # A new application start: the Manager minted a new start identity.
+    runtime, host = _runtime(tmp_path, restarted, "restarted", 0x3F9A00000000002B)
     try:
         reconciled = runtime.reconcile_persistent_values()
-        assert reconciled["history_changed"] is True
         assert reconciled["dropped"] == [
             {
                 "project_path": _PROJECT,
                 "key": "pallet_index",
                 "reason": "key_not_declared_persistent",
-            }
-        ]
-        assert reconciled["unobserved_applies"] == [
-            # The new history's first Apply was the startup one, never seen.
-            {
-                "record_digest": restarted.applies[0]["record_digest"],
-                "project_path": _PROJECT,
             }
         ]
         _start(runtime, restarted)
@@ -254,31 +239,6 @@ def test_a_notified_delete_apply_drops_only_the_removed_key(tmp_path: Path) -> N
         event for event in _audit(runtime, run)
         if event["kind"] == "persistent_key_value_dropped"
     ]
-
-
-@pytest.mark.usefixtures("_no_scene")
-def test_a_late_notification_never_cleans_against_outdated_declarations(
-    tmp_path: Path,
-) -> None:
-    headless, _first = _store_pallet_nine(tmp_path)
-    late = deepcopy(headless.current)
-    headless.apply(
-        _program(_key("pallet_index", initial=0), _key("layer", initial=0), _key("extra"))
-    )
-    runtime, host = _runtime(tmp_path, headless, "second")
-    _start(runtime, headless)
-    host.stores[0].write("extra", 1)
-    runtime.shutdown()
-
-    # A late notification whose read still returns the older activation
-    # (narrower: no `extra`) must not clean up against it.
-    newer = headless.current
-    headless.current = late
-    stale, _host = _runtime(tmp_path, headless, "stale")
-    assert stale.reconcile_persistent_values()["outcome"] == "stale"
-    stale.shutdown()
-    headless.current = newer
-    assert _stored_values(tmp_path) == {"extra": 1, "layer": 4, "pallet_index": 9}
 
 
 def _stored_values(tmp_path: Path, live: ProgramRuntime | None = None) -> dict[str, Any]:
@@ -416,7 +376,7 @@ def test_a_cleanup_whose_file_write_fails_is_made_and_written_later(
 
 
 def test_another_register_version_refuses_the_runner_by_name(tmp_path: Path) -> None:
-    path = tmp_path / "persistent-keys.v4.json"
+    path = tmp_path / "persistent-keys.v5.json"
     path.write_text('{"schema_version": "manyforge.persistent_key_register.v1"}')
     with pytest.raises(ProgramRunnerError) as refused:
         ProgramRuntime(

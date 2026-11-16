@@ -275,7 +275,46 @@ RecoveryAuthorityCapture make_automatic_planning_capture(const std::string& code
   capture.failed_validation_code = code;
   capture.failed_execution_effect = ParticipantEffectKnowledge::kNoEffect;
   capture.failed_preparation_never_dispatched = true;
+  capture.terminal_cleanup_complete = true;
   return capture;
+}
+
+// OD-257: a failed execution, retryable or not, is not decided while its
+// terminal cleanup runs; a stronger wait of its branch still comes first.
+TEST(RecoveryAssessmentTest, FailedExecutionWaitsForTerminalCleanupBehindItsStrongerWaits) {
+  for (const bool retryable : {true, false}) {
+    SCOPED_TRACE(retryable);
+    RecoveryAuthorityCapture capture;
+    capture.execution_id = 42;
+    capture.execution_state = ExecutionState::kFailed;
+    capture.failed_validation_retryable = retryable;
+    capture.terminal_effect = ParticipantEffectKnowledge::kNoEffect;
+    const auto pending = build_recovery_assessment(capture, 0);
+    EXPECT_EQ(pending.status, RecoveryAssessmentStatus::kWaiting);
+    EXPECT_EQ(pending.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
+    EXPECT_EQ(pending.recovery_class,
+              retryable ? RecoveryClass::kFailedValidation : RecoveryClass::kUnknownFault);
+    EXPECT_EQ(pending.allowed_actions, std::vector<RecoveryAction>{RecoveryAction::kResetCycle});
+    EXPECT_FALSE(pending.retry_admissible);
+    EXPECT_FALSE(pending.eligible_close);
+    EXPECT_FALSE(stopped_awaiting_terminal_cleanup(pending));
+    // A retryable failure awaiting its cleanup is not a non-retryable one.
+    EXPECT_EQ(failed_not_retry_admissible(pending), !retryable);
+
+    capture.stronger_authority_active = true;
+    EXPECT_EQ(build_recovery_assessment(capture, 0).reason_code,
+              retryable ? std::string(reason_codes::kRecoveryStrongerAuthorityActive)
+                        : std::string(reason_codes::kRecoveryTerminalCleanupPending));
+    capture.stronger_authority_active = false;
+
+    capture.terminal_cleanup_complete = true;
+    const auto decided = build_recovery_assessment(capture, 0);
+    EXPECT_EQ(decided.status, retryable ? RecoveryAssessmentStatus::kRetryReady
+                                        : RecoveryAssessmentStatus::kResetRequired);
+    EXPECT_EQ(decided.retry_admissible, retryable);
+    EXPECT_TRUE(decided.eligible_close);
+    EXPECT_EQ(failed_not_retry_admissible(decided), !retryable);
+  }
 }
 
 TEST(RecoveryAssessmentTest, AutomaticPlanningRetryRequiresClosedCauseAndExactNoEffectProof) {

@@ -3568,10 +3568,6 @@ class HeadlessService:
         )
         return {
             "schema_version": "manyforge.headless_health.v1",
-            **({"workbench_previous_session_registration": registration}
-               if (registration := getattr(
-                   self.core, "workbench_previous_session_registration", None
-               )) is not None else {}),
             "status_scope": "headless_projection",
             "status": "ready" if projection_ready else "degraded",
             "headless_projection_ready": projection_ready,

@@ -2073,8 +2073,7 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
 CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  // One Manager source snapshot answers both which committed activation is
-  // current and which committed Applies its publication history holds.
+  // One Manager source snapshot answers which committed activation is current.
   const auto runtime = RefreshLocked();
   const auto &record = ActiveAppliedRecordLocked(runtime);
   const auto &manager_payload =
@@ -2082,59 +2081,13 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   const auto publication_generation = RequiredCounter(
       RequiredMember(RequiredMember(manager_payload, "active"), "publication"),
       "publication_generation", 2U);
-  // Every committed Apply Manager's journal retains, the empty cell included.
-  // The journal is bounded by eviction, so older committed Applies may be
-  // gone; the retained ones and the current one are what consumers follow.
-  // Canonical origin bytes keep ordering exact.
-  using CommittedApply = std::tuple<std::string, std::string, std::uint64_t,
-                                    std::uint64_t, std::string>;
-  const auto committed_apply = [](const CanonicalValue &apply_record) {
-    const auto initialization =
-        RequiredString(apply_record, "scene_initialization");
-    const auto origin =
-        ReadPreparedOrigin(RequiredMember(apply_record, "prepared_activation"));
-    Require(initialization == "preserve" || initialization == "initialize",
-            "program_activation_invalid",
-            "Manager Scene initialization purpose is invalid");
-    return CommittedApply(RequiredString(apply_record, "intent_digest"),
-                          content_identity::canonical_json(origin),
-                          RequiredCounter(apply_record, "apply_id", 1U),
-                          RequiredCounter(apply_record, "apply_generation", 1U),
-                          initialization);
-  };
-  std::vector<CommittedApply> committed;
-  for (const auto &candidate :
-       RequiredArray(RequiredMember(manager_payload, "apply"), "records")) {
-    if (RequiredBool(candidate, "committed")) {
-      committed.push_back(committed_apply(candidate));
-    }
-  }
-  std::sort(committed.begin(), committed.end());
-  // Publication 1 is the canonical-empty bootstrap and every later one is
-  // exactly one committed named Apply. Eviction only removes older committed
-  // Applies, so the retained ones can never outnumber the Apply publications:
-  // more would pair this publication with a newer journal (a split read).
-  Require(committed.size() < publication_generation &&
-              std::adjacent_find(committed.begin(), committed.end(),
-                                 [](const auto &left, const auto &right) {
-                                   return std::get<0>(left) ==
-                                          std::get<0>(right);
-                                 }) == committed.end(),
-          "program_activation_history_incomplete",
-          "Manager's committed Applies do not match its publications");
-  CanonicalValue::Array committed_applies;
-  committed_applies.reserve(committed.size());
-  for (const auto &[record_digest, origin_json, apply_id, apply_generation,
-                    initialization] : committed) {
-    committed_applies.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"apply_generation", Number(apply_generation, "apply_generation")},
-        {"apply_id", Number(apply_id, "apply_id")},
-        {"record_digest", CanonicalValue(record_digest)},
-        {"origin", content_identity::parse_canonical_json(origin_json)},
-        {"scene_initialization", CanonicalValue(initialization)},
-    }));
-  }
+  const auto initialization = RequiredString(record, "scene_initialization");
+  Require(initialization == "preserve" || initialization == "initialize",
+          "program_activation_invalid",
+          "Manager Scene initialization purpose is invalid");
   const auto &prepared = RequiredMember(record, "prepared_activation");
+  const auto &origin = ReadPreparedOrigin(prepared);
+  const auto record_digest = RequiredString(record, "intent_digest");
   const auto outcome = ReadAppliedProgramOutcome(prepared);
   CanonicalValue program(nullptr);
   std::shared_ptr<const deployment::RetainedBundle> bundle;
@@ -2154,7 +2107,6 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   }
   CanonicalValue program_frame_facts(nullptr);
   if (outcome.program_binding_id.has_value() && !outcome.non_executable.has_value()) {
-    const auto record_digest = RequiredString(record, "intent_digest");
     const auto revision = RequiredString(prepared, "program_revision");
     const auto bundle_id = RequiredString(prepared, "retained_bundle_id");
     const auto graph_revision = RequiredString(prepared, "graph_revision");
@@ -2194,16 +2146,11 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
         RequiredString(applied_program_frame_facts_->second, "graph_revision") == graph_revision)
       program_frame_facts = applied_program_frame_facts_->second;
   }
-  const auto active = committed_apply(record);
-  Require(std::binary_search(committed.begin(), committed.end(), active),
-          "program_activation_history_incomplete",
-          "the active Apply is not among Manager's committed Applies");
-  const auto &[record_digest, origin_json, apply_id, apply_generation,
-               initialization] = active;
   return CanonicalValue(CanonicalValue::Object{
-      {"apply_generation", Number(apply_generation, "apply_generation")},
-      {"apply_id", Number(apply_id, "apply_id")},
-      {"committed_applies", CanonicalValue(std::move(committed_applies))},
+      {"apply_generation",
+       Number(RequiredCounter(record, "apply_generation", 1U),
+              "apply_generation")},
+      {"apply_id", Number(RequiredCounter(record, "apply_id", 1U), "apply_id")},
       {"program", std::move(program)},
       {"program_frame_facts", std::move(program_frame_facts)},
       {"program_binding_id", outcome.program_binding_id.has_value()
@@ -2213,7 +2160,7 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
       {"publication_generation",
        Number(publication_generation, "publication_generation")},
       {"record_digest", CanonicalValue(record_digest)},
-      {"origin", content_identity::parse_canonical_json(origin_json)},
+      {"origin", origin},
       {"scene_initialization", CanonicalValue(initialization)},
       {"schema_version",
        CanonicalValue(std::string(kCommittedScenarioActivationSchemaVersion))},

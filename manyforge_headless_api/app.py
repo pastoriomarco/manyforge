@@ -431,7 +431,6 @@ def _error_status(code: str) -> int:
         "execution_owner_not_ready",
         "operator_alarm_state_unavailable",
         "program_applied_selection_not_active",
-        "program_activation_history_incomplete",
         "program_runner_unavailable",
         "program_run_scheduling_failed",
         "program_cycle_reconciliation_required",

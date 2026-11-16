@@ -6,7 +6,6 @@ import type {
   CatalogResponse,
   HealthResponse,
   StartupScenarioNotice,
-  WorkbenchSessionNotice,
   JsonValue,
   ProgramDocument,
   ProgramAuthoringDocument,
@@ -40,7 +39,6 @@ import {
   nullableStringAt,
   numberAt,
   objectAt,
-  positiveIntegerAt,
   positiveNumberAt,
   quaternionAt,
   stringArrayAt,
@@ -205,86 +203,6 @@ function parseCatalogEntry(value: unknown, path: string): CatalogEntry {
   };
 }
 
-function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
-  const path = 'health.workbench_session_notice';
-  const record = objectAt(value, path);
-  exactKeysAt(record, [
-    'schema_version', 'session_id', 'archive_relative_path', 'shutdown',
-    'effects', 'history_coverage', 'journal_families', 'message',
-    'unfinished_operations', 'unfinished_operation_count', 'application_start_id',
-  ], path);
-  if (record.schema_version !== 'manyforge.workbench_previous_session.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.workbench_previous_session.v2');
-  }
-  const sessionId = stringAt(record.session_id, `${path}.session_id`);
-  if (!/^[0-9a-f]{32}$/.test(sessionId)) {
-    return fail(`${path}.session_id`, '32 lowercase hexadecimal characters');
-  }
-  const archiveRelativePath = stringAt(record.archive_relative_path, `${path}.archive_relative_path`);
-  if (archiveRelativePath !== `previous-runs/${sessionId}`) {
-    return fail(`${path}.archive_relative_path`, 'the matching previous-run archive path');
-  }
-  if (record.shutdown !== 'clean' && record.shutdown !== 'unknown') {
-    return fail(`${path}.shutdown`, 'clean or unknown');
-  }
-  if (record.effects !== 'closed' && record.effects !== 'unresolved' && record.effects !== 'unknown') {
-    return fail(`${path}.effects`, 'closed, unresolved or unknown');
-  }
-  if (record.history_coverage !== 'not_imported') {
-    return fail(`${path}.history_coverage`, 'not_imported');
-  }
-  const journalFamilies = stringArrayAt(record.journal_families, `${path}.journal_families`);
-  const expectedFamilies = ['program_cycle', 'scene', 'manager', 'kernel_operation'];
-  if (journalFamilies.length !== expectedFamilies.length
-    || journalFamilies.some((family, index) => family !== expectedFamilies[index])) {
-    return fail(`${path}.journal_families`, 'the four ordered journal families');
-  }
-  const message = stringAt(record.message, `${path}.message`);
-  const messageBytes = new TextEncoder().encode(message);
-  if (messageBytes.length > 1024 || new TextDecoder().decode(messageBytes) !== message
-    || message.normalize('NFC') !== message) {
-    return fail(`${path}.message`, 'NFC UTF-8 text of at most 1024 bytes');
-  }
-  let unfinishedOperationIds: number[] | null = null;
-  let unfinishedOperationCount: number | null = null;
-  let applicationStartId: string | null = null;
-  if (record.unfinished_operations !== null || record.unfinished_operation_count !== null
-    || record.application_start_id !== null) {
-    applicationStartId = stringAt(record.application_start_id, `${path}.application_start_id`);
-    if (!/^[0-9a-f]{16}$/.test(applicationStartId) || /^0{16}$/.test(applicationStartId)) {
-      return fail(`${path}.application_start_id`, '16 lowercase hexadecimal characters, not all zero');
-    }
-    unfinishedOperationIds = boundedArrayAt(
-      record.unfinished_operations, `${path}.unfinished_operations`, 64,
-    ).map((item, index) => {
-      const at = `${path}.unfinished_operations[${index}]`;
-      const row = objectAt(item, at);
-      exactKeysAt(row, ['operation_id', 'disposition'], at);
-      if (row.disposition !== 'host_replaced') return fail(`${at}.disposition`, 'host_replaced');
-      return positiveIntegerAt(row.operation_id, `${at}.operation_id`);
-    });
-    unfinishedOperationCount = integerAt(
-      record.unfinished_operation_count, `${path}.unfinished_operation_count`,
-    );
-    if (unfinishedOperationCount < unfinishedOperationIds.length) {
-      return fail(`${path}.unfinished_operation_count`, 'at least the listed operations');
-    }
-  }
-  return {
-    schemaVersion: record.schema_version,
-    sessionId,
-    archiveRelativePath,
-    shutdown: record.shutdown,
-    effects: record.effects,
-    historyCoverage: record.history_coverage,
-    journalFamilies,
-    message,
-    unfinishedOperationIds,
-    unfinishedOperationCount,
-    applicationStartId,
-  };
-}
-
 export function parseHealthResponse(value: unknown): HealthResponse {
   const record = objectAt(value, 'health');
   const mode = stringAt(record.mode, 'health.mode');
@@ -318,9 +236,6 @@ export function parseHealthResponse(value: unknown): HealthResponse {
       ? null
       : objectAt(record.headless, 'health.headless'),
     timestamp: numberAt(record.timestamp, 'health.timestamp'),
-    workbenchSessionNotice: record.workbench_session_notice == null
-      ? null
-      : parseWorkbenchSessionNotice(record.workbench_session_notice),
     startupScenarioNotice: record.startup_scenario_notice == null
       ? null
       : parseStartupScenarioNotice(record.startup_scenario_notice),

@@ -1023,10 +1023,12 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
   Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
           label + " socket path is invalid");
   struct stat path_status {};
-  Require(::lstat(path.c_str(), &path_status) == 0 &&
-              S_ISSOCK(path_status.st_mode) &&
+  const bool present = ::lstat(path.c_str(), &path_status) == 0;
+  Require(present || errno != ENOENT,
+          label + " socket does not exist yet (the process has not started or is not ready)");
+  Require(present && S_ISSOCK(path_status.st_mode) &&
               path_status.st_uid == ::geteuid(),
-          label + " socket is not an exact same-user socket");
+          label + " socket is not a socket owned by this user");
   FileDescriptor connection(
       ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
   if (!connection) {

@@ -903,7 +903,14 @@ TEST(SqliteOperationJournalTest, StopEventRecordsWhileAnEventReaderHoldsItsSnaps
   const auto command = CommandIntent("reader-command");
   ASSERT_TRUE(
       Accept(journal, command, Acceptance(command, state), state).ok());
-  record_during_read = [&] { return StopAccepted(*owner, AcceptedStopEvent(1U, 20)); };
+  // The Stop row is written by another thread, as the Kernel's writer does: a
+  // write on the reader's own thread would nest the write lock inside the
+  // reader lock, the opposite of Close's order.
+  record_during_read = [&] {
+    return std::async(std::launch::async, [&] {
+             return StopAccepted(*owner, AcceptedStopEvent(1U, 20));
+           }).get();
+  };
 
   const auto page = journal.ReadOperationalEvents(0U, 8U);
   ASSERT_TRUE(page.ok()) << page.error().message;

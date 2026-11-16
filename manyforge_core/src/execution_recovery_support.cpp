@@ -522,6 +522,19 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
     assessment.allowed_actions.push_back(RecoveryAction::kResetCycle);
   };
 
+  // One rule for a terminal execution (Failed or Stopped): while its execute
+  // worker's terminal cleanup still runs it is not yet decided (waiting,
+  // `terminal_cleanup_pending`), after its branch's own stronger waits. The
+  // cleanup's completion republishes (retry_ready, reset_required, close).
+  const bool terminal_cleanup_pending =
+      (capture.execution_state == ExecutionState::kFailed ||
+       capture.execution_state == ExecutionState::kStopped) &&
+      !capture.terminal_cleanup_complete;
+  const auto await_terminal_cleanup = [&]() {
+    assessment.status = RecoveryAssessmentStatus::kWaiting;
+    assessment.reason_code = reason_codes::kRecoveryTerminalCleanupPending;
+  };
+
   switch (capture.execution_state) {
     case ExecutionState::kInterrupted: {
       assessment.recovery_class = RecoveryClass::kUnknownFault;
@@ -543,20 +556,24 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       break;
     }
     case ExecutionState::kFailed: {
-      if (!capture.failed_validation_retryable) {
-        assessment.recovery_class = RecoveryClass::kUnknownFault;
-        assessment.status = RecoveryAssessmentStatus::kResetRequired;
-        assessment.reason_code = reason_codes::kRecoveryFailedNotRetryable;
-        add_reset_action();
-        break;
-      }
-      assessment.recovery_class = RecoveryClass::kFailedValidation;
+      const bool retryable = capture.failed_validation_retryable;
+      assessment.recovery_class =
+          retryable ? RecoveryClass::kFailedValidation : RecoveryClass::kUnknownFault;
       add_reset_action();
-      if (any_stop_owner_active || capture.stronger_authority_active) {
+      if (retryable && (any_stop_owner_active || capture.stronger_authority_active)) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = any_stop_owner_active
                                      ? reason_codes::kRecoveryStopOwnerActive
                                      : reason_codes::kRecoveryStrongerAuthorityActive;
+        break;
+      }
+      if (terminal_cleanup_pending) {
+        await_terminal_cleanup();
+        break;
+      }
+      if (!retryable) {
+        assessment.status = RecoveryAssessmentStatus::kResetRequired;
+        assessment.reason_code = reason_codes::kRecoveryFailedNotRetryable;
         break;
       }
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
@@ -583,11 +600,8 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
         assessment.reason_code = reason_codes::kRecoveryStopNotCertified;
         break;
       }
-      if (!capture.terminal_cleanup_complete) {
-        // Settled, but the execute worker's terminal cleanup still runs:
-        // not yet decided. Its completion republishes (retry_ready, close).
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryTerminalCleanupPending;
+      if (terminal_cleanup_pending) {
+        await_terminal_cleanup();
         assessment.evidence_refs.push_back(std::to_string(assessment.stop_event_id));
         break;
       }
@@ -639,6 +653,12 @@ bool stopped_awaiting_terminal_cleanup(const KernelRecoveryAssessmentDTO& assess
          assessment.status == RecoveryAssessmentStatus::kWaiting &&
          assessment.reason_code == reason_codes::kRecoveryTerminalCleanupPending &&
          assessment.backend_stop_confirmed && assessment.stop_event_id != 0U;
+}
+
+bool failed_not_retry_admissible(const KernelRecoveryAssessmentDTO& assessment) noexcept {
+  return assessment.execution_state == ExecutionState::kFailed && !assessment.retry_admissible &&
+         !(assessment.recovery_class == RecoveryClass::kFailedValidation &&
+           assessment.reason_code == reason_codes::kRecoveryTerminalCleanupPending);
 }
 
 bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO& previous,

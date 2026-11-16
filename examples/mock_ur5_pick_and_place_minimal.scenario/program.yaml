@@ -141,5 +141,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1"
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

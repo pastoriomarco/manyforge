@@ -686,7 +686,6 @@ describe('stored persistent value edits', () => {
     sequence: 7,
     keys: [],
     edits: [],
-    applyObservationFault: null,
   });
   const run = (programRunId: number, runRevision: number) => ({
     capture: { programRunId }, runRevision,

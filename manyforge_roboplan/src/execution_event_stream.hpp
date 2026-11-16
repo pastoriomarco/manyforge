@@ -163,7 +163,10 @@ public:
             "execution_event_subscribers_full",
             "the execution host serves its bounded number of event "
             "subscriptions",
-            kMaximumMessageBytes, kSendDeadline},
+            kMaximumMessageBytes, kSendDeadline,
+            // A refused subscriber's subscribe packet is read first, within
+            // the subscribe limit, so the "full" error reaches it.
+            kSubscribeDeadline},
         [this](const int subscriber, const std::stop_token writer_stop) {
           Serve(subscriber, writer_stop);
         },

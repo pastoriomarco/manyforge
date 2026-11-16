@@ -266,7 +266,6 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
     {
         "apply_generation",
         "apply_id",
-        "committed_applies",
         "scene_initialization",
         "program",
         "program_frame_facts",
@@ -279,9 +278,6 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
         "schema_version",
     }
 )
-_COMMITTED_APPLY_FIELDS = frozenset(
-    {"apply_generation", "apply_id", "record_digest", "origin", "scene_initialization"}
-)
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 
 
@@ -293,21 +289,19 @@ def validate_committed_scenario_activation(
     """Validate Manager's current committed Scenario activation.
 
     Publication 1 is the canonical-empty bootstrap and every later one is
-    one committed named Apply. Manager's journal is bounded by eviction, so
-    the committed Applies are the retained ones: never more than the Apply
-    publications, and always including the current one.
+    one committed named Apply; the activation names the current one.
     """
 
     if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
         _fail(label, "the closed committed Scenario activation record")
-    if value.get("schema_version") != "manyforge.committed_scenario_activation.v5":
+    if value.get("schema_version") != "manyforge.committed_scenario_activation.v6":
         _fail(
-            f"{label}.schema_version", "manyforge.committed_scenario_activation.v5"
+            f"{label}.schema_version", "manyforge.committed_scenario_activation.v6"
         )
     generation = value.get("publication_generation")
     if type(generation) is not int or not 2 <= generation <= _MAXIMUM_SAFE_INTEGER:
         _fail(f"{label}.publication_generation", "an integer of at least 2")
-    current = _committed_apply(value, label)
+    _committed_apply(value, label)
     if value.get("program") is not None and not isinstance(value.get("program"), dict):
         _fail(f"{label}.program", "an object or null")
     binding_id = value.get("program_binding_id")
@@ -329,20 +323,6 @@ def validate_committed_scenario_activation(
             })
         except ValueError as error:
             _fail(f"{label}.program_frame_facts", str(error))
-    committed = value.get("committed_applies")
-    if not isinstance(committed, list) or len(committed) > generation - 1:
-        _fail(f"{label}.committed_applies", "at most one record per Apply publication")
-    applies: list[tuple[str, dict[str, Any], str, int, str]] = []
-    for index, row in enumerate(committed):
-        row_label = f"{label}.committed_applies[{index}]"
-        if not isinstance(row, dict) or set(row) != _COMMITTED_APPLY_FIELDS:
-            _fail(row_label, "the closed committed Apply record")
-        applies.append(_committed_apply(row, row_label))
-    digests = [apply[0] for apply in applies]
-    if digests != sorted(set(digests)):
-        _fail(f"{label}.committed_applies", "unique records in digest order")
-    if current not in applies:
-        _fail(f"{label}.committed_applies", "the current Apply among them")
     return value
 
 

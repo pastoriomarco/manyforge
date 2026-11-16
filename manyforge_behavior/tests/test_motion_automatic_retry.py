@@ -1144,26 +1144,87 @@ def test_an_uncertain_failure_under_an_intervention_policy_is_held_with_its_iden
 
 
 @pytest.mark.parametrize("unavailable", [False, True], ids=["unassessed", "observation-unavailable"])
-def test_an_assessment_that_stays_unavailable_is_reread_boundedly_then_retained(
-    monkeypatch, unavailable
+def test_an_assessment_that_stays_undecided_is_reread_every_tick_without_giving_up(
+    unavailable,
 ) -> None:
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 4)
-    port = _MotionPort([_failed(None)], observes=[_failed(None)] * 10)
+    """OD-257: a long undecided phase (150 ticks) neither retains the
+    operation nor returns the failure; the decided read closes it."""
+
+    decided = _failed(_assessment(eligible=False))
+    undecided = [] if unavailable else [_failed(None)] * 150
+    port = _MotionPort([_failed(None)], observes=undecided + [decided])
     if unavailable:
         def observe(task_id):
-            port.observations += 1
-            raise OwnerTaskObservationUnavailableError("owner unreachable")
+            if port.observations < 150:
+                port.observations += 1
+                raise OwnerTaskObservationUnavailableError("owner unreachable")
+            return _MotionPort.observe(port, task_id)
         port.observe = observe
     _time, clock = _clocked()
     adapter = _motion(port, clock)
 
-    statuses = [_tick(adapter) for _ in range(4)]
-    assert statuses == [_RUNNING, _RUNNING, _RUNNING, _FAILURE]  # Never indefinitely RUNNING.
-    assert port.observations == 5  # Only exact rereads of the same operation.
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150  # Never gives up while undecided.
     assert port.closes == []
+    assert _tick(adapter) is _FAILURE  # Decided: closed, then the failure.
+    assert port.observations == 151  # Only exact rereads of the same operation.
+    assert len(port.closes) == 1
     assert len(port.starts) == 1
     assert adapter.failure_reason_code == "planning_failed"
-    assert adapter.cached_control_state() == "unrecoverable"  # Retained for Reset.
+    assert adapter.cached_control_state() == "inactive"
+
+
+def _cleanup_pending_assessment() -> dict[str, Any]:
+    """The Kernel's failed execution while its terminal cleanup still runs
+    (OD-257): waiting, no close permission yet."""
+
+    return {
+        **_assessment(eligible_close=False),
+        "status": "waiting",
+        "reason_code": "terminal_cleanup_pending",
+    }
+
+
+def test_a_failed_move_with_retries_is_retried_after_its_terminal_cleanup() -> None:
+    """OD-257: the move is retried once the cleanup ended, however long it ran."""
+
+    pending = _failed(_cleanup_pending_assessment())
+    port = _MotionPort(
+        [pending, _succeeded()], observes=[pending] * 150 + [_failed(_assessment())]
+    )
+    _time, clock = _clocked()
+    adapter = _motion(
+        port, clock, parameters={"automatic_retries": 1, "automatic_retry_delay_s": 0.0}
+    )
+
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150
+    assert port.closes == []  # No close permission while the cleanup runs.
+    for _ in range(5):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.closes) == 1  # Closed on the decided read, then retried.
+    assert len(port.starts) == 2
+
+
+def test_a_held_failure_after_its_terminal_cleanup_offers_continue() -> None:
+    """OD-257: the hold carries the decided assessment with its close
+    permission (Continue), never the cleanup wait."""
+
+    pending = _failed(_cleanup_pending_assessment())
+    port = _MotionPort([pending], observes=[pending] * 150 + [_failed(_assessment())])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock, parameters={"automatic_retries": 0})
+    adapter.hold_failures_for_intervention()
+
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150
+    assert _tick(adapter) is _FAILURE  # The wrapper holds it with owner actions.
+    assert port.closes == []
+    assessment = adapter.owner_recovery_context["owner_assessment"]
+    assert assessment["status"] == "retry_ready"
+    assert assessment["eligible_close"] is True  # Continue closes it.
 
 
 def test_a_transiently_unavailable_assessment_closes_once_it_is_readable() -> None:
@@ -1191,18 +1252,21 @@ def test_a_successful_read_showing_no_residency_is_already_retired() -> None:
     assert adapter.cached_control_state() == "inactive"
 
 
-def test_an_abandoned_move_whose_assessment_stays_unavailable_is_left_for_reset(monkeypatch) -> None:
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
+def test_an_abandoned_move_whose_assessment_stays_undecided_is_reread_until_it_closes() -> None:
     interrupted = _failed(None, state=OwnerTaskState.INTERRUPTED)
-    port = _MotionPort([_active()], observes=[_active()] + [interrupted] * 10)
+    decided = _failed(_assessment(execution_state="Stopped"), state=OwnerTaskState.INTERRUPTED)
+    port = _MotionPort([_active()], observes=[_active()] + [interrupted] * 150 + [decided])
     _time, clock = _clocked()
     adapter = _motion(port, clock)
     _tick(adapter)
     adapter.stop(_INVALID)
 
-    # One observation still active, then two unavailable rereads, then left.
-    assert [adapter.drain_invalidated() for _ in range(4)] == [False, False, False, True]
+    # One observation still active, then 150 undecided rereads (OD-257).
+    assert [adapter.drain_invalidated() for _ in range(151)] == [False] * 151
     assert port.closes == []
+    assert adapter.has_pending_drain
+    assert adapter.drain_invalidated() is True  # Decided: closed.
+    assert len(port.closes) == 1
     assert not adapter.has_pending_drain
 
 
@@ -1518,12 +1582,11 @@ def test_interrupt_adapter_retains_a_trip_whose_assessment_requires_intervention
 
 @pytest.mark.parametrize("spelling", ["stopped", "intervention_required", "STOPPED", "Unknown"])
 def test_interrupt_adapter_does_not_decide_on_an_unknown_execution_state_spelling(
-    monkeypatch, spelling
+    spelling,
 ) -> None:
     # Only Core's exact TitleCase spellings qualify: an unknown one is neither
     # stopped nor intervention, so the stopped operation stays undecided and
     # the node keeps rereading (it waits, never decides).
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
     task = _interrupt_task(
         OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_captured_stop_assessment(spelling),
@@ -1630,15 +1693,12 @@ def _stuck_stop() -> OwnerTaskSnapshot:
     )
 
 
-def test_an_unconfirmed_stop_waits_for_the_component_then_gets_its_normal_result(
-    monkeypatch,
-) -> None:
+def test_an_unconfirmed_stop_waits_for_the_component_then_gets_its_normal_result() -> None:
     """A stopped operation whose result can't be
     confirmed (the component's activity is `unknown`) neither holds for an
-    operator acknowledgement nor advances the tree: the node waits past the
-    old reread bound, then gets the Stop's normal result once it settles."""
+    operator acknowledgement nor advances the tree: the node waits without a
+    time limit, then gets the Stop's normal result once it settles."""
 
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
     stuck = _program_stop_trip(pending=True)
     ready = _program_stop_trip(pending=False)
     port = _MotionPort([stuck], observes=[stuck] * 6 + [ready])
@@ -2116,3 +2176,120 @@ def test_a_motion_refused_while_the_simulation_is_not_playing_holds_for_run() ->
     assert adapter.status is _SUCCESS
     assert len(port.starts) == 3
     assert adapter.audit_events[-1]["kind"] == "program_node_simulation_hold_ended"
+
+
+def _retired_refusal() -> OwnerTaskSnapshot:
+    """A move refused before sending (here a rule's `rule_holds` at the final
+    recheck) whose operation the Kernel already retired: no assessment."""
+
+    task = _failed(None)
+    return replace(
+        task,
+        metadata={**task.metadata, "resident": False, "operation_state": "intervention_required"},
+        reason_code="rule_holds",
+        message="Rule light_curtain holds its scope (its condition holds)",
+    )
+
+
+def test_a_held_failure_of_a_retired_operation_holds_without_an_owner_task() -> None:
+    """OD-263: nothing is left to hold, so the hold carries no owner task and
+    its offers follow the node's policy (Continue, Retry, manual result)."""
+
+    port = _MotionPort([_retired_refusal()])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+    adapter.hold_failures_for_intervention()
+    recovery = _Interventions(_Log())
+    node = RecoveryAwareNode(
+        child=adapter,
+        node_instance_id="motion",
+        policy=SimpleNamespace(recovery_policy={"allow_intervention": True, "max_retries": 0}),
+        attempt_source=_Attempts(),
+        recovery_port=recovery,
+    )
+
+    node.tick_once()
+    assert node.status is _RUNNING  # Held for the operator.
+    assert port.closes == []
+    assert adapter.owner_recovery_context is None
+    assert len(recovery.required) == 1
+    required = recovery.required[0]
+    assert required["reason_code"] == "rule_holds"
+    assert "owner_task_id" not in required and "owner_assessment" not in required
+
+
+def _stopped_newcomer(effect: str = "no_effect") -> OwnerTaskSnapshot:
+    """A take-over newcomer ended by the operator's Stop before it was sent,
+    already retired by the Kernel (its assessment is unreadable)."""
+
+    task = _failed(None, state=OwnerTaskState.INTERRUPTED)
+    return replace(
+        task,
+        metadata={
+            **task.metadata,
+            "resident": False,
+            "operation_state": "stopped",
+            "stop_event_id": 49,
+            "operation_failure": {
+                **_FACT,
+                "failure": {"code": "operation_stopped", "message": "native operation was interrupted"},
+                "terminal_facts": [{"kind": "cancelled_before_dispatch", "effect": effect}],
+            },
+            "recovery_assessment_failure": {
+                "reason_code": "owner_recovery_assessment_invalid",
+                "message": "operation has no resident recovery owner",
+            },
+        },
+        reason_code="operation_stopped",
+        message="native operation was interrupted",
+    )
+
+
+def test_a_newcomer_ended_by_the_stop_that_holds_it_holds_and_resubmits_on_resume() -> None:
+    """OD-264: nothing of it started, so the node holds like a Stop-fence
+    refusal at admission, and Resume makes a fresh attempt; the run is not
+    failed."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    port = _MotionPort([_stopped_newcomer(), _succeeded()])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+
+
+def test_a_stopped_newcomer_whose_node_is_not_held_still_fails() -> None:
+    """A Stop that does not hold the node (the Program's own Stop) keeps the
+    failure path, as does a newcomer that may have moved."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    for task, held in ((_stopped_newcomer(), frozenset()),
+                       (_stopped_newcomer("effect_settled"), frozenset({"motion"}))):
+        port = _MotionPort([task])
+        _time, clock = _clocked()
+        stop_state = OperatorMotionStopState({"motion": ()})
+        stop_state.publish(OperatorMotionStopSnapshot(3, held))
+        adapter = _motion(port, clock, hold=stop_state)
+        assert _tick(adapter) is _FAILURE
+        assert adapter.failure_reason_code == "operation_stopped"

@@ -79,9 +79,9 @@ the Program runner itself, so a key declared `read` still receives its
 - A stored value that the applied Program no longer accepts (for example a
   pose outside a narrowed `allowed_frames`) is dropped with a notice when the
   run starts, and the run still starts from `initial:`.
-- If the runner missed an Apply, the values are kept and the page shows the
-  fault "Applied Program not seen by stored values"
-  (`applied_program_not_observed`) so the cause can be found and fixed.
+- Stored values follow the Program the runner actually activates. An Apply
+  that a later one replaced before the runner activated it has no effect on
+  them.
 - A Reset with **Reload initial scene** also resets every persistent key,
   whatever its access, to `initial:` (or empty). Its confirmation lists the
   stored values it resets (current value → new value), and each reset is

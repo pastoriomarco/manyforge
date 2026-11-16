@@ -44,49 +44,16 @@ afterEach(() => {
 });
 
 describe('Composer shell continuity', () => {
-  it('shows only the backend-projected session notice in the existing warning rail', async () => {
+  it('shows a refused startup project in the warning rail until it is cleared', async () => {
     const health: HealthResponse = {
       status: 'ok', mode: 'headless_client', components: {},
       runtimeAvailability: null, headless: null, timestamp: 1,
     };
-    healthProjection.value = health;
-    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
     // Resolve the existing lazy viewport so its real runtime overlay is rendered.
+    healthProjection.value = health;
+    renderToStaticMarkup(<App />);
     await import('./components/StructuralViewer');
     await Promise.resolve();
-    healthProjection.value = { ...health, workbenchSessionNotice: {
-      schemaVersion: 'manyforge.workbench_previous_session.v2',
-      sessionId: 'a'.repeat(32),
-      archiveRelativePath: `previous-runs/${'a'.repeat(32)}`,
-      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
-      journalFamilies: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
-      message: 'Session a: journals retained; motion effects unknown. Nothing was resumed.',
-      unfinishedOperationIds: null, unfinishedOperationCount: null, applicationStartId: null,
-    } };
-    const markup = renderToStaticMarkup(<App />);
-    expect(markup).toContain('ManyForge did not close correctly last time.');
-    expect(markup).toContain('The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.');
-    expect(markup).toContain('workbench-notice-row severity-warning');
-    const noticeHealth = healthProjection.value;
-    for (const status of ['registered', 'acknowledged', 'quiet']) {
-      healthProjection.value = { ...noticeHealth, headless: {
-        workbench_previous_session_registration: { session_id: 'a'.repeat(32), status },
-      } };
-      expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
-    }
-    healthProjection.value = { ...noticeHealth, headless: {
-      workbench_previous_session_registration: { session_id: 'b'.repeat(32), status: 'registered' },
-    } };
-    expect(renderToStaticMarkup(<App />)).toContain('ManyForge did not close correctly last time.');
-    healthProjection.value = { ...health, workbenchSessionNotice: null };
-    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
-  });
-
-  it('shows a refused startup project in the warning rail until it is cleared', () => {
-    const health: HealthResponse = {
-      status: 'ok', mode: 'headless_client', components: {},
-      runtimeAvailability: null, headless: null, timestamp: 1,
-    };
     const message = 'Startup project /p/cell.scenario was not opened: a Scenario is still applied. Start a New Scenario, then Load.';
     healthProjection.value = { ...health, startupScenarioNotice: {
       path: '/p/cell.scenario', code: 'scenario_new_required', message,

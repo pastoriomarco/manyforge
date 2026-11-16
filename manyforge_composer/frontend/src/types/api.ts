@@ -27,7 +27,6 @@ export interface HealthResponse {
   runtimeAvailability: RuntimeAvailability | null;
   headless: Record<string, unknown> | null;
   timestamp: number;
-  workbenchSessionNotice?: WorkbenchSessionNotice | null;
   /** The startup project was not opened; cleared by the next Load or New. */
   startupScenarioNotice?: StartupScenarioNotice | null;
 }
@@ -36,23 +35,6 @@ export interface StartupScenarioNotice {
   path: string;
   code: string;
   message: string;
-}
-
-export interface WorkbenchSessionNotice {
-  schemaVersion: 'manyforge.workbench_previous_session.v2';
-  sessionId: string;
-  archiveRelativePath: string;
-  shutdown: 'clean' | 'unknown';
-  effects: 'closed' | 'unresolved' | 'unknown';
-  historyCoverage: 'not_imported';
-  journalFamilies: string[];
-  message: string;
-  /** The previous run's first 64 unfinished operation numbers, each marked
-   * host_replaced; null with the count when its journal was unreadable. */
-  unfinishedOperationIds: number[] | null;
-  unfinishedOperationCount: number | null;
-  /** The start these operation numbers belong to; null with them. */
-  applicationStartId: string | null;
 }
 
 export interface CatalogJsonSchema {
@@ -950,15 +932,14 @@ export interface PersistentKeyValue {
 }
 
 /**
- * One attributed change: an operator request, a write from a run's node, a
- * value dropped because the committed Program no longer keeps it, or a fault
- * (a committed Apply the Program runner never observed).
+ * One attributed change: an operator request, a write from a run's node, or a
+ * value dropped because the committed Program no longer keeps it.
  */
 export interface PersistentKeyValueEdit {
   sequence: number;
   /** Null when a change covers every key of the Scenario. */
   key: string | null;
-  action: 'set' | 'reset' | 'clear' | 'dropped' | 'fault';
+  action: 'set' | 'reset' | 'clear' | 'dropped';
   /**
    * The application start that wrote the change: run and attempt numbers
    * restart with every start, so they are read with it.
@@ -969,7 +950,7 @@ export interface PersistentKeyValueEdit {
   programRunId: number | null;
   nodeInstanceId: string | null;
   nodeAttemptId: number | null;
-  /** Why a value was dropped, or the fault (`applied_program_not_observed`). */
+  /** Why a value was dropped. */
   reason: string | null;
   detail: string | null;
 }
@@ -986,12 +967,6 @@ export interface PersistentKeyValues {
   sequence: number;
   keys: PersistentKeyValue[];
   edits: PersistentKeyValueEdit[];
-  /**
-   * Committed Applies of this Scenario the Program runner never observed.
-   * Values were kept and checked against the current Program; the missed
-   * notification is a defect to find and fix.
-   */
-  applyObservationFault: { code: string; recordDigests: string[] } | null;
 }
 
 /** The facts of one automatic motion retry, parsed strictly from its audit event. */

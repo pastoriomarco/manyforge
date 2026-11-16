@@ -260,6 +260,10 @@ export function DeploymentCompositionPanel({
           )}
           <div className="program-declaration-form compact">
             <h3>Manager Apply inventory</h3>
+            <p className="panel-intro">
+              The running Apply, the one that installed the active configuration and the newest
+              finished one. Older Applies are in History.
+            </p>
             {readModel.status.status.apply.records.length === 0 ? (
               <p className="panel-intro">No Manager Apply has been recorded.</p>
             ) : (

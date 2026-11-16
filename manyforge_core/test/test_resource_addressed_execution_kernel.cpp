@@ -148,8 +148,7 @@ TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertaintyIsJournaledForEx
   EXPECT_TRUE(kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id).ok());
   ASSERT_TRUE(drain_journal(kernel));
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "state:subordinate_state_observed";
+    journal.SetFailNextKind("state:subordinate_state_observed");
   }
   // A failed write neither refuses nor undoes the confirmation; it sets the fault.
   EXPECT_TRUE(kernel.record_late_cancel_uncertain(&engine, engine.next_execution_id).ok());
@@ -185,8 +184,7 @@ TEST(ResourceAddressedExecutionKernelTest, LateGripperCancelUsesExactCommandAndD
   EXPECT_FALSE(kernel.record_late_cancel_uncertain(&engine, preparation, command, generation,
                                                    CommandTargetId("other.target")).ok());
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "state:subordinate_state_observed";
+    journal.SetFailNextKind("state:subordinate_state_observed");
   }
   // The failed write does not refuse the confirmation; it sets the fault.
   const auto projected = kernel.record_late_cancel_uncertain(&engine, preparation, command, generation, target);
@@ -401,8 +399,7 @@ TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertaintyDoesNotAcknowled
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(wait_until([&] { return engine.execute_calls.load() == 1; }));
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "state:subordinate_state_observed";
+    journal.SetFailNextKind("state:subordinate_state_observed");
   }
   // The failed write is not acknowledged as success: the action stands and
   // the write fault is set.
@@ -1021,7 +1018,7 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAdmissionJournalFailureIsLogged
   auto kernel_heap_test_owner = make_unclaimed_kernel({direct}, clock, scheduler, journal, config);
   auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
-  journal.fail_next_kind = "operation_accepted";
+  journal.SetFailNextKind("operation_accepted");
   journal.hold_after_failure = true;
   // The failed acceptance row refuses nothing: the motion is dispatched and
   // the write fault is set.
@@ -9821,8 +9818,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(journal.calls.size(), baseline);
   }
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "state:subordinate_state_observed";
+    journal.SetFailNextKind("state:subordinate_state_observed");
   }
   // The terminal commits at once; its failed row only sets the fault.
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
@@ -13458,15 +13454,14 @@ TEST(ResourceAddressedExecutionKernelTest,
                                              ? "state:operation_reset_failed"
                                              : "state:operation_acknowledge_completed_failed";
         auto failure_records = std::make_shared<std::atomic_int>();
-        journal.SetConcurrentRecordHook([failure_kind, persistence, failure_records](std::string_view kind) {
+        journal.SetRecordHook([failure_kind, persistence, failure_records](std::string_view kind) {
           if (kind != failure_kind) return;
           ++*failure_records;
           if (std::string_view(persistence) == "threw")
             throw std::runtime_error("journal unavailable");
         });
         if (std::string_view(persistence) == "rejected") {
-          std::lock_guard lock(journal.mutex);
-          journal.fail_next_kind = failure_kind;
+          journal.SetFailNextKind(failure_kind);
         }
         const auto before = kernel.get_operation_projection(executed.value().operation_id);
         ASSERT_TRUE(before.ok());
@@ -13590,7 +13585,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       auto& kernel = *kernel_heap_test_owner;
       HeldSettlementCall fault_write;
       if (initial_reset && fault_write_fails) {
-        journal.SetConcurrentRecordHook([hold = fault_write.Blocker()](std::string_view kind) {
+        journal.SetRecordHook([hold = fault_write.Blocker()](std::string_view kind) {
           if (kind == "state:operation_reset_failed") hold();
         });
       }
@@ -13615,9 +13610,8 @@ TEST(ResourceAddressedExecutionKernelTest,
             false, ErrorDTO{"settlement_rejected", "settlement rejected", {}}};
       }
       if (fault_write_fails) {
-        std::lock_guard lock(journal.mutex);
-        journal.fail_next_kind = initial_reset ? "state:operation_reset_failed"
-                                               : "state:operation_acknowledge_completed_failed";
+        journal.SetFailNextKind(initial_reset ? "state:operation_reset_failed"
+                                               : "state:operation_acknowledge_completed_failed");
         journal.hold_after_failure = true;
       }
       const auto before = kernel.get_operation_state(executed.value().operation_id);
@@ -13662,8 +13656,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       // A failed acceptance row of the Reset neither refuses it nor holds its
       // cleanup effects; it starts a new loss episode.
       if (fault_write_fails) {
-        std::lock_guard lock(journal.mutex);
-        journal.fail_next_kind = "control_accepted";
+        journal.SetFailNextKind("control_accepted");
         journal.hold_after_failure = true;
       }
       const auto reset =
@@ -13907,10 +13900,10 @@ TEST(ResourceAddressedExecutionKernelTest, ThrownObservationWriteReleasesCommitF
   ASSERT_TRUE(before.ok());
   ASSERT_TRUE(drain_journal(kernel));
   std::atomic_bool failed{};
-  journal.record_hook = [&](std::string_view kind) {
+  journal.SetRecordHook([&](std::string_view kind) {
     if (kind == "state:subordinate_state_observed" && !failed.exchange(true))
       throw std::runtime_error("injected ordinary write failure");
-  };
+  });
   // The observation commits at once; the write that throws on the writer
   // only sets the fault.
   EXPECT_NO_THROW(engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted));
@@ -13952,11 +13945,11 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(drain_journal(kernel));
     // The writer stops at the batch after the throw, so the fault stays
     // readable.
-    journal.record_hook = [&journal](std::string_view kind) {
+    journal.SetRecordHook([&journal](std::string_view kind) {
       if (kind != "operation_accepted") return;
       journal.Block();
       throw std::runtime_error("admission write threw");
-    };
+    });
     const auto intent = coordinated
                             ? grouped_motion_commands_operation("request.throw-admission")
                             : motion_operation("request.throw-admission");
@@ -13979,7 +13972,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(fault->program_run_id, intent.program_run_id);
     EXPECT_EQ(fault->operation_id, std::optional(accepted.value().operation_id));
     EXPECT_EQ(fault->operation_revision, std::optional(accepted.value().operation_revision));
-    journal.record_hook = {};
+    journal.SetRecordHook({});
     // The operation is resident: reconfiguration may retain or refuse it; the
     // fault fact stays while the episode lasts.
     static_cast<void>(kernel.reconfigure_runtime_participants(
@@ -14035,8 +14028,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto effects_before = scale ? engine.runtime_scale_calls.load() : engine.acknowledge_calls.load();
     const std::string kind = scale ? "runtime_scale_accepted" : "control_accepted";
     {
-      std::lock_guard lock(journal.mutex);
-      journal.fail_next_kind = kind;
+      journal.SetFailNextKind(kind);
       journal.hold_after_failure = !scale;
     }
     if (scale) {
@@ -14118,18 +14110,18 @@ TEST(ResourceAddressedExecutionKernelTest,
     auto& kernel = *kernel_heap_test_owner;
     ASSERT_TRUE(drain_journal(kernel));
     // The writer stops at the batch after the throw: the fault stays readable.
-    journal.record_hook = [&](std::string_view kind) {
+    journal.SetRecordHook([&](std::string_view kind) {
       if (kind != "operation_accepted") return;
       journal.Block();
       throw std::runtime_error(message);
-    };
+    });
     EXPECT_TRUE(kernel.execute(motion_operation("journal.invalid-text")).ok());
     ASSERT_TRUE(wait_until([&] { return kernel.get_operation_journal_write_fault().has_value(); }));
     const auto fault = kernel.get_operation_journal_write_fault();
     ASSERT_TRUE(fault);
     EXPECT_EQ(fault->error.message, bounded_operation_journal_diagnostic_text(message, 1024U));
     EXPECT_NO_THROW((void)manyforge::content_identity::CanonicalValue(fault->error.message));
-    journal.record_hook = {};
+    journal.SetRecordHook({});
     journal.Unblock();
     ASSERT_TRUE(drain_journal(kernel));
   }
@@ -14155,10 +14147,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto operation = kernel.execute(scoped_motion_operation("journal.scoped-state"));
   ASSERT_TRUE(operation.ok());
   ASSERT_TRUE(drain_journal(kernel));
-  journal.record_hook = [](std::string_view kind) {
+  journal.SetRecordHook([](std::string_view kind) {
     if (kind == "state:subordinate_state_observed")
       throw std::runtime_error(std::string(2048U, 'x'));
-  };
+  });
   EXPECT_NO_THROW(engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted));
   ASSERT_TRUE(drain_journal(kernel));
   const auto fault = kernel.get_operation_journal_write_fault();
@@ -14177,10 +14169,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   // A later control write failing in the same loss episode cannot replace
   // its first fact, regardless of the backend's newer error; a later clean
   // batch only clears it.
-  journal.record_hook = {};
+  journal.SetRecordHook({});
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "control_accepted";
+    journal.SetFailNextKind("control_accepted");
   }
   const auto state = kernel.get_operation_state(operation.value().operation_id);
   ASSERT_TRUE(state.ok());
@@ -15300,8 +15291,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   for (const auto& corrupt : invalidate) {
     engine.UpdateRuntimeScale([&](auto& scale) { corrupt(scale); });
     {
-      std::lock_guard lock(journal.mutex);
-      journal.fail_next_kind = "state:runtime_scale_status_invalid";
+      journal.SetFailNextKind("state:runtime_scale_status_invalid");
     }
     // The failed row refuses nothing: the observation is applied and the
     // journal write fault is set.
@@ -16639,8 +16629,7 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteFaultDoesNotBlockMotion) 
   auto& kernel = *kernel_heap_test_owner;
 
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "operation_accepted";
+    journal.SetFailNextKind("operation_accepted");
     journal.hold_after_failure = true;
   }
   // The failed acceptance row refuses nothing: the motion is dispatched.
@@ -17268,7 +17257,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto& kernel = *kernel_heap_test_owner;
   const auto first = kernel.execute(motion_operation("request.stop-journal.first.execute"));
   ASSERT_TRUE(first.ok()) << first.error().message;
-  journal.fail_next_kind = "stop_event_accepted";
+  journal.SetFailNextKind("stop_event_accepted");
 
   // A Stop is never refused, also at the ordinary ledger capacity.
   const auto stopped = kernel.stop(stop_request("request.stop-journal.stop", first.value(), 1U));
@@ -17826,7 +17815,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   FakeParticipantEngine rejected_engine;
   FakeOperationJournal failing_journal;
-  failing_journal.fail_next_kind = "operation_accepted";
+  failing_journal.SetFailNextKind("operation_accepted");
   failing_journal.hold_after_failure = true;
   auto failing_kernel_heap_test_owner = make_claimed_kernel(
       {registration(
@@ -17913,8 +17902,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.get_operation_state(executed.value().operation_id).value().operation_revision;
   ASSERT_TRUE(drain_journal(kernel));
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "control_accepted";
+    journal.SetFailNextKind("control_accepted");
     journal.hold_after_failure = true;
   }
   {
@@ -19468,7 +19456,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   std::atomic_bool retirement_started{};
   std::atomic_bool settled_after_retirement_start{};
   const auto test_thread = std::this_thread::get_id();
-  journal.record_hook = [&, hold_write = settlement.Blocker()](const std::string_view kind) {
+  journal.SetRecordHook([&, hold_write = settlement.Blocker()](const std::string_view kind) {
     if (kind != "state:operation_acknowledge_completed_failed" ||
         std::this_thread::get_id() == test_thread) {
       return;
@@ -19477,7 +19465,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     if (retirement_started.load(std::memory_order_acquire)) {
       settled_after_retirement_start.store(true, std::memory_order_release);
     }
-  };
+  });
   ASSERT_TRUE(kernel->acknowledge_completed(
                   control_request("request.retirement.failure.ack", executed.value(), 1U))
                   .ok());
@@ -23555,6 +23543,289 @@ TEST(ResourceAddressedExecutionKernelTest,
 }  // namespace
 
 namespace {
+// An unsent take-over as in
+// NeverDispatchedTakeoverUsesExactLocalCloseBeforeOrdinaryWinnerPreparation:
+// the original is still planning and its local close succeeds (or, with
+// `close_accepted == false`, is refused so the take-over stays pending).
+struct UnsentTakeoverResetFixture {
+  explicit UnsentTakeoverResetFixture(
+      ResourceAddressedExecutionKernelConfig config = ResourceAddressedExecutionKernelConfig{
+          kTestApplicationStartId, CellId("cell.test"), 8U}) {
+    engine.supports_motion_replacement = true;
+    engine.defer_prepare_completion = true;
+    auto row = registration(
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+    row.motion_takeover_preparation_budget_s = 1.0;
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    owner = make_uncaptured_kernel({row}, clock, scheduler, journal, std::move(config));
+  }
+
+  void ArmLocalClose(bool close_accepted) {
+    engine.status.execution_id = engine.next_execution_id;
+    engine.status.state = ExecutionState::kPlanning;
+    engine.recovery_assessment.execution_id = engine.next_execution_id;
+    engine.recovery_assessment.eligible_close = true;
+    engine.recovery_action_hook = [this, close_accepted] {
+      const auto& request = *engine.last_recovery_request;
+      engine.next_recovery_result = KernelRecoveryActionResultDTO{
+          request.request_key, request.action, close_accepted, {}, std::nullopt};
+      if (!close_accepted) return;
+      engine.defer_prepare_completion = false;
+      engine.next_execution_id = 2U;
+      engine.next_execute_result = Result<std::uint64_t>::Ok(2U);
+      {
+        std::lock_guard lock(engine.prepared_motion_mutex_);
+        engine.prepared_snapshot.reset();
+      }
+      engine.status = {};
+    };
+  }
+
+  [[nodiscard]] Result<OperationControlAcceptedDTO> Reset(const std::string& request_id,
+                                                          const OperationAcceptedDTO& operation) {
+    const auto state = owner->get_operation_state(operation.operation_id);
+    EXPECT_TRUE(state.ok());
+    return owner->reset(
+        control_request(request_id, operation, state.value().operation_revision.value()));
+  }
+
+  [[nodiscard]] OperationReadProjectionDTO Read(const OperationAcceptedDTO& operation) const {
+    const auto read = owner->get_operation_projection(operation.operation_id);
+    EXPECT_TRUE(read.ok());
+    return read.value();
+  }
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::unique_ptr<ResourceAddressedExecutionKernel> owner;
+};
+
+void expect_retired_unsent_candidate(const OperationReadProjectionDTO& candidate) {
+  EXPECT_FALSE(candidate.resident);
+  EXPECT_FALSE(candidate.control_pending);
+  EXPECT_EQ(candidate.operation.state, OperationStateKind::kStopped);
+  ASSERT_TRUE(candidate.operation.participants.front().terminal_fact);
+  EXPECT_EQ(candidate.operation.participants.front().terminal_fact->kind,
+            ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(candidate.operation.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_FALSE(candidate.operation.participants.front().terminal_error);
+}
+
+// A Reset of the cold-committed source after the take-over's advance ended
+// has nothing to wait for: it settles before it returns.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetOfAnUnsentTakeoverSourceAfterTheAdvanceSettlesAtOnce) {
+  UnsentTakeoverResetFixture fixture;
+  auto& kernel = *fixture.owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.reset.after.original"));
+  ASSERT_TRUE(original.ok());
+  fixture.ArmLocalClose(true);
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.reset.after.winner"));
+  fixture.engine.recovery_action_hook = {};
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(fixture.Read(original.value()).resident);
+  const auto reset = fixture.Reset("unsent.reset.after.reset", original.value());
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  const auto source = fixture.Read(original.value());
+  EXPECT_FALSE(source.resident);
+  EXPECT_FALSE(source.control_pending);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, candidate.value().operation_id);
+  }
+}
+
+// A Reset of the source accepted while the take-over's advance still prepares
+// and sends the candidate stays pending until that advance ends, then settles
+// there; the candidate is not touched.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetOfAnUnsentTakeoverSourceDuringCandidatePreparationSettlesWhenTheAdvanceEnds) {
+  UnsentTakeoverResetFixture fixture;
+  auto& kernel = *fixture.owner;
+  auto& engine = fixture.engine;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.reset.gap.original"));
+  ASSERT_TRUE(original.ok());
+  fixture.ArmLocalClose(true);
+  std::optional<Result<OperationControlAcceptedDTO>> reset;
+  std::optional<OperationReadProjectionDTO> during_preparation;
+  std::optional<OperationReadProjectionDTO> at_dispatch;
+  engine.prepare_motion_hook = [&] {
+    if (engine.prepare_motion_calls.load() != 2 || reset) return;
+    reset = fixture.Reset("unsent.reset.gap.reset", original.value());
+    during_preparation = fixture.Read(original.value());
+  };
+  engine.execute_return_hook = [&] {
+    if (reset && !at_dispatch) at_dispatch = fixture.Read(original.value());
+  };
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.reset.gap.winner"));
+  engine.prepare_motion_hook = {};
+  engine.execute_return_hook = {};
+  engine.recovery_action_hook = {};
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(reset.has_value());
+  ASSERT_TRUE(reset->ok()) << reset->error().message;
+  ASSERT_TRUE(during_preparation && at_dispatch);
+  EXPECT_TRUE(during_preparation->resident);
+  EXPECT_TRUE(during_preparation->control_pending);
+  EXPECT_TRUE(at_dispatch->resident);
+  EXPECT_TRUE(at_dispatch->control_pending);
+  const auto source = fixture.Read(original.value());
+  EXPECT_FALSE(source.resident);
+  EXPECT_FALSE(source.control_pending);
+  const auto next = fixture.Read(candidate.value());
+  EXPECT_TRUE(next.resident);
+  EXPECT_FALSE(next.control_pending);
+  EXPECT_EQ(next.operation.state, OperationStateKind::kPrepared);
+  EXPECT_EQ(engine.prepare_motion_calls.load(), 2);
+  EXPECT_EQ(engine.execute_calls.load(), 1);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_EQ(slot.state, ResourceSlotState::kDispatched);
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, candidate.value().operation_id);
+  }
+}
+
+// After such a Reset settled, the source is gone (a repeated Reset is not
+// refused as busy) and the candidate is stopped and reset as usual.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetOfAnUnsentTakeoverSourceDuringCandidatePreparationLeavesTheCandidateToStopAndReset) {
+  UnsentTakeoverResetFixture fixture;
+  auto& kernel = *fixture.owner;
+  auto& engine = fixture.engine;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.reset.stop.original"));
+  ASSERT_TRUE(original.ok());
+  fixture.ArmLocalClose(true);
+  std::optional<Result<OperationControlAcceptedDTO>> reset;
+  engine.prepare_motion_hook = [&] {
+    if (engine.prepare_motion_calls.load() != 2 || reset) return;
+    reset = fixture.Reset("unsent.reset.stop.reset", original.value());
+  };
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.reset.stop.winner"));
+  engine.prepare_motion_hook = {};
+  engine.recovery_action_hook = {};
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(reset && reset->ok());
+  EXPECT_FALSE(fixture.Read(original.value()).resident);
+  const auto repeated = kernel.reset(control_request(
+      "unsent.reset.stop.reset.again", original.value(),
+      reset->value().operation_revision_after_acceptance.value()));
+  ASSERT_FALSE(repeated.ok());
+  EXPECT_EQ(repeated.error().details.at("reason"), "operation_not_resident");
+
+  static_cast<void>(kernel.stop_all(full_stop_request("unsent.reset.stop.all")));
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return fixture.Read(candidate.value()).operation.state == OperationStateKind::kStopped;
+  }));
+  const auto candidate_reset = fixture.Reset("unsent.reset.stop.winner.reset", candidate.value());
+  ASSERT_TRUE(candidate_reset.ok()) << candidate_reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return !fixture.Read(candidate.value()).resident;
+  }));
+  EXPECT_FALSE(fixture.Read(original.value()).resident);
+  for (const auto& slot : kernel.resource_snapshot()) EXPECT_FALSE(slot.owner);
+}
+
+// The unsent cold commit is refused (an operator-alarm interlock appears
+// during the source's local close) after the source became terminal; the
+// take-over then waits. A Reset of the source ends that pending take-over
+// without effect and both operations retire.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetOfASourceWhoseUnsentTakeoverCommitWasRefusedEndsThePendingTakeover) {
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId, CellId("cell.test"), 8U};
+  config.operator_alarm_attention =
+      OperatorAlarmAttentionPolicyDTO{kAttentionMaximumAgeNs, kAttentionHostBootId};
+  UnsentTakeoverResetFixture fixture(std::move(config));
+  auto& kernel = *fixture.owner;
+  auto& engine = fixture.engine;
+  ASSERT_TRUE(kernel.PublishOperatorAlarmAttention(attention_snapshot(0U)).ok());
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.refused.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  fixture.ArmLocalClose(true);
+  const auto close = engine.recovery_action_hook;
+  std::vector<std::string> resources;
+  for (const auto& slot : kernel.resource_snapshot()) resources.push_back(slot.resource_id.value());
+  engine.recovery_action_hook = [&] {
+    close();
+    ASSERT_TRUE(kernel
+                    .PublishOperatorAlarmAttention(
+                        attention_snapshot(1U, {alarm_member("interlock.arm", resources)}))
+                    .ok());
+  };
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.refused.winner"));
+  engine.recovery_action_hook = {};
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  EXPECT_EQ(fixture.Read(original.value()).operation.state, OperationStateKind::kStopped);
+  EXPECT_EQ(fixture.Read(candidate.value()).operation.state, OperationStateKind::kResolving);
+
+  const auto reset = fixture.Reset("unsent.refused.reset", original.value());
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return !fixture.Read(original.value()).resident && !fixture.Read(candidate.value()).resident;
+  }));
+  EXPECT_FALSE(fixture.Read(original.value()).control_pending);
+  expect_retired_unsent_candidate(fixture.Read(candidate.value()));
+  EXPECT_EQ(engine.execute_calls.load(), 0);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+    EXPECT_FALSE(slot.owner);
+  }
+}
+
+// A terminal incumbent whose unsent take-over is still pending (its local
+// close was refused) has no Reset target. Its Reset ends the pending take-over
+// without effect and both operations retire.
+TEST(ResourceAddressedExecutionKernelTest,
+     TargetlessResetOfAnIncumbentEndsItsPendingTakeoverWithoutEffect) {
+  UnsentTakeoverResetFixture fixture;
+  auto& kernel = *fixture.owner;
+  auto& engine = fixture.engine;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, "unsent.pending.original"));
+  ASSERT_TRUE(original.ok());
+  fixture.ArmLocalClose(false);
+  const auto candidate = kernel.execute(takeover_intent(1U, "unsent.pending.winner"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  EXPECT_EQ(fixture.Read(original.value()).operation.state, OperationStateKind::kStopped);
+  EXPECT_EQ(fixture.Read(candidate.value()).operation.state, OperationStateKind::kResolving);
+
+  const auto reset = fixture.Reset("unsent.pending.reset", original.value());
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    return !fixture.Read(original.value()).resident && !fixture.Read(candidate.value()).resident;
+  }));
+  engine.recovery_action_hook = {};
+  EXPECT_FALSE(fixture.Read(original.value()).control_pending);
+  expect_retired_unsent_candidate(fixture.Read(candidate.value()));
+  EXPECT_EQ(engine.execute_calls.load(), 0);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    EXPECT_EQ(slot.state, ResourceSlotState::kFree);
+    EXPECT_FALSE(slot.owner);
+  }
+}
+}  // namespace
+
+namespace {
 // Disjoint integration gaps after the parent owner's takeover tests. Reuse the
 // existing fixture and its real identity-fenced replacement/Stop hooks.
 TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertainReplacementUsesTakeoverReconciliation) {
@@ -23592,8 +23863,7 @@ TEST(ResourceAddressedExecutionKernelTest, LateCancelUncertainReplacementUsesTak
             ParticipantEffectKnowledge::kEffectUncertain;
   }));
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "state:late_cancel_uncertainty_confirmed";
+    journal.SetFailNextKind("state:late_cancel_uncertainty_confirmed");
     journal.hold_after_failure = true;
   }
   // The failed row refuses nothing; it sets the journal write fault.
@@ -26115,16 +26385,21 @@ TEST(ResourceAddressedExecutionKernelTest,
     }
     ASSERT_TRUE(fixture.PublishOther(2, true).ok());
     ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    // The rule's own Stop. Its completion raises the F1 Halt in the same
+    // commit, which then names the operation's Stop; the rule outcome keeps
+    // naming the rule's Stop and is finalized when that Stop ends.
+    std::optional<StopEventId> prior_stop;
     ASSERT_TRUE(wait_until([&] {
       const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
-      if (!state.ok() || !state.value().stop_event_id) return false;
-      const auto status = fixture.kernel->read_stop(*state.value().stop_event_id);
-      return status.ok() && status.value().complete;
+      if (!state.ok()) return false;
+      for (const auto& row : state.value().participants)
+        for (const auto& outcome : row.io_rule_outcomes)
+          if (outcome.stop_event_id && outcome.stop_result) prior_stop = outcome.stop_event_id;
+      return prior_stop.has_value();
     }));
-    const auto prior_operation =
-        fixture.kernel->get_operation_state(accepted.value().operation_id).value();
     // An unproven settlement leaves the attempt uncontained (§3.3 P4/P5).
-    const auto prior_status = fixture.kernel->read_stop(*prior_operation.stop_event_id).value();
+    const auto prior_status = fixture.kernel->read_stop(*prior_stop).value();
+    EXPECT_EQ(prior_status.requested, StopKind::kInterruptRule);
     EXPECT_EQ(prior_status.result, StopEventResult::kSomeFailed);
     // The failure raised a Halt (§3.6 F1); wait for it to end too.
     const auto newest = fixture.kernel->get_stop_stream_facts().last_stop_event_id;
@@ -29140,9 +29415,9 @@ TEST(ResourceAddressedExecutionKernelTest,
   // Declared after the fixture: even an assertion failure releases the journal
   // before Kernel teardown drains its journal writer.
   HeldSettlementCall blocked_journal;
-  fixture.journal.record_hook = [block = blocked_journal.Blocker()](std::string_view kind) {
+  fixture.journal.SetRecordHook([block = blocked_journal.Blocker()](std::string_view kind) {
     if (kind == "interrupt_rule_state_changed") block();
-  };
+  });
   auto service = program_io_service(fixture.clock);
   ASSERT_TRUE(service);
   const auto signal = program_io_descriptor();
@@ -30992,9 +31267,9 @@ void VerifyPreemptedMotionResetAdmission(const bool hold_terminal_publication) {
   reject_first_smooth_preparation(engine);
   HeldSettlementCall publication;
   if (hold_terminal_publication) {
-    journal.record_hook = [hold = publication.Blocker()](const std::string_view kind) {
+    journal.SetRecordHook([hold = publication.Blocker()](const std::string_view kind) {
       if (kind == "state:motion_takeover_ended") hold();
-    };
+    });
   }
   const auto candidate = kernel.execute(spring_fallback_intent("retirement.candidate"));
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
@@ -31061,7 +31336,7 @@ void VerifyPreemptedMotionResetAdmission(const bool hold_terminal_publication) {
   EXPECT_EQ(engine.recovery_action_calls.load(), 1);
   publication.Release();
   ASSERT_TRUE(drain_journal(kernel));
-  journal.record_hook = {};
+  journal.SetRecordHook({});
   engine.prepare_motion_hook = {};
   engine.recovery_action_hook = {};
 }
@@ -31480,6 +31755,166 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalHoldRuleWithNothingMovingHoldsT
   EXPECT_EQ(refused.error().details.at("reason"), "program_node_stop_fence_active");
 }
 
+// OD-263: a `hold` rule's Stop covers the held run's move still being
+// prepared, as the operator's Stop does: it is stopped before sending (no
+// effect, never `rule_holds`), the node holds, and after the rule clears
+// Resume plans the move again.
+TEST(ResourceAddressedExecutionKernelTest, GlobalHoldRuleTripWhileAMoveIsPreparingHoldsTheMove) {
+  GlobalMotionRuleFixture fixture;
+  auto& kernel = *fixture.kernel;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
+  fixture.engine.defer_prepare_completion = true;
+  const auto accepted = kernel.execute(scoped_motion_operation("global.hold.preparing"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto id = accepted.value().operation_id;
+
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(kernel.ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kTripped));
+  const auto held = kernel.get_program_execution_scope(ProgramRunNumber(1U));
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  EXPECT_FALSE(held.value().held_nodes.empty());
+  EXPECT_EQ(held.value().stopped_by_rule_id, std::optional<std::string>("global.guard"));
+  // The hold's own Stop event covers the unsent move at once.
+  const auto covered = kernel.get_operation_state(id);
+  ASSERT_TRUE(covered.ok()) << covered.error().message;
+  ASSERT_TRUE(covered.value().stop_event_id.has_value());
+  const auto event = *covered.value().stop_event_id;
+
+  (void)fixture.engine.complete_preparation();
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(id);
+    return state.ok() && terminal(state.value().state);
+  }));
+  ASSERT_TRUE(wait_stop_complete(kernel, event));
+  const auto ended = kernel.get_operation_state(id);
+  ASSERT_TRUE(ended.ok()) << ended.error().message;
+  EXPECT_EQ(ended.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(ended.value().stop_event_id, std::optional<StopEventId>(event));
+  const auto& row = ended.value().participants.front();
+  EXPECT_FALSE(row.terminal_error.has_value());
+  ASSERT_TRUE(row.terminal_fact.has_value());
+  EXPECT_EQ(row.terminal_fact->kind, ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(row.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  const auto projection = kernel.get_operation_projection(id);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  EXPECT_TRUE(projection.value().resident);  // Held for Resume, not retired.
+  const auto recovery = kernel.get_operation_recovery_assessment(id);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  EXPECT_EQ(recovery.value().assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
+  EXPECT_EQ(recovery.value().assessment.status, RecoveryAssessmentStatus::kRetryReady);
+
+  // Resume waits for the rule; once it clears, the Program's Resume replans
+  // the held move and its next attempt is planned and sent.
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(kernel.ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
+  KernelRecoveryActionRequestDTO replan{TestRequestKey("global.hold.preparing.replan"),
+                                        RecoveryAction::kReplanFromStoppedState,
+                                        "program_runner", 1U, 1U, 41U, "resume"};
+  fixture.engine.next_recovery_result = {replan.request_key, replan.action, true, {},
+                                         std::nullopt};
+  const auto replanned = kernel.apply_operation_recovery_action(
+      id, ended.value().operation_revision, replan);
+  ASSERT_TRUE(replanned.ok()) << replanned.error().message;
+  ASSERT_TRUE(replanned.value().accepted);
+  const auto cleared = kernel.get_program_execution_scope(ProgramRunNumber(1U));
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  const auto resumed = kernel.release_program_selection(
+      program_selection_request("global.hold.preparing.resume", "all"),
+      cleared.value().hold_revision);
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_TRUE(resumed.value().held_nodes.empty());
+  fixture.engine.defer_prepare_completion = false;
+  // The fake keeps one prepared slot: the cancelled one makes room.
+  fixture.engine.prepared_snapshot.reset();
+  fixture.engine.next_execution_id = 42U;
+  fixture.engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+  const int prepared_before = fixture.engine.prepare_motion_calls;
+  auto next = scoped_motion_operation("global.hold.preparing.next");
+  next.participants.front().execution_scope->node_attempt_id = NodeAttemptNumber(2U);
+  const auto again = kernel.execute(next);
+  ASSERT_TRUE(again.ok()) << again.error().message;
+  EXPECT_GT(fixture.engine.prepare_motion_calls, prepared_before);
+  EXPECT_TRUE(wait_until([&] { return fixture.engine.dispatch_prepared_motion_calls == 1; }));
+}
+
+// OD-264 (Kernel side, unchanged): the operator's group Stop during a
+// take-over whose newcomer is still preparing ends the newcomer Stopped by
+// that Stop with no effect, retired at once; the Program holds its node.
+TEST(ResourceAddressedExecutionKernelTest, GroupStopDuringATakeoverEndsThePreparingNewcomerWithNoEffect) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId, CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto owner = make_uncaptured_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  {
+    auto table = std::make_shared<ProgramExecutionTableDTO>();
+    const auto prototype = capture.table->nodes.front();
+    for (std::size_t index = 0U; index != 2U; ++index) {
+      auto node = prototype;
+      node.instance_id = ProgramNodeInstanceId("move." + std::to_string(index));
+      table->nodes.push_back(std::move(node));
+    }
+    table->named_selections = {{"arm", {0U, 1U}}};
+    capture.table = std::move(table);
+  }
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
+  const auto intent_for = [](const std::size_t node, std::string request) {
+    auto intent = scoped_motion_operation(std::move(request));
+    intent.participants.front().execution_scope = ProgramNodeExecutionScopeDTO{
+        ProgramNodeInstanceId("move." + std::to_string(node)), NodeAttemptNumber(1U)};
+    return intent;
+  };
+  const auto incumbent = kernel.execute(intent_for(0U, "takeover.stop.incumbent"));
+  ASSERT_TRUE(incumbent.ok()) << incumbent.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.defer_prepare_completion = true;
+  const auto candidate = kernel.execute(intent_for(1U, "takeover.stop.newcomer"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto newcomer = candidate.value().operation_id;
+  (void)kernel.reconcile_subordinate_state();
+
+  const auto stopped = kernel.stop_program_selection(program_selection_request("takeover.stop", "all"));
+  ASSERT_TRUE(stopped.state.has_value());
+  (void)engine.complete_preparation();
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto state = kernel.get_operation_state(newcomer);
+    return state.ok() && terminal(state.value().state);
+  }));
+  const auto ended = kernel.get_operation_state(newcomer);
+  ASSERT_TRUE(ended.ok()) << ended.error().message;
+  EXPECT_EQ(ended.value().state, OperationStateKind::kStopped);
+  EXPECT_EQ(ended.value().stop_event_id, std::optional<StopEventId>(stopped.stop.event_id));
+  const auto& fact = ended.value().participants.front();
+  EXPECT_FALSE(fact.terminal_error.has_value());
+  ASSERT_TRUE(fact.terminal_fact.has_value());
+  EXPECT_EQ(fact.terminal_fact->kind, ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(fact.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  const auto projection = kernel.get_operation_projection(newcomer);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  EXPECT_FALSE(projection.value().resident);
+  const auto scope = kernel.get_program_execution_scope(ProgramRunNumber(1U));
+  ASSERT_TRUE(scope.ok()) << scope.error().message;
+  EXPECT_EQ(scope.value().held_nodes.size(), 2U);
+}
+
 // `fail_node` keeps the run going: no hold; the next motion in scope
 // fails at once with `rule_holds` and the tree handles it.
 TEST(ResourceAddressedExecutionKernelTest, GlobalFailNodeRuleWithNothingMovingLeavesTheRunGoing) {
@@ -31556,6 +31991,38 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleThatCantWatchGatesItsScopeU
       EXPECT_TRUE(allowed.ok()) << allowed.error().message;
     }
   }
+}
+
+// OD-258: a move refused by a global I/O rule at the final pre-dispatch
+// recheck fails at once with no effect (CONTRACTS §8); its operation is not
+// kept resident, so the same robot's next move is admitted.
+TEST(ResourceAddressedExecutionKernelTest, GlobalRuleRefusalBeforeDispatchEndsTheMoveAndFreesTheRobot) {
+  GlobalMotionRuleFixture fixture(true, true, IoRuleOnTripDTO::kNotify);
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
+  ensure_default_program(*fixture.kernel);
+  fixture.engine.defer_prepare_completion = true;
+  const auto accepted = fixture.kernel->execute(fixture.Intent(false, "global.predispatch"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  fixture.clock.advance(101);  // The reading goes stale: the rule can't watch.
+  ASSERT_TRUE(fixture.engine.complete_preparation().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = fixture.kernel->get_operation_projection(accepted.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
+  EXPECT_EQ(fixture.engine.dispatch_prepared_motion_calls, 0);
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  EXPECT_EQ(fixture.engine.cancel_prepared_motion_calls, 1);
+  const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  ASSERT_EQ(state.value().participants.size(), 1U);
+  ASSERT_TRUE(state.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(state.value().participants.front().terminal_error->code, "rule_holds");
+
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
+  const auto next = fixture.kernel->execute(fixture.Intent(false, "global.predispatch.next"));
+  EXPECT_TRUE(next.ok()) << next.error().message;
 }
 
 // Any active rule (stop or notify) that loses its signals while motion in its
@@ -31874,7 +32341,7 @@ TEST(ResourceAddressedExecutionKernelTest, ALostActiveTcpRowIsCountedAndAlarmed)
   auto& kernel = *kernel_heap_test_owner;
   posting_kernel = &kernel;
   ASSERT_TRUE(drain_journal(kernel));
-  journal.fail_next_kind = "active_tcp_changed";
+  journal.SetFailNextKind("active_tcp_changed");
   journal.hold_after_failure = true;
   const auto set = kernel.execute(set_tcp_operation("active_tcp.lost"));
   ASSERT_TRUE(set.ok()) << set.error().message;
@@ -32462,9 +32929,9 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleRepliesDuringAStalledScal
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   HeldSettlementCall record;
   const auto blocker = record.Blocker();
-  journal.record_hook = [blocker](std::string_view kind) {
+  journal.SetRecordHook([blocker](std::string_view kind) {
     if (kind == "runtime_scale_accepted") blocker();
-  };
+  });
   ASSERT_TRUE(
       kernel.set_runtime_scale_control(runtime_scale_control_request("scale.first", 0U, 0.6)).ok());
   ASSERT_TRUE(record.Entered());
@@ -32595,9 +33062,9 @@ TEST(ResourceAddressedExecutionKernelTest, SpeedAndStopRowsAreWrittenInActionOrd
   // Keep the writer inside the first speed row's write.
   HeldSettlementCall record;
   const auto blocker = record.Blocker();
-  journal.record_hook = [blocker](std::string_view kind) {
+  journal.SetRecordHook([blocker](std::string_view kind) {
     if (kind == "runtime_scale_accepted") blocker();
-  };
+  });
   ASSERT_TRUE(
       kernel.set_runtime_scale_control(runtime_scale_control_request("scale.first", 0U, 0.6)).ok());
   ASSERT_TRUE(record.Entered());
@@ -33857,17 +34324,17 @@ TEST(ResourceAddressedExecutionKernelTest, KernelDestructionWritesEveryPostedRec
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(drain_journal(*kernel));
   HeldSettlementCall writer;
-  journal.record_hook = [hold = writer.Blocker(),
+  journal.SetRecordHook([hold = writer.Blocker(),
                          held = std::make_shared<std::atomic_bool>()](std::string_view kind) {
     if (kind == "state:subordinate_state_observed" && !held->exchange(true)) hold();
-  };
+  });
   engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
   ASSERT_TRUE(writer.Entered());
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
   auto retiring = std::async(std::launch::async, [owner = kernel.release()] { delete owner; });
   writer.Release();
   retiring.get();
-  journal.record_hook = {};
+  journal.SetRecordHook({});
   ASSERT_FALSE(journal.states.empty());
   EXPECT_EQ(journal.states.back().operation_id, accepted.value().operation_id);
   EXPECT_EQ(journal.states.back().state, OperationStateKind::kCompleted);
@@ -33887,8 +34354,7 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteErrorSetsTheFaultUntilACl
   ASSERT_TRUE(drain_journal(kernel));
   ::testing::internal::CaptureStderr();
   {
-    std::lock_guard lock(journal.mutex);
-    journal.fail_next_kind = "operation_accepted";
+    journal.SetFailNextKind("operation_accepted");
     journal.hold_after_failure = true;
   }
   const auto accepted = kernel.execute(motion_operation("writer.fault.once"));
@@ -33909,9 +34375,9 @@ TEST(ResourceAddressedExecutionKernelTest, JournalWriteErrorSetsTheFaultUntilACl
     std::lock_guard lock(journal.mutex);
     ASSERT_FALSE(journal.states.empty());
     EXPECT_EQ(journal.states.back().state, OperationStateKind::kExecuting);
-    journal.fail_next_kind = "state:subordinate_state_observed";
-    journal.hold_after_failure = true;
   }
+  journal.SetFailNextKind("state:subordinate_state_observed");
+  journal.hold_after_failure = true;
   engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kCompleted);
   ASSERT_TRUE(wait_until([&] { return kernel.get_operation_journal_write_fault().has_value(); }));
   EXPECT_EQ(kernel.get_operation_journal_write_fault()->write_kind, "subordinate_state_observed");

@@ -148,7 +148,6 @@ from .models import (
     RuntimeBlackboardWriteRequest,
 )
 from .persistent_keys import (
-    MAX_RECONCILED_APPLIES,
     OPERATOR_WRITABLE_ACCESS,
     CommittedActivation,
     PersistentKeyEdit,
@@ -169,10 +168,10 @@ _LOGGER = logging.getLogger(__name__)
 # A transport without the rule-state channel has no global rules to wait for.
 _NO_GLOBAL_RULES: Final = RuleCatalog(None, 1, "", "", (), ())
 PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v3"
-PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v2"
+PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v3"
 PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v2"
 PERSISTENT_KEY_RECONCILIATION_VERSION: Final = (
-    "manyforge.persistent_key_reconciliation.v1"
+    "manyforge.persistent_key_reconciliation.v2"
 )
 PROGRAM_NODE_PREVIEW_INTENT_VERSION: Final = (
     "manyforge.program_node_correction_preview_intent.v3"
@@ -4198,17 +4197,6 @@ class ProgramRuntime:
                             reason=notice.reason,
                             detail=notice.detail,
                         )
-                    # A committed Apply of this Scenario project that was
-                    # never observed: the values were kept, the defect is shown.
-                    for record_digest in self._persistent_keys.unobserved_applies(
-                        run_admission.project_path
-                    ):
-                        controls.audit_value(
-                            "persistent_key_apply_not_observed",
-                            project_path=run_admission.project_path,
-                            code="applied_program_not_observed",
-                            record_digest=record_digest,
-                        )
                 with self._runtime_controls_lock:
                     self._runtime_controls[snapshot.capture.program_run_id] = controls
                 result = self._project_run(snapshot.to_dict())
@@ -4831,20 +4819,14 @@ class ProgramRuntime:
             if (
                 not isinstance(projection, Mapping)
                 or projection.get("schema_version")
-                != "manyforge.committed_scenario_activation.v5"
+                != "manyforge.committed_scenario_activation.v6"
                 or not isinstance(projection.get("origin"), Mapping)
             ):
                 raise ProgramRunnerError(
                     "persistent_key_activation_unavailable",
                     "the committed activation lacks the current typed origin",
                 )
-            projection = validate_committed_scenario_activation(projection)
-            if len(projection["committed_applies"]) > MAX_RECONCILED_APPLIES:
-                raise ProgramRunnerError(
-                    "persistent_key_activation_unavailable",
-                    "the retained committed Apply history exceeds its bound",
-                )
-            return projection
+            return validate_committed_scenario_activation(projection)
         except (HeadlessClientError, ProgramBindingTransportError) as error:
             raise ProgramRunnerError(
                 "persistent_key_activation_unavailable",
@@ -4883,10 +4865,7 @@ class ProgramRuntime:
                 record_digest=projection["record_digest"],
                 project_path=projection["origin"]["project_path"],
                 declarations={} if program is None else dict(program.blackboard_keys),
-                committed_applies={
-                    row["record_digest"]: row["origin"]["project_path"]
-                    for row in projection["committed_applies"]
-                },
+                apply_id=projection["apply_id"],
             )
         except PersistentKeyRegisterError as error:
             raise ProgramRunnerError(
@@ -4916,15 +4895,6 @@ class ProgramRuntime:
                 "the committed Scenario activation is not the admitted one",
             )
         reconciliation = register.reconcile(activation)
-        for record_digest, project_path in reconciliation.unobserved:
-            # Kept values, but a notification path failed: find and fix it.
-            _LOGGER.warning(
-                "applied_program_not_observed: committed Apply %s of Scenario "
-                "project %r reached the Program runner only through a later "
-                "reconciliation; stored values were kept",
-                record_digest,
-                project_path,
-            )
         return activation, program, reconciliation
 
     def reconcile_persistent_values(self) -> dict[str, Any]:
@@ -4963,11 +4933,6 @@ class ProgramRuntime:
                 }
                 for notice in reconciliation.dropped
             ],
-            "unobserved_applies": [
-                {"record_digest": digest, "project_path": project}
-                for digest, project in reconciliation.unobserved
-            ],
-            "history_changed": reconciliation.history_changed,
         }
 
     def _applied_persistent_keys(
@@ -5015,10 +4980,8 @@ class ProgramRuntime:
         )
 
     def _live_run_id(self, activation: CommittedActivation) -> int | None:
-        """The run whose value store currently holds this project's values.
-
-        A run's capture names its committed Apply; the activation's history
-        maps that Apply to its Scenario project folder.
+        """The run whose value store currently holds this project's values:
+        a live run of this committed activation (its capture names the Apply).
         """
 
         snapshots, _truncated = self._owner.list_snapshots(
@@ -5026,10 +4989,7 @@ class ProgramRuntime:
         )
         for snapshot in snapshots:
             capture = snapshot.to_dict()["capture"]
-            if (
-                activation.committed_applies.get(capture["applied_record_digest"])
-                == activation.project_path
-            ):
+            if capture["applied_record_digest"] == activation.record_digest:
                 return capture["program_run_id"]
         return None
 
@@ -5046,10 +5006,11 @@ class ProgramRuntime:
         # Only values the register durably reconciled with this committed
         # activation are shown, exactly those a run would restore.
         project_path = activation.project_path
-        reconciled = register.activation == {
-            "record_digest": activation.record_digest,
-            "project_path": project_path,
-        }
+        stored = register.activation
+        reconciled = stored is not None and (
+            stored["record_digest"],
+            stored["project_path"],
+        ) == (activation.record_digest, project_path)
         rows = register.values(project_path) if reconciled else {}
         restorable = register.restore(project_path, declarations) if reconciled else {}
         keys = []
@@ -5076,14 +5037,6 @@ class ProgramRuntime:
             "sequence": sequence,
             "keys": keys,
             "edits": register.edits(project_path),
-            "apply_observation_fault": (
-                {
-                    "code": "applied_program_not_observed",
-                    "record_digests": list(unobserved),
-                }
-                if (unobserved := register.unobserved_applies(project_path))
-                else None
-            ),
         }
 
     def read_persistent_values(self) -> dict[str, Any]:

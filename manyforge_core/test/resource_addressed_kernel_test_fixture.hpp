@@ -2344,7 +2344,7 @@ class FakeOperationJournal final : public IOperationJournal {
   }
 
   Result<std::uint64_t> RecordInterruptRuleStateChanged(const IoRuleStateChangeDTO& change) {
-    if (record_hook) record_hook("interrupt_rule_state_changed");
+    RunRecordHook("interrupt_rule_state_changed");
     std::lock_guard lock(mutex);
     interrupt_rule_state_changes.push_back(change);
     return Result<std::uint64_t>::Ok(next_sequence++);
@@ -2384,21 +2384,32 @@ class FakeOperationJournal final : public IOperationJournal {
     return Result<std::uint64_t>::Ok(next_sequence++);
   }
 
-  void SetConcurrentRecordHook(std::function<void(std::string_view)> hook) {
+  // Tests set the hook while the Kernel's journal writer runs: it is set and
+  // read under `mutex`, and called outside it so that a blocked callback does
+  // not block unrelated journal projection.
+  void SetRecordHook(std::function<void(std::string_view)> hook) {
     std::lock_guard lock(mutex);
-    concurrent_record_hook = std::move(hook);
+    record_hook_ = std::move(hook);
+  }
+
+  // The next record of this kind fails; set while the writer runs, so it is
+  // set and read under `mutex`, like the record hook.
+  void SetFailNextKind(std::optional<std::string> kind) {
+    std::lock_guard lock(mutex);
+    fail_next_kind = std::move(kind);
+  }
+
+  void RunRecordHook(std::string_view kind) {
+    std::function<void(std::string_view)> hook;
+    {
+      std::lock_guard lock(mutex);
+      hook = record_hook_;
+    }
+    if (hook) hook(kind);
   }
 
   Result<std::uint64_t> Record(std::string kind, const OperationStateDTO& state) {
-    std::function<void(std::string_view)> concurrent_hook;
-    {
-      std::lock_guard lock(mutex);
-      concurrent_hook = concurrent_record_hook;
-    }
-    if (concurrent_hook) concurrent_hook(kind);
-    if (record_hook) {
-      record_hook(kind);
-    }
+    RunRecordHook(kind);
     std::lock_guard lock(mutex);
     calls.push_back(kind);
     if (timeline != nullptr) {
@@ -2422,7 +2433,6 @@ class FakeOperationJournal final : public IOperationJournal {
   }
 
   std::optional<ErrorDTO> begin_start_error;
-  std::optional<std::string> fail_next_kind;
   std::atomic_bool hold_after_failure{};
   std::optional<std::string> throw_after_capture_kind;
   bool fail_next_cell_release{};
@@ -2437,10 +2447,6 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> control_acceptance_hook;
   std::function<void()> stop_acceptance_hook;
   std::function<void()> cell_admission_acquire_hook;
-  std::function<void(std::string_view)> record_hook;
-  // Copy under mutex and invoke outside: a blocked callback must not block
-  // unrelated journal projection.
-  std::function<void(std::string_view)> concurrent_record_hook;
   std::vector<IoRuleStateChangeDTO> interrupt_rule_state_changes;
   std::vector<ActiveTcpChangeDTO> active_tcp_changes;
   std::vector<StopEventId> projected_stop_acceptances;
@@ -2454,6 +2460,8 @@ class FakeOperationJournal final : public IOperationJournal {
   std::mutex mutex;
 
  private:
+  std::function<void(std::string_view)> record_hook_;
+  std::optional<std::string> fail_next_kind;
   std::mutex block_mutex_;
   std::condition_variable block_changed_;
   bool blocked_{};

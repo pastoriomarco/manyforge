@@ -86,7 +86,7 @@ def _reconciled_register(tmp_path: Path) -> PersistentKeyRegister:
             record_digest="sha256:" + "a" * 64,
             project_path=_PROJECT,
             declarations=_declarations(),
-            committed_applies={"sha256:" + "a" * 64: _PROJECT},
+            apply_id=1,
         )
     )
     return register

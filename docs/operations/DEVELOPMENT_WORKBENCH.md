@@ -341,10 +341,12 @@ their existing separate storage. A state root that still holds
 does not know, is refused and left unchanged; move that entry out of the
 state root, then start again.
 
-An unclosed previous session, or readable unresolved work, produces a named
-warning in the existing Workbench notification rail. An ordinary verified
-shutdown stays quiet when remaining journal evidence is opaque; History records
-the unknown families. These facts describe durable work and process shutdown,
+An unclosed previous session, or readable unresolved work, raises the alarm
+"ManyForge did not close correctly last time"
+(`manyforge.runtime.previous_session_unclean`) once Headless has filed the
+previous-session report at start. An ordinary verified shutdown stays quiet
+when remaining journal evidence is opaque; History records the unknown
+families. These facts describe durable work and process shutdown,
 not physical rest. History also records that old journal events may not have
 been imported. Reports are written durably to `session-reports/pending/`, then
 the existing historian appends each idempotently before moving it to
@@ -570,16 +572,14 @@ the top right) are installation-specific and survive stop/start. They are kept i
 Values of `persistent` blackboard keys are owned by the Program runner and kept
 beside them in `.manyforge-dev/state/program-runner/` (mounted as
 `/var/lib/manyforge/program-runner`), in a file named by its format version,
-`persistent-keys.v<N>.json` (currently `persistent-keys.v4.json`). These installation settings
+`persistent-keys.v<N>.json` (currently `persistent-keys.v5.json`). These installation settings
 remain separate from the persistent runtime root described above.
 Stored values survive `stop`/`start` while the applied Program still declares
 their key persistent with the same type and fields; a value whose key a
-committed Apply removed or restructured is dropped with a notice. The
-workbench Manager's state resets with the container, so the first Apply after
-a start begins a new publication history; the stored values are simply checked
-against that Program. A committed Apply the Program runner never observed
-keeps the values and is reported as `applied_program_not_observed` on the
-stored-values page and in the run audit: it is a defect to investigate. Only
+committed Apply removed or restructured is dropped with a notice. The values
+follow the Program the runner actually activates: on every wake it checks them
+against the current committed activation, and an Apply a later one superseded
+before the runner activated it has no effect. Only
 the current format's file is opened or created. An earlier register file
 (`persistent-keys.json`, or a `persistent-keys.v<N>.json` with a lower number)
 is never opened, moved, rewritten or deleted; when the current file does not

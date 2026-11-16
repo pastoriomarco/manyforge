@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  api, apiErrorCode, authoringRefusalMessage, isStaleWorkspaceError, preparationCauseCode,
+  api, apiErrorCode, authoringRefusalMessage, incompleteScenarioText, isStaleWorkspaceError,
+  preparationCauseCode,
 } from '../api/client';
 import { applyResultText } from '../components/ApplyImpact';
 import type { AuthoringCommand } from '../state/busyOperation';
@@ -34,9 +35,12 @@ import { deploymentActionUnavailableReason } from '../state/documentStates';
 
 /**
  * The text of a refused Preview/Apply/Load/New: the
- * catalogue's text for its code, e.g. `apply_refused_run_in_progress`.
+ * catalogue's text for its code, e.g. `apply_refused_run_in_progress`; an
+ * incomplete Scenario document also names its cause.
  */
 export function cellApplyErrorText(reason: unknown, fallback: string): string {
+  const incomplete = incompleteScenarioText(reason);
+  if (incomplete !== null) return incomplete;
   const message = errorMessage(reason, fallback);
   const code = apiErrorCode(reason);
   return code === null ? message : codedErrorText({ code, message });

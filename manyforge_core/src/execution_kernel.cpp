@@ -2237,6 +2237,8 @@ void ExecutionKernel::clear_runtime_collision_state_projection() {
 
 void ExecutionKernel::finish_execute_worker() {
   worker_signals_.mark_complete();
+  // A refresh already scheduled may have captured before this completion.
+  recovery_assessment_dirty_.store(true, std::memory_order_release);
   schedule_recovery_assessment_refresh("terminal_cleanup_completed");
 }
 
@@ -7030,8 +7032,7 @@ Result<AddressedParticipantStopSettlementDTO> ExecutionKernel::settle_addressed_
       request.effect_prevented_before_dispatch ? "addressed_cancelled_before_dispatch_settlement"
                                                : "addressed_stopped_participant_settlement");
   const bool recovery_matches = contained_failure
-                                    ? assessment.execution_state == ExecutionState::kFailed &&
-                                          !assessment.retry_admissible
+                                    ? failed_not_retry_admissible(assessment)
                                     : assessment.execution_state == ExecutionState::kStopped &&
                                           assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
                                           ((assessment.status == RecoveryAssessmentStatus::kRetryReady &&

@@ -4,13 +4,13 @@ Manager's command socket only answers requests and its published source is
 read on demand, so no push reaches Headless when an Apply commits. Headless
 forwards every named Apply, so it follows each one it forwarded: it asks
 Manager for that Apply's status until the outcome is final, then waits until
-its own committed-activation projection names that Apply among its committed
-history (Manager publishes its source just after recording the outcome) and
-wakes the Program runner once. Neither wait has a limit of its own (OD-214):
-Manager ends every Apply (at the latest after its own Apply bound), a
-succeeded Apply always carries its publication, and closing the service ends
-both. The history names each committed Apply by its
-identity, so an Apply a later one already superseded is found there as well.
+its own committed-activation projection names that Apply or a later one as
+the active configuration's Apply (Manager publishes its source just after
+recording the outcome; Apply numbers count up within one start) and wakes the
+Program runner once. Neither wait has a limit of its own (OD-214): Manager
+ends every Apply (at the latest after its own Apply bound), a succeeded Apply
+always carries its publication, and closing the service ends both. An Apply a
+later one already superseded is covered by that later one.
 A failed or unknown-effect Apply never published anything and wakes nothing.
 The wake carries nothing: the runner reads the committed activation itself,
 so a late or repeated wake is harmless.
@@ -83,7 +83,7 @@ class CommittedApplyFollower:
     def _run(self, apply_id: int, apply_generation: int) -> None:
         try:
             if self._committed(apply_id, apply_generation):
-                self._await_publication(apply_id, apply_generation)
+                self._await_publication(apply_id)
                 if not self._stop.is_set():
                     self._wake()
         except Exception:  # A follower never takes the process down.
@@ -109,19 +109,16 @@ class CommittedApplyFollower:
             self._stop.wait(self._poll)
         return False
 
-    def _projected(self, apply_id: int, apply_generation: int) -> bool:
+    def _projected(self, apply_id: int) -> bool:
         try:
-            committed = self._committed_activation()["committed_applies"]
+            active = self._committed_activation()["apply_id"]
         except Exception:
             return False
-        return any(
-            row["apply_id"] == apply_id and row["apply_generation"] == apply_generation
-            for row in committed
-        )
+        return active >= apply_id
 
-    def _await_publication(self, apply_id: int, apply_generation: int) -> None:
+    def _await_publication(self, apply_id: int) -> None:
         while not self._stop.is_set():
-            if self._projected(apply_id, apply_generation):
+            if self._projected(apply_id):
                 return
             self._stop.wait(self._poll)
 

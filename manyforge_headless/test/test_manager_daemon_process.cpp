@@ -397,26 +397,38 @@ RequiredMember(const content_identity::CanonicalValue &value,
   return *member;
 }
 
-/// Whether one Manager source value pairs its active publication with an
-/// Apply history of the same generation: publication 1 is the bootstrap and
-/// each later one is exactly one committed named Apply. These short sessions
-/// evict nothing, so the counts match exactly (Headless itself only refuses
-/// more committed Applies than publications: program_activation_history_incomplete).
+/// Whether one Manager source value pairs its active publication with Apply
+/// records of the same generation: the Apply that installed the active
+/// configuration is among the (at most three) records, and no record names a
+/// committed Apply newer than it.
 bool ManagerSourceHistoryIsOneGeneration(
     const content_identity::CanonicalValue &payload) {
-  const auto generation =
-      RequiredMember(RequiredMember(RequiredMember(payload, "active"),
-                                    "publication"),
-                     "publication_generation")
-          .as_number();
-  double committed = 0.0;
-  for (const auto &record :
-       RequiredMember(RequiredMember(payload, "apply"), "records").as_array()) {
-    if (RequiredMember(record, "committed").as_bool()) {
-      committed += 1.0;
-    }
+  const auto &transaction = RequiredMember(
+      RequiredMember(RequiredMember(payload, "active"), "publication"),
+      "transaction");
+  const auto &records =
+      RequiredMember(RequiredMember(payload, "apply"), "records").as_array();
+  if (records.size() > 3U) {
+    return false;
   }
-  return committed + 1.0 == generation;
+  if (RequiredMember(transaction, "kind").as_string() != "named_apply") {
+    return std::none_of(records.begin(), records.end(), [](const auto &record) {
+      return RequiredMember(record, "committed").as_bool();
+    });
+  }
+  const auto active = RequiredMember(transaction, "apply_id").as_number();
+  bool installer = false;
+  for (const auto &record : records) {
+    if (!RequiredMember(record, "committed").as_bool()) {
+      continue;
+    }
+    const auto apply_id = RequiredMember(record, "apply_id").as_number();
+    if (apply_id > active) {
+      return false;
+    }
+    installer = installer || apply_id == active;
+  }
+  return installer;
 }
 
 const std::string &RequiredText(const content_identity::CanonicalValue &value,
@@ -3150,7 +3162,8 @@ TEST(ManagerDaemonProcess,
                 "scope=cell-role:program_runner"),
             std::string::npos);
   EXPECT_NE(ReadStartupStderr(directory).find(
-                "Program Runner liveness socket is not an exact same-user socket"),
+                "Program Runner liveness socket does not exist yet (the process "
+                "has not started or is not ready)"),
             std::string::npos);
   EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
   expect_unchanged_over_heartbeats(1U);

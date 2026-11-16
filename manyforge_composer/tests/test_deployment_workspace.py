@@ -601,14 +601,67 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     state.headless_client = _Headless()  # type: ignore[assignment]
     state.allowed_fs_roots = [str(tmp_path)]
     state.allowed_deployment_write_roots = [str(tmp_path)]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
-        "ready": False,
-        "current_scenario": None,
-        "unavailable_reasons": ["not_applied"],
-    }
     app = FastAPI()
     app.include_router(create_deployment_draft_router(state))
     return TestClient(app), state
+
+
+def test_workspace_read_while_apply_publishes_shows_not_ready(
+    tmp_path: Path,
+) -> None:
+    """OD-265: one publication read; an Apply ending mid-read is no 500."""
+
+    client, state = _client(tmp_path)
+    digest = "sha256:" + "a" * 64
+    published = {
+        "ready": True,
+        "unavailable_reasons": [],
+        "published_scenario": {
+            "deployment_artifact_id": "cell",
+            "deployment_revision": digest,
+            "retained_bundle_id": digest,
+            "graph_revision": digest,
+            "program_id": "p",
+            "program_revision": digest,
+            "scenario_id": "s",
+            "source_document_digest": digest,
+            "program_outcome": {"kind": "bound", "program_binding_id": digest},
+        },
+    }
+    reads = iter(
+        [
+            {
+                "ready": False,
+                "published_scenario": None,
+                "unavailable_reasons": ["deployment_not_published"],
+            },
+            published,
+        ]
+    )
+    # The Apply's publication becomes ready after the first read, and the
+    # Manager has converged on it.
+    state.published_scenario = lambda: next(reads)  # type: ignore[method-assign]
+    fresh = {"available": True, "freshness": "fresh", "known_gaps": []}
+    state.headless_client.manager_status = lambda: {  # type: ignore[union-attr]
+        "source": fresh,
+        "status": {
+            "manager_ready": True,
+            "runtime": {"converged": True},
+            "active": {"retained_bundle_id": digest, "graph_revision": digest},
+        },
+    }
+    state.headless_client.manager_diff = lambda: {  # type: ignore[union-attr]
+        "source": fresh,
+        "converged": True,
+    }
+
+    response = client.get("/api/deployment/workspace")
+
+    assert response.status_code == 200, response.text
+    applied = response.json()["managerApplied"]
+    assert applied["deploymentRevision"] is None
+    assert applied["scenarioId"] is None
+    assert applied["activationOrder"] is None
 
 
 @pytest.mark.parametrize("route", ["save", "save-as"])

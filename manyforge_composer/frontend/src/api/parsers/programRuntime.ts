@@ -1325,15 +1325,12 @@ function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyVa
     'program_run_id', 'project_path', 'reason', 'request_key', 'sequence', 'source_label',
   ], path);
   const action = stringAt(record.action, `${path}.action`);
-  if (
-    action !== 'set' && action !== 'reset' && action !== 'clear'
-    && action !== 'dropped' && action !== 'fault'
-  ) {
-    return fail(`${path}.action`, 'set, reset, clear, dropped or fault');
+  if (action !== 'set' && action !== 'reset' && action !== 'clear' && action !== 'dropped') {
+    return fail(`${path}.action`, 'set, reset, clear or dropped');
   }
   const reason = nullableStringAt(record.reason, `${path}.reason`);
-  if ((reason !== null) !== (action === 'dropped' || action === 'fault')) {
-    return fail(`${path}.reason`, 'a reason exactly for a dropped value or a fault');
+  if ((reason !== null) !== (action === 'dropped')) {
+    return fail(`${path}.reason`, 'a reason exactly for a dropped value');
   }
   return {
     sequence: positiveIntegerAt(record.sequence, `${path}.sequence`),
@@ -1353,32 +1350,17 @@ function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyVa
   };
 }
 
-function persistentKeyApplyObservationFaultAt(
-  value: unknown,
-  path: string,
-): PersistentKeyValues['applyObservationFault'] {
-  if (value === null) return null;
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['code', 'record_digests'], path);
-  const recordDigests = arrayAt(record.record_digests, `${path}.record_digests`)
-    .map((digest, index) => digestAt(digest, `${path}.record_digests[${index}]`));
-  if (recordDigests.length === 0) {
-    return fail(`${path}.record_digests`, 'at least one committed Apply');
-  }
-  return { code: stringAt(record.code, `${path}.code`), recordDigests };
-}
-
 export function parsePersistentKeyValues(
   value: unknown,
   path = 'persistentKeyValues',
 ): PersistentKeyValues {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'apply_observation_fault', 'edits', 'keys', 'program_revision', 'program_run_id',
+    'edits', 'keys', 'program_revision', 'program_run_id',
     'project_path', 'scenario_id', 'schema_version', 'sequence',
   ], path);
-  if (record.schema_version !== 'manyforge.persistent_key_values.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v2');
+  if (record.schema_version !== 'manyforge.persistent_key_values.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v3');
   }
   return {
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
@@ -1390,10 +1372,6 @@ export function parsePersistentKeyValues(
       .map((row, index) => persistentKeyValueAt(row, `${path}.keys[${index}]`)),
     edits: arrayAt(record.edits, `${path}.edits`)
       .map((row, index) => persistentKeyValueEditAt(row, `${path}.edits[${index}]`)),
-    applyObservationFault: persistentKeyApplyObservationFaultAt(
-      record.apply_observation_fault,
-      `${path}.apply_observation_fault`,
-    ),
   };
 }
 

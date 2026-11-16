@@ -588,6 +588,13 @@ TEST(StopStateCoreTest, StopUnconfirmedHoldsLatchUntilControllerIdle) {
   harness.kernel.observe_component_states(
       {CellComponentState(component, ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
   EXPECT_TRUE(harness.kernel.stop_unconfirmed_components().empty());
+  // The failed-Stop Halt's stage attempts may still run on the stop-stage
+  // executor; they read the scripted results, so change them only once every
+  // participant Stop has ended.
+  ASSERT_TRUE(wait_until([&] {
+    StopControlExecutorTestAccess::WakeAfterClockAdvance(harness.kernel);
+    return StopControlExecutorTestAccess::StoppingCount(harness.kernel) == 0U;
+  }));
   harness.first_engine.next_stop_result = StopResultDTO{true, std::nullopt};
   harness.second_engine.next_stop_result = StopResultDTO{true, std::nullopt};
 }

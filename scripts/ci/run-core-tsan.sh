@@ -29,11 +29,17 @@ cmake \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1 -DNDEBUG" \
   -DMANYFORGE_GTEST_TIMEOUT_SECONDS="${GTEST_TIMEOUT_SECONDS}" \
-  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=maybe-uninitialized" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
 
-cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
-python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
+# gcc 13's -O1 sanitizer build reports false "may be used uninitialized" warnings for values
+# inside std::optional (OD-262); they still print but do not fail the build.
+# The test binaries run with address randomisation off: gcc 13's ThreadSanitizer aborts at start
+# ("unexpected memory mapping") under the kernel's mmap randomisation (OD-262). In a container
+# this needs the personality(ADDR_NO_RANDOMIZE) call allowed by its seccomp profile. The build runs
+# under it too, because test discovery runs each test binary while building.
+setarch "$(uname -m)" -R cmake --build "${BUILD_DIR}" --parallel "${PARALLEL}"
+setarch "$(uname -m)" -R python3 "${SCRIPT_DIR}/run-ctest-gtest-binaries-grouped.py" \
   --build-dir "${BUILD_DIR}" \
   --summary-prefix CORE_TSAN

@@ -75,7 +75,8 @@ class SqliteOperationJournal final : public IOperationJournal {
   /// `wall_time_text` (tests) gives a row's wall time from the action's
   /// steady-clock time; by default it is derived from the system clock.
   /// `critical_section_observer` (tests) is called inside an event read's
-  /// snapshot, once its first row has been read.
+  /// snapshot, once its first row has been read. It runs under the reader
+  /// lock and must not call back into this journal on its own thread.
   SqliteOperationJournal(std::filesystem::path database_path, CellId cell_id,
                          std::size_t history_capacity = kMaximumOperationJournalHistory,
                          std::function<std::string(std::int64_t)> wall_time_text = {},

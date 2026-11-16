@@ -66,7 +66,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         server = Node("manyforge_fake_selected_simulator_owner")
         _install_services(server, state)
         executor.add_node(server)
-        worker = threading.Thread(target=executor.spin, daemon=True)
+        worker = threading.Thread(target=executor.spin)
         worker.start()
         client_node = Node("manyforge_selected_simulator_client_test")
 
@@ -136,7 +136,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
             client_node.destroy_node()
         executor.shutdown()
         if worker is not None:
-            worker.join(timeout=2.0)
+            worker.join()
         if server is not None:
             server.destroy_node()
         if rclpy.ok():

@@ -1269,17 +1269,14 @@ def test_direct_serve_selects_one_session_before_starting_any_owner(tmp_path, mo
     assert marker["session_id"] == started[0] and marker["disposition"] == "stopped"
 
 
-def test_preselected_session_report_is_shared_by_existing_consumers(tmp_path, monkeypatch):
+def test_preselected_session_report_is_passed_to_headless(tmp_path, monkeypatch):
     root = tmp_path / "state"
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", root)
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=False,
         headless_port=1, runner_port=2, composer_port=3, frontend_port=4)
-    assert workbench._previous_session_report() is None
     assert workbench._previous_session_arguments() == ()
     previous = "a" * 32
     workbench.session = SimpleNamespace(marker={"previous_session": {"session_id": previous}})
-    report = root / "session-reports" / (previous + ".json")
-    assert workbench._previous_session_report() == report
     assert workbench._previous_session_arguments() == ("--workbench-previous-session-reports-root", str(root / "session-reports"), "--workbench-previous-session-id", previous)
 
 

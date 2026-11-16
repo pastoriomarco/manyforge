@@ -858,7 +858,68 @@ def test_routes_reject_loading_incomplete_scenario_without_workspace_mutation(
     rejected, _rejected_row = client.command("/api/scenario/load", {"path": str(target)})
     assert rejected.status_code == 409
     assert rejected.json()["detail"]["code"] == "scenario_activation_incomplete"
+    assert rejected.json()["detail"]["effect"] == "none"
+    # The refusal names the missing member under ``details`` (OD-260); both
+    # members are empty here and the Program's is named first.
+    assert rejected.json()["detail"]["details"] == {
+        "member": "program.yaml", "diagnostic_count": 0,
+    }
+    assert "context" not in rejected.json()["detail"]
     assert state.authoring_workspace.snapshot().identity == before_load
+
+
+def test_load_of_a_program_that_cannot_be_built_names_its_first_diagnostic(
+    tmp_path: Path,
+) -> None:
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    # The root's children become the top-level nodes: the Program has more
+    # than one root and cannot be built.
+    authoring = deepcopy(_PROGRAM_FIXTURE)
+    root = authoring["forest"][0]
+    assert len(root["children"]) > 1
+    authoring["forest"] = root["children"]
+    authoring["positions"] = {
+        key: value for key, value in authoring["positions"].items()
+        if key != root["instance_id"]
+    }
+    document = _document("cell")
+    document["program_draft"] = authoring
+    target = Path(save_scenario_artifact(
+        document, str(tmp_path / "cell.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    expected = derive_candidate(authoring, state.node_catalog)[1]
+    assert expected[0]["code"] == "authoring_forest_root_count"
+
+    before_load = state.authoring_workspace.snapshot().identity
+    rejected, _rejected_row = client.command("/api/scenario/load", {"path": str(target)})
+    assert rejected.status_code == 409
+    detail = rejected.json()["detail"]
+    assert detail["code"] == "scenario_activation_incomplete"
+    assert detail["effect"] == "none"
+    assert detail["details"] == {
+        "member": "program.yaml",
+        "cause_code": "authoring_forest_root_count",
+        "path": "forest",
+        "diagnostic_count": len(expected),
+    }
+    assert "context" not in detail
+    assert state.authoring_workspace.snapshot().identity == before_load
+
+    # A complete Program with an empty Deployment names deployment.yaml.
+    no_deployment = _document("other")
+    no_deployment["deployment_draft"] = None
+    other = save_scenario_artifact(
+        no_deployment, str(tmp_path / "other.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    rejected, _rejected_row = client.command("/api/scenario/load", {"path": other})
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["details"] == {
+        "member": "deployment.yaml", "diagnostic_count": 0,
+    }
 
 
 def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(

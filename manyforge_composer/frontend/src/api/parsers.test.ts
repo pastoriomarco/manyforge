@@ -3854,64 +3854,6 @@ describe('headless projection parsers', () => {
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
     expect(headless.runtimeAvailability).toBeNull();
-    expect(structural.workbenchSessionNotice).toBeNull();
-  });
-
-  it('parses the optional projected previous-session notice without classifying it', () => {
-    const notice = {
-      schema_version: 'manyforge.workbench_previous_session.v2',
-      session_id: 'a'.repeat(32),
-      archive_relative_path: `previous-runs/${'a'.repeat(32)}`,
-      shutdown: 'clean',
-      effects: 'unknown',
-      history_coverage: 'not_imported',
-      journal_families: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
-      message: 'Previous session journals retained; effects are unknown.',
-      unfinished_operations: [{ operation_id: 7, disposition: 'host_replaced' }],
-      unfinished_operation_count: 3,
-      application_start_id: '3f9a0000000000a1',
-    };
-    const health = {
-      status: 'ok', mode: 'headless_client', components: {},
-      runtimeAvailability: null, timestamp: 1,
-      workbench_session_notice: notice,
-    };
-    const parsed = parseHealthResponse(health).workbenchSessionNotice;
-    expect(parsed).toEqual({
-      schemaVersion: notice.schema_version,
-      sessionId: notice.session_id,
-      archiveRelativePath: notice.archive_relative_path,
-      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
-      journalFamilies: notice.journal_families, message: notice.message,
-      unfinishedOperationIds: [7], unfinishedOperationCount: 3,
-      applicationStartId: '3f9a0000000000a1',
-    });
-    expect(parseHealthResponse({ ...health, workbench_session_notice: null })
-      .workbenchSessionNotice).toBeNull();
-
-    for (const invalid of [
-      { ...notice, schema_version: 'other' },
-      { ...notice, session_id: 'A'.repeat(32) },
-      { ...notice, archive_relative_path: `previous-runs/${'b'.repeat(32)}` },
-      { ...notice, archive_relative_path: `previous-sessions/${'a'.repeat(32)}` },
-      { ...notice, unfinished_operations: null },
-      { ...notice, unfinished_operations: [{ operation_id: '7', disposition: 'host_replaced' }] },
-      { ...notice, unfinished_operation_count: 0 },
-      { ...notice, application_start_id: null },
-      { ...notice, application_start_id: '3F9A0000000000A1' },
-      { ...notice, shutdown: 'verified' },
-      { ...notice, effects: 'safe' },
-      { ...notice, history_coverage: 'imported' },
-      { ...notice, journal_families: notice.journal_families.slice(1) },
-      { ...notice, journal_families: [...notice.journal_families].reverse() },
-      { ...notice, message: '\u00e9'.repeat(513) },
-      { ...notice, message: 'e\u0301' },
-      { ...notice, message: '\ud800' },
-      { ...notice, extra: true },
-    ]) {
-      expect(() => parseHealthResponse({ ...health, workbench_session_notice: invalid }))
-        .toThrow('health.workbench_session_notice');
-    }
   });
 
   it('parses the optional startup-project notice', () => {
@@ -5797,7 +5739,7 @@ describe('addressed Robot Control parsers', () => {
 
 describe('persistent key value parsers', () => {
   const listing = {
-    schema_version: 'manyforge.persistent_key_values.v2',
+    schema_version: 'manyforge.persistent_key_values.v3',
     scenario_id: 'cell-pick',
     project_path: '/projects/cell-pick.scenario',
     program_revision: `sha256:${'a'.repeat(64)}`,
@@ -5825,7 +5767,6 @@ describe('persistent key value parsers', () => {
       program_run_id: 1, node_instance_id: 'set_layer', node_attempt_id: 4,
       reason: null, detail: null,
     }],
-    apply_observation_fault: null,
   };
 
   it('parses stored values, their starting values and the audited edits', () => {
@@ -5854,7 +5795,6 @@ describe('persistent key value parsers', () => {
       programRunId: 1, nodeInstanceId: 'set_layer', nodeAttemptId: 4,
       reason: null, detail: null,
     }]);
-    expect(parsed.applyObservationFault).toBeNull();
     // A stored-value edit answers at acceptance with its runner row (OD-214).
     expect(parseProgramCommandReply({
       schema_version: 'manyforge.program_command_reply.v1',
@@ -5910,7 +5850,7 @@ describe('persistent key value parsers', () => {
       })).toThrow(/application_start_id|exactly/);
     }
     expect(() => parsePersistentKeyValues({
-      ...listing, schema_version: 'manyforge.persistent_key_values.v1',
+      ...listing, schema_version: 'manyforge.persistent_key_values.v2',
     })).toThrow(/schema_version/);
     expect(() => parseProgramCommandReply({
       schema_version: 'manyforge.program_command_reply.v1',
@@ -5926,14 +5866,14 @@ describe('persistent key value parsers', () => {
       sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'dropped',
       application_start_id: '3f9a000000000001', request_key: null, source_label: 'committed_apply',
       program_run_id: null, node_instance_id: null, node_attempt_id: null,
-      reason: 'applied_program_not_observed', detail: null,
+      reason: 'key_not_declared_persistent', detail: null,
     };
     const parsed = parsePersistentKeyValues({
       ...listing,
       edits: [dropped],
     });
     expect(parsed.edits[0]).toMatchObject({
-      action: 'dropped', key: null, reason: 'applied_program_not_observed',
+      action: 'dropped', key: null, reason: 'key_not_declared_persistent',
     });
     // A drop always names why; nothing else does.
     expect(() => parsePersistentKeyValues({
@@ -5944,26 +5884,12 @@ describe('persistent key value parsers', () => {
     })).toThrow(/reason/);
   });
 
-  it('parses a committed Apply the runner never observed as a named fault', () => {
-    const missed = `sha256:${'b'.repeat(64)}`;
-    const parsed = parsePersistentKeyValues({
-      ...listing,
-      edits: [{
-        sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'fault',
-        application_start_id: '3f9a000000000001', request_key: null, source_label: 'committed_apply',
-        program_run_id: null, node_instance_id: null, node_attempt_id: null,
-        reason: 'applied_program_not_observed', detail: `committed Apply ${missed} was not observed`,
-      }],
-      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [missed] },
-    });
-    expect(parsed.edits[0]).toMatchObject({ action: 'fault', reason: 'applied_program_not_observed' });
-    expect(parsed.applyObservationFault).toEqual({
-      code: 'applied_program_not_observed', recordDigests: [missed],
-    });
+  it('refuses the removed Apply-observation fault', () => {
+    expect(() => parsePersistentKeyValues({ ...listing, apply_observation_fault: null }))
+      .toThrow(/exactly/);
     expect(() => parsePersistentKeyValues({
-      ...listing,
-      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [] },
-    })).toThrow(/at least one/);
+      ...listing, edits: [{ ...listing.edits[0], action: 'fault', reason: 'x' }],
+    })).toThrow(/action/);
   });
 });
 

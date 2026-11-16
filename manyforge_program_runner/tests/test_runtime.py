@@ -1971,7 +1971,7 @@ def test_terminal_carried_loss_restores_from_persistent_register_for_next_run(
             record_digest=activation_digest,
             project_path=project_path,
             declarations=program.blackboard_keys,
-            committed_applies={activation_digest: project_path},
+            apply_id=1,
         )
     )
     current_store = ProgramValueStore.from_program(

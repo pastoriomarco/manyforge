@@ -535,18 +535,13 @@ def _close_decidable(task: OwnerTaskSnapshot) -> bool:
     )
 
 
-# Exact rereads (one per tick) of a normal failed resident whose current
-# assessment stays unavailable, before its identity is retained for the
-# existing intervention handling instead. A stopped operation
-# is reread without this bound: its result waits for the component's activity
-# to leave `unknown`.
-_ASSESSMENT_REREAD_LIMIT: Final = 100
 # A run's failure message bound (`FailureRecord`).
 _MAX_FAILURE_MESSAGE_BYTES: Final = 4_096
 
 
 def _terminal_cleanup_pending(task: OwnerTaskSnapshot) -> bool:
-    """The certified Stop's terminal cleanup still runs: not yet decided."""
+    """The ended (failed or stopped) execution's terminal cleanup still runs:
+    not yet decided."""
 
     assessment = task.metadata.get("recovery_assessment")
     return (
@@ -602,9 +597,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._phase = _TaskPhase.SUBMIT
         # An abandoned attempt's task still to close, with its identity.
         self._drain: tuple[OwnerTaskSnapshot, NodeAttemptIdentity] | None = None
-        self._drain_rereads = 0
-        # Exact rereads of this attempt's unavailable failure assessment.
-        self._assessment_rereads = 0
         self._holds_failure = False
         # The failed operation's own facts when its failure reached the tree.
         self._operation_failure: Mapping[str, Any] | None = None
@@ -674,7 +666,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._phase = _TaskPhase.SUBMIT
         self._operation_failure = None
         self.simulation_stop_pending = False
-        self._assessment_rereads = 0
 
     @property
     def operation_failure(self) -> Mapping[str, Any] | None:
@@ -715,12 +706,13 @@ class OwnerTaskAdapter(_OwnerAdapter):
     def _await_settled_assessment(
         self, task: OwnerTaskSnapshot
     ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        """A failure can arrive before its assessment is readable. Reread the
+        """A failure can arrive before its assessment is decided. Reread the
         exact current operation, read-only, once per tick: (RUNNING, task)
-        while it is not yet decidable (a stopped operation also after a failed
-        read, `_failed_read`), (FAILURE, task) for any other failed read,
-        and (None, task) once the read decides its closure (`_close_decidable`)
-        or the bounded rereads are spent (then it is retained)."""
+        while it is not yet decidable, failed and stopped alike (a stopped
+        operation also after a failed read, `_failed_read`), (FAILURE, task)
+        for any other failed read, and (None, task) once the read decides its
+        closure (`_close_decidable`). No time limit (OD-214): the Kernel
+        republishes when the execution's terminal cleanup ends."""
 
         if _close_decidable(task):
             return None, task
@@ -729,7 +721,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         except OwnerTaskObservationUnavailableError:
             if task.state is OwnerTaskState.INTERRUPTED:
                 return self._failed_read(task), task
-            return self._reread_pending(task)
+            return py_trees.common.Status.RUNNING, task
         except Exception as exc:
             self._record_owner_error("owner_request_failed", exc)
             return self._failed_read(task), task
@@ -750,7 +742,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             # node's reason, the read problem is named in its message.
             self._record_operation_failure_with_read_problem(observed, read_failure)
             return self._failed_read(observed), observed
-        return self._reread_pending(observed)
+        return py_trees.common.Status.RUNNING, observed
 
     def _record_operation_failure_with_read_problem(
         self, task: OwnerTaskSnapshot, read_failure: Mapping[str, Any]
@@ -769,17 +761,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
             message = task.message
         self._record_owner_failure(task.reason_code, message, task.details)
         self._note_operation_failure(task)
-
-    def _reread_pending(
-        self, task: OwnerTaskSnapshot
-    ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        self._assessment_rereads += 1
-        if (
-            task.state is OwnerTaskState.INTERRUPTED
-            or self._assessment_rereads < _ASSESSMENT_REREAD_LIMIT
-        ):
-            return py_trees.common.Status.RUNNING, task
-        return None, task  # Still unavailable: retained, never waited on.
 
     def _note_operation_failure(self, task: OwnerTaskSnapshot) -> None:
         fact = task.metadata.get("operation_failure")
@@ -800,6 +781,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._record_owner_failure(task.reason_code, task.message, task.details)
         self._note_operation_failure(task)
         if self._holds_failure or not self._closable(task):
+            if self._holds_failure and not _close_eligible(task) and _retired(task):
+                # Retirement already completed: nothing is left to hold, so
+                # the hold has no owner task and its offers follow the
+                # node's policy (OD-263), as `_advance_close` drops it.
+                self._task = None
             self._phase = _TaskPhase.DONE
             return py_trees.common.Status.FAILURE
         self._phase = _TaskPhase.CLOSING
@@ -811,8 +797,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         The exact current close permission decides first. Without it, an
         operation already retired (resident false) leaves nothing to close;
         otherwise (no permission, uncertain effects, an unresolved
-        intervention, a refused or impossible close, or an assessment still
-        unavailable after the bounded rereads) the operation stays retained
+        intervention, a refused or impossible close) the operation stays retained
         (Reset releases it; its alarm stands) and the failure is returned.
         An unknown close outcome keeps the node RUNNING; the same request
         replays.
@@ -983,9 +968,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 # An operator Stop's interruption is not a failure; any
                 # other paused owner result is the owner's failure.
                 stop_interruption = parameter == "operator_stop_policy"
-                if stop_interruption and _terminal_cleanup_pending(task):
-                    # Hold on the decided assessment (its Resume and Reset
-                    # offers), not on the brief cleanup wait (bounded).
+                if _terminal_cleanup_pending(task):
+                    # Hold on the decided assessment (its Resume, Retry,
+                    # Continue and Reset offers), not on the cleanup wait.
                     pending, task = self._await_settled_assessment(task)
                     if pending is not None:
                         return pending
@@ -1030,7 +1015,45 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 # scheduler removes the run from automatic ticking, so neither
                 # a retry nor a stale output write can occur.
                 return py_trees.common.Status.RUNNING
+        if self._hold_stopped_unstarted(task):
+            return py_trees.common.Status.RUNNING
         return self._fail_to_tree(task)
+
+    def _hold_stopped_unstarted(self, task: OwnerTaskSnapshot) -> bool:
+        """A Stop that holds this node ended its operation with no effect and
+        the Kernel already retired it (a take-over newcomer, OD-264): nothing
+        started, so the node holds exactly as a Stop-fence refusal at
+        admission does and Resume makes a fresh attempt."""
+
+        state = self._operator_stop_state
+        fact = task.metadata.get("operation_failure")
+        facts = fact.get("terminal_facts") if isinstance(fact, Mapping) else None
+        if (
+            state is None
+            or task.state is not OwnerTaskState.INTERRUPTED
+            or not _retired(task)
+            or type(task.metadata.get("stop_event_id")) is not int
+            or task.metadata["stop_event_id"] < 1
+            or not isinstance(facts, (list, tuple))
+            or not facts
+            or any(
+                not isinstance(item, Mapping) or item.get("effect") != "no_effect"
+                for item in facts
+            )
+        ):
+            return False
+        try:
+            state.refresh()
+        except Exception:
+            pass  # The last published scope decides, as in `_hold_before_admission`.
+        scope = state.snapshot()
+        if self._node_instance_id not in scope.held_nodes:
+            return False
+        self._task = None
+        self._phase = _TaskPhase.SUBMIT
+        self._held_before_admission = scope.hold_revision
+        self.feedback_message = task.message
+        return True
 
     def _on_priority_refusal(
         self, error: OwnerInvocationRefusedByPriorityError
@@ -1374,15 +1397,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return True
 
     def _drain_pending(self, task: OwnerTaskSnapshot, identity: NodeAttemptIdentity) -> bool:
-        """The drained operation's assessment is still unavailable: reread it
-        on later ticks, then leave it retained for Reset (bounded)."""
+        """The drained operation's assessment is not yet decidable: reread it
+        on later ticks (the same wait as `_await_settled_assessment`)."""
 
-        self._drain_rereads += 1
-        if self._drain_rereads < _ASSESSMENT_REREAD_LIMIT:
-            self._drain = (task, identity)
-            return False
-        self._drain = None
-        return True
+        self._drain = (task, identity)
+        return False
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
         request, self._request = self._request, None
@@ -1417,7 +1436,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 return
         if self._closable(task):
             self._drain = (task, identity)
-            self._drain_rereads = 0
             self._phase = _TaskPhase.DONE
 
 
@@ -2206,7 +2224,7 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
             return waiting
         if _terminal_cleanup_pending(task):
             # Decide (close, hold or fail) on the settled assessment: a held
-            # failure keeps its Retry and Continue offers (bounded rereads).
+            # failure keeps its Retry and Continue offers.
             waiting, task = self._await_settled_assessment(task)
             if waiting is not None:
                 return waiting

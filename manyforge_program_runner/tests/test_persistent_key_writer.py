@@ -81,7 +81,7 @@ def _activation(*declarations: BlackboardKeyDeclaration, digest: str = "h.apply.
         record_digest=digest,
         project_path=_SCENARIO,
         declarations={row.key: row for row in declarations},
-        committed_applies={"h.apply.1": _SCENARIO, digest: _SCENARIO},
+        apply_id=int(digest.rsplit(".", 1)[1]),
     )
 
 
@@ -230,7 +230,7 @@ def test_an_operator_set_during_a_blocked_write_returns_and_is_read_from_memory(
             record_digest="h.apply.1",
             project_path=_PROJECT,
             declarations=dict(declarations),
-            committed_applies={"h.apply.1": _PROJECT},
+            apply_id=1,
         )
     ).outcome == "reconciled"
     entered, release = _blocked_replace(monkeypatch)

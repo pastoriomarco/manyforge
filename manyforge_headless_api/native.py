@@ -403,7 +403,6 @@ class NativeHeadlessCore:
                 "headless_native_binding_unavailable",
                 "manyforge_headless_py is not importable",
             ) from exc
-        self.workbench_previous_session_registration: dict[str, str] | None = None
         try:
             self._native = manyforge_headless_py.HeadlessApiCore(
                 str(config.install_root),
@@ -490,7 +489,6 @@ class NativeHeadlessCore:
                     or receipt["session_id"] != current_identity
                     or receipt["status"] not in {"registered", "acknowledged", "quiet"}):
                     raise ValueError("current previous-session registration receipt is invalid")
-                self.workbench_previous_session_registration = receipt
         finally:
             os.close(reports)
 

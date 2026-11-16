@@ -979,9 +979,6 @@ class Workbench:
                 f"http://127.0.0.1:{self.frontend_port}"
             ),
         }
-        previous_report = self._previous_session_report()
-        if previous_report is not None:
-            composer_environment["MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"] = str(previous_report)
         composer_roots = _composer_filesystem_roots(self.artifact_root)
         composer_environment["MANYFORGE_FS_ROOTS"] = composer_roots
         composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = composer_roots
@@ -1195,10 +1192,6 @@ class Workbench:
         except (HeadlessClientError, OSError, ValueError, WorkbenchError):
             return
         self._ready_reported = True
-
-    def _previous_session_report(self) -> Path | None:
-        previous = self.session.marker.get("previous_session") if self.session is not None else None
-        return STATE_ROOT / "session-reports" / (previous["session_id"] + ".json") if previous else None
 
     def _previous_session_arguments(self) -> tuple[str, ...]:
         if self.session is None:

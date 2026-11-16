@@ -215,9 +215,8 @@ def test_registers_only_current_report_after_durable_replay(tmp_path: Path, nati
     reports, _ = _pending(tmp_path, "a" * 32)
     _pending(tmp_path, "b" * 32)
     native.registration_status = status
-    core = NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
+    NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
     assert native.observed == ["a" * 32]
-    assert core.workbench_previous_session_registration == {"session_id": "a" * 32, "status": status}
     NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
     assert native.observed == ["a" * 32, "a" * 32]
     assert len(native.calls) == 2  # Finalized reports are not bulk-replayed.
@@ -225,9 +224,8 @@ def test_registers_only_current_report_after_durable_replay(tmp_path: Path, nati
 
 def test_registration_without_current_identity_stays_absent(tmp_path: Path, native: SimpleNamespace) -> None:
     reports, _ = _pending(tmp_path)
-    core = NativeHeadlessCore(_config(tmp_path, reports))
+    NativeHeadlessCore(_config(tmp_path, reports))
     assert native.observed == []
-    assert core.workbench_previous_session_registration is None
 
 
 @pytest.mark.parametrize("failure", ["missing", "wrong_identity", "symlink", "bad_receipt", "query_failure"])
@@ -258,19 +256,3 @@ def test_config_refuses_invalid_current_archive_identity(tmp_path: Path, identit
 def test_config_requires_report_root_for_current_identity(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         replace(_config(tmp_path, None), workbench_previous_session_id="a" * 32)
-
-
-def test_existing_health_projects_only_completed_native_registration() -> None:
-    from manyforge_headless_api.service import HeadlessService
-    receipt = {"session_id": "a" * 32, "status": "acknowledged"}
-    core = SimpleNamespace(
-        alarm_snapshot=lambda **_: {"health": {"state": "available"}, "reconciled": True},
-        historian_health=lambda: {"available": True},
-        workbench_previous_session_registration=receipt,
-    )
-    service = HeadlessService(core, SimpleNamespace(), application_start_id="3f9a0000000000a1")
-    service.runtime = lambda: {"complete": True}
-    service.node_environment = lambda: {"source": {"available": True, "freshness": "fresh", "known_gaps": []}}
-    assert service.health()["workbench_previous_session_registration"] == receipt
-    core.workbench_previous_session_registration = None
-    assert "workbench_previous_session_registration" not in service.health()

@@ -17,18 +17,6 @@ from manyforge_headless_api.tests.test_app import (
 )
 
 
-def _committed(*apply_ids: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "apply_id": apply_id,
-            "apply_generation": 1,
-            "record_digest": "sha256:" + str(index) * 64,
-            "scenario_id": "scenario.1",
-        }
-        for index, apply_id in enumerate(apply_ids)
-    ]
-
-
 class _Outcomes:
     """Manager's status answers for one Apply, then its projection."""
 
@@ -56,12 +44,10 @@ class _Outcomes:
             return {
                 "apply_id": 6,
                 "apply_generation": 1,
-                "committed_applies": _committed(6),
             }
         return {
             "apply_id": 7,
             "apply_generation": 1,
-            "committed_applies": _committed(6, 7),
         }
 
     def wake(self) -> None:
@@ -112,13 +98,12 @@ def test_an_apply_already_superseded_by_a_later_one_wakes_at_once() -> None:
     outcomes = _Outcomes(["succeeded"], projected_after=0)
 
     def superseded() -> dict[str, Any]:
-        # The very first read already holds the followed Apply and the later
-        # one that superseded it; it is never current again.
+        # The very first read already names a later Apply that superseded
+        # the followed one; it is never current again.
         outcomes.events.append("projection")
         return {
             "apply_id": 8,
             "apply_generation": 1,
-            "committed_applies": _committed(6, 7, 8),
         }
 
     follower = CommittedApplyFollower(
@@ -186,7 +171,7 @@ def test_closing_the_service_ends_a_follow_that_has_no_end_yet(stage: str) -> No
 
     def activation() -> dict[str, Any]:
         read.set()
-        return {"apply_id": 6, "apply_generation": 1, "committed_applies": _committed(6)}
+        return {"apply_id": 6, "apply_generation": 1}
 
     follower = CommittedApplyFollower(
         observe_apply=observe,

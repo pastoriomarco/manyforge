@@ -825,6 +825,12 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
         policy.effective_priority, {}, candidate.resources};
     bool eligible_effect = false;
     std::vector<StopInterruptSelection> interrupt_selections;
+    // A `hold` is the operator's Stop of the run (OD-263): it also covers the
+    // held run's motion in its scope that is not sent yet (planning or
+    // prepared), which the Stop then cancels before sending, as a group Stop does.
+    const auto* held_run = hold && program_cycle_claim_run_ && program_cycle_claim_run_->capture
+                               ? &program_cycle_claim_run_->program_run_id
+                               : nullptr;
     for (auto& [operation_id, operation] : active_operations_) {
       if (terminal(operation->state.state)) continue;
       for (auto& participant : operation->participants) {
@@ -841,7 +847,11 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
         // A Stop attempt already contains this participant.
         const bool resident = participant.stop.phase == StopPhase::kStopping;
         const bool executing = public_row->state == OperationStateKind::kExecuting || boundary;
-        if (!resident && !executing) continue;
+        const bool unsent = !resident && !executing && held_run != nullptr &&
+                            operation->state.program_run_id == *held_run &&
+                            participant.stop.phase == StopPhase::kRunning &&
+                            !participant.prepared_dispatch_released;
+        if (!resident && !executing && !unsent) continue;
         if (resident) {
           // Existing stopping-phase arbitration admits strictly higher rules
           // only; an equal or lower one is already contained by that Stop.
@@ -867,6 +877,20 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
         if (participant.payload_kind != OperationParticipantPayloadKind::kMotion ||
             participant.binding.value().capability_id.value() != "execution.trajectory.execute")
           continue;  // Everything retains ordinary gripper/output Stop.
+        if (unsent) {
+          // Nothing moves yet: no rule outcome row, only the Stop's cover
+          // with the rule's entry into its sealed plan.
+          if (!participant.ordinary_stop_plan)
+            return Result<void>::Err(global_rule_error("io_global_rule_response_membership_stale"));
+          const auto entry = ResolvePreparedIoRuleStopEntry(*participant.ordinary_stop_plan,
+                                                            policy.stop_entry_stage_id);
+          if (!entry.ok()) return Result<void>::Err(entry.error());
+          interrupt_selections.push_back(StopInterruptSelection{
+              operation_id, participant.slot_owner.participant_id.ordinal - 1U,
+              participant.ordinary_stop_plan.get(),
+              static_cast<std::uint8_t>(entry.value().stage_index), kNoStopStage});
+          continue;
+        }
         if (!participant.prepared_participant || !participant.ordinary_stop_plan ||
             !public_row->command_id.nonzero())
           return Result<void>::Err(global_rule_error("io_global_rule_response_membership_stale"));

@@ -841,10 +841,31 @@ CanonicalValue BuildManagerSourcePayload(
   // committed Apply published cannot be paired with that Apply's record.
   Require(ManagerRuntimeAccountsForCommittedApplies(runtime, apply_inventory),
           "active runtime predates a committed Apply publication");
-  CanonicalValue::Array applies;
-  applies.reserve(apply_inventory.size());
+  // At most three Apply records (OD-256): the running one, the one that
+  // installed the active configuration and the newest finished one (they may
+  // coincide). The journal keeps the rest, readable one at a time through
+  // `apply_status`; the inventory is in Apply-number order.
+  const auto *installer =
+      std::get_if<core::NamedApplyPublicationTransactionDTO>(
+          &publication.request.transaction_ref);
+  const component_manager::PersistedManagerApplyStatus *newest_terminal =
+      nullptr;
   for (const auto &apply : apply_inventory) {
-    Require(apply.intent.intent.cell_id == apply_journal.cell_id(),
+    if (apply.terminal_outcome.has_value()) {
+      newest_terminal = &apply;
+    }
+  }
+  CanonicalValue::Array applies;
+  for (const auto &apply : apply_inventory) {
+    const auto &intent = apply.intent.intent;
+    const bool installed_active =
+        installer != nullptr && installer->apply_id == intent.apply_id &&
+        installer->apply_generation == intent.apply_generation;
+    if (apply.terminal_outcome.has_value() && !installed_active &&
+        &apply != newest_terminal) {
+      continue;
+    }
+    Require(intent.cell_id == apply_journal.cell_id(),
             "Apply status belongs to a different cell");
     applies.emplace_back(ApplyStatus(apply));
   }

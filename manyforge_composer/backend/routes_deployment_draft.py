@@ -445,11 +445,6 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
             value = projection.get("published_scenario")
             if isinstance(value, dict):
                 current = value
-            elif not projection.get("ready"):
-                strict = state.current_scenario()
-                value = strict.get("current_scenario")
-                if isinstance(value, dict):
-                    current = value
         except HeadlessClientError as error:
             unavailable.append(error.code)
     draft_revision = draft["deploymentRevision"]

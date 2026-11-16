@@ -11,6 +11,7 @@ import threading
 from threading import Event, Thread
 from types import MappingProxyType, SimpleNamespace
 import time
+import traceback
 from typing import Any
 
 import pytest
@@ -74,7 +75,10 @@ from manyforge_behavior.program_run_owner import (
     build_program_run_admission,
     program_run_end,
 )
-from manyforge_behavior.production_ports import NativeKernelProgramPort
+from manyforge_behavior.production_ports import (
+    NativeKernelProgramPort,
+    ProductionPortError,
+)
 from manyforge_behavior import program_runtime
 from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
 from manyforge_behavior.run_sender import RunSender
@@ -1806,6 +1810,91 @@ def test_terminal_reset_waiter_has_no_deadline_and_ends_at_shutdown():
     finally:
         host.shutdown()
         waiter.join(2.0)
+
+
+def test_reset_of_a_finished_run_survives_the_reset_stops_hold_facts():
+    # The run's context is released at its end; the native scope port then
+    # refuses a scope read for it (`_NativeKernelProgramScopePort.
+    # execution_scope`: only for a bound run). Reset's own Stop raises the
+    # Kernel's stop progress, so the stream delivers new hold facts for the
+    # ended run and wakes its tick. That tick reads no scope and changes no
+    # revision: the finished run's terminal snapshot stays as it ended, the
+    # tick worker does not fail and Reset's containment settles.
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    bound: set[int] = set()
+    bind, read_scope = scope.bind, scope.execution_scope
+
+    def bind_run(context):
+        bind(context)
+        bound.add(context.program_run_id)
+
+    def execution_scope(program_run_id):
+        if program_run_id not in bound:
+            raise ProductionPortError("Program-run client context is not bound")
+        return read_scope(program_run_id)
+
+    scope.bind = bind_run
+    scope.unbind = bound.discard
+    scope.execution_scope = execution_scope
+    host = ProgramRunTickHost(owner, tick_interval_s=0.001)
+    run_id = host.start_run(admission).capture.program_run_id
+    _host_scene_step_sent(host)
+    terminal = host.advance_ready_once()[0]
+    assert terminal.state is ProgramRunState.SUCCEEDED
+    assert run_id not in bound
+
+    stop_requested, reconciled = Event(), Event()
+    request_stop = scope.request_stop
+
+    def reset_stop(*args):
+        snapshot = request_stop(*args)
+        stop_requested.set()
+        return snapshot
+
+    reconcile = owner._reconcile_hold_facts  # noqa: SLF001
+
+    def reconcile_spy(program_run_id, facts):
+        changed = reconcile(program_run_id, facts)
+        if facts is not None:
+            reconciled.set()
+        return changed
+
+    scope.request_stop = reset_stop
+    owner._reconcile_hold_facts = reconcile_spy  # noqa: SLF001
+    scope.state = ProgramRunScopeState.ACTIVE
+    results = []
+    errors = []
+
+    def reset_wait():
+        try:
+            results.append(host.contain_reset_run(run_id, stop_request_key=_key()))
+        except Exception as error:
+            errors.append(error)
+
+    host.start()
+    waiter = Thread(target=reset_wait)
+    waiter.start()
+    try:
+        assert stop_requested.wait(2.0)
+        # The follower thread hands the Kernel's new facts to the host.
+        host.apply_hold_facts(_kernel_facts(scope, run_id, stop_progress_sequence=1))
+        assert reconciled.wait(2.0)
+        scope.state = ProgramRunScopeState.SETTLED
+        waiter.join(2.0)
+        assert not waiter.is_alive()
+        failure = host._worker_failure  # noqa: SLF001
+        assert failure is None, "".join(traceback.format_exception(failure))
+        assert not errors and results == [terminal]
+        assert host.read(run_id) == terminal
+        assert task.starts == 1 and scope.stop_requests == 1
+        host.reset_run(run_id)
+        host.forget_reset_run(run_id)
+    finally:
+        scope.state = ProgramRunScopeState.SETTLED
+        waiter.join(2.0)
+        host.shutdown()
 
 
 def test_first_tree_tick_can_wait_for_running_publication_without_another_worker() -> (
@@ -5536,6 +5625,42 @@ def test_program_owner_retires_held_preparation_before_exact_selected_release(cl
         assert task.starts == 1
 
 
+def test_a_stop_ending_an_unstarted_newcomer_keeps_the_run_held_and_resume_retries():
+    """OD-264: a take-over newcomer ended by the Stop that holds its node,
+    with no effect and already retired, holds like a Stop-fence refusal; the
+    run stays held (never `program_terminal_scope_not_settled`) and Resume
+    makes a fresh attempt."""
+    class NewcomerPort(_TaskPort):
+        stopped = False
+        def observe(self, task_id):
+            if not self.stopped or self.starts > 1:
+                return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.ACTIVE)
+            return OwnerTaskSnapshot(
+                task_id=task_id, state=OwnerTaskState.INTERRUPTED,
+                metadata={"operation_id": 7, "resident": False, "operation_state": "stopped",
+                          "stop_event_id": 1, "operation_failure": {
+                              "operation": {"operation_id": 7, "operation_revision": 3},
+                              "resource_ids": ["arm"],
+                              "failure": {"code": "operation_stopped",
+                                          "message": "native operation was interrupted"},
+                              "terminal_facts": [{"kind": "cancelled_before_dispatch",
+                                                  "effect": "no_effect"}]}},
+                reason_code="operation_stopped", message="native operation was interrupted")
+    owner,admission,task,scope,events = _fixture(initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events:NewcomerPort(events,OwnerTaskState.ACTIVE))
+    run_id=owner.start(_program_dwell_admission(admission)).capture.program_run_id
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    owner.stop_motion(run_id,group_id="all",stop_request_key=_key())
+    task.stopped = True
+    for _ in range(3):
+        assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    assert task.starts == 1 and scope.held
+    owner.resume_motion(run_id,expected_hold_revision=scope.hold_revision,
+                        request_key=_key(),group_id="all",reason=None)
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    assert task.starts == 2
+
+
 class _MotionRetryTaskPort(_TaskPort):
     """A motion attempt fails with an eligible planning cause; it can be closed."""
 
@@ -7104,9 +7229,9 @@ def test_a_newer_freeze_of_a_halted_run_raises_its_run_revision() -> None:
 
 
 def test_changed_hold_facts_are_read_on_the_next_tick_only() -> None:
+    # The run stays Running throughout: an ended run re-reads no scope.
     owner, admission, _task, scope, _events = _fixture(
-        initial_task_state=OwnerTaskState.ACTIVE,
-        task_factory=_OperatorStopTaskPort,
+        initial_task_state=OwnerTaskState.ACTIVE
     )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     run_id = host.start_run(admission).capture.program_run_id
@@ -7148,6 +7273,7 @@ def test_changed_hold_facts_are_read_on_the_next_tick_only() -> None:
         progressed = replace(progressed, **change)
         owner.advance_once(run_id, hold_facts=progressed)
     assert len(refresh_reads) == 5
+    assert owner.read(run_id).state is ProgramRunState.RUNNING
     _on_tick(host, lambda: host.stop_run(run_id))
     host.shutdown()
 

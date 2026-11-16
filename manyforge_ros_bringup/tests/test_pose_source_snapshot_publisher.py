@@ -294,25 +294,29 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
         publisher.start()
 
         assert not captures.wait(timeout=0.1)
-        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread = threading.Thread(target=executor.spin)
         spin_thread.start()
         assert captures.wait(timeout=2.0)
     finally:
+        stopped = None
         if publisher is not None:
-            assert publisher.stop()
-            assert client_cancelled.is_set()
-            assert client_closed.is_set()
-            assert dispatcher.intents == []
+            stopped = publisher.stop()
             for auxiliary in publisher.auxiliary_nodes:
                 executor.remove_node(auxiliary)
                 auxiliary.destroy_node()
             executor.remove_node(publisher)
             publisher.destroy_node()
-        executor.shutdown(timeout_sec=2.0)
+        executor.shutdown()
         if spin_thread is not None:
-            spin_thread.join(timeout=2.0)
+            spin_thread.join()
         if context.ok():
             rclpy.shutdown(context=context)
+        # Asserted only after the spin thread is joined (OD-259).
+        if publisher is not None:
+            assert stopped
+            assert client_cancelled.is_set()
+            assert client_closed.is_set()
+            assert dispatcher.intents == []
 
 
 class _RecordingStreamSinks:
@@ -394,7 +398,7 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         stream_sink_factory=sinks,
         context=context,
     )
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread = threading.Thread(target=executor.spin)
     try:
         executor.add_node(publisher)
         for auxiliary in publisher.auxiliary_nodes:
@@ -412,16 +416,18 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         ):
             time.sleep(0.01)
     finally:
-        assert publisher.stop()
+        stopped = publisher.stop()
         for auxiliary in publisher.auxiliary_nodes:
             executor.remove_node(auxiliary)
             auxiliary.destroy_node()
         executor.remove_node(publisher)
         publisher.destroy_node()
-        executor.shutdown(timeout_sec=2.0)
-        spin_thread.join(timeout=2.0)
+        executor.shutdown()
+        spin_thread.join()
         if context.ok():
             rclpy.shutdown(context=context)
+        # Asserted only after the spin thread is joined (OD-259).
+        assert stopped
 
     assert batches and batches[0] == (gripper, "/mac_n_cheese_centered")
     cheese = next(
@@ -654,7 +660,7 @@ def test_simulation_worker_future_completes_on_single_threaded_executor() -> Non
         finally:
             completed.set()
 
-    spinner = threading.Thread(target=executor.spin, daemon=True)
+    spinner = threading.Thread(target=executor.spin)
     worker = threading.Thread(target=capture, daemon=True)
     try:
         spinner.start()
@@ -672,16 +678,18 @@ def test_simulation_worker_future_completes_on_single_threaded_executor() -> Non
         client.cancel()
         if worker.ident is not None:
             worker.join(timeout=3.0)
-        assert not worker.is_alive()
-        client.close()
-        executor.shutdown(timeout_sec=2.0)
-        spinner.join(timeout=2.0)
-        assert not spinner.is_alive()
+        worker_stopped = not worker.is_alive()
+        if worker_stopped:
+            client.close()
+        executor.shutdown()
+        spinner.join()
         executor.remove_node(node)
         node.destroy_service(service)
         node.destroy_node()
         if context.ok():
             rclpy.shutdown(context=context)
+        # Asserted only after the spin thread is joined (OD-259).
+        assert worker_stopped
 
 
 def test_pose_entity_create_task_failure_reports_owner_fault() -> None:
@@ -774,7 +782,7 @@ def test_pose_simulation_client_entities_use_owner_executor(tmp_path: Path) -> N
         finally:
             completed.set()
 
-    spinner = threading.Thread(target=executor.spin, daemon=True)
+    spinner = threading.Thread(target=executor.spin)
     worker = threading.Thread(target=capture, daemon=True)
     try:
         spinner.start()
@@ -802,12 +810,11 @@ def test_pose_simulation_client_entities_use_owner_executor(tmp_path: Path) -> N
         client.cancel()
         if worker.ident is not None:
             worker.join(timeout=3.0)
-        assert not worker.is_alive()
-        if not client._closed:
+        worker_stopped = not worker.is_alive()
+        if worker_stopped and not client._closed:
             client.close()
-        executor.shutdown(timeout_sec=2.0)
-        spinner.join(timeout=2.0)
-        assert not spinner.is_alive()
+        executor.shutdown()
+        spinner.join()
         executor.remove_node(auxiliary)
         executor.remove_node(publisher)
         auxiliary.destroy_service(service)
@@ -815,6 +822,8 @@ def test_pose_simulation_client_entities_use_owner_executor(tmp_path: Path) -> N
         publisher.destroy_node()
         if context.ok():
             rclpy.shutdown(context=context)
+        # Asserted only after the spin thread is joined (OD-259).
+        assert worker_stopped
 
 
 def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> None:

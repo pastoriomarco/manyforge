@@ -743,16 +743,25 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 state, authoring, program, diagnostics, deployment
             )
             no_program = authoring is not None and authoring.get("forest") == [] and not authoring.get("scene")
-            incomplete = (
-                (program is None and not no_program)
-                or deployment is None
-            )
-            if incomplete or not isinstance(deployment, dict):
-                raise ScenarioArtifactError(
-                    "scenario_activation_incomplete",
-                    "only a complete v2 Scenario document can be loaded",
-                    status_code=409,
-                )
+            program_missing = program is None and not no_program
+            if program_missing or deployment is None:
+                # The missing member and the first typed diagnostic of a
+                # Program that cannot be built, sent under ``details`` where
+                # the panel reads them (OD-260).
+                incomplete_details: dict[str, Any] = {
+                    "member": SCENARIO_PROJECT_MEMBERS[
+                        "program_draft" if program_missing else "deployment_draft"
+                    ],
+                    "diagnostic_count": len(diagnostics) if program_missing else 0,
+                }
+                if program_missing and diagnostics:
+                    incomplete_details["cause_code"] = diagnostics[0]["code"]
+                    incomplete_details["path"] = diagnostics[0]["path"]
+                raise refused_before_effect(409, {
+                    "code": "scenario_activation_incomplete",
+                    "message": "only a complete v2 Scenario document can be loaded",
+                    "details": incomplete_details,
+                })
             # Load establishes Saved from the exact captured source, independently
             # of whether the subsequent Apply succeeds.
             post_state["program"].update(

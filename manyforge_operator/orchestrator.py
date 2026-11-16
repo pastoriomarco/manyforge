@@ -555,10 +555,6 @@ def native_commands(
         # Composer installation settings are saved data: data/composer/ (F1).
         "MANYFORGE_STATE_DIR": str(config.data_root),
     }
-    if previous_session_id is not None:
-        composer_environment["MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"] = str(
-            config.session_reports_root / f"{previous_session_id}.json"
-        )
 
     def journaled(component_id: str, argv: Sequence[str]) -> tuple[str, ...]:
         return tuple(_journal_command(config.instance_id, component_id, argv)[0])

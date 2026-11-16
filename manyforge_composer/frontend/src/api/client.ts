@@ -456,6 +456,30 @@ export function preparationCauseCode(error: unknown): string | null {
   return typeof cause === 'string' && cause !== '' ? cause : null;
 }
 
+/**
+ * The operator text of a Load refused as an incomplete Scenario document:
+ * the catalog text, the missing member and, for a Program that cannot be
+ * built, its first typed diagnostic (`details.cause_code`, a catalog code)
+ * and where it is. Null for every other refusal.
+ */
+export function incompleteScenarioText(error: unknown): string | null {
+  if (!(error instanceof ApiError) || apiErrorCode(error) !== 'scenario_activation_incomplete') return null;
+  const details = error.structuredError?.details;
+  const member = details?.member;
+  const text = errorCatalogRow('scenario_activation_incomplete')?.[0] ?? error.message;
+  if (typeof member !== 'string' || member === '') return text;
+  const cause = details?.cause_code;
+  if (typeof cause !== 'string' || cause === '') return `${text}: ${member} is empty.`;
+  const path = details?.path;
+  const where = typeof path === 'string' && path !== '' ? `${member}, ${path}` : member;
+  const catalogRow = errorCatalogRow(cause);
+  if (catalogRow === null) return `${text} (${where}: ${cause}).`;
+  const count = details?.diagnostic_count;
+  const more = typeof count === 'number' && count > 1
+    ? ` ${count - 1} more problem${count === 2 ? '' : 's'} in ${member}.` : '';
+  return `${text} (${where}). ${catalogRow[1] || `${catalogRow[0]}.`}${more}`;
+}
+
 // The document was written to the named path but not read back or adopted as
 // Saved (for example a newer workspace revision): a definite outcome, so the
 // client shows it, refreshes and adopts the current identity, never retries.

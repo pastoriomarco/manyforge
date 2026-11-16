@@ -2179,7 +2179,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const bool failed_contained =
             value.terminal_fact && is_settled_execution_failure(*value.terminal_fact) &&
             handoff_request.payload_kind == OperationParticipantPayloadKind::kMotion &&
-            recovery.execution_state == ExecutionState::kFailed && !recovery.retry_admissible;
+            failed_not_retry_admissible(recovery);
         const bool ordinary_stopped =
             !value.terminal_fact && recovery.execution_state == ExecutionState::kStopped &&
             recovery.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
